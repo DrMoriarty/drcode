@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import ssl
+import subprocess
+import sys
 from pathlib import Path
 from typing import ClassVar
 
 import httpx
 from pydantic_ai import Agent
-from pydantic_ai.messages import FunctionToolCallEvent, PartDeltaEvent, TextPartDelta
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    PartDeltaEvent,
+    TextPartDelta,
+    ThinkingPartDelta,
+)
 from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.markup import escape
-from rich.padding import Padding
-from rich.table import Table
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Footer,
     Header,
@@ -25,7 +33,6 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    RichLog,
     Static,
     TextArea,
 )
@@ -79,8 +86,71 @@ class NewTaskInput(TextArea):
         self._app().cancel_new_task()
 
 
+class UserBlock(Static):
+    """User message: full-width background with an accent bar on the left.
+
+    Plain Text content (not a rich Table) so selection extraction stays clean.
+    """
+
+    DEFAULT_CSS = """
+    UserBlock {
+        background: $panel;
+        border-left: thick $accent;
+        padding: 1 2;
+    }
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(Text(text), expand=True)
+
+
+class ReasoningBlock(Static):
+    """Collapsible model-reasoning block; collapsed by default, click to toggle.
+
+    While the model is thinking, `append()` streams text into the block.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(classes="reasoning collapsed")
+        self._content = ""
+        self._streaming = False
+
+    def begin(self) -> None:
+        self._streaming = True
+        self._redraw()
+
+    def append(self, delta: str) -> None:
+        self._content += delta
+        self._redraw()
+
+    def set_content(self, text: str) -> None:
+        """Fill from history (not streaming)."""
+        self._content = text
+        self._redraw()
+
+    def finish(self) -> None:
+        self._streaming = False
+        self._redraw()
+
+    def on_click(self) -> None:
+        self.toggle_class("collapsed")
+        self._redraw()
+
+    def _redraw(self) -> None:
+        collapsed = self.has_class("collapsed")
+        arrow = "▸" if collapsed else "▾"
+        status = "…" if self._streaming else ""
+        header = f"[bold dim]{arrow} Reasoning{status}[/]"
+        if collapsed:
+            self.update(header)
+        else:
+            body = escape(self._content) or "[dim italic](empty)[/]"
+            self.update(f"{header}\n{body}")
+
+
 class DrCodeApp(App[None]):
     CSS = """
+    Screen { layers: base toast; }
     #main { height: 1fr; }
     #sidebar-col { width: 36; border-right: solid $primary; }
     #sidebar { height: 1fr; border: none; }
@@ -91,11 +161,25 @@ class DrCodeApp(App[None]):
     #chat-col { height: 1fr; }
     #task-statusbar { dock: top; height: 1; background: $panel; color: $text; padding: 0 1; }
     #chat-log { height: 1fr; border: none; background: $surface; }
+    #chat-log > * { margin-bottom: 1; }
+    .reasoning { padding: 0 1; }
+    .reasoning:hover { background: $panel; }
     #stream-label { display: none; padding: 0 1; color: $accent; }
     #stream-label.visible { display: block; }
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
     .section-header { color: $accent; text-style: bold; padding: 0 1; }
     .task-item { padding: 0 1; }
+    #copy-toast {
+        layer: toast;
+        dock: bottom;
+        width: auto;
+        height: auto;
+        margin: 0 0 3 1;
+        padding: 0 2;
+        background: $panel;
+        border: solid $success;
+        color: $text;
+    }
     .hidden { display: none; }
     #new-task {
         height: 1fr; width: 1fr;
@@ -140,6 +224,8 @@ class DrCodeApp(App[None]):
         self._pending_rendered: list[str] = []
         # Whether the chat log currently holds at least one block.
         self._chat_has_content = False
+        # Auto-hide timer for the "copied" toast.
+        self._copy_toast_timer: Timer | None = None
 
     # -- layout -------------------------------------------------------------
 
@@ -151,7 +237,7 @@ class DrCodeApp(App[None]):
                 yield Static("", id="model-status")
             with Vertical(id="chat-col"):
                 yield Static("", id="task-statusbar")
-                yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
+                yield VerticalScroll(id="chat-log")
                 yield Static("", id="stream-label")
                 yield Input(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):
@@ -162,6 +248,7 @@ class DrCodeApp(App[None]):
                         id="nt-hint",
                     )
         yield Static("", id="statusbar")
+        yield Static("", id="copy-toast", classes="hidden")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -185,8 +272,8 @@ class DrCodeApp(App[None]):
     # -- widgets helpers ------------------------------------------------------
 
     @property
-    def chat_log(self) -> RichLog:
-        return self.query_one("#chat-log", RichLog)
+    def chat_log(self) -> VerticalScroll:
+        return self.query_one("#chat-log", VerticalScroll)
 
     @property
     def stream_label(self) -> Static:
@@ -207,6 +294,57 @@ class DrCodeApp(App[None]):
     @property
     def viewed(self) -> Task | None:
         return self.manager.tasks.get(self.viewed_id) if self.viewed_id else None
+
+    # -- copy on select -------------------------------------------------------
+
+    def _selected_text(self) -> str | None:
+        """Extract the currently selected text from rendered lines.
+
+        Done at the app level instead of Widget.get_selection, which works on
+        logical (unwrapped) text and returns garbled results for wrapped lines.
+        """
+        parts: list[str] = []
+        for widget, selection in self.screen.selections.items():
+            if not widget.is_attached:
+                continue
+            lines: list[str] = []
+            for y in range(widget.size.height):
+                span = selection.get_span(y)
+                if span is None:
+                    continue
+                start, end = span
+                line = widget.render_line(y).text
+                lines.append(
+                    (line[start:] if end == -1 else line[start:end]).rstrip()
+                )
+            if lines:
+                parts.append("\n".join(lines).rstrip())
+        if not parts:
+            return None
+        return "\n".join(parts)
+
+    def _copy_with_fallback(self, text: str) -> None:
+        # copy_to_clipboard uses OSC52, which macOS Terminal.app ignores;
+        # pbcopy always works there.
+        self.copy_to_clipboard(text)
+        if sys.platform == "darwin" and shutil.which("pbcopy"):
+            subprocess.run(["pbcopy"], input=text.encode(), check=False)
+
+    def _show_copy_toast(self, text: str) -> None:
+        preview = escape(text if len(text) <= 40 else text[:39] + "…")
+        toast = self.query_one("#copy-toast", Static)
+        toast.update(f"✓ copied: {preview}")
+        toast.remove_class("hidden")
+        if self._copy_toast_timer is not None:
+            self._copy_toast_timer.stop()
+        self._copy_toast_timer = self.set_timer(2.0, lambda: toast.add_class("hidden"))
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        text = self._selected_text()
+        if not text:
+            return
+        self._copy_with_fallback(text)
+        self._show_copy_toast(text)
 
     # -- sidebar ---------------------------------------------------------------
 
@@ -320,7 +458,7 @@ class DrCodeApp(App[None]):
     def view_task(self, task_id: str) -> None:
         self.viewed_id = task_id
         task = self.manager.get(task_id)
-        self.chat_log.clear()
+        self.chat_log.remove_children()
         self._chat_has_content = False
         self._pending_rendered = []
         self.stream_label.update("")
@@ -333,36 +471,32 @@ class DrCodeApp(App[None]):
         self.refresh_sidebar()
         self.refresh_status()
 
-    def _user_block(self, text: str) -> RenderableType:
-        variables = self.get_css_variables()
-        bg = variables.get("panel", "blue")
-        accent = variables.get("accent", "cyan")
-        grid = Table.grid(expand=True)
-        grid.add_column(width=1)
-        grid.add_column(ratio=1)
-        body = Text(text, style=f"on {bg}")
-        body_lines = max(1, len(text.splitlines()))
-        border = Text("\n".join("▌" for _ in range(body_lines)), style=accent)
-        grid.add_row(border, Padding(body, (0, 2), style=f"on {bg}"))
-        # Vertical padding is filled with the background too, so the block
-        # visually extends one line above and one line below the text.
-        return Padding(grid, (1, 2), style=f"on {bg}")
-
-    def _write_chat(self, content: RenderableType, *, expand: bool = False) -> None:
-        """Write one block to the chat log, separated by a blank line."""
-        if self._chat_has_content:
-            self.chat_log.write("")
-        self.chat_log.write(content, expand=expand)
+    def _write_chat(
+        self, content: RenderableType | Widget, *, expand: bool = False
+    ) -> None:
+        """Mount one block to the chat log."""
+        if isinstance(content, Widget):
+            content.add_class("chat-block")
+        else:
+            content = Static(content, expand=expand, classes="chat-block")
+        self.chat_log.mount(content)
+        self.chat_log.scroll_end(animate=False)
         self._chat_has_content = True
 
     def _write_history_line(self, role: str, text: str) -> None:
         if role == "user":
-            self._write_chat(self._user_block(text), expand=True)
+            self._write_chat(UserBlock(text))
         elif role == "user-pending":
             self._pending_rendered.append(text)
-            self._write_chat(self._user_block(text), expand=True)
+            self._write_chat(UserBlock(text))
+        elif role == "reasoning":
+            block = ReasoningBlock()
+            block.set_content(text)
+            self._write_chat(block)
         elif role == "assistant":
             self._write_chat(Markdown(text, code_theme="ansi_dark"))
+        elif role == "tool":
+            self._write_chat(f"[dim]{escape(text)}[/]")
         elif role == "tester":
             self._write_chat(f"[bold magenta]tester ›[/] {text}")
         elif role == "system":
@@ -451,17 +585,33 @@ class DrCodeApp(App[None]):
                     ) as run:
                         async for node in run:
                             if Agent.is_model_request_node(node):
+                                reasoning_block: ReasoningBlock | None = None
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
-                                        if isinstance(
-                                            event, PartDeltaEvent
-                                        ) and isinstance(event.delta, TextPartDelta):
-                                            buffer.append(event.delta.content_delta)
+                                        if not isinstance(event, PartDeltaEvent):
+                                            continue
+                                        delta = event.delta
+                                        if (
+                                            isinstance(delta, ThinkingPartDelta)
+                                            and delta.content_delta
+                                        ):
+                                            if self.viewed_id == task_id:
+                                                if reasoning_block is None:
+                                                    reasoning_block = ReasoningBlock()
+                                                    reasoning_block.begin()
+                                                    self._write_chat(reasoning_block)
+                                                reasoning_block.append(
+                                                    delta.content_delta
+                                                )
+                                        elif isinstance(delta, TextPartDelta):
+                                            buffer.append(delta.content_delta)
                                             if self.viewed_id == task_id:
                                                 self.stream_label.add_class("visible")
                                                 self.stream_label.update(
                                                     "".join(buffer)
                                                 )
+                                if reasoning_block is not None:
+                                    reasoning_block.finish()
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:

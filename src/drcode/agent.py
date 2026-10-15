@@ -228,19 +228,32 @@ def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
 
 
 def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Turn serialized ModelMessages into (role, text) pairs for the chat UI."""
+    """Turn serialized ModelMessages into (role, text) pairs for the chat UI.
+
+    Roles: "user", "reasoning" (model thinking), "assistant" (text + tool
+    calls combined), rendered by the TUI in message order.
+    """
     out: list[tuple[str, str]] = []
     for msg in messages:
-        role = "user" if msg.get("role") == "request" else "assistant"
+        if msg.get("role") == "request":
+            for part in msg.get("parts", []):
+                if part.get("part_kind") == "user-prompt":
+                    content = part.get("content")
+                    if isinstance(content, str) and content:
+                        out.append(("user", content))
+            continue
+        reasoning: list[str] = []
         chunks: list[str] = []
         for part in msg.get("parts", []):
             kind = part.get("part_kind")
-            if kind == "user-prompt":
-                content = part.get("content")
-                if isinstance(content, str):
+            if kind == "thinking":
+                content = part.get("content", "")
+                if content:
+                    reasoning.append(content)
+            elif kind == "text":
+                content = part.get("content", "")
+                if content:
                     chunks.append(content)
-            elif kind == "text" and role == "assistant":
-                chunks.append(part.get("content", ""))
             elif kind == "tool-call":
                 args = part.get("args")
                 args_str = (
@@ -249,11 +262,11 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
                     else args
                 )
                 chunks.append(f"⚙ {part.get('tool_name', '?')}({args_str[:200]})")
-            elif kind == "tool-return":
-                pass
-        text = "\n".join(c for c in chunks if c)
+        if reasoning:
+            out.append(("reasoning", "\n\n".join(reasoning)))
+        text = "\n".join(chunks)
         if text:
-            out.append((role, text))
+            out.append(("assistant", text))
     return out
 
 

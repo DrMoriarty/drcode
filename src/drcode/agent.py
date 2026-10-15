@@ -230,10 +230,13 @@ def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
 def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Turn serialized ModelMessages into (role, text) pairs for the chat UI.
 
-    Roles: "user", "reasoning" (model thinking), "assistant" (text + tool
-    calls combined), rendered by the TUI in message order.
+    Roles: "user", "reasoning" (model thinking), "assistant" (text),
+    "tool-call" (name + args as one line), rendered by the TUI in message
+    order.
     """
     out: list[tuple[str, str]] = []
+    reasoning: list[str] = []
+    chunks: list[str] = []
     for msg in messages:
         if msg.get("role") == "request":
             for part in msg.get("parts", []):
@@ -242,31 +245,42 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
                     if isinstance(content, str) and content:
                         out.append(("user", content))
             continue
-        reasoning: list[str] = []
-        chunks: list[str] = []
         for part in msg.get("parts", []):
             kind = part.get("part_kind")
             if kind == "thinking":
                 content = part.get("content", "")
                 if content:
+                    if chunks:
+                        out.append(("assistant", "\n".join(chunks)))
+                        chunks = []
                     reasoning.append(content)
             elif kind == "text":
                 content = part.get("content", "")
                 if content:
+                    if reasoning:
+                        out.append(("reasoning", "\n\n".join(reasoning)))
+                        reasoning = []
                     chunks.append(content)
             elif kind == "tool-call":
                 args = part.get("args")
                 args_str = (
-                    json.dumps(args, ensure_ascii=False)
-                    if not isinstance(args, str)
-                    else args
+                    args
+                    if isinstance(args, str)
+                    else json.dumps(args or {}, ensure_ascii=False)
                 )
-                chunks.append(f"⚙ {part.get('tool_name', '?')}({args_str[:200]})")
+                if reasoning:
+                    out.append(("reasoning", "\n\n".join(reasoning)))
+                    reasoning = []
+                if chunks:
+                    out.append(("assistant", "\n".join(chunks)))
+                    chunks = []
+                out.append(("tool-call", f"{part.get('tool_name', '?')}({args_str})"))
         if reasoning:
             out.append(("reasoning", "\n\n".join(reasoning)))
-        text = "\n".join(chunks)
-        if text:
-            out.append(("assistant", text))
+            reasoning = []
+        if chunks:
+            out.append(("assistant", "\n".join(chunks)))
+            chunks = []
     return out
 
 

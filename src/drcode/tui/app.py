@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import ssl
 import subprocess
@@ -148,6 +149,31 @@ class ReasoningBlock(Static):
             self.update(f"{header}\n{body}")
 
 
+class ToolCallBlock(Static):
+    """Collapsible tool-call block; collapsed by default, click to toggle.
+
+    Header shows the call (name + truncated args) in gray; expanding reveals
+    the full call, also in gray.
+    """
+
+    def __init__(self, call: str) -> None:
+        super().__init__(classes="tool-call collapsed")
+        self._call = call
+        self._redraw()
+
+    def on_click(self) -> None:
+        self.toggle_class("collapsed")
+        self._redraw()
+
+    def _redraw(self) -> None:
+        arrow = "▸" if self.has_class("collapsed") else "▾"
+        if self.has_class("collapsed"):
+            shown = self._call if len(self._call) <= 120 else self._call[:119] + "…"
+            self.update(f"{arrow} ⚙ {escape(shown)}")
+        else:
+            self.update(f"{arrow} ⚙ {escape(self._call)}")
+
+
 class DrCodeApp(App[None]):
     CSS = """
     Screen { layers: base toast; }
@@ -164,6 +190,8 @@ class DrCodeApp(App[None]):
     #chat-log > * { margin-bottom: 1; }
     .reasoning { padding: 0 1; }
     .reasoning:hover { background: $panel; }
+    .tool-call { padding: 0 1; color: $text-muted; }
+    .tool-call:hover { background: $panel; }
     #stream-label { display: none; padding: 0 1; color: $accent; }
     #stream-label.visible { display: block; }
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
@@ -314,9 +342,7 @@ class DrCodeApp(App[None]):
                     continue
                 start, end = span
                 line = widget.render_line(y).text
-                lines.append(
-                    (line[start:] if end == -1 else line[start:end]).rstrip()
-                )
+                lines.append((line[start:] if end == -1 else line[start:end]).rstrip())
             if lines:
                 parts.append("\n".join(lines).rstrip())
         if not parts:
@@ -383,9 +409,7 @@ class DrCodeApp(App[None]):
                     "completed": "✓",
                     "clarification": "❓",
                 }.get(t.status.value, "⏳")
-                kind_letter = (
-                    "[red]B[/]" if t.kind is TaskKind.BUG else "[green]F[/]"
-                )
+                kind_letter = "[red]B[/]" if t.kind is TaskKind.BUG else "[green]F[/]"
                 if t.verification is VerificationStatus.PASSED:
                     suffix = " ✅"
                 elif t.verification is VerificationStatus.FAILED:
@@ -495,6 +519,8 @@ class DrCodeApp(App[None]):
             block = ReasoningBlock()
             block.set_content(text)
             self._write_chat(block)
+        elif role == "tool-call":
+            self._write_chat(ToolCallBlock(text))
         elif role == "assistant":
             self._write_chat(Markdown(text, code_theme="ansi_dark"))
         elif role == "tool":
@@ -633,8 +659,19 @@ class DrCodeApp(App[None]):
                                         if self.viewed_id != task_id:
                                             continue
                                         if isinstance(event, FunctionToolCallEvent):
+                                            args = event.part.args
+                                            args_str = (
+                                                args
+                                                if isinstance(args, str)
+                                                else json.dumps(
+                                                    args or {}, ensure_ascii=False
+                                                )
+                                            )
                                             self._write_chat(
-                                                f"[dim]⚙ {event.part.tool_name}[/]"
+                                                ToolCallBlock(
+                                                    f"{event.part.tool_name}"
+                                                    f"({args_str})"
+                                                )
                                             )
                     if run.result is not None:
                         task.messages = serialize_messages(run.result.all_messages())
@@ -716,8 +753,19 @@ class DrCodeApp(App[None]):
                                     if self.viewed_id == task_id and isinstance(
                                         event, FunctionToolCallEvent
                                     ):
+                                        args = event.part.args
+                                        args_str = (
+                                            args
+                                            if isinstance(args, str)
+                                            else json.dumps(
+                                                args or {}, ensure_ascii=False
+                                            )
+                                        )
                                         self._write_chat(
-                                            f"[dim]⚙ tester: {event.part.tool_name}[/]"
+                                            ToolCallBlock(
+                                                f"tester: {event.part.tool_name}"
+                                                f"({args_str})"
+                                            )
                                         )
                 if run.result is not None and self.viewed_id == task_id:
                     self._write_history_line("tester", run.result.output)

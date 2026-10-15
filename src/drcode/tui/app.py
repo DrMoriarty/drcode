@@ -505,6 +505,15 @@ class DrCodeApp(App[None]):
                     if promoted:
                         self.run_agent(promoted.id)
                         self.refresh_status()
+                elif task.status is TaskStatus.ACTIVE and not task.pending_input:
+                    # The agent answered and nothing is pending: the task is
+                    # done automatically (as if the user pressed done). The
+                    # tester promotes the next queued task when it finishes.
+                    self.manager.mark_done(task.id)
+                    self.refresh_sidebar()
+                    if self.viewed_id == task_id:
+                        self.view_task(task.id)
+                    self.run_tester(task.id)
 
     # -- tester run ------------------------------------------------------------------
 

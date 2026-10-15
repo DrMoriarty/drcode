@@ -11,3 +11,4 @@ wheels/
 
 # drcode task storage
 .drcode/
+.env

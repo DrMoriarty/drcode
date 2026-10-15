@@ -377,15 +377,15 @@ class DrCodeApp(App[None]):
         for name, tasks in sections:
             sidebar.append(TaskItem(f"{name} ({len(tasks)})", header=True))
             for t in tasks:
-                if t.kind is TaskKind.BUG:
-                    marker = "🐞"
-                else:
-                    marker = {
-                        "queued": "⏳",
-                        "active": "▶",
-                        "completed": "✓",
-                        "clarification": "❓",
-                    }.get(t.status.value, "⏳")
+                marker = {
+                    "queued": "⏳",
+                    "active": "▶",
+                    "completed": "✓",
+                    "clarification": "❓",
+                }.get(t.status.value, "⏳")
+                kind_letter = (
+                    "[red]B[/]" if t.kind is TaskKind.BUG else "[green]F[/]"
+                )
                 if t.verification is VerificationStatus.PASSED:
                     suffix = " ✅"
                 elif t.verification is VerificationStatus.FAILED:
@@ -395,7 +395,9 @@ class DrCodeApp(App[None]):
                 viewed = " ●" if t.id == self.viewed_id else ""
                 sidebar.append(
                     TaskItem(
-                        f"{marker} #{t.id} {t.title_display}{suffix}{viewed}", t.id
+                        f"{marker} {kind_letter} #{t.id} "
+                        f"{escape(t.title_display)}{suffix}{viewed}",
+                        t.id,
                     )
                 )
         sidebar.refresh()
@@ -532,15 +534,28 @@ class DrCodeApp(App[None]):
             bar.update("")
             return
         created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        kind = (
+            "[bold red]bug[/]"
+            if task.kind is TaskKind.BUG
+            else "[bold green]feature[/]"
+        )
+        status_colors = {
+            TaskStatus.QUEUED: "yellow",
+            TaskStatus.ACTIVE: "cyan",
+            TaskStatus.COMPLETED: "green",
+            TaskStatus.AWAITING_CLARIFICATION: "yellow",
+        }
+        status = f"[{status_colors[task.status]}]{task.status.value}[/]"
         parts = [
-            f"#{task.id} {task.title_display}",
-            f"created: {created}",
-            f"status: {task.status.value}",
+            kind,
+            f"#{task.id} {escape(task.title_display)}",
+            f"[dim]{created}[/]",
+            status,
         ]
         if task.verification is VerificationStatus.PASSED:
-            parts.append("✅ тестирование пройдено")
+            parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:
-            parts.append("❌ тестирование провалено")
+            parts.append("[red]✗ testing[/]")
         bar.update("   ".join(parts))
 
     # -- agent run -----------------------------------------------------------------

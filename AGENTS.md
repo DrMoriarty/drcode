@@ -20,7 +20,7 @@ The agent needs `DRCODE_MODEL` and `DRCODE_API_KEY` (env vars or `.env` in the r
 
 Task-centric coding agent (pydantic-ai + textual), inspired by opencode. Single package under `src/drcode/`:
 
-- `task_manager.py` — state machine: queued → active → completed. At most one ACTIVE task; when it's marked done the first queued task with pending input is promoted automatically. Sending input to a COMPLETED task re-queues it. On startup any stale ACTIVE task is demoted to queued.
+- `task_manager.py` — state machine: queued → active → completed, plus awaiting-clarification: the agent's `ask_clarifying_question` tool pauses the task on a question and the next queued task starts; when the user answers, the task re-enters the pipeline at the head of the queue (or is activated immediately if nothing is active). At most one ACTIVE task; when it's marked done the first queued task with pending input is promoted automatically. Sending input to a COMPLETED task re-queues it. On startup any stale ACTIVE task is demoted to queued (awaiting-clarification tasks survive restarts).
 - `models.py` — `Task` holds the full pydantic-ai transcript as serialized `ModelMessage` dicts (`task.messages`); queued user input lives in `task.pending_input` until the agent run consumes it.
 - `storage.py` — persists each task as `<project>/.drcode/tasks/<id>.json` (atomic tmp-file write; corrupted files are moved to `.json.bak`, not deleted). `.drcode/` is gitignored.
 - `agent.py` — builds the pydantic-ai `Agent` with tools registered inline; `deps` is just the project root (`Path`). `serialize_messages`/`load_messages` round-trip transcripts; `extract_display` renders them for the chat UI.

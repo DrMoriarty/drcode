@@ -20,6 +20,7 @@ class TaskStatus(str, enum.Enum):
     QUEUED = "queued"
     ACTIVE = "active"
     COMPLETED = "completed"
+    AWAITING_CLARIFICATION = "clarification"
 
 
 class TaskKind(str, enum.Enum):
@@ -30,6 +31,13 @@ class TaskKind(str, enum.Enum):
 class VerificationStatus(str, enum.Enum):
     PASSED = "Проверено успешно"
     FAILED = "Проверено с ошибками"
+
+
+class Clarification(BaseModel):
+    """A question the agent asked the user and is waiting an answer for."""
+
+    question: str
+    options: list[str] = Field(default_factory=list)
 
 
 class Task(BaseModel):
@@ -44,6 +52,10 @@ class Task(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
     # User messages typed while the task is queued/not yet processed.
     pending_input: list[str] = Field(default_factory=list)
+    # Set while the agent is waiting for the user to answer a question.
+    clarification: Clarification | None = None
+    # Answered clarification tasks jump to the head of the queue.
+    queue_head: bool = False
 
     def touch(self) -> None:
         self.updated_at = _now()

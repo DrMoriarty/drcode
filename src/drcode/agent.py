@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
@@ -23,7 +24,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from . import tools
 from .config import Config
-from .models import TaskKind, VerificationStatus
+from .models import Clarification, TaskKind, TaskStatus, VerificationStatus
 from .task_manager import TaskManager
 
 SYSTEM_PROMPT = """\
@@ -31,54 +32,105 @@ You are drcode, an expert software engineering agent working directly in the use
 You can read, create and edit files, search the codebase and run shell commands.
 Work autonomously: explore the code, implement the requested change, run tests or
 builds when available, and report a concise summary of what you did.
-Prefer minimal, focused changes. Never commit to git unless explicitly asked.\
+Prefer minimal, focused changes. Never commit to git unless explicitly asked.
+If the request is ambiguous or missing a detail you cannot resolve from the code,
+call ask_clarifying_question instead of guessing. After calling it the task is
+paused awaiting the user's answer: end your turn immediately and do not call any
+more tools.\
 """
 
-DepsType = Path  # project root
+
+@dataclass
+class AgentDeps:
+    """Dependencies for the coding agent: project root, task manager, task id."""
+
+    root: Path
+    manager: TaskManager
+    task_id: str
 
 
-def build_agent(config: Config) -> Agent[DepsType, str]:
-    model = OpenAIChatModel(
-        config.model,
-        provider=OpenAIProvider(base_url=config.base_url, api_key=config.api_key),
+# Гейтвей api-copilot.x5.ru блокирует запросы с UA известных CLI/SDK
+# (curl, OpenAI/Python, pydantic-ai, ...) — политика против автоматизации.
+# Нейтральный UA проходит; ставим его на уровне клиента и в model_settings
+# (pydantic-ai перебивает client-заголовки per-request заголовком pydantic-ai/x.y).
+USER_AGENT = "drcode/0.1"
+EXTRA_HEADERS = {"User-Agent": USER_AGENT}
+
+
+def build_model(config: Config):
+    client = AsyncOpenAI(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        default_headers=EXTRA_HEADERS,
     )
-    agent = Agent(model, instructions=SYSTEM_PROMPT, deps_type=DepsType)
+    return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
+
+
+def build_agent(config: Config) -> Agent[AgentDeps, str]:
+    model = build_model(config)
+    agent = Agent(
+        model,
+        instructions=SYSTEM_PROMPT,
+        deps_type=AgentDeps,
+        model_settings={"extra_headers": EXTRA_HEADERS},
+    )
 
     @agent.tool
     def read_file(
-        ctx: RunContext[DepsType], path: str, offset: int = 1, limit: int = 2000
+        ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
         """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return tools.read_file(ctx.deps, path, offset, limit)
+        return tools.read_file(ctx.deps.root, path, offset, limit)
 
     @agent.tool
-    def write_file(ctx: RunContext[DepsType], path: str, content: str) -> str:
+    def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file with the given content."""
-        return tools.write_file(ctx.deps, path, content)
+        return tools.write_file(ctx.deps.root, path, content)
 
     @agent.tool
     def edit_file(
-        ctx: RunContext[DepsType], path: str, old_string: str, new_string: str
+        ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
         """Replace an exact unique substring in a file. old_string must match exactly once."""
-        return tools.edit_file(ctx.deps, path, old_string, new_string)
+        return tools.edit_file(ctx.deps.root, path, old_string, new_string)
 
     @agent.tool
-    def glob_files(ctx: RunContext[DepsType], pattern: str) -> list[str]:
+    def glob_files(ctx: RunContext[AgentDeps], pattern: str) -> list[str]:
         """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
-        return tools.glob_files(ctx.deps, pattern)
+        return tools.glob_files(ctx.deps.root, pattern)
 
     @agent.tool
     def grep_search(
-        ctx: RunContext[DepsType], pattern: str, include: str = ""
+        ctx: RunContext[AgentDeps], pattern: str, include: str = ""
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional filename regex filter."""
-        return tools.grep_search(ctx.deps, pattern, include)
+        return tools.grep_search(ctx.deps.root, pattern, include)
 
     @agent.tool
-    def run_bash(ctx: RunContext[DepsType], command: str) -> str:
+    def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
         """Run a shell command in the project root and return its output (2 min timeout)."""
-        return tools.run_bash(ctx.deps, command)
+        return tools.run_bash(ctx.deps.root, command)
+
+    @agent.tool
+    def ask_clarifying_question(
+        ctx: RunContext[AgentDeps], question: str, options: list[str] | None = None
+    ) -> str:
+        """Ask the user a clarifying question and pause the task until they answer.
+        Use when the request is ambiguous or a required detail is missing.
+        `options` is an optional list of suggested answers; pass it when a small
+        set of choices covers the reasonable answers, otherwise omit it."""
+        task = ctx.deps.manager.get(ctx.deps.task_id)
+        task.clarification = Clarification(
+            question=question.strip(),
+            options=[o.strip() for o in (options or []) if o.strip()],
+        )
+        task.status = TaskStatus.AWAITING_CLARIFICATION
+        task.touch()
+        ctx.deps.manager.storage.save(task)
+        return (
+            "Question sent to the user. The task is paused awaiting clarification; "
+            "end your turn now and do not call any more tools."
+        )
 
     return agent
 
@@ -113,11 +165,13 @@ class TesterDeps:
 
 
 def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
-    model = OpenAIChatModel(
-        config.model,
-        provider=OpenAIProvider(base_url=config.base_url, api_key=config.api_key),
+    model = build_model(config)
+    agent = Agent(
+        model,
+        instructions=TESTER_SYSTEM_PROMPT,
+        deps_type=TesterDeps,
+        model_settings={"extra_headers": EXTRA_HEADERS},
     )
-    agent = Agent(model, instructions=TESTER_SYSTEM_PROMPT, deps_type=TesterDeps)
 
     @agent.tool
     def read_file(
@@ -204,6 +258,7 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 __all__ = [
+    "AgentDeps",
     "ModelRequest",
     "ModelResponse",
     "TesterDeps",

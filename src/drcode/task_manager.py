@@ -35,8 +35,11 @@ class TaskManager:
 
     def queued(self) -> list[Task]:
         tasks = [t for t in self.all_tasks() if t.status is TaskStatus.QUEUED]
-        # Bug reports jump the queue: all bugs first (oldest first), then features.
-        tasks.sort(key=lambda t: (t.kind is not TaskKind.BUG, t.created_at))
+        # Answered clarifications jump the queue first, then bug reports
+        # (both oldest first), then features.
+        tasks.sort(
+            key=lambda t: (not t.queue_head, t.kind is not TaskKind.BUG, t.created_at)
+        )
         return tasks
 
     # -- mutations ------------------------------------------------------------
@@ -55,7 +58,8 @@ class TaskManager:
         return task
 
     def send(self, task_id: str, text: str) -> Task:
-        """Add user input to a task. A completed task re-enters the pipeline."""
+        """Add user input to a task. A completed task re-enters the pipeline;
+        an answered clarification goes to the head of the queue."""
         task = self.get(task_id)
         task.pending_input.append(text.strip())
         if task.status is TaskStatus.COMPLETED:
@@ -63,6 +67,18 @@ class TaskManager:
             task.touch()
             self.storage.save(task)
             self.promote_next()
+        elif task.status is TaskStatus.AWAITING_CLARIFICATION:
+            task.status = TaskStatus.QUEUED
+            task.queue_head = True
+            task.clarification = None
+            task.touch()
+            self.storage.save(task)
+            self.promote_next()
+        else:
+            # QUEUED/ACTIVE: just accumulate input (also when the model is not
+            # configured — the agent picks it up on the next activation).
+            task.touch()
+            self.storage.save(task)
         return task
 
     def mark_done(self, task_id: str) -> Task:
@@ -81,6 +97,7 @@ class TaskManager:
         for t in self.queued():
             if t.pending_input:
                 t.status = TaskStatus.ACTIVE
+                t.queue_head = False
                 t.touch()
                 self.storage.save(t)
                 return t

@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import enum
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _short_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+class TaskStatus(str, enum.Enum):
+    QUEUED = "queued"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+
+
+class TaskKind(str, enum.Enum):
+    BUG = "bug"
+    FEATURE = "feature"
+
+
+class VerificationStatus(str, enum.Enum):
+    PASSED = "Проверено успешно"
+    FAILED = "Проверено с ошибками"
+
+
+class Task(BaseModel):
+    id: str = Field(default_factory=_short_id)
+    title: str
+    kind: TaskKind = TaskKind.FEATURE
+    status: TaskStatus = TaskStatus.QUEUED
+    verification: VerificationStatus | None = None
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    # Serialized pydantic-ai ModelMessages (full transcript incl. tool calls).
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    # User messages typed while the task is queued/not yet processed.
+    pending_input: list[str] = Field(default_factory=list)
+
+    def touch(self) -> None:
+        self.updated_at = _now()
+
+    @property
+    def title_display(self) -> str:
+        return self.title if len(self.title) <= 40 else self.title[:39] + "…"

@@ -1,0 +1,27 @@
+[project]
+name = "drcode"
+version = "0.1.0"
+description = "Task-centric console AI coding agent (pydantic-ai + textual)"
+readme = "README.md"
+authors = [
+    { name = "DrMoriarty", email = "drmoriarty.0@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-ai>=2.56.0",
+    "pydantic-settings>=2.16.0",
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+drcode = "drcode:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright[nodejs]>=1.1.414",
+    "ruff>=0.17.1",
+]

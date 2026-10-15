@@ -231,14 +231,17 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Turn serialized ModelMessages into (role, text) pairs for the chat UI.
 
     Roles: "user", "reasoning" (model thinking), "assistant" (text),
-    "tool-call" (name + args as one line), rendered by the TUI in message
-    order.
+    "tool-call" (name(args) line; the TUI shows the name as the collapsed
+    header and the args in the expandable body), rendered by the TUI in
+    message order.
     """
     out: list[tuple[str, str]] = []
     reasoning: list[str] = []
     chunks: list[str] = []
     for msg in messages:
-        if msg.get("role") == "request":
+        # pydantic-ai 2.x serializes ModelRequest with "kind": "request"
+        # (older versions used "role"); support both.
+        if msg.get("kind") == "request" or msg.get("role") == "request":
             for part in msg.get("parts", []):
                 if part.get("part_kind") == "user-prompt":
                     content = part.get("content")

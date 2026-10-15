@@ -152,14 +152,23 @@ class ReasoningBlock(Static):
 class ToolCallBlock(Static):
     """Collapsible tool-call block; collapsed by default, click to toggle.
 
-    Header shows the call (name + truncated args) in gray; expanding reveals
-    the full call, also in gray.
+    Header shows only the tool name ("⚙ grep_search") in gray; expanding
+    reveals the arguments, also in gray.
     """
 
     def __init__(self, call: str) -> None:
         super().__init__(classes="tool-call collapsed")
-        self._call = call
+        self._header, self._args = self._split(call)
         self._redraw()
+
+    @staticmethod
+    def _split(call: str) -> tuple[str, str]:
+        """Split "name(args)" (possibly with a prefix like "tester: ") into
+        (header, args). Falls back to (call, "") if the shape is unexpected."""
+        open_idx = call.find("(")
+        if open_idx != -1 and call.endswith(")"):
+            return call[:open_idx].rstrip(), call[open_idx + 1 : -1]
+        return call, ""
 
     def on_click(self) -> None:
         self.toggle_class("collapsed")
@@ -167,11 +176,11 @@ class ToolCallBlock(Static):
 
     def _redraw(self) -> None:
         arrow = "▸" if self.has_class("collapsed") else "▾"
-        if self.has_class("collapsed"):
-            shown = self._call if len(self._call) <= 120 else self._call[:119] + "…"
-            self.update(f"{arrow} ⚙ {escape(shown)}")
+        header = f"{arrow} ⚙ {escape(self._header)}"
+        if self.has_class("collapsed") or not self._args:
+            self.update(header)
         else:
-            self.update(f"{arrow} ⚙ {escape(self._call)}")
+            self.update(f"{header}\n{escape(self._args)}")
 
 
 class DrCodeApp(App[None]):
@@ -793,6 +802,8 @@ class DrCodeApp(App[None]):
         return self.query_one("#nt-input", NewTaskInput)
 
     def action_new_task(self) -> None:
+        # Every entry into the new-task screen starts from a clean editor.
+        self.new_task_input.clear()
         self.chat_log.add_class("hidden")
         self.stream_label.add_class("hidden")
         self.chat_input.add_class("hidden")

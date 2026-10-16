@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,41 +99,50 @@ def build_agent(
         model_settings={"extra_headers": EXTRA_HEADERS},
     )
 
+    # All blocking tools run in a worker thread (or as asyncio subprocesses
+    # for run_bash): called inline they would stall the event loop, which
+    # also drives the Textual UI — long commands froze keyboard input.
     @agent.tool
-    def read_file(
+    async def read_file(
         ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
         """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return tools.read_file(ctx.deps.root, path, offset, limit)
+        return await asyncio.to_thread(
+            tools.read_file, ctx.deps.root, path, offset, limit
+        )
 
     @agent.tool
-    def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
+    async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file with the given content."""
-        return tools.write_file(ctx.deps.root, path, content)
+        return await asyncio.to_thread(tools.write_file, ctx.deps.root, path, content)
 
     @agent.tool
-    def edit_file(
+    async def edit_file(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
         """Replace an exact unique substring in a file. old_string must match exactly once."""
-        return tools.edit_file(ctx.deps.root, path, old_string, new_string)
+        return await asyncio.to_thread(
+            tools.edit_file, ctx.deps.root, path, old_string, new_string
+        )
 
     @agent.tool
-    def glob_files(ctx: RunContext[AgentDeps], pattern: str) -> list[str]:
+    async def glob_files(ctx: RunContext[AgentDeps], pattern: str) -> list[str]:
         """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
-        return tools.glob_files(ctx.deps.root, pattern)
+        return await asyncio.to_thread(tools.glob_files, ctx.deps.root, pattern)
 
     @agent.tool
-    def grep_search(
+    async def grep_search(
         ctx: RunContext[AgentDeps], pattern: str, include: str = ""
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional filename regex filter."""
-        return tools.grep_search(ctx.deps.root, pattern, include)
+        return await asyncio.to_thread(
+            tools.grep_search, ctx.deps.root, pattern, include
+        )
 
     @agent.tool
-    def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
+    async def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
         """Run a shell command in the project root and return its output (2 min timeout)."""
-        return tools.run_bash(ctx.deps.root, command)
+        return await tools.run_bash(ctx.deps.root, command)
 
     @agent.tool
     def ask_clarifying_question(
@@ -197,28 +207,32 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
     )
 
     @agent.tool
-    def read_file(
+    async def read_file(
         ctx: RunContext[TesterDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
         """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return tools.read_file(ctx.deps.root, path, offset, limit)
+        return await asyncio.to_thread(
+            tools.read_file, ctx.deps.root, path, offset, limit
+        )
 
     @agent.tool
-    def glob_files(ctx: RunContext[TesterDeps], pattern: str) -> list[str]:
+    async def glob_files(ctx: RunContext[TesterDeps], pattern: str) -> list[str]:
         """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
-        return tools.glob_files(ctx.deps.root, pattern)
+        return await asyncio.to_thread(tools.glob_files, ctx.deps.root, pattern)
 
     @agent.tool
-    def grep_search(
+    async def grep_search(
         ctx: RunContext[TesterDeps], pattern: str, include: str = ""
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional filename regex filter."""
-        return tools.grep_search(ctx.deps.root, pattern, include)
+        return await asyncio.to_thread(
+            tools.grep_search, ctx.deps.root, pattern, include
+        )
 
     @agent.tool
-    def run_bash(ctx: RunContext[TesterDeps], command: str) -> str:
+    async def run_bash(ctx: RunContext[TesterDeps], command: str) -> str:
         """Run a shell command in the project root and return its output (2 min timeout)."""
-        return tools.run_bash(ctx.deps.root, command)
+        return await tools.run_bash(ctx.deps.root, command)
 
     @agent.tool
     def create_bug_report(

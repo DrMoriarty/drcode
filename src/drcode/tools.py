@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
-import subprocess
 from pathlib import Path
 
 MAX_TOOL_OUTPUT = 10_000
@@ -85,16 +85,22 @@ def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
     return results
 
 
-def run_bash(root: Path, command: str) -> str:
-    proc = subprocess.run(
+async def run_bash(root: Path, command: str) -> str:
+    proc = await asyncio.create_subprocess_shell(
         command,
-        shell=True,
-        check=False,
         cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=BASH_TIMEOUT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    out = out.strip()[:MAX_TOOL_OUTPUT]
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=BASH_TIMEOUT
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return f"exit=-1\n(command timed out after {BASH_TIMEOUT}s)"
+    out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()[
+        :MAX_TOOL_OUTPUT
+    ]
     return f"exit={proc.returncode}\n{out or '(no output)'}"

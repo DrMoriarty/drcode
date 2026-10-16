@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import shutil
 import ssl
 import subprocess
@@ -24,6 +25,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
 )
+from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
 from rich.markup import escape
@@ -38,7 +40,6 @@ from textual.widget import Widget
 from textual.widgets import (
     Footer,
     Header,
-    Input,
     Label,
     ListItem,
     ListView,
@@ -106,6 +107,78 @@ class NewTaskInput(TextArea):
 
     def action_cancel_new_task(self) -> None:
         self._app().cancel_new_task()
+
+
+class ChatInput(TextArea):
+    """Multi-line chat editor that grows with the text.
+
+    Enter sends the message; Shift+Enter / Alt+Enter insert a newline.
+    Soft wrapping breaks long lines at the right edge, and the widget's
+    height follows the wrapped text (up to a cap) so the whole draft
+    stays visible while typing; beyond the cap it scrolls internally.
+    """
+
+    MAX_LINES: ClassVar = 10
+
+    BINDINGS: ClassVar = [
+        Binding("enter", "submit", "Send", priority=True),
+    ]
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(
+            soft_wrap=True,
+            show_line_numbers=False,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def _app(self) -> DrCodeApp:
+        app = self.app
+        assert isinstance(app, DrCodeApp)
+        return app
+
+    def action_submit(self) -> None:
+        self._app().submit_chat_input()
+
+    async def _on_key(self, event: events.Key) -> None:
+        # A "vertical" Enter variant inserts a newline; plain Enter is
+        # bound to submit above. Terminals without the kitty keyboard
+        # protocol report Shift+Enter as plain Enter — Alt+Enter is the
+        # portable fallback for a newline.
+        if event.key in ("shift+enter", "alt+enter"):
+            event.stop()
+            event.prevent_default()
+            if not self.read_only:
+                self.insert("\n")
+                self._update_height()
+            return
+        await super()._on_key(event)
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._update_height()
+
+    def on_resize(self) -> None:
+        self._update_height()
+
+    def _wrapped_line_count(self) -> int:
+        """Number of visual lines the draft occupies at the current width
+        (soft-wrapped)."""
+        # content_size excludes the 1+1 horizontal padding; before the first
+        # layout it may be 0 — fall back to the widget/screen width so the
+        # estimate stays sane.
+        width = (
+            self.content_size.width
+            or (self.size.width - 2)
+            or (self.screen.size.width - 2)
+            or 80
+        )
+        width = max(width, 1)
+        return sum(
+            max(1, math.ceil(cell_len(line) / width))
+            for line in (self.text.splitlines() or [""])
+        )
+
+    def _update_height(self) -> None:
+        self.styles.height = max(2, min(self._wrapped_line_count(), self.MAX_LINES))
 
 
 class UserBlock(Static):
@@ -346,6 +419,18 @@ class DrCodeApp(App[None]):
     # 1-column empty gutter on both sides: no text sticks to the window edge.
     #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }
+    # Multi-line chat editor: height is driven from Python (wrapped line
+    # count, capped); auto here is just the pre-measure fallback.
+    #chat-input {
+        height: auto;
+        min-height: 2;
+        padding: 0 1;
+        border: none;
+        background: $surface;
+    }
+    #chat-input:focus {
+        background: $surface-lighten-1;
+    }
     .reasoning { padding: 0 4; color: $text-muted; }
     .reasoning:hover { background: $panel; }
     .tool-call { padding: 0 4; color: $text-muted; }
@@ -408,6 +493,7 @@ class DrCodeApp(App[None]):
         ("ctrl+t", "cycle_task_kind", "Change type"),
         ("ctrl+p", "settings", "Settings"),
         ("ctrl+h", "toggle_hold", "Hold/Resume"),
+        ("ctrl+delete", "delete_task", "Delete held"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -493,7 +579,7 @@ class DrCodeApp(App[None]):
                     yield Static("", id="task-status-left")
                     yield Static("", id="task-status-right")
                 yield VerticalScroll(id="chat-log")
-                yield Input(placeholder="Type a message…", id="chat-input")
+                yield ChatInput(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):
                     yield Static(
                         "This is not a live chat with the agent — "
@@ -541,8 +627,8 @@ class DrCodeApp(App[None]):
         return self.query_one("#chat-log", VerticalScroll)
 
     @property
-    def chat_input(self) -> Input:
-        return self.query_one("#chat-input", Input)
+    def chat_input(self) -> ChatInput:
+        return self.query_one("#chat-input", ChatInput)
 
     @property
     def sidebar(self) -> ListView:
@@ -724,18 +810,18 @@ class DrCodeApp(App[None]):
         )
         hold = by_status.get(TaskStatus.HOLD, [])
 
-        # The third flag hides empty sections: NEEDS CLARIFICATION is only
-        # shown while there is something awaiting an answer.
-        sections: list[tuple[str, list[Task], bool]] = [
-            ("QUEUE", queue, True),
-            ("NEEDS CLARIFICATION", clarification, False),
-            ("ACTIVE", active, True),
-            ("TESTING", testing, True),
-            ("COMPLETED", completed, True),
-            ("ON HOLD", hold, True),
+        # Empty sections are not rendered at all: the sidebar shows only the
+        # stages the pipeline currently has tasks in.
+        sections: list[tuple[str, list[Task]]] = [
+            ("QUEUE", queue),
+            ("NEEDS CLARIFICATION", clarification),
+            ("ACTIVE", active),
+            ("TESTING", testing),
+            ("COMPLETED", completed),
+            ("ON HOLD", hold),
         ]
-        for name, tasks, show_empty in sections:
-            if not tasks and not show_empty:
+        for name, tasks in sections:
+            if not tasks:
                 continue
             sidebar.append(TaskItem(f"{name} ({len(tasks)})", header=True))
             for t in tasks:
@@ -1838,13 +1924,15 @@ class DrCodeApp(App[None]):
             self.refresh_task_status()
 
     def action_toggle_hold(self) -> None:
-        """Park the viewed queued task out of the backlog (hold) or return a
-        held task to the queue. Held tasks are never taken into work until
-        explicitly resumed; typed input keeps accumulating."""
+        """Park the viewed task out of the backlog (hold) or return a held
+        task to where it was. Works for queued tasks and for tasks awaiting
+        a clarifying answer (the question is preserved and shown again on
+        resume). Held tasks are never taken into work until explicitly
+        resumed; typed input keeps accumulating."""
         task = self.viewed
         if task is None:
             return
-        if task.status is TaskStatus.QUEUED:
+        if task.status in (TaskStatus.QUEUED, TaskStatus.AWAITING_CLARIFICATION):
             self.manager.set_hold(task.id, on=True)
         elif task.status is TaskStatus.HOLD:
             self.manager.set_hold(task.id, on=False)
@@ -1853,6 +1941,29 @@ class DrCodeApp(App[None]):
         self.refresh_sidebar()
         self.refresh_status()
         if self.viewed_id == task.id:
+            self.refresh_task_status()
+
+    def action_delete_task(self) -> None:
+        """Fully remove the viewed held task — from the sidebar and from disk
+        (.drcode/tasks/<id>.json). Only parked tasks can be deleted: nothing
+        is running for them, so no worker state is left behind. Resume from
+        hold is Ctrl+H; deletion is Ctrl+Delete."""
+        task = self.viewed
+        if task is None or task.status is not TaskStatus.HOLD:
+            return
+        self.manager.delete(task.id)
+        # The chat pane shows the deleted task: switch to another one (or
+        # an empty pane when the backlog is gone entirely).
+        self.viewed_id = None
+        self.chat_log.remove_children()
+        self._chat_has_content = False
+        self._pending_rendered = []
+        remaining = self.manager.all_tasks()
+        if remaining:
+            self.view_task(remaining[0].id)
+        else:
+            self.refresh_sidebar()
+            self.refresh_status()
             self.refresh_task_status()
 
     def action_focus_sidebar(self) -> None:
@@ -1875,16 +1986,15 @@ class DrCodeApp(App[None]):
             self.view_task(item.task_id)
             self.chat_input.focus()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id != "chat-input":
-            return
-        text = event.value.strip()
+    def submit_chat_input(self) -> None:
+        """Send the chat editor's content (Enter in the chat input)."""
+        text = self.chat_input.text.strip()
         if not text:
             return
         task = self.viewed
         if task is None:
             return
-        event.input.clear()
+        self.chat_input.clear()
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:

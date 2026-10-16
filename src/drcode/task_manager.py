@@ -137,16 +137,36 @@ class TaskManager:
         self.storage.delete(task_id)
 
     def set_hold(self, task_id: str, *, on: bool) -> Task:
-        """Park a not-yet-started (QUEUED) task out of the backlog (hold) or
-        return it to the queue. Held tasks keep their pending input and queue
-        stamp but are never promoted while held — queued() skips them, so
-        promote_next() can't pick them up. The caller is responsible for only
-        holding queued tasks."""
+        """Park a not-yet-started task out of the backlog (hold) or return it
+        to where it was. Held tasks keep their pending input, queue stamp and
+        the pending clarifying question, but are never promoted while held —
+        queued() skips them, so promote_next() can't pick them up.
+
+        Holdable statuses: QUEUED and AWAITING_CLARIFICATION (a question the
+        user is not ready to answer can be shelved without losing it). On
+        resume the task returns to AWAITING_CLARIFICATION if its question is
+        still unanswered, otherwise to the queue — and if the user answered
+        while the task was held, the answer counts as an answered
+        clarification (head of the queue), mirroring send()'s transition."""
         task = self.get(task_id)
-        if on and task.status is TaskStatus.QUEUED:
+        if on and task.status in (
+            TaskStatus.QUEUED,
+            TaskStatus.AWAITING_CLARIFICATION,
+        ):
             task.status = TaskStatus.HOLD
         elif not on and task.status is TaskStatus.HOLD:
-            task.status = TaskStatus.QUEUED
+            if task.clarification is not None:
+                if task.pending_input:
+                    # Answered while held: re-queue at the head, like an
+                    # ordinary answered clarification.
+                    task.status = TaskStatus.QUEUED
+                    task.queue_head = True
+                    task.clarification = None
+                else:
+                    # The question is still open: back to awaiting an answer.
+                    task.status = TaskStatus.AWAITING_CLARIFICATION
+            else:
+                task.status = TaskStatus.QUEUED
         task.touch()
         self.storage.save(task)
         return task

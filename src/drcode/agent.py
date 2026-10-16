@@ -29,8 +29,15 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from . import tools
 from .config import Config
-from .models import Clarification, TaskKind, TaskStatus, VerificationStatus
+from .models import (
+    Clarification,
+    TaskEvent,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+)
 from .task_manager import TaskManager
+from .tools import PathViolation
 from .version import APP_VERSION
 
 FEATURE_SYSTEM_PROMPT = """\
@@ -110,6 +117,40 @@ async def _run_tool(fn: Callable[..., Any], *args: Any) -> Any:
         raise ModelRetry(str(e) or type(e).__name__) from e
 
 
+def _log_violation(deps: AgentDeps | TesterDeps, tool: str, error: str) -> None:
+    """Persist a permission violation into the task's service-event log.
+
+    Like all TaskEvents, it is shown in the chat under the "service events"
+    separator but never reaches the model context.
+    """
+    task = deps.manager.get(deps.task_id)
+    task.events.append(TaskEvent(kind="permission", text=f"{tool}: {error}"))
+    task.touch()
+    deps.manager.storage.save(task)
+
+
+async def _run_tool_logged(
+    deps: AgentDeps | TesterDeps, tool: str, fn: Callable[..., Any], *args: Any
+) -> Any:
+    """Run a tool and turn a PathViolation into a retry prompt for the model,
+    logging the refusal into the task history first."""
+    try:
+        return await _run_tool(fn, *args)
+    except PathViolation as e:
+        _log_violation(deps, tool, str(e))
+        raise ModelRetry(str(e)) from e
+
+
+async def _run_bash_logged(
+    deps: AgentDeps | TesterDeps, root: Path, command: str
+) -> str:
+    try:
+        return await tools.run_bash(root, command)
+    except PathViolation as e:
+        _log_violation(deps, "run_bash", str(e))
+        raise ModelRetry(str(e)) from e
+
+
 def build_model(config: Config):
     client = AsyncOpenAI(
         base_url=config.base_url,
@@ -163,21 +204,36 @@ def build_agent(
     async def read_file(
         ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
-        """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return await _run_tool(tools.read_file, ctx.deps.root, path, offset, limit)
+        """Read a text file from anywhere on the filesystem (relative paths resolve
+        against the project root). Lines are numbered, starting from `offset`
+        (1-based), up to `limit` lines."""
+        return await _run_tool_logged(
+            ctx.deps, "read_file", tools.read_file, ctx.deps.root, path, offset, limit
+        )
 
     @agent.tool
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
-        """Create or overwrite a file with the given content."""
-        return await _run_tool(tools.write_file, ctx.deps.root, path, content)
+        """Create or overwrite a file. Only the project root (with all subdirectories)
+        and /tmp (with all subdirectories) are writable; use /tmp to test hypotheses."""
+        return await _run_tool_logged(
+            ctx.deps, "write_file", tools.write_file, ctx.deps.root, path, content
+        )
 
     @agent.tool
     async def edit_file(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
-        """Replace an exact unique substring in a file. old_string must match exactly once."""
-        return await _run_tool(
-            tools.edit_file, ctx.deps.root, path, old_string, new_string
+        """Replace an exact unique substring in a file. old_string must match exactly once.
+        Only the project root (with all subdirectories) and /tmp (with all subdirectories)
+        are writable; use /tmp to test hypotheses."""
+        return await _run_tool_logged(
+            ctx.deps,
+            "edit_file",
+            tools.edit_file,
+            ctx.deps.root,
+            path,
+            old_string,
+            new_string,
         )
 
     @agent.tool
@@ -194,8 +250,9 @@ def build_agent(
 
     @agent.tool
     async def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
-        """Run a shell command in the project root and return its output (2 min timeout)."""
-        return await tools.run_bash(ctx.deps.root, command)
+        """Run a shell command in the project root and return its output (2 min timeout).
+        rm/mv/cp are only allowed with paths inside the project root or /tmp."""
+        return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
 
     @agent.tool
     def ask_clarifying_question(
@@ -264,8 +321,12 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
     async def read_file(
         ctx: RunContext[TesterDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
-        """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return await _run_tool(tools.read_file, ctx.deps.root, path, offset, limit)
+        """Read a text file from anywhere on the filesystem (relative paths resolve
+        against the project root). Lines are numbered, starting from `offset`
+        (1-based), up to `limit` lines."""
+        return await _run_tool_logged(
+            ctx.deps, "read_file", tools.read_file, ctx.deps.root, path, offset, limit
+        )
 
     @agent.tool
     async def glob_files(ctx: RunContext[TesterDeps], pattern: str) -> list[str]:
@@ -281,8 +342,9 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
 
     @agent.tool
     async def run_bash(ctx: RunContext[TesterDeps], command: str) -> str:
-        """Run a shell command in the project root and return its output (2 min timeout)."""
-        return await tools.run_bash(ctx.deps.root, command)
+        """Run a shell command in the project root and return its output (2 min timeout).
+        rm/mv/cp are only allowed with paths inside the project root or /tmp."""
+        return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
 
     @agent.tool
     def create_bug_report(

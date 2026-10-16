@@ -14,11 +14,9 @@ from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
-    ModelResponse,
     PartDeltaEvent,
     TextPartDelta,
     ThinkingPartDelta,
-    ToolCallPart,
 )
 from rich.console import RenderableType
 from rich.markdown import Markdown
@@ -48,7 +46,7 @@ from ..agent import (
     build_agent,
     build_tester_agent,
     extract_display,
-    load_messages,
+    resumable_history,
     serialize_messages,
 )
 from ..config import Config
@@ -231,13 +229,17 @@ class DrCodeApp(App[None]):
         width: 80%; height: 10;
         border: solid $primary;
     }
+    # Labels must stay width: auto: a full-width (1fr) sibling disables
+    # horizontal centering for the whole #new-task container, leaving the
+    # input glued to the left edge.
     #nt-kind-label {
+        width: auto;
         margin-top: 1;
         text-style: bold;
     }
     #nt-kind-label.kind-feature { color: $success; }
     #nt-kind-label.kind-bug { color: $error; }
-    #nt-hint { color: $text-disabled; }
+    #nt-hint { width: auto; color: $text-disabled; }
     """
     BINDINGS: ClassVar = [
         ("ctrl+n", "new_task", "New task"),
@@ -277,6 +279,9 @@ class DrCodeApp(App[None]):
         # surfaced as a red "error ›" line and killed the first streamed run
         # after a startup resume).
         self._new_task_mode = False
+        # Snapshot of the task state the sidebar was last rendered from; the
+        # poller compares against it to redraw only on actual change.
+        self._sidebar_snapshot: tuple = ()
 
     # -- layout -------------------------------------------------------------
 
@@ -314,6 +319,10 @@ class DrCodeApp(App[None]):
         self.refresh_status()
         self.refresh_connection()
         self.set_interval(30, self.refresh_connection)
+        # The sidebar must follow task-status changes on its own: statuses
+        # also mutate mid-run (agent tools, promote_next in the worker
+        # finally-blocks) where no one calls refresh_sidebar().
+        self.set_interval(1.0, self._poll_sidebar)
         # Resume after restart. TESTING tasks (the app died during testing)
         # are re-tested FIRST, before any queued task goes into development;
         # run_tester promotes the queue when it finishes. Otherwise the
@@ -404,6 +413,27 @@ class DrCodeApp(App[None]):
 
     # -- sidebar ---------------------------------------------------------------
 
+    def _sidebar_fingerprint(self) -> tuple:
+        """Lightweight snapshot of everything the sidebar renders: status,
+        verification label, title and the viewed-marker per task."""
+        return tuple(
+            (
+                t.id,
+                t.status.value,
+                t.verification,
+                t.title_display,
+                t.id == self.viewed_id,
+            )
+            for t in self.manager.all_tasks()
+        )
+
+    def _poll_sidebar(self) -> None:
+        """Redraw the sidebar only when the underlying task state changed
+        since the last render (status transitions, new bug reports from the
+        tester, promote_next() activations, …)."""
+        if self._sidebar_fingerprint() != self._sidebar_snapshot:
+            self.refresh_sidebar()
+
     def refresh_sidebar(self) -> None:
         sidebar = self.sidebar
         sidebar.clear()
@@ -460,6 +490,7 @@ class DrCodeApp(App[None]):
                     )
                 )
         sidebar.refresh()
+        self._sidebar_snapshot = self._sidebar_fingerprint()
 
     # -- model connection status ---------------------------------------------
 
@@ -541,19 +572,37 @@ class DrCodeApp(App[None]):
             self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
+        # Opening a task always lands on the latest entry (previously this
+        # happened implicitly because every mount scrolled to the end).
+        self.chat_log.scroll_end(animate=False)
         self.refresh_sidebar()
         self.refresh_status()
+
+    def _chat_at_bottom(self) -> bool:
+        """True when the last line of the chat log is in the viewport.
+
+        Tolerance of 1 line absorbs rounding of fractional scroll offsets.
+        """
+        log = self.chat_log
+        return log.scroll_offset.y >= log.max_scroll_y - 1
 
     def _write_chat(
         self, content: RenderableType | Widget, *, expand: bool = False
     ) -> None:
-        """Mount one block to the chat log."""
+        """Mount one block to the chat log.
+
+        Scrolls to the end only when the user is already looking at the
+        bottom: a scrolled-up reader must not be yanked down by new tool
+        calls / reasoning blocks arriving while the agent runs.
+        """
+        follow = self._chat_at_bottom()
         if isinstance(content, Widget):
             content.add_class("chat-block")
         else:
             content = Static(content, expand=expand, classes="chat-block")
         self.chat_log.mount(content)
-        self.chat_log.scroll_end(animate=False)
+        if follow:
+            self.chat_log.scroll_end(animate=False)
         self._chat_has_content = True
 
     def _write_history_line(self, role: str, text: str) -> None:
@@ -607,11 +656,10 @@ class DrCodeApp(App[None]):
             bar.update("")
             return
         created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
-        kind = (
-            "[bold red]bug[/]"
-            if task.kind is TaskKind.BUG
-            else "[bold green]feature[/]"
-        )
+        kind = {
+            TaskKind.BUG: "[bold red]bug[/]",
+            TaskKind.DOCUMENTATION: "[bold yellow]documentation[/]",
+        }.get(task.kind, "[bold green]feature[/]")
         status_colors = {
             TaskStatus.QUEUED: "yellow",
             TaskStatus.ACTIVE: "cyan",
@@ -634,7 +682,9 @@ class DrCodeApp(App[None]):
 
     # -- agent run -----------------------------------------------------------------
 
-    def _persist_task_messages(self, task: Task, run: AgentRun[AgentDeps, str]) -> None:
+    def _persist_task_messages(
+        self, task: Task, run: AgentRun[AgentDeps, str] | None
+    ) -> None:
         """Snapshot the transcript produced so far into the task.
 
         One agent turn can run for minutes (many model requests and tool
@@ -645,19 +695,21 @@ class DrCodeApp(App[None]):
         lost everything it had done. Persisting after every completed node
         keeps both the on-disk history and `view_task` current.
 
-        A snapshot is skipped while the transcript ends with unanswered tool
-        calls: resuming from such a state would send an invalid history
-        (tool_calls without results) to the model API.
+        The snapshot may end with an incomplete exchange (tool calls
+        without results), which the model API would reject on resume —
+        `resumable_history()` trims that tail when the transcript is next
+        loaded as history.
+
+        `run` is None when the failure happened before the run context was
+        entered (e.g. `agent.iter()` or `resumable_history()` raised); there
+        is nothing new to persist then — the pending input is re-queued by
+        the caller and retried on the next activation.
         """
+        if run is None:
+            return
         try:
             messages = run.all_messages()
         except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
-            return
-        if (
-            messages
-            and isinstance(messages[-1], ModelResponse)
-            and any(isinstance(p, ToolCallPart) for p in messages[-1].parts)
-        ):
             return
         task.messages = serialize_messages(messages)
         self.manager.storage.save(task)
@@ -679,10 +731,14 @@ class DrCodeApp(App[None]):
                 return
             self.agent_running = True
             self.refresh_status()
-            agent = build_agent(self.config)
+            agent = build_agent(self.config, kind=task.kind)
+            # Bound only once `async with agent.iter(...)` is entered; the
+            # except handlers below must not touch a run that never started.
+            run: AgentRun[AgentDeps, str] | None = None
             while task.pending_input and task.status is TaskStatus.ACTIVE:
+                run = None
                 text = task.pending_input.pop(0)
-                history = load_messages(task.messages)
+                history = resumable_history(task.messages)
                 buffer: list[str] = []
                 if self.viewed_id == task_id:
                     if text in self._pending_rendered:
@@ -717,9 +773,24 @@ class DrCodeApp(App[None]):
                                                     reasoning_block = ReasoningBlock()
                                                     reasoning_block.begin()
                                                     self._write_chat(reasoning_block)
-                                                reasoning_block.append(
-                                                    delta.content_delta
-                                                )
+                                                    reasoning_block.append(
+                                                        delta.content_delta
+                                                    )
+                                                else:
+                                                    # Streaming grows the block
+                                                    # without a new mount: keep
+                                                    # following only if the tail
+                                                    # was visible before the
+                                                    # delta arrived.
+                                                    follow = self._chat_at_bottom()
+                                                    reasoning_block.append(
+                                                        delta.content_delta
+                                                    )
+                                                    if follow:
+                                                        self.chat_log.call_after_refresh(
+                                                            self.chat_log.scroll_end,
+                                                            animate=False,
+                                                        )
                                         elif isinstance(delta, TextPartDelta):
                                             buffer.append(delta.content_delta)
                                             if (
@@ -987,8 +1058,16 @@ class DrCodeApp(App[None]):
         self.manager.mark_done(task.id)
         self.refresh_sidebar()
         self.view_task(task.id)
-        # Completed: run the tester, it promotes the next queued task when done.
-        self.run_tester(task.id)
+        if task.status is TaskStatus.TESTING:
+            # Completed: run the tester, it promotes the next queued task
+            # when done. Documentation tasks skip the tester (they are
+            # already completed), so promote the queue here.
+            self.run_tester(task.id)
+        else:
+            promoted = self.manager.promote_next()
+            if promoted:
+                self.run_agent(promoted.id)
+            self.refresh_status()
 
     def action_abort_run(self) -> None:
         if self.agent_running or self.tester_running:
@@ -1049,6 +1128,12 @@ class DrCodeApp(App[None]):
             return
         if not 0 <= index < len(task.clarification.options):
             return
+        self._submit_user_text(task, task.clarification.options[index])
+
+
+def run_app(project_root: Path) -> None:
+    DrCodeApp(project_root).run()
+turn
         self._submit_user_text(task, task.clarification.options[index])
 
 

@@ -90,9 +90,16 @@ class TaskManager:
         promotes it to COMPLETED (via set_verification). Promotion of the next
         task is up to the caller (the app runs the tester first, then
         promotes). If the app dies while TESTING, the task is re-tested on
-        the next startup before any queued task starts."""
+        the next startup before any queued task starts.
+
+        Documentation tasks skip the tester entirely: they are completed
+        right away."""
         task = self.get(task_id)
-        task.status = TaskStatus.TESTING
+        task.status = (
+            TaskStatus.COMPLETED
+            if task.kind is TaskKind.DOCUMENTATION
+            else TaskStatus.TESTING
+        )
         task.touch()
         self.storage.save(task)
         return task

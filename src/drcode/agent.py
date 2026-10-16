@@ -39,6 +39,20 @@ paused awaiting the user's answer: end your turn immediately and do not call any
 more tools.\
 """
 
+DOCUMENTATION_SYSTEM_PROMPT = """\
+You are drcode, a documentation assistant working directly in the user's repository.
+Your task is to answer the user's questions by studying the source code and the
+project's documentation, or to update the documentation in accordance with the
+user's assignment. All tools are available to you: read and search the codebase,
+create and edit files, and run shell commands. Explore the code thoroughly before
+answering or editing so your answer and changes reflect the actual implementation.
+Prefer minimal, focused changes. Never commit to git unless explicitly asked.
+If the request is ambiguous or missing a detail you cannot resolve from the code,
+call ask_clarifying_question instead of guessing. After calling it the task is
+paused awaiting the user's answer: end your turn immediately and do not call any
+more tools.\
+"""
+
 
 @dataclass
 class AgentDeps:
@@ -66,11 +80,17 @@ def build_model(config: Config):
     return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
 
 
-def build_agent(config: Config) -> Agent[AgentDeps, str]:
+def build_agent(config: Config, kind: TaskKind = TaskKind.FEATURE) -> Agent[AgentDeps, str]:
+    """Build the coding agent. Documentation tasks get a dedicated system
+    prompt (answer questions / update docs) but the same tool set."""
     model = build_model(config)
     agent = Agent(
         model,
-        instructions=SYSTEM_PROMPT,
+        instructions=(
+            DOCUMENTATION_SYSTEM_PROMPT
+            if kind is TaskKind.DOCUMENTATION
+            else SYSTEM_PROMPT
+        ),
         deps_type=AgentDeps,
         model_settings={"extra_headers": EXTRA_HEADERS},
     )
@@ -229,6 +249,28 @@ def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
     return ModelMessagesTypeAdapter.validate_python(data)
 
 
+def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
+    """Load persisted messages for resuming an interrupted/previous run.
+
+    A snapshot taken mid-turn may end with an incomplete exchange: tool
+    calls whose results never arrived, or tool results without the
+    follow-up model response. Model APIs reject such a tail, so truncate
+    to the last safe boundary — a user prompt or a completed (tool-call-
+    free) model response.
+    """
+    messages = list(load_messages(data))
+    cut = 0
+    for i, msg in enumerate(messages):
+        if isinstance(msg, ModelRequest):
+            if any(isinstance(p, UserPromptPart) for p in msg.parts):
+                cut = i + 1
+        elif isinstance(msg, ModelResponse) and not any(
+            isinstance(p, ToolCallPart) for p in msg.parts
+        ):
+            cut = i + 1
+    return messages[:cut]
+
+
 def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Turn serialized ModelMessages into (role, text) pairs for the chat UI.
 
@@ -291,6 +333,7 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 __all__ = [
     "AgentDeps",
+    "DOCUMENTATION_SYSTEM_PROMPT",
     "ModelRequest",
     "ModelResponse",
     "TesterDeps",
@@ -302,5 +345,6 @@ __all__ = [
     "build_tester_agent",
     "extract_display",
     "load_messages",
+    "resumable_history",
     "serialize_messages",
 ]

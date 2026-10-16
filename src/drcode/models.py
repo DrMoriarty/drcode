@@ -30,6 +30,9 @@ class TaskStatus(str, enum.Enum):
 class TaskKind(str, enum.Enum):
     BUG = "bug"
     FEATURE = "feature"
+    # Documentation: agent studies code/docs to answer questions or update
+    # docs; never goes through the tester — mark_done() completes it.
+    DOCUMENTATION = "documentation"
 
 
 class VerificationStatus(str, enum.Enum):

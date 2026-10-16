@@ -266,6 +266,12 @@ class DrCodeApp(App[None]):
         align: center middle;
     }
     #new-task.hidden { display: none; }
+    #nt-note {
+        width: 80%;
+        color: $text-disabled;
+        text-align: center;
+        margin-bottom: 1;
+    }
     #nt-input {
         width: 80%; height: 10;
         border: solid $primary;
@@ -369,6 +375,11 @@ class DrCodeApp(App[None]):
                 yield VerticalScroll(id="chat-log")
                 yield Input(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):
+                    yield Static(
+                        "This is not a live chat with the agent — "
+                        "you are composing a task to be executed later.",
+                        id="nt-note",
+                    )
                     yield NewTaskInput(placeholder="Describe the task…", id="nt-input")
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
@@ -737,6 +748,10 @@ class DrCodeApp(App[None]):
         self.refresh_status()
 
     def view_task(self, task_id: str) -> None:
+        # Opening a task cancels a pending new-task creation: the click on a
+        # sidebar item is an explicit "leave the form" from the user.
+        if self._new_task_mode:
+            self._leave_new_task_mode()
         self.viewed_id = task_id
         task = self.manager.get(task_id)
         self.chat_log.remove_children()

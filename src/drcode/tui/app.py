@@ -694,38 +694,49 @@ class DrCodeApp(App[None]):
     def refresh_sidebar(self) -> None:
         sidebar = self.sidebar
         sidebar.clear()
-        sections: list[tuple[str, list[Task]]] = [
-            (
-                "ACTIVE",
-                [t for t in self.manager.all_tasks() if t.status is TaskStatus.ACTIVE],
-            ),
-            (
-                "NEEDS CLARIFICATION",
-                [
-                    t
-                    for t in self.manager.all_tasks()
-                    if t.status is TaskStatus.AWAITING_CLARIFICATION
-                ],
-            ),
-            ("QUEUE", self.manager.queued()),
-            (
-                "ON HOLD",
-                [t for t in self.manager.all_tasks() if t.status is TaskStatus.HOLD],
-            ),
-            (
-                "TESTING",
-                [t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING],
-            ),
-            (
-                "COMPLETED",
-                [
-                    t
-                    for t in self.manager.all_tasks()
-                    if t.status is TaskStatus.COMPLETED
-                ],
-            ),
+        # Group tasks by status; each group keeps the created_at order of
+        # all_tasks() unless sorted explicitly below.
+        by_status: dict[TaskStatus, list[Task]] = {}
+        for t in self.manager.all_tasks():
+            by_status.setdefault(t.status, []).append(t)
+
+        # Sidebar mirrors the pipeline a task flows through, top to bottom:
+        # queue → clarifications → active → testing → completed.
+        queue = list(reversed(self.manager.queued()))
+        clarification = sorted(
+            by_status.get(TaskStatus.AWAITING_CLARIFICATION, []),
+            key=lambda t: t.updated_at,
+            reverse=True,
+        )
+        active = by_status.get(TaskStatus.ACTIVE, [])
+        testing = by_status.get(TaskStatus.TESTING, [])
+        # Normally one task is being tested; if several are stuck in
+        # TESTING, the one the tester is working on goes to the bottom of
+        # the section (closest to the pipeline's exit into COMPLETED).
+        testing_active_id = self._tester_task_id
+        testing = [t for t in testing if t.id != testing_active_id] + [
+            t for t in testing if t.id == testing_active_id
         ]
-        for name, tasks in sections:
+        completed = sorted(
+            by_status.get(TaskStatus.COMPLETED, []),
+            key=lambda t: t.updated_at,
+            reverse=True,
+        )
+        hold = by_status.get(TaskStatus.HOLD, [])
+
+        # The third flag hides empty sections: NEEDS CLARIFICATION is only
+        # shown while there is something awaiting an answer.
+        sections: list[tuple[str, list[Task], bool]] = [
+            ("QUEUE", queue, True),
+            ("NEEDS CLARIFICATION", clarification, False),
+            ("ACTIVE", active, True),
+            ("TESTING", testing, True),
+            ("COMPLETED", completed, True),
+            ("ON HOLD", hold, True),
+        ]
+        for name, tasks, show_empty in sections:
+            if not tasks and not show_empty:
+                continue
             sidebar.append(TaskItem(f"{name} ({len(tasks)})", header=True))
             for t in tasks:
                 marker = {

@@ -60,7 +60,9 @@ class TaskManager:
     def send(self, task_id: str, text: str) -> Task:
         """Add user input to a task. A completed (or being-tested) task
         re-enters the pipeline; an answered clarification goes to the head
-        of the queue."""
+        of the queue. Promotion (activation) is up to the caller: the app
+        advances the pipeline through _advance(), which never starts new
+        development while any testing is incomplete."""
         task = self.get(task_id)
         task.pending_input.append(text.strip())
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
@@ -70,14 +72,12 @@ class TaskManager:
             task.verification = None
             task.touch()
             self.storage.save(task)
-            self.promote_next()
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
             task.status = TaskStatus.QUEUED
             task.queue_head = True
             task.clarification = None
             task.touch()
             self.storage.save(task)
-            self.promote_next()
         else:
             # QUEUED/ACTIVE: just accumulate input (also when the model is not
             # configured — the agent picks it up on the next activation).

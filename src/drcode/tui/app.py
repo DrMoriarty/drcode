@@ -55,7 +55,14 @@ from ..agent import (
     strip_retried_prompt,
 )
 from ..config import Config
-from ..models import Clarification, Task, TaskKind, TaskStatus, VerificationStatus
+from ..models import (
+    Clarification,
+    Task,
+    TaskEvent,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+)
 from ..task_manager import TaskManager
 
 
@@ -303,10 +310,12 @@ class DrCodeApp(App[None]):
         self._chat_has_content = False
         # Auto-hide timer for the "copied" toast.
         self._copy_toast_timer: Timer | None = None
-        # Tasks whose tester run already failed this session (e.g. network
-        # down). They stay TESTING but are not retried in-session — the next
-        # startup picks them up again. Keeps _next_testing() from looping.
-        self._tester_failed: set[str] = set()
+        # Per-task tester failure tracking: consecutive failure count and
+        # the earliest monotonic time the task may be retried. A failed
+        # tester run is retried with backoff, not dropped: tasks in TESTING
+        # block the whole pipeline, so they must eventually get their round.
+        self._tester_fail_count: dict[str, int] = {}
+        self._tester_retry_at: dict[str, float] = {}
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
@@ -385,18 +394,11 @@ class DrCodeApp(App[None]):
         # finally-blocks) where no one calls refresh_sidebar().
         self.set_interval(1.0, self._poll_sidebar)
         self.set_interval(1.0, self._poll_activity)
-        # Resume after restart. TESTING tasks (the app died during testing)
-        # are re-tested FIRST, before any queued task goes into development;
-        # run_tester promotes the queue when it finishes. Otherwise the
-        # startup demotion (active -> queued) leaves pending_input stranded
-        # unless the queue is promoted here.
-        testing = self._next_testing()
-        if testing is not None:
-            self.run_tester(testing.id)
-            return
-        promoted = self.manager.promote_next()
-        if promoted:
-            self.run_agent(promoted.id)
+        # Resume after restart. _advance() re-tests TESTING tasks (the app
+        # died during testing) FIRST — the startup demotion (active ->
+        # queued) leaves pending_input stranded unless the queue is
+        # promoted here.
+        self._advance()
 
     # -- widgets helpers ------------------------------------------------------
 
@@ -666,17 +668,70 @@ class DrCodeApp(App[None]):
 
     # -- chat pane ---------------------------------------------------------------
 
+    def _log_event(self, task: Task, text: str, *, kind: str = "system") -> None:
+        """Persist a service event into the task's event log.
+
+        These lines are shown in the chat but must never reach the model:
+        they live in `task.events`, outside the transcripts that
+        resumable_history() reads, so a resumed agent never sees them.
+        """
+        task.events.append(TaskEvent(kind=kind, text=text))
+        task.touch()
+        self.manager.storage.save(task)
+
+    @staticmethod
+    def _format_event(event: TaskEvent) -> str:
+        ts = event.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        return f"[dim]{ts}[/] {escape(event.text)}"
+
+    def _show_event(self, task: Task, text: str, *, kind: str = "system") -> None:
+        """Persist an event and, if the task is open, render it live."""
+        self._log_event(task, text, kind=kind)
+        if self.viewed_id == task.id:
+            self._write_history_line("event", self._format_event(task.events[-1]))
+
     def _next_testing(self) -> Task | None:
-        """Oldest task stuck in TESTING (crash/abort mid-test) that has not
-        already failed testing this session."""
+        """Oldest task in TESTING (crash/abort mid-test) whose retry backoff
+        has expired. Tasks whose tester run failed recently are skipped
+        until their scheduled retry time."""
+        now = time.monotonic()
         return next(
             (
                 t
                 for t in self.manager.all_tasks()
-                if t.status is TaskStatus.TESTING and t.id not in self._tester_failed
+                if t.status is TaskStatus.TESTING
+                and self._tester_retry_at.get(t.id, 0.0) <= now
             ),
             None,
         )
+
+    def _advance(self) -> None:
+        """The single pipeline gate: testing always has absolute priority.
+
+        Every path that used to promote the queue goes through here, so a
+        new development run can never start while any task is awaiting
+        verification. While a tester run is in flight this is a no-op —
+        the tester's own completion path advances the pipeline.
+        """
+        if self.tester_running:
+            return
+        testing = self._next_testing()
+        if testing is not None:
+            # Set synchronously: two _advance() calls within one event-loop
+            # tick must not start two tester workers (the exclusive group
+            # would cancel the first before it does anything).
+            self.tester_running = True
+            self.run_tester(testing.id)
+            return
+        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+            # Every TESTING task is within its retry backoff window: the
+            # rule "no new development while any testing is incomplete"
+            # holds even then — the retry timer will call _advance() again.
+            return
+        promoted = self.manager.promote_next(exclude=self._agent_failed)
+        if promoted:
+            self.run_agent(promoted.id)
+        self.refresh_status()
 
     def view_task(self, task_id: str) -> None:
         self.viewed_id = task_id
@@ -700,6 +755,11 @@ class DrCodeApp(App[None]):
                 if role == "tool-call":
                     text = f"tester: {text}"
                 self._write_history_line(role, text)
+        # Service events (failures, skips) — human-only, with timestamps.
+        if task.events:
+            self._write_history_line("events-sep", "")
+            for event in task.events:
+                self._write_history_line("event", self._format_event(event))
         for pending in task.pending_input:
             self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
@@ -758,6 +818,10 @@ class DrCodeApp(App[None]):
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
             self._write_chat(f"[bold magenta]──── {label} ────[/]")
+        elif role == "events-sep":
+            self._write_chat("[bold red]──── service events ────[/]")
+        elif role == "event":
+            self._write_chat(f"[bold red]event ›[/] {text}")
         elif role == "system":
             self._write_chat(f"[bold red]error ›[/] {text}")
 
@@ -774,13 +838,16 @@ class DrCodeApp(App[None]):
     def refresh_status(self) -> None:
         active = self.manager.active
         queue_len = len(self.manager.queued())
+        testing_len = len(
+            [t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING]
+        )
         state = "running" if self.agent_running else "idle"
         tester = "running" if self.tester_running else "idle"
         who = f"#{active.id} {active.title_display}" if active else "none"
         model = self.config.model or "(model not configured)"
         self.query_one("#statusbar", Static).update(
-            f" active: {who}   queue: {queue_len}   agent: {state}   "
-            f"tester: {tester}   model: {model} "
+            f" active: {who}   queue: {queue_len}   testing: {testing_len}   "
+            f"agent: {state}   tester: {tester}   model: {model} "
         )
         self.refresh_task_status()
 
@@ -923,15 +990,19 @@ class DrCodeApp(App[None]):
         self._agent_generation += 1
         generation = self._agent_generation
         task = self.manager.get(task_id)
+        # Bound only once `async with agent.iter(...)` is entered; the
+        # except handlers below must not touch a run that never started.
+        # Initialized before the try: build_agent() itself may raise.
+        run: AgentRun[AgentDeps, str] | None = None
+        cancelled = False
         try:
             if not self.config.is_ready:
-                if self.viewed_id == task_id:
-                    self._write_history_line(
-                        "system",
-                        "Model is not configured. Set DRCODE_MODEL, DRCODE_BASE_URL "
-                        "and DRCODE_API_KEY (env vars or .env); the message is kept "
-                        "and will be sent once the model is available.",
-                    )
+                self._show_event(
+                    task,
+                    "Model is not configured. Set DRCODE_MODEL, DRCODE_BASE_URL "
+                    "and DRCODE_API_KEY (env vars or .env); the message is kept "
+                    "and will be sent once the model is available.",
+                )
                 return
             self.agent_running = True
             self._agent_failed.discard(task_id)
@@ -939,9 +1010,6 @@ class DrCodeApp(App[None]):
             self._touch_activity()
             self.refresh_status()
             agent = build_agent(self.config, kind=task.kind)
-            # Bound only once `async with agent.iter(...)` is entered; the
-            # except handlers below must not touch a run that never started.
-            run: AgentRun[AgentDeps, str] | None = None
             while task.pending_input and task.status is TaskStatus.ACTIVE:
                 run = None
                 text = task.pending_input.pop(0)
@@ -1058,6 +1126,7 @@ class DrCodeApp(App[None]):
                 except asyncio.CancelledError:
                     # Interrupted (abort or a new comment): keep the message so
                     # the agent retries it on the next activation.
+                    cancelled = True
                     task.pending_input.insert(0, text)
                     # Persist whatever the interrupted turn managed to do,
                     # otherwise its whole work survives only in the widgets
@@ -1069,11 +1138,10 @@ class DrCodeApp(App[None]):
                     self._drop_stream_preview(generation)
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
+                    # Persist the failure even for a superseded run: it
+                    # happened, and the human must be able to see it.
+                    self._show_event(task, f"{type(e).__name__}: {e}")
                     if generation == self._agent_generation:
-                        if self.viewed_id == task_id:
-                            self._write_history_line(
-                                "system", f"{type(e).__name__}: {e}"
-                            )
                         # A mid-stream failure leaves a half-streamed orange
                         # preview above the input: clear it, otherwise the
                         # stale fragments hang in the dialog (and would be
@@ -1095,6 +1163,10 @@ class DrCodeApp(App[None]):
             if generation == self._agent_generation:
                 self.agent_running = False
                 self.refresh_status()
+            # A cancelled run (user abort, or a newer run taking over) must
+            # not restart the pipeline: the abort stops everything until the
+            # user acts, and the newer run advances on its own completion.
+            if not cancelled and generation == self._agent_generation:
                 if task.status is TaskStatus.AWAITING_CLARIFICATION:
                     # The user may have answered while the run was still
                     # finishing (the answer sits in pending_input and send()'s
@@ -1102,14 +1174,11 @@ class DrCodeApp(App[None]):
                     # for an answer that has already arrived.
                     self.manager.requeue_answered_clarification(task.id)
                     # The agent paused the task on a clarifying question: show it
-                    # and let the next queued task run while the user answers.
+                    # and let the pipeline continue while the user answers.
                     if self.viewed_id == task_id and task.clarification:
                         self._write_clarification(task.clarification)
                     self.refresh_sidebar()
-                    promoted = self.manager.promote_next(exclude=self._agent_failed)
-                    if promoted:
-                        self.run_agent(promoted.id)
-                        self.refresh_status()
+                    self._advance()
                 elif task.status is TaskStatus.ACTIVE and not task.pending_input:
                     # The agent answered and nothing is pending: the task is
                     # done automatically (as if the user pressed done).
@@ -1117,42 +1186,50 @@ class DrCodeApp(App[None]):
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:
                         self.view_task(task.id)
-                    if task.status is TaskStatus.TESTING:
-                        # The tester promotes the next queued task when it
-                        # finishes.
-                        self.run_tester(task.id)
-                    else:
-                        # Documentation tasks skip the tester entirely (they
-                        # are already completed): promote the queue here.
-                        promoted = self.manager.promote_next(exclude=self._agent_failed)
-                        if promoted:
-                            self.run_agent(promoted.id)
-                        self.refresh_status()
+                    # Testing (this task or an older one in the backlog)
+                    # always goes before any new development.
+                    self._advance()
                 elif task.status is TaskStatus.QUEUED:
                     # The run failed and demoted the task back to the queue:
                     # keep the pipeline going with the next task (failed ones
                     # are excluded, so a dead gateway can't loop the queue).
-                    promoted = self.manager.promote_next(exclude=self._agent_failed)
-                    if promoted:
-                        self.run_agent(promoted.id)
-                        self.refresh_status()
+                    self._advance()
 
     # -- tester run ------------------------------------------------------------------
+
+    def _schedule_tester_retry(self, task_id: str) -> None:
+        """Backoff before the next tester attempt for a failed task.
+
+        TESTING tasks block the whole pipeline, so a failed tester run is
+        retried (with capped exponential backoff) instead of being dropped
+        from the backlog until restart."""
+        count = self._tester_fail_count.get(task_id, 1)
+        delay = min(5 * 2 ** (count - 1), 300)
+        self._tester_retry_at[task_id] = time.monotonic() + delay
+        self.set_timer(delay, self._advance)
 
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
         """After any task completes, verify the project and label the task."""
         task = self.manager.get(task_id)
+        # Initialized before the try: build_tester_agent() itself may raise,
+        # and the handlers below reference `run`.
+        run: AgentRun[TesterDeps, str] | None = None
+        cancelled = False
         try:
             if not self.config.is_ready:
-                self._tester_failed.add(task_id)
-                if self.viewed_id == task_id:
-                    self._write_history_line(
-                        "system",
-                        "Tester skipped: model is not configured. Set DRCODE_MODEL, "
-                        "DRCODE_BASE_URL and DRCODE_API_KEY (env vars or .env).",
-                    )
+                self._tester_fail_count[task_id] = (
+                    self._tester_fail_count.get(task_id, 0) + 1
+                )
+                self._schedule_tester_retry(task_id)
+                self._show_event(
+                    task,
+                    "Tester skipped: model is not configured. Set DRCODE_MODEL, "
+                    "DRCODE_BASE_URL and DRCODE_API_KEY (env vars or .env).",
+                )
                 return
+            # Idempotent: _advance() sets this before starting the worker so
+            # two _advance() calls in one tick cannot double-start the tester.
             self.tester_running = True
             self._current_tool = None
             self._touch_activity()
@@ -1167,7 +1244,6 @@ class DrCodeApp(App[None]):
             deps = TesterDeps(
                 root=self.project_root, manager=self.manager, task_id=task_id
             )
-            run: AgentRun[TesterDeps, str] | None = None
             try:
                 async with tester.iter(
                     f"Verify completed task #{task.id}: {task.title}", deps=deps
@@ -1209,30 +1285,29 @@ class DrCodeApp(App[None]):
             except asyncio.CancelledError:
                 # Aborted (or superseded): keep whatever the tester did so
                 # far, then re-raise so the worker teardown stays clean.
+                cancelled = True
                 self._persist_tester_messages(task, run)
                 raise
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
-                self._tester_failed.add(task_id)
                 self._persist_tester_messages(task, run)
-                if self.viewed_id == task_id:
-                    self._write_history_line(
-                        "system", f"tester failed: {type(e).__name__}: {e}"
-                    )
+                self._tester_fail_count[task_id] = (
+                    self._tester_fail_count.get(task_id, 0) + 1
+                )
+                self._schedule_tester_retry(task_id)
+                self._show_event(task, f"tester failed: {type(e).__name__}: {e}")
         finally:
             self.tester_running = False
             self.refresh_status()
             self.refresh_sidebar()
-            # Testing backlog first: if several tasks are stuck in TESTING
-            # (crash mid-test), test them all before new development starts.
-            testing = self._next_testing()
-            if testing is not None:
-                self.run_tester(testing.id)
-            else:
-                # Tester finished: pick the next available task from the queue.
-                promoted = self.manager.promote_next(exclude=self._agent_failed)
-                if promoted:
-                    self.run_agent(promoted.id)
-                    self.refresh_status()
+            if task.status is TaskStatus.COMPLETED:
+                # Success: give the next testing round of this task a fresh
+                # backoff budget.
+                self._tester_fail_count.pop(task_id, None)
+                self._tester_retry_at.pop(task_id, None)
+            # A cancelled run (user abort, or a newer tester taking over)
+            # must not restart the pipeline.
+            if not cancelled:
+                self._advance()
 
     # -- actions ---------------------------------------------------------------------
 
@@ -1317,13 +1392,8 @@ class DrCodeApp(App[None]):
         self.refresh_sidebar()
         self.view_task(task.id)
         self.chat_input.focus()
-        # A task with a description and no active task starts immediately.
-        promoted = (
-            task if task.status is TaskStatus.ACTIVE else self.manager.promote_next()
-        )
-        if promoted:
-            self.run_agent(promoted.id)
-            self.refresh_status()
+        # Starts immediately unless testing is pending or the queue is busy.
+        self._advance()
 
     def action_done_task(self) -> None:
         task = self.viewed
@@ -1334,16 +1404,8 @@ class DrCodeApp(App[None]):
         self.manager.mark_done(task.id)
         self.refresh_sidebar()
         self.view_task(task.id)
-        if task.status is TaskStatus.TESTING:
-            # Completed: run the tester, it promotes the next queued task
-            # when done. Documentation tasks skip the tester (they are
-            # already completed), so promote the queue here.
-            self.run_tester(task.id)
-        else:
-            promoted = self.manager.promote_next()
-            if promoted:
-                self.run_agent(promoted.id)
-            self.refresh_status()
+        # Testing backlog first (possibly an older TESTING task), then queue.
+        self._advance()
 
     def action_abort_run(self) -> None:
         if self.agent_running or self.tester_running:
@@ -1385,17 +1447,20 @@ class DrCodeApp(App[None]):
 
     def _submit_user_text(self, task: Task, text: str) -> None:
         self.manager.send(task.id, text)
-        was_active = task.status is TaskStatus.ACTIVE
-        if was_active:
+        if task.status is TaskStatus.ACTIVE:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back
             # to pending_input) and the new run resumes with the comment.
             self._clear_stream_label()
             self.run_agent(task.id)
+        else:
+            # Queued/clarification/... input: advance the pipeline — testing
+            # backlog first, then the queue.
+            self._advance()
         self.refresh_sidebar()
         self.refresh_status()
         # For an active task run_agent() renders the message itself.
-        if not was_active and self.viewed_id == task.id:
+        if task.status is not TaskStatus.ACTIVE and self.viewed_id == task.id:
             self._write_history_line("user-pending", text)
 
     def action_pick_option(self, index: int) -> None:

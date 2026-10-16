@@ -40,6 +40,19 @@ class VerificationStatus(str, enum.Enum):
     FAILED = "Проверено с ошибками"
 
 
+class TaskEvent(BaseModel):
+    """A service/UI event (errors, skips, aborts) shown in the chat.
+
+    Kept in a dedicated field on the task, outside `messages` and
+    `tester_messages`, so resuming an agent never feeds these lines into
+    the model context — they are for the human only.
+    """
+
+    at: datetime = Field(default_factory=_now)
+    kind: str = "system"
+    text: str
+
+
 class Clarification(BaseModel):
     """A question the agent asked the user and is waiting an answer for."""
 
@@ -66,6 +79,9 @@ class Task(BaseModel):
     pending_input: list[str] = Field(default_factory=list)
     # Set while the agent is waiting for the user to answer a question.
     clarification: Clarification | None = None
+    # Service events (tester/agent failures, skips) with timestamps. Human
+    # only: never serialized into the model context on resume.
+    events: list[TaskEvent] = Field(default_factory=list)
     # Answered clarification tasks jump to the head of the queue.
     queue_head: bool = False
 

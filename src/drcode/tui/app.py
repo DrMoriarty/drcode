@@ -18,7 +18,10 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
     TextPartDelta,
+    ThinkingPart,
     ThinkingPartDelta,
 )
 from rich.console import Console, RenderableType
@@ -218,13 +221,21 @@ class AssistantBlock(Static):
 class ToolCallBlock(Static):
     """Collapsible tool-call block; collapsed by default, click to toggle.
 
-    Header shows only the tool name ("⚙ grep_search") in gray; expanding
-    reveals the arguments, also in gray.
+    Header shows the tool name plus the value of its primary argument
+    ("⚙ edit_file src/drcode/agent.py") in gray; expanding reveals the
+    full arguments, also in gray.
     """
+
+    # Which parameter carries the "main" value when a tool takes several
+    # (checked in order; the first present wins). Single-argument tools
+    # always show that one argument's value.
+    _MAIN_PARAM_KEYS = ("path", "command", "pattern", "question")
+    _MAX_ARG_LEN = 60
 
     def __init__(self, call: str) -> None:
         super().__init__(classes="tool-call collapsed")
         self._header, self._args = self._split(call)
+        self._header += self._primary_arg_suffix(self._args)
         self._redraw()
 
     @staticmethod
@@ -235,6 +246,30 @@ class ToolCallBlock(Static):
         if open_idx != -1 and call.endswith(")"):
             return call[:open_idx].rstrip(), call[open_idx + 1 : -1]
         return call, ""
+
+    @classmethod
+    def _primary_arg_suffix(cls, args: str) -> str:
+        """Return " value" for the tool's primary argument, "" if none."""
+        try:
+            parsed = json.loads(args) if args else None
+        except ValueError:
+            return ""
+        if not isinstance(parsed, dict) or not parsed:
+            return ""
+        if len(parsed) == 1:
+            value = next(iter(parsed.values()))
+        else:
+            value = next(
+                (parsed[k] for k in cls._MAIN_PARAM_KEYS if k in parsed), None
+            )
+        if value is None:
+            return ""
+        text = " ".join(str(value).split())
+        if not text:
+            return ""
+        if len(text) > cls._MAX_ARG_LEN:
+            text = text[: cls._MAX_ARG_LEN - 1] + "…"
+        return f" {text}"
 
     def on_click(self) -> None:
         self.toggle_class("collapsed")
@@ -1106,9 +1141,30 @@ class DrCodeApp(App[None]):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
                                         self._touch_activity()
-                                        if not isinstance(event, PartDeltaEvent):
+                                        if isinstance(event, PartStartEvent):
+                                            # The first chunk of a new text/thinking
+                                            # part arrives as PartStartEvent carrying
+                                            # the content itself (only subsequent
+                                            # chunks come as deltas); dropping it
+                                            # loses the beginning of the message
+                                            # from the live view.
+                                            part = event.part
+                                            if isinstance(part, ThinkingPart):
+                                                delta: (
+                                                    ThinkingPartDelta | TextPartDelta
+                                                ) = ThinkingPartDelta(
+                                                    content_delta=part.content
+                                                )
+                                            elif isinstance(part, TextPart):
+                                                delta = TextPartDelta(
+                                                    content_delta=part.content
+                                                )
+                                            else:
+                                                continue
+                                        elif isinstance(event, PartDeltaEvent):
+                                            delta = event.delta
+                                        else:
                                             continue
-                                        delta = event.delta
                                         if (
                                             isinstance(delta, ThinkingPartDelta)
                                             and delta.content_delta

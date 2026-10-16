@@ -65,6 +65,9 @@ class TaskManager:
         task.pending_input.append(text.strip())
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             task.status = TaskStatus.QUEUED
+            # Old verification label no longer applies: the task will be
+            # tested again after its next development round.
+            task.verification = None
             task.touch()
             self.storage.save(task)
             self.promote_next()
@@ -106,3 +109,19 @@ class TaskManager:
                 self.storage.save(t)
                 return t
         return None
+
+    def requeue_answered_clarification(self, task_id: str) -> None:
+        """A clarifying question was asked, but the user's answer already sits
+        in pending_input (it was typed while the agent run was still finishing,
+        so send()'s clarification transition never fired). Re-queue the task at
+        the head instead of waiting forever for an answer that has arrived."""
+        task = self.get(task_id)
+        if task.status is not TaskStatus.AWAITING_CLARIFICATION:
+            return
+        if not task.pending_input:
+            return
+        task.status = TaskStatus.QUEUED
+        task.queue_head = True
+        task.clarification = None
+        task.touch()
+        self.storage.save(task)

@@ -11,11 +11,14 @@ from typing import ClassVar
 
 import httpx
 from pydantic_ai import Agent
+from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
+    ModelResponse,
     PartDeltaEvent,
     TextPartDelta,
     ThinkingPartDelta,
+    ToolCallPart,
 )
 from rich.console import RenderableType
 from rich.markdown import Markdown
@@ -203,6 +206,7 @@ class DrCodeApp(App[None]):
     .tool-call:hover { background: $panel; }
     #stream-label { display: none; padding: 0 1; color: $accent; }
     #stream-label.visible { display: block; }
+    #stream-label.hidden { display: none; }
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
     .section-header { color: $accent; text-style: bold; padding: 0 1; }
     .task-item { padding: 0 1; }
@@ -263,10 +267,16 @@ class DrCodeApp(App[None]):
         self._chat_has_content = False
         # Auto-hide timer for the "copied" toast.
         self._copy_toast_timer: Timer | None = None
-        # Task ids the tester already ran against this session. A TESTING task
-        # the tester failed on (e.g. network down) is not retried in-session —
-        # it stays TESTING and is re-tested on the next startup.
-        self._tester_attempts: set[str] = set()
+        # Tasks whose tester run already failed this session (e.g. network
+        # down). They stay TESTING but are not retried in-session — the next
+        # startup picks them up again. Keeps _next_testing() from looping.
+        self._tester_failed: set[str] = set()
+        # True while the new-task form covers the chat view. Must exist from
+        # the start: the streaming loop reads it on every text delta, and an
+        # unset attribute would crash the run (it did — the AttributeError
+        # surfaced as a red "error ›" line and killed the first streamed run
+        # after a startup resume).
+        self._new_task_mode = False
 
     # -- layout -------------------------------------------------------------
 
@@ -309,14 +319,7 @@ class DrCodeApp(App[None]):
         # run_tester promotes the queue when it finishes. Otherwise the
         # startup demotion (active -> queued) leaves pending_input stranded
         # unless the queue is promoted here.
-        testing = next(
-            (
-                t
-                for t in self.manager.all_tasks()
-                if t.status is TaskStatus.TESTING
-            ),
-            None,
-        )
+        testing = self._next_testing()
         if testing is not None:
             self.run_tester(testing.id)
             return
@@ -420,11 +423,7 @@ class DrCodeApp(App[None]):
             ("QUEUE", self.manager.queued()),
             (
                 "TESTING",
-                [
-                    t
-                    for t in self.manager.all_tasks()
-                    if t.status is TaskStatus.TESTING
-                ],
+                [t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING],
             ),
             (
                 "COMPLETED",
@@ -517,13 +516,25 @@ class DrCodeApp(App[None]):
 
     # -- chat pane ---------------------------------------------------------------
 
+    def _next_testing(self) -> Task | None:
+        """Oldest task stuck in TESTING (crash/abort mid-test) that has not
+        already failed testing this session."""
+        return next(
+            (
+                t
+                for t in self.manager.all_tasks()
+                if t.status is TaskStatus.TESTING and t.id not in self._tester_failed
+            ),
+            None,
+        )
+
     def view_task(self, task_id: str) -> None:
         self.viewed_id = task_id
         task = self.manager.get(task_id)
         self.chat_log.remove_children()
         self._chat_has_content = False
         self._pending_rendered = []
-        self.stream_label.update("")
+        self._clear_stream_label()
         for role, text in extract_display(task.messages):
             self._write_history_line(role, text)
         for pending in task.pending_input:
@@ -604,6 +615,7 @@ class DrCodeApp(App[None]):
         status_colors = {
             TaskStatus.QUEUED: "yellow",
             TaskStatus.ACTIVE: "cyan",
+            TaskStatus.TESTING: "magenta",
             TaskStatus.COMPLETED: "green",
             TaskStatus.AWAITING_CLARIFICATION: "yellow",
         }
@@ -621,6 +633,34 @@ class DrCodeApp(App[None]):
         bar.update("   ".join(parts))
 
     # -- agent run -----------------------------------------------------------------
+
+    def _persist_task_messages(self, task: Task, run: AgentRun[AgentDeps, str]) -> None:
+        """Snapshot the transcript produced so far into the task.
+
+        One agent turn can run for minutes (many model requests and tool
+        calls). Saving only on turn completion leaves the stored history
+        stale while the agent works: switching to the task then shows
+        nothing new (for a fresh task — nothing at all), and an interrupted
+        turn (abort, a follow-up comment cancelling the exclusive worker)
+        lost everything it had done. Persisting after every completed node
+        keeps both the on-disk history and `view_task` current.
+
+        A snapshot is skipped while the transcript ends with unanswered tool
+        calls: resuming from such a state would send an invalid history
+        (tool_calls without results) to the model API.
+        """
+        try:
+            messages = run.all_messages()
+        except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
+            return
+        if (
+            messages
+            and isinstance(messages[-1], ModelResponse)
+            and any(isinstance(p, ToolCallPart) for p in messages[-1].parts)
+        ):
+            return
+        task.messages = serialize_messages(messages)
+        self.manager.storage.save(task)
 
     @work(exclusive=True, group="agent")
     async def run_agent(self, task_id: str) -> None:
@@ -682,7 +722,10 @@ class DrCodeApp(App[None]):
                                                 )
                                         elif isinstance(delta, TextPartDelta):
                                             buffer.append(delta.content_delta)
-                                            if self.viewed_id == task_id:
+                                            if (
+                                                self.viewed_id == task_id
+                                                and not self._new_task_mode
+                                            ):
                                                 self.stream_label.add_class("visible")
                                                 self.stream_label.update(
                                                     "".join(buffer)
@@ -709,31 +752,57 @@ class DrCodeApp(App[None]):
                                                     f"({args_str})"
                                                 )
                                             )
+                    # Keep the stored history current while the turn runs:
+                    # view_task() renders from task.messages, so without this
+                    # a switch away+back shows the pre-run transcript (for a
+                    # fresh task — an empty chat).
+                    self._persist_task_messages(task, run)
                     if run.result is not None:
                         task.messages = serialize_messages(run.result.all_messages())
                         self.manager.storage.save(task)
                     if self.viewed_id == task_id:
-                        self.stream_label.remove_class("visible")
+                        self._clear_stream_label()
                         self._write_history_line("assistant", "".join(buffer))
-                        self.stream_label.update("")
                 except asyncio.CancelledError:
                     # Interrupted (abort or a new comment): keep the message so
                     # the agent retries it on the next activation.
                     task.pending_input.insert(0, text)
+                    # Persist whatever the interrupted turn managed to do,
+                    # otherwise its whole work survives only in the widgets
+                    # and vanishes from the history on the next view_task().
+                    self._persist_task_messages(task, run)
                     self.manager.storage.save(task)
+                    # Drop our streaming preview; a newer run (if any) owns
+                    # the label now and must not be touched.
+                    self._drop_stream_preview(generation)
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
-                    if self.viewed_id == task_id:
-                        self._write_history_line("system", f"{type(e).__name__}: {e}")
+                    if generation == self._agent_generation:
+                        if self.viewed_id == task_id:
+                            self._write_history_line(
+                                "system", f"{type(e).__name__}: {e}"
+                            )
+                        # A mid-stream failure leaves a half-streamed orange
+                        # preview above the input: clear it, otherwise the
+                        # stale fragments hang in the dialog (and would be
+                        # shown for whatever the user does next).
+                        self._drop_stream_preview(generation)
                     task.pending_input.insert(
                         0, text
                     )  # not lost, retry on next activation
+                    self._persist_task_messages(task, run)
+                    self.manager.storage.save(task)
                     break
         finally:
             if generation == self._agent_generation:
                 self.agent_running = False
                 self.refresh_status()
                 if task.status is TaskStatus.AWAITING_CLARIFICATION:
+                    # The user may have answered while the run was still
+                    # finishing (the answer sits in pending_input and send()'s
+                    # clarification transition never fired): don't wait forever
+                    # for an answer that has already arrived.
+                    self.manager.requeue_answered_clarification(task.id)
                     # The agent paused the task on a clarifying question: show it
                     # and let the next queued task run while the user answers.
                     if self.viewed_id == task_id and task.clarification:
@@ -761,6 +830,7 @@ class DrCodeApp(App[None]):
         task = self.manager.get(task_id)
         try:
             if not self.config.is_ready:
+                self._tester_failed.add(task_id)
                 if self.viewed_id == task_id:
                     self._write_history_line(
                         "system",
@@ -806,6 +876,7 @@ class DrCodeApp(App[None]):
                 if run.result is not None and self.viewed_id == task_id:
                     self._write_history_line("tester", run.result.output)
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
+                self._tester_failed.add(task_id)
                 if self.viewed_id == task_id:
                     self._write_history_line(
                         "system", f"tester failed: {type(e).__name__}: {e}"
@@ -814,11 +885,17 @@ class DrCodeApp(App[None]):
             self.tester_running = False
             self.refresh_status()
             self.refresh_sidebar()
-            # Tester finished: pick the next available task from the queue.
-            promoted = self.manager.promote_next()
-            if promoted:
-                self.run_agent(promoted.id)
-                self.refresh_status()
+            # Testing backlog first: if several tasks are stuck in TESTING
+            # (crash mid-test), test them all before new development starts.
+            testing = self._next_testing()
+            if testing is not None:
+                self.run_tester(testing.id)
+            else:
+                # Tester finished: pick the next available task from the queue.
+                promoted = self.manager.promote_next()
+                if promoted:
+                    self.run_agent(promoted.id)
+                    self.refresh_status()
 
     # -- actions ---------------------------------------------------------------------
 
@@ -828,9 +905,24 @@ class DrCodeApp(App[None]):
     def new_task_input(self) -> NewTaskInput:
         return self.query_one("#nt-input", NewTaskInput)
 
+    def _clear_stream_label(self) -> None:
+        """Drop the live streaming preview entirely (content + visibility)."""
+        self.stream_label.remove_class("visible")
+        self.stream_label.update("")
+
+    def _drop_stream_preview(self, generation: int) -> None:
+        """Clear the streaming preview after an agent run ends, but only if
+        no newer run has (already) taken over the label."""
+        if generation == self._agent_generation:
+            self._clear_stream_label()
+
     def action_new_task(self) -> None:
         # Every entry into the new-task screen starts from a clean editor.
         self.new_task_input.clear()
+        self._new_task_mode = True
+        # The streaming preview belongs to the chat view, not the form: a
+        # run in progress must not leak its orange text over the form.
+        self._clear_stream_label()
         self.chat_log.add_class("hidden")
         self.stream_label.add_class("hidden")
         self.chat_input.add_class("hidden")
@@ -839,9 +931,13 @@ class DrCodeApp(App[None]):
         self.new_task_input.focus()
 
     def _leave_new_task_mode(self) -> None:
+        self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
         self.chat_log.remove_class("hidden")
         self.stream_label.remove_class("hidden")
+        # Content may be stale (a run streamed while the form was open, or
+        # finished in the background): don't resurrect it.
+        self._clear_stream_label()
         self.chat_input.remove_class("hidden")
 
     def cancel_new_task(self) -> None:
@@ -900,7 +996,9 @@ class DrCodeApp(App[None]):
             self.workers.cancel_group(self, "tester")
             self.agent_running = False
             self.tester_running = False
-            self.stream_label.remove_class("visible")
+            # Hide AND empty: the aborted run's partial text must not be
+            # resurrected by a later add_class("visible").
+            self._clear_stream_label()
             self.refresh_status()
 
     def action_focus_sidebar(self) -> None:
@@ -936,8 +1034,7 @@ class DrCodeApp(App[None]):
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back
             # to pending_input) and the new run resumes with the comment.
-            self.stream_label.remove_class("visible")
-            self.stream_label.update("")
+            self._clear_stream_label()
             self.run_agent(task.id)
         self.refresh_sidebar()
         self.refresh_status()

@@ -77,6 +77,13 @@ class Task(BaseModel):
     tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
     # User messages typed while the task is queued/not yet processed.
     pending_input: list[str] = Field(default_factory=list)
+    # True when the last agent attempt was interrupted (abort, error) and
+    # may have left work undone. Replaces the old "re-queue the consumed
+    # prompt" retry marker: the prompt stays in the transcript at its
+    # chronological position and is NEVER re-sent as a new message. The
+    # agent resumes the attempt without new user text on the next
+    # activation (run_agent's continuation turn).
+    unfinished: bool = False
     # Set while the agent is waiting for the user to answer a question.
     clarification: Clarification | None = None
     # Service events (tester/agent failures, skips) with timestamps. Human

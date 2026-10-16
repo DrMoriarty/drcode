@@ -51,12 +51,13 @@ from ..agent import (
     TesterDeps,
     build_agent,
     build_tester_agent,
+    ends_with_open_request,
     extract_display,
     is_pending_retry,
-    is_unfinished_attempt,
     last_context_tokens,
     resumable_history,
     run_context_tokens,
+    sanitized_messages,
     serialize_messages,
 )
 from ..config import Config
@@ -259,9 +260,7 @@ class ToolCallBlock(Static):
         if len(parsed) == 1:
             value = next(iter(parsed.values()))
         else:
-            value = next(
-                (parsed[k] for k in cls._MAIN_PARAM_KEYS if k in parsed), None
-            )
+            value = next((parsed[k] for k in cls._MAIN_PARAM_KEYS if k in parsed), None)
         if value is None:
             return ""
         text = " ".join(str(value).split())
@@ -365,6 +364,7 @@ class DrCodeApp(App[None]):
     BINDINGS: ClassVar = [
         ("ctrl+n", "new_task", "New task"),
         ("ctrl+d", "done_task", "Done"),
+        ("ctrl+x", "cancel_task", "Cancel task"),
         ("ctrl+o", "focus_sidebar", "Tasks"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+t", "cycle_task_kind", "Change type"),
@@ -380,6 +380,8 @@ class DrCodeApp(App[None]):
         self.viewed_id: str | None = None
         self.agent_running = False
         self.tester_running = False
+        # Task id the tester worker is currently verifying (for Ctrl+X).
+        self._tester_task_id: str | None = None
         self.new_task_kind: TaskKind = TaskKind.FEATURE
         # Incremented on every run_agent() start; the finally block of a
         # superseded (cancelled) run must not touch shared state.
@@ -1106,27 +1108,41 @@ class DrCodeApp(App[None]):
             self._touch_activity()
             self.refresh_status()
             agent = build_agent(self.config, kind=task.kind, root=self.project_root)
-            while task.pending_input and task.status is TaskStatus.ACTIVE:
+            # Chronological message flow: the transcript is the single
+            # chronological record — the original prompt lives in it exactly
+            # once and is NEVER re-queued/re-sent. Each activation first
+            # consumes every pending user message in arrival order, then —
+            # only if the last attempt was interrupted — runs one
+            # continuation turn without new text to pick the interrupted
+            # work back up.
+            while task.status is TaskStatus.ACTIVE:
                 run = None
-                text = task.pending_input.pop(0)
-                history = resumable_history(task.messages)
-                # A crashed/interrupted run may have left this prompt in the
-                # persisted transcript together with everything it managed
-                # to do. Continue that attempt instead of re-sending the
-                # text: re-sending would duplicate the prompt, and
-                # resumable_history() has already trimmed the only tail the
-                # API cannot accept (tool calls without results), so nothing
-                # else from the attempt is lost.
-                is_retry = is_unfinished_attempt(history, text)
-                if self.viewed_id == task_id:
-                    if text in self._pending_rendered:
-                        # Already shown as a queued block; don't repeat it.
-                        self._pending_rendered.remove(text)
-                    elif not is_retry:
-                        self._write_history_line("user", text)
+                if task.pending_input:
+                    text = task.pending_input.pop(0)
+                    history = resumable_history(task.messages)
+                    if self.viewed_id == task_id:
+                        if text in self._pending_rendered:
+                            # Already shown as a queued block; don't repeat it.
+                            self._pending_rendered.remove(text)
+                        else:
+                            self._write_history_line("user", text)
+                elif task.unfinished:
+                    if not ends_with_open_request(task.messages):
+                        # The interrupted attempt actually finished its
+                        # exchange — nothing to resume; clear the flag so
+                        # the task can complete normally below.
+                        task.unfinished = False
+                        self.manager.storage.save(task)
+                        break
+                    task.unfinished = False
+                    self.manager.storage.save(task)
+                    text = None
+                    history = resumable_history(task.messages)
+                else:
+                    break
                 try:
                     async with agent.iter(
-                        None if is_retry else text,
+                        text,
                         message_history=history,
                         deps=AgentDeps(
                             root=self.project_root,
@@ -1267,17 +1283,23 @@ class DrCodeApp(App[None]):
                         # by view_task and must be restored from history).
                         self.view_task(task_id)
                 except asyncio.CancelledError:
-                    # Interrupted (abort or a new comment): keep the message so
-                    # the agent retries it on the next activation. Appended to
-                    # the END, not the head: newer user input (sent after the
-                    # abort) must reach the agent first.
+                    # Interrupted (abort, or a newer run taking over). The
+                    # consumed prompt is NOT re-queued — it stays in the
+                    # transcript at its chronological position;
+                    # task.unfinished marks the possibly-undone attempt and
+                    # the next activation resumes it without re-sending text.
                     cancelled = True
-                    task.pending_input.append(text)
-                    # Persist whatever the interrupted turn managed to do,
-                    # otherwise its whole work survives only in the widgets
-                    # and vanishes from the history on the next view_task().
-                    self._persist_task_messages(task, run)
-                    self.manager.storage.save(task)
+                    if generation == self._agent_generation and (
+                        task.status is TaskStatus.ACTIVE
+                    ):
+                        # Persist whatever the interrupted turn managed to
+                        # do, then sanitize: drop the API-invalid tail (tool
+                        # calls without results, the empty interrupted
+                        # request) so later messages can append in any order.
+                        self._persist_task_messages(task, run)
+                        task.messages = sanitized_messages(task.messages)
+                        task.unfinished = True
+                        self.manager.storage.save(task)
                     # Drop our streaming preview; a newer run (if any) owns
                     # the label now and must not be touched.
                     self._drop_stream_preview(generation)
@@ -1292,14 +1314,16 @@ class DrCodeApp(App[None]):
                         # stale fragments hang in the dialog (and would be
                         # shown for whatever the user does next).
                         self._drop_stream_preview(generation)
-                    task.pending_input.insert(
-                        0, text
-                    )  # not lost, retried on the next user nudge
+                    self._persist_task_messages(task, run)
+                    task.messages = sanitized_messages(task.messages)
+                    # Not lost: unfinished marks the attempt; promotion
+                    # resumes it (this session it is excluded via
+                    # _agent_failed so a dead gateway can't loop the queue).
+                    task.unfinished = True
                     # Demote honestly: an ACTIVE task with no runner is a
                     # state nothing ever picks up again (promote_next skips
                     # it) — the task goes back to the queue instead, and the
                     # queue continues with the next task.
-                    self._persist_task_messages(task, run)
                     task.status = TaskStatus.QUEUED
                     self._agent_failed.add(task_id)
                     self.manager.storage.save(task)
@@ -1324,9 +1348,17 @@ class DrCodeApp(App[None]):
                         self._write_clarification(task.clarification)
                     self.refresh_sidebar()
                     self._advance()
-                elif task.status is TaskStatus.ACTIVE and not task.pending_input:
-                    # The agent answered and nothing is pending: the task is
-                    # done automatically (as if the user pressed done).
+                elif (
+                    task.status is TaskStatus.ACTIVE
+                    and not task.pending_input
+                    and not task.unfinished
+                ):
+                    # The agent answered and nothing is pending or left to
+                    # resume: the task is done automatically (as if the user
+                    # pressed done). An unfinished (interrupted) task stays
+                    # ACTIVE paused instead — the poller surfaces it as
+                    # "active, nothing running" until the user acts or the
+                    # app restarts (promotion then resumes the attempt).
                     self.manager.mark_done(task.id)
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:
@@ -1356,6 +1388,7 @@ class DrCodeApp(App[None]):
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
         """After any task completes, verify the project and label the task."""
+        self._tester_task_id = task_id
         task = self.manager.get(task_id)
         # Initialized before the try: build_tester_agent() itself may raise,
         # and the handlers below reference `run`.
@@ -1442,6 +1475,7 @@ class DrCodeApp(App[None]):
                 self._show_event(task, f"tester failed: {type(e).__name__}: {e}")
         finally:
             self.tester_running = False
+            self._tester_task_id = None
             self.refresh_status()
             self.refresh_sidebar()
             if task.status is TaskStatus.COMPLETED:
@@ -1552,6 +1586,33 @@ class DrCodeApp(App[None]):
         # Testing backlog first (possibly an older TESTING task), then queue.
         self._advance()
 
+    def action_cancel_task(self) -> None:
+        """User cancels the viewed task (not relevant anymore): drop all
+        queued input and complete it immediately — the tester never runs."""
+        task = self.viewed
+        if task is None or task.status is TaskStatus.COMPLETED:
+            return
+        active = self.manager.active
+        if self.agent_running and active is not None and active.id == task.id:
+            self.workers.cancel_group(self, "agent")
+            self.agent_running = False
+            self._current_tool = None
+        if self.tester_running and self._tester_task_id == task.id:
+            self.workers.cancel_group(self, "tester")
+            self.tester_running = False
+            self._current_tool = None
+        self.manager.cancel(task.id)
+        self._show_event(
+            task,
+            "Задача отменена пользователем — снята с конвейера без тестирования.",
+        )
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        # The pipeline continues: testing backlog first, then the queue.
+        self._advance()
+
     def action_abort_run(self) -> None:
         if self.agent_running or self.tester_running:
             self.workers.cancel_group(self, "agent")
@@ -1606,7 +1667,7 @@ class DrCodeApp(App[None]):
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
-        self.manager.send(task.id, text, priority=task.status is TaskStatus.ACTIVE)
+        self.manager.send(task.id, text)
         if task.status is TaskStatus.ACTIVE:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back

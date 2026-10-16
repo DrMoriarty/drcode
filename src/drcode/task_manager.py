@@ -80,21 +80,15 @@ class TaskManager:
         self.storage.save(task)
         return task
 
-    def send(self, task_id: str, text: str, *, priority: bool = False) -> Task:
-        """Add user input to a task. A completed (or being-tested) task
-        re-enters the pipeline; an answered clarification goes to the head
-        of the queue. Promotion (activation) is up to the caller: the app
-        advances the pipeline through _advance(), which never starts new
-        development while any testing is incomplete.
-
-        `priority` puts the text at the head of pending_input: a fresh user
-        message to an active task must be seen by the agent before any
-        earlier queued input (e.g. a prompt re-queued by an aborted run)."""
+    def send(self, task_id: str, text: str) -> Task:
+        """Add user input to a task (appended chronologically). A completed
+        (or being-tested) task re-enters the pipeline; an answered
+        clarification goes to the head of the queue. Promotion (activation)
+        is up to the caller: the app advances the pipeline through
+        _advance(), which never starts new development while any testing is
+        incomplete."""
         task = self.get(task_id)
-        if priority:
-            task.pending_input.insert(0, text.strip())
-        else:
-            task.pending_input.append(text.strip())
+        task.pending_input.append(text.strip())
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             task.status = TaskStatus.QUEUED
             # Old verification label no longer applies: the task will be
@@ -153,19 +147,36 @@ class TaskManager:
         return task
 
     def promote_next(self, exclude: set[str] | None = None) -> Task | None:
-        """If no task is active, activate the first queued task that has input.
+        """If no task is active, activate the first queued task that has
+        pending input or an interrupted attempt to resume.
         `exclude` skips tasks that already failed this session (bounded
         retries: a failing task must not stall the whole queue in a loop)."""
         if self.active is not None:
             return None
         for t in self.queued():
-            if t.pending_input and (exclude is None or t.id not in exclude):
+            if (t.pending_input or t.unfinished) and (
+                exclude is None or t.id not in exclude
+            ):
                 t.status = TaskStatus.ACTIVE
                 t.queue_head = False
                 t.touch()
                 self.storage.save(t)
                 return t
         return None
+
+    def cancel(self, task_id: str) -> Task:
+        """User cancelled the task (not relevant anymore): drop all queued
+        input, clear the resume flag and complete it immediately — the
+        tester is skipped everywhere a finished task would run it."""
+        task = self.get(task_id)
+        task.pending_input.clear()
+        task.unfinished = False
+        task.clarification = None
+        task.queue_head = False
+        task.status = TaskStatus.COMPLETED
+        task.touch()
+        self.storage.save(task)
+        return task
 
     def requeue_answered_clarification(self, task_id: str) -> None:
         """A clarifying question was asked, but the user's answer already sits

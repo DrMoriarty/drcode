@@ -311,6 +311,27 @@ def serialize_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
     return ModelMessagesTypeAdapter.dump_python(messages, mode="json")  # type: ignore[return-value]
 
 
+def sanitized_messages(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Transcript truncated to its API-valid prefix (resumable_history rule).
+
+    Applied when a run is interrupted: the invalid tail (a response with
+    tool calls whose results never arrived, the empty interrupted request
+    pydantic-ai appends) is dropped so the stored transcript stays valid no
+    matter in which order later user messages get appended to it.
+    """
+    return serialize_messages(resumable_history(data))
+
+
+def ends_with_open_request(data: list[dict[str, Any]]) -> bool:
+    """True when the transcript ends with an unanswered user request —
+    i.e. there is an interrupted attempt that a continuation turn can pick
+    up (the transcript is expected to be sanitized at that point)."""
+    if not data:
+        return False
+    last = data[-1]
+    return last.get("kind") == "request" or last.get("role") == "request"
+
+
 def _usage_context_tokens(input_tokens: int, cache_read: int, cache_write: int) -> int:
     """Tokens the model actually saw in that request: uncached prompt +
     cache reads + cache writes (Anthropic-style accounting splits the prompt
@@ -387,40 +408,12 @@ def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
     return messages[:cut]
 
 
-def is_unfinished_attempt(history: list[ModelMessage], text: str) -> bool:
-    """True when `text` is already the prompt of an unfinished attempt in
-    `history`: the run that consumed it crashed or was interrupted before
-    finishing, so the attempt must be continued rather than re-sent —
-    re-sending would duplicate the prompt in the transcript. False when the
-    attempt already finished (its last response is a text answer): then an
-    identical prompt is a genuine new request.
-
-    Object-level mirror of `is_pending_retry()`.
-    """
-    idx = None
-    for i, msg in enumerate(history):
-        if isinstance(msg, ModelRequest) and any(
-            isinstance(p, UserPromptPart) and p.content == text for p in msg.parts
-        ):
-            idx = i
-    if idx is None:
-        return False
-    for msg in reversed(history[idx + 1 :]):
-        if isinstance(msg, ModelResponse):
-            finished = any(
-                isinstance(p, TextPart) and p.content for p in msg.parts
-            ) and not any(isinstance(p, ToolCallPart) for p in msg.parts)
-            return not finished
-    return True
-
-
 def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     """True when `text` is already the prompt of an unfinished attempt in the
-    serialized transcript (a failed/interrupted run re-queued it to
-    `pending_input` for a retry). The chat renders the prompt and the partial
-    work from the transcript itself; showing the pending copy too would draw
-    the same message twice. Serialized-message mirror of
-    `is_unfinished_attempt()`.
+    serialized transcript (possible only for legacy tasks whose interrupted
+    prompt was re-queued into `pending_input` by older builds). The chat
+    renders the prompt and the partial work from the transcript itself;
+    showing the pending copy too would draw the same message twice.
     """
     idx = None
     for i, msg in enumerate(messages):
@@ -516,13 +509,14 @@ __all__ = [
     "UserPromptPart",
     "build_agent",
     "build_tester_agent",
+    "ends_with_open_request",
     "extract_display",
     "is_pending_retry",
-    "is_unfinished_attempt",
     "last_context_tokens",
     "load_agents_md",
     "load_messages",
     "resumable_history",
     "run_context_tokens",
+    "sanitized_messages",
     "serialize_messages",
 ]

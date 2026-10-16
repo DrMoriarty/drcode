@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import shutil
 import ssl
@@ -20,7 +21,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ThinkingPartDelta,
 )
-from rich.console import RenderableType
+from rich.console import Console, RenderableType
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
@@ -163,6 +164,22 @@ class ReasoningBlock(Static):
             self.update(f"{header}\n{body}")
 
 
+def _markdown_text(text: str, width: int) -> Text:
+    """Render markdown to a styled Text at a fixed width.
+
+    A rich Markdown renderable can't take part in Textual's mouse selection:
+    RichVisual strips carry no "offset" meta, so a drag inside the widget
+    degrades to a select-all of the whole block, and no selection highlight
+    is ever painted. A Text is promoted to Content, which supports both.
+    """
+    console = Console(width=width, legacy_windows=False, file=io.StringIO())
+    options = console.options.update(width=width, highlight=False)
+    result = Text()
+    for segment in console.render(Markdown(text, code_theme="ansi_dark"), options):
+        result.append(segment.text, segment.style)
+    return result
+
+
 class AssistantBlock(Static):
     """Live assistant answer, streamed directly into the chat log.
 
@@ -171,13 +188,31 @@ class AssistantBlock(Static):
     (instead of a preview panel under the chat log).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, text: str = "") -> None:
         super().__init__(classes="assistant")
-        self._content = ""
+        self._content = text
+        self._text: Text | None = None
+        self._width = 0
 
     def append(self, delta: str) -> None:
-        self._content += delta
-        self.update(Markdown(self._content, code_theme="ansi_dark"))
+        self.set_content(self._content + delta)
+
+    def set_content(self, text: str) -> None:
+        """Fill or replace the markdown (also used for history rendering)."""
+        self._content = text
+        self._text = None
+        self.refresh()
+
+    def on_resize(self) -> None:
+        self._text = None
+        self.refresh()
+
+    def render(self) -> Text:
+        width = self.content_size.width or self.size.width or 80
+        if self._text is None or self._width != width:
+            self._text = _markdown_text(self._content, width)
+            self._width = width
+        return self._text
 
 
 class ToolCallBlock(Static):
@@ -243,6 +278,9 @@ class DrCodeApp(App[None]):
     .reasoning:hover { background: $panel; }
     .tool-call { padding: 0 4; color: $text-muted; }
     .tool-call:hover { background: $panel; }
+    # Fixed width: the markdown is rendered to a Text at the content width,
+    # so an auto-width widget would resize (and rewrap) as lines arrive.
+    .assistant { width: 100%; }
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
     .section-header { color: $accent; text-style: bold; padding: 0 1; }
     .task-item { padding: 0 1; }
@@ -833,7 +871,7 @@ class DrCodeApp(App[None]):
         elif role == "tool-call":
             self._write_chat(ToolCallBlock(text))
         elif role == "assistant":
-            self._write_chat(Markdown(text, code_theme="ansi_dark"))
+            self._write_chat(AssistantBlock(text))
         elif role == "tool":
             self._write_chat(f"[dim]{escape(text)}[/]")
         elif role == "tester":

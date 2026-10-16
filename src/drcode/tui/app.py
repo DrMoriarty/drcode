@@ -82,6 +82,12 @@ from ..models import (
     VerificationStatus,
 )
 from ..prompts import load_init_repo_prompt
+from ..settings import (
+    RETENTION_OPTIONS,
+    CompletedRetention,
+    ProjectSettings,
+    ProjectSettingsStore,
+)
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
 
@@ -430,6 +436,46 @@ class ServiceCommandsProvider(Provider):
                 yield Hit(score, matcher.highlight(name), callback, help=help_text)
 
 
+class ProjectSettingsCommandsProvider(Provider):
+    """Project-preference commands in the Settings palette.
+
+    One hit per option of the completed-tasks auto-cleanup setting; picking
+    one persists it into `<project>/.drcode/settings.json`, so the choice is
+    scoped to the project, not the user.
+    """
+
+    def _options(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.completed_retention
+        options: list[tuple[str, str, Callable[[], object]]] = []
+        for option in RETENTION_OPTIONS:
+            name = f"Автоудаление завершённых задач: {option.label}"
+            if option is current:
+                name += " (текущее)"
+            options.append(
+                (
+                    name,
+                    (
+                        "Удалять завершённые задачи при старте приложения "
+                        "(настройка проекта)"
+                    ),
+                    lambda option=option: app.action_set_completed_retention(option),
+                )
+            )
+        return options
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._options():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._options():
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
 class DrCodeApp(App[None]):
     # The stock command-palette binding (ctrl+p, shown as "palette" in the
     # footer) is replaced by our own "Settings" binding (ctrl+s) below;
@@ -440,7 +486,11 @@ class DrCodeApp(App[None]):
     # Providers for the Settings palette (it passes no explicit providers,
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends).
-    COMMANDS: ClassVar = {get_system_commands_provider, ServiceCommandsProvider}
+    COMMANDS: ClassVar = {
+        get_system_commands_provider,
+        ServiceCommandsProvider,
+        ProjectSettingsCommandsProvider,
+    }
 
     CSS = """
     Screen { layers: base toast; }
@@ -554,6 +604,14 @@ class DrCodeApp(App[None]):
         self.project_root = project_root
         self.config = Config()
         self.manager = TaskManager(project_root)
+        # Project-scoped preferences (<project>/.drcode/settings.json), then
+        # the startup cleanup: completed tasks older than the retention
+        # setting are removed before anything is shown or resumed.
+        self.settings_store = ProjectSettingsStore(project_root)
+        self.settings: ProjectSettings = self.settings_store.load()
+        self._purged_tasks = self.manager.purge_expired_completed(
+            self.settings.completed_retention.days
+        )
         self.viewed_id: str | None = None
         self.agent_running = False
         self.tester_running = False
@@ -648,6 +706,15 @@ class DrCodeApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        if self._purged_tasks:
+            # The startup cleanup removed something — say so, so deleted
+            # history never "silently vanishes".
+            self.notify(
+                f"Удалено завершённых задач: {len(self._purged_tasks)} "
+                f"({self.settings.completed_retention.label})",
+                title="Автоочистка",
+                timeout=6,
+            )
         self.refresh_project_info()
         self.refresh_sidebar()
         tasks = self.manager.all_tasks()
@@ -2048,6 +2115,18 @@ class DrCodeApp(App[None]):
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
+
+    def action_set_completed_retention(self, retention: CompletedRetention) -> None:
+        """Settings command: after how long completed tasks are deleted at
+        startup. Persisted per project (.drcode/settings.json); the cleanup
+        itself runs once per app start."""
+        self.settings.completed_retention = retention
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Автоудаление завершённых задач: {retention.label}",
+            title="Настройки проекта",
+            timeout=4,
+        )
 
     def action_update_agents_md(self) -> None:
         """Create a documentation task that writes/refreshes AGENTS.md.

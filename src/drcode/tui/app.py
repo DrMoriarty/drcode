@@ -48,6 +48,7 @@ from ..agent import (
     build_agent,
     build_tester_agent,
     extract_display,
+    is_pending_retry,
     last_context_tokens,
     resumable_history,
     run_context_tokens,
@@ -763,6 +764,11 @@ class DrCodeApp(App[None]):
             for event in task.events:
                 self._write_history_line("event", self._format_event(event))
         for pending in task.pending_input:
+            if is_pending_retry(task.messages, pending):
+                # The failed/interrupted run left this prompt in the
+                # transcript: it is already rendered from task.messages
+                # above — writing the pending copy again duplicates it.
+                continue
             self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
@@ -1477,7 +1483,11 @@ class DrCodeApp(App[None]):
         self.refresh_sidebar()
         self.refresh_status()
         # For an active task run_agent() renders the message itself.
-        if task.status is not TaskStatus.ACTIVE and self.viewed_id == task.id:
+        if (
+            task.status is not TaskStatus.ACTIVE
+            and self.viewed_id == task.id
+            and not is_pending_retry(task.messages, text)
+        ):
             self._write_history_line("user-pending", text)
 
     def action_pick_option(self, index: int) -> None:

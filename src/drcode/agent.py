@@ -398,9 +398,11 @@ def strip_retried_prompt(
     the chat. Dropping the prompt together with the incomplete tail after it
     makes the retry regenerate the attempt cleanly.
 
-    The transcript is left untouched when the attempt already produced a
-    final (non-empty text) model response — then an identical prompt is a
-    genuine new request, not a retry.
+    The transcript is left untouched when the attempt already finished —
+    its last model response is text-only (a final answer, no tool calls) —
+    then an identical prompt is a genuine new request, not a retry.
+    Intermediate responses that mix prose with tool calls do not count:
+    an attempt containing them was cut off mid-work.
     """
     idx = None
     for i, msg in enumerate(messages):
@@ -410,12 +412,43 @@ def strip_retried_prompt(
             idx = i
     if idx is None:
         return messages, False
-    for msg in messages[idx + 1 :]:
-        if isinstance(msg, ModelResponse) and any(
-            isinstance(p, TextPart) and p.content for p in msg.parts
-        ):
-            return messages, False
+    for msg in reversed(messages[idx + 1 :]):
+        if isinstance(msg, ModelResponse):
+            finished = any(
+                isinstance(p, TextPart) and p.content for p in msg.parts
+            ) and not any(isinstance(p, ToolCallPart) for p in msg.parts)
+            if finished:
+                return messages, False
+            break
     return messages[:idx], True
+
+
+def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
+    """True when `text` is already the prompt of an unfinished attempt in the
+    serialized transcript (a failed/interrupted run re-queued it to
+    `pending_input` for a retry). The chat renders the prompt and the partial
+    work from the transcript itself; showing the pending copy too would draw
+    the same message twice. Serialized-message mirror of
+    `strip_retried_prompt()`.
+    """
+    idx = None
+    for i, msg in enumerate(messages):
+        if msg.get("kind") != "request" and msg.get("role") != "request":
+            continue
+        for part in msg.get("parts", []):
+            if part.get("part_kind") == "user-prompt" and part.get("content") == text:
+                idx = i
+    if idx is None:
+        return False
+    for msg in reversed(messages[idx + 1 :]):
+        if msg.get("kind") == "response" or msg.get("role") == "response":
+            parts = msg.get("parts", [])
+            has_text = any(
+                p.get("part_kind") == "text" and p.get("content") for p in parts
+            )
+            has_tool_call = any(p.get("part_kind") == "tool-call" for p in parts)
+            return not (has_text and not has_tool_call)
+    return True
 
 
 def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -493,6 +526,7 @@ __all__ = [
     "build_agent",
     "build_tester_agent",
     "extract_display",
+    "is_pending_retry",
     "last_context_tokens",
     "load_agents_md",
     "load_messages",

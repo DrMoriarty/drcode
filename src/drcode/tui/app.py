@@ -162,15 +162,20 @@ class ReasoningBlock(Static):
         self._redraw()
 
     def _redraw(self) -> None:
+        # Body is passed as plain Text, never as a markup string: the model's
+        # reasoning regularly contains bracket sequences ("[Binding(...") that
+        # Textual's markup parser accepts as tags (unlike Rich's escape()).
         collapsed = self.has_class("collapsed")
         arrow = "▸" if collapsed else "▾"
         status = "…" if self._streaming else ""
-        header = f"[bold dim]{arrow} Reasoning{status}[/]"
-        if collapsed:
-            self.update(header)
-        else:
-            body = escape(self._content) or "[dim italic](empty)[/]"
-            self.update(f"{header}\n{body}")
+        text = Text.assemble((f"{arrow} Reasoning{status}", "bold dim"))
+        if not collapsed:
+            text.append("\n")
+            if self._content:
+                text.append(self._content)
+            else:
+                text.append("(empty)", "dim italic")
+        self.update(text)
 
 
 def _markdown_text(text: str, width: int) -> Text:
@@ -282,12 +287,13 @@ class ToolCallBlock(Static):
         self._redraw()
 
     def _redraw(self) -> None:
+        # Plain Text, not a markup string — tool arguments are model JSON and
+        # may contain bracket sequences Textual's markup parser takes for tags.
         arrow = "▸" if self.has_class("collapsed") else "▾"
-        header = f"{arrow} ⚙ {escape(self._header)}"
-        if self.has_class("collapsed") or not self._args:
-            self.update(header)
-        else:
-            self.update(f"{header}\n{escape(self._args)}")
+        text = Text(f"{arrow} ⚙ {self._header}")
+        if not self.has_class("collapsed") and self._args:
+            text.append("\n").append(self._args)
+        self.update(text)
 
 
 class SettingsPalette(CommandPalette):

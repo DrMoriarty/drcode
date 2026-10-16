@@ -129,6 +129,13 @@ class TaskManager:
         self.storage.save(task)
         return task
 
+    def delete(self, task_id: str) -> None:
+        """Remove the task entirely: from memory and from disk storage.
+        Intended for parked (held) tasks; the caller decides which statuses
+        may be deleted."""
+        self.tasks.pop(task_id, None)
+        self.storage.delete(task_id)
+
     def set_hold(self, task_id: str, *, on: bool) -> Task:
         """Park a not-yet-started (QUEUED) task out of the backlog (hold) or
         return it to the queue. Held tasks keep their pending input and queue

@@ -503,11 +503,14 @@ class DrCodeApp(App[None]):
     #project-info { height: auto; padding: 0 1; }
     #project-info .project-dir { color: $text-muted; }
     #project-info .app-title { color: $accent; text-style: bold; }
-    #model-status { height: auto; padding: 0 1; }
+    #model-status { height: auto; padding: 0 1; margin-top: 1; }
     #model-status.ok { color: $success; }
     #model-status.warn { color: $warning; }
     #model-status.error { color: $error; }
-    #activity-status { height: auto; padding: 0 1; color: $text-disabled; }
+    #activity-status {
+        height: auto; padding: 0 1; margin-top: 1;
+        color: $text-disabled;
+    }
     #activity-status.fresh { color: $success; }
     #activity-status.stale { color: $warning; }
     #chat-col { height: 1fr; }

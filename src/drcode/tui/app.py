@@ -1268,9 +1268,11 @@ class DrCodeApp(App[None]):
                         self.view_task(task_id)
                 except asyncio.CancelledError:
                     # Interrupted (abort or a new comment): keep the message so
-                    # the agent retries it on the next activation.
+                    # the agent retries it on the next activation. Appended to
+                    # the END, not the head: newer user input (sent after the
+                    # abort) must reach the agent first.
                     cancelled = True
-                    task.pending_input.insert(0, text)
+                    task.pending_input.append(text)
                     # Persist whatever the interrupted turn managed to do,
                     # otherwise its whole work survives only in the widgets
                     # and vanishes from the history on the next view_task().
@@ -1604,7 +1606,7 @@ class DrCodeApp(App[None]):
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
-        self.manager.send(task.id, text)
+        self.manager.send(task.id, text, priority=task.status is TaskStatus.ACTIVE)
         if task.status is TaskStatus.ACTIVE:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back

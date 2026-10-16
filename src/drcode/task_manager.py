@@ -80,14 +80,21 @@ class TaskManager:
         self.storage.save(task)
         return task
 
-    def send(self, task_id: str, text: str) -> Task:
+    def send(self, task_id: str, text: str, *, priority: bool = False) -> Task:
         """Add user input to a task. A completed (or being-tested) task
         re-enters the pipeline; an answered clarification goes to the head
         of the queue. Promotion (activation) is up to the caller: the app
         advances the pipeline through _advance(), which never starts new
-        development while any testing is incomplete."""
+        development while any testing is incomplete.
+
+        `priority` puts the text at the head of pending_input: a fresh user
+        message to an active task must be seen by the agent before any
+        earlier queued input (e.g. a prompt re-queued by an aborted run)."""
         task = self.get(task_id)
-        task.pending_input.append(text.strip())
+        if priority:
+            task.pending_input.insert(0, text.strip())
+        else:
+            task.pending_input.append(text.strip())
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             task.status = TaskStatus.QUEUED
             # Old verification label no longer applies: the task will be

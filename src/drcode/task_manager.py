@@ -12,11 +12,27 @@ class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
         self.tasks: dict[str, Task] = {t.id: t for t in self.storage.load_all()}
+        # Monotonic queue-position counter: bumped when a task is explicitly
+        # re-positioned in the queue (kind change to bug → head, to feature
+        # → tail). Older tasks without a stamp get one in created_at order,
+        # so the stamp reproduces the historical ordering exactly.
+        self._queue_seq = max(
+            (t.queue_seq for t in self.tasks.values() if t.queue_seq is not None),
+            default=0,
+        )
+        for t in sorted(self.tasks.values(), key=lambda t: t.created_at):
+            if t.queue_seq is None:
+                t.queue_seq = self._next_queue_seq()
+                self.storage.save(t)
         # On startup at most one task may have been active when the app closed.
         for t in self.tasks.values():
             if t.status is TaskStatus.ACTIVE:
                 t.status = TaskStatus.QUEUED
                 self.storage.save(t)
+
+    def _next_queue_seq(self) -> int:
+        self._queue_seq += 1
+        return self._queue_seq
 
     # -- queries ------------------------------------------------------------
 
@@ -36,9 +52,15 @@ class TaskManager:
     def queued(self) -> list[Task]:
         tasks = [t for t in self.all_tasks() if t.status is TaskStatus.QUEUED]
         # Answered clarifications jump the queue first, then bug reports
-        # (both oldest first), then features.
+        # (both oldest first), then features. Within each group the explicit
+        # queue stamp orders the tasks: it starts as the creation order and
+        # is bumped when a task is re-positioned (e.g. by a kind change).
         tasks.sort(
-            key=lambda t: (not t.queue_head, t.kind is not TaskKind.BUG, t.created_at)
+            key=lambda t: (
+                not t.queue_head,
+                t.kind is not TaskKind.BUG,
+                t.queue_seq if t.queue_seq is not None else 0,
+            )
         )
         return tasks
 
@@ -50,6 +72,7 @@ class TaskManager:
         task = Task(
             title=title or first_message.splitlines()[0][:60] or "New task",
             kind=kind,
+            queue_seq=self._next_queue_seq(),
         )
         if first_message.strip():
             task.pending_input.append(first_message.strip())
@@ -83,6 +106,24 @@ class TaskManager:
             # configured — the agent picks it up on the next activation).
             task.touch()
             self.storage.save(task)
+        return task
+
+    def set_kind(self, task_id: str, kind: TaskKind) -> Task:
+        """Change the kind of a not-yet-started (QUEUED) task and re-position
+        it in the queue: bug → head of the queue, feature → tail. Other kinds
+        (documentation) keep the current position. The caller is responsible
+        for only calling this on queued tasks."""
+        task = self.get(task_id)
+        if task.kind is kind:
+            return task
+        task.kind = kind
+        if kind is TaskKind.BUG:
+            task.queue_head = True
+        elif kind is TaskKind.FEATURE:
+            task.queue_head = False
+            task.queue_seq = self._next_queue_seq()
+        task.touch()
+        self.storage.save(task)
         return task
 
     def mark_done(self, task_id: str) -> Task:

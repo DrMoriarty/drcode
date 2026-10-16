@@ -84,6 +84,10 @@ class Task(BaseModel):
     events: list[TaskEvent] = Field(default_factory=list)
     # Answered clarification tasks jump to the head of the queue.
     queue_head: bool = False
+    # Explicit position stamp within the queue (assigned in created_at order
+    # on load, bumped when a task is re-positioned, e.g. by a kind change).
+    # Together with queue_head and kind it fully determines queue order.
+    queue_seq: int | None = None
 
     def touch(self) -> None:
         self.updated_at = _now()

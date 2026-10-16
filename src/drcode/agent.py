@@ -29,12 +29,32 @@ from .config import Config
 from .models import Clarification, TaskKind, TaskStatus, VerificationStatus
 from .task_manager import TaskManager
 
-SYSTEM_PROMPT = """\
+FEATURE_SYSTEM_PROMPT = """\
 You are drcode, an expert software engineering agent working directly in the user's repository.
 You can read, create and edit files, search the codebase and run shell commands.
 Work autonomously: explore the code, implement the requested change, run tests or
 builds when available, and report a concise summary of what you did.
-Prefer minimal, focused changes. Never commit to git unless explicitly asked.
+You are implementing a FEATURE. Do not shy away from large changes: refactoring
+the existing codebase, introducing new classes and modules, and restructuring
+existing code are all normal and expected parts of building a feature — do them
+when they make the result better, cleaner or more maintainable. Never commit to
+git unless explicitly asked.
+If the request is ambiguous or missing a detail you cannot resolve from the code,
+call ask_clarifying_question instead of guessing. After calling it the task is
+paused awaiting the user's answer: end your turn immediately and do not call any
+more tools.\
+"""
+
+BUG_SYSTEM_PROMPT = """\
+You are drcode, an expert software engineering agent working directly in the user's repository.
+You can read, create and edit files, search the codebase and run shell commands.
+Work autonomously: explore the code, implement the requested change, run tests or
+builds when available, and report a concise summary of what you did.
+You are fixing a BUG. Your goal is to fix the bug with MINIMAL changes — touch
+only what is necessary to make the bug go away. Large changes, refactoring,
+creating new classes or modules and other restructuring must happen ONLY when
+the bug cannot be fixed otherwise; if a minimal fix is possible, always choose it.
+Never commit to git unless explicitly asked.
 If the request is ambiguous or missing a detail you cannot resolve from the code,
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
@@ -93,14 +113,17 @@ def load_agents_md(root: Path) -> str:
 def build_agent(
     config: Config, kind: TaskKind = TaskKind.FEATURE, root: Path | None = None
 ) -> Agent[AgentDeps, str]:
-    """Build the coding agent. Documentation tasks get a dedicated system
-    prompt (answer questions / update docs) but the same tool set. When the
-    project root contains AGENTS.md, its content is appended to the
-    instructions."""
+    """Build the coding agent. Every task kind gets a dedicated system prompt:
+    bug tasks instruct minimal changes, feature tasks encourage refactoring and
+    new classes, documentation tasks answer questions / update docs. The tool
+    set is the same for all kinds. When the project root contains AGENTS.md,
+    its content is appended to the instructions."""
     model = build_model(config)
-    base_prompt = (
-        DOCUMENTATION_SYSTEM_PROMPT if kind is TaskKind.DOCUMENTATION else SYSTEM_PROMPT
-    )
+    base_prompt = {
+        TaskKind.BUG: BUG_SYSTEM_PROMPT,
+        TaskKind.FEATURE: FEATURE_SYSTEM_PROMPT,
+        TaskKind.DOCUMENTATION: DOCUMENTATION_SYSTEM_PROMPT,
+    }[kind]
     instructions = base_prompt
     if root is not None:
         agents_md = load_agents_md(root)
@@ -446,7 +469,9 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 __all__ = [
+    "BUG_SYSTEM_PROMPT",
     "DOCUMENTATION_SYSTEM_PROMPT",
+    "FEATURE_SYSTEM_PROMPT",
     "AgentDeps",
     "ModelRequest",
     "ModelResponse",

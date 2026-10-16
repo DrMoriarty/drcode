@@ -287,6 +287,7 @@ class DrCodeApp(App[None]):
         ("ctrl+d", "done_task", "Done"),
         ("ctrl+o", "focus_sidebar", "Tasks"),
         ("ctrl+i", "focus_input", "Input"),
+        ("ctrl+t", "cycle_task_kind", "Change type"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -484,6 +485,7 @@ class DrCodeApp(App[None]):
             (
                 t.id,
                 t.status.value,
+                t.kind.value,
                 t.verification,
                 t.title_display,
                 t.id == self.viewed_id,
@@ -1418,6 +1420,21 @@ class DrCodeApp(App[None]):
             # resurrected by a later add_class("visible").
             self._clear_stream_label()
             self.refresh_status()
+
+    def action_cycle_task_kind(self) -> None:
+        """Cycle the type of the viewed task (feature → bug → documentation).
+        Only a queued (not yet started) task can be re-typed; bug moves it
+        to the head of the queue, feature — to the tail."""
+        task = self.viewed
+        if task is None or task.status is not TaskStatus.QUEUED:
+            return
+        idx = self._KIND_CYCLE.index(task.kind)
+        new_kind = self._KIND_CYCLE[(idx + 1) % len(self._KIND_CYCLE)]
+        self.manager.set_kind(task.id, new_kind)
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
 
     def action_focus_sidebar(self) -> None:
         self.sidebar.focus()

@@ -9,8 +9,10 @@ import ssl
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import httpx
 from pydantic_ai import Agent
@@ -31,9 +33,15 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, get_system_commands_provider
 from textual.binding import Binding
-from textual.command import CommandPalette
+from textual.command import (
+    CommandPalette,
+    DiscoveryHit,
+    Hit,
+    Hits,
+    Provider,
+)
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import ThemeProvider
 from textual.timer import Timer
@@ -56,6 +64,7 @@ from ..agent import (
     build_tester_agent,
     ends_with_open_request,
     extract_display,
+    first_user_prompt,
     is_pending_retry,
     last_context_tokens,
     resumable_history,
@@ -72,8 +81,14 @@ from ..models import (
     TaskStatus,
     VerificationStatus,
 )
+from ..prompts import load_init_repo_prompt
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
+
+# Sort anchor for history entries without a recorded timestamp (old
+# transcripts predating per-message stamps): they keep their relative
+# order and sort before everything that has a real time.
+_MIN_TIME = datetime.min.replace(tzinfo=UTC)
 
 
 class TaskItem(ListItem):
@@ -386,12 +401,46 @@ class SettingsPalette(CommandPalette):
     """
 
 
+class ServiceCommandsProvider(Provider):
+    """App-specific commands in the Settings palette.
+
+    Registered alongside the system commands via `DrCodeApp.COMMANDS`;
+    every hit is an app action that creates a pre-configured service task.
+    """
+
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app = cast("DrCodeApp", self.app)
+        return [
+            (
+                "Обновить/создать AGENTS.md",
+                "documentation task: agent creates or refreshes AGENTS.md",
+                app.action_update_agents_md,
+            ),
+        ]
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._commands():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._commands():
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
 class DrCodeApp(App[None]):
     # The stock command-palette binding (ctrl+p, shown as "palette" in the
     # footer) is replaced by our own "Settings" binding (ctrl+s) below;
     # disabling the built-in also stops it from shadowing the app's own
     # settings binding.
     ENABLE_COMMAND_PALETTE: ClassVar[bool] = False
+
+    # Providers for the Settings palette (it passes no explicit providers,
+    # so it reads this set): the system commands (theme, quit, …) plus our
+    # own service commands (AGENTS.md refresh and friends).
+    COMMANDS: ClassVar = {get_system_commands_provider, ServiceCommandsProvider}
 
     CSS = """
     Screen { layers: base toast; }
@@ -1057,26 +1106,44 @@ class DrCodeApp(App[None]):
         self._chat_has_content = False
         self._pending_rendered = []
         self._clear_stream_label()
-        for role, text in extract_display(task.messages):
-            self._write_history_line(role, text)
-        # Tester rounds come after the development transcript, each behind
-        # its own "testing" separator. The tester's synthetic prompt
-        # ("Verify completed task #…") is not shown.
+        # Rebuild the full history as ONE chronological timeline. Both the
+        # serialized transcripts (per-message timestamps) and the service
+        # events (TaskEvent.at) carry wall-clock stamps, so a stable sort
+        # by timestamp reproduces exactly the order in which the entries
+        # were rendered live — the same order on every (re)open, instead of
+        # clumping all events at the tail.
+        timeline: list[tuple[datetime, int, str, str]] = []
+        seq = 0
+
+        def _add(at: datetime | None, role: str, text: str) -> None:
+            nonlocal seq
+            timeline.append((at or _MIN_TIME, seq, role, text))
+            seq += 1
+
+        for at, role, text in extract_display(task.messages):
+            _add(at, role, text)
+        # Tester rounds: the synthetic prompt ("Verify completed task #…")
+        # is not shown; each round is announced by its own "testing"
+        # separator anchored at the round's first message.
         for round_messages in task.tester_messages:
             if not round_messages:
                 continue
-            self._write_history_line("testing-sep", "")
-            for role, text in extract_display(round_messages):
+            round_items = extract_display(round_messages)
+            round_at = next((at for at, _, _ in round_items if at is not None), None)
+            _add(round_at, "testing-sep", "")
+            for at, role, text in round_items:
                 if role == "user":
                     continue
                 if role == "tool-call":
                     text = f"tester: {text}"
-                self._write_history_line(role, text)
-        # Service events (failures, skips) — human-only, with timestamps.
-        if task.events:
-            self._write_history_line("events-sep", "")
-            for event in task.events:
-                self._write_history_line("event", self._format_event(event))
+                _add(at, role, text)
+        # Service events (failures, skips) — human-only, with timestamps;
+        # interleaved at the position they occurred at.
+        for event in task.events:
+            _add(event.at, "event", self._format_event(event))
+        timeline.sort(key=lambda item: item[:2])
+        for _, _, role, text in timeline:
+            self._write_history_line(role, text)
         for pending in task.pending_input:
             if is_pending_retry(task.messages, pending):
                 # The failed/interrupted run left this prompt in the
@@ -1140,8 +1207,6 @@ class DrCodeApp(App[None]):
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
             self._write_chat(f"[bold magenta]──── {label} ────[/]")
-        elif role == "events-sep":
-            self._write_chat("[bold red]──── service events ────[/]")
         elif role == "event":
             self._write_chat(f"[bold red]event ›[/] {text}")
         elif role == "system":
@@ -1708,9 +1773,13 @@ class DrCodeApp(App[None]):
                 root=self.project_root, manager=self.manager, task_id=task_id
             )
             try:
-                async with tester.iter(
-                    f"Verify completed task #{task.id}: {task.title}", deps=deps
-                ) as run:
+                prompt = f"Verify completed task #{task.id}: {task.title}"
+                # The tester needs the original assignment to paraphrase it
+                # into a commit message (see the git_commit step in its prompt).
+                original = first_user_prompt(task.messages)
+                if original and original != task.title:
+                    prompt += f"\n\nOriginal task:\n{original}"
+                async with tester.iter(prompt, deps=deps) as run:
                     async for node in run:
                         if Agent.is_call_tools_node(node):
                             async with node.stream(run.ctx) as stream:
@@ -1979,6 +2048,24 @@ class DrCodeApp(App[None]):
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
+
+    def action_update_agents_md(self) -> None:
+        """Create a documentation task that writes/refreshes AGENTS.md.
+
+        The task is pre-filled with the bundled init-repo prompt (its final
+        paragraph names the actual project directory) and runs with the
+        `documentation` kind: the tester is skipped and mark_done() completes
+        it right away."""
+        task = self.manager.create(
+            "Обновить/создать AGENTS.md",
+            load_init_repo_prompt(self.project_root),
+            kind=TaskKind.DOCUMENTATION,
+        )
+        self.refresh_sidebar()
+        self.view_task(task.id)
+        self.chat_input.focus()
+        # Starts immediately unless testing is pending or the queue is busy.
+        self._advance()
 
     def action_change_theme(self) -> None:
         """Theme picker, opened from the Settings palette ("Theme" command).

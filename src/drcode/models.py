@@ -81,6 +81,10 @@ class Task(BaseModel):
     tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
     # User messages typed while the task is queued/not yet processed.
     pending_input: list[str] = Field(default_factory=list)
+    # When the task reached COMPLETED (tester verdict, documentation done or
+    # user cancel). Drives the startup auto-cleanup of old completed tasks
+    # (see ProjectSettings.completed_retention); None while not completed.
+    completed_at: datetime | None = None
     # True when the last agent attempt was interrupted (abort, error) and
     # may have left work undone. Replaces the old "re-queue the consumed
     # prompt" retry marker: the prompt stays in the transcript at its

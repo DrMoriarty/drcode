@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from .models import (
     TaskKind,
     TaskStatus,
     VerificationStatus,
+    _now,
 )
 from .task_manager import TaskManager
 from .tools import PathViolation
@@ -287,14 +290,21 @@ Steps:
 tests (pytest, npm test, cargo test, …) and a build/compile command.
 2. Run each detected check via run_bash. If there are no tests or linters configured, \
 say so and still try to build/compile the project.
-3. If everything passes, call set_verification(success=True) and give a short summary \
-of what you ran.
-4. If anything fails, call set_verification(success=False), then call create_bug_report \
+3. If everything passes: before labelling the task, check whether the project root is \
+a git repository (git_commit does this itself). If it is, write a short commit message \
+that concisely paraphrases the original task (imperative mood, e.g. "Add retry logic \
+to the tester pipeline") and call git_commit with it. If the commit fails (e.g. git \
+identity is not configured), still pass verification and mention the failure in your \
+summary. If the project is not a git repository, skip the commit entirely.
+4. Call set_verification(success=True) and give a short summary of what you ran \
+(and whether a commit was made).
+5. If anything fails, call set_verification(success=False), then call create_bug_report \
 with a clear title and a description containing what failed, the exact command and the \
 error output, and give a short summary.
 
 Your filesystem tools are read-only and you must not modify any files; run_bash is for \
-running checks only.\
+running checks only. The single exception is git_commit, used only after all checks \
+passed: it stages the changes and commits them.\
 """
 
 
@@ -355,6 +365,29 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
         return f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
 
     @agent.tool
+    async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
+        """Stage all changed files in the project root and create a git commit
+        with the given message. Use only after all checks passed, with a short
+        message paraphrasing the original task. Skips gracefully when the
+        project root is not a git repository or there is nothing to commit."""
+        root = ctx.deps.root
+        message = message.strip().strip("'\"")
+        if not message:
+            return "Empty commit message — nothing committed."
+        inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
+        if not inside.startswith("exit=0") or "true" not in inside:
+            return "Not a git repository — nothing committed."
+        await tools.run_bash(root, "git add -A -- . ':(exclude).drcode'")
+        staged = await tools.run_bash(root, "git diff --cached --name-only")
+        if staged.startswith("exit=0") and not staged.removeprefix("exit=0").strip():
+            return "Nothing to commit — the working tree is clean."
+        commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
+        if not commit.startswith("exit=0"):
+            return f"Commit failed:\n{commit}"
+        head = await tools.run_bash(root, "git log -1 --oneline")
+        return f"Committed successfully.\n{head}"
+
+    @agent.tool
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:
         """Set the verification label on the verified task (passed or failed)
         and finish its testing: the task becomes completed."""
@@ -363,6 +396,7 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
             VerificationStatus.PASSED if success else VerificationStatus.FAILED
         )
         task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
         task.touch()
         ctx.deps.manager.storage.save(task)
         return f"Verification label set: {task.verification.value}; task completed."
@@ -498,26 +532,80 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     return True
 
 
-def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Turn serialized ModelMessages into (role, text) pairs for the chat UI.
+def first_user_prompt(messages: list[dict[str, Any]]) -> str:
+    """First user prompt of a serialized transcript — the original task text.
+
+    Used to hand the tester the task's initial assignment (the title alone is
+    often too terse to paraphrase into a commit message).
+    """
+    for msg in messages:
+        if msg.get("kind") != "request" and msg.get("role") != "request":
+            continue
+        for part in msg.get("parts", []):
+            if part.get("part_kind") == "user-prompt":
+                content = part.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+    return ""
+
+
+def _message_time(msg: dict[str, Any]) -> datetime | None:
+    """Timestamp of a serialized ModelMessage (None when not recorded).
+
+    pydantic-ai 2.x puts a top-level `timestamp` on both ModelRequest and
+    ModelResponse; older transcripts only carried per-part timestamps on
+    requests (UserPromptPart / ToolReturnPart), so those are used as a
+    fallback (the latest part stamp)."""
+    raw = msg.get("timestamp")
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, datetime):
+        return raw
+    stamps: list[datetime] = []
+    for part in msg.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+        part_raw = part.get("timestamp")
+        if isinstance(part_raw, str):
+            try:
+                stamps.append(datetime.fromisoformat(part_raw))
+            except ValueError:
+                pass
+        elif isinstance(part_raw, datetime):
+            stamps.append(part_raw)
+    return max(stamps) if stamps else None
+
+
+def extract_display(
+    messages: list[dict[str, Any]],
+) -> list[tuple[datetime | None, str, str]]:
+    """Turn serialized ModelMessages into (timestamp, role, text) triples
+    for the chat UI.
 
     Roles: "user", "reasoning" (model thinking), "assistant" (text),
     "tool-call" (name(args) line; the TUI shows the name as the collapsed
     header and the args in the expandable body), rendered by the TUI in
-    message order.
+    message order. The timestamp (message creation time, None when the
+    transcript format didn't record one) lets the TUI interleave these
+    entries with other timestamped streams (service events, tester rounds)
+    into a single chronological timeline.
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[datetime | None, str, str]] = []
     reasoning: list[str] = []
     chunks: list[str] = []
     for msg in messages:
         # pydantic-ai 2.x serializes ModelRequest with "kind": "request"
         # (older versions used "role"); support both.
+        at = _message_time(msg)
         if msg.get("kind") == "request" or msg.get("role") == "request":
             for part in msg.get("parts", []):
                 if part.get("part_kind") == "user-prompt":
                     content = part.get("content")
                     if isinstance(content, str) and content:
-                        out.append(("user", content))
+                        out.append((at, "user", content))
             continue
         for part in msg.get("parts", []):
             kind = part.get("part_kind")
@@ -525,14 +613,14 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
                 content = part.get("content", "")
                 if content:
                     if chunks:
-                        out.append(("assistant", "\n".join(chunks)))
+                        out.append((at, "assistant", "\n".join(chunks)))
                         chunks = []
                     reasoning.append(content)
             elif kind == "text":
                 content = part.get("content", "")
                 if content:
                     if reasoning:
-                        out.append(("reasoning", "\n\n".join(reasoning)))
+                        out.append((at, "reasoning", "\n\n".join(reasoning)))
                         reasoning = []
                     chunks.append(content)
             elif kind == "tool-call":
@@ -543,17 +631,19 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
                     else json.dumps(args or {}, ensure_ascii=False)
                 )
                 if reasoning:
-                    out.append(("reasoning", "\n\n".join(reasoning)))
+                    out.append((at, "reasoning", "\n\n".join(reasoning)))
                     reasoning = []
                 if chunks:
-                    out.append(("assistant", "\n".join(chunks)))
+                    out.append((at, "assistant", "\n".join(chunks)))
                     chunks = []
-                out.append(("tool-call", f"{part.get('tool_name', '?')}({args_str})"))
+                out.append(
+                    (at, "tool-call", f"{part.get('tool_name', '?')}({args_str})")
+                )
         if reasoning:
-            out.append(("reasoning", "\n\n".join(reasoning)))
+            out.append((at, "reasoning", "\n\n".join(reasoning)))
             reasoning = []
         if chunks:
-            out.append(("assistant", "\n".join(chunks)))
+            out.append((at, "assistant", "\n".join(chunks)))
             chunks = []
     return out
 
@@ -574,6 +664,7 @@ __all__ = [
     "build_tester_agent",
     "ends_with_open_request",
     "extract_display",
+    "first_user_prompt",
     "is_pending_retry",
     "last_context_tokens",
     "load_agents_md",

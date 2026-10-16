@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
-from .models import Task, TaskKind, TaskStatus
+from .models import Task, TaskKind, TaskStatus, _now
 from .storage import Storage
 
 
@@ -96,6 +97,9 @@ class TaskManager:
             # Old verification label no longer applies: the task will be
             # tested again after its next development round.
             task.verification = None
+            # Fresh pipeline run: the completion timestamp (auto-cleanup
+            # anchor) restarts with the eventual new completion.
+            task.completed_at = None
             task.touch()
             self.storage.save(task)
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
@@ -135,6 +139,28 @@ class TaskManager:
         may be deleted."""
         self.tasks.pop(task_id, None)
         self.storage.delete(task_id)
+
+    def purge_expired_completed(self, retention_days: int | None) -> list[Task]:
+        """Delete COMPLETED tasks older than the retention period.
+
+        Runs once at app startup. `retention_days` None (setting "never")
+        disables the cleanup. Age anchor: `completed_at` (set on every
+        transition to COMPLETED); for tasks completed by an older build
+        without the timestamp, `updated_at` is used as a fallback. Returns
+        the removed tasks so the caller can report the cleanup.
+        """
+        if retention_days is None:
+            return []
+        cutoff = _now() - timedelta(days=retention_days)
+        expired = [
+            t
+            for t in self.tasks.values()
+            if t.status is TaskStatus.COMPLETED
+            and (t.completed_at or t.updated_at) < cutoff
+        ]
+        for task in expired:
+            self.delete(task.id)
+        return expired
 
     def set_hold(self, task_id: str, *, on: bool) -> Task:
         """Park a not-yet-started task out of the backlog (hold) or return it
@@ -186,6 +212,8 @@ class TaskManager:
             if task.kind is TaskKind.DOCUMENTATION
             else TaskStatus.TESTING
         )
+        if task.status is TaskStatus.COMPLETED:
+            task.completed_at = _now()
         task.touch()
         self.storage.save(task)
         return task
@@ -218,6 +246,7 @@ class TaskManager:
         task.clarification = None
         task.queue_head = False
         task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
         task.touch()
         self.storage.save(task)
         return task

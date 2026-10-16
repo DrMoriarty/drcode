@@ -35,6 +35,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import CommandPalette
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.theme import ThemeProvider
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
@@ -387,8 +388,9 @@ class SettingsPalette(CommandPalette):
 
 class DrCodeApp(App[None]):
     # The stock command-palette binding (ctrl+p, shown as "palette" in the
-    # footer) is replaced by our own "Settings" binding below; disabling the
-    # built-in also stops it from shadowing the app's own ctrl+p binding.
+    # footer) is replaced by our own "Settings" binding (ctrl+s) below;
+    # disabling the built-in also stops it from shadowing the app's own
+    # settings binding.
     ENABLE_COMMAND_PALETTE: ClassVar[bool] = False
 
     CSS = """
@@ -491,7 +493,7 @@ class DrCodeApp(App[None]):
         ("ctrl+o", "focus_sidebar", "Tasks"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+t", "cycle_task_kind", "Change type"),
-        ("ctrl+p", "settings", "Settings"),
+        ("ctrl+s", "settings", "Settings"),
         ("ctrl+h", "toggle_hold", "Hold/Resume"),
         ("ctrl+delete", "delete_task", "Delete held"),
         ("escape", "abort_run", "Stop agent"),
@@ -1973,10 +1975,27 @@ class DrCodeApp(App[None]):
         self.chat_input.focus()
 
     def action_settings(self) -> None:
-        """Open the Settings modal (the command palette, Ctrl+P)."""
+        """Open the Settings modal (the command palette, Ctrl+S)."""
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
+
+    def action_change_theme(self) -> None:
+        """Theme picker, opened from the Settings palette ("Theme" command).
+
+        The stock App.action_change_theme pushes a full-width CommandPalette;
+        reuse the narrowed SettingsPalette instead so the theme list has the
+        same width as the Settings modal.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--theme-palette",
+                providers=[ThemeProvider],
+                placeholder="Search for themes…",
+            )
+        )
 
     # -- events -------------------------------------------------------------------------
 

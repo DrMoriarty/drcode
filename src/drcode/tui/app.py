@@ -197,9 +197,9 @@ class DrCodeApp(App[None]):
     #task-statusbar { dock: top; height: 1; background: $panel; color: $text; padding: 0 1; }
     #chat-log { height: 1fr; border: none; background: $surface; }
     #chat-log > * { margin-bottom: 1; }
-    .reasoning { padding: 0 1; }
+    .reasoning { padding: 0 4; color: $text-muted; }
     .reasoning:hover { background: $panel; }
-    .tool-call { padding: 0 1; color: $text-muted; }
+    .tool-call { padding: 0 4; color: $text-muted; }
     .tool-call:hover { background: $panel; }
     #stream-label { display: none; padding: 0 1; color: $accent; }
     #stream-label.visible { display: block; }
@@ -263,6 +263,10 @@ class DrCodeApp(App[None]):
         self._chat_has_content = False
         # Auto-hide timer for the "copied" toast.
         self._copy_toast_timer: Timer | None = None
+        # Task ids the tester already ran against this session. A TESTING task
+        # the tester failed on (e.g. network down) is not retried in-session —
+        # it stays TESTING and is re-tested on the next startup.
+        self._tester_attempts: set[str] = set()
 
     # -- layout -------------------------------------------------------------
 
@@ -300,8 +304,22 @@ class DrCodeApp(App[None]):
         self.refresh_status()
         self.refresh_connection()
         self.set_interval(30, self.refresh_connection)
-        # Resume after restart: the startup demotion (active -> queued) leaves
-        # pending_input stranded unless the queue is promoted here.
+        # Resume after restart. TESTING tasks (the app died during testing)
+        # are re-tested FIRST, before any queued task goes into development;
+        # run_tester promotes the queue when it finishes. Otherwise the
+        # startup demotion (active -> queued) leaves pending_input stranded
+        # unless the queue is promoted here.
+        testing = next(
+            (
+                t
+                for t in self.manager.all_tasks()
+                if t.status is TaskStatus.TESTING
+            ),
+            None,
+        )
+        if testing is not None:
+            self.run_tester(testing.id)
+            return
         promoted = self.manager.promote_next()
         if promoted:
             self.run_agent(promoted.id)
@@ -401,6 +419,14 @@ class DrCodeApp(App[None]):
             ),
             ("QUEUE", self.manager.queued()),
             (
+                "TESTING",
+                [
+                    t
+                    for t in self.manager.all_tasks()
+                    if t.status is TaskStatus.TESTING
+                ],
+            ),
+            (
                 "COMPLETED",
                 [
                     t
@@ -415,6 +441,7 @@ class DrCodeApp(App[None]):
                 marker = {
                     "queued": "⏳",
                     "active": "▶",
+                    "testing": "🧪",
                     "completed": "✓",
                     "clarification": "❓",
                 }.get(t.status.value, "⏳")

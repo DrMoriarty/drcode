@@ -19,6 +19,10 @@ def _short_id() -> str:
 class TaskStatus(str, enum.Enum):
     QUEUED = "queued"
     ACTIVE = "active"
+    # Development finished, the tester has not labelled the task yet. If the
+    # app dies here, the task is re-tested first on the next startup (before
+    # any queued task is taken into development).
+    TESTING = "testing"
     COMPLETED = "completed"
     AWAITING_CLARIFICATION = "clarification"
 

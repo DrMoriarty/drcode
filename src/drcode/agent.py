@@ -207,14 +207,16 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
 
     @agent.tool
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:
-        """Set the verification label on the verified task: passed or failed."""
+        """Set the verification label on the verified task (passed or failed)
+        and finish its testing: the task becomes completed."""
         task = ctx.deps.manager.get(ctx.deps.task_id)
         task.verification = (
             VerificationStatus.PASSED if success else VerificationStatus.FAILED
         )
+        task.status = TaskStatus.COMPLETED
         task.touch()
         ctx.deps.manager.storage.save(task)
-        return f"Verification label set: {task.verification.value}"
+        return f"Verification label set: {task.verification.value}; task completed."
 
     return agent
 

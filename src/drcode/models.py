@@ -89,7 +89,8 @@ class Task(BaseModel):
     # Service events (tester/agent failures, skips) with timestamps. Human
     # only: never serialized into the model context on resume.
     events: list[TaskEvent] = Field(default_factory=list)
-    # Answered clarification tasks jump to the head of the queue.
+    # Answered clarification tasks jump ahead of other non-bug queued tasks
+    # (bug reports always sort before them).
     queue_head: bool = False
     # Explicit position stamp within the queue (assigned in created_at order
     # on load, bumped when a task is re-positioned, e.g. by a kind change).

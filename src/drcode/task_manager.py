@@ -51,17 +51,19 @@ class TaskManager:
 
     def queued(self) -> list[Task]:
         tasks = [t for t in self.all_tasks() if t.status is TaskStatus.QUEUED]
-        # Answered clarifications jump the queue first, then bug reports
-        # (both oldest first), then features. Within each group the explicit
-        # queue stamp orders the tasks: it starts as the creation order and
-        # is bumped when a task is re-positioned (e.g. by a kind change).
-        tasks.sort(
-            key=lambda t: (
-                not t.queue_head,
-                t.kind is not TaskKind.BUG,
-                t.queue_seq if t.queue_seq is not None else 0,
-            )
-        )
+
+        # Bug reports always come first — newest at the very head, so a bug
+        # report the tester has just created is picked up immediately after
+        # the testing round finishes. Everything else follows: answered
+        # clarifications (queue_head) before the rest, then the explicit
+        # queue stamp (creation order, bumped when a task is re-positioned,
+        # e.g. by a kind change).
+        def _queue_key(t: Task) -> tuple:
+            if t.kind is TaskKind.BUG:
+                return (0, 0, -(t.queue_seq if t.queue_seq is not None else 0))
+            return (1, not t.queue_head, t.queue_seq if t.queue_seq is not None else 0)
+
+        tasks.sort(key=_queue_key)
         return tasks
 
     # -- mutations ------------------------------------------------------------

@@ -1178,7 +1178,13 @@ class DrCodeApp(App[None]):
                                             else:
                                                 continue
                                         elif isinstance(event, PartDeltaEvent):
-                                            delta = event.delta
+                                            if isinstance(
+                                                event.delta,
+                                                ThinkingPartDelta | TextPartDelta,
+                                            ):
+                                                delta = event.delta
+                                            else:
+                                                continue
                                         else:
                                             continue
                                         if (
@@ -1211,6 +1217,7 @@ class DrCodeApp(App[None]):
                                         elif (
                                             isinstance(delta, TextPartDelta)
                                             and delta.content_delta
+                                            and self.viewed_id == task_id
                                         ):
                                             # Stream the answer into the chat
                                             # log as it is produced: the block
@@ -1218,19 +1225,16 @@ class DrCodeApp(App[None]):
                                             # up between the reasoning and
                                             # tool-call blocks (no separate
                                             # preview area under the log).
-                                            if self.viewed_id == task_id:
-                                                if assistant_block is None:
-                                                    assistant_block = AssistantBlock()
-                                                    self._write_chat(assistant_block)
-                                                follow = self._chat_at_bottom()
-                                                assistant_block.append(
-                                                    delta.content_delta
+                                            if assistant_block is None:
+                                                assistant_block = AssistantBlock()
+                                                self._write_chat(assistant_block)
+                                            follow = self._chat_at_bottom()
+                                            assistant_block.append(delta.content_delta)
+                                            if follow:
+                                                self.chat_log.call_after_refresh(
+                                                    self.chat_log.scroll_end,
+                                                    animate=False,
                                                 )
-                                                if follow:
-                                                    self.chat_log.call_after_refresh(
-                                                        self.chat_log.scroll_end,
-                                                        animate=False,
-                                                    )
                                 if reasoning_block is not None:
                                     reasoning_block.finish()
                                 # The stream is closed: this request's usage

@@ -366,61 +366,52 @@ def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
 def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
     """Load persisted messages for resuming an interrupted/previous run.
 
-    A snapshot taken mid-turn may end with an incomplete exchange: tool
-    calls whose results never arrived, or tool results without the
-    follow-up model response. Model APIs reject such a tail, so truncate
-    to the last safe boundary — a user prompt or a completed (tool-call-
-    free) model response.
+    The only tail a model API cannot accept is a half-done exchange: a
+    model response with tool calls whose results never arrived, or a
+    response the stream cut off before any part arrived (an empty
+    assistant message). The transcript is truncated right before such a
+    response. Everything else — user prompts, tool returns, retry prompts,
+    completed text answers — is a valid point to continue from and is
+    kept, so a retried run resumes the attempt where it stopped instead of
+    redoing it from scratch.
     """
     messages = list(load_messages(data))
     cut = 0
     for i, msg in enumerate(messages):
-        if isinstance(msg, ModelRequest):
-            if any(isinstance(p, UserPromptPart) for p in msg.parts):
-                cut = i + 1
-        elif isinstance(msg, ModelResponse) and not any(
-            isinstance(p, ToolCallPart) for p in msg.parts
+        if isinstance(msg, ModelRequest) or (
+            isinstance(msg, ModelResponse)
+            and any(isinstance(p, TextPart) and p.content for p in msg.parts)
+            and not any(isinstance(p, ToolCallPart) for p in msg.parts)
         ):
             cut = i + 1
     return messages[:cut]
 
 
-def strip_retried_prompt(
-    messages: list[ModelMessage], text: str
-) -> tuple[list[ModelMessage], bool]:
-    """Cut an interrupted attempt at `text` out of a resumable transcript.
+def is_unfinished_attempt(history: list[ModelMessage], text: str) -> bool:
+    """True when `text` is already the prompt of an unfinished attempt in
+    `history`: the run that consumed it crashed or was interrupted before
+    finishing, so the attempt must be continued rather than re-sent —
+    re-sending would duplicate the prompt in the transcript. False when the
+    attempt already finished (its last response is a text answer): then an
+    identical prompt is a genuine new request.
 
-    A retried message may already be present in the persisted transcript:
-    an interrupted run persists `all_messages()` (which includes the prompt
-    and any partial work done so far) before the message goes back to
-    `pending_input`. Re-sending the same text as a new prompt would duplicate
-    it — in the stored transcript and as a second user block at the end of
-    the chat. Dropping the prompt together with the incomplete tail after it
-    makes the retry regenerate the attempt cleanly.
-
-    The transcript is left untouched when the attempt already finished —
-    its last model response is text-only (a final answer, no tool calls) —
-    then an identical prompt is a genuine new request, not a retry.
-    Intermediate responses that mix prose with tool calls do not count:
-    an attempt containing them was cut off mid-work.
+    Object-level mirror of `is_pending_retry()`.
     """
     idx = None
-    for i, msg in enumerate(messages):
+    for i, msg in enumerate(history):
         if isinstance(msg, ModelRequest) and any(
             isinstance(p, UserPromptPart) and p.content == text for p in msg.parts
         ):
             idx = i
     if idx is None:
-        return messages, False
-    for msg in reversed(messages[idx + 1 :]):
+        return False
+    for msg in reversed(history[idx + 1 :]):
         if isinstance(msg, ModelResponse):
             finished = any(
                 isinstance(p, TextPart) and p.content for p in msg.parts
             ) and not any(isinstance(p, ToolCallPart) for p in msg.parts)
-            if finished:
-                return messages, False
-            break
-    return messages[:idx], True
+            return not finished
+    return True
 
 
 def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
@@ -429,7 +420,7 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     `pending_input` for a retry). The chat renders the prompt and the partial
     work from the transcript itself; showing the pending copy too would draw
     the same message twice. Serialized-message mirror of
-    `strip_retried_prompt()`.
+    `is_unfinished_attempt()`.
     """
     idx = None
     for i, msg in enumerate(messages):
@@ -527,11 +518,11 @@ __all__ = [
     "build_tester_agent",
     "extract_display",
     "is_pending_retry",
+    "is_unfinished_attempt",
     "last_context_tokens",
     "load_agents_md",
     "load_messages",
     "resumable_history",
     "run_context_tokens",
     "serialize_messages",
-    "strip_retried_prompt",
 ]

@@ -49,11 +49,11 @@ from ..agent import (
     build_tester_agent,
     extract_display,
     is_pending_retry,
+    is_unfinished_attempt,
     last_context_tokens,
     resumable_history,
     run_context_tokens,
     serialize_messages,
-    strip_retried_prompt,
 )
 from ..config import Config
 from ..models import (
@@ -1037,12 +1037,14 @@ class DrCodeApp(App[None]):
                 run = None
                 text = task.pending_input.pop(0)
                 history = resumable_history(task.messages)
-                # A retried message may already be present in the persisted
-                # transcript (the interrupted run saved its prompt and partial
-                # work before re-queueing the text): cut that stale attempt,
-                # otherwise the prompt is duplicated in the transcript and
-                # drawn a second time at the end of the chat.
-                history, is_retry = strip_retried_prompt(history, text)
+                # A crashed/interrupted run may have left this prompt in the
+                # persisted transcript together with everything it managed
+                # to do. Continue that attempt instead of re-sending the
+                # text: re-sending would duplicate the prompt, and
+                # resumable_history() has already trimmed the only tail the
+                # API cannot accept (tool calls without results), so nothing
+                # else from the attempt is lost.
+                is_retry = is_unfinished_attempt(history, text)
                 if self.viewed_id == task_id:
                     if text in self._pending_rendered:
                         # Already shown as a queued block; don't repeat it.
@@ -1051,7 +1053,7 @@ class DrCodeApp(App[None]):
                         self._write_history_line("user", text)
                 try:
                     async with agent.iter(
-                        text,
+                        None if is_retry else text,
                         message_history=history,
                         deps=AgentDeps(
                             root=self.project_root,

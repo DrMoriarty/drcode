@@ -1009,7 +1009,7 @@ class DrCodeApp(App[None]):
             self._current_tool = None
             self._touch_activity()
             self.refresh_status()
-            agent = build_agent(self.config, kind=task.kind)
+            agent = build_agent(self.config, kind=task.kind, root=self.project_root)
             while task.pending_input and task.status is TaskStatus.ACTIVE:
                 run = None
                 text = task.pending_input.pop(0)

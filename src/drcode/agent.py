@@ -82,19 +82,35 @@ def build_model(config: Config):
     return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
 
 
+def load_agents_md(root: Path) -> str:
+    """Return the project's AGENTS.md content, or an empty string if absent."""
+    try:
+        return (root / "AGENTS.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def build_agent(
-    config: Config, kind: TaskKind = TaskKind.FEATURE
+    config: Config, kind: TaskKind = TaskKind.FEATURE, root: Path | None = None
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Documentation tasks get a dedicated system
-    prompt (answer questions / update docs) but the same tool set."""
+    prompt (answer questions / update docs) but the same tool set. When the
+    project root contains AGENTS.md, its content is appended to the
+    instructions."""
     model = build_model(config)
+    base_prompt = (
+        DOCUMENTATION_SYSTEM_PROMPT if kind is TaskKind.DOCUMENTATION else SYSTEM_PROMPT
+    )
+    instructions = base_prompt
+    if root is not None:
+        agents_md = load_agents_md(root)
+        if agents_md.strip():
+            instructions = (
+                f"{base_prompt}\n\n# Project instructions (AGENTS.md)\n\n{agents_md}"
+            )
     agent = Agent(
         model,
-        instructions=(
-            DOCUMENTATION_SYSTEM_PROMPT
-            if kind is TaskKind.DOCUMENTATION
-            else SYSTEM_PROMPT
-        ),
+        instructions=instructions,
         deps_type=AgentDeps,
         model_settings={"extra_headers": EXTRA_HEADERS},
     )
@@ -443,6 +459,7 @@ __all__ = [
     "build_tester_agent",
     "extract_display",
     "last_context_tokens",
+    "load_agents_md",
     "load_messages",
     "resumable_history",
     "run_context_tokens",

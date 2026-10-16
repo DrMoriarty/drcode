@@ -1043,7 +1043,6 @@ class DrCodeApp(App[None]):
                 # otherwise the prompt is duplicated in the transcript and
                 # drawn a second time at the end of the chat.
                 history, is_retry = strip_retried_prompt(history, text)
-                buffer: list[str] = []
                 if self.viewed_id == task_id:
                     if text in self._pending_rendered:
                         # Already shown as a queued block; don't repeat it.
@@ -1063,6 +1062,7 @@ class DrCodeApp(App[None]):
                         async for node in run:
                             if Agent.is_model_request_node(node):
                                 reasoning_block: ReasoningBlock | None = None
+                                assistant_block: AssistantBlock | None = None
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
                                         self._touch_activity()
@@ -1096,11 +1096,29 @@ class DrCodeApp(App[None]):
                                                             self.chat_log.scroll_end,
                                                             animate=False,
                                                         )
-                                        elif isinstance(delta, TextPartDelta):
-                                            # The live preview widget was
-                                            # removed: the text is shown after
-                                            # the turn as an assistant block.
-                                            buffer.append(delta.content_delta)
+                                        elif (
+                                            isinstance(delta, TextPartDelta)
+                                            and delta.content_delta
+                                        ):
+                                            # Stream the answer into the chat
+                                            # log as it is produced: the block
+                                            # grows in place, so the text shows
+                                            # up between the reasoning and
+                                            # tool-call blocks (no separate
+                                            # preview area under the log).
+                                            if self.viewed_id == task_id:
+                                                if assistant_block is None:
+                                                    assistant_block = AssistantBlock()
+                                                    self._write_chat(assistant_block)
+                                                follow = self._chat_at_bottom()
+                                                assistant_block.append(
+                                                    delta.content_delta
+                                                )
+                                                if follow:
+                                                    self.chat_log.call_after_refresh(
+                                                        self.chat_log.scroll_end,
+                                                        animate=False,
+                                                    )
                                 if reasoning_block is not None:
                                     reasoning_block.finish()
                                 # The stream is closed: this request's usage
@@ -1135,17 +1153,23 @@ class DrCodeApp(App[None]):
                                                     f"({args_str})"
                                                 )
                                             )
-                    # Keep the stored history current while the turn runs:
-                    # view_task() renders from task.messages, so without this
-                    # a switch away+back shows the pre-run transcript (for a
-                    # fresh task — an empty chat).
-                    self._persist_task_messages(task, run)
+                            # Keep the stored history current while the
+                            # turn runs: view_task() renders from
+                            # task.messages, so without a per-node snapshot
+                            # a switch away+back mid-turn shows the pre-turn
+                            # transcript and everything streamed before the
+                            # switch is lost from the history.
+                            self._persist_task_messages(task, run)
                     if run.result is not None:
                         task.messages = serialize_messages(run.result.all_messages())
                         self.manager.storage.save(task)
                     if self.viewed_id == task_id:
-                        self._clear_stream_label()
-                        self._write_history_line("assistant", "".join(buffer))
+                        # The streamed reasoning/assistant blocks are already
+                        # in the chat. Re-render from the persisted transcript
+                        # only to cover the case where the view was switched
+                        # away and back mid-run (the streamed blocks were wiped
+                        # by view_task and must be restored from history).
+                        self.view_task(task_id)
                 except asyncio.CancelledError:
                     # Interrupted (abort or a new comment): keep the message so
                     # the agent retries it on the next activation.

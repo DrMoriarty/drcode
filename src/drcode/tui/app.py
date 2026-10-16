@@ -134,6 +134,9 @@ class ReasoningBlock(Static):
         super().__init__(classes="reasoning collapsed")
         self._content = ""
         self._streaming = False
+        # Chat-view epoch this block belongs to; a mid-node view_task()
+        # wipes the log and bumps the app's epoch, orphaning the block.
+        self.stream_epoch = -1
 
     def begin(self) -> None:
         self._streaming = True
@@ -197,6 +200,8 @@ class AssistantBlock(Static):
         self._content = text
         self._text: Text | None = None
         self._width = 0
+        # Chat-view epoch this block belongs to; see ReasoningBlock.
+        self.stream_epoch = -1
 
     def append(self, delta: str) -> None:
         self.set_content(self._content + delta)
@@ -433,6 +438,10 @@ class DrCodeApp(App[None]):
         # this up at persist points, so the status bar reads from here
         # first and falls back to the stored transcript (final value).
         self._live_ctx_tokens: dict[str, int] = {}
+        # Bumped by every view_task(): the streaming loop compares it with
+        # each block's stream_epoch to detect that a mid-node re-render
+        # orphaned the live blocks and they must be re-mounted.
+        self._chat_epoch = 0
 
     # -- layout -------------------------------------------------------------
 
@@ -829,6 +838,11 @@ class DrCodeApp(App[None]):
             self._leave_new_task_mode()
         self.viewed_id = task_id
         task = self.manager.get(task_id)
+        # Wipe marker for the streaming loop: any block created before this
+        # point belongs to a dead view and must be re-mounted on the next
+        # delta (its accumulated content is carried over, so the live text
+        # never loses the tail of an in-flight response).
+        self._chat_epoch += 1
         self.chat_log.remove_children()
         self._chat_has_content = False
         self._pending_rendered = []
@@ -1191,33 +1205,60 @@ class DrCodeApp(App[None]):
                                             isinstance(delta, ThinkingPartDelta)
                                             and delta.content_delta
                                         ):
-                                            if self.viewed_id == task_id:
-                                                if reasoning_block is None:
-                                                    reasoning_block = ReasoningBlock()
-                                                    reasoning_block.begin()
+                                            if (
+                                                reasoning_block is None
+                                                or reasoning_block.stream_epoch
+                                                != self._chat_epoch
+                                            ):
+                                                old, reasoning_block = (
+                                                    reasoning_block,
+                                                    ReasoningBlock(),
+                                                )
+                                                reasoning_block.stream_epoch = (
+                                                    self._chat_epoch
+                                                )
+                                                if old is not None:
+                                                    # A mid-node view_task()
+                                                    # re-render orphaned the
+                                                    # old block: carry the
+                                                    # already-streamed text
+                                                    # over, or the rest of
+                                                    # this response would
+                                                    # never become visible.
+                                                    reasoning_block.set_content(
+                                                        old._content
+                                                    )
+                                                reasoning_block.begin()
+                                                if self.viewed_id == task_id:
                                                     self._write_chat(reasoning_block)
-                                                    reasoning_block.append(
-                                                        delta.content_delta
+                                                reasoning_block.append(
+                                                    delta.content_delta
+                                                )
+                                            else:
+                                                # Streaming grows the block
+                                                # without a new mount: keep
+                                                # following only if the tail
+                                                # was visible before the
+                                                # delta arrived. Deltas are
+                                                # appended even when the task
+                                                # is off-screen: they must
+                                                # survive a later re-render.
+                                                follow = (
+                                                    self._chat_at_bottom()
+                                                    if self.viewed_id == task_id
+                                                    else False
+                                                )
+                                                reasoning_block.append(
+                                                    delta.content_delta
+                                                )
+                                                if follow:
+                                                    self.chat_log.call_after_refresh(
+                                                        self.chat_log.scroll_end,
+                                                        animate=False,
                                                     )
-                                                else:
-                                                    # Streaming grows the block
-                                                    # without a new mount: keep
-                                                    # following only if the tail
-                                                    # was visible before the
-                                                    # delta arrived.
-                                                    follow = self._chat_at_bottom()
-                                                    reasoning_block.append(
-                                                        delta.content_delta
-                                                    )
-                                                    if follow:
-                                                        self.chat_log.call_after_refresh(
-                                                            self.chat_log.scroll_end,
-                                                            animate=False,
-                                                        )
                                         elif (
                                             isinstance(delta, TextPartDelta)
                                             and delta.content_delta
-                                            and self.viewed_id == task_id
                                         ):
                                             # Stream the answer into the chat
                                             # log as it is produced: the block
@@ -1225,16 +1266,45 @@ class DrCodeApp(App[None]):
                                             # up between the reasoning and
                                             # tool-call blocks (no separate
                                             # preview area under the log).
-                                            if assistant_block is None:
-                                                assistant_block = AssistantBlock()
-                                                self._write_chat(assistant_block)
-                                            follow = self._chat_at_bottom()
-                                            assistant_block.append(delta.content_delta)
-                                            if follow:
-                                                self.chat_log.call_after_refresh(
-                                                    self.chat_log.scroll_end,
-                                                    animate=False,
+                                            if (
+                                                assistant_block is None
+                                                or assistant_block.stream_epoch
+                                                != self._chat_epoch
+                                            ):
+                                                old, assistant_block = (
+                                                    assistant_block,
+                                                    AssistantBlock(),
                                                 )
+                                                assistant_block.stream_epoch = (
+                                                    self._chat_epoch
+                                                )
+                                                if old is not None:
+                                                    # See the reasoning branch:
+                                                    # re-mount after a mid-node
+                                                    # view_task() wipe, keeping
+                                                    # the streamed so far.
+                                                    assistant_block.set_content(
+                                                        old._content
+                                                    )
+                                                if self.viewed_id == task_id:
+                                                    self._write_chat(assistant_block)
+                                                assistant_block.append(
+                                                    delta.content_delta
+                                                )
+                                            else:
+                                                follow = (
+                                                    self._chat_at_bottom()
+                                                    if self.viewed_id == task_id
+                                                    else False
+                                                )
+                                                assistant_block.append(
+                                                    delta.content_delta
+                                                )
+                                                if follow:
+                                                    self.chat_log.call_after_refresh(
+                                                        self.chat_log.scroll_end,
+                                                        animate=False,
+                                                    )
                                 if reasoning_block is not None:
                                     reasoning_block.finish()
                                 # The stream is closed: this request's usage

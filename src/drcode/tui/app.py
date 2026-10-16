@@ -6,6 +6,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -14,6 +15,7 @@ from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
+    FunctionToolResultEvent,
     PartDeltaEvent,
     TextPartDelta,
     ThinkingPartDelta,
@@ -190,10 +192,15 @@ class DrCodeApp(App[None]):
     #main { height: 1fr; }
     #sidebar-col { width: 36; border-right: solid $primary; }
     #sidebar { height: 1fr; border: none; }
-    #model-status { dock: bottom; height: auto; padding: 0 1; }
+    # Sidebar bottom: model-status then activity-status, plain flow
+    # (no dock) so they always stack in compose order under the list.
+    #model-status { height: auto; padding: 0 1; }
     #model-status.ok { color: $success; }
     #model-status.warn { color: $warning; }
     #model-status.error { color: $error; }
+    #activity-status { height: auto; padding: 0 1; color: $text-disabled; }
+    #activity-status.fresh { color: $success; }
+    #activity-status.stale { color: $warning; }
     #chat-col { height: 1fr; }
     #task-statusbar { dock: top; height: 1; background: $panel; color: $text; padding: 0 1; }
     #chat-log { height: 1fr; border: none; background: $surface; }
@@ -282,6 +289,14 @@ class DrCodeApp(App[None]):
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
+        # Last moment an agent/tester event (stream delta, tool call/result)
+        # was seen; the activity label compares it against now. Zero means
+        # the current run has not emitted anything yet.
+        self._last_activity = 0.0
+        # Tool the run is currently waiting on (name at call start, cleared
+        # on the result event) — lets the label distinguish "tool busy" from
+        # "total silence".
+        self._current_tool: str | None = None
 
     # -- layout -------------------------------------------------------------
 
@@ -291,6 +306,7 @@ class DrCodeApp(App[None]):
             with Vertical(id="sidebar-col"):
                 yield ListView(id="sidebar")
                 yield Static("", id="model-status")
+                yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
                 yield Static("", id="task-statusbar")
                 yield VerticalScroll(id="chat-log")
@@ -323,6 +339,7 @@ class DrCodeApp(App[None]):
         # also mutate mid-run (agent tools, promote_next in the worker
         # finally-blocks) where no one calls refresh_sidebar().
         self.set_interval(1.0, self._poll_sidebar)
+        self.set_interval(1.0, self._poll_activity)
         # Resume after restart. TESTING tasks (the app died during testing)
         # are re-tested FIRST, before any queued task goes into development;
         # run_tester promotes the queue when it finishes. Otherwise the
@@ -357,6 +374,10 @@ class DrCodeApp(App[None]):
     @property
     def model_status(self) -> Static:
         return self.query_one("#model-status", Static)
+
+    @property
+    def activity_status(self) -> Static:
+        return self.query_one("#activity-status", Static)
 
     @property
     def viewed(self) -> Task | None:
@@ -545,6 +566,47 @@ class DrCodeApp(App[None]):
             label.add_class("error")
             label.update(f"✗ {model} — unavailable (HTTP {resp.status_code})")
 
+    # -- run activity indicator ----------------------------------------------
+
+    def _touch_activity(self, tool: str | None = None, *, done: bool = False) -> None:
+        """Record a sign of life from the agent/tester run. `tool` marks a
+        tool call start; `done` clears the current-tool marker (result
+        arrived)."""
+        self._last_activity = time.monotonic()
+        if done:
+            self._current_tool = None
+        elif tool is not None:
+            self._current_tool = tool
+
+    @staticmethod
+    def _fmt_age(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+
+    def _poll_activity(self) -> None:
+        """Every second, show in the sidebar whether the run makes progress
+        or has gone silent (hung model request, long tool, deadlock)."""
+        label = self.activity_status
+        if not (self.agent_running or self.tester_running):
+            label.remove_class("fresh", "stale")
+            label.update("○ idle")
+            return
+        who = "agent" if self.agent_running else "tester"
+        age = int(time.monotonic() - self._last_activity)
+        if self._current_tool:
+            detail = f"tool {self._current_tool} running {self._fmt_age(age)}"
+        else:
+            detail = f"last event {self._fmt_age(age)} ago"
+        if age < 30:
+            label.remove_class("stale")
+            label.add_class("fresh")
+            label.update(f"▶ {who}: working · {detail}")
+        else:
+            label.remove_class("fresh")
+            label.add_class("stale")
+            label.update(f"⚠ {who}: stalled? · {detail} (esc to stop)")
+
     # -- chat pane ---------------------------------------------------------------
 
     def _next_testing(self) -> Task | None:
@@ -730,6 +792,8 @@ class DrCodeApp(App[None]):
                     )
                 return
             self.agent_running = True
+            self._current_tool = None
+            self._touch_activity()
             self.refresh_status()
             agent = build_agent(self.config, kind=task.kind)
             # Bound only once `async with agent.iter(...)` is entered; the
@@ -761,6 +825,7 @@ class DrCodeApp(App[None]):
                                 reasoning_block: ReasoningBlock | None = None
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
+                                        self._touch_activity()
                                         if not isinstance(event, PartDeltaEvent):
                                             continue
                                         delta = event.delta
@@ -806,6 +871,10 @@ class DrCodeApp(App[None]):
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
+                                        if isinstance(event, FunctionToolCallEvent):
+                                            self._touch_activity(event.part.tool_name)
+                                        elif isinstance(event, FunctionToolResultEvent):
+                                            self._touch_activity(done=True)
                                         if self.viewed_id != task_id:
                                             continue
                                         if isinstance(event, FunctionToolCallEvent):
@@ -910,6 +979,8 @@ class DrCodeApp(App[None]):
                     )
                 return
             self.tester_running = True
+            self._current_tool = None
+            self._touch_activity()
             self.refresh_status()
             if self.viewed_id == task_id:
                 self._write_history_line(
@@ -927,6 +998,10 @@ class DrCodeApp(App[None]):
                         if Agent.is_call_tools_node(node):
                             async with node.stream(run.ctx) as stream:
                                 async for event in stream:
+                                    if isinstance(event, FunctionToolCallEvent):
+                                        self._touch_activity(event.part.tool_name)
+                                    elif isinstance(event, FunctionToolResultEvent):
+                                        self._touch_activity(done=True)
                                     if self.viewed_id == task_id and isinstance(
                                         event, FunctionToolCallEvent
                                     ):
@@ -1075,6 +1150,7 @@ class DrCodeApp(App[None]):
             self.workers.cancel_group(self, "tester")
             self.agent_running = False
             self.tester_running = False
+            self._current_tool = None
             # Hide AND empty: the aborted run's partial text must not be
             # resurrected by a later add_class("visible").
             self._clear_stream_label()
@@ -1128,12 +1204,6 @@ class DrCodeApp(App[None]):
             return
         if not 0 <= index < len(task.clarification.options):
             return
-        self._submit_user_text(task, task.clarification.options[index])
-
-
-def run_app(project_root: Path) -> None:
-    DrCodeApp(project_root).run()
-turn
         self._submit_user_text(task, task.clarification.options[index])
 
 

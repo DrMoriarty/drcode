@@ -14,6 +14,19 @@ _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 PROJECT_PATH_PLACEHOLDER = "{project_path}"
 
 
+def load_compaction_prompts() -> tuple[str, str]:
+    """(system prompt, output template) for the context-compaction agent.
+
+    The system prompt (compaction.txt) instructs an anchored summarizer: it
+    updates the current summary instead of writing a new one from scratch.
+    The template (compaction.md) is the exact output structure the
+    summarizer must follow.
+    """
+    system = (_PROMPTS_DIR / "compaction.txt").read_text(encoding="utf-8")
+    template = (_PROMPTS_DIR / "compaction.md").read_text(encoding="utf-8")
+    return system, template
+
+
 def load_init_repo_prompt(project_root: Path) -> str:
     """Prompt for the "Обновить/создать AGENTS.md" documentation task.
 

@@ -60,16 +60,23 @@ from ..agent import (
     AgentDeps,
     TesterDeps,
     build_agent,
+    build_compaction_agent,
+    build_compaction_prompt,
     build_tester_agent,
+    compacted_messages,
     ends_with_open_request,
     extract_display,
+    extract_previous_summary,
     first_user_prompt,
     is_pending_retry,
+    is_summary_message,
     last_context_tokens,
+    render_history_for_summary,
     resumable_history,
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
+    split_original_prompts,
 )
 from ..config import Config
 from ..models import (
@@ -80,7 +87,7 @@ from ..models import (
     TaskStatus,
     VerificationStatus,
 )
-from ..prompts import load_init_repo_prompt
+from ..prompts import load_compaction_prompts, load_init_repo_prompt
 from ..settings import (
     RETENTION_OPTIONS,
     CompletedRetention,
@@ -519,7 +526,8 @@ class DrCodeApp(App[None]):
     #task-statusbar { dock: top; height: 1; background: $panel; padding: 0 1; }
     #task-status-left { width: 1fr; color: $text; }
     #task-status-right { width: auto; color: $text; }
-    # Context counter turns amber near the limit and red at it.
+    # Context counter: red from the compaction threshold, yellow from
+    # twice the remaining headroom (threshold 80 → yellow from 60%).
     #task-status-right.ctx-warn { color: $warning; }
     #task-status-right.ctx-crit { color: $error; }
     # 1-column empty gutter on both sides: no text sticks to the window edge.
@@ -667,11 +675,6 @@ class DrCodeApp(App[None]):
         # live value first and falls back to the persisted one (the final
         # value of a finished task — it stays in the history via the saved
         # per-response usage).
-        self._live_ctx_tokens: dict[str, int] = {}
-        # Context fill (tokens) seen by the latest model request per task,
-        # updated live while the agent runs. The task transcript only picks
-        # this up at persist points, so the status bar reads from here
-        # first and falls back to the stored transcript (final value).
         self._live_ctx_tokens: dict[str, int] = {}
         # Bumped by every view_task(): the streaming loop compares it with
         # each block's stream_epoch to detect that a mid-node re-render
@@ -1278,6 +1281,12 @@ class DrCodeApp(App[None]):
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
             self._write_chat(f"[bold magenta]──── {label} ────[/]")
+        elif role == "summary":
+            # Compaction summary: a marker separator, then the summary
+            # itself rendered as markdown (it is the model's output the
+            # agent continues from, not a user message).
+            self._write_chat("[bold magenta]──── context compacted ────[/]")
+            self._write_chat(AssistantBlock(text))
         elif role == "event":
             self._write_chat(f"[bold red]event ›[/] {text}")
         elif role == "system":
@@ -1380,9 +1389,14 @@ class DrCodeApp(App[None]):
                 f"🧠 {self._fmt_ctx_tokens(tokens)} / "
                 f"{self._fmt_ctx_tokens(max_tokens)} · {pct}%"
             )
-            if pct >= 95:
+            # Red from the compaction threshold, yellow when the remaining
+            # headroom is twice the red-zone headroom: threshold 80 →
+            # yellow from 60, threshold 90 → yellow from 80.
+            threshold = min(max(self.config.compaction_threshold, 1), 100)
+            warn_pct = 2 * threshold - 100
+            if pct >= threshold:
                 right.add_class("ctx-crit")
-            elif pct >= 80:
+            elif warn_pct > 0 and pct >= warn_pct:
                 right.add_class("ctx-warn")
         else:
             text = f"🧠 {self._fmt_ctx_tokens(tokens)}"
@@ -1444,6 +1458,66 @@ class DrCodeApp(App[None]):
         task.tester_messages[-1] = serialize_messages(messages)
         self.manager.storage.save(task)
 
+    async def _maybe_compact(self, task: Task) -> None:
+        """Context compaction gate, called between agent turns (a turn
+        boundary is the only safe point: the transcript never ends with
+        unanswered tool calls there).
+
+        When the context fill reaches the configured threshold (percent of
+        max_context_tokens), the main agent's work is paused, a tool-less
+        summarizer agent rewrites the transcript into a structured summary
+        (anchored to the previous one, if any), and the transcript is
+        replaced by the original user prompt(s) plus that summary. A
+        compaction failure is never fatal: it is logged into the service
+        events and the run continues with the uncompressed history.
+        """
+        max_tokens = self.config.max_context_tokens
+        if max_tokens <= 0:
+            return
+        threshold = min(max(self.config.compaction_threshold, 1), 100)
+        tokens = self._live_ctx_tokens.get(task.id)
+        if tokens is None:
+            tokens = last_context_tokens(task.messages)
+        if not tokens or tokens * 100 < threshold * max_tokens:
+            return
+        pct = round(tokens * 100 / max_tokens)
+        _, rest = split_original_prompts(task.messages)
+        if not any(not is_summary_message(m) for m in rest):
+            # Nothing to summarize (only the original prompt(s), possibly
+            # plus a previous summary): compacting again would be a no-op.
+            return
+        self._show_event(
+            task,
+            f"Context fill {pct}% — pausing the agent and compacting history…",
+        )
+        try:
+            agent = build_compaction_agent(self.config)
+            prompt = build_compaction_prompt(
+                extract_previous_summary(task.messages),
+                render_history_for_summary(task.messages),
+                load_compaction_prompts()[1],
+            )
+            result = await agent.run(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+            return
+        task.messages = compacted_messages(task.messages, result.output)
+        task.touch()
+        self.manager.storage.save(task)
+        # The live token reading is stale now (it belongs to the old
+        # transcript); drop it so the counter falls back to the compacted
+        # transcript until the next model request reports real usage.
+        self._live_ctx_tokens.pop(task.id, None)
+        self._show_event(
+            task,
+            "Context compacted: history summarized, original task "
+            "prompt(s) kept verbatim.",
+        )
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+
     @work(exclusive=True, group="agent")
     async def run_agent(self, task_id: str) -> None:
         self._agent_generation += 1
@@ -1480,7 +1554,6 @@ class DrCodeApp(App[None]):
                 run = None
                 if task.pending_input:
                     text = task.pending_input.pop(0)
-                    history = resumable_history(task.messages)
                     if self.viewed_id == task_id:
                         if text in self._pending_rendered:
                             # Already shown as a queued block; don't repeat it.
@@ -1498,10 +1571,15 @@ class DrCodeApp(App[None]):
                     task.unfinished = False
                     self.manager.storage.save(task)
                     text = None
-                    history = resumable_history(task.messages)
                 else:
                     break
                 try:
+                    # Context compaction gate: before the history for the
+                    # next turn is loaded, the fill is checked against the
+                    # threshold; when exceeded, the transcript is summarized
+                    # in place (history is computed AFTER compaction).
+                    await self._maybe_compact(task)
+                    history = resumable_history(task.messages)
                     async with agent.iter(
                         text,
                         message_history=history,

@@ -57,6 +57,11 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=_now)
     # Serialized pydantic-ai ModelMessages (full transcript incl. tool calls).
     messages: list[dict[str, Any]] = Field(default_factory=list)
+    # Serialized transcripts of the tester runs, one entry per testing round.
+    # Kept separate from `messages` so the coding agent never resumes with
+    # tester-only tool calls (set_verification, create_bug_report) in its
+    # model history.
+    tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
     # User messages typed while the task is queued/not yet processed.
     pending_input: list[str] = Field(default_factory=list)
     # Set while the agent is waiting for the user to answer a question.

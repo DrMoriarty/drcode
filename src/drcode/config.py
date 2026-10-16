@@ -18,6 +18,10 @@ class Config(BaseSettings):
     model: str = ""  # e.g. "gpt-4o", "qwen3-coder-30b", model id of your provider
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
+    # Context window of the model, tokens: the task status bar shows context
+    # fill as a percentage of this. Providers rarely report it — set via
+    # DRCODE_MAX_CONTEXT_TOKENS when the default doesn't match the model.
+    max_context_tokens: int = 200_000
 
     @property
     def is_ready(self) -> bool:

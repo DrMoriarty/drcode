@@ -48,8 +48,11 @@ from ..agent import (
     build_agent,
     build_tester_agent,
     extract_display,
+    last_context_tokens,
     resumable_history,
+    run_context_tokens,
     serialize_messages,
+    strip_retried_prompt,
 )
 from ..config import Config
 from ..models import Clarification, Task, TaskKind, TaskStatus, VerificationStatus
@@ -152,6 +155,23 @@ class ReasoningBlock(Static):
             self.update(f"{header}\n{body}")
 
 
+class AssistantBlock(Static):
+    """Live assistant answer, streamed directly into the chat log.
+
+    Grows in place like ReasoningBlock, so the text appears between the
+    reasoning and tool-call blocks while the model is still producing it
+    (instead of a preview panel under the chat log).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(classes="assistant")
+        self._content = ""
+
+    def append(self, delta: str) -> None:
+        self._content += delta
+        self.update(Markdown(self._content, code_theme="ansi_dark"))
+
+
 class ToolCallBlock(Static):
     """Collapsible tool-call block; collapsed by default, click to toggle.
 
@@ -202,19 +222,25 @@ class DrCodeApp(App[None]):
     #activity-status.fresh { color: $success; }
     #activity-status.stale { color: $warning; }
     #chat-col { height: 1fr; }
-    #task-statusbar { dock: top; height: 1; background: $panel; color: $text; padding: 0 1; }
-    #chat-log { height: 1fr; border: none; background: $surface; }
+    #task-statusbar { dock: top; height: 1; background: $panel; padding: 0 1; }
+    #task-status-left { width: 1fr; color: $text; }
+    #task-status-right { width: auto; color: $text; }
+    # Context counter turns amber near the limit and red at it.
+    #task-status-right.ctx-warn { color: $warning; }
+    #task-status-right.ctx-crit { color: $error; }
+    # 1-column empty gutter on both sides: no text sticks to the window edge.
+    #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }
     .reasoning { padding: 0 4; color: $text-muted; }
     .reasoning:hover { background: $panel; }
     .tool-call { padding: 0 4; color: $text-muted; }
     .tool-call:hover { background: $panel; }
-    #stream-label { display: none; padding: 0 1; color: $accent; }
-    #stream-label.visible { display: block; }
-    #stream-label.hidden { display: none; }
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
     .section-header { color: $accent; text-style: bold; padding: 0 1; }
     .task-item { padding: 0 1; }
+    # Highlight for the task currently open in the chat pane.
+    TaskItem.viewed { background: $panel; }
+    TaskItem.viewed > .task-item { text-style: bold; }
     #copy-toast {
         layer: toast;
         dock: bottom;
@@ -246,6 +272,7 @@ class DrCodeApp(App[None]):
     }
     #nt-kind-label.kind-feature { color: $success; }
     #nt-kind-label.kind-bug { color: $error; }
+    #nt-kind-label.kind-documentation { color: yellow; }
     #nt-hint { width: auto; color: $text-disabled; }
     """
     BINDINGS: ClassVar = [
@@ -302,6 +329,18 @@ class DrCodeApp(App[None]):
         # on the result event) — lets the label distinguish "tool busy" from
         # "total silence".
         self._current_tool: str | None = None
+        # Context fill (tokens) seen by the latest completed model request,
+        # per task, updated live while the run streams. The stored transcript
+        # is only refreshed at persist points, so the status bar reads the
+        # live value first and falls back to the persisted one (the final
+        # value of a finished task — it stays in the history via the saved
+        # per-response usage).
+        self._live_ctx_tokens: dict[str, int] = {}
+        # Context fill (tokens) seen by the latest model request per task,
+        # updated live while the agent runs. The task transcript only picks
+        # this up at persist points, so the status bar reads from here
+        # first and falls back to the stored transcript (final value).
+        self._live_ctx_tokens: dict[str, int] = {}
 
     # -- layout -------------------------------------------------------------
 
@@ -313,9 +352,10 @@ class DrCodeApp(App[None]):
                 yield Static("", id="model-status")
                 yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
-                yield Static("", id="task-statusbar")
+                with Horizontal(id="task-statusbar"):
+                    yield Static("", id="task-status-left")
+                    yield Static("", id="task-status-right")
                 yield VerticalScroll(id="chat-log")
-                yield Static("", id="stream-label")
                 yield Input(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):
                     yield NewTaskInput(placeholder="Describe the task…", id="nt-input")
@@ -363,10 +403,6 @@ class DrCodeApp(App[None]):
     @property
     def chat_log(self) -> VerticalScroll:
         return self.query_one("#chat-log", VerticalScroll)
-
-    @property
-    def stream_label(self) -> Static:
-        return self.query_one("#stream-label", Static)
 
     @property
     def chat_input(self) -> Input:
@@ -500,7 +536,10 @@ class DrCodeApp(App[None]):
                     "completed": "✓",
                     "clarification": "❓",
                 }.get(t.status.value, "⏳")
-                kind_letter = "[red]B[/]" if t.kind is TaskKind.BUG else "[green]F[/]"
+                kind_letter = {
+                    TaskKind.BUG: "[red]B[/]",
+                    TaskKind.DOCUMENTATION: "[yellow]D[/]",
+                }.get(t.kind, "[green]F[/]")
                 if t.verification is VerificationStatus.PASSED:
                     suffix = " ✅"
                 elif t.verification is VerificationStatus.FAILED:
@@ -508,13 +547,14 @@ class DrCodeApp(App[None]):
                 else:
                     suffix = ""
                 viewed = " ●" if t.id == self.viewed_id else ""
-                sidebar.append(
-                    TaskItem(
-                        f"{marker} {kind_letter} #{t.id} "
-                        f"{escape(t.title_display)}{suffix}{viewed}",
-                        t.id,
-                    )
+                item = TaskItem(
+                    f"{marker} {kind_letter} #{t.id} "
+                    f"{escape(t.title_display)}{suffix}{viewed}",
+                    t.id,
                 )
+                if t.id == self.viewed_id:
+                    item.add_class("viewed")
+                sidebar.append(item)
         sidebar.refresh()
         self._sidebar_snapshot = self._sidebar_fingerprint()
 
@@ -647,6 +687,19 @@ class DrCodeApp(App[None]):
         self._clear_stream_label()
         for role, text in extract_display(task.messages):
             self._write_history_line(role, text)
+        # Tester rounds come after the development transcript, each behind
+        # its own "testing" separator. The tester's synthetic prompt
+        # ("Verify completed task #…") is not shown.
+        for round_messages in task.tester_messages:
+            if not round_messages:
+                continue
+            self._write_history_line("testing-sep", "")
+            for role, text in extract_display(round_messages):
+                if role == "user":
+                    continue
+                if role == "tool-call":
+                    text = f"tester: {text}"
+                self._write_history_line(role, text)
         for pending in task.pending_input:
             self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
@@ -702,6 +755,9 @@ class DrCodeApp(App[None]):
             self._write_chat(f"[dim]{escape(text)}[/]")
         elif role == "tester":
             self._write_chat(f"[bold magenta]tester ›[/] {text}")
+        elif role == "testing-sep":
+            label = f"testing: {text}" if text else "testing"
+            self._write_chat(f"[bold magenta]──── {label} ────[/]")
         elif role == "system":
             self._write_chat(f"[bold red]error ›[/] {text}")
 
@@ -729,10 +785,18 @@ class DrCodeApp(App[None]):
         self.refresh_task_status()
 
     def refresh_task_status(self) -> None:
-        bar = self.query_one("#task-statusbar", Static)
+        left = self.query_one("#task-status-left", Static)
+        right = self.query_one("#task-status-right", Static)
+        # The new-task form is not tied to any task: keep the bar empty so
+        # the previously viewed task doesn't keep updating behind the form.
+        if self._new_task_mode:
+            left.update("")
+            right.update("")
+            return
         task = self.viewed
         if task is None:
-            bar.update("")
+            left.update("")
+            right.update("")
             return
         created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
         kind = {
@@ -757,7 +821,46 @@ class DrCodeApp(App[None]):
             parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:
             parts.append("[red]✗ testing[/]")
-        bar.update("   ".join(parts))
+        left.update("   ".join(parts))
+        self._update_ctx_counter(right, task)
+
+    @staticmethod
+    def _fmt_ctx_tokens(n: int) -> str:
+        if n >= 1000:
+            return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
+        return str(n)
+
+    def _update_ctx_counter(self, right: Static, task: Task) -> None:
+        """Right corner of the task status bar: current context fill in
+        tokens and percent of the allowed maximum.
+
+        Source of truth: the latest model request usage. For a run in
+        progress — the live value; otherwise (finished task, history view)
+        — the value computed from the persisted transcript, i.e. the final
+        value is saved in the task history together with the per-response
+        usage and survives restarts.
+        """
+        right.remove_class("ctx-warn", "ctx-crit")
+        tokens = self._live_ctx_tokens.get(task.id)
+        if tokens is None:
+            tokens = last_context_tokens(task.messages)
+        if not tokens:
+            right.update("")
+            return
+        max_tokens = self.config.max_context_tokens
+        if max_tokens > 0:
+            pct = round(tokens * 100 / max_tokens)
+            text = (
+                f"🧠 {self._fmt_ctx_tokens(tokens)} / "
+                f"{self._fmt_ctx_tokens(max_tokens)} · {pct}%"
+            )
+            if pct >= 95:
+                right.add_class("ctx-crit")
+            elif pct >= 80:
+                right.add_class("ctx-warn")
+        else:
+            text = f"🧠 {self._fmt_ctx_tokens(tokens)}"
+        right.update(text)
 
     # -- agent run -----------------------------------------------------------------
 
@@ -793,6 +896,28 @@ class DrCodeApp(App[None]):
         task.messages = serialize_messages(messages)
         self.manager.storage.save(task)
 
+    def _persist_tester_messages(
+        self, task: Task, run: AgentRun[TesterDeps, str] | None
+    ) -> None:
+        """Snapshot the tester transcript into the task's last testing round.
+
+        Mirrors _persist_task_messages for the tester run: without it the
+        tester's reasoning, tool calls and answer would exist only in the
+        chat widgets and vanish from the history on the next view_task().
+        The round entry is created up front by run_tester; `run` is None
+        when the failure happened before the run context was entered.
+        """
+        if run is None:
+            return
+        try:
+            messages = run.all_messages()
+        except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
+            return
+        if not task.tester_messages:
+            task.tester_messages.append([])
+        task.tester_messages[-1] = serialize_messages(messages)
+        self.manager.storage.save(task)
+
     @work(exclusive=True, group="agent")
     async def run_agent(self, task_id: str) -> None:
         self._agent_generation += 1
@@ -821,12 +946,18 @@ class DrCodeApp(App[None]):
                 run = None
                 text = task.pending_input.pop(0)
                 history = resumable_history(task.messages)
+                # A retried message may already be present in the persisted
+                # transcript (the interrupted run saved its prompt and partial
+                # work before re-queueing the text): cut that stale attempt,
+                # otherwise the prompt is duplicated in the transcript and
+                # drawn a second time at the end of the chat.
+                history, is_retry = strip_retried_prompt(history, text)
                 buffer: list[str] = []
                 if self.viewed_id == task_id:
                     if text in self._pending_rendered:
                         # Already shown as a queued block; don't repeat it.
                         self._pending_rendered.remove(text)
-                    else:
+                    elif not is_retry:
                         self._write_history_line("user", text)
                 try:
                     async with agent.iter(
@@ -875,17 +1006,20 @@ class DrCodeApp(App[None]):
                                                             animate=False,
                                                         )
                                         elif isinstance(delta, TextPartDelta):
+                                            # The live preview widget was
+                                            # removed: the text is shown after
+                                            # the turn as an assistant block.
                                             buffer.append(delta.content_delta)
-                                            if (
-                                                self.viewed_id == task_id
-                                                and not self._new_task_mode
-                                            ):
-                                                self.stream_label.add_class("visible")
-                                                self.stream_label.update(
-                                                    "".join(buffer)
-                                                )
                                 if reasoning_block is not None:
                                     reasoning_block.finish()
+                                # The stream is closed: this request's usage
+                                # is final. Refresh the context counter in
+                                # the task status bar for the running task.
+                                ctx_tokens = run_context_tokens(run)
+                                if ctx_tokens is not None:
+                                    self._live_ctx_tokens[task_id] = ctx_tokens
+                                    if self.viewed_id == task_id:
+                                        self.refresh_task_status()
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
@@ -978,13 +1112,22 @@ class DrCodeApp(App[None]):
                         self.refresh_status()
                 elif task.status is TaskStatus.ACTIVE and not task.pending_input:
                     # The agent answered and nothing is pending: the task is
-                    # done automatically (as if the user pressed done). The
-                    # tester promotes the next queued task when it finishes.
+                    # done automatically (as if the user pressed done).
                     self.manager.mark_done(task.id)
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:
                         self.view_task(task.id)
-                    self.run_tester(task.id)
+                    if task.status is TaskStatus.TESTING:
+                        # The tester promotes the next queued task when it
+                        # finishes.
+                        self.run_tester(task.id)
+                    else:
+                        # Documentation tasks skip the tester entirely (they
+                        # are already completed): promote the queue here.
+                        promoted = self.manager.promote_next(exclude=self._agent_failed)
+                        if promoted:
+                            self.run_agent(promoted.id)
+                        self.refresh_status()
                 elif task.status is TaskStatus.QUEUED:
                     # The run failed and demoted the task back to the queue:
                     # keep the pipeline going with the next task (failed ones
@@ -1014,14 +1157,17 @@ class DrCodeApp(App[None]):
             self._current_tool = None
             self._touch_activity()
             self.refresh_status()
+            # New testing round: created up front, filled by
+            # _persist_tester_messages as the run progresses. An empty round
+            # (crash before any snapshot) is skipped when rendering.
+            task.tester_messages.append([])
             if self.viewed_id == task_id:
-                self._write_history_line(
-                    "tester", f"Verifying task #{task.id}: {task.title}"
-                )
+                self._write_history_line("testing-sep", "")
             tester = build_tester_agent(self.config)
             deps = TesterDeps(
                 root=self.project_root, manager=self.manager, task_id=task_id
             )
+            run: AgentRun[TesterDeps, str] | None = None
             try:
                 async with tester.iter(
                     f"Verify completed task #{task.id}: {task.title}", deps=deps
@@ -1051,10 +1197,23 @@ class DrCodeApp(App[None]):
                                                 f"({args_str})"
                                             )
                                         )
+                        # Keep the stored history current while the test
+                        # runs: switching to the task mid-test shows the
+                        # tester's work done so far.
+                        self._persist_tester_messages(task, run)
                 if run.result is not None and self.viewed_id == task_id:
-                    self._write_history_line("tester", run.result.output)
+                    # Re-render from the persisted transcript: the streamed
+                    # tool-call blocks above are replaced by the full history
+                    # view (separator + reasoning + tool calls + answer).
+                    self.view_task(task_id)
+            except asyncio.CancelledError:
+                # Aborted (or superseded): keep whatever the tester did so
+                # far, then re-raise so the worker teardown stays clean.
+                self._persist_tester_messages(task, run)
+                raise
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
                 self._tester_failed.add(task_id)
+                self._persist_tester_messages(task, run)
                 if self.viewed_id == task_id:
                     self._write_history_line(
                         "system", f"tester failed: {type(e).__name__}: {e}"
@@ -1084,9 +1243,11 @@ class DrCodeApp(App[None]):
         return self.query_one("#nt-input", NewTaskInput)
 
     def _clear_stream_label(self) -> None:
-        """Drop the live streaming preview entirely (content + visibility)."""
-        self.stream_label.remove_class("visible")
-        self.stream_label.update("")
+        """Legacy hook of the removed streaming-preview widget.
+
+        The preview was replaced by in-place assistant blocks; nothing to
+        clear — kept as a no-op so abort/new-task paths stay simple.
+        """
 
     def _drop_stream_preview(self, generation: int) -> None:
         """Clear the streaming preview after an agent run ends, but only if
@@ -1098,45 +1259,53 @@ class DrCodeApp(App[None]):
         # Every entry into the new-task screen starts from a clean editor.
         self.new_task_input.clear()
         self._new_task_mode = True
+        # The form is not tied to any task: drop the viewed highlight so the
+        # sidebar doesn't single out a task while the user composes a new one.
+        self.viewed_id = None
+        self.refresh_sidebar()
         # The streaming preview belongs to the chat view, not the form: a
         # run in progress must not leak its orange text over the form.
         self._clear_stream_label()
         self.chat_log.add_class("hidden")
-        self.stream_label.add_class("hidden")
         self.chat_input.add_class("hidden")
         self.query_one("#new-task", Vertical).remove_class("hidden")
         self._update_kind_label()
+        self.refresh_task_status()
         self.new_task_input.focus()
 
     def _leave_new_task_mode(self) -> None:
         self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
         self.chat_log.remove_class("hidden")
-        self.stream_label.remove_class("hidden")
         # Content may be stale (a run streamed while the form was open, or
         # finished in the background): don't resurrect it.
         self._clear_stream_label()
         self.chat_input.remove_class("hidden")
+        self.refresh_task_status()
 
     def cancel_new_task(self) -> None:
         self._leave_new_task_mode()
         self.chat_input.focus()
 
+    # Tab cycles the new-task type through all three kinds.
+    _KIND_CYCLE: ClassVar = (TaskKind.FEATURE, TaskKind.BUG, TaskKind.DOCUMENTATION)
+
     def toggle_new_task_kind(self) -> None:
-        self.new_task_kind = (
-            TaskKind.BUG if self.new_task_kind is TaskKind.FEATURE else TaskKind.FEATURE
-        )
+        idx = self._KIND_CYCLE.index(self.new_task_kind)
+        self.new_task_kind = self._KIND_CYCLE[(idx + 1) % len(self._KIND_CYCLE)]
         self._update_kind_label()
 
     def _update_kind_label(self) -> None:
         label = self.query_one("#nt-kind-label", Static)
+        label.remove_class("kind-feature", "kind-bug", "kind-documentation")
         if self.new_task_kind is TaskKind.BUG:
             label.update("type: bug")
-            label.remove_class("kind-feature")
             label.add_class("kind-bug")
+        elif self.new_task_kind is TaskKind.DOCUMENTATION:
+            label.update("type: documentation")
+            label.add_class("kind-documentation")
         else:
             label.update("type: feature")
-            label.remove_class("kind-bug")
             label.add_class("kind-feature")
 
     def submit_new_task(self) -> None:

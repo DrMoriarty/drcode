@@ -1,7 +1,7 @@
 # drcode
 
 Console AI coding agent (pydantic-ai + textual), inspired by opencode.
-The center is not a chat session, but a **programming task** (feature request or bug report):
+The center is not a chat session, but a **task** (feature request, bug report, or documentation question):
 
 - one task is *active* at a time — work on it looks like a dialog that starts with the task description;
 - while the agent works, you can create new tasks and put them in a **queue**;
@@ -35,6 +35,13 @@ DRCODE_API_KEY=sk-...
 | `ctrl+i` | Focus chat input                                    |
 | `escape` | Abort the running agent                             |
 | `ctrl+q` | Quit                                                |
+
+## Context fill
+
+The task status bar (top) shows the current context fill in the right corner:
+tokens and percent of the allowed maximum (`DRCODE_MAX_CONTEXT_TOKENS`,
+default 200000). For finished tasks the final value is restored from the
+saved transcript (per-response usage stored in `.drcode/tasks/<id>.json`).
 
 ## Storage
 

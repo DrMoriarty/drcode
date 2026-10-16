@@ -9,6 +9,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -80,7 +81,9 @@ def build_model(config: Config):
     return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
 
 
-def build_agent(config: Config, kind: TaskKind = TaskKind.FEATURE) -> Agent[AgentDeps, str]:
+def build_agent(
+    config: Config, kind: TaskKind = TaskKind.FEATURE
+) -> Agent[AgentDeps, str]:
     """Build the coding agent. Documentation tasks get a dedicated system
     prompt (answer questions / update docs) but the same tool set."""
     model = build_model(config)
@@ -245,6 +248,54 @@ def serialize_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
     return ModelMessagesTypeAdapter.dump_python(messages, mode="json")  # type: ignore[return-value]
 
 
+def _usage_context_tokens(input_tokens: int, cache_read: int, cache_write: int) -> int:
+    """Tokens the model actually saw in that request: uncached prompt +
+    cache reads + cache writes (Anthropic-style accounting splits the prompt
+    across the three fields)."""
+    return input_tokens + cache_read + cache_write
+
+
+def last_context_tokens(data: list[dict[str, Any]]) -> int | None:
+    """Context fill (tokens) at the end of a serialized transcript.
+
+    Each ModelResponse carries the usage of the request that produced it,
+    and its input side is the full context the model saw (history + tools +
+    prompt). The last response with non-zero usage therefore gives the
+    final context fill of the task — for finished tasks as well, since the
+    transcript with usage is persisted in the task history.
+    """
+    for msg in reversed(data):
+        if msg.get("kind") != "response" and msg.get("role") != "response":
+            continue
+        usage = msg.get("usage") or {}
+        tokens = _usage_context_tokens(
+            usage.get("input_tokens") or 0,
+            usage.get("cache_read_tokens") or 0,
+            usage.get("cache_write_tokens") or 0,
+        )
+        if tokens:
+            return tokens
+    return None
+
+
+def run_context_tokens(run: AgentRun[Any, Any]) -> int | None:
+    """Context fill (tokens) after the latest completed model request of a
+    live run (usage of the last ModelResponse in the run's transcript)."""
+    try:
+        messages = run.all_messages()
+    except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
+        return None
+    for msg in reversed(messages):
+        if isinstance(msg, ModelResponse):
+            usage = msg.usage
+            tokens = _usage_context_tokens(
+                usage.input_tokens, usage.cache_read_tokens, usage.cache_write_tokens
+            )
+            if tokens:
+                return tokens
+    return None
+
+
 def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
     return ModelMessagesTypeAdapter.validate_python(data)
 
@@ -269,6 +320,39 @@ def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
         ):
             cut = i + 1
     return messages[:cut]
+
+
+def strip_retried_prompt(
+    messages: list[ModelMessage], text: str
+) -> tuple[list[ModelMessage], bool]:
+    """Cut an interrupted attempt at `text` out of a resumable transcript.
+
+    A retried message may already be present in the persisted transcript:
+    an interrupted run persists `all_messages()` (which includes the prompt
+    and any partial work done so far) before the message goes back to
+    `pending_input`. Re-sending the same text as a new prompt would duplicate
+    it — in the stored transcript and as a second user block at the end of
+    the chat. Dropping the prompt together with the incomplete tail after it
+    makes the retry regenerate the attempt cleanly.
+
+    The transcript is left untouched when the attempt already produced a
+    final (non-empty text) model response — then an identical prompt is a
+    genuine new request, not a retry.
+    """
+    idx = None
+    for i, msg in enumerate(messages):
+        if isinstance(msg, ModelRequest) and any(
+            isinstance(p, UserPromptPart) and p.content == text for p in msg.parts
+        ):
+            idx = i
+    if idx is None:
+        return messages, False
+    for msg in messages[idx + 1 :]:
+        if isinstance(msg, ModelResponse) and any(
+            isinstance(p, TextPart) and p.content for p in msg.parts
+        ):
+            return messages, False
+    return messages[:idx], True
 
 
 def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -332,8 +416,8 @@ def extract_display(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 __all__ = [
-    "AgentDeps",
     "DOCUMENTATION_SYSTEM_PROMPT",
+    "AgentDeps",
     "ModelRequest",
     "ModelResponse",
     "TesterDeps",
@@ -344,7 +428,10 @@ __all__ = [
     "build_agent",
     "build_tester_agent",
     "extract_display",
+    "last_context_tokens",
     "load_messages",
     "resumable_history",
+    "run_context_tokens",
     "serialize_messages",
+    "strip_retried_prompt",
 ]

@@ -31,6 +31,7 @@ from . import tools
 from .config import Config
 from .models import Clarification, TaskKind, TaskStatus, VerificationStatus
 from .task_manager import TaskManager
+from .version import APP_VERSION
 
 FEATURE_SYSTEM_PROMPT = """\
 You are drcode, an expert software engineering agent working directly in the user's repository.
@@ -92,7 +93,7 @@ class AgentDeps:
 # (curl, OpenAI/Python, pydantic-ai, ...) — политика против автоматизации.
 # Нейтральный UA проходит; ставим его на уровне клиента и в model_settings
 # (pydantic-ai перебивает client-заголовки per-request заголовком pydantic-ai/x.y).
-USER_AGENT = "drcode/0.1"
+USER_AGENT = f"drcode/{APP_VERSION}"
 EXTRA_HEADERS = {"User-Agent": USER_AGENT}
 
 # Errors tools raise for situations the model can fix (bad path, missing

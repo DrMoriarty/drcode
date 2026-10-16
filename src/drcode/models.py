@@ -18,6 +18,9 @@ def _short_id() -> str:
 
 class TaskStatus(str, enum.Enum):
     QUEUED = "queued"
+    # Parked by the user out of the backlog: never promoted while held
+    # (input keeps accumulating; Ctrl+P resumes it back into the queue).
+    HOLD = "hold"
     ACTIVE = "active"
     # Development finished, the tester has not labelled the task yet. If the
     # app dies here, the task is re-tested first on the next startup (before

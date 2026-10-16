@@ -31,6 +31,7 @@ from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import CommandPalette
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
 from textual.widget import Widget
@@ -70,6 +71,7 @@ from ..models import (
     VerificationStatus,
 )
 from ..task_manager import TaskManager
+from ..version import APP_VERSION
 
 
 class TaskItem(ListItem):
@@ -288,14 +290,39 @@ class ToolCallBlock(Static):
             self.update(f"{header}\n{escape(self._args)}")
 
 
+class SettingsPalette(CommandPalette):
+    """Command palette ("Settings") modal.
+
+    The stock CommandPalette stretches over the full screen width; this
+    subclass narrows its container to about half of the screen, but never
+    below 60 columns (on a narrow terminal 60 wins and may overflow).
+    """
+
+    DEFAULT_CSS = """
+    SettingsPalette #--container {
+        width: 50%;
+        min-width: 60;
+    }
+    """
+
+
 class DrCodeApp(App[None]):
+    # The stock command-palette binding (ctrl+p, shown as "palette" in the
+    # footer) is replaced by our own "Settings" binding below; disabling the
+    # built-in also stops it from shadowing the app's own ctrl+p binding.
+    ENABLE_COMMAND_PALETTE: ClassVar[bool] = False
+
     CSS = """
     Screen { layers: base toast; }
     #main { height: 1fr; }
     #sidebar-col { width: 36; border-right: solid $primary; }
     #sidebar { height: 1fr; border: none; }
-    # Sidebar bottom: model-status then activity-status, plain flow
-    # (no dock) so they always stack in compose order under the list.
+    # Sidebar bottom: project-info, model-status then activity-status,
+    # plain flow (no dock) so they always stack in compose order under
+    # the list.
+    #project-info { height: auto; padding: 0 1; }
+    #project-info .project-dir { color: $text-muted; }
+    #project-info .app-title { color: $accent; text-style: bold; }
     #model-status { height: auto; padding: 0 1; }
     #model-status.ok { color: $success; }
     #model-status.warn { color: $warning; }
@@ -373,6 +400,8 @@ class DrCodeApp(App[None]):
         ("ctrl+o", "focus_sidebar", "Tasks"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+t", "cycle_task_kind", "Change type"),
+        ("ctrl+p", "settings", "Settings"),
+        ("ctrl+h", "toggle_hold", "Hold/Resume"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -450,6 +479,7 @@ class DrCodeApp(App[None]):
         with Horizontal(id="main"):
             with Vertical(id="sidebar-col"):
                 yield ListView(id="sidebar")
+                yield Static("", id="project-info")
                 yield Static("", id="model-status")
                 yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
@@ -475,6 +505,7 @@ class DrCodeApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.refresh_project_info()
         self.refresh_sidebar()
         tasks = self.manager.all_tasks()
         active = self.manager.active
@@ -510,6 +541,10 @@ class DrCodeApp(App[None]):
     @property
     def sidebar(self) -> ListView:
         return self.query_one("#sidebar", ListView)
+
+    @property
+    def project_info(self) -> Static:
+        return self.query_one("#project-info", Static)
 
     @property
     def model_status(self) -> Static:
@@ -574,6 +609,60 @@ class DrCodeApp(App[None]):
 
     # -- sidebar ---------------------------------------------------------------
 
+    def _display_dir(self) -> str:
+        """Working directory with the home prefix collapsed to `~`."""
+        path = self.project_root
+        try:
+            rel = path.relative_to(Path.home())
+        except ValueError:
+            return str(path)
+        if str(rel) == ".":
+            return "~"
+        return f"~/{rel}"
+
+    def _git_branch(self) -> str | None:
+        """Current branch of the git repo in the working directory.
+
+        Parsed straight from `.git` (also handles worktrees, where `.git`
+        is a file with a `gitdir:` pointer) so no `git` binary is needed.
+        """
+        dot_git = self.project_root / ".git"
+        try:
+            if dot_git.is_dir():
+                git_dir: Path | None = dot_git
+            elif dot_git.is_file():
+                line = dot_git.read_text(encoding="utf-8").strip()
+                if not line.startswith("gitdir:"):
+                    return None
+                git_dir = Path(line.split(":", 1)[1].strip())
+                if not git_dir.is_absolute():
+                    git_dir = self.project_root / git_dir
+            else:
+                git_dir = None
+        except OSError:
+            return None
+        if git_dir is None:
+            return None
+        try:
+            content = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if content.startswith("ref: refs/heads/"):
+            return content[len("ref: refs/heads/") :]
+        if content.startswith("ref: "):
+            return content[len("ref: ") :]
+        return content[:7]  # detached HEAD
+
+    def refresh_project_info(self) -> None:
+        """Top of the sidebar, above the model status: working directory
+        with the git branch (`~/pr/drcode:main`), then name and version."""
+        branch = self._git_branch()
+        dir_text = escape(self._display_dir())
+        where = f"{dir_text}:{branch}" if branch else dir_text
+        self.project_info.update(
+            f"[dim]{where}[/]\n[bold]DrCode[/] [dim]{APP_VERSION}[/]"
+        )
+
     def _sidebar_fingerprint(self) -> tuple:
         """Lightweight snapshot of everything the sidebar renders: status,
         verification label, title and the viewed-marker per task."""
@@ -614,6 +703,10 @@ class DrCodeApp(App[None]):
             ),
             ("QUEUE", self.manager.queued()),
             (
+                "ON HOLD",
+                [t for t in self.manager.all_tasks() if t.status is TaskStatus.HOLD],
+            ),
+            (
                 "TESTING",
                 [t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING],
             ),
@@ -631,6 +724,7 @@ class DrCodeApp(App[None]):
             for t in tasks:
                 marker = {
                     "queued": "⏳",
+                    "hold": "⏸",
                     "active": "▶",
                     "testing": "🧪",
                     "completed": "✓",
@@ -660,11 +754,20 @@ class DrCodeApp(App[None]):
 
     # -- model connection status ---------------------------------------------
 
+    def _recover_from_outage(self) -> None:
+        """Error → connected transition: the outage is over, so un-block the
+        tasks whose runs died with it. They were excluded from promotion via
+        _agent_failed and would stay stranded until restart otherwise. If
+        nothing is running, the pipeline picks the next task immediately."""
+        self._agent_failed.clear()
+        self._advance()
+
     def refresh_connection(self) -> None:
         self.run_worker(self._check_model(), exclusive=True, group="model-check")
 
     async def _check_model(self) -> None:
         label = self.model_status
+        was_error = label.has_class("error")
         if not self.config.is_ready:
             label.remove_class("ok", "error")
             label.add_class("warn")
@@ -707,6 +810,8 @@ class DrCodeApp(App[None]):
         elif resp.status_code < 500:
             label.add_class("ok")
             label.update(f"● {model} — connected")
+            if was_error:
+                self._recover_from_outage()
         else:
             label.add_class("error")
             label.update(f"✗ {model} — unavailable (HTTP {resp.status_code})")
@@ -984,6 +1089,7 @@ class DrCodeApp(App[None]):
         }.get(task.kind, "[bold green]feature[/]")
         status_colors = {
             TaskStatus.QUEUED: "yellow",
+            TaskStatus.HOLD: "blue",
             TaskStatus.ACTIVE: "cyan",
             TaskStatus.TESTING: "magenta",
             TaskStatus.COMPLETED: "green",
@@ -1714,11 +1820,35 @@ class DrCodeApp(App[None]):
         if self.viewed_id == task.id:
             self.refresh_task_status()
 
+    def action_toggle_hold(self) -> None:
+        """Park the viewed queued task out of the backlog (hold) or return a
+        held task to the queue. Held tasks are never taken into work until
+        explicitly resumed; typed input keeps accumulating."""
+        task = self.viewed
+        if task is None:
+            return
+        if task.status is TaskStatus.QUEUED:
+            self.manager.set_hold(task.id, on=True)
+        elif task.status is TaskStatus.HOLD:
+            self.manager.set_hold(task.id, on=False)
+        else:
+            return
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+
     def action_focus_sidebar(self) -> None:
         self.sidebar.focus()
 
     def action_focus_input(self) -> None:
         self.chat_input.focus()
+
+    def action_settings(self) -> None:
+        """Open the Settings modal (the command palette, Ctrl+P)."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(SettingsPalette(id="--command-palette"))
 
     # -- events -------------------------------------------------------------------------
 

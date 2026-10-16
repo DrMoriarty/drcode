@@ -129,6 +129,21 @@ class TaskManager:
         self.storage.save(task)
         return task
 
+    def set_hold(self, task_id: str, *, on: bool) -> Task:
+        """Park a not-yet-started (QUEUED) task out of the backlog (hold) or
+        return it to the queue. Held tasks keep their pending input and queue
+        stamp but are never promoted while held — queued() skips them, so
+        promote_next() can't pick them up. The caller is responsible for only
+        holding queued tasks."""
+        task = self.get(task_id)
+        if on and task.status is TaskStatus.QUEUED:
+            task.status = TaskStatus.HOLD
+        elif not on and task.status is TaskStatus.HOLD:
+            task.status = TaskStatus.QUEUED
+        task.touch()
+        self.storage.save(task)
+        return task
+
     def mark_done(self, task_id: str) -> Task:
         """Development is finished: move the task to TESTING. Only the tester
         promotes it to COMPLETED (via set_verification). Promotion of the next

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ from typing import Any
 from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.agent import AgentRun
+from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -92,6 +95,19 @@ class AgentDeps:
 USER_AGENT = "drcode/0.1"
 EXTRA_HEADERS = {"User-Agent": USER_AGENT}
 
+# Errors tools raise for situations the model can fix (bad path, missing
+# old_string, broken regex). pydantic-ai 2.x converts only ModelRetry and
+# arg-validation failures into retry prompts; any other exception crashes
+# the whole run, so these must be re-raised as ModelRetry.
+TOOL_RETRY_ERRORS = (ValueError, OSError, re.error)
+
+
+async def _run_tool(fn: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except TOOL_RETRY_ERRORS as e:
+        raise ModelRetry(str(e) or type(e).__name__) from e
+
 
 def build_model(config: Config):
     client = AsyncOpenAI(
@@ -136,6 +152,7 @@ def build_agent(
         instructions=instructions,
         deps_type=AgentDeps,
         model_settings={"extra_headers": EXTRA_HEADERS},
+        retries=10,
     )
 
     # All blocking tools run in a worker thread (or as asyncio subprocesses
@@ -146,37 +163,33 @@ def build_agent(
         ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
         """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return await asyncio.to_thread(
-            tools.read_file, ctx.deps.root, path, offset, limit
-        )
+        return await _run_tool(tools.read_file, ctx.deps.root, path, offset, limit)
 
     @agent.tool
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file with the given content."""
-        return await asyncio.to_thread(tools.write_file, ctx.deps.root, path, content)
+        return await _run_tool(tools.write_file, ctx.deps.root, path, content)
 
     @agent.tool
     async def edit_file(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
         """Replace an exact unique substring in a file. old_string must match exactly once."""
-        return await asyncio.to_thread(
+        return await _run_tool(
             tools.edit_file, ctx.deps.root, path, old_string, new_string
         )
 
     @agent.tool
     async def glob_files(ctx: RunContext[AgentDeps], pattern: str) -> list[str]:
         """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
-        return await asyncio.to_thread(tools.glob_files, ctx.deps.root, pattern)
+        return await _run_tool(tools.glob_files, ctx.deps.root, pattern)
 
     @agent.tool
     async def grep_search(
         ctx: RunContext[AgentDeps], pattern: str, include: str = ""
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional filename regex filter."""
-        return await asyncio.to_thread(
-            tools.grep_search, ctx.deps.root, pattern, include
-        )
+        return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool
     async def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
@@ -243,6 +256,7 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
         instructions=TESTER_SYSTEM_PROMPT,
         deps_type=TesterDeps,
         model_settings={"extra_headers": EXTRA_HEADERS},
+        retries=10,
     )
 
     @agent.tool
@@ -250,23 +264,19 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
         ctx: RunContext[TesterDeps], path: str, offset: int = 1, limit: int = 2000
     ) -> str:
         """Read a text file. Lines are numbered, starting from `offset` (1-based), up to `limit` lines."""
-        return await asyncio.to_thread(
-            tools.read_file, ctx.deps.root, path, offset, limit
-        )
+        return await _run_tool(tools.read_file, ctx.deps.root, path, offset, limit)
 
     @agent.tool
     async def glob_files(ctx: RunContext[TesterDeps], pattern: str) -> list[str]:
         """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
-        return await asyncio.to_thread(tools.glob_files, ctx.deps.root, pattern)
+        return await _run_tool(tools.glob_files, ctx.deps.root, pattern)
 
     @agent.tool
     async def grep_search(
         ctx: RunContext[TesterDeps], pattern: str, include: str = ""
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional filename regex filter."""
-        return await asyncio.to_thread(
-            tools.grep_search, ctx.deps.root, pattern, include
-        )
+        return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool
     async def run_bash(ctx: RunContext[TesterDeps], command: str) -> str:

@@ -104,12 +104,14 @@ class TaskManager:
         self.storage.save(task)
         return task
 
-    def promote_next(self) -> Task | None:
-        """If no task is active, activate the first queued task that has input."""
+    def promote_next(self, exclude: set[str] | None = None) -> Task | None:
+        """If no task is active, activate the first queued task that has input.
+        `exclude` skips tasks that already failed this session (bounded
+        retries: a failing task must not stall the whole queue in a loop)."""
         if self.active is not None:
             return None
         for t in self.queued():
-            if t.pending_input:
+            if t.pending_input and (exclude is None or t.id not in exclude):
                 t.status = TaskStatus.ACTIVE
                 t.queue_head = False
                 t.touch()

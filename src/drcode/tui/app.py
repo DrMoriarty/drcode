@@ -280,6 +280,11 @@ class DrCodeApp(App[None]):
         # down). They stay TESTING but are not retried in-session — the next
         # startup picks them up again. Keeps _next_testing() from looping.
         self._tester_failed: set[str] = set()
+        # Same idea for agent runs: a task whose run crashed (e.g. the model
+        # gateway is unreachable) is demoted to QUEUED and skipped by
+        # promote_next for the rest of the session, so one broken task (or a
+        # dead gateway) doesn't loop the whole queue through the error.
+        self._agent_failed: set[str] = set()
         # True while the new-task form covers the chat view. Must exist from
         # the start: the streaming loop reads it on every text delta, and an
         # unset attribute would crash the run (it did — the AttributeError
@@ -589,6 +594,18 @@ class DrCodeApp(App[None]):
         or has gone silent (hung model request, long tool, deadlock)."""
         label = self.activity_status
         if not (self.agent_running or self.tester_running):
+            active = self.manager.active
+            if active is not None:
+                # Task claims to be active but no worker owns it (e.g. the
+                # user aborted the run, or an older build stranded it):
+                # surface the inconsistency instead of showing a fake idle.
+                label.remove_class("fresh")
+                label.add_class("stale")
+                label.update(
+                    f"⚠ #{active.id} active, nothing running — "
+                    "send a message to (re)start"
+                )
+                return
             label.remove_class("fresh", "stale")
             label.update("○ idle")
             return
@@ -792,6 +809,7 @@ class DrCodeApp(App[None]):
                     )
                 return
             self.agent_running = True
+            self._agent_failed.discard(task_id)
             self._current_tool = None
             self._touch_activity()
             self.refresh_status()
@@ -929,8 +947,14 @@ class DrCodeApp(App[None]):
                         self._drop_stream_preview(generation)
                     task.pending_input.insert(
                         0, text
-                    )  # not lost, retry on next activation
+                    )  # not lost, retried on the next user nudge
+                    # Demote honestly: an ACTIVE task with no runner is a
+                    # state nothing ever picks up again (promote_next skips
+                    # it) — the task goes back to the queue instead, and the
+                    # queue continues with the next task.
                     self._persist_task_messages(task, run)
+                    task.status = TaskStatus.QUEUED
+                    self._agent_failed.add(task_id)
                     self.manager.storage.save(task)
                     break
         finally:
@@ -948,7 +972,7 @@ class DrCodeApp(App[None]):
                     if self.viewed_id == task_id and task.clarification:
                         self._write_clarification(task.clarification)
                     self.refresh_sidebar()
-                    promoted = self.manager.promote_next()
+                    promoted = self.manager.promote_next(exclude=self._agent_failed)
                     if promoted:
                         self.run_agent(promoted.id)
                         self.refresh_status()
@@ -961,6 +985,14 @@ class DrCodeApp(App[None]):
                     if self.viewed_id == task_id:
                         self.view_task(task.id)
                     self.run_tester(task.id)
+                elif task.status is TaskStatus.QUEUED:
+                    # The run failed and demoted the task back to the queue:
+                    # keep the pipeline going with the next task (failed ones
+                    # are excluded, so a dead gateway can't loop the queue).
+                    promoted = self.manager.promote_next(exclude=self._agent_failed)
+                    if promoted:
+                        self.run_agent(promoted.id)
+                        self.refresh_status()
 
     # -- tester run ------------------------------------------------------------------
 
@@ -1038,7 +1070,7 @@ class DrCodeApp(App[None]):
                 self.run_tester(testing.id)
             else:
                 # Tester finished: pick the next available task from the queue.
-                promoted = self.manager.promote_next()
+                promoted = self.manager.promote_next(exclude=self._agent_failed)
                 if promoted:
                     self.run_agent(promoted.id)
                     self.refresh_status()

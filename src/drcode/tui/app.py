@@ -48,7 +48,6 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Footer,
-    Header,
     Label,
     ListItem,
     ListView,
@@ -90,6 +89,7 @@ from ..settings import (
 )
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
+from .header import ModelStatusHeader
 
 # Sort anchor for history entries without a recorded timestamp (old
 # transcripts predating per-message stamps): they keep their relative
@@ -497,13 +497,15 @@ class DrCodeApp(App[None]):
     #main { height: 1fr; }
     #sidebar-col { width: 36; border-right: solid $primary; }
     #sidebar { height: 1fr; border: none; }
-    # Sidebar bottom: project-info, model-status then activity-status,
-    # plain flow (no dock) so they always stack in compose order under
-    # the list.
+    # Sidebar bottom: project-info then activity-status, plain flow (no
+    # dock) so they always stack in compose order under the list.
     #project-info { height: auto; padding: 0 1; }
     #project-info .project-dir { color: $text-muted; }
     #project-info .app-title { color: $accent; text-style: bold; }
-    #model-status { height: auto; padding: 0 1; margin-top: 1; }
+    # Connection status lives in the header (see tui/header.py), docked
+    # left between the icon and the title; the ok/warn/error classes are
+    # set by _check_model().
+    #model-status { width: auto; padding: 0 1; }
     #model-status.ok { color: $success; }
     #model-status.warn { color: $warning; }
     #model-status.error { color: $error; }
@@ -679,12 +681,11 @@ class DrCodeApp(App[None]):
     # -- layout -------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield ModelStatusHeader(show_clock=True)
         with Horizontal(id="main"):
             with Vertical(id="sidebar-col"):
                 yield ListView(id="sidebar")
                 yield Static("", id="project-info")
-                yield Static("", id="model-status")
                 yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
                 with Horizontal(id="task-statusbar"):
@@ -995,7 +996,7 @@ class DrCodeApp(App[None]):
         if not self.config.is_ready:
             label.remove_class("ok", "error")
             label.add_class("warn")
-            label.update("○ model not configured — set DRCODE_MODEL / DRCODE_API_KEY")
+            label.update("○ model not configured")
             return
         model = self.config.model
         # Системное хранилище сертификатов: корпоративные CA (как у
@@ -1033,7 +1034,7 @@ class DrCodeApp(App[None]):
             label.update(f"✗ {model} — auth failed (HTTP {resp.status_code})")
         elif resp.status_code < 500:
             label.add_class("ok")
-            label.update(f"● {model} — connected")
+            label.update(f"● {model}")
             if was_error:
                 self._recover_from_outage()
         else:

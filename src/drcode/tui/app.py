@@ -464,7 +464,12 @@ class AssistantBlock(Static):
         self._flush_timer = None
         if self.is_attached:
             self._text = None
-            self.refresh()
+            # layout=True: the block's height is auto (computed at layout
+            # time from the renderable) and the content just grew — a
+            # repaint-only refresh would paint into the stale region and
+            # clip the message to the old height until some other event
+            # forces a re-layout.
+            self.refresh(layout=True)
 
     def finish(self) -> None:
         if self._flush_timer is not None:
@@ -472,7 +477,7 @@ class AssistantBlock(Static):
             self._flush_timer = None
         self._streaming = False
         self._text = None
-        self.refresh()
+        self.refresh(layout=True)
 
     def set_content(self, text: str) -> None:
         """Fill or replace the markdown (also used for history rendering)."""

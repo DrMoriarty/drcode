@@ -90,6 +90,12 @@ class Config(BaseSettings):
     # colors: red from this fill, yellow from half the remaining headroom
     # (2 * threshold - 100, e.g. 60% at the default 80).
     compaction_threshold: int = 80
+    # Cap on model turns (model responses acted upon) per agent/tester run —
+    # pydantic-ai's UsageLimits.request_limit. Its built-in default of 50 is
+    # too low for coding tasks, so drcode raises it; set to null to disable
+    # the cap entirely. The counter is per run: a new user message starts
+    # from zero again.
+    request_limit: int | None = 500
 
     def __init__(self, project_root: Path | None = None, **data: object) -> None:
         # Scaffold the user config dir (idempotent, no-op when it exists)

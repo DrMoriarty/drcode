@@ -28,6 +28,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
 )
+from pydantic_ai.usage import UsageLimits
 from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
@@ -1938,6 +1939,9 @@ class DrCodeApp(App[None]):
                             manager=self.manager,
                             task_id=task_id,
                         ),
+                        usage_limits=UsageLimits(
+                            request_limit=self.config.request_limit
+                        ),
                     ) as run:
                         async for node in run:
                             if Agent.is_model_request_node(node):
@@ -2296,7 +2300,11 @@ class DrCodeApp(App[None]):
                 original = first_user_prompt(task.messages)
                 if original and original != task.title:
                     prompt += f"\n\nOriginal task:\n{original}"
-                async with tester.iter(prompt, deps=deps) as run:
+                async with tester.iter(
+                    prompt,
+                    deps=deps,
+                    usage_limits=UsageLimits(request_limit=self.config.request_limit),
+                ) as run:
                     async for node in run:
                         if Agent.is_call_tools_node(node):
                             async with node.stream(run.ctx) as stream:

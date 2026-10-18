@@ -615,7 +615,10 @@ class DrCodeApp(App[None]):
     def __init__(self, project_root: Path) -> None:
         super().__init__()
         self.project_root = project_root
-        self.config = Config()
+        # Layered config: env > project (.env / drcode.json) >
+        # ~/.config/drcode/drcode.json > defaults. The user config dir is
+        # scaffolded (with drcode.json.example) on first start inside Config.
+        self.config = Config(project_root=project_root)
         self.manager = TaskManager(project_root)
         # Project-scoped preferences (<project>/.drcode/settings.json), then
         # the startup cleanup: completed tasks older than the retention

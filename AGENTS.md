@@ -14,7 +14,7 @@ No tests, CI, or pre-commit hooks exist — verify changes manually with ruff + 
 
 ## Configuration gotcha
 
-The agent needs `DRCODE_MODEL` and `DRCODE_API_KEY` (env vars or `.env` in the repo root; see `src/drcode/config.py`). Without them the TUI starts fine but every message fails with "Model is not configured". `DRCODE_BASE_URL` defaults to the OpenAI API; any OpenAI-compatible endpoint works.
+The agent needs `model` and `api_key`. Settings are layered (higher wins): `DRCODE_*` env vars > project `.env` / project `drcode.json` > user-level `~/.config/drcode/drcode.json` (XDG_CONFIG_HOME-aware) > built-in defaults (see `src/drcode/config.py`). On first start the user config dir is scaffolded with `drcode.json.example` listing every configurable parameter — when adding a new `Config` field, add a placeholder to `_EXAMPLE_PLACEHOLDERS` if it has no sensible default. Without a configured model/key the TUI starts fine but every message fails with "Model is not configured". `base_url` defaults to the OpenAI API; any OpenAI-compatible endpoint works.
 
 ## Architecture
 

@@ -36,8 +36,8 @@ class CompletedRetention(str, enum.Enum):
     def label(self) -> str:
         """Human-readable option label for the settings UI."""
         if self is CompletedRetention.NEVER:
-            return "никогда"
-        return f"через {self.value} дней"
+            return "never"
+        return f"after {self.value} days"
 
 
 RETENTION_OPTIONS: tuple[CompletedRetention, ...] = (

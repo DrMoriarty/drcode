@@ -11,6 +11,7 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import ClassVar, cast
 
@@ -560,41 +561,67 @@ class ServiceCommandsProvider(Provider):
 class ProjectSettingsCommandsProvider(Provider):
     """Project-preference commands in the Settings palette.
 
-    One hit per option of the completed-tasks auto-cleanup setting; picking
-    one persists it into `<project>/.drcode/settings.json`, so the choice is
-    scoped to the project, not the user.
+    A single entry for the completed-tasks auto-cleanup setting; its current
+    value is shown after the ":". Picking it opens the option-selection
+    palette (same UX as the theme picker); choosing an option there persists
+    it into `<project>/.drcode/settings.json`, so the choice is scoped to
+    the project, not the user. Escape dismisses the selection window and
+    keeps the current value.
     """
 
-    def _options(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
         app = cast("DrCodeApp", self.app)
-        current = app.settings.completed_retention
-        options: list[tuple[str, str, Callable[[], object]]] = []
-        for option in RETENTION_OPTIONS:
-            name = f"Автоудаление завершённых задач: {option.label}"
-            if option is current:
-                name += " (текущее)"
-            options.append(
+        return [
+            (
+                f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
                 (
-                    name,
-                    (
-                        "Удалять завершённые задачи при старте приложения "
-                        "(настройка проекта)"
-                    ),
-                    lambda option=option: app.action_set_completed_retention(option),
-                )
+                    "Delete completed tasks older than the retention period at app "
+                    "startup (project setting)"
+                ),
+                app.action_change_completed_retention,
             )
-        return options
+        ]
 
     async def discover(self) -> Hits:
-        for name, help_text, callback in self._options():
+        for name, help_text, callback in self._commands():
             yield DiscoveryHit(name, callback, help=help_text)
 
     async def search(self, query: str) -> Hits:
         matcher = self.matcher(query)
-        for name, help_text, callback in self._options():
+        for name, help_text, callback in self._commands():
             score = matcher.match(name)
             if score > 0:
                 yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
+class RetentionOptionsProvider(Provider):
+    """Options of the completed-tasks auto-cleanup setting.
+
+    Shown in the selection palette opened from the single Settings entry;
+    picking an option applies it immediately, Escape dismisses the palette
+    without changing anything. The currently active option is marked.
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.completed_retention
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_completed_retention, option),
+            )
+            for option in RETENTION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
 
 
 class DrCodeApp(App[None]):
@@ -2442,9 +2469,27 @@ class DrCodeApp(App[None]):
         self.settings.completed_retention = retention
         self.settings_store.save(self.settings)
         self.notify(
-            f"Автоудаление завершённых задач: {retention.label}",
-            title="Настройки проекта",
+            f"Auto-delete completed tasks: {retention.label}",
+            title="Project settings",
             timeout=4,
+        )
+
+    def action_change_completed_retention(self) -> None:
+        """Completed-tasks auto-cleanup picker, opened from the single
+        Settings entry ("Auto-delete completed tasks: …").
+
+        Pushes the narrowed SettingsPalette with the retention options so the
+        selection window has the same width as the Settings modal; picking an
+        option applies it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--retention-palette",
+                providers=[RetentionOptionsProvider],
+                placeholder="Search for options…",
+            )
         )
 
     def action_update_agents_md(self) -> None:

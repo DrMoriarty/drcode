@@ -37,17 +37,24 @@ from textual import events, work
 from textual.app import App, ComposeResult, get_system_commands_provider
 from textual.binding import Binding
 from textual.command import (
+    CommandInput,
+    CommandList,
     CommandPalette,
     DiscoveryHit,
     Hit,
     Hits,
+    LoadingIndicator,
     Provider,
+    SearchIcon,
 )
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Size
+from textual.strip import Strip
 from textual.theme import ThemeProvider
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
+    Button,
     Footer,
     Label,
     ListItem,
@@ -121,7 +128,38 @@ class TaskItem(ListItem):
         self.task_id = task_id
 
 
-class NewTaskInput(TextArea):
+class WordNavTextArea(TextArea):
+    """TextArea with macOS-style Option+Arrow word navigation.
+
+    Terminals report Option+Left/Right as `alt+left`/`alt+right` (kitty
+    keyboard protocol or CSI 1;3x sequences), but stock TextArea only binds
+    `ctrl+left`/`ctrl+right` — so Option+Arrow arrives unbound. Some
+    terminals (legacy esc+b / esc+f meta encoding) surface as `alt+b` /
+    `alt+f`, so those aliases are bound too. Option+Shift+Arrow extends the
+    selection by word, matching native macOS text fields.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("alt+left,alt+b", "cursor_word_left", "Cursor word left", show=False),
+        Binding(
+            "alt+right,alt+f", "cursor_word_right", "Cursor word right", show=False
+        ),
+        Binding(
+            "alt+shift+left,alt+shift+b",
+            "cursor_word_left(True)",
+            "Cursor word left select",
+            show=False,
+        ),
+        Binding(
+            "alt+shift+right,alt+shift+f",
+            "cursor_word_right(True)",
+            "Cursor word right select",
+            show=False,
+        ),
+    ]
+
+
+class NewTaskInput(WordNavTextArea):
     """Multi-line editor for a new task; Tab toggles the task type."""
 
     BINDINGS: ClassVar = [
@@ -145,7 +183,7 @@ class NewTaskInput(TextArea):
         self._app().cancel_new_task()
 
 
-class ChatInput(TextArea):
+class ChatInput(WordNavTextArea):
     """Multi-line chat editor that grows with the text.
 
     Enter sends the message; Shift+Enter / Alt+Enter insert a newline.
@@ -513,12 +551,82 @@ class ToolCallBlock(Static):
         self.update(text)
 
 
+class SpacedCommandList(CommandList):
+    """CommandList that renders one blank line between adjacent options.
+
+    Textual's OptionList lays options out back-to-back with no vertical
+    spacing, and its virtual layout ignores component-class padding, so the
+    gap is implemented at the layout level: every option except the last
+    gets a trailing spacer row (no option meta, so clicks/hover on it are
+    ignored). Overrides the private layout internals of OptionList
+    (`_update_lines`, `get_content_height`, `render_line`); revisit when
+    upgrading textual.
+    """
+
+    _SPACER: ClassVar[int] = -1
+    """Line-offset sentinel marking a blank separator row."""
+
+    def _update_lines(self) -> None:
+        if not self.scrollable_content_region:
+            return
+        line_cache = self._line_cache
+        lines = line_cache.lines
+        next_index = lines[-1][0] + 1 if lines else 0
+        get_visual = self._get_visual
+        width = self.scrollable_content_region.width - self._get_left_gutter_width()
+
+        if next_index < len(self.options):
+            padding = self.get_component_styles("option-list--option").padding
+            last_index = len(self.options) - 1
+            for index, option in enumerate(self.options[next_index:], next_index):
+                line_cache.index_to_line[index] = len(line_cache.lines)
+                line_count = (
+                    get_visual(option).get_height(self.styles, width - padding.width)
+                    + option._divider
+                )
+                line_cache.heights[index] = line_count
+                line_cache.lines.extend(
+                    [(index, line_no) for line_no in range(line_count)]
+                )
+                if index < last_index:
+                    line_cache.lines.append((index, self._SPACER))
+
+        last_divider = self.options and self.options[-1]._divider
+        virtual_size = Size(width, len(lines) - (1 if last_divider else 0))
+        if virtual_size != self.virtual_size:
+            self.virtual_size = virtual_size
+            self._scroll_update(virtual_size)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        # One extra row for each gap between adjacent options.
+        return super().get_content_height(container, viewport, width) + max(
+            0, len(self.options) - 1
+        )
+
+    def render_line(self, y: int) -> Strip:
+        try:
+            _, line_offset = self._lines[y]
+        except IndexError:
+            return Strip.blank(
+                self.scrollable_content_region.width,
+                self.get_visual_style("option-list--option").rich_style,
+            )
+        if line_offset == self._SPACER:
+            return Strip.blank(
+                self.scrollable_content_region.width,
+                self.get_visual_style("option-list--option").rich_style,
+            )
+        return super().render_line(y)
+
+
 class SettingsPalette(CommandPalette):
     """Command palette ("Settings") modal.
 
     The stock CommandPalette stretches over the full screen width; this
     subclass narrows its container to about half of the screen, but never
-    below 60 columns (on a narrow terminal 60 wins and may overflow).
+    below 60 columns (on a narrow terminal 60 wins and may overflow). It
+    also swaps in a SpacedCommandList so palette entries are separated by a
+    blank line.
     """
 
     DEFAULT_CSS = """
@@ -527,6 +635,18 @@ class SettingsPalette(CommandPalette):
         min-width: 60;
     }
     """
+
+    def compose(self) -> ComposeResult:
+        # Same as CommandPalette.compose, but with the spaced command list.
+        with Vertical(id="--container"):
+            with Horizontal(id="--input"):
+                yield SearchIcon()
+                yield CommandInput(placeholder=self._placeholder, select_on_focus=False)
+                if not self.run_on_select:
+                    yield Button("▶")
+            with Vertical(id="--results"):
+                yield SpacedCommandList()
+                yield LoadingIndicator()
 
 
 class ServiceCommandsProvider(Provider):
@@ -540,7 +660,7 @@ class ServiceCommandsProvider(Provider):
         app = cast("DrCodeApp", self.app)
         return [
             (
-                "Обновить/создать AGENTS.md",
+                "Update/create AGENTS.md",
                 "documentation task: agent creates or refreshes AGENTS.md",
                 app.action_update_agents_md,
             ),
@@ -2500,7 +2620,7 @@ class DrCodeApp(App[None]):
         `documentation` kind: the tester is skipped and mark_done() completes
         it right away."""
         task = self.manager.create(
-            "Обновить/создать AGENTS.md",
+            "Update/create AGENTS.md",
             load_init_repo_prompt(self.project_root),
             kind=TaskKind.DOCUMENTATION,
         )

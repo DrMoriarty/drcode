@@ -49,7 +49,9 @@ def user_config_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
     """A fresh temporary project directory (the agent's writable root)."""
-    return tmp_path / "project"
+    root = tmp_path / "project"
+    root.mkdir()
+    return root
 
 
 @pytest.fixture

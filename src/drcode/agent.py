@@ -513,6 +513,22 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
                 content = part.get("content")
                 if isinstance(content, str) and content:
                     lines.append(f"[user]\n{content}")
+            elif kind == "tool-return":
+                # Tool returns live in request messages (ModelRequest with a
+                # ToolReturnPart) — they must be rendered BEFORE the generic
+                # "skip everything else in a request" branch below, or the
+                # summarizer loses the bulk of the working context.
+                content = part.get("content")
+                if isinstance(content, str):
+                    text = content
+                else:
+                    try:
+                        text = json.dumps(content, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        text = str(content)
+                if len(text) > _COMPACTION_TOOL_RESULT_CAP:
+                    text = text[:_COMPACTION_TOOL_RESULT_CAP] + "\n…[truncated]"
+                lines.append(f"[tool result for {part.get('tool_name', '?')}]\n{text}")
             elif is_request:
                 continue
             elif kind == "text":

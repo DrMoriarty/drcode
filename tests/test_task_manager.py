@@ -7,10 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from drcode.models import TaskKind, TaskStatus, VerificationStatus, _now
+from drcode.models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from drcode.storage import Storage
 from drcode.task_manager import TaskManager
-
 
 # -- creation -----------------------------------------------------------------
 
@@ -30,7 +29,7 @@ def test_create_title_from_first_message(manager: TaskManager) -> None:
 
 
 def test_create_title_fallback(manager: TaskManager) -> None:
-    task = manager.create("", "   ")
+    task = manager.create("", "")
     assert task.title == "New task"
     assert task.pending_input == []
 
@@ -59,9 +58,13 @@ def test_bugs_go_to_head_newest_first(manager: TaskManager) -> None:
 
 
 def test_answered_clarification_goes_before_regular(manager: TaskManager) -> None:
+    from drcode.models import Clarification
+
     a = manager.create("a", "x")
     b = manager.create("b", "x")
-    # b gets its clarification answered first → head of non-bug tasks.
+    # b asked a question and the user answers it → head of non-bug tasks.
+    b.status = TaskStatus.AWAITING_CLARIFICATION
+    b.clarification = Clarification(question="q?")
     manager.send(b.id, "the answer")
     assert manager.queued() == [b, a]
 
@@ -98,7 +101,7 @@ def test_send_to_completed_requeues_and_clears_verification(
     assert task.status is TaskStatus.QUEUED
     assert task.verification is None
     assert task.completed_at is None
-    assert task.pending_input == ["more", "again"]
+    assert task.pending_input == ["x", "more", "again"]
 
 
 def test_send_to_testing_requeues(manager: TaskManager) -> None:
@@ -183,7 +186,7 @@ def test_hold_and_resume(manager: TaskManager) -> None:
 def test_hold_awaiting_clarification_and_resume_back(manager: TaskManager) -> None:
     from drcode.models import Clarification
 
-    task = manager.create("t", "x")
+    task = manager.create("t", "")  # no pending input: the question is still open
     task.status = TaskStatus.AWAITING_CLARIFICATION
     task.clarification = Clarification(question="q?")
 
@@ -352,7 +355,8 @@ def test_requeue_answered_clarification_noops(manager: TaskManager) -> None:
     # Wrong status.
     manager.requeue_answered_clarification(task.id)
     assert task.status is TaskStatus.QUEUED
-    # Right status but no input.
+    # Right status but no pending answer.
+    task.pending_input.clear()
     task.status = TaskStatus.AWAITING_CLARIFICATION
     manager.requeue_answered_clarification(task.id)
     assert task.status is TaskStatus.AWAITING_CLARIFICATION

@@ -37,12 +37,12 @@ def test_frozen_version_uses_meipass(monkeypatch, tmp_path: Path) -> None:
     class FakeSys:
         frozen = True
         _MEIPASS = str(tmp_path)
+        executable = "/fake/drcode"
 
-    monkeypatch.setattr(version_module.sys, "frozen", True, raising=False)
     monkeypatch.setattr(version_module, "sys", FakeSys)
     assert version_module._frozen_version() == "9.9.9"
 
 
-def test_frozen_version_none_when_not_frozen(monkeypatch) -> None:
-    monkeypatch.setattr(version_module.sys, "frozen", False, raising=False)
+def test_frozen_version_none_when_not_frozen() -> None:
+    # Real sys module: frozen is not set.
     assert version_module._frozen_version() is None

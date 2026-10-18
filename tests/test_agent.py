@@ -11,6 +11,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -38,7 +39,7 @@ from drcode.agent import (
     split_original_prompts,
 )
 from drcode.config import Config
-from drcode.models import Task, TaskKind
+from drcode.models import TaskKind
 from drcode.task_manager import TaskManager
 from drcode.tools import PathViolation
 
@@ -53,7 +54,9 @@ def text_response(text: str) -> ModelResponse:
 
 def tool_call_response(call_id: str = "c1", tool: str = "run_bash") -> ModelResponse:
     return ModelResponse(
-        parts=[ToolCallPart(tool_name=tool, args={"command": "ls"}, tool_call_id=call_id)]
+        parts=[
+            ToolCallPart(tool_name=tool, args={"command": "ls"}, tool_call_id=call_id)
+        ]
     )
 
 
@@ -103,7 +106,12 @@ def test_resumable_history_keeps_completed_exchange() -> None:
 
 def test_resumable_history_cuts_open_tool_call() -> None:
     data = serialize_messages(
-        [user_msg("q"), text_response("thinking"), tool_call_response(), tool_return_msg()]
+        [
+            user_msg("q"),
+            text_response("thinking"),
+            tool_call_response(),
+            tool_return_msg(),
+        ]
     )
     # Full exchange with a result is valid.
     assert len(resumable_history(data)) == 4
@@ -194,11 +202,11 @@ def test_extract_display_user_and_assistant() -> None:
 def test_extract_display_groups_thinking_and_text() -> None:
     response = ModelResponse(
         parts=[
-            agent_mod.ThinkingPart(content="hmm"),
+            ThinkingPart(content="hmm"),
             TextPart(content="answer text"),
         ]
     )
-    data = serialize_messages([user_msg("q"), response])
+    data = serialize_messages([response])
     out = extract_display(data)
     assert [(role, text) for _, role, text in out] == [
         ("reasoning", "hmm"),
@@ -227,7 +235,7 @@ def test_extract_display_summary_message() -> None:
 def test_extract_display_reasoning_flushed_before_tool_call() -> None:
     response = ModelResponse(
         parts=[
-            agent_mod.ThinkingPart(content="think"),
+            ThinkingPart(content="think"),
             ToolCallPart(tool_name="t", args={}, tool_call_id="c"),
         ]
     )
@@ -237,7 +245,7 @@ def test_extract_display_reasoning_flushed_before_tool_call() -> None:
 
 
 def test_extract_display_reasoning_flushed_at_message_end() -> None:
-    response = ModelResponse(parts=[agent_mod.ThinkingPart(content="think")])
+    response = ModelResponse(parts=[ThinkingPart(content="think")])
     data = serialize_messages([response])
     out = extract_display(data)
     assert [role for _, role, _ in out] == ["reasoning"]
@@ -273,7 +281,11 @@ def test_split_original_prompts_summary_first() -> None:
 
 def test_extract_previous_summary() -> None:
     data = serialize_messages(
-        [user_msg("task"), text_response("w"), user_msg(f"{COMPACTION_SUMMARY_PREFIX}\nbody\n")]
+        [
+            user_msg("task"),
+            text_response("w"),
+            user_msg(f"{COMPACTION_SUMMARY_PREFIX}\nbody\n"),
+        ]
     )
     assert extract_previous_summary(data) == "body"
     assert extract_previous_summary(serialize_messages([user_msg("task")])) is None
@@ -318,9 +330,7 @@ def test_render_history_truncates_huge_tool_results() -> None:
         [
             ModelRequest(
                 parts=[
-                    ToolReturnPart(
-                        tool_name="run_bash", content=huge, tool_call_id="c"
-                    )
+                    ToolReturnPart(tool_name="run_bash", content=huge, tool_call_id="c")
                 ]
             )
         ]
@@ -437,6 +447,10 @@ def _tool_names(ag) -> set[str]:
     return {t.name for t in ag._function_toolset.tools.values()}
 
 
+def _instructions_text(ag) -> str:
+    return "\n".join(si.instruction for si in ag._instructions)
+
+
 def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
     from drcode.agent import (
         BUG_SYSTEM_PROMPT,
@@ -451,7 +465,7 @@ def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
         (TaskKind.DOCUMENTATION, DOCUMENTATION_SYSTEM_PROMPT),
     ):
         ag = build_agent(fake_config, kind=kind)
-        assert prompt in str(ag._instructions)
+        assert prompt in _instructions_text(ag)
     # All kinds share the same tool set.
     ag = build_agent(fake_config, kind=TaskKind.BUG)
     assert {
@@ -470,20 +484,22 @@ def test_build_agent_appends_agents_md(fake_config: Config, project_root: Path) 
 
     (project_root / "AGENTS.md").write_text("PROJECT SPECIFIC RULE")
     ag = build_agent(fake_config, kind=TaskKind.FEATURE, root=project_root)
-    instructions = str(ag._instructions)
+    instructions = _instructions_text(ag)
     assert FEATURE_SYSTEM_PROMPT in instructions
     assert "Project instructions (AGENTS.md)" in instructions
     assert "PROJECT SPECIFIC RULE" in instructions
 
 
-def test_build_agent_without_root_or_empty_agents_md(fake_config: Config, project_root: Path) -> None:
-    from drcode.agent import FEATURE_SYSTEM_PROMPT, build_agent
+def test_build_agent_without_root_or_empty_agents_md(
+    fake_config: Config, project_root: Path
+) -> None:
+    from drcode.agent import build_agent
 
     ag = build_agent(fake_config, kind=TaskKind.FEATURE)  # no root passed
-    assert "Project instructions" not in str(ag._instructions)
+    assert "Project instructions" not in _instructions_text(ag)
     (project_root / "AGENTS.md").write_text("   \n")  # whitespace only
     ag2 = build_agent(fake_config, kind=TaskKind.FEATURE, root=project_root)
-    assert "Project instructions" not in str(ag2._instructions)
+    assert "Project instructions" not in _instructions_text(ag2)
 
 
 def test_build_tester_agent_has_tester_tools(fake_config: Config) -> None:

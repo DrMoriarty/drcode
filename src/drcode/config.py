@@ -106,8 +106,12 @@ class Config(BaseSettings):
         # Single-threaded TUI startup — no locking needed.
         global _pending_project_root
         _pending_project_root = project_root or Path.cwd()
-        self._project_root = _pending_project_root
         super().__init__(**data)  # type: ignore[arg-type]
+        # AFTER super().__init__(): pydantic initializes private attributes
+        # to their defaults during model construction, which would wipe a
+        # value assigned before it (the default is Path.cwd() — wrong for
+        # the TUI operating on another directory).
+        self._project_root = _pending_project_root
 
     @property
     def project_config_file(self) -> Path:

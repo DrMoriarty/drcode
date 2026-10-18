@@ -37,6 +37,7 @@ def test_defaults(project_root: Path) -> None:
     assert cfg.base_url == "https://api.openai.com/v1"
     assert cfg.max_context_tokens == 200_000
     assert cfg.compaction_threshold == 80
+    assert cfg.request_limit == 500
     assert cfg.model == ""
     assert cfg.api_key == ""
 
@@ -165,7 +166,9 @@ def test_example_values_use_placeholders() -> None:
         == "https://api.openai.com/v1"
     )
     assert (
-        config_module._example_value("compaction_threshold", fields["compaction_threshold"])
+        config_module._example_value(
+            "compaction_threshold", fields["compaction_threshold"]
+        )
         == 80
     )
     # Placeholders must never reference unknown fields.

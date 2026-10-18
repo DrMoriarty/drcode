@@ -12,7 +12,6 @@ from drcode.settings import (
     ProjectSettingsStore,
 )
 
-
 # -- CompletedRetention -------------------------------------------------------
 
 
@@ -65,7 +64,9 @@ def test_store_roundtrip(project_root: Path) -> None:
 def test_store_creates_parent_dir(project_root: Path) -> None:
     store = ProjectSettingsStore(project_root / "sub" / "dir")
     store.save(ProjectSettings())
-    assert (project_root / "sub" / "dir" / "settings.json").is_file()
+    # Settings live under <root>/.drcode/settings.json; the store must
+    # create the whole chain itself.
+    assert (project_root / "sub" / "dir" / ".drcode" / "settings.json").is_file()
 
 
 def test_store_missing_file_returns_defaults(project_root: Path) -> None:

@@ -72,8 +72,11 @@ class TaskManager:
     def create(
         self, title: str, first_message: str, kind: TaskKind = TaskKind.FEATURE
     ) -> Task:
+        first_line = (
+            first_message.splitlines()[0][:60] if first_message.splitlines() else ""
+        )
         task = Task(
-            title=title or first_message.splitlines()[0][:60] or "New task",
+            title=title or first_line or "New task",
             kind=kind,
             queue_seq=self._next_queue_seq(),
         )

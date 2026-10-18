@@ -25,7 +25,6 @@ from drcode.tools import (
     write_file,
 )
 
-
 # -- path resolution & permissions ----------------------------------------------
 
 
@@ -82,9 +81,10 @@ def test_resolve_edit_path_symlink_into_root_ok(project_root: Path) -> None:
 
 
 def test_resolve_edit_path_relative(project_root: Path) -> None:
-    assert resolve_edit_path(project_root, "a/b.txt") == (
-        project_root / "a/b.txt"
-    ).resolve()
+    assert (
+        resolve_edit_path(project_root, "a/b.txt")
+        == (project_root / "a/b.txt").resolve()
+    )
 
 
 def test_resolve_edit_path_macos_tmp_symlink(project_root: Path) -> None:

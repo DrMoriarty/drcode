@@ -103,6 +103,12 @@ from .header import ModelStatusHeader
 # order and sort before everything that has a real time.
 _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 
+# Braille spinner frames for the "work in progress" animation shown in a
+# reasoning block while the model is thinking and in a tool-call block while
+# the tool is executing.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_INTERVAL = 0.12
+
 
 class TaskItem(ListItem):
     def __init__(
@@ -231,7 +237,10 @@ class UserBlock(Static):
 class ReasoningBlock(Static):
     """Collapsible model-reasoning block; collapsed by default, click to toggle.
 
-    While the model is thinking, `append()` streams text into the block.
+    While the model is thinking, `append()` streams text into the block and
+    an animated spinner runs in the header; `finish()` (the request stream
+    ended) stops it. `thinking(False)` pauses the spinner mid-stream when the
+    model moved on from thinking to the answer text.
     """
 
     def __init__(self) -> None:
@@ -239,13 +248,34 @@ class ReasoningBlock(Static):
         self._content = ""
         self._streaming = False
         self._flush_timer: Timer | None = None
+        self._spin_timer: Timer | None = None
+        self._spin_frame = 0
         # Chat-view epoch this block belongs to; a mid-node view_task()
         # wipes the log and bumps the app's epoch, orphaning the block.
         self.stream_epoch = -1
 
     def begin(self) -> None:
         self._streaming = True
+        self._set_thinking(True)
         self._redraw()
+
+    def thinking(self, on: bool) -> None:
+        """Spinner on/off while the stream is still running: True while a
+        thinking part is arriving, False once text parts take over."""
+        if self._streaming:
+            self._set_thinking(on)
+
+    def _set_thinking(self, on: bool) -> None:
+        if on and self._spin_timer is None:
+            self._spin_timer = self.set_interval(_SPINNER_INTERVAL, self._spin)
+        elif not on and self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+
+    def _spin(self) -> None:
+        self._spin_frame = (self._spin_frame + 1) % len(_SPINNER_FRAMES)
+        if self.is_attached:
+            self._redraw()
 
     def append(self, delta: str) -> None:
         # Content is accumulated immediately (a mid-node view_task() carries
@@ -272,7 +302,13 @@ class ReasoningBlock(Static):
             self._flush_timer.stop()
             self._flush_timer = None
         self._streaming = False
+        self._set_thinking(False)
         self._redraw()
+
+    def on_unmount(self) -> None:
+        # A view switch wipes the block mid-stream: stop the animation, so
+        # an orphaned widget doesn't keep ticking until the run ends.
+        self._set_thinking(False)
 
     def on_click(self) -> None:
         self.toggle_class("collapsed")
@@ -284,7 +320,11 @@ class ReasoningBlock(Static):
         # Textual's markup parser accepts as tags (unlike Rich's escape()).
         collapsed = self.has_class("collapsed")
         arrow = "▸" if collapsed else "▾"
-        status = "…" if self._streaming else ""
+        status = (
+            f" {_SPINNER_FRAMES[self._spin_frame]}"
+            if self._spin_timer is not None
+            else ""
+        )
         text = Text.assemble((f"{arrow} Reasoning{status}", "bold dim"))
         if not collapsed:
             text.append("\n")
@@ -393,7 +433,36 @@ class ToolCallBlock(Static):
         super().__init__(classes="tool-call collapsed")
         self._header, self._args = self._split(call)
         self._header += self._primary_arg_suffix(self._args)
+        self._spin_timer: Timer | None = None
+        self._spin_frame = 0
         self._redraw()
+
+    def start_spinner(self) -> None:
+        """Tool execution in progress: animate the header marker until
+        stop_spinner() (the result event) — or unmount (the view was
+        switched away) — stops it."""
+        if self._spin_timer is None:
+            self._spin_timer = self.set_interval(_SPINNER_INTERVAL, self._spin)
+
+    def stop_spinner(self) -> None:
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+        if self.is_attached:
+            self._redraw()
+
+    def _spin(self) -> None:
+        self._spin_frame = (self._spin_frame + 1) % len(_SPINNER_FRAMES)
+        if self.is_attached:
+            self._redraw()
+
+    def on_unmount(self) -> None:
+        # A view switch wipes the block while the tool is still running: the
+        # animation must not keep ticking on an orphaned widget (the fresh
+        # block created on re-render gets its own spinner).
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
 
     @staticmethod
     def _split(call: str) -> tuple[str, str]:
@@ -434,7 +503,10 @@ class ToolCallBlock(Static):
         # Plain Text, not a markup string — tool arguments are model JSON and
         # may contain bracket sequences Textual's markup parser takes for tags.
         arrow = "▸" if self.has_class("collapsed") else "▾"
-        text = Text(f"{arrow} ⚙ {self._header}")
+        marker = (
+            _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "⚙"
+        )
+        text = Text(f"{arrow} {marker} {self._header}")
         if not self.has_class("collapsed") and self._args:
             text.append("\n").append(self._args)
         self.update(text)
@@ -714,6 +786,16 @@ class DrCodeApp(App[None]):
         # on the result event) — lets the label distinguish "tool busy" from
         # "total silence".
         self._current_tool: str | None = None
+        # Tool calls currently executing, per run (the run key is
+        # ("agent"|"tester", generation)): tool_call_id ->
+        # (task_id, rendered call text, live block with the spinner). The
+        # text lets a mid-run view re-render (view_task wipes the chat log)
+        # re-attach the running spinner to the freshly rendered block.
+        self._active_tools: dict[
+            tuple[str, int], dict[str, tuple[str, str, ToolCallBlock]]
+        ] = {}
+        # Monotonic stamp distinguishing successive tester runs.
+        self._tester_generation = 0
         # Context fill (tokens) seen by the latest completed model request,
         # per task, updated live while the run streams. The stored transcript
         # is only refreshed at persist points, so the status bar reads the
@@ -1265,7 +1347,11 @@ class DrCodeApp(App[None]):
             _add(event.at, "event", self._format_event(event))
         timeline.sort(key=lambda item: item[:2])
         for _, _, role, text in timeline:
-            self._write_history_line(role, text)
+            block = self._write_history_line(role, text)
+            if role == "tool-call" and isinstance(block, ToolCallBlock):
+                # A tool still executing (run in flight) gets its spinner
+                # back on the freshly rendered block.
+                self._reattach_tool_spinner(block, text, task_id)
         for pending in task.pending_input:
             if is_pending_retry(task.messages, pending):
                 # The failed/interrupted run left this prompt in the
@@ -1301,6 +1387,51 @@ class DrCodeApp(App[None]):
             self._last_follow = now
             self.chat_log.call_after_refresh(self.chat_log.scroll_end, animate=False)
 
+    # -- tool-call spinners ------------------------------------------------------
+
+    def _tool_call_started(
+        self,
+        run_key: tuple[str, int],
+        task_id: str,
+        call_id: str,
+        call_text: str,
+        block: ToolCallBlock,
+    ) -> None:
+        """Register a tool call whose execution just began (spinner on)."""
+        self._active_tools.setdefault(run_key, {})[call_id] = (
+            task_id,
+            call_text,
+            block,
+        )
+
+    def _tool_call_finished(self, call_id: str) -> None:
+        """Tool result arrived: stop the spinner of its block (in whichever
+        run registered it — agent and tester never overlap, but the lookup
+        is over all runs anyway)."""
+        for per_run in self._active_tools.values():
+            entry = per_run.pop(call_id, None)
+            if entry is not None:
+                entry[2].stop_spinner()
+
+    def _stop_run_tools(self, run_key: tuple[str, int]) -> None:
+        """End-of-run cleanup: anything still marked running for this run
+        (a result event lost to an abort/error) loses its spinner."""
+        for _task_id, _text, block in self._active_tools.pop(run_key, {}).values():
+            block.stop_spinner()
+
+    def _reattach_tool_spinner(
+        self, block: ToolCallBlock, call_text: str, task_id: str
+    ) -> None:
+        """After a mid-run view re-render, hand a still-running call's
+        spinner over to the freshly rendered block (matched by the exact
+        rendered call text — same tool with the same arguments)."""
+        for per_run in self._active_tools.values():
+            for call_id, (tid, text, _old) in per_run.items():
+                if tid == task_id and text == call_text:
+                    per_run[call_id] = (tid, text, block)
+                    block.start_spinner()
+                    return
+
     def _write_chat(
         self, content: RenderableType | Widget, *, expand: bool = False
     ) -> None:
@@ -1320,20 +1451,26 @@ class DrCodeApp(App[None]):
             self.chat_log.scroll_end(animate=False)
         self._chat_has_content = True
 
-    def _write_history_line(self, role: str, text: str) -> None:
+    def _write_history_line(self, role: str, text: str) -> Widget | None:
+        """Render one history entry into the chat log.
+
+        Returns the mounted block widget (None for markup-string lines) so
+        callers can tweak it afterwards — view_task re-attaches the running
+        spinner to tool-call blocks this way.
+        """
+        block: Widget | None = None
         if role == "user":
-            self._write_chat(UserBlock(text))
+            block = UserBlock(text)
         elif role == "user-pending":
             self._pending_rendered.append(text)
-            self._write_chat(UserBlock(text))
+            block = UserBlock(text)
         elif role == "reasoning":
             block = ReasoningBlock()
             block.set_content(text)
-            self._write_chat(block)
         elif role == "tool-call":
-            self._write_chat(ToolCallBlock(text))
+            block = ToolCallBlock(text)
         elif role == "assistant":
-            self._write_chat(AssistantBlock(text))
+            block = AssistantBlock(text)
         elif role == "tool":
             self._write_chat(f"[dim]{escape(text)}[/]")
         elif role == "tester":
@@ -1346,11 +1483,14 @@ class DrCodeApp(App[None]):
             # itself rendered as markdown (it is the model's output the
             # agent continues from, not a user message).
             self._write_chat("[bold magenta]──── context compacted ────[/]")
-            self._write_chat(AssistantBlock(text))
+            block = AssistantBlock(text)
         elif role == "event":
             self._write_chat(f"[bold red]event ›[/] {text}")
         elif role == "system":
             self._write_chat(f"[bold red]error ›[/] {text}")
+        if block is not None:
+            self._write_chat(block)
+        return block
 
     def _write_clarification(self, clarification: Clarification) -> None:
         lines = [f"[bold blue]drcode ❓[/] {escape(clarification.question)}"]
@@ -1582,6 +1722,9 @@ class DrCodeApp(App[None]):
     async def run_agent(self, task_id: str) -> None:
         self._agent_generation += 1
         generation = self._agent_generation
+        # Key for the tool-spinner registry: superseded runs clean up only
+        # their own entries.
+        run_key: tuple[str, int] = ("agent", generation)
         task = self.manager.get(task_id)
         # Bound only once `async with agent.iter(...)` is entered; the
         # except handlers below must not touch a run that never started.
@@ -1728,6 +1871,7 @@ class DrCodeApp(App[None]):
                                                 # appended even when the task
                                                 # is off-screen: they must
                                                 # survive a later re-render.
+                                                reasoning_block.thinking(True)
                                                 follow = (
                                                     self._chat_at_bottom()
                                                     if self.viewed_id == task_id
@@ -1748,6 +1892,10 @@ class DrCodeApp(App[None]):
                                             # up between the reasoning and
                                             # tool-call blocks (no separate
                                             # preview area under the log).
+                                            # Thinking is over for now — stop
+                                            # the reasoning block's spinner.
+                                            if reasoning_block is not None:
+                                                reasoning_block.thinking(False)
                                             if (
                                                 assistant_block is None
                                                 or assistant_block.stream_epoch
@@ -1802,6 +1950,11 @@ class DrCodeApp(App[None]):
                                         if isinstance(event, FunctionToolCallEvent):
                                             self._touch_activity(event.part.tool_name)
                                         elif isinstance(event, FunctionToolResultEvent):
+                                            # Result stops the spinner even
+                                            # when the task is off-screen.
+                                            self._tool_call_finished(
+                                                event.part.tool_call_id
+                                            )
                                             self._touch_activity(done=True)
                                         if self.viewed_id != task_id:
                                             continue
@@ -1814,12 +1967,19 @@ class DrCodeApp(App[None]):
                                                     args or {}, ensure_ascii=False
                                                 )
                                             )
-                                            self._write_chat(
-                                                ToolCallBlock(
-                                                    f"{event.part.tool_name}"
-                                                    f"({args_str})"
-                                                )
+                                            call_text = (
+                                                f"{event.part.tool_name}({args_str})"
                                             )
+                                            block = ToolCallBlock(call_text)
+                                            self._tool_call_started(
+                                                run_key,
+                                                task_id,
+                                                event.part.tool_call_id,
+                                                call_text,
+                                                block,
+                                            )
+                                            block.start_spinner()
+                                            self._write_chat(block)
                             # Keep the stored history current while the
                             # turn runs: view_task() renders from
                             # task.messages, so without a per-node snapshot
@@ -1884,6 +2044,9 @@ class DrCodeApp(App[None]):
                     self.manager.storage.save(task)
                     break
         finally:
+            # Stop any spinner whose result event was lost to an abort or a
+            # run error (normally all of them are already stopped).
+            self._stop_run_tools(run_key)
             if generation == self._agent_generation:
                 self.agent_running = False
                 self.refresh_status()
@@ -1944,6 +2107,8 @@ class DrCodeApp(App[None]):
     async def run_tester(self, task_id: str) -> None:
         """After any task completes, verify the project and label the task."""
         self._tester_task_id = task_id
+        self._tester_generation += 1
+        run_key: tuple[str, int] = ("tester", self._tester_generation)
         task = self.manager.get(task_id)
         # Initialized before the try: build_tester_agent() itself may raise,
         # and the handlers below reference `run`.
@@ -1992,6 +2157,11 @@ class DrCodeApp(App[None]):
                                     if isinstance(event, FunctionToolCallEvent):
                                         self._touch_activity(event.part.tool_name)
                                     elif isinstance(event, FunctionToolResultEvent):
+                                        # Result stops the spinner even when
+                                        # the task is off-screen.
+                                        self._tool_call_finished(
+                                            event.part.tool_call_id
+                                        )
                                         self._touch_activity(done=True)
                                     if self.viewed_id == task_id and isinstance(
                                         event, FunctionToolCallEvent
@@ -2004,12 +2174,20 @@ class DrCodeApp(App[None]):
                                                 args or {}, ensure_ascii=False
                                             )
                                         )
-                                        self._write_chat(
-                                            ToolCallBlock(
-                                                f"tester: {event.part.tool_name}"
-                                                f"({args_str})"
-                                            )
+                                        call_text = (
+                                            f"tester: {event.part.tool_name}"
+                                            f"({args_str})"
                                         )
+                                        block = ToolCallBlock(call_text)
+                                        self._tool_call_started(
+                                            run_key,
+                                            task_id,
+                                            event.part.tool_call_id,
+                                            call_text,
+                                            block,
+                                        )
+                                        block.start_spinner()
+                                        self._write_chat(block)
                         # Keep the stored history current while the test
                         # runs: switching to the task mid-test shows the
                         # tester's work done so far.
@@ -2033,6 +2211,9 @@ class DrCodeApp(App[None]):
                 self._schedule_tester_retry(task_id)
                 self._show_event(task, f"tester failed: {type(e).__name__}: {e}")
         finally:
+            # Stop any spinner whose result event was lost to an abort or a
+            # tester error (normally all of them are already stopped).
+            self._stop_run_tools(run_key)
             self.tester_running = False
             self._tester_task_id = None
             self.refresh_status()

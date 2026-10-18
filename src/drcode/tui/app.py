@@ -1086,6 +1086,13 @@ class DrCodeApp(App[None]):
         # each block's stream_epoch to detect that a mid-node re-render
         # orphaned the live blocks and they must be re-mounted.
         self._chat_epoch = 0
+        # While True, _write_chat() collects blocks into _chat_batch instead
+        # of mounting them one by one (view_task's history rebuild mounts the
+        # whole timeline with a single mount + scroll — per-block mounting of
+        # a fat transcript forces a layout/scroll pass per block and freezes
+        # the event loop for seconds).
+        self._chat_batching = False
+        self._chat_batch: list[Widget] = []
         # Clarification object currently rendered in the open chat view.
         # Compared by identity: a newly asked question is a fresh instance,
         # so the agent run's end-of-run handler never re-draws a question
@@ -1677,6 +1684,20 @@ class DrCodeApp(App[None]):
         # never loses the tail of an in-flight response).
         self._chat_epoch += 1
         self.chat_log.remove_children()
+        self._chat_batching = True
+        try:
+            self._render_task_history(task, task_id)
+        finally:
+            # Opening a task always lands on the latest entry (previously
+            # this happened implicitly because every mount scrolled to the
+            # end). The finally keeps a mid-render exception from leaving
+            # batching on (later live writes would be swallowed).
+            self._flush_chat_batch()
+        self.refresh_sidebar()
+        self.refresh_status()
+
+    def _render_task_history(self, task: Task, task_id: str) -> None:
+        """Write the task's full history into the (batched) chat log."""
         self._chat_has_content = False
         self._pending_rendered = []
         self._clear_stream_label()
@@ -1735,11 +1756,6 @@ class DrCodeApp(App[None]):
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
             self._rendered_clarification = task.clarification
-        # Opening a task always lands on the latest entry (previously this
-        # happened implicitly because every mount scrolled to the end).
-        self.chat_log.scroll_end(animate=False)
-        self.refresh_sidebar()
-        self.refresh_status()
 
     def _chat_at_bottom(self) -> bool:
         """True when the last line of the chat log is in the viewport.
@@ -1814,16 +1830,32 @@ class DrCodeApp(App[None]):
         Scrolls to the end only when the user is already looking at the
         bottom: a scrolled-up reader must not be yanked down by new tool
         calls / reasoning blocks arriving while the agent runs.
+
+        While batching (view_task's history rebuild), the block is only
+        collected — _flush_chat_batch() mounts the whole timeline in one
+        go afterwards.
         """
-        follow = self._chat_at_bottom()
         if isinstance(content, Widget):
             content.add_class("chat-block")
         else:
             content = Static(content, expand=expand, classes="chat-block")
+        if self._chat_batching:
+            self._chat_batch.append(content)
+            self._chat_has_content = True
+            return
+        follow = self._chat_at_bottom()
         self.chat_log.mount(content)
         if follow:
             self.chat_log.scroll_end(animate=False)
         self._chat_has_content = True
+
+    def _flush_chat_batch(self) -> None:
+        """Mount the blocks collected by a batched history rebuild."""
+        self._chat_batching = False
+        if self._chat_batch:
+            self.chat_log.mount(*self._chat_batch)
+            self._chat_batch.clear()
+        self.chat_log.scroll_end(animate=False)
 
     def _write_history_line(self, role: str, text: str) -> Widget | None:
         """Render one history entry into the chat log.
@@ -2199,6 +2231,14 @@ class DrCodeApp(App[None]):
                             request_limit=self.config.request_limit
                         ),
                     ) as run:
+                        # Sync markers for the per-node re-render (below):
+                        # view_dirty — content was produced while the task
+                        # was off-screen, so the open chat view (if any) is
+                        # missing it; _chat_epoch mismatch — the user
+                        # switched views mid-node, and the switch-back
+                        # render covered only the persisted transcript.
+                        view_dirty = False
+                        synced_epoch = self._chat_epoch
                         async for node in run:
                             if Agent.is_model_request_node(node):
                                 reasoning_block: ReasoningBlock | None = None
@@ -2266,6 +2306,8 @@ class DrCodeApp(App[None]):
                                                 reasoning_block.begin()
                                                 if self.viewed_id == task_id:
                                                     self._write_chat(reasoning_block)
+                                                else:
+                                                    view_dirty = True
                                                 reasoning_block.append(
                                                     delta.content_delta
                                                 )
@@ -2279,6 +2321,8 @@ class DrCodeApp(App[None]):
                                                 # is off-screen: they must
                                                 # survive a later re-render.
                                                 reasoning_block.thinking(True)
+                                                if self.viewed_id != task_id:
+                                                    view_dirty = True
                                                 follow = (
                                                     self._chat_at_bottom()
                                                     if self.viewed_id == task_id
@@ -2325,10 +2369,14 @@ class DrCodeApp(App[None]):
                                                     )
                                                 if self.viewed_id == task_id:
                                                     self._write_chat(assistant_block)
+                                                else:
+                                                    view_dirty = True
                                                 assistant_block.append(
                                                     delta.content_delta
                                                 )
                                             else:
+                                                if self.viewed_id != task_id:
+                                                    view_dirty = True
                                                 follow = (
                                                     self._chat_at_bottom()
                                                     if self.viewed_id == task_id
@@ -2376,6 +2424,11 @@ class DrCodeApp(App[None]):
                                             )
                                             self._touch_activity(done=True)
                                         if self.viewed_id != task_id:
+                                            # The tool-call block is skipped
+                                            # (it will come from the next
+                                            # re-render): the open view is
+                                            # missing it.
+                                            view_dirty = True
                                             continue
                                         if isinstance(event, FunctionToolCallEvent):
                                             args = event.part.args
@@ -2445,13 +2498,22 @@ class DrCodeApp(App[None]):
                     if run.result is not None:
                         task.messages = serialize_messages(run.result.all_messages())
                         self.manager.storage.save(task)
-                    if self.viewed_id == task_id:
+                    if self.viewed_id == task_id and (
+                        view_dirty or self._chat_epoch != synced_epoch
+                    ):
                         # The streamed reasoning/assistant blocks are already
-                        # in the chat. Re-render from the persisted transcript
-                        # only to cover the case where the view was switched
-                        # away and back mid-run (the streamed blocks were wiped
-                        # by view_task and must be restored from history).
+                        # in the chat: re-rendering from the persisted
+                        # transcript after every node would remount the whole
+                        # (growing) history each time and freeze the UI for
+                        # seconds on fat transcripts. Do it only when the open
+                        # view is actually out of sync: content arrived while
+                        # the task was off-screen (view_dirty), or the user
+                        # switched views mid-node — the switch-back render
+                        # covered only the transcript persisted at the
+                        # previous node boundary.
                         self.view_task(task_id)
+                        view_dirty = False
+                        synced_epoch = self._chat_epoch
                     # The turn went through: the rate-limit retry budget for
                     # this task starts over.
                     self._agent_429_count.pop(task_id, None)

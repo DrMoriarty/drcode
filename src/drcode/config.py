@@ -31,7 +31,15 @@ from pydantic_settings import (
 # env_file в pydantic-settings резолвится относительно cwd, а TUI может быть
 # запущен из любой директории — якоримся на корень репозитория через __file__.
 # Последний файл в кортеже побеждает: локальный .env переопределяет репозиторный.
-_REPO_ENV = Path(__file__).resolve().parents[2] / ".env"
+# Файл учитывается только для запуска из исходников (рядом pyproject.toml):
+# у pip-установленной или замороженной копии parents[2] — это site-packages
+# или временный каталог распаковки, искать там .env бессмысленно.
+_REPO_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_REPO_ENV_FILES: tuple[Path | str, ...] = (
+    (_REPO_ENV_PATH, ".env")
+    if (_REPO_ENV_PATH.parent / "pyproject.toml").is_file()
+    else (".env",)
+)
 
 # User-level config directory/file. $XDG_CONFIG_HOME is honored so Linux
 # packagers/redirectors can move the config tree; defaults to ~/.config.
@@ -62,7 +70,7 @@ _EXAMPLE_PLACEHOLDERS: dict[str, str] = {
 
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(_REPO_ENV, ".env"), env_prefix="DRCODE_", extra="ignore"
+        env_file=_REPO_ENV_FILES, env_prefix="DRCODE_", extra="ignore"
     )
 
     # Root of the project this config belongs to (private, not a setting).

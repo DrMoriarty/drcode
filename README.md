@@ -10,12 +10,44 @@ The center is not a chat session, but a **task** (feature request, bug report, o
 
 ## Install & run
 
+From source (development):
+
 ```bash
 uv sync
 uv run drcode
 ```
 
+Globally available from any project directory:
+
+```bash
+uv tool install .        # installs the `drcode` command into ~/.local/bin
+# or, equivalently, with pipx:
+pipx install .
+# or plain pip (preferably into the user environment):
+pip install .
+```
+
+Update after code changes: `uv tool install . --force` (pipx: `pipx upgrade .` or reinstall).
+Uninstall: `uv tool uninstall drcode`.
+
 The TUI operates on the **current directory** (`Path.cwd()`).
+
+## Standalone binary
+
+A self-contained executable that bundles its own Python interpreter and all
+dependencies — no Python installation and no library versions required on the
+target machine. Build it on each target OS/architecture (cross-compilation is
+not supported):
+
+```bash
+bash scripts/build-binary.sh
+# → dist/drcode  (one-file Mach-O / ELF executable, ~45 MB)
+```
+
+PyInstaller is provisioned automatically via the `build` dependency group
+(`uv sync --group build`). The binary reads the same configuration (env vars,
+`~/.config/drcode/drcode.json`, per-project `.env` / `drcode.json`) as the
+installed package.
 
 ## Configuration
 

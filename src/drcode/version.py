@@ -10,14 +10,35 @@ to the source tree), the version falls back to the package metadata.
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 
+def _frozen_version() -> str | None:
+    """Version from the `version` file bundled into a PyInstaller build.
+
+    Frozen binaries carry the file next to the unpacked payload
+    (`sys._MEIPASS`); no `pyproject.toml` exists there, so the regular
+    discovery below would never see it.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    try:
+        text = (base / "version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
 @lru_cache(maxsize=1)
 def app_version() -> str:
+    frozen = _frozen_version()
+    if frozen:
+        return frozen
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / "version"

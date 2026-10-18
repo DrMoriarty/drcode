@@ -238,6 +238,7 @@ class ReasoningBlock(Static):
         super().__init__(classes="reasoning collapsed")
         self._content = ""
         self._streaming = False
+        self._flush_timer: Timer | None = None
         # Chat-view epoch this block belongs to; a mid-node view_task()
         # wipes the log and bumps the app's epoch, orphaning the block.
         self.stream_epoch = -1
@@ -247,8 +248,19 @@ class ReasoningBlock(Static):
         self._redraw()
 
     def append(self, delta: str) -> None:
+        # Content is accumulated immediately (a mid-node view_task() carries
+        # it over), but the redraw is throttled: _redraw rebuilds the full
+        # Text from the whole accumulated content — doing that per delta
+        # saturates the event loop (which also drives the UI) and makes
+        # keyboard/mouse input lag while the agent runs.
         self._content += delta
-        self._redraw()
+        if self._flush_timer is None:
+            self._flush_timer = self.set_timer(0.1, self._flush)
+
+    def _flush(self) -> None:
+        self._flush_timer = None
+        if self.is_attached:
+            self._redraw()
 
     def set_content(self, text: str) -> None:
         """Fill from history (not streaming)."""
@@ -256,6 +268,9 @@ class ReasoningBlock(Static):
         self._redraw()
 
     def finish(self) -> None:
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
         self._streaming = False
         self._redraw()
 
@@ -309,15 +324,39 @@ class AssistantBlock(Static):
         self._content = text
         self._text: Text | None = None
         self._width = 0
+        self._streaming = False
+        self._flush_timer: Timer | None = None
         # Chat-view epoch this block belongs to; see ReasoningBlock.
         self.stream_epoch = -1
 
     def append(self, delta: str) -> None:
-        self.set_content(self._content + delta)
+        # Streaming mode: raw text, throttled repaint. Rendering the full
+        # markdown (Rich parse + highlighting of the whole accumulated
+        # answer) on every delta starves the event loop that also drives
+        # the UI — the markdown is rendered once when the stream finishes.
+        self._streaming = True
+        self._content += delta
+        if self._flush_timer is None:
+            self._flush_timer = self.set_timer(0.1, self._flush)
+
+    def _flush(self) -> None:
+        self._flush_timer = None
+        if self.is_attached:
+            self._text = None
+            self.refresh()
+
+    def finish(self) -> None:
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        self._streaming = False
+        self._text = None
+        self.refresh()
 
     def set_content(self, text: str) -> None:
         """Fill or replace the markdown (also used for history rendering)."""
         self._content = text
+        self._streaming = False
         self._text = None
         self.refresh()
 
@@ -328,7 +367,10 @@ class AssistantBlock(Static):
     def render(self) -> Text:
         width = self.content_size.width or self.size.width or 80
         if self._text is None or self._width != width:
-            self._text = _markdown_text(self._content, width)
+            if self._streaming:
+                self._text = Text(self._content)
+            else:
+                self._text = _markdown_text(self._content, width)
             self._width = width
         return self._text
 
@@ -679,6 +721,9 @@ class DrCodeApp(App[None]):
         # value of a finished task — it stays in the history via the saved
         # per-response usage).
         self._live_ctx_tokens: dict[str, int] = {}
+        # Monotonic stamp of the last coalesced follow-the-tail scroll while
+        # streaming (see _stream_follow).
+        self._last_follow = 0.0
         # Bumped by every view_task(): the streaming loop compares it with
         # each block's stream_epoch to detect that a mid-node re-render
         # orphaned the live blocks and they must be re-mounted.
@@ -1244,6 +1289,18 @@ class DrCodeApp(App[None]):
         log = self.chat_log
         return log.scroll_offset.y >= log.max_scroll_y - 1
 
+    def _stream_follow(self) -> None:
+        """Keep the chat tail visible while streaming, coalesced to ~10 Hz.
+
+        Called per streamed delta; each scroll_end schedules a refresh+scroll
+        pass over the (growing) chat log — doing that per delta saturates the
+        event loop and makes keyboard/mouse input unresponsive.
+        """
+        now = time.monotonic()
+        if now - self._last_follow >= 0.1:
+            self._last_follow = now
+            self.chat_log.call_after_refresh(self.chat_log.scroll_end, animate=False)
+
     def _write_chat(
         self, content: RenderableType | Widget, *, expand: bool = False
     ) -> None:
@@ -1680,10 +1737,7 @@ class DrCodeApp(App[None]):
                                                     delta.content_delta
                                                 )
                                                 if follow:
-                                                    self.chat_log.call_after_refresh(
-                                                        self.chat_log.scroll_end,
-                                                        animate=False,
-                                                    )
+                                                    self._stream_follow()
                                         elif (
                                             isinstance(delta, TextPartDelta)
                                             and delta.content_delta
@@ -1729,12 +1783,11 @@ class DrCodeApp(App[None]):
                                                     delta.content_delta
                                                 )
                                                 if follow:
-                                                    self.chat_log.call_after_refresh(
-                                                        self.chat_log.scroll_end,
-                                                        animate=False,
-                                                    )
+                                                    self._stream_follow()
                                 if reasoning_block is not None:
                                     reasoning_block.finish()
+                                if assistant_block is not None:
+                                    assistant_block.finish()
                                 # The stream is closed: this request's usage
                                 # is final. Refresh the context counter in
                                 # the task status bar for the running task.

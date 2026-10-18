@@ -944,7 +944,11 @@ class DrCodeApp(App[None]):
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+t", "cycle_task_kind", "Change type"),
         ("ctrl+s", "settings", "Settings"),
-        ("ctrl+h", "toggle_hold", "Hold/Resume"),
+        # Two bindings on one key: the footer (and the key dispatch) picks
+        # the first one whose check_action allows it — so exactly one of
+        # Hold/Resume is shown, depending on the viewed task's status.
+        ("ctrl+h", "hold_task", "Hold"),
+        ("ctrl+h", "resume_task", "Resume"),
         ("ctrl+delete", "delete_task", "Delete held"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+q", "quit", "Quit"),
@@ -1137,6 +1141,35 @@ class DrCodeApp(App[None]):
     @property
     def viewed(self) -> Task | None:
         return self.manager.tasks.get(self.viewed_id) if self.viewed_id else None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Gate the app-level bindings on the current state: a binding that
+        can't do anything right now (no viewed task, wrong status, nothing
+        running) is hidden from the footer instead of failing silently.
+
+        True = enabled+visible, False = disabled+hidden, None = disabled
+        but grayed out in the footer.
+        """
+        task = self.viewed
+        if action == "done_task":
+            return task is not None and task.status is not TaskStatus.COMPLETED
+        if action == "cancel_task":
+            return task is not None and task.status is not TaskStatus.COMPLETED
+        if action == "cycle_task_kind":
+            # Only a queued (not yet started) task can be re-typed.
+            return task is not None and task.status is TaskStatus.QUEUED
+        if action == "hold_task":
+            return task is not None and task.status in (
+                TaskStatus.QUEUED,
+                TaskStatus.AWAITING_CLARIFICATION,
+            )
+        if action == "resume_task":
+            return task is not None and task.status is TaskStatus.HOLD
+        if action == "delete_task":
+            return task is not None and task.status is TaskStatus.HOLD
+        if action == "abort_run":
+            return self.agent_running or self.tester_running
+        return True
 
     # -- copy on select -------------------------------------------------------
 
@@ -1789,6 +1822,9 @@ class DrCodeApp(App[None]):
         self.refresh_task_status()
 
     def refresh_task_status(self) -> None:
+        # The footer mirrors the state check_action() gates on (viewed task,
+        # its status, running flags): re-evaluate the visible bindings.
+        self.refresh_bindings()
         left = self.query_one("#task-status-left", Static)
         right = self.query_one("#task-status-right", Static)
         # The new-task form is not tied to any task: keep the bar empty so
@@ -2671,21 +2707,30 @@ class DrCodeApp(App[None]):
         if self.viewed_id == task.id:
             self.refresh_task_status()
 
-    def action_toggle_hold(self) -> None:
-        """Park the viewed task out of the backlog (hold) or return a held
-        task to where it was. Works for queued tasks and for tasks awaiting
-        a clarifying answer (the question is preserved and shown again on
-        resume). Held tasks are never taken into work until explicitly
-        resumed; typed input keeps accumulating."""
+    def action_hold_task(self) -> None:
+        """Park the viewed task out of the backlog (hold). Works for queued
+        tasks and for tasks awaiting a clarifying answer (the question is
+        preserved and shown again on resume). Held tasks are never taken
+        into work until explicitly resumed; typed input keeps accumulating."""
         task = self.viewed
-        if task is None:
+        if task is None or task.status not in (
+            TaskStatus.QUEUED,
+            TaskStatus.AWAITING_CLARIFICATION,
+        ):
             return
-        if task.status in (TaskStatus.QUEUED, TaskStatus.AWAITING_CLARIFICATION):
-            self.manager.set_hold(task.id, on=True)
-        elif task.status is TaskStatus.HOLD:
-            self.manager.set_hold(task.id, on=False)
-        else:
+        self.manager.set_hold(task.id, on=True)
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+
+    def action_resume_task(self) -> None:
+        """Return a held task to where it was (queued or awaiting
+        clarification, whichever it was parked from)."""
+        task = self.viewed
+        if task is None or task.status is not TaskStatus.HOLD:
             return
+        self.manager.set_hold(task.id, on=False)
         self.refresh_sidebar()
         self.refresh_status()
         if self.viewed_id == task.id:
@@ -2718,7 +2763,13 @@ class DrCodeApp(App[None]):
         self.sidebar.focus()
 
     def action_focus_input(self) -> None:
-        self.chat_input.focus()
+        # The new-task form replaces the chat input while it is open: the
+        # hidden chat editor must not steal focus (a focused display:none
+        # widget swallows typing into nowhere).
+        if self._new_task_mode:
+            self.new_task_input.focus()
+        else:
+            self.chat_input.focus()
 
     def action_settings(self) -> None:
         """Open the Settings modal (the command palette, Ctrl+S)."""

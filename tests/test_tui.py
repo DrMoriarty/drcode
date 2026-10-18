@@ -159,17 +159,17 @@ async def test_action_toggle_hold_and_delete(app: DrCodeApp) -> None:
     task = app.manager.create("parked", "")  # no input: stays queued
     async with app.run_test() as pilot:
         await pilot.pause()
-        app.action_toggle_hold()
+        app.action_hold_task()
         assert task.status is TaskStatus.HOLD
 
-        app.action_toggle_hold()
+        app.action_resume_task()
         assert task.status is TaskStatus.QUEUED
 
         # Only held tasks can be deleted.
         app.action_delete_task()
         assert task.id in app.manager.tasks
 
-        app.action_toggle_hold()
+        app.action_hold_task()
         app.action_delete_task()
         assert app.manager.all_tasks() == []
         assert not (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
@@ -206,7 +206,7 @@ async def test_sidebar_shows_task_statuses(app: DrCodeApp) -> None:
         await pilot.pause()
         items = app.query("TaskItem")
         assert items
-        app.action_toggle_hold()
+        app.action_hold_task()
         await pilot.pause()
         # Sidebar snapshot changed → the poller redraws it.
         app._poll_sidebar()

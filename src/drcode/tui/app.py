@@ -1037,6 +1037,12 @@ class DrCodeApp(App[None]):
         # each block's stream_epoch to detect that a mid-node re-render
         # orphaned the live blocks and they must be re-mounted.
         self._chat_epoch = 0
+        # Clarification object currently rendered in the open chat view.
+        # Compared by identity: a newly asked question is a fresh instance,
+        # so the agent run's end-of-run handler never re-draws a question
+        # that a view_task() re-render has already put on screen (which
+        # used to show the question twice while the dialog stayed open).
+        self._rendered_clarification: Clarification | None = None
 
     # -- layout -------------------------------------------------------------
 
@@ -1624,6 +1630,7 @@ class DrCodeApp(App[None]):
             self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
+            self._rendered_clarification = task.clarification
         # Opening a task always lands on the latest entry (previously this
         # happened implicitly because every mount scrolled to the end).
         self.chat_log.scroll_end(animate=False)
@@ -2328,8 +2335,17 @@ class DrCodeApp(App[None]):
                     self.manager.requeue_answered_clarification(task.id)
                     # The agent paused the task on a clarifying question: show it
                     # and let the pipeline continue while the user answers.
-                    if self.viewed_id == task_id and task.clarification:
+                    # Skip when the end-of-turn view_task() re-render above
+                    # already drew it — otherwise the question shows twice
+                    # while the dialog stays open (a switch away+back renders
+                    # it once, via view_task alone).
+                    if (
+                        self.viewed_id == task_id
+                        and task.clarification
+                        and task.clarification is not self._rendered_clarification
+                    ):
                         self._write_clarification(task.clarification)
+                        self._rendered_clarification = task.clarification
                     self.refresh_sidebar()
                     self._advance()
                 elif (

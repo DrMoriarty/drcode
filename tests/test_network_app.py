@@ -98,6 +98,30 @@ def instant_timers(net_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch) -> list[
 # -- agent run: happy path ----------------------------------------------------------
 
 
+async def test_queued_comments_merge_into_one_first_prompt(
+    net_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The original brief plus comments typed before the run starts (while
+    the task sat in the queue) reach the agent as ONE prompt, so it solves
+    the task as a whole instead of one message per turn."""
+    task = net_app.manager.create("t", "original brief", kind=TaskKind.DOCUMENTATION)
+    net_app.manager.send(task.id, "first comment")
+    net_app.manager.send(task.id, "second comment")
+    scripted.steps = [text_response("done")]
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="documentation task completed",
+        )
+
+    assert task.pending_input == []
+    # Exactly one model round-trip, carrying the whole brief at once.
+    assert len(scripted.calls) == 1
+    assert scripted.calls[0] == "original brief\n\nfirst comment\n\nsecond comment"
+
+
 async def test_agent_tool_roundtrip_completes_task(
     net_app: DrCodeApp, scripted: ScriptedState, project_root: Path
 ) -> None:

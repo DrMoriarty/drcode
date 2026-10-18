@@ -2117,25 +2117,34 @@ class DrCodeApp(App[None]):
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
             # once and is NEVER re-queued/re-sent. Each activation first
-            # consumes every pending user message in arrival order, then —
-            # only if the last attempt was interrupted — runs one
+            # consumes every pending user message in arrival order — merged
+            # into ONE prompt, so a brief queued up before the run (original
+            # message + comments) is solved as a whole, not turn-by-turn —
+            # then, only if the last attempt was interrupted, runs one
             # continuation turn without new text to pick the interrupted
             # work back up.
             while task.status is TaskStatus.ACTIVE:
                 run = None
-                # The consumed pending entry (None for a continuation turn):
-                # kept around so a transient failure can re-queue it with
-                # its original "typed at" stamp intact.
-                consumed: PendingInput | None = None
+                # The consumed pending entries (empty for a continuation
+                # turn): kept around so a transient failure can re-queue
+                # them with their original "typed at" stamps intact.
+                consumed: list[PendingInput] = []
                 if task.pending_input:
-                    consumed = task.pending_input.pop(0)
-                    text = consumed.text
+                    # Batch consumption: everything queued before this turn
+                    # (the original brief plus comments typed while the task
+                    # sat in the queue or while another turn ran) is sent as
+                    # a single prompt — the agent must see the whole picture
+                    # at once and decide from all of it.
+                    consumed = list(task.pending_input)
+                    task.pending_input.clear()
+                    text = "\n\n".join(entry.text for entry in consumed)
                     if self.viewed_id == task_id:
-                        if text in self._pending_rendered:
-                            # Already shown as a queued block; don't repeat it.
-                            self._pending_rendered.remove(text)
-                        else:
-                            self._write_history_line("user", text)
+                        for entry in consumed:
+                            if entry.text in self._pending_rendered:
+                                # Already shown as a queued block; don't repeat it.
+                                self._pending_rendered.remove(entry.text)
+                            else:
+                                self._write_history_line("user", entry.text)
                 elif task.unfinished:
                     if not ends_with_open_request(task.messages):
                         # The interrupted attempt actually finished its
@@ -2318,11 +2327,11 @@ class DrCodeApp(App[None]):
                                 # so the chat thread stays chronological even
                                 # when the prompt sat in pending_input for a
                                 # while before this run picked it up.
-                                if consumed is not None:
+                                if consumed and text is not None:
                                     backdate_user_prompt(
                                         run.all_messages(),
-                                        consumed.text,
-                                        consumed.at,
+                                        text,
+                                        consumed[0].at,
                                     )
                                 # The stream is closed: this request's usage
                                 # is final. Refresh the context counter in
@@ -2470,21 +2479,21 @@ class DrCodeApp(App[None]):
                             self._drop_stream_preview(generation)
                         self._persist_task_messages(task, run)
                         task.messages = sanitized_messages(task.messages)
-                        if run is None and text is not None:
+                        if run is None and consumed:
                             # The request never started (pydantic-ai appends
                             # the user message before calling the model, and
                             # with `run` None nothing was persisted): put the
-                            # consumed prompt back at the head of the pending
-                            # queue so the retry re-sends it verbatim (with
-                            # its original "typed at" stamp).
-                            assert consumed is not None
-                            task.pending_input.insert(0, consumed)
-                            # It was already rendered as a user block when it
-                            # was popped: the retry must not draw it twice.
-                            if self.viewed_id == task_id and (
-                                text not in self._pending_rendered
-                            ):
-                                self._pending_rendered.append(text)
+                            # consumed prompts back at the head of the pending
+                            # queue so the retry re-sends them verbatim (with
+                            # their original "typed at" stamps).
+                            task.pending_input[:0] = consumed
+                            # They were already rendered as user blocks when
+                            # they were popped: the retry must not draw them
+                            # twice.
+                            if self.viewed_id == task_id:
+                                for entry in consumed:
+                                    if entry.text not in self._pending_rendered:
+                                        self._pending_rendered.append(entry.text)
                         if ends_with_open_request(task.messages):
                             # The request is recorded in the transcript: the
                             # retry resumes the attempt without new text.

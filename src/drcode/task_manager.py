@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
-from .models import Task, TaskKind, TaskStatus, _now
+from .models import PendingInput, Task, TaskKind, TaskStatus, _now
 from .storage import Storage
 
 
@@ -81,7 +81,7 @@ class TaskManager:
             queue_seq=self._next_queue_seq(),
         )
         if first_message.strip():
-            task.pending_input.append(first_message.strip())
+            task.pending_input.append(PendingInput(text=first_message.strip()))
         self.tasks[task.id] = task
         self.storage.save(task)
         return task
@@ -94,7 +94,7 @@ class TaskManager:
         _advance(), which never starts new development while any testing is
         incomplete."""
         task = self.get(task_id)
-        task.pending_input.append(text.strip())
+        task.pending_input.append(PendingInput(text=text.strip()))
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             task.status = TaskStatus.QUEUED
             # Old verification label no longer applies: the task will be

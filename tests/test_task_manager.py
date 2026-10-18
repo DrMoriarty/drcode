@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from drcode.models import Task, TaskKind, TaskStatus, VerificationStatus, _now
+from drcode.models import (
+    PendingInput,
+    Task,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+    _now,
+)
 from drcode.storage import Storage
 from drcode.task_manager import TaskManager
 
@@ -18,7 +25,7 @@ def test_create_basic(manager: TaskManager, project_root: Path) -> None:
     task = manager.create("My title", "Do the thing")
     assert task.title == "My title"
     assert task.status is TaskStatus.QUEUED
-    assert task.pending_input == ["Do the thing"]
+    assert [e.text for e in task.pending_input] == ["Do the thing"]
     assert task.queue_seq == 1
     assert (project_root / ".drcode" / "tasks" / f"{task.id}.json").is_file()
 
@@ -83,7 +90,7 @@ def test_held_tasks_skipped_in_queue(manager: TaskManager) -> None:
 def test_send_to_queued_accumulates(manager: TaskManager) -> None:
     task = manager.create("t", "first")
     manager.send(task.id, "second")
-    assert task.pending_input == ["first", "second"]
+    assert [e.text for e in task.pending_input] == ["first", "second"]
     assert task.status is TaskStatus.QUEUED
 
 
@@ -101,7 +108,7 @@ def test_send_to_completed_requeues_and_clears_verification(
     assert task.status is TaskStatus.QUEUED
     assert task.verification is None
     assert task.completed_at is None
-    assert task.pending_input == ["x", "more", "again"]
+    assert [e.text for e in task.pending_input] == ["x", "more", "again"]
 
 
 def test_send_to_testing_requeues(manager: TaskManager) -> None:
@@ -125,12 +132,12 @@ def test_send_to_awaiting_clarification_sets_queue_head(
     assert task.status is TaskStatus.QUEUED
     assert task.queue_head is True
     assert task.clarification is None
-    assert task.pending_input == ["x", "my answer"]
+    assert [e.text for e in task.pending_input] == ["x", "my answer"]
 
 
 def test_send_strips_whitespace(manager: TaskManager) -> None:
     task = manager.create("t", "  padded  ")
-    assert task.pending_input == ["padded"]
+    assert [e.text for e in task.pending_input] == ["padded"]
 
 
 # -- set_kind -----------------------------------------------------------------
@@ -176,11 +183,11 @@ def test_hold_and_resume(manager: TaskManager) -> None:
     task = manager.create("t", "input text")
     manager.set_hold(task.id, on=True)
     assert task.status is TaskStatus.HOLD
-    assert task.pending_input == ["input text"]
+    assert [e.text for e in task.pending_input] == ["input text"]
 
     manager.set_hold(task.id, on=False)
     assert task.status is TaskStatus.QUEUED
-    assert task.pending_input == ["input text"]
+    assert [e.text for e in task.pending_input] == ["input text"]
 
 
 def test_hold_awaiting_clarification_and_resume_back(manager: TaskManager) -> None:
@@ -343,7 +350,7 @@ def test_requeue_answered_clarification(manager: TaskManager) -> None:
     # already arrived in pending_input (typed while the run was finishing).
     task.status = TaskStatus.AWAITING_CLARIFICATION
     task.clarification = Clarification(question="q?")
-    task.pending_input.append("late answer")
+    task.pending_input.append(PendingInput(text="late answer"))
     manager.requeue_answered_clarification(task.id)
     assert task.status is TaskStatus.QUEUED
     assert task.queue_head is True

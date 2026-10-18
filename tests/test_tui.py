@@ -59,7 +59,7 @@ async def test_create_task_through_ui(app: DrCodeApp) -> None:
         assert len(tasks) == 1
         task = tasks[0]
         assert task.kind is TaskKind.FEATURE
-        assert task.pending_input == ["Build the thing\nwith details"]
+        assert [e.text for e in task.pending_input] == ["Build the thing\nwith details"]
         # No model configured: the run stops at the guard and the task
         # stays active with its prompt kept (it will be sent once a model
         # is available).

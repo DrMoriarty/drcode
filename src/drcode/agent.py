@@ -762,6 +762,26 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     return True
 
 
+def backdate_user_prompt(messages: list[ModelMessage], text: str, at: datetime) -> None:
+    """Stamp the user request carrying `text` with `at` — the moment the
+    user typed the prompt — in place.
+
+    pydantic-ai timestamps the ModelRequest it builds from a consumed
+    pending prompt with the consumption time, which can be minutes after
+    the message was actually sent (the prompt may sit in pending_input
+    while other work runs). The chat thread is ordered by these stamps, so
+    the request is backdated to keep the transcript chronological.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in msg.parts:
+            if isinstance(part, UserPromptPart) and part.content == text:
+                part.timestamp = at
+                msg.timestamp = at
+                return
+
+
 def first_user_prompt(messages: list[dict[str, Any]]) -> str:
     """First user prompt of a serialized transcript — the original task text.
 

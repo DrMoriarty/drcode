@@ -70,6 +70,7 @@ from ..agent import (
     USER_AGENT,
     AgentDeps,
     TesterDeps,
+    backdate_user_prompt,
     build_agent,
     build_compaction_agent,
     build_compaction_prompt,
@@ -92,6 +93,7 @@ from ..agent import (
 from ..config import Config
 from ..models import (
     Clarification,
+    PendingInput,
     Task,
     TaskEvent,
     TaskKind,
@@ -1691,6 +1693,16 @@ class DrCodeApp(App[None]):
         # interleaved at the position they occurred at.
         for event in task.events:
             _add(event.at, "event", self._format_event(event))
+        # Queued user input — interleaved by the moment it was TYPED, not
+        # pinned to the tail: comments sent while the task was queued or
+        # running belong between the messages that were on screen then.
+        for entry in task.pending_input:
+            if is_pending_retry(task.messages, entry.text):
+                # The failed/interrupted run left this prompt in the
+                # transcript: it is already rendered from task.messages
+                # above — writing the pending copy again duplicates it.
+                continue
+            _add(entry.at, "user-pending", entry.text)
         timeline.sort(key=lambda item: item[:2])
         for _, _, role, text in timeline:
             block = self._write_history_line(role, text)
@@ -1698,13 +1710,6 @@ class DrCodeApp(App[None]):
                 # A tool still executing (run in flight) gets its spinner
                 # back on the freshly rendered block.
                 self._reattach_tool_spinner(block, text, task_id)
-        for pending in task.pending_input:
-            if is_pending_retry(task.messages, pending):
-                # The failed/interrupted run left this prompt in the
-                # transcript: it is already rendered from task.messages
-                # above — writing the pending copy again duplicates it.
-                continue
-            self._write_history_line("user-pending", pending)
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
             self._rendered_clarification = task.clarification
@@ -2118,8 +2123,13 @@ class DrCodeApp(App[None]):
             # work back up.
             while task.status is TaskStatus.ACTIVE:
                 run = None
+                # The consumed pending entry (None for a continuation turn):
+                # kept around so a transient failure can re-queue it with
+                # its original "typed at" stamp intact.
+                consumed: PendingInput | None = None
                 if task.pending_input:
-                    text = task.pending_input.pop(0)
+                    consumed = task.pending_input.pop(0)
+                    text = consumed.text
                     if self.viewed_id == task_id:
                         if text in self._pending_rendered:
                             # Already shown as a queued block; don't repeat it.
@@ -2302,6 +2312,18 @@ class DrCodeApp(App[None]):
                                     reasoning_block.finish()
                                 if assistant_block is not None:
                                     assistant_block.finish()
+                                # The consumed prompt is now in the transcript
+                                # (the model-request node just appended it).
+                                # Backdate it to the moment the user typed it,
+                                # so the chat thread stays chronological even
+                                # when the prompt sat in pending_input for a
+                                # while before this run picked it up.
+                                if consumed is not None:
+                                    backdate_user_prompt(
+                                        run.all_messages(),
+                                        consumed.text,
+                                        consumed.at,
+                                    )
                                 # The stream is closed: this request's usage
                                 # is final. Refresh the context counter in
                                 # the task status bar for the running task.
@@ -2453,8 +2475,10 @@ class DrCodeApp(App[None]):
                             # the user message before calling the model, and
                             # with `run` None nothing was persisted): put the
                             # consumed prompt back at the head of the pending
-                            # queue so the retry re-sends it verbatim.
-                            task.pending_input.insert(0, text)
+                            # queue so the retry re-sends it verbatim (with
+                            # its original "typed at" stamp).
+                            assert consumed is not None
+                            task.pending_input.insert(0, consumed)
                             # It was already rendered as a user block when it
                             # was popped: the retry must not draw it twice.
                             if self.viewed_id == task_id and (

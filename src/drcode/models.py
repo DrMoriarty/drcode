@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def _now() -> datetime:
@@ -64,6 +64,18 @@ class Clarification(BaseModel):
     options: list[str] = Field(default_factory=list)
 
 
+class PendingInput(BaseModel):
+    """A user message queued before the agent consumes it.
+
+    `at` is when the user typed the message — the chat thread places it by
+    this stamp (not by the consumption order), so comments sent while the
+    task was queued or running keep their chronological place in the thread.
+    """
+
+    text: str
+    at: datetime = Field(default_factory=_now)
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=_short_id)
     title: str
@@ -79,8 +91,9 @@ class Task(BaseModel):
     # tester-only tool calls (set_verification, create_bug_report) in its
     # model history.
     tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
-    # User messages typed while the task is queued/not yet processed.
-    pending_input: list[str] = Field(default_factory=list)
+    # User messages typed while the task is queued/not yet processed,
+    # stamped with the moment they were typed (see PendingInput).
+    pending_input: list[PendingInput] = Field(default_factory=list)
     # When the task reached COMPLETED (tester verdict, documentation done or
     # user cancel). Drives the startup auto-cleanup of old completed tasks
     # (see ProjectSettings.completed_retention); None while not completed.
@@ -104,6 +117,31 @@ class Task(BaseModel):
     # on load, bumped when a task is re-positioned, e.g. by a kind change).
     # Together with queue_head and kind it fully determines queue order.
     queue_seq: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_pending_input(cls, data: Any) -> Any:
+        """Accept pre-timestamp tasks whose pending_input was list[str]:
+        wrap plain strings into PendingInput, all stamped with the same
+        wall-clock anchor (updated_at, i.e. the last queued comment) so the
+        stable timeline sort keeps their original relative order."""
+        if isinstance(data, dict):
+            pending = data.get("pending_input")
+            if isinstance(pending, list) and any(
+                isinstance(item, str) for item in pending
+            ):
+                stamp = data.get("updated_at") or data.get("created_at")
+                migrated: list[Any] = []
+                for item in pending:
+                    if isinstance(item, str):
+                        entry: dict[str, Any] = {"text": item}
+                        if stamp is not None:
+                            entry["at"] = stamp
+                        migrated.append(entry)
+                    else:
+                        migrated.append(item)
+                data["pending_input"] = migrated
+        return data
 
     def touch(self) -> None:
         self.updated_at = _now()

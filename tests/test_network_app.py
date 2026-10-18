@@ -262,7 +262,7 @@ async def test_model_not_configured_keeps_prompt_pending(project_root: Path) -> 
         )
     assert any("Model is not configured" in t for t in event_texts(task))
     assert task.status is TaskStatus.ACTIVE
-    assert task.pending_input == ["some prompt"]
+    assert [e.text for e in task.pending_input] == ["some prompt"]
     assert not app.agent_running
 
 

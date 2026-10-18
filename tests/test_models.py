@@ -6,6 +6,7 @@ import json
 
 from drcode.models import (
     Clarification,
+    PendingInput,
     Task,
     TaskEvent,
     TaskKind,
@@ -58,7 +59,7 @@ def test_task_json_roundtrip() -> None:
         kind=TaskKind.BUG,
         status=TaskStatus.TESTING,
         verification=VerificationStatus.FAILED,
-        pending_input=["hello"],
+        pending_input=[PendingInput(text="hello")],
         unfinished=True,
         clarification=Clarification(question="Which one?", options=["a", "b"]),
         events=[TaskEvent(kind="permission", text="denied")],

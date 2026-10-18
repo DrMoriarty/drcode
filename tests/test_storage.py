@@ -6,7 +6,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
-from drcode.models import Task, _now
+from drcode.models import PendingInput, Task, _now
 from drcode.storage import Storage
 
 
@@ -16,7 +16,11 @@ def make_task(title: str, **kwargs) -> Task:
 
 def test_save_and_load_roundtrip(project_root: Path) -> None:
     storage = Storage(project_root)
-    task = make_task("persisted", pending_input=["do it"], queue_seq=3)
+    task = make_task(
+        "persisted",
+        pending_input=[PendingInput(text="do it", at=_now())],
+        queue_seq=3,
+    )
     storage.save(task)
 
     assert (project_root / ".drcode" / "tasks" / f"{task.id}.json").is_file()
@@ -25,7 +29,7 @@ def test_save_and_load_roundtrip(project_root: Path) -> None:
     loaded = storage2.load_all()
     assert [t.id for t in loaded] == [task.id]
     assert loaded[0].title == "persisted"
-    assert loaded[0].pending_input == ["do it"]
+    assert [e.text for e in loaded[0].pending_input] == ["do it"]
     assert loaded[0].queue_seq == 3
 
 

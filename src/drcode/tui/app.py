@@ -18,6 +18,7 @@ from typing import ClassVar, cast
 import httpx
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -120,6 +121,14 @@ _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 # the tool is executing.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_INTERVAL = 0.12
+
+# Rate-limit (HTTP 429) handling for agent runs: a rate-limited run is
+# retried in place (the task stays ACTIVE) after a backoff delay, at most
+# RATE_LIMIT_RETRIES times — only when the budget is exhausted does the
+# run fall back to the ordinary failure path (requeue + session exclusion).
+RATE_LIMIT_RETRIES = 5
+# Backoff: 5s doubling per failure, capped here (5, 10, 20, 40, 60).
+RATE_LIMIT_DELAY_MAX = 60.0
 
 
 class TaskItem(ListItem):
@@ -997,6 +1006,13 @@ class DrCodeApp(App[None]):
         # promote_next for the rest of the session, so one broken task (or a
         # dead gateway) doesn't loop the whole queue through the error.
         self._agent_failed: set[str] = set()
+        # Rate-limit (HTTP 429) bookkeeping for agent runs, per task:
+        # consecutive 429 failures this session (retry budget) and the
+        # earliest monotonic time the delayed re-run fires at. Unlike a
+        # generic failure (immediate requeue), a rate-limited run keeps
+        # the task ACTIVE and is retried after a backoff delay.
+        self._agent_429_count: dict[str, int] = {}
+        self._agent_429_retry_at: dict[str, float] = {}
         # True while the new-task form covers the chat view. Must exist from
         # the start: the streaming loop reads it on every text delta, and an
         # unset attribute would crash the run (it did — the AttributeError
@@ -1501,6 +1517,18 @@ class DrCodeApp(App[None]):
         if not (self.agent_running or self.tester_running):
             active = self.manager.active
             if active is not None:
+                # Rate-limited run waiting for its delayed retry: the task
+                # is fine, the re-run timer just has not fired yet.
+                retry_at = self._agent_429_retry_at.get(active.id)
+                if retry_at is not None and retry_at > time.monotonic():
+                    left = max(1, int(retry_at - time.monotonic()))
+                    attempt = self._agent_429_count.get(active.id, 0)
+                    label.remove_class("fresh", "stale")
+                    label.update(
+                        f"⏳ #{active.id} 429 retry {attempt}/"
+                        f"{RATE_LIMIT_RETRIES} in {left}s"
+                    )
+                    return
                 # Task claims to be active but no worker owns it (e.g. the
                 # user aborted the run, or an older build stranded it):
                 # surface the inconsistency instead of showing a fake idle.
@@ -2059,6 +2087,7 @@ class DrCodeApp(App[None]):
                 return
             self.agent_running = True
             self._agent_failed.discard(task_id)
+            self._agent_429_retry_at.pop(task_id, None)
             self._current_tool = None
             self._touch_activity()
             self.refresh_status()
@@ -2317,6 +2346,10 @@ class DrCodeApp(App[None]):
                         # away and back mid-run (the streamed blocks were wiped
                         # by view_task and must be restored from history).
                         self.view_task(task_id)
+                    # The turn went through: the rate-limit retry budget for
+                    # this task starts over.
+                    self._agent_429_count.pop(task_id, None)
+                    self._agent_429_retry_at.pop(task_id, None)
                 except asyncio.CancelledError:
                     # Interrupted (abort, or a newer run taking over). The
                     # consumed prompt is NOT re-queued — it stays in the
@@ -2340,6 +2373,51 @@ class DrCodeApp(App[None]):
                     self._drop_stream_preview(generation)
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
+                    # HTTP 429 (rate limit) is transient: instead of
+                    # requeueing the task right away, retry the run in place
+                    # after a backoff delay (5s doubling up to 60s), at most
+                    # RATE_LIMIT_RETRIES times. Only when the budget is
+                    # exhausted does the ordinary failure path below apply.
+                    if (
+                        isinstance(e, ModelHTTPError)
+                        and e.status_code == 429
+                        and self._agent_429_count.get(task_id, 0) < RATE_LIMIT_RETRIES
+                    ):
+                        attempt = self._agent_429_count.get(task_id, 0) + 1
+                        self._agent_429_count[task_id] = attempt
+                        delay = min(5 * 2 ** (attempt - 1), RATE_LIMIT_DELAY_MAX)
+                        self._show_event(
+                            task,
+                            f"HTTP 429 (rate limited): retry {attempt}/"
+                            f"{RATE_LIMIT_RETRIES} in {int(delay)} s",
+                        )
+                        if generation == self._agent_generation:
+                            self._drop_stream_preview(generation)
+                        self._persist_task_messages(task, run)
+                        task.messages = sanitized_messages(task.messages)
+                        if run is None and text is not None:
+                            # The request never started (pydantic-ai appends
+                            # the user message before calling the model, and
+                            # with `run` None nothing was persisted): put the
+                            # consumed prompt back at the head of the pending
+                            # queue so the retry re-sends it verbatim.
+                            task.pending_input.insert(0, text)
+                            # It was already rendered as a user block when it
+                            # was popped: the retry must not draw it twice.
+                            if self.viewed_id == task_id and (
+                                text not in self._pending_rendered
+                            ):
+                                self._pending_rendered.append(text)
+                        if ends_with_open_request(task.messages):
+                            # The request is recorded in the transcript: the
+                            # retry resumes the attempt without new text.
+                            task.unfinished = True
+                        self._agent_429_retry_at[task_id] = time.monotonic() + delay
+                        # The task stays ACTIVE — no requeue, no pipeline
+                        # advance; the delayed re-run below picks it up.
+                        self.manager.storage.save(task)
+                        self.set_timer(delay, partial(self.run_agent, task_id))
+                        return
                     # Persist the failure even for a superseded run: it
                     # happened, and the human must be able to see it.
                     self._show_event(task, f"{type(e).__name__}: {e}")

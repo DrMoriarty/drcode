@@ -44,11 +44,11 @@ from textual.command import (
     DiscoveryHit,
     Hit,
     Hits,
-    LoadingIndicator,
     Provider,
     SearchIcon,
 )
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.styles import RulesMap
 from textual.geometry import Size
 from textual.strip import Strip
 from textual.theme import ThemeProvider
@@ -60,6 +60,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    LoadingIndicator,
     Static,
     TextArea,
 )
@@ -557,11 +558,11 @@ class SpacedCommandList(CommandList):
 
     Textual's OptionList lays options out back-to-back with no vertical
     spacing, and its virtual layout ignores component-class padding, so the
-    gap is implemented at the layout level: every option except the last
-    gets a trailing spacer row (no option meta, so clicks/hover on it are
-    ignored). Overrides the private layout internals of OptionList
-    (`_update_lines`, `get_content_height`, `render_line`); revisit when
-    upgrading textual.
+    gap is implemented at the layout level: every option gets a trailing
+    spacer row (the one after the last option is cropped from the virtual
+    size; no option meta, so clicks/hover on spacers are ignored). Overrides
+    the private layout internals of OptionList (`_update_lines`,
+    `get_content_height`, `render_line`); revisit when upgrading textual.
     """
 
     _SPACER: ClassVar[int] = -1
@@ -578,22 +579,30 @@ class SpacedCommandList(CommandList):
 
         if next_index < len(self.options):
             padding = self.get_component_styles("option-list--option").padding
-            last_index = len(self.options) - 1
             for index, option in enumerate(self.options[next_index:], next_index):
                 line_cache.index_to_line[index] = len(line_cache.lines)
+                # Cast: get_height() wants RulesMap, but the base class
+                # passes its RenderStyles here too (same runtime lookup).
                 line_count = (
-                    get_visual(option).get_height(self.styles, width - padding.width)
+                    get_visual(option).get_height(
+                        cast("RulesMap", self.styles), width - padding.width
+                    )
                     + option._divider
                 )
                 line_cache.heights[index] = line_count
                 line_cache.lines.extend(
                     [(index, line_no) for line_no in range(line_count)]
                 )
-                if index < last_index:
-                    line_cache.lines.append((index, self._SPACER))
+                # A spacer after every option; the trailing one after the
+                # last option is cropped from the virtual size below, and
+                # option batches appended later keep their gaps.
+                line_cache.lines.append((index, self._SPACER))
 
         last_divider = self.options and self.options[-1]._divider
-        virtual_size = Size(width, len(lines) - (1 if last_divider else 0))
+        virtual_size = Size(
+            width,
+            len(lines) - (1 if last_divider else 0) - (1 if lines else 0),
+        )
         if virtual_size != self.virtual_size:
             self.virtual_size = virtual_size
             self._scroll_update(virtual_size)

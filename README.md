@@ -94,7 +94,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 - Model connection status, checked every 30 s; recovery from an outage un-blocks the tasks whose runs died with it.
 - Copy on select: selecting text in the chat copies it to the clipboard (with a toast; `pbcopy` fallback on macOS).
 - Multi-line chat input (Enter sends, Shift/Alt+Enter inserts a newline) that grows with the draft; the new-task form (Tab toggles the type, Ctrl+Enter creates).
-- Settings palette (`ctrl+s`): system commands, themes, "Обновить/создать AGENTS.md" service task (a pre-filled documentation task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" entry (current value shown after the colon; picking it opens the option-selection palette, Escape dismisses).
+- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled documentation task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" entry (current value shown after the colon; picking it opens the option-selection palette, Escape dismisses).
 - Chat history is one chronological timeline: agent messages, tester rounds behind a "testing" separator, and service events (failures, skips, permission violations) with timestamps. None of the service lines ever reach the model context.
 
 ## Keys

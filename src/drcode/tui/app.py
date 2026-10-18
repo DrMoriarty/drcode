@@ -1091,9 +1091,10 @@ class DrCodeApp(App[None]):
             )
         self.refresh_project_info()
         self.refresh_sidebar()
-        tasks = self.manager.all_tasks()
-        active = self.manager.active
-        initial = active or (tasks[0] if tasks else None)
+        # Open the chat on the task at the top of the first non-empty
+        # sidebar section (same pick the sidebar renders first), not on the
+        # active task / newest entry.
+        initial = self._sidebar_top_task()
         if initial:
             self.view_task(initial.id)
         else:
@@ -1298,17 +1299,19 @@ class DrCodeApp(App[None]):
         if self._sidebar_fingerprint() != self._sidebar_snapshot:
             self.refresh_sidebar()
 
-    def refresh_sidebar(self) -> None:
-        sidebar = self.sidebar
-        sidebar.clear()
+    def _sidebar_sections(self) -> list[tuple[str, list[Task]]]:
+        """Sidebar content: pipeline sections top to bottom, empty ones
+        dropped (the sidebar shows only the stages that have tasks).
+
+        Shared by the sidebar rendering and the startup view pick (the
+        opened task must be the one at the top of the sidebar).
+        """
         # Group tasks by status; each group keeps the created_at order of
         # all_tasks() unless sorted explicitly below.
         by_status: dict[TaskStatus, list[Task]] = {}
         for t in self.manager.all_tasks():
             by_status.setdefault(t.status, []).append(t)
 
-        # Sidebar mirrors the pipeline a task flows through, top to bottom:
-        # queue → clarifications → active → testing → completed.
         queue = list(reversed(self.manager.queued()))
         clarification = sorted(
             by_status.get(TaskStatus.AWAITING_CLARIFICATION, []),
@@ -1331,8 +1334,6 @@ class DrCodeApp(App[None]):
         )
         hold = by_status.get(TaskStatus.HOLD, [])
 
-        # Empty sections are not rendered at all: the sidebar shows only the
-        # stages the pipeline currently has tasks in.
         sections: list[tuple[str, list[Task]]] = [
             ("QUEUE", queue),
             ("NEEDS CLARIFICATION", clarification),
@@ -1341,9 +1342,19 @@ class DrCodeApp(App[None]):
             ("COMPLETED", completed),
             ("ON HOLD", hold),
         ]
-        for name, tasks in sections:
-            if not tasks:
-                continue
+        return [(name, tasks) for name, tasks in sections if tasks]
+
+    def _sidebar_top_task(self) -> Task | None:
+        """First task of the first non-empty sidebar section — what the
+        chat pane opens on startup."""
+        for _name, tasks in self._sidebar_sections():
+            return tasks[0]
+        return None
+
+    def refresh_sidebar(self) -> None:
+        sidebar = self.sidebar
+        sidebar.clear()
+        for name, tasks in self._sidebar_sections():
             # A collapsed section keeps only its header line: the "+" shows
             # there is content hidden underneath, "-" means fully expanded.
             collapsed = name in self._collapsed_sections

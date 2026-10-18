@@ -88,7 +88,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 ## TUI
 
 - Streaming chat: assistant answers and model reasoning render live in the chat log (markdown for answers, collapsible gray blocks for reasoning and tool calls, showing the tool name plus its primary argument).
-- Sidebar grouped by pipeline stage with per-task markers: kind letter, status icon, verification label, viewed highlight.
+- Sidebar grouped by pipeline stage with per-task markers: kind letter, status icon, verification label, viewed highlight. Sections collapse/expand via click, Enter or Space on the section header.
 - Task status bar (top) with kind, id, creation date, status — and the **context fill** in the right corner: tokens and percent of `DRCODE_MAX_CONTEXT_TOKENS` (amber near the limit, red at it; the final value is restored from the saved transcript for finished tasks).
 - Activity indicator: whether the agent/tester is making progress or has gone silent (hung request, long tool), with the currently running tool and its age.
 - Model connection status, checked every 30 s; recovery from an outage un-blocks the tasks whose runs died with it.

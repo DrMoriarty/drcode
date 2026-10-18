@@ -16,7 +16,7 @@ from textual.widgets import ListView, TextArea
 
 from drcode.models import TaskKind, TaskStatus
 from drcode.storage import Storage
-from drcode.tui.app import DrCodeApp
+from drcode.tui.app import DrCodeApp, TaskItem
 
 
 @pytest.fixture
@@ -212,3 +212,88 @@ async def test_sidebar_shows_task_statuses(app: DrCodeApp) -> None:
         app._poll_sidebar()
         items = app.query("TaskItem")
         assert items
+
+
+# -- sidebar collapsible sections -------------------------------------------------
+
+
+async def test_sidebar_header_enter_and_space_collapse_section(app: DrCodeApp) -> None:
+    # No pending input: the tasks stay QUEUED (and in the QUEUE section)
+    # for the whole test.
+    app.manager.create("task one", "")
+    app.manager.create("task two", "")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        sidebar = app.sidebar
+        sidebar.focus()
+        await pilot.pause()
+        await pilot.press("down")
+        header = sidebar.highlighted_child
+        assert isinstance(header, TaskItem)
+        assert header.section is not None
+        section = header.section
+        row_count = len(sidebar.children)
+        assert row_count > 1
+
+        # Enter on the header collapses the category: only the header row
+        # (with the "+" marker) remains.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert section in app._collapsed_sections
+        assert len(sidebar.children) == 1
+        header = sidebar.highlighted_child
+        assert isinstance(header, TaskItem)
+        assert header.text.lstrip().startswith("+")
+
+        # Space expands it back ("-" marker, all rows visible again).
+        await pilot.press("space")
+        await pilot.pause()
+        assert section not in app._collapsed_sections
+        assert len(sidebar.children) == row_count
+        header = sidebar.highlighted_child
+        assert isinstance(header, TaskItem)
+        assert header.text.lstrip().startswith("-")
+
+
+async def test_sidebar_header_click_toggles_section(app: DrCodeApp) -> None:
+    app.manager.create("task one", "")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        sidebar = app.sidebar
+        section = next(
+            item.section
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.section is not None
+        )
+        row_count = len(sidebar.children)
+        header = next(
+            item
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.section
+        )
+        # Click the header row: collapses.
+        await pilot.click(header)
+        await pilot.pause()
+        assert section in app._collapsed_sections
+        assert len(sidebar.children) == 1
+        # Click again: expands.
+        header = sidebar.children[0]
+        await pilot.click(header)
+        await pilot.pause()
+        assert section not in app._collapsed_sections
+        assert len(sidebar.children) == row_count
+
+
+async def test_sidebar_task_row_click_still_opens_task(app: DrCodeApp) -> None:
+    task = app.manager.create("clickable", "")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        sidebar = app.sidebar
+        row = next(
+            item
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.task_id == task.id
+        )
+        await pilot.click(row)
+        await pilot.pause()
+        assert app.viewed_id == task.id

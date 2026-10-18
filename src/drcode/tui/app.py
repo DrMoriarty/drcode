@@ -124,12 +124,39 @@ _SPINNER_INTERVAL = 0.12
 
 class TaskItem(ListItem):
     def __init__(
-        self, text: str, task_id: str | None = None, *, header: bool = False
+        self,
+        text: str,
+        task_id: str | None = None,
+        *,
+        header: bool = False,
+        section: str | None = None,
     ) -> None:
         super().__init__(
             Label(text, classes="section-header" if header else "task-item")
         )
         self.task_id = task_id
+        self.text = text
+        # For section headers: the collapsible category they belong to
+        # (None on task rows). Enter/space/click on a header toggles it.
+        self.section = section
+
+
+class Sidebar(ListView):
+    """Task list with collapsible pipeline sections.
+
+    Space on a highlighted section header toggles it (Enter and mouse
+    clicks are handled via the ListView.Selected event in the app).
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("space", "toggle_section", "Expand/collapse", show=False),
+    ]
+
+    def action_toggle_section(self) -> None:
+        item = self.highlighted_child
+        if isinstance(item, TaskItem) and item.section is not None:
+            app = cast("DrCodeApp", self.app)
+            app.toggle_sidebar_section(item.section)
 
 
 class WordNavTextArea(TextArea):
@@ -975,6 +1002,9 @@ class DrCodeApp(App[None]):
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
+        # Sidebar sections currently collapsed (Enter/space/click on a
+        # section header toggles it); session-only, not persisted.
+        self._collapsed_sections: set[str] = set()
         # Last moment an agent/tester event (stream delta, tool call/result)
         # was seen; the activity label compares it against now. Zero means
         # the current run has not emitted anything yet.
@@ -1014,7 +1044,7 @@ class DrCodeApp(App[None]):
         yield ModelStatusHeader(show_clock=True)
         with Horizontal(id="main"):
             with Vertical(id="sidebar-col"):
-                yield ListView(id="sidebar")
+                yield Sidebar(id="sidebar")
                 yield Static("", id="project-info")
                 yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
@@ -1275,7 +1305,15 @@ class DrCodeApp(App[None]):
         for name, tasks in sections:
             if not tasks:
                 continue
-            sidebar.append(TaskItem(f"{name} ({len(tasks)})", header=True))
+            # A collapsed section keeps only its header line: the "+" shows
+            # there is content hidden underneath, "-" means fully expanded.
+            collapsed = name in self._collapsed_sections
+            marker = "+" if collapsed else "-"
+            sidebar.append(
+                TaskItem(f"{marker} {name} ({len(tasks)})", header=True, section=name)
+            )
+            if collapsed:
+                continue
             for t in tasks:
                 marker = {
                     "queued": "⏳",
@@ -1306,6 +1344,23 @@ class DrCodeApp(App[None]):
                 sidebar.append(item)
         sidebar.refresh()
         self._sidebar_snapshot = self._sidebar_fingerprint()
+
+    def toggle_sidebar_section(self, section: str) -> None:
+        """Collapse/expand one sidebar category (its header row).
+
+        The rebuild resets the ListView cursor, so it is put back onto the
+        toggled header — the next space/enter keeps working on it.
+        """
+        if section in self._collapsed_sections:
+            self._collapsed_sections.discard(section)
+        else:
+            self._collapsed_sections.add(section)
+        self.refresh_sidebar()
+        sidebar = self.sidebar
+        for index, item in enumerate(sidebar.children):
+            if isinstance(item, TaskItem) and item.section == section:
+                sidebar.index = index
+                break
 
     # -- model connection status ---------------------------------------------
 
@@ -2755,9 +2810,17 @@ class DrCodeApp(App[None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
-        if isinstance(item, TaskItem) and item.task_id:
-            self.view_task(item.task_id)
-            self.chat_input.focus()
+        if isinstance(item, TaskItem):
+            if item.section is not None:
+                # Enter (or a mouse click) on a section header toggles the
+                # category; focus stays in the sidebar for further toggling.
+                event.stop()
+                self.toggle_sidebar_section(item.section)
+                self.sidebar.focus()
+                return
+            if item.task_id:
+                self.view_task(item.task_id)
+                self.chat_input.focus()
 
     def submit_chat_input(self) -> None:
         """Send the chat editor's content (Enter in the chat input)."""

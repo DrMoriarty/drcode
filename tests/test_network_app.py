@@ -31,6 +31,7 @@ from drcode.agent import (
     serialize_messages,
 )
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
+from drcode.tui import app as app_module
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (
     ScriptedState,
@@ -338,6 +339,166 @@ async def test_compaction_success_replaces_history(
     assert is_summary_message(task.messages[1])
     assert "THE SUMMARY BODY" in task.messages[1]["parts"][0]["content"]
     assert not state.steps  # exactly one summarizer request happened
+
+
+# -- mid-run context compaction ------------------------------------------------------------
+
+
+@pytest.fixture
+def scripted_fills(monkeypatch: pytest.MonkeyPatch):
+    """Script the context fill reported after each completed model request.
+
+    The streamed FunctionModel mock recomputes usage from the message
+    content (real usage never flows through it), so the fill the app reads
+    live after every model request node is scripted instead: one value per
+    model request, consumed in order."""
+
+    def install(fills: list[int]) -> None:
+        queue = iter(fills)
+        monkeypatch.setattr(
+            app_module, "run_context_tokens", lambda run: next(queue, None)
+        )
+
+    return install
+
+
+async def test_mid_run_compaction_pauses_and_resumes(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """The fill crossing the threshold inside a single turn (one run makes
+    many model requests) stops the run at the next tool boundary, compacts
+    and resumes via a continuation turn — the work is not lost."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create(
+        "docs", "long task", kind=TaskKind.DOCUMENTATION
+    )
+    scripted_fills([100, 900])
+    scripted.steps = [
+        # 100 of 1000 — below the 80% threshold, the run goes on.
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        # 900 of 1000 — past the threshold: the run must pause here.
+        tool_response("read_file", {"path": "README.md"}, "c2"),
+        text_response("THE SUMMARY BODY"),  # compaction summarizer
+        text_response("final answer"),  # continuation turn
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed after mid-run compaction",
+        )
+
+    texts = event_texts(task)
+    assert any(t.startswith("Context fill 90% — pausing the run") for t in texts)
+    assert any("Context compacted" in t for t in texts)
+    # Transcript replaced: original prompt verbatim + one summary request
+    # (+ the continuation's answer). pydantic-ai merges the two consecutive
+    # requests of the compacted history into one, keeping both prompts.
+    assert [m["kind"] for m in task.messages] == ["request", "response"]
+    prompt_contents = [
+        p["content"]
+        for p in task.messages[0]["parts"]
+        if p["part_kind"] == "user-prompt"
+    ]
+    assert prompt_contents[0] == "long task"
+    assert any("[context summary]" in c for c in prompt_contents)
+    assert any("THE SUMMARY BODY" in c for c in prompt_contents)
+    # Four model round-trips: two development requests, the summarizer, the
+    # continuation; the summarizer saw the rendered transcript, the
+    # continuation started from the summary.
+    assert len(scripted.calls) == 4
+    assert "read_file" in scripted.calls[2]
+    assert "[context summary]" in scripted.calls[3]
+    assert not task.unfinished
+
+
+async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """A failing summarizer must not turn the mid-run gate into a
+    break→continuation loop: after one failure the run continues
+    uncompressed (turn-boundary compaction still retries next turn)."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create(
+        "docs", "long task", kind=TaskKind.DOCUMENTATION
+    )
+    scripted_fills([100, 900, 950])
+    scripted.steps = [
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        tool_response("read_file", {"path": "README.md"}, "c2"),
+        api_error("Connection error."),  # compaction summarizer dies
+        # The continuation runs past the threshold again — the gate must
+        # stay silent now, or the task would never finish.
+        tool_response("read_file", {"path": "README.md"}, "c3"),
+        text_response("carried on"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed despite failing compaction",
+        )
+
+    texts = event_texts(task)
+    assert len([t for t in texts if t.startswith("compaction failed")]) == 1
+    assert len([t for t in texts if "pausing the run" in t]) == 1
+    assert not any("Context compacted" in t for t in texts)
+    # Uncompressed history carried the run to the end.
+    assert not any(is_summary_message(m) for m in task.messages)
+    assert len(scripted.calls) == 5
+    assert not task.unfinished
+
+
+async def test_no_mid_run_pause_below_threshold(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """A turn whose fill stays under the threshold runs to the end without
+    a pause and without touching the summarizer."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create(
+        "docs", "long task", kind=TaskKind.DOCUMENTATION
+    )
+    scripted_fills([500])
+    scripted.steps = [
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        text_response("done"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed without compaction",
+        )
+
+    texts = event_texts(task)
+    assert not [t for t in texts if "Context fill" in t or "Context compacted" in t]
+    assert not any(is_summary_message(m) for m in task.messages)
+    assert len(scripted.calls) == 2
+    assert not task.unfinished
 
 
 # -- connection probe (_check_model) ------------------------------------------------------

@@ -1050,6 +1050,11 @@ class DrCodeApp(App[None]):
         # value of a finished task — it stays in the history via the saved
         # per-response usage).
         self._live_ctx_tokens: dict[str, int] = {}
+        # Tasks whose latest compaction attempt failed: the mid-run
+        # compaction gate must not stop the run for them (a persistently
+        # failing summarizer would otherwise loop break→continuation→break
+        # forever); turn-boundary compaction still retries each turn.
+        self._compaction_failed: set[str] = set()
         # Monotonic stamp of the last coalesced follow-the-tail scroll while
         # streaming (see _stream_follow).
         self._last_follow = 0.0
@@ -2003,6 +2008,22 @@ class DrCodeApp(App[None]):
         task.tester_messages[-1] = serialize_messages(messages)
         self.manager.storage.save(task)
 
+    def _compaction_due(self, task: Task) -> int | None:
+        """Context fill (tokens) when the compaction threshold is reached
+        (percent of max_context_tokens), None otherwise. Prefers the live
+        reading of the running turn over the persisted transcript, whose
+        usage lags behind by the not-yet-persisted requests."""
+        max_tokens = self.config.max_context_tokens
+        if max_tokens <= 0:
+            return None
+        threshold = min(max(self.config.compaction_threshold, 1), 100)
+        tokens = self._live_ctx_tokens.get(task.id)
+        if tokens is None:
+            tokens = last_context_tokens(task.messages)
+        if not tokens or tokens * 100 < threshold * max_tokens:
+            return None
+        return tokens
+
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
         boundary is the only safe point: the transcript never ends with
@@ -2016,16 +2037,10 @@ class DrCodeApp(App[None]):
         compaction failure is never fatal: it is logged into the service
         events and the run continues with the uncompressed history.
         """
-        max_tokens = self.config.max_context_tokens
-        if max_tokens <= 0:
-            return
-        threshold = min(max(self.config.compaction_threshold, 1), 100)
-        tokens = self._live_ctx_tokens.get(task.id)
+        tokens = self._compaction_due(task)
         if tokens is None:
-            tokens = last_context_tokens(task.messages)
-        if not tokens or tokens * 100 < threshold * max_tokens:
             return
-        pct = round(tokens * 100 / max_tokens)
+        pct = round(tokens * 100 / self.config.max_context_tokens)
         _, rest = split_original_prompts(task.messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
@@ -2046,8 +2061,10 @@ class DrCodeApp(App[None]):
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+            self._compaction_failed.add(task.id)
             self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return
+        self._compaction_failed.discard(task.id)
         task.messages = compacted_messages(task.messages, result.output)
         task.touch()
         self.manager.storage.save(task)
@@ -2329,6 +2346,42 @@ class DrCodeApp(App[None]):
                                             )
                                             block.start_spinner()
                                             self._write_chat(block)
+                                # Mid-run compaction gate: a single turn can
+                                # run for many model requests, and the
+                                # turn-boundary gate above would only fire
+                                # when the whole run ends — the fill can grow
+                                # far past the threshold inside one turn.
+                                # Stop the run here: the tool results of the
+                                # round just executed are the last thing the
+                                # model saw, and a break leaves them
+                                # uncommitted in run.all_messages() (the
+                                # transcript ends with unanswered tool calls
+                                # — sanitized away below, the redo of that
+                                # one round is the price of the pause). The
+                                # attempt is marked unfinished, so the
+                                # while-loop's next iteration compact (the
+                                # gate above) and resume via a continuation
+                                # turn. Skipped when compaction keeps
+                                # failing, otherwise a persistently broken
+                                # summarizer would loop
+                                # break→continuation→break.
+                                tokens = self._compaction_due(task)
+                                if tokens is not None and (
+                                    task.id not in self._compaction_failed
+                                ):
+                                    pct = round(
+                                        tokens * 100 / self.config.max_context_tokens
+                                    )
+                                    self._show_event(
+                                        task,
+                                        f"Context fill {pct}% — pausing the "
+                                        "run to compact history…",
+                                    )
+                                    self._persist_task_messages(task, run)
+                                    task.messages = sanitized_messages(task.messages)
+                                    task.unfinished = True
+                                    self.manager.storage.save(task)
+                                    break
                             # Keep the stored history current while the
                             # turn runs: view_task() renders from
                             # task.messages, so without a per-node snapshot

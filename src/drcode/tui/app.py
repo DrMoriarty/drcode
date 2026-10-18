@@ -169,6 +169,23 @@ class Sidebar(ListView):
             app = cast("DrCodeApp", self.app)
             app.toggle_sidebar_section(item.section)
 
+    def _on_list_item__child_clicked(self, event: ListItem._ChildClicked) -> None:
+        """Ignore clicks on items removed by a sidebar rebuild.
+
+        refresh_sidebar() clears and re-appends the items, and
+        ListView.clear() removes the old widgets asynchronously (it returns
+        an AwaitRemove) — so a click can land on an item that is still in
+        the DOM but already pruned from the ListView's node list. The stock
+        handler does an unchecked index lookup and crashes on it.
+
+        Textual dispatches this handler for every class in the MRO, so the
+        ListView base implementation runs after this one — prevented here
+        via prevent_default(); no super() call (it would double-run both).
+        """
+        if event.item not in self.children:
+            event.stop()
+            event.prevent_default()
+
 
 class WordNavTextArea(TextArea):
     """TextArea with macOS-style Option+Arrow word navigation.

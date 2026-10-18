@@ -308,6 +308,28 @@ running checks only. The single exception is git_commit, used only after all che
 passed: it stages the changes and commits them.\
 """
 
+# Same tester, but the "Task finalization" project setting is "Testing": the
+# verified changes are left uncommitted — there is no git_commit tool at all,
+# and the prompt must not mention one.
+TESTER_SYSTEM_PROMPT_NO_COMMIT = """\
+You are drcode's QA tester agent. A coding task has just been completed and your \
+job is to verify that it did not break the project.
+
+Steps:
+1. Inspect the project to detect available tooling: linters (ruff, eslint, mypy, …), \
+tests (pytest, npm test, cargo test, …) and a build/compile command.
+2. Run each detected check via run_bash. If there are no tests or linters configured, \
+say so and still try to build/compile the project.
+3. Call set_verification(success=True) and give a short summary of what you ran. \
+Do NOT create any git commits — committing verified changes is not part of your job.
+4. If anything fails, call set_verification(success=False), then call create_bug_report \
+with a clear title and a description containing what failed, the exact command and the \
+error output, and give a short summary.
+
+Your filesystem tools are read-only and you must not modify any files; run_bash is for \
+running checks only. Never stage, commit or otherwise modify the repository state.\
+"""
+
 
 @dataclass
 class TesterDeps:
@@ -318,11 +340,21 @@ class TesterDeps:
     task_id: str
 
 
-def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
+def build_tester_agent(
+    config: Config, *, allow_commit: bool = True
+) -> Agent[TesterDeps, str]:
+    """Build the QA tester agent.
+
+    `allow_commit=False` (project setting "Task finalization: Testing")
+    selects the commit-free system prompt and does not register the
+    git_commit tool, so verified changes are left uncommitted.
+    """
     model = build_model(config)
     agent = Agent(
         model,
-        instructions=TESTER_SYSTEM_PROMPT,
+        instructions=(
+            TESTER_SYSTEM_PROMPT if allow_commit else TESTER_SYSTEM_PROMPT_NO_COMMIT
+        ),
         deps_type=TesterDeps,
         model_settings={"extra_headers": EXTRA_HEADERS},
         retries=10,
@@ -365,28 +397,35 @@ def build_tester_agent(config: Config) -> Agent[TesterDeps, str]:
         bug = ctx.deps.manager.create(title, description, kind=TaskKind.BUG)
         return f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
 
-    @agent.tool
-    async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
-        """Stage all changed files in the project root and create a git commit
-        with the given message. Use only after all checks passed, with a short
-        message paraphrasing the original task. Skips gracefully when the
-        project root is not a git repository or there is nothing to commit."""
-        root = ctx.deps.root
-        message = message.strip().strip("'\"")
-        if not message:
-            return "Empty commit message — nothing committed."
-        inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
-        if not inside.startswith("exit=0") or "true" not in inside:
-            return "Not a git repository — nothing committed."
-        await tools.run_bash(root, "git add -A -- . ':(exclude).drcode'")
-        staged = await tools.run_bash(root, "git diff --cached --name-only")
-        if staged.startswith("exit=0") and not staged.removeprefix("exit=0").strip():
-            return "Nothing to commit — the working tree is clean."
-        commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
-        if not commit.startswith("exit=0"):
-            return f"Commit failed:\n{commit}"
-        head = await tools.run_bash(root, "git log -1 --oneline")
-        return f"Committed successfully.\n{head}"
+    # The commit tool exists only when the project setting allows it: with
+    # "Task finalization: Testing" the model cannot commit even if it tries.
+    if allow_commit:
+
+        @agent.tool
+        async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
+            """Stage all changed files in the project root and create a git commit
+            with the given message. Use only after all checks passed, with a short
+            message paraphrasing the original task. Skips gracefully when the
+            project root is not a git repository or there is nothing to commit."""
+            root = ctx.deps.root
+            message = message.strip().strip("'\"")
+            if not message:
+                return "Empty commit message — nothing committed."
+            inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
+            if not inside.startswith("exit=0") or "true" not in inside:
+                return "Not a git repository — nothing committed."
+            await tools.run_bash(root, "git add -A -- . ':(exclude).drcode'")
+            staged = await tools.run_bash(root, "git diff --cached --name-only")
+            if (
+                staged.startswith("exit=0")
+                and not staged.removeprefix("exit=0").strip()
+            ):
+                return "Nothing to commit — the working tree is clean."
+            commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
+            if not commit.startswith("exit=0"):
+                return f"Commit failed:\n{commit}"
+            head = await tools.run_bash(root, "git log -1 --oneline")
+            return f"Committed successfully.\n{head}"
 
     @agent.tool
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:

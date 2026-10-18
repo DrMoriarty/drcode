@@ -239,6 +239,18 @@ class TaskManager:
                 return t
         return None
 
+    def complete_without_verification(self, task_id: str) -> Task:
+        """Finish the task without a tester round (project setting
+        "Task finalization: None"): a task that reached TESTING is completed
+        right away, with no verification label."""
+        task = self.get(task_id)
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
+        task.unfinished = False
+        task.touch()
+        self.storage.save(task)
+        return task
+
     def cancel(self, task_id: str) -> Task:
         """User cancelled the task (not relevant anymore): drop all queued
         input, clear the resume flag and complete it immediately — the

@@ -99,10 +99,12 @@ from ..models import (
 )
 from ..prompts import load_compaction_prompts, load_init_repo_prompt
 from ..settings import (
+    FINALIZATION_OPTIONS,
     RETENTION_OPTIONS,
     CompletedRetention,
     ProjectSettings,
     ProjectSettingsStore,
+    TaskFinalization,
 )
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
@@ -691,12 +693,12 @@ class ServiceCommandsProvider(Provider):
 class ProjectSettingsCommandsProvider(Provider):
     """Project-preference commands in the Settings palette.
 
-    A single entry for the completed-tasks auto-cleanup setting; its current
-    value is shown after the ":". Picking it opens the option-selection
-    palette (same UX as the theme picker); choosing an option there persists
-    it into `<project>/.drcode/settings.json`, so the choice is scoped to
-    the project, not the user. Escape dismisses the selection window and
-    keeps the current value.
+    One entry per project preference; its current value is shown after the
+    ":". Picking an entry opens the option-selection palette (same UX as the
+    theme picker); choosing an option there persists it into
+    `<project>/.drcode/settings.json`, so the choice is scoped to the
+    project, not the user. Escape dismisses the selection window and keeps
+    the current value.
     """
 
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
@@ -709,7 +711,15 @@ class ProjectSettingsCommandsProvider(Provider):
                     "startup (project setting)"
                 ),
                 app.action_change_completed_retention,
-            )
+            ),
+            (
+                f"Task finalization: {app.settings.task_finalization.label}",
+                (
+                    "What runs after development: tester + git commit, tester "
+                    "without commit, or nothing (project setting)"
+                ),
+                app.action_change_task_finalization,
+            ),
         ]
 
     async def discover(self) -> Hits:
@@ -741,6 +751,36 @@ class RetentionOptionsProvider(Provider):
                 partial(app.action_set_completed_retention, option),
             )
             for option in RETENTION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class FinalizationOptionsProvider(Provider):
+    """Options of the "Task finalization" setting.
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option to
+    apply it immediately, Escape keeps the current one. The active option is
+    marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.task_finalization
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_task_finalization, option),
+            )
+            for option in FINALIZATION_OPTIONS
         ]
 
     async def discover(self) -> Hits:
@@ -1433,6 +1473,17 @@ class DrCodeApp(App[None]):
         """
         if self.tester_running:
             return
+        if self.settings.task_finalization is TaskFinalization.NONE:
+            # No tester at all: every task that reached TESTING (this tick or
+            # left over from a run started under another setting) is completed
+            # straight away, and the queue continues below.
+            finalized = [
+                t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING
+            ]
+            for t in finalized:
+                self.manager.complete_without_verification(t.id)
+            if finalized:
+                self.refresh_sidebar()
         testing = self._next_testing()
         if testing is not None:
             # Set synchronously: two _advance() calls within one event-loop
@@ -2298,7 +2349,12 @@ class DrCodeApp(App[None]):
             task.tester_messages.append([])
             if self.viewed_id == task_id:
                 self._write_history_line("testing-sep", "")
-            tester = build_tester_agent(self.config)
+            tester = build_tester_agent(
+                self.config,
+                allow_commit=(
+                    self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
+                ),
+            )
             deps = TesterDeps(
                 root=self.project_root, manager=self.manager, task_id=task_id
             )
@@ -2625,6 +2681,37 @@ class DrCodeApp(App[None]):
             SettingsPalette(
                 id="--retention-palette",
                 providers=[RetentionOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_task_finalization(self, finalization: TaskFinalization) -> None:
+        """Settings command: what happens after a development round finishes
+        (tester + commit / tester / nothing). Persisted per project
+        (.drcode/settings.json); applies to every task finalized from now on.
+        Switching to "None" lets the pipeline complete any tasks currently
+        waiting for testing on the next _advance()."""
+        self.settings.task_finalization = finalization
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Task finalization: {finalization.label}",
+            title="Project settings",
+            timeout=4,
+        )
+        self._advance()
+
+    def action_change_task_finalization(self) -> None:
+        """Task-finalization picker, opened from the Settings entry
+        ("Task finalization: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the three options; picking one applies
+        it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--finalization-palette",
+                providers=[FinalizationOptionsProvider],
                 placeholder="Search for options…",
             )
         )

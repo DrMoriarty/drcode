@@ -118,10 +118,44 @@ STALL_NUDGE_OPTIONS: tuple[StallNudge, ...] = (
 )
 
 
+class GitHubSyncInterval(str, enum.Enum):
+    """How often the GitHub Issues sync runs (project setting)."""
+
+    HOUR_1 = "1"
+    HOUR_2 = "2"
+    HOUR_4 = "4"
+
+    @property
+    def hours(self) -> int:
+        return int(self.value)
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        return f"{self.value} hour" + ("s" if self.hours > 1 else "")
+
+
+GITHUB_SYNC_INTERVAL_OPTIONS: tuple[GitHubSyncInterval, ...] = (
+    GitHubSyncInterval.HOUR_1,
+    GitHubSyncInterval.HOUR_2,
+    GitHubSyncInterval.HOUR_4,
+)
+
+
 class ProjectSettings(BaseModel):
     completed_retention: CompletedRetention = CompletedRetention.DAYS_7
     task_finalization: TaskFinalization = TaskFinalization.TESTING_COMMIT
     stall_nudge: StallNudge = StallNudge.MIN_30
+    # -- GitHub Issues integration ------------------------------------------
+    # Enabled may be switched on even with no token/repo set (or when the
+    # connection check fails): the sync simply logs an error each cycle
+    # until the values are fixed.
+    github_enabled: bool = False
+    # Personal access token (fine-grained or classic, needs repo read access).
+    github_token: str = ""
+    # Full repository name "owner/repo" (a pasted URL is normalized on save).
+    github_repo: str = ""
+    github_sync_interval: GitHubSyncInterval = GitHubSyncInterval.HOUR_1
 
 
 class ProjectSettingsStore:

@@ -117,6 +117,11 @@ class Task(BaseModel):
     # on load, bumped when a task is re-positioned, e.g. by a kind change).
     # Together with queue_head and kind it fully determines queue order.
     queue_seq: int | None = None
+    # Number of the GitHub issue this task was imported from (GitHub Issues
+    # integration); None for locally created tasks. The tester appends the
+    # "Fixes #N" keyword to its commit message so GitHub links the commit
+    # back to the issue.
+    github_issue: int | None = None
 
     @model_validator(mode="before")
     @classmethod

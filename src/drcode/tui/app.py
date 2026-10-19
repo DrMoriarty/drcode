@@ -91,6 +91,14 @@ from ..agent import (
     split_original_prompts,
 )
 from ..config import Config
+from ..github import (
+    GitHubClient,
+    GitHubError,
+    GitHubSyncState,
+    GitHubSyncStateStore,
+    issue_commit_hint,
+    sync_issues,
+)
 from ..models import (
     Clarification,
     PendingInput,
@@ -114,6 +122,7 @@ from ..settings import (
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
 from .agents_dialog import AgentsMdDialog
+from .github_dialog import GitHubSettingsDialog, GitHubSetup
 from .header import ModelStatusHeader
 from .setup_dialog import ModelSetup, ModelSetupDialog
 
@@ -801,6 +810,18 @@ class ProjectSettingsCommandsProvider(Provider):
                 ),
                 app.action_change_stall_nudge,
             ),
+            (
+                (
+                    "GitHub integration: "
+                    f"{'on' if app.settings.github_enabled else 'off'}"
+                ),
+                (
+                    "Periodically import open GitHub issues as tasks: bug → "
+                    "bug report, enhancement → feature request (project "
+                    "setting)"
+                ),
+                app.action_change_github,
+            ),
         ]
 
     async def discover(self) -> Hits:
@@ -1102,6 +1123,12 @@ class DrCodeApp(App[None]):
         # setting are removed before anything is shown or resumed.
         self.settings_store = ProjectSettingsStore(project_root)
         self.settings: ProjectSettings = self.settings_store.load()
+        # GitHub Issues sync: persisted bookkeeping (last sync, seen issue
+        # numbers) and the monotonic time of the next scheduled cycle. The
+        # first cycle runs shortly after startup.
+        self._github_state_store = GitHubSyncStateStore(project_root)
+        self._github_state: GitHubSyncState = self._github_state_store.load()
+        self._github_next_sync = time.monotonic() + 15.0
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
@@ -1281,6 +1308,9 @@ class DrCodeApp(App[None]):
         # Stall watchdog: auto-nudge a run that stopped showing signs of
         # life for the configured period (see _poll_stall).
         self.set_interval(1.0, self._poll_stall)
+        # GitHub Issues sync scheduler: every 30s, checks whether the
+        # configured interval has elapsed (see _poll_github_sync).
+        self.set_interval(30, self._poll_github_sync)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is
@@ -3228,6 +3258,10 @@ class DrCodeApp(App[None]):
                 original = first_user_prompt(task.messages)
                 if original and original != task.title:
                     prompt += f"\n\nOriginal task:\n{original}"
+                # A GitHub-imported task must link its commit back to the
+                # originating issue ("Fixes #N" keyword in the message).
+                if task.github_issue is not None:
+                    prompt += f"\n\n{issue_commit_hint(task.github_issue)}"
                 # Round continuation loop: a testing round is a single
                 # `tester.iter()` run, but it can make many model requests
                 # (each `read_file`/`run_bash` result grows the context).
@@ -3777,6 +3811,96 @@ class DrCodeApp(App[None]):
                 placeholder="Search for options…",
             )
         )
+
+    def action_change_github(self) -> None:
+        """GitHub-integration dialog, opened from the Settings entry
+        ("GitHub integration: on/off"). Collects the token, repository,
+        sync interval and the enable switch; Save persists the values into
+        the project settings regardless of the connection status shown in
+        the dialog."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            GitHubSettingsDialog(
+                enabled=self.settings.github_enabled,
+                token=self.settings.github_token,
+                repo=self.settings.github_repo,
+                interval=self.settings.github_sync_interval,
+            ),
+            self._github_settings_done,
+        )
+
+    def _github_settings_done(self, setup: GitHubSetup | None) -> None:
+        if setup is None:
+            return
+        self.settings.github_enabled = setup.enabled
+        self.settings.github_token = setup.token
+        self.settings.github_repo = setup.repo
+        self.settings.github_sync_interval = setup.interval
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"GitHub integration: {'on' if setup.enabled else 'off'}"
+            + (
+                f" ({setup.repo}, every {setup.interval.label})"
+                if setup.enabled and setup.repo
+                else ""
+            ),
+            title="Project settings",
+            timeout=4,
+        )
+        if setup.enabled:
+            # A fresh save (or just turning it on) triggers a sync cycle
+            # right away; the schedule then continues by the interval.
+            self._github_next_sync = time.monotonic()
+            self._poll_github_sync()
+        self.refresh_status()
+
+    # -- GitHub Issues sync ----------------------------------------------------
+
+    def _poll_github_sync(self) -> None:
+        """Scheduler tick (every 30s): when the integration is enabled and
+        the configured interval has elapsed, run one sync cycle. The next
+        slot is stamped at attempt time, so a failing cycle (bad token,
+        unreachable GitHub) retries on the next interval instead of
+        hammering the API."""
+        if not (
+            self.settings.github_enabled
+            and self.settings.github_token
+            and self.settings.github_repo
+        ):
+            return
+        if time.monotonic() < self._github_next_sync:
+            return
+        self._github_next_sync = (
+            time.monotonic() + self.settings.github_sync_interval.hours * 3600
+        )
+        self.run_worker(self._github_sync(), exclusive=True, group="github-sync")
+
+    async def _github_sync(self) -> None:
+        client = GitHubClient(self.settings.github_token, self.settings.github_repo)
+        try:
+            imported, skipped = await sync_issues(
+                self.manager, client, self._github_state
+            )
+        except GitHubError as e:
+            self.notify(
+                f"GitHub sync failed: {e}",
+                title="GitHub integration",
+                severity="warning",
+                timeout=8,
+            )
+            return
+        self._github_state_store.save(self._github_state)
+        if imported or skipped:
+            self.notify(
+                f"GitHub sync: {imported} new task(s) imported, {skipped} skipped",
+                title="GitHub integration",
+                timeout=6,
+            )
+            if imported:
+                self.refresh_sidebar()
+                # New tasks enter the pipeline (testing backlog first).
+                self._advance()
 
     def action_update_agents_md(self) -> None:
         """Create a research task that writes/refreshes AGENTS.md.

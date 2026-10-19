@@ -48,6 +48,7 @@ from textual.command import (
     SearchIcon,
 )
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.css.styles import RulesMap
 from textual.geometry import Size
 from textual.strip import Strip
@@ -135,7 +136,7 @@ RATE_LIMIT_DELAY_MAX = 60.0
 # How many chat blocks one step of the batched history drain mounts before
 # yielding to the event loop (see _flush_chat_batch). ~1-2ms per block means
 # a step stays around a 60ms frame even on the slowest widgets.
-_CHAT_MOUNT_CHUNK = 32
+_CHAT_MOUNT_CHUNK = 16
 
 
 class TaskItem(ListItem):
@@ -1647,8 +1648,13 @@ class DrCodeApp(App[None]):
     def _poll_activity(self) -> None:
         """Every second, show in the sidebar whether the run makes progress
         or has gone silent (hung model request, long tool, deadlock)."""
-        self._render_model_status()
-        label = self.activity_status
+        try:
+            self._render_model_status()
+            label = self.activity_status
+        except NoMatches:
+            # Teardown race: the 1s timer can tick while the app is being
+            # dismantled and its status widgets are already gone.
+            return
         if not (self.agent_running or self.tester_running):
             active = self.manager.active
             if active is not None:

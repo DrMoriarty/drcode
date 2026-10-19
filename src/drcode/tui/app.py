@@ -1051,6 +1051,11 @@ class DrCodeApp(App[None]):
     #nt-kind-label.kind-bug { color: $error; }
     #nt-kind-label.kind-research { color: yellow; }
     #nt-hint { width: auto; color: $text-disabled; }
+    #nt-kinds {
+        width: auto;
+        margin-top: 1;
+        color: $text-disabled;
+    }
     """
     BINDINGS: ClassVar = [
         ("ctrl+n", "new_task", "New task"),
@@ -1225,6 +1230,7 @@ class DrCodeApp(App[None]):
                         "tab — switch type   ctrl+enter — create   esc — cancel",
                         id="nt-hint",
                     )
+                    yield Static("", id="nt-kinds")
         yield Static("", id="statusbar")
         yield Static("", id="copy-toast", classes="hidden")
         yield Footer()
@@ -3221,6 +3227,22 @@ class DrCodeApp(App[None]):
     # Tab cycles the new-task type through all three kinds.
     _KIND_CYCLE: ClassVar = (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH)
 
+    # One-line summary per kind, shown at the bottom of the new-task form;
+    # the currently selected kind is highlighted (markup colors mirror the
+    # #nt-kind-label classes above).
+    _KIND_DESCRIPTIONS: ClassVar[dict[TaskKind, str]] = {
+        TaskKind.BUG: "fix broken functionality with minimal, targeted changes",
+        TaskKind.FEATURE: "build new functionality and refactor the codebase",
+        TaskKind.RESEARCH: (
+            "explore the project, answer questions and file follow-up tasks"
+        ),
+    }
+    _KIND_COLOR: ClassVar[dict[TaskKind, str]] = {
+        TaskKind.BUG: "red",
+        TaskKind.FEATURE: "green",
+        TaskKind.RESEARCH: "yellow",
+    }
+
     def toggle_new_task_kind(self) -> None:
         idx = self._KIND_CYCLE.index(self.new_task_kind)
         self.new_task_kind = self._KIND_CYCLE[(idx + 1) % len(self._KIND_CYCLE)]
@@ -3238,6 +3260,18 @@ class DrCodeApp(App[None]):
         else:
             label.update("type: feature")
             label.add_class("kind-feature")
+        self._update_kind_descriptions()
+
+    def _update_kind_descriptions(self) -> None:
+        lines = []
+        for kind in self._KIND_CYCLE:
+            active = kind is self.new_task_kind
+            name = kind.value.ljust(8)
+            if active:
+                name = f"[{self._KIND_COLOR[kind]}][b]{name}[/][/]"
+            marker = "▸" if active else " "
+            lines.append(f"{marker} {name} — {self._KIND_DESCRIPTIONS[kind]}")
+        self.query_one("#nt-kinds", Static).update("\n".join(lines))
 
     def submit_new_task(self) -> None:
         text = self.new_task_input.text.strip()

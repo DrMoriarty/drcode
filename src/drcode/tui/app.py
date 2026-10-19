@@ -1072,6 +1072,12 @@ class DrCodeApp(App[None]):
     # variable, so a ClassVar override trips pyright.
     TITLE = "DrCode"
 
+    # Terminal tab title (iTerm2 etc.): Textual never emits an OSC title
+    # sequence itself, so the tab falls back to the process name ("Python").
+    # We write OSC 0 on mount (see _set_terminal_title) and clear it on
+    # unmount so the title doesn't linger after the app exits.
+    TERMINAL_TITLE: ClassVar[str] = "DrCode"
+
     # Providers for the Settings palette (it passes no explicit providers,
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends).
@@ -1388,7 +1394,25 @@ class DrCodeApp(App[None]):
         yield Static("", id="copy-toast", classes="hidden")
         yield Footer()
 
+    def _set_terminal_title(self, title: str) -> None:
+        """Write an OSC 0 sequence so the terminal shows `title` in its tab.
+
+        iTerm2 (and other xterm-like terminals) title a tab from the last
+        title escape received, falling back to the job name — which is why
+        an untitled TUI shows up as "Python".
+        """
+        driver = self._driver
+        if driver is not None:
+            driver.write(f"\x1b]0;{title}\x07")
+            driver.flush()
+
+    def on_unmount(self) -> None:
+        # Clear the tab title so "DrCode — <project>" doesn't stick around
+        # in the terminal after the app has exited.
+        self._set_terminal_title("")
+
     def on_mount(self) -> None:
+        self._set_terminal_title(f"{self.TERMINAL_TITLE} — {self.project_root.name}")
         if self._purged_tasks:
             # The startup cleanup removed something — say so, so deleted
             # history never "silently vanishes".

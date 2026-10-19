@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from .github import GitHubClient, GitHubError, GitHubSyncStateStore, sync_issues
+from .models import TaskKind
 from .settings import ProjectSettingsStore
 from .task_manager import TaskManager
 
@@ -52,4 +53,27 @@ def run_github_sync(project_root: Path) -> int:
         f"GitHub sync ({settings.github_repo}): "
         f"{imported} new task(s) imported, {skipped} skipped."
     )
+    return 0
+
+
+def create_task_from_cli(project_root: Path, kind: TaskKind, description: str) -> int:
+    """One-shot task creation without the TUI; returns the exit code.
+
+    Stores the description as the task's first queued message (the title
+    is derived from its first line, like in the app) and prints the id of
+    the created task. The pipeline itself is left to the next interactive
+    start — no agent run is started here.
+    """
+    text = description.strip()
+    if not text:
+        print(
+            "error: the task description is empty — pass a non-empty text "
+            "after the option.",
+            file=sys.stderr,
+        )
+        return 1
+
+    manager = TaskManager(project_root)
+    task = manager.create("", text, kind=kind)
+    print(f"Task {task.id} ({kind.value}) created successfully.")
     return 0

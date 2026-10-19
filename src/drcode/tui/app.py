@@ -1943,7 +1943,7 @@ class DrCodeApp(App[None]):
         width = label.container_size.width or 34
         pad = max(1, width - cell_len(status) - cell_len(version))
         label.update(
-            f"{status}{' ' * pad}[bold $accent]DrCode[/] [dim]{APP_VERSION}[/]\n"
+            f"{status}{' ' * pad}[bold $accent]DrCode[/] [white]{APP_VERSION}[/]\n"
             f"{detail}"
         )
 

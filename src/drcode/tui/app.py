@@ -4207,6 +4207,7 @@ class DrCodeApp(App[None]):
         if task is None or task.status is not TaskStatus.HOLD:
             return
         self.manager.set_hold(task.id, on=False)
+        self._advance()
         self.refresh_sidebar()
         self.refresh_status()
         if self.viewed_id == task.id:

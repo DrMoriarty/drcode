@@ -113,6 +113,7 @@ from ..settings import (
 )
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
+from .agents_dialog import AgentsMdDialog
 from .header import ModelStatusHeader
 from .setup_dialog import ModelSetup, ModelSetupDialog
 
@@ -1289,6 +1290,10 @@ class DrCodeApp(App[None]):
         # created and browsed, they just never start).
         if self.config.is_ready:
             self._advance()
+            # Model settings exist — offer to create AGENTS.md if the
+            # project has none (the setup-dialog path offers it too,
+            # right after the settings are saved).
+            self._maybe_offer_agents_md()
         else:
             self.push_screen(
                 ModelSetupDialog(
@@ -1333,6 +1338,36 @@ class DrCodeApp(App[None]):
         self.refresh_connection()
         self.refresh_status()
         self._advance()
+        # The settings were just created — the "no AGENTS.md" offer now
+        # applies as well.
+        self._maybe_offer_agents_md()
+
+    def _maybe_offer_agents_md(self) -> None:
+        """Startup offer: model configured, project root has no AGENTS.md.
+
+        Asks the user once per session; on agreement creates the same
+        pre-filled research task as the Settings palette's
+        "Update/create AGENTS.md" entry. Skipped silently when the model
+        is not configured (the pipeline is idle anyway), when AGENTS.md
+        already exists, or when such a research task is already in the
+        backlog.
+        """
+        if not self.config.is_ready:
+            return
+        if (self.project_root / "AGENTS.md").exists():
+            return
+        if any(
+            t.kind is TaskKind.RESEARCH and "AGENTS.md" in t.title
+            for t in self.manager.tasks.values()
+        ):
+            return
+        self.push_screen(AgentsMdDialog(), self._agents_md_answered)
+
+    def _agents_md_answered(self, create: bool | None) -> None:
+        # Textual's dismissal type includes None (ESC without a result);
+        # the dialog always answers with True/False, treat None as "no".
+        if create:
+            self._create_agents_task()
 
     # -- widgets helpers ------------------------------------------------------
 
@@ -3750,6 +3785,11 @@ class DrCodeApp(App[None]):
         paragraph names the actual project directory) and runs with the
         `research` kind: the tester is skipped and mark_done() completes
         it right away."""
+        self._create_agents_task()
+
+    def _create_agents_task(self) -> None:
+        """Shared body of the Settings action and the startup AGENTS.md
+        offer: queue the pre-filled research task and open it in chat."""
         task = self.manager.create(
             "Update/create AGENTS.md",
             load_init_repo_prompt(self.project_root),

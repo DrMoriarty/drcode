@@ -1,18 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec: standalone one-file `drcode` binary.
+"""PyInstaller spec: standalone `drcode` binary.
 
 Build with `bash scripts/build-binary.sh` (or `.venv/bin/pyinstaller
 --noconfirm --clean drcode.spec` after `uv sync --group build`).
 
-The result is a self-contained executable that bundles its own Python
-interpreter and all dependencies — no system Python or site-packages
-required. It is platform-specific (build on each target OS/arch).
+The result is a self-contained `dist/drcode/` folder (onedir bundle) with
+the `drcode` executable inside — it bundles its own Python interpreter and
+all dependencies, no system Python or site-packages required. It is
+platform-specific (build on each target OS/arch).
+
+Why onedir and not one-file: a one-file executable unpacks its whole
+payload into a fresh temp directory on EVERY start, and on hardened macOS
+setups each freshly written binary/dylib then costs hundreds of
+milliseconds to load (per-file signature verification by the OS) —
+`drcode --version` measured 10-20s, and even a hello-world one-file build
+took 3-5s. With onedir the files are written once at unpack time and
+subsequent starts load them straight from disk: ~0.4s cold binary start.
+Set DRCODE_ONEFILE=1 to build a legacy single-file executable instead.
 """
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import copy_metadata
 
 ROOT = Path(SPECPATH).resolve()
+ONEFILE = os.environ.get("DRCODE_ONEFILE", "") not in ("", "0", "false")
 
 a = Analysis(
     [str(ROOT / "drcode_entry.py")],
@@ -42,22 +54,49 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="drcode",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=True,
-    exclude_binaries=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+if ONEFILE:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="drcode",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=True,
+        exclude_binaries=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="drcode",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=True,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="drcode",
+    )

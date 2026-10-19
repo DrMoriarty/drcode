@@ -1,7 +1,8 @@
 name: build-binaries
 
-# Builds standalone one-file `drcode` binaries (PyInstaller, drcode.spec)
-# for: macOS Apple Silicon, Linux x86_64, Linux arm64, Windows x86_64.
+# Builds standalone `drcode` onedir bundles (PyInstaller, drcode.spec)
+# for: macOS Apple Silicon, Linux x86_64, Linux arm64, Windows x86_64,
+# and packs each into a single distributable .tar.gz.
 #
 # - Run manually from the Actions tab (workflow_dispatch), or
 # - Push a tag `v1.2.3` to also create a GitHub Release with all binaries.
@@ -43,19 +44,15 @@ jobs:
           # macOS Apple Silicon (M-series runners are arm64)
           - os: macos-latest
             target: macos-arm64
-            exe: drcode
           # Linux x86_64
           - os: ubuntu-latest
             target: linux-x86_64
-            exe: drcode
           # Linux arm64 (free arm runner for public repos)
           - os: ubuntu-24.04-arm
             target: linux-arm64
-            exe: drcode
           # Windows x86_64
           - os: windows-latest
             target: windows-x86_64
-            exe: drcode.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -70,17 +67,20 @@ jobs:
       - name: Build binary
         run: uv run pyinstaller --noconfirm --clean drcode.spec
 
-      # Release assets don't preserve the executable bit, so unix binaries
-      # are shipped gzipped (run `gunzip drcode-...gz && chmod +x drcode`).
+      # The build produces a dist/drcode/ onedir bundle (see drcode.spec for
+      # why onedir and not one-file); pack it into a single distributable
+      # archive. tar preserves the executable bit, so after unpacking the
+      # binary runs directly: `tar -xzf drcode-...tar.gz && ./drcode/drcode`.
       - name: Package artifact
         run: |
           version="${{ needs.prepare.outputs.version }}"
           name="drcode-${version}-${{ matrix.target }}"
           mkdir -p out
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "dist/${{ matrix.exe }}" "out/${name}.exe"
+            cp -r "dist/drcode" "${name}"
+            7z a "out/${name}.zip" "${name}"
           else
-            gzip -c "dist/${{ matrix.exe }}" > "out/${name}.gz"
+            tar -C dist -czf "out/${name}.tar.gz" drcode
           fi
 
       - uses: actions/upload-artifact@v4

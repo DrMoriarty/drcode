@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .models import TaskKind
+if TYPE_CHECKING:
+    from .models import TaskKind
 
 
 def _print_help() -> None:
@@ -52,6 +54,7 @@ def _pop_option_value(args: list[str], flag: str) -> str | None:
 def main() -> None:
     args = sys.argv[1:]
 
+    # Cheap flags first: they must not pay for the heavy imports below.
     if "--help" in args or "-h" in args:
         _print_help()
         return
@@ -61,6 +64,8 @@ def main() -> None:
 
         print(APP_VERSION)
         return
+
+    from .models import TaskKind
 
     if "--git-hub-sync" in args:
         from .cli import run_github_sync

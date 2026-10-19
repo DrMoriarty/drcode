@@ -38,15 +38,32 @@ The TUI operates on the **current directory** (`Path.cwd()`).
 
 ## Standalone binary
 
-A self-contained executable that bundles its own Python interpreter and all
+A self-contained bundle that ships its own Python interpreter and all
 dependencies — no Python installation and no library versions required on the
 target machine. Build it on each target OS/architecture (cross-compilation is
 not supported):
 
 ```bash
 bash scripts/build-binary.sh
-# → dist/drcode  (one-file Mach-O / ELF executable, ~45 MB)
+# → dist/drcode/            (onedir bundle, run it as dist/drcode/drcode)
+# → dist/drcode-<version>-<os>-<arch>.tar.gz   (distributable archive)
 ```
+
+Install from a release archive:
+
+```bash
+tar -xzf drcode-<version>-<os>-<arch>.tar.gz
+./drcode/drcode --version
+```
+
+The build produces an **onedir** bundle rather than a single-file executable
+on purpose: a one-file PyInstaller binary unpacks its whole payload into a
+fresh temp directory on every start, and on hardened macOS setups each
+freshly written binary/dylib is then re-verified by the OS (hundreds of ms
+per file), which made even `drcode --version` take 10+ seconds. With onedir
+the payload is written once at unpack time and subsequent starts are fast
+(~0.4s). Set `DRCODE_ONEFILE=1` to build a legacy single-file executable
+anyway.
 
 PyInstaller is provisioned automatically via the `build` dependency group
 (`uv sync --group build`). The binary reads the same configuration (env vars,

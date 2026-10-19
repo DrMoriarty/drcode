@@ -22,6 +22,10 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload))
 
 
+def _project_config(project_root: Path) -> Path:
+    return project_root / ".drcode" / "drcode.json"
+
+
 # -- is_ready -------------------------------------------------------------------
 
 
@@ -48,7 +52,7 @@ def test_defaults(project_root: Path) -> None:
 
 
 def test_env_beats_everything(project_root: Path, monkeypatch) -> None:
-    _write_json(project_root / "drcode.json", {"compaction_threshold": 10})
+    _write_json(_project_config(project_root), {"compaction_threshold": 10})
     monkeypatch.setenv("DRCODE_COMPACTION_THRESHOLD", "99")
     cfg = Config(project_root=project_root)
     assert cfg.compaction_threshold == 99
@@ -58,7 +62,7 @@ def test_project_json_beats_user_json(
     project_root: Path, user_config_dir: Path
 ) -> None:
     _write_json(user_config_dir / "drcode.json", {"compaction_threshold": 20})
-    _write_json(project_root / "drcode.json", {"compaction_threshold": 30})
+    _write_json(_project_config(project_root), {"compaction_threshold": 30})
     cfg = Config(project_root=project_root)
     assert cfg.compaction_threshold == 30
 
@@ -79,7 +83,8 @@ def test_corrupted_project_json_skipped(
     project_root: Path, user_config_dir: Path
 ) -> None:
     _write_json(user_config_dir / "drcode.json", {"compaction_threshold": 20})
-    (project_root / "drcode.json").write_text("{broken")
+    _project_config(project_root).parent.mkdir(parents=True, exist_ok=True)
+    _project_config(project_root).write_text("{broken")
     cfg = Config(project_root=project_root)
     # Startup survives and falls through to the user-level layer.
     assert cfg.compaction_threshold == 20
@@ -94,13 +99,56 @@ def test_corrupted_user_json_skipped(project_root: Path) -> None:
 
 def test_project_config_file_property(project_root: Path) -> None:
     cfg = Config(project_root=project_root)
-    assert cfg.project_config_file == project_root / "drcode.json"
+    assert cfg.project_config_file == project_root / ".drcode" / "drcode.json"
 
 
 def test_unknown_json_keys_ignored(project_root: Path) -> None:
-    _write_json(project_root / "drcode.json", {"no_such_field": 1})
+    _write_json(_project_config(project_root), {"no_such_field": 1})
     cfg = Config(project_root=project_root)
     assert cfg.compaction_threshold == 80
+
+
+# -- legacy project-root drcode.json -----------------------------------------
+
+
+def test_legacy_root_config_still_read(project_root: Path) -> None:
+    # Configs written by older versions sat in the project root; they are
+    # honored until the file is re-saved to the new location.
+    _write_json(project_root / "drcode.json", {"compaction_threshold": 33})
+    cfg = Config(project_root=project_root)
+    assert cfg.compaction_threshold == 33
+
+
+def test_current_config_beats_legacy(project_root: Path) -> None:
+    _write_json(project_root / "drcode.json", {"compaction_threshold": 11})
+    _write_json(_project_config(project_root), {"compaction_threshold": 22})
+    cfg = Config(project_root=project_root)
+    assert cfg.compaction_threshold == 22
+
+
+def test_save_migrates_legacy_config(project_root: Path) -> None:
+    legacy = project_root / "drcode.json"
+    _write_json(legacy, {"model": "old-model", "compaction_threshold": 42})
+    cfg = Config(project_root=project_root)
+    cfg.model = "new-model"
+    cfg.base_url = "https://example.com/v1"
+    saved = cfg.save_to_project()
+    assert saved == _project_config(project_root)
+    assert saved.is_file()
+    data = json.loads(saved.read_text())
+    # Connection fields updated, unrelated keys preserved.
+    assert data["model"] == "new-model"
+    assert data["compaction_threshold"] == 42
+    # The stale legacy copy is gone after migration.
+    assert not legacy.exists()
+
+
+def test_save_creates_drcode_dir(project_root: Path) -> None:
+    cfg = Config(project_root=project_root)
+    cfg.model = "m"
+    cfg.base_url = "https://example.com/v1"
+    assert cfg.save_to_project().is_file()
+    assert (project_root / ".drcode" / "drcode.json").is_file()
 
 
 # -- _parsable_or_none ---------------------------------------------------------------

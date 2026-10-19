@@ -7,6 +7,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from .config import PROJECT_STATE_DIRNAME
+from .gitignore import ensure_drcode_gitignored
 from .models import Task
 
 
@@ -15,28 +17,11 @@ class Storage:
 
     def __init__(self, project_root: Path) -> None:
         self.root = project_root
-        self.tasks_dir = project_root / ".drcode" / "tasks"
+        self.tasks_dir = project_root / PROJECT_STATE_DIRNAME / "tasks"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
-        self._ensure_gitignored(project_root)
-
-    @staticmethod
-    def _ensure_gitignored(project_root: Path) -> None:
-        """Add `.drcode/` to the project's .gitignore if one exists."""
-        gitignore = project_root / ".gitignore"
-        if not gitignore.is_file():
-            return
-        lines = gitignore.read_text().splitlines()
-        if any(
-            line.strip().lstrip("!").rstrip("/") == ".drcode"
-            or line.strip().endswith("/.drcode")
-            for line in lines
-            if line.strip() and not line.strip().startswith("#")
-        ):
-            return
-        with gitignore.open("a") as f:
-            if lines and lines[-1].strip():
-                f.write("\n")
-            f.write(".drcode/\n")
+        # `.drcode/` holds transcripts and the project config — never
+        # commit it (the helper is a no-op outside a git repository).
+        ensure_drcode_gitignored(project_root)
 
     def load_all(self) -> list[Task]:
         tasks: list[Task] = []

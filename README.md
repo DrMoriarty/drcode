@@ -67,7 +67,7 @@ anyway.
 
 PyInstaller is provisioned automatically via the `build` dependency group
 (`uv sync --group build`). The binary reads the same configuration (env vars,
-`~/.config/drcode/drcode.json`, per-project `.env` / `drcode.json`) as the
+`~/.config/drcode/drcode.json`, per-project `.env` / `.drcode/drcode.json`) as the
 installed package.
 
 ## Configuration

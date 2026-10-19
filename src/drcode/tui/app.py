@@ -2821,7 +2821,8 @@ class DrCodeApp(App[None]):
                 self._show_event(
                     task,
                     "Model is not configured. Restart drcode to open the setup "
-                    "dialog, or set model/base_url in drcode.json (project) / "
+                    "dialog, or set model/base_url in .drcode/drcode.json "
+                    "(project) / "
                     "~/.config/drcode/drcode.json / DRCODE_* env vars; the "
                     "message is kept and will be sent once the model is "
                     "available.",

@@ -1,15 +1,16 @@
 """First-start model setup dialog.
 
 Shown modally when the app starts with no model/base_url configured
-anywhere (env vars, project drcode.json, user-level config). The user
-must enter a model id and a base URL; the API key and the context-window
-size are optional. ESC dismisses the dialog — the app stays usable
-without a model (tasks can be created and browsed, nothing runs).
+anywhere (env vars, project .drcode/drcode.json, user-level config). The
+user must enter a model id and a base URL; the API key and the
+context-window size are optional. ESC dismisses the dialog — the app
+stays usable without a model (tasks can be created and browsed, nothing
+runs).
 
 Save first validates the connection with a live probe request against
 the endpoint; on failure the error is shown and the dialog stays open,
 on success the values are handed back to the app, which persists them
-into `<project>/drcode.json` and starts using them immediately.
+into `<project>/.drcode/drcode.json` and starts using them immediately.
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         with Vertical(id="setup-dialog"):
             yield Static(
                 "Model connection is not configured. Enter the settings for "
-                "this project — they will be saved to [b]drcode.json[/b]. "
+                "this project — they will be saved to [b].drcode/drcode.json[/b]. "
                 "Fields marked [b]*[/b] are required.",
                 id="sd-note",
             )

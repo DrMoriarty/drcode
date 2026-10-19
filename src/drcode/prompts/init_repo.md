@@ -11,7 +11,7 @@ Read the highest-value sources first:
 - build, test, lint, formatter, typecheck, and codegen config
 - CI workflows and pre-commit / task runner config
 - existing instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, `.cursorrules`, `.github/copilot-instructions.md`)
-- repo-local drcode config such as `drcode.json`
+- repo-local drcode config such as `.drcode/drcode.json`
 
 If architecture is still unclear after reading config and docs, inspect a small number of representative code files to find the real entrypoints, package boundaries, and execution flow. Prefer reading the files that explain how the system is wired together over random leaf files.
 Prefer executable sources of truth over prose. If docs conflict with config or scripts, trust the executable source and only keep what you can verify.

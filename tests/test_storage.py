@@ -97,25 +97,37 @@ def test_save_is_atomic_no_tmp_leftovers(project_root: Path) -> None:
 
 
 def test_gitignore_appended_when_missing(project_root: Path) -> None:
+    (project_root / ".git").mkdir()
     (project_root / ".gitignore").write_text("*.pyc\n")
     Storage(project_root)
     text = (project_root / ".gitignore").read_text()
     assert ".drcode/" in text
 
 
+def test_gitignore_created_when_absent(project_root: Path) -> None:
+    # A git repo without a .gitignore gets one, with the entry inside.
+    (project_root / ".git").mkdir()
+    Storage(project_root)
+    assert (project_root / ".gitignore").is_file()
+    assert ".drcode/" in (project_root / ".gitignore").read_text()
+
+
+def test_no_git_repo_no_gitignore_created(project_root: Path) -> None:
+    # Outside a git repository drcode never drops a .gitignore.
+    Storage(project_root)
+    assert not (project_root / ".gitignore").exists()
+
+
 def test_gitignore_not_duplicated(project_root: Path) -> None:
+    (project_root / ".git").mkdir()
     (project_root / ".gitignore").write_text(".drcode\n")
     Storage(project_root)
     assert (project_root / ".gitignore").read_text().count(".drcode") == 1
 
 
 def test_gitignore_respects_comment_lines(project_root: Path) -> None:
+    (project_root / ".git").mkdir()
     (project_root / ".gitignore").write_text("# .drcode\n")
     Storage(project_root)
     # The commented mention doesn't count: the real entry is added.
     assert ".drcode/" in (project_root / ".gitignore").read_text()
-
-
-def test_no_gitignore_no_file_created(project_root: Path) -> None:
-    Storage(project_root)
-    assert not (project_root / ".gitignore").exists()

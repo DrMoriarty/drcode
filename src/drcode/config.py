@@ -3,7 +3,8 @@
 Sources, from highest to lowest priority (a higher layer wins):
 
 1. process environment (`DRCODE_*` variables),
-2. project-level files: `<project>/.env` (dotenv) and `<project>/drcode.json`,
+2. project-level files: `<project>/.env` (dotenv) and
+   `<project>/.drcode/drcode.json`,
 3. user-level file: `~/.config/drcode/drcode.json` (XDG_CONFIG_HOME-aware),
 4. built-in defaults.
 
@@ -28,6 +29,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from .gitignore import ensure_drcode_gitignored
+
 # env_file в pydantic-settings резолвится относительно cwd, а TUI может быть
 # запущен из любой директории — якоримся на корень репозитория через __file__.
 # Последний файл в кортеже побеждает: локальный .env переопределяет репозиторный.
@@ -50,8 +53,14 @@ USER_CONFIG_FILE = _USER_CONFIG_DIR / "drcode.json"
 USER_CONFIG_EXAMPLE_FILE = _USER_CONFIG_DIR / "drcode.json.example"
 
 # Project-level json file, resolved per instance (the TUI passes the project
-# root, which is normally the cwd the app was started in).
+# root, which is normally the cwd the app was started in). It lives inside
+# `.drcode/` together with the task storage, so a single gitignore entry
+# covers both (see `drcode.gitignore`).
+PROJECT_STATE_DIRNAME = ".drcode"
 PROJECT_CONFIG_FILENAME = "drcode.json"
+# Configs written by older versions sat in the project root; they are still
+# read (and migrated on save) so an upgrade doesn't lose the model settings.
+_LEGACY_PROJECT_CONFIG_FILENAME = "drcode.json"
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # NOTE for maintainers: whenever you add/change a user-configurable field of
@@ -115,24 +124,39 @@ class Config(BaseSettings):
 
     @property
     def project_config_file(self) -> Path:
-        return self._project_root / PROJECT_CONFIG_FILENAME
+        return self._project_root / PROJECT_STATE_DIRNAME / PROJECT_CONFIG_FILENAME
 
     def save_to_project(self) -> Path:
-        """Persist the model connection settings into <project>/drcode.json.
+        """Persist the model connection settings into `.drcode/drcode.json`.
 
         Used by the first-start setup dialog: the entered model/base_url/
         api_key/max_context_tokens must survive restarts in the project
         itself. Existing keys in the file are preserved (only the four
         connection fields are updated), so unrelated project settings
-        (e.g. compaction_threshold) are not lost.
+        (e.g. compaction_threshold) are not lost. A config left by an
+        older version in the project root is merged in and removed — the
+        `.drcode/drcode.json` file becomes the single source of truth.
         """
         data: dict[str, object] = {}
+        legacy = self._project_root / _LEGACY_PROJECT_CONFIG_FILENAME
         try:
             loaded = json.loads(self.project_config_file.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 data = loaded
         except FileNotFoundError:
-            pass
+            # Fresh project: pick up a legacy root-level config, if any,
+            # so nothing the user configured there is lost.
+            try:
+                loaded = json.loads(legacy.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (
+                FileNotFoundError,
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ):
+                pass
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             # Corrupted file: start fresh rather than crash the dialog —
             # the values being saved are the source of truth anyway.
@@ -145,9 +169,20 @@ class Config(BaseSettings):
                 "max_context_tokens": self.max_context_tokens,
             }
         )
+        self.project_config_file.parent.mkdir(parents=True, exist_ok=True)
         self.project_config_file.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        # The config now lives in `.drcode/`; drop the stale legacy copy
+        # so it can't shadow or confuse (it is no longer read once the
+        # new file exists).
+        if legacy.is_file():
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+        # `.drcode/` also holds task storage — make sure git ignores it.
+        ensure_drcode_gitignored(self._project_root)
         return self.project_config_file
 
     @classmethod
@@ -203,9 +238,17 @@ def _project_json_file() -> Path:
 
     The value comes from `_pending_project_root`, which `Config.__init__`
     publishes right before `super().__init__()` runs the settings sources
-    (defaults to cwd for bare `Config()` calls).
+    (defaults to cwd for bare `Config()` calls). When the current
+    `.drcode/drcode.json` does not exist, a legacy root-level `drcode.json`
+    left by an older version is read instead, so pre-migration projects
+    keep their settings until the file is re-saved.
     """
-    return _pending_project_root / PROJECT_CONFIG_FILENAME
+    root = _pending_project_root
+    current = root / PROJECT_STATE_DIRNAME / PROJECT_CONFIG_FILENAME
+    if current.is_file():
+        return current
+    legacy = root / _LEGACY_PROJECT_CONFIG_FILENAME
+    return legacy if legacy.is_file() else current
 
 
 # Set by `Config.__init__` just before `super().__init__()` so the

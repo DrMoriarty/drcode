@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.usage import RunUsage
 
 from . import tools
 from .config import Config
@@ -863,6 +864,37 @@ def run_context_tokens(run: AgentRun[Any, Any]) -> int | None:
     return None
 
 
+def last_response_usage(run: AgentRun[Any, Any]) -> RunUsage | None:
+    """Exact token usage of the latest completed model request of a live run.
+
+    Each ModelResponse carries the usage of the request that produced it;
+    the last response with non-zero usage therefore gives the per-request
+    input/cache/output figures for the accumulator in the TUI (distinct
+    from run_context_tokens, which only sums the input side). None when
+    the run has no completed model request yet.
+    """
+    try:
+        messages = run.all_messages()
+    except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
+        return None
+    for msg in reversed(messages):
+        if isinstance(msg, ModelResponse):
+            u = msg.usage
+            if (
+                u.input_tokens
+                or u.output_tokens
+                or u.cache_read_tokens
+                or u.cache_write_tokens
+            ):
+                return RunUsage(
+                    input_tokens=u.input_tokens,
+                    cache_read_tokens=u.cache_read_tokens,
+                    cache_write_tokens=u.cache_write_tokens,
+                    output_tokens=u.output_tokens,
+                )
+    return None
+
+
 def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
     return ModelMessagesTypeAdapter.validate_python(data)
 
@@ -1090,6 +1122,7 @@ __all__ = [
     "is_pending_retry",
     "is_summary_message",
     "last_context_tokens",
+    "last_response_usage",
     "load_agents_md",
     "load_messages",
     "probe_model",

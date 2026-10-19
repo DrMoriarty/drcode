@@ -11,6 +11,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from operator import attrgetter
@@ -30,7 +31,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
 )
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RunUsage, UsageLimits
 from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
@@ -92,6 +93,7 @@ from ..agent import (
     is_pending_retry,
     is_summary_message,
     last_context_tokens,
+    last_response_usage,
     probe_model,
     render_history_for_summary,
     resumable_history,
@@ -175,6 +177,32 @@ def _is_retryable_network_error(e: BaseException) -> bool:
 def _network_retry_delay(attempt: int) -> float:
     """Backoff before retry `attempt` (1-based): 5s doubling, capped."""
     return min(5 * 2 ** (attempt - 1), NETWORK_DELAY_MAX)
+
+
+@dataclass
+class SessionTokenUsage:
+    """Cumulative exact token usage of every model call this session.
+
+    Fed from the four per-response usage fields pydantic-ai reports on
+    each ModelResponse (main agent, tester and the compaction summarizer
+    alike) — billing-grade numbers, unlike the char/4 approximation the
+    live tok/s figure uses. Session-scoped only: resets on restart, never
+    backfilled from persisted transcripts.
+    """
+
+    input_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, usage: RunUsage | None) -> None:
+        """Fold one request's (or run's) usage in; None is a no-op."""
+        if usage is None:
+            return
+        self.input_tokens += usage.input_tokens or 0
+        self.cache_read_tokens += usage.cache_read_tokens or 0
+        self.cache_write_tokens += usage.cache_write_tokens or 0
+        self.output_tokens += usage.output_tokens or 0
 
 
 # How many chat blocks one step of the batched history drain mounts before
@@ -1335,6 +1363,10 @@ class DrCodeApp(App[None]):
         }
         self._session_created: dict[TaskKind, int] = {kind: 0 for kind in TaskKind}
         self._session_completed = 0
+        # Exact cumulative token usage of every model call this session
+        # (main agent + tester + compaction summarizer) — shown in the
+        # expanded header's bottom line. Session-scoped: resets on restart.
+        self._session_usage = SessionTokenUsage()
         # Activation → completion spans (seconds) of the tasks completed
         # this session; feeds the average/median figures.
         self._session_durations: list[float] = []
@@ -2101,10 +2133,11 @@ class DrCodeApp(App[None]):
 
     def _header_stats_text(self) -> str:
         """The expanded header's session-statistics line: tasks completed
-        this session, average/median activation→completion time and the
+        this session, average/median activation→completion time, the
         bugs:features ratio of the tasks created this session (research
         tasks are excluded from the ratio: they are neither bug fixes nor
-        implemented features)."""
+        implemented features) and the exact cumulative token usage of
+        every model call of the session."""
         durations = self._session_durations
         if durations:
             avg = statistics.fmean(durations)
@@ -2116,10 +2149,14 @@ class DrCodeApp(App[None]):
             times = "avg — · median —"
         bugs = self._session_created[TaskKind.BUG]
         features = self._session_created[TaskKind.FEATURE]
-        return (
+        line = (
             f"tasks done: {self._session_completed} · {times} · "
-            f"bugs:features {bugs}:{features} · {self._header_github_text()}"
+            f"bugs:features {bugs}:{features}"
         )
+        usage = self._header_usage_text()
+        if usage:
+            line += f" · {usage}"
+        return f"{line} · {self._header_github_text()}"
 
     def _header_github_text(self) -> str:
         """GitHub-integration status for the expanded header's bottom line:
@@ -2140,6 +2177,50 @@ class DrCodeApp(App[None]):
         if self._github_last_error:
             status += f" · error: {self._github_last_error}"
         return status
+
+    @staticmethod
+    def _fmt_tokens(n: int) -> str:
+        """Compact human token count for the header (e.g. 45k, 1.2M, 980)."""
+
+        def fmt(v: float, unit: str) -> str:
+            return f"{v:.1f}".rstrip("0").rstrip(".") + unit
+
+        if n >= 1_000_000:
+            return fmt(n / 1_000_000, "M")
+        if n >= 1_000:
+            k = f"{n / 1_000:.1f}".rstrip("0").rstrip(".")
+            if float(k) < 1000:  # 999_950+ rounds up into M territory
+                return f"{k}k"
+            return fmt(n / 1_000_000, "M")
+        return str(n)
+
+    def _record_session_usage(self, usage: RunUsage | None) -> None:
+        """Fold one model call's exact token usage into the session
+        totals (main agent, tester and compaction summarizer alike) and
+        refresh the expanded header line for an instant update — the 1 s
+        poller keeps it live while the header is collapsed (no-op there)."""
+        if usage is None:
+            return
+        self._session_usage.add(usage)
+        self._render_header_tall()
+
+    def _header_usage_text(self) -> str:
+        """Exact cumulative token usage of the session, compactly: the
+        four per-response counters pydantic-ai reports. Zero fields are
+        omitted (providers without prompt caching simply show no cache
+        part); an all-zero counter renders as an empty string."""
+        u = self._session_usage
+        parts: list[str] = []
+        if u.input_tokens:
+            parts.append(f"tok in {self._fmt_tokens(u.input_tokens)}")
+        if u.cache_read_tokens or u.cache_write_tokens:
+            parts.append(
+                f"cache {self._fmt_tokens(u.cache_read_tokens)}"
+                f"/{self._fmt_tokens(u.cache_write_tokens)}"
+            )
+        if u.output_tokens:
+            parts.append(f"out {self._fmt_tokens(u.output_tokens)}")
+        return " · ".join(parts)
 
     def _render_header_tall(self) -> None:
         """Refresh the two expanded-header lines (no-op while collapsed:
@@ -2914,6 +2995,8 @@ class DrCodeApp(App[None]):
             self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return
         self._compaction_failed.discard(task.id)
+        # The summarizer's model calls count toward the session usage too.
+        self._record_session_usage(result.usage)
         task.messages = compacted_messages(task.messages, result.output)
         task.touch()
         self.manager.storage.save(task)
@@ -2984,6 +3067,8 @@ class DrCodeApp(App[None]):
             self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return False
         self._compaction_failed.discard(task.id)
+        # The summarizer's model calls count toward the session usage too.
+        self._record_session_usage(result.usage)
         task.tester_messages[-1] = compacted_messages(round_messages, result.output)
         task.touch()
         self.manager.storage.save(task)
@@ -3280,6 +3365,9 @@ class DrCodeApp(App[None]):
                                     self._live_ctx_tokens[task_id] = ctx_tokens
                                     if self.viewed_id == task_id:
                                         self.refresh_task_status()
+                                # Exact per-request usage of the completed
+                                # model call, into the session totals.
+                                self._record_session_usage(last_response_usage(run))
                                 # A model call went through: the network-retry
                                 # budget for this task starts over, so the
                                 # NEXT network error counts from one again —
@@ -3698,6 +3786,9 @@ class DrCodeApp(App[None]):
                                     async for _event in stream:
                                         self._touch_activity()
                                 live_tokens = run_context_tokens(run)
+                                # Exact per-request usage of the completed
+                                # model call, into the session totals.
+                                self._record_session_usage(last_response_usage(run))
                                 # A model call went through: the network-retry
                                 # budget for this testing round starts over,
                                 # so the NEXT network error counts from one

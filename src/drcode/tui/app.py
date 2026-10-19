@@ -1575,6 +1575,7 @@ class DrCodeApp(App[None]):
         self.config.model = setup.model
         self.config.base_url = setup.base_url
         self.config.api_key = setup.api_key
+        self.config.health_check_url = setup.health_check_url
         if setup.max_context_tokens is not None:
             self.config.max_context_tokens = setup.max_context_tokens
         try:
@@ -1990,7 +1991,15 @@ class DrCodeApp(App[None]):
             return
         model = self.config.model
         started = time.monotonic()
-        ok, detail = await probe_model(model, self.config.base_url, self.config.api_key)
+        # The cached health_check_url is probed first (cheaper, no generation);
+        # the checked_url itself is discarded here — the header only needs the
+        # ok/detail status.
+        ok, detail, _checked_url = await probe_model(
+            model,
+            self.config.base_url,
+            self.config.api_key,
+            health_check_url=self.config.health_check_url,
+        )
         # Round-trip of the probe itself, shown on the expanded header line.
         self._last_probe_ms = int((time.monotonic() - started) * 1000)
         if not ok:

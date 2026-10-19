@@ -41,6 +41,7 @@ class ModelSetup:
     base_url: str
     api_key: str
     max_context_tokens: int | None  # None = keep the default
+    health_check_url: str = ""  # verified availability endpoint, cached for later runs
 
 
 class ModelSetupDialog(ModalScreen[ModelSetup | None]):
@@ -188,7 +189,10 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         self._checking = True
         button.disabled = True
         try:
-            ok, detail = await probe_model(
+            # A 3-tuple: (ok, detail, checked_url). The checked_url is the
+            # verified availability endpoint (no generation) to cache for
+            # cheaper checks on later runs.
+            ok, detail, checked_url = await probe_model(
                 model, base_url, api_key, timeout=_PROBE_TIMEOUT
             )
         finally:
@@ -202,6 +206,7 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
+                health_check_url=checked_url,
                 max_context_tokens=max_context_tokens,
             )
         )

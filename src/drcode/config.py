@@ -88,6 +88,9 @@ class Config(BaseSettings):
     model: str = ""  # e.g. "gpt-4o", "qwen3-coder-30b", model id of your provider
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
+    # A verified availability/metadata endpoint (no generation) found by the
+    # first-start probe, cached for cheaper availability checks on later runs.
+    health_check_url: str = ""
     # Context window of the model, tokens: the task status bar shows context
     # fill as a percentage of this. Providers rarely report it — set via
     # DRCODE_MAX_CONTEXT_TOKENS when the default doesn't match the model.
@@ -166,6 +169,7 @@ class Config(BaseSettings):
                 "model": self.model,
                 "base_url": self.base_url,
                 "api_key": self.api_key,
+                "health_check_url": self.health_check_url,
                 "max_context_tokens": self.max_context_tokens,
             }
         )

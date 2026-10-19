@@ -12,8 +12,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic_ai import ModelRequest, ModelResponse
+from pydantic_ai.messages import TextPart, UserPromptPart
 from textual.widgets import ListView, TextArea
 
+from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp, TaskItem
@@ -98,7 +101,16 @@ async def test_submit_empty_form_creates_nothing(app: DrCodeApp) -> None:
         assert app.manager.all_tasks() == []
 
 
-# -- chat rendering ---------------------------------------------------------------
+# -- chat rendering ----------------------------------------------------------------
+
+
+def _fat_transcript(turns: int) -> list[dict]:
+    """Serialized user/assistant alternation — two blocks per turn."""
+    messages: list[ModelRequest | ModelResponse] = []
+    for i in range(turns):
+        messages.append(ModelRequest(parts=[UserPromptPart(content=f"question {i}")]))
+        messages.append(ModelResponse(parts=[TextPart(content=f"answer {i}")]))
+    return serialize_messages(messages)
 
 
 async def test_view_task_renders_pending_prompt(app: DrCodeApp) -> None:
@@ -111,6 +123,53 @@ async def test_view_task_renders_pending_prompt(app: DrCodeApp) -> None:
             str(w.render()) for w in app.query_one("#chat-log").children
         )
         assert "the original prompt" in rendered
+
+
+async def test_view_task_drains_fat_history_in_chunks(app: DrCodeApp) -> None:
+    """A fat history mounts in chunks (input stays responsive); the drain
+    must still end with the full timeline on screen and batching off."""
+    task = app.manager.create("fat task", "prompt")
+    task.messages = _fat_transcript(80)
+    task.status = TaskStatus.COMPLETED
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        for _ in range(30):  # let the chunked drain run to completion
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert app._chat_batch == []
+        log = app.query_one("#chat-log")
+        # 2 blocks per turn + the still-pending original prompt.
+        assert len(log.children) == 161
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "question 0" in rendered
+        assert "answer 79" in rendered
+
+
+async def test_view_switch_mid_drain_drops_stale_chunks(app: DrCodeApp) -> None:
+    """Opening another task while a fat drain is still pending must not
+    leak the old view's blocks into the new view's log."""
+    fat = app.manager.create("fat task", "prompt")
+    fat.messages = _fat_transcript(80)
+    fat.status = TaskStatus.COMPLETED
+    other = app.manager.create("other task", "other prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(fat.id)
+        # Switch away before any drain chunk beyond the first could run.
+        app.view_task(other.id)
+        for _ in range(30):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "question 0" not in rendered
+        assert "other prompt" in rendered
 
 
 async def test_service_event_persisted_and_shown(app: DrCodeApp) -> None:

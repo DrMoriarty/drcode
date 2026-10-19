@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
@@ -130,6 +131,11 @@ _SPINNER_INTERVAL = 0.12
 RATE_LIMIT_RETRIES = 5
 # Backoff: 5s doubling per failure, capped here (5, 10, 20, 40, 60).
 RATE_LIMIT_DELAY_MAX = 60.0
+
+# How many chat blocks one step of the batched history drain mounts before
+# yielding to the event loop (see _flush_chat_batch). ~1-2ms per block means
+# a step stays around a 60ms frame even on the slowest widgets.
+_CHAT_MOUNT_CHUNK = 32
 
 
 class TaskItem(ListItem):
@@ -1056,6 +1062,14 @@ class DrCodeApp(App[None]):
         # on the result event) — lets the label distinguish "tool busy" from
         # "total silence".
         self._current_tool: str | None = None
+        # Sliding window of streamed output ((monotonic stamp, approximated
+        # token count) samples) — feeds the live tok/s figure in the header
+        # connection status. See _record_stream_tokens/_tokens_per_second.
+        self._tps_samples: deque[tuple[float, int]] = deque()
+        # Base text of the header connection label ("● model" / "✗ …"),
+        # written by _check_model; _render_model_status appends the live
+        # activity suffix (tok/s / waiting / testing) on top of it.
+        self._conn_label = "○ checking…"
         # Tool calls currently executing, per run (the run key is
         # ("agent"|"tester", generation)): tool_call_id ->
         # (task_id, rendered call text, live block with the spinner). The
@@ -1087,11 +1101,15 @@ class DrCodeApp(App[None]):
         self._chat_epoch = 0
         # While True, _write_chat() collects blocks into _chat_batch instead
         # of mounting them one by one (view_task's history rebuild mounts the
-        # whole timeline with a single mount + scroll — per-block mounting of
+        # whole timeline chunked + one final scroll — per-block mounting of
         # a fat transcript forces a layout/scroll pass per block and freezes
         # the event loop for seconds).
         self._chat_batching = False
         self._chat_batch: list[Widget] = []
+        # _chat_epoch value the running drain belongs to: a view switch
+        # mid-drain bumps the epoch and the remaining stale chunks are
+        # dropped instead of mounting into the new view's log.
+        self._chat_batch_epoch = 0
         # Clarification object currently rendered in the open chat view.
         # Compared by identity: a newly asked question is a fresh instance,
         # so the agent run's end-of-run handler never re-draws a question
@@ -1528,22 +1546,85 @@ class DrCodeApp(App[None]):
         label = self.model_status
         was_error = label.has_class("error")
         if not self.config.is_ready:
+            self._conn_label = "○ model not configured"
             label.remove_class("ok", "error")
             label.add_class("warn")
-            label.update("○ model not configured")
+            self._render_model_status()
             return
         model = self.config.model
         ok, detail = await probe_model(model, self.config.base_url, self.config.api_key)
         if not ok:
+            self._conn_label = f"✗ {model} — {detail}"
             label.remove_class("ok", "warn")
             label.add_class("error")
-            label.update(f"✗ {model} — {detail}")
+            self._render_model_status()
             return
+        self._conn_label = f"● {model}"
         label.remove_class("warn", "error")
         label.add_class("ok")
-        label.update(f"● {model}")
+        self._render_model_status()
         if was_error:
             self._recover_from_outage()
+
+    # -- live output rate (header tok/s) --------------------------------------
+
+    # Window over which the streamed output rate is averaged, and the minimum
+    # span of samples before a rate is shown at all (the very first second of
+    # a stream would otherwise produce a wildly spiky figure).
+    _TPS_WINDOW = 6.0
+    _TPS_MIN_SPAN = 1.5
+
+    def _record_stream_tokens(self, text: str) -> None:
+        """Record a streamed delta for the live tok/s estimate.
+
+        Streaming APIs emit deltas roughly token-sized, so the character
+        count divided by the conventional ~4 chars/token is a good enough
+        approximation — the point is the visual "is it producing" signal,
+        not billing-grade accounting.
+        """
+        now = time.monotonic()
+        self._tps_samples.append((now, max(1, len(text) // 4)))
+        self._prune_tps_samples(now)
+
+    def _prune_tps_samples(self, now: float) -> None:
+        cutoff = now - self._TPS_WINDOW
+        samples = self._tps_samples
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+    def _tokens_per_second(self) -> float | None:
+        """Output rate over the sliding window (None = nothing measurable:
+        no recent stream output, or too little of it to average yet)."""
+        now = time.monotonic()
+        self._prune_tps_samples(now)
+        samples = self._tps_samples
+        if not samples:
+            return None
+        span = now - samples[0][0]
+        if span < self._TPS_MIN_SPAN:
+            return None
+        return sum(n for _, n in samples) / span
+
+    def _render_model_status(self) -> None:
+        """Header connection label + live activity suffix.
+
+        The suffix is the global "is the model producing" signal: a tok/s
+        figure while tokens stream in (regardless of which task is open in
+        the chat), "waiting" while a run is alive but the model is silent
+        (a tool executing, a non-streamed request in flight), "testing"
+        while the tester works, and just the plain connection label when
+        nothing runs.
+        """
+        label = self.model_status
+        tps = self._tokens_per_second()
+        if tps is not None:
+            label.update(f"{self._conn_label} · {tps:.0f} tok/s")
+        elif self.agent_running:
+            label.update(f"{self._conn_label} · waiting")
+        elif self.tester_running:
+            label.update(f"{self._conn_label} · testing")
+        else:
+            label.update(self._conn_label)
 
     # -- run activity indicator ----------------------------------------------
 
@@ -1566,6 +1647,7 @@ class DrCodeApp(App[None]):
     def _poll_activity(self) -> None:
         """Every second, show in the sidebar whether the run makes progress
         or has gone silent (hung model request, long tool, deadlock)."""
+        self._render_model_status()
         label = self.activity_status
         if not (self.agent_running or self.tester_running):
             active = self.manager.active
@@ -1701,6 +1783,10 @@ class DrCodeApp(App[None]):
         # never loses the tail of an in-flight response).
         self._chat_epoch += 1
         self.chat_log.remove_children()
+        # Drop any un-drained chunks of a previous view: their drain is
+        # stale now (the epoch guard below would drop them anyway, but the
+        # new _render_task_history appends into the same list).
+        self._chat_batch.clear()
         self._chat_batching = True
         try:
             self._render_task_history(task, task_id)
@@ -1848,9 +1934,9 @@ class DrCodeApp(App[None]):
         bottom: a scrolled-up reader must not be yanked down by new tool
         calls / reasoning blocks arriving while the agent runs.
 
-        While batching (view_task's history rebuild), the block is only
-        collected — _flush_chat_batch() mounts the whole timeline in one
-        go afterwards.
+        While batching (view_task's history rebuild and its chunked drain),
+        the block is only collected — _flush_chat_batch() mounts the
+        timeline in chunks afterwards.
         """
         if isinstance(content, Widget):
             content.add_class("chat-block")
@@ -1867,12 +1953,47 @@ class DrCodeApp(App[None]):
         self._chat_has_content = True
 
     def _flush_chat_batch(self) -> None:
-        """Mount the blocks collected by a batched history rebuild."""
-        self._chat_batching = False
-        if self._chat_batch:
-            self.chat_log.mount(*self._chat_batch)
+        """Start mounting the blocks collected by a batched history rebuild.
+
+        Mounts in chunks, yielding to the event loop between them: one
+        mounted block costs a few ms (textual re-applies styles over all
+        mounted widgets per mount), so a fat 600-block history would freeze
+        keyboard/mouse input for ~2s if mounted in a single synchronous
+        pass. Late live writes (a stream starting while the drain is still
+        going) keep appending to _chat_batch — batching stays on until the
+        last chunk — and ride along with the remaining chunks.
+        """
+        self._chat_batching = True
+        self._chat_batch_epoch = self._chat_epoch
+        self._drain_chat_batch()
+
+    def _drain_chat_batch(self) -> None:
+        """Mount one chunk of the pending batch, reschedule for the rest."""
+        if self._chat_batch_epoch != self._chat_epoch:
+            # The view switched mid-drain: the new view_task wiped the log
+            # and owns it now — drop the stale tail.
+            self._chat_batching = False
             self._chat_batch.clear()
-        self.chat_log.scroll_end(animate=False)
+            return
+        chunk = self._chat_batch[:_CHAT_MOUNT_CHUNK]
+        del self._chat_batch[:_CHAT_MOUNT_CHUNK]
+        try:
+            if chunk:
+                self.chat_log.mount(*chunk)
+            if self._chat_batch:
+                self.call_after_refresh(self._drain_chat_batch)
+            else:
+                self._chat_batching = False
+                # Opening a task always lands on the latest entry (previously
+                # this happened implicitly because every mount scrolled to
+                # the end).
+                self.chat_log.scroll_end(animate=False)
+        except Exception:
+            # Never leave batching stuck on: later live writes would be
+            # silently swallowed.
+            self._chat_batching = False
+            self._chat_batch.clear()
+            raise
 
     def _write_history_line(self, role: str, text: str) -> Widget | None:
         """Render one history entry into the chat log.
@@ -2184,6 +2305,7 @@ class DrCodeApp(App[None]):
             self._agent_failed.discard(task_id)
             self._agent_429_retry_at.pop(task_id, None)
             self._current_tool = None
+            self._tps_samples.clear()
             self._touch_activity()
             self.refresh_status()
             agent = build_agent(self.config, kind=task.kind, root=self.project_root)
@@ -2295,6 +2417,10 @@ class DrCodeApp(App[None]):
                                                 continue
                                         else:
                                             continue
+                                        if delta.content_delta:
+                                            self._record_stream_tokens(
+                                                delta.content_delta
+                                            )
                                         if (
                                             isinstance(delta, ThinkingPartDelta)
                                             and delta.content_delta
@@ -2726,6 +2852,7 @@ class DrCodeApp(App[None]):
             # two _advance() calls in one tick cannot double-start the tester.
             self.tester_running = True
             self._current_tool = None
+            self._tps_samples.clear()
             self._touch_activity()
             self.refresh_status()
             # New testing round: created up front, filled by
@@ -3027,6 +3154,9 @@ class DrCodeApp(App[None]):
         # an empty pane when the backlog is gone entirely).
         self.viewed_id = None
         self.chat_log.remove_children()
+        # Invalidate any pending history drain: without the epoch bump its
+        # remaining chunks would mount into this wiped log as zombies.
+        self._chat_epoch += 1
         self._chat_has_content = False
         self._pending_rendered = []
         remaining = self.manager.all_tasks()

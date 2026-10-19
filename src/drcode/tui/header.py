@@ -2,7 +2,10 @@
 
 The stock Textual `Header` renders icon → title → clock. `ModelStatusHeader`
 inserts a `HeaderModelStatus` widget right after the icon, so the indicator
-sits between the ⭘ button and the centered title.
+sits between the ⭘ button and the centered title. The icon itself is hidden
+via CSS: the app replaces the stock command palette with its own Settings
+palette (Ctrl+S), which leaves the stock icon disabled — it would still show
+a hover highlight while ignoring clicks.
 
 Clicking the header toggles the stock "tall" mode (1 → 3 lines). In the
 expanded state two extra lines appear (see `HeaderTallInfo`): the
@@ -92,6 +95,14 @@ class ModelStatusHeader(Header):
     DEFAULT_CSS = """
     ModelStatusHeader {
         layers: title-layer _default;
+    }
+    /* The app disables the command palette (Settings on Ctrl+S instead), so
+    the stock HeaderIcon is inert: Textual marks it disabled and drops its
+    click events, but still paints the :hover highlight — a dead-looking
+    button. Hide it (and free its docked 8-cell column); the status label
+    takes its place at the left edge. Scoped to this header only. */
+    ModelStatusHeader HeaderIcon {
+        display: none;
     }
     /* The extra tall-only lines are hidden in the collapsed state; the
     display rules live here (not in HeaderTallInfo's own stylesheet) so

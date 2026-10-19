@@ -960,7 +960,7 @@ class DrCodeApp(App[None]):
     #sidebar { height: 1fr; border: none; }
     # Sidebar bottom: project-info then activity-status, plain flow (no
     # dock) so they always stack in compose order under the list.
-    #project-info { height: auto; padding: 0 1; }
+    #project-info { height: auto; padding: 0 1; text-align: right; }
     #project-info .project-dir { color: $text-muted; }
     #project-info .app-title { color: $accent; text-style: bold; }
     # Connection status lives in the header (see tui/header.py), docked

@@ -58,7 +58,8 @@ class TaskManager:
         # the testing round finishes. Everything else follows: answered
         # clarifications (queue_head) before the rest, then the explicit
         # queue stamp (creation order, bumped when a task is re-positioned,
-        # e.g. by a kind change).
+        # e.g. by a kind change). A manual move (move_in_queue) re-stamps
+        # the whole queue so this same key reproduces the user's order.
         def _queue_key(t: Task) -> tuple:
             if t.kind is TaskKind.BUG:
                 return (0, 0, -(t.queue_seq if t.queue_seq is not None else 0))
@@ -134,6 +135,67 @@ class TaskManager:
             task.queue_seq = self._next_queue_seq()
         task.touch()
         self.storage.save(task)
+        return task
+
+    def _apply_manual_order(self, order: list[Task]) -> None:
+        """Persist a manually adjusted queue order (index 0 = next to run)
+        into the queue stamps, so the standard sort key in queued()
+        reproduces it — including after an app restart.
+
+        The stamps are reassigned above the current counter (no collisions
+        with stamps held by non-queued tasks): non-bug tasks ascending along
+        the order (tasks created later still append at the tail), bugs
+        descending (a freshly created bug still lands at the very head of
+        the bug block). The queue_head markers are folded into the stamps —
+        after a manual move the explicit positions are the source of truth,
+        while a future answered clarification (queue_head=True + a fresh
+        stamp) still jumps ahead of the non-bug block.
+        """
+        bugs = [t for t in order if t.kind is TaskKind.BUG]
+        rest = [t for t in order if t.kind is not TaskKind.BUG]
+        base = self._queue_seq
+        for i, t in enumerate(bugs):
+            # Descending: the closer to execution, the larger the stamp.
+            t.queue_seq = base + len(bugs) - i
+        seq = base + len(bugs)
+        for t in rest:
+            seq += 1
+            t.queue_seq = seq
+            t.queue_head = False
+        for t in bugs:
+            t.queue_head = False
+        self._queue_seq = seq
+        for t in order:
+            self.storage.save(t)
+
+    def move_in_queue(self, task_id: str, *, up: bool) -> Task | None:
+        """Manually move a QUEUED task one step in the backlog.
+
+        The sidebar runs top → bottom from the farthest task to the one the
+        pipeline picks next; `up=True` moves the task one step away from
+        execution (up the list), `up=False` — one step closer (down the
+        list). The new position is persisted (see _apply_manual_order) and
+        survives restarts; tasks created afterwards still enter by the
+        default algorithms (bugs at the very head, the rest at the tail).
+
+        Returns the moved task, or None when the move is impossible: the
+        task is not queued, it is already at the corresponding edge of the
+        queue, or the swap would cross the bug block (bug reports always
+        run first — hold a bug with set_hold if it must wait).
+        """
+        task = self.tasks.get(task_id)
+        if task is None or task.status is not TaskStatus.QUEUED:
+            return None
+        order = self.queued()
+        i = order.index(task)
+        j = i + 1 if up else i - 1
+        if not 0 <= j < len(order):
+            return None
+        if (order[j].kind is TaskKind.BUG) != (task.kind is TaskKind.BUG):
+            return None
+        order[i], order[j] = order[j], order[i]
+        task.touch()
+        self._apply_manual_order(order)
         return task
 
     def delete(self, task_id: str) -> None:

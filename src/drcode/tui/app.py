@@ -982,6 +982,8 @@ class DrCodeApp(App[None]):
         ("ctrl+o", "focus_sidebar", "Tasks"),
         ("ctrl+i", "focus_input", "Input"),
         ("ctrl+t", "cycle_task_kind", "Change type"),
+        ("ctrl+up", "move_task_up", "Move up"),
+        ("ctrl+down", "move_task_down", "Move down"),
         ("ctrl+s", "settings", "Settings"),
         # Two bindings on one key: the footer (and the key dispatch) picks
         # the first one whose check_action allows it — so exactly one of
@@ -1277,6 +1279,20 @@ class DrCodeApp(App[None]):
         if action == "cycle_task_kind":
             # Only a queued (not yet started) task can be re-typed.
             return task is not None and task.status is TaskStatus.QUEUED
+        if action in ("move_task_up", "move_task_down"):
+            # Manual reordering works on queued tasks only; the binding is
+            # hidden while the task sits at the corresponding edge of the
+            # queue or at the bug-block boundary (bugs always run first).
+            if task is None or task.status is not TaskStatus.QUEUED:
+                return False
+            order = self.manager.queued()
+            if len(order) < 2 or task not in order:
+                return False
+            i = order.index(task)
+            j = i - 1 if action == "move_task_down" else i + 1
+            if not 0 <= j < len(order):
+                return False
+            return (order[j].kind is TaskKind.BUG) == (task.kind is TaskKind.BUG)
         if action == "hold_task":
             return task is not None and task.status in (
                 TaskStatus.QUEUED,
@@ -1397,7 +1413,8 @@ class DrCodeApp(App[None]):
 
     def _sidebar_fingerprint(self) -> tuple:
         """Lightweight snapshot of everything the sidebar renders: status,
-        verification label, title and the viewed-marker per task."""
+        verification label, title, the viewed-marker and the queue stamp
+        (the QUEUE section is order-sensitive) per task."""
         return tuple(
             (
                 t.id,
@@ -1406,6 +1423,8 @@ class DrCodeApp(App[None]):
                 t.verification,
                 t.title_display,
                 t.id == self.viewed_id,
+                t.queue_seq,
+                t.queue_head,
             )
             for t in self.manager.all_tasks()
         )
@@ -1527,6 +1546,16 @@ class DrCodeApp(App[None]):
         sidebar = self.sidebar
         for index, item in enumerate(sidebar.children):
             if isinstance(item, TaskItem) and item.section == section:
+                sidebar.index = index
+                break
+
+    def _refocus_sidebar_task(self, task_id: str) -> None:
+        """Put the ListView cursor back onto a task's row after a sidebar
+        rebuild (the rebuild resets it), so a series of reorder/hold keys
+        keeps working on the same task without re-selecting it."""
+        sidebar = self.sidebar
+        for index, item in enumerate(sidebar.children):
+            if isinstance(item, TaskItem) and item.task_id == task_id:
                 sidebar.index = index
                 break
 
@@ -3117,6 +3146,29 @@ class DrCodeApp(App[None]):
         self.refresh_status()
         if self.viewed_id == task.id:
             self.refresh_task_status()
+
+    def action_move_task_up(self) -> None:
+        """Move the viewed queued task one step up the backlog — away from
+        execution (the list runs top = farthest, bottom = next to run)."""
+        self._move_viewed_task(up=True)
+
+    def action_move_task_down(self) -> None:
+        """Move the viewed queued task one step down the backlog — closer
+        to execution (swaps it with the task the pipeline would pick
+        before it)."""
+        self._move_viewed_task(up=False)
+
+    def _move_viewed_task(self, *, up: bool) -> None:
+        task = self.viewed
+        if task is None or task.status is not TaskStatus.QUEUED:
+            return
+        if self.manager.move_in_queue(task.id, up=up) is None:
+            return
+        self.refresh_sidebar()
+        self._refocus_sidebar_task(task.id)
+        # The Move up/Move down footer buttons hide at the queue edges and
+        # at the bug-block boundary — re-evaluate the visible bindings.
+        self.refresh_bindings()
 
     def action_hold_task(self) -> None:
         """Park the viewed task out of the backlog (hold). Works for queued

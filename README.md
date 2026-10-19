@@ -105,6 +105,8 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 | `ctrl+d` | Mark viewed task done → next queued starts |
 | `ctrl+x` | Cancel viewed task: drop pending input, complete without testing |
 | `ctrl+t` | Change type of a queued task (bug → head, feature → tail) |
+| `ctrl+up` | Move a queued task one step up the backlog (away from execution) |
+| `ctrl+down` | Move a queued task one step down the backlog (closer to execution) |
 | `ctrl+h` | Hold / resume viewed task |
 | `ctrl+delete` | Delete viewed held task (from the sidebar and disk) |
 | `ctrl+s` | Settings palette (themes, AGENTS.md refresh, auto-cleanup) |

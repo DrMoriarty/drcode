@@ -176,6 +176,104 @@ def test_set_kind_same_kind_is_noop(manager: TaskManager) -> None:
     assert b.queue_seq == seq_before
 
 
+# -- move_in_queue --------------------------------------------------------------
+
+
+def test_move_down_swaps_with_execution_neighbor(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    c = manager.create("c", "x")
+    # Down the sidebar = closer to execution = one step toward the queue head.
+    assert manager.move_in_queue(c.id, up=False) is c
+    assert manager.queued() == [a, c, b]
+
+
+def test_move_up_swaps_away_from_execution(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    c = manager.create("c", "x")
+    assert manager.move_in_queue(a.id, up=True) is a
+    assert manager.queued() == [b, a, c]
+
+
+def test_move_at_edges_is_noop(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    assert manager.move_in_queue(a.id, up=False) is None  # already next to run
+    assert manager.move_in_queue(b.id, up=True) is None  # already the last
+    assert manager.queued() == [a, b]
+
+
+def test_move_non_queued_is_noop(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    c = manager.create("c", "x")
+    a.status = TaskStatus.ACTIVE
+    assert manager.move_in_queue(a.id, up=True) is None
+    assert manager.move_in_queue(b.id, up=True) is b  # unaffected
+    assert manager.queued() == [c, b]
+
+
+def test_manual_order_survives_restart(project_root: Path) -> None:
+    manager = TaskManager(project_root)
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    c = manager.create("c", "x")
+    manager.move_in_queue(c.id, up=False)  # [a, c, b]
+
+    reloaded = TaskManager(project_root)
+    assert reloaded.queued() == [a, c, b]
+
+
+def test_new_tasks_follow_default_algorithms_after_manual_move(
+    manager: TaskManager,
+) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.move_in_queue(b.id, up=False)  # [b, a]
+    # A new feature still appends at the tail (farthest from execution).
+    c = manager.create("c", "x")
+    assert manager.queued() == [b, a, c]
+    # A new bug still jumps to the very head (closest to execution).
+    bug = manager.create("bug", "x", kind=TaskKind.BUG)
+    assert manager.queued() == [bug, b, a, c]
+
+
+def test_move_cannot_cross_bug_block(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    bug = manager.create("bug", "x", kind=TaskKind.BUG)
+    # Moving the feature down would put it ahead of the bug — not allowed.
+    assert manager.move_in_queue(a.id, up=False) is None
+    assert manager.queued() == [bug, a]
+    # Moving the bug up would demote it below the feature — not allowed either.
+    assert manager.move_in_queue(bug.id, up=True) is None
+    assert manager.queued() == [bug, a]
+    # But within the bug block (and within the rest) moves work.
+    bug2 = manager.create("bug2", "x", kind=TaskKind.BUG)
+    assert manager.queued() == [bug2, bug, a]
+    assert manager.move_in_queue(bug2.id, up=True) is bug2
+    assert manager.queued() == [bug, bug2, a]
+
+
+def test_move_repositions_answered_clarification_marker(
+    manager: TaskManager,
+) -> None:
+    from drcode.models import Clarification
+
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    b.status = TaskStatus.AWAITING_CLARIFICATION
+    b.clarification = Clarification(question="q?")
+    manager.send(b.id, "answer")  # [b, a] — answered clarification at the head
+    manager.move_in_queue(b.id, up=True)  # [a, b]
+    assert manager.queued() == [a, b]
+    # A later answered clarification still lands ahead of the non-bug block.
+    a.status = TaskStatus.AWAITING_CLARIFICATION
+    a.clarification = Clarification(question="q2?")
+    manager.send(a.id, "answer 2")
+    assert manager.queued() == [a, b]
+
+
 # -- hold / delete ------------------------------------------------------------
 
 

@@ -1272,6 +1272,14 @@ class DrCodeApp(App[None]):
         # block the whole pipeline, so they must eventually get their round.
         self._tester_fail_count: dict[str, int] = {}
         self._tester_retry_at: dict[str, float] = {}
+        # Rate-limit (HTTP 429) bookkeeping for tester runs (mirrors the
+        # agent's dicts below): a rate-limited testing round is retried in
+        # place — the round transcript is kept and the retry resumes it as
+        # a continuation turn — instead of restarting the round from
+        # scratch. `_tester_429_resume` marks tasks whose next tester run
+        # must continue the current round rather than start a new one.
+        self._tester_429_count: dict[str, int] = {}
+        self._tester_429_resume: set[str] = set()
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
@@ -3519,6 +3527,14 @@ class DrCodeApp(App[None]):
         self._tester_generation += 1
         run_key: tuple[str, int] = ("tester", self._tester_generation)
         task = self.manager.get(task_id)
+        # A 429 retry continues the current testing round in place instead
+        # of starting a new one (the flag is set by the 429 handler below).
+        # Ignored when the task left TESTING in the meantime: the round
+        # would test stale state.
+        resume_round = task_id in self._tester_429_resume and (
+            task.status is TaskStatus.TESTING
+        )
+        self._tester_429_resume.discard(task_id)
         # Initialized before the try: build_tester_agent() itself may raise,
         # and the handlers below reference `run`.
         run: AgentRun[TesterDeps, str] | None = None
@@ -3545,9 +3561,10 @@ class DrCodeApp(App[None]):
             # New testing round: created up front, filled by
             # _persist_tester_messages as the run progresses. An empty round
             # (crash before any snapshot) is skipped when rendering.
-            task.tester_messages.append([])
-            if self.viewed_id == task_id:
-                self._write_history_line("testing-sep", "")
+            if not resume_round:
+                task.tester_messages.append([])
+                if self.viewed_id == task_id:
+                    self._write_history_line("testing-sep", "")
             tester = build_tester_agent(
                 self.config,
                 allow_commit=(
@@ -3579,7 +3596,18 @@ class DrCodeApp(App[None]):
                 # result could blow the model window before the tester
                 # ever calls set_verification, looping the round in
                 # fruitless retries.
-                text: str | None = prompt
+                # A resumed round continues from the persisted round
+                # transcript (no new prompt — the while-loop below builds
+                # the continuation history from it); an empty round (the
+                # rate-limited request was never recorded) re-sends the
+                # prompt as usual.
+                text: str | None = (
+                    None
+                    if resume_round
+                    and task.tester_messages
+                    and task.tester_messages[-1]
+                    else prompt
+                )
                 # Live context reading of the current round; the shared
                 # _live_ctx_tokens map belongs to the agent transcript and
                 # must not be polluted with the tester's.
@@ -3620,6 +3648,11 @@ class DrCodeApp(App[None]):
                                     async for _event in stream:
                                         self._touch_activity()
                                 live_tokens = run_context_tokens(run)
+                                # A model call went through: the 429 retry
+                                # budget for this testing round starts over,
+                                # so the NEXT 429 counts from one again
+                                # (mirrors the agent's per-request reset).
+                                self._tester_429_count.pop(task_id, None)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
@@ -3718,7 +3751,34 @@ class DrCodeApp(App[None]):
                     self.view_task(task_id)
                 raise
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
+                # HTTP 429 (rate limit) is transient: instead of restarting
+                # the whole testing round, retry it in place (the task stays
+                # TESTING, the round transcript is kept and the retry
+                # resumes it as a continuation turn) after a backoff delay,
+                # at most RATE_LIMIT_RETRIES times — only when the budget is
+                # exhausted does the ordinary failure path below apply
+                # (mirrors run_agent's 429 handling).
+                if (
+                    isinstance(e, ModelHTTPError)
+                    and e.status_code == 429
+                    and self._tester_429_count.get(task_id, 0) < RATE_LIMIT_RETRIES
+                ):
+                    attempt = self._tester_429_count.get(task_id, 0) + 1
+                    self._tester_429_count[task_id] = attempt
+                    self._agent_429_total += 1
+                    delay = min(5 * 2 ** (attempt - 1), RATE_LIMIT_DELAY_MAX)
+                    self._show_event(
+                        task,
+                        f"HTTP 429 (rate limited): tester retry {attempt}/"
+                        f"{RATE_LIMIT_RETRIES} in {int(delay)} s",
+                    )
+                    self._persist_tester_messages(task, run)
+                    self._tester_429_resume.add(task_id)
+                    self._tester_retry_at[task_id] = time.monotonic() + delay
+                    self.set_timer(delay, self._advance)
+                    return
                 self._persist_tester_messages(task, run)
+                self._tester_429_resume.discard(task_id)
                 self._tester_fail_count[task_id] = (
                     self._tester_fail_count.get(task_id, 0) + 1
                 )
@@ -3734,8 +3794,10 @@ class DrCodeApp(App[None]):
             self.refresh_sidebar()
             if task.status is TaskStatus.COMPLETED:
                 # Success: give the next testing round of this task a fresh
-                # backoff budget.
+                # backoff and 429 budget.
                 self._tester_fail_count.pop(task_id, None)
+                self._tester_429_count.pop(task_id, None)
+                self._tester_429_resume.discard(task_id)
                 self._tester_retry_at.pop(task_id, None)
             # A cancelled run (user abort, or a newer tester taking over)
             # must not restart the pipeline.
@@ -3895,6 +3957,7 @@ class DrCodeApp(App[None]):
             self.tester_running = False
             self._current_tool = None
         self.manager.cancel(task.id)
+        self._tester_429_resume.discard(task.id)
         self._show_event(
             task,
             "Задача отменена пользователем — снята с конвейера без тестирования.",

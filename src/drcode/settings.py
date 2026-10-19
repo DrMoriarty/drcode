@@ -51,8 +51,9 @@ RETENTION_OPTIONS: tuple[CompletedRetention, ...] = (
 class TaskFinalization(str, enum.Enum):
     """What happens to a task after its development round finishes.
 
-    TESTING_COMMIT: the tester verifies the project and commits the verified
-    changes (the historical default). TESTING: the tester verifies but never
+    TESTING_COMMIT: the tester verifies the project, commits the verified
+    changes and pushes them to the remote (push failure never fails the
+    task — it is only logged). TESTING: the tester verifies but never
     commits. NONE: no tester at all — tasks go straight to COMPLETED.
     """
 
@@ -64,7 +65,7 @@ class TaskFinalization(str, enum.Enum):
     def label(self) -> str:
         """Human-readable option label for the settings UI."""
         if self is TaskFinalization.TESTING_COMMIT:
-            return "Testing + Git commit"
+            return "Testing + Git commit + push"
         if self is TaskFinalization.TESTING:
             return "Testing"
         return "None"

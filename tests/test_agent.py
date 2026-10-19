@@ -435,6 +435,76 @@ async def test_run_bash_logged_converts_violation(deps: AgentDeps) -> None:
     assert task.events[-1].kind == "permission"
 
 
+# -- tester git push -----------------------------------------------------------------
+
+
+def _git_init_repo(path: Path, *, bare: bool = False) -> None:
+    import subprocess
+
+    args = ["git", "init", "-q"]
+    if bare:
+        args.append("--bare")
+    subprocess.run(args + [str(path)], check=True, capture_output=True)
+
+
+def _git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+
+def _tester_deps(root: Path) -> agent_mod.TesterDeps:
+    manager = TaskManager(root)
+    task = manager.create("t", "x")
+    return agent_mod.TesterDeps(root=root, manager=manager, task_id=task.id)
+
+
+async def test_git_push_skips_without_remote(tmp_path: Path) -> None:
+    _git_init_repo(tmp_path)
+    deps = _tester_deps(tmp_path)
+    result = await agent_mod._git_push(deps, tmp_path)
+    assert "skipped" in result
+    task = deps.manager.get(deps.task_id)
+    assert [e.kind for e in task.events] == ["git"]
+    assert "no remote" in task.events[0].text
+
+
+async def test_git_push_failure_logs_event_but_never_fails(tmp_path: Path) -> None:
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    # A remote that does not exist: the push must fail gracefully.
+    _git(tmp_path, "remote", "add", "origin", str(tmp_path / "missing.git"))
+    deps = _tester_deps(tmp_path)
+    result = await agent_mod._git_push(deps, tmp_path)
+    assert "Push failed" in result
+    assert "not a verification failure" in result
+    task = deps.manager.get(deps.task_id)
+    assert len(task.events) == 1
+    assert task.events[0].kind == "git"
+    assert "fatal" in task.events[0].text
+
+
+async def test_git_push_success_with_bare_remote(tmp_path: Path) -> None:
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    origin = tmp_path / "origin.git"
+    _git_init_repo(origin, bare=True)
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+    deps = _tester_deps(tmp_path)
+    result = await agent_mod._git_push(deps, tmp_path)
+    assert "Pushed successfully" in result
+    task = deps.manager.get(deps.task_id)
+    assert task.events == []
+
+
 # -- agent construction (no network calls) ------------------------------------------
 
 

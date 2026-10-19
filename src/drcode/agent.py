@@ -181,16 +181,21 @@ async def _run_tool(fn: Callable[..., Any], *args: Any) -> Any:
         raise ModelRetry(str(e) or type(e).__name__) from e
 
 
-def _log_violation(deps: AgentDeps | TesterDeps, tool: str, error: str) -> None:
-    """Persist a permission violation into the task's service-event log.
+def _log_service_event(deps: AgentDeps | TesterDeps, kind: str, text: str) -> None:
+    """Persist a service event into the task's event log.
 
     Like all TaskEvents, it is shown in the chat under the "service events"
     separator but never reaches the model context.
     """
     task = deps.manager.get(deps.task_id)
-    task.events.append(TaskEvent(kind="permission", text=f"{tool}: {error}"))
+    task.events.append(TaskEvent(kind=kind, text=text))
     task.touch()
     deps.manager.storage.save(task)
+
+
+def _log_violation(deps: AgentDeps | TesterDeps, tool: str, error: str) -> None:
+    """Persist a permission violation into the task's service-event log."""
+    _log_service_event(deps, "permission", f"{tool}: {error}")
 
 
 async def _run_tool_logged(
@@ -400,11 +405,15 @@ say so and still try to build/compile the project.
 3. If everything passes: before labelling the task, check whether the project root is \
 a git repository (git_commit does this itself). If it is, write a short commit message \
 that concisely paraphrases the original task (imperative mood, e.g. "Add retry logic \
-to the tester pipeline") and call git_commit with it. If the commit fails (e.g. git \
-identity is not configured), still pass verification and mention the failure in your \
-summary. If the project is not a git repository, skip the commit entirely.
+to the tester pipeline") and call git_commit with it; it also pushes the branch to \
+the remote. If the commit fails (e.g. git identity is not configured), still pass \
+verification and mention the failure in your summary. A failed push (no network, \
+diverged remote, no upstream, …) is NOT a verification failure: the error is logged \
+into the task's event log automatically — still pass verification and mention the \
+push problem in your summary. If the project is not a git repository, skip the \
+commit entirely.
 4. Call set_verification(success=True) and give a short summary of what you ran \
-(and whether a commit was made).
+(and whether a commit was made and pushed).
 5. If anything fails, call set_verification(success=False), then call create_bug_report \
 with a clear title and a description containing what failed, the exact command and the \
 error output, and give a short summary.
@@ -444,6 +453,36 @@ class TesterDeps:
     root: Path
     manager: TaskManager
     task_id: str
+
+
+async def _git_push(deps: TesterDeps, root: Path) -> str:
+    """Best-effort `git push` after a successful commit.
+
+    A push failure never fails verification: the error is written into the
+    task's service-event log and reported back to the model as a note, so the
+    tester still passes the task."""
+    remotes = await tools.run_bash(root, "git remote")
+    names = remotes.removeprefix("exit=0").strip()
+    if not remotes.startswith("exit=0") or not names or names == "(no output)":
+        _log_service_event(deps, "git", "git push skipped: no remote configured.")
+        return "\ngit push skipped: no remote configured."
+    push = await tools.run_bash(root, "git push")
+    if push.startswith("exit=0"):
+        return "\nPushed successfully."
+    if "no upstream" in push:
+        # Fresh branch without tracking: retry once, setting the upstream.
+        push = await tools.run_bash(root, "git push --set-upstream origin HEAD")
+        if push.startswith("exit=0"):
+            return "\nPushed successfully (set upstream to origin/HEAD)."
+    detail = push.removeprefix("exit=0").strip() or "(no output)"
+    _log_service_event(deps, "git", f"git push failed:\n{detail}")
+    return (
+        "\nPush failed (the commit is safe locally):\n"
+        f"{detail}\n"
+        "This is not a verification failure — proceed with "
+        "set_verification(success=True) and mention the push problem "
+        "in your summary."
+    )
 
 
 def build_tester_agent(
@@ -516,9 +555,13 @@ def build_tester_agent(
         @agent.tool
         async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
             """Stage all changed files in the project root and create a git commit
-            with the given message. Use only after all checks passed, with a short
-            message paraphrasing the original task. Skips gracefully when the
-            project root is not a git repository or there is nothing to commit."""
+            with the given message, then push the branch to its remote. Use only
+            after all checks passed, with a short message paraphrasing the
+            original task. Skips gracefully when the project root is not a git
+            repository or there is nothing to commit. A failed push (no network,
+            diverged remote, no upstream, …) is NOT a failure: the push error is
+            recorded in the task's event log and the commit stays safe locally —
+            still proceed with set_verification(success=True)."""
             root = ctx.deps.root
             message = message.strip().strip("'\"")
             if not message:
@@ -537,7 +580,8 @@ def build_tester_agent(
             if not commit.startswith("exit=0"):
                 return f"Commit failed:\n{commit}"
             head = await tools.run_bash(root, "git log -1 --oneline")
-            return f"Committed successfully.\n{head}"
+            result = f"Committed successfully.\n{head}"
+            return result + await _git_push(ctx.deps, root)
 
     @agent.tool
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:

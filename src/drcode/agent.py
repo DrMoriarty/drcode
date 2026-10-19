@@ -197,10 +197,10 @@ async def _run_tool_logged(
 
 
 async def _run_bash_logged(
-    deps: AgentDeps | TesterDeps, root: Path, command: str
+    deps: AgentDeps | TesterDeps, root: Path, command: str, timeout: float | None = None
 ) -> str:
     try:
-        return await tools.run_bash(root, command)
+        return await tools.run_bash(root, command, timeout)
     except PathViolation as e:
         _log_violation(deps, "run_bash", str(e))
         raise ModelRetry(str(e)) from e
@@ -307,10 +307,15 @@ def build_agent(
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool
-    async def run_bash(ctx: RunContext[AgentDeps], command: str) -> str:
-        """Run a shell command in the project root and return its output (2 min timeout).
+    async def run_bash(
+        ctx: RunContext[AgentDeps], command: str, timeout: int | None = None
+    ) -> str:
+        """Run a shell command in the project root and return its output.
+        The command is killed after `timeout` seconds (default 120); pass a
+        larger timeout for long-running commands (builds, test suites) —
+        values above 3600 (60 minutes) are clamped to 3600.
         rm/mv/cp are only allowed with paths inside the project root or /tmp."""
-        return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
+        return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     # Task-creation tools exist only for the research agent: coding
     # agents (feature/bug) work on their own task and must not spawn more;
@@ -475,10 +480,15 @@ def build_tester_agent(
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool
-    async def run_bash(ctx: RunContext[TesterDeps], command: str) -> str:
-        """Run a shell command in the project root and return its output (2 min timeout).
+    async def run_bash(
+        ctx: RunContext[TesterDeps], command: str, timeout: int | None = None
+    ) -> str:
+        """Run a shell command in the project root and return its output.
+        The command is killed after `timeout` seconds (default 120); pass a
+        larger timeout for long-running checks (full test suites, builds) —
+        values above 3600 (60 minutes) are clamped to 3600.
         rm/mv/cp are only allowed with paths inside the project root or /tmp."""
-        return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
+        return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     @agent.tool
     def create_bug_report(

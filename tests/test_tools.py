@@ -385,6 +385,30 @@ def test_run_bash_timeout_message(project_root: Path, monkeypatch) -> None:
     assert "exit=-1" in out
 
 
+def test_run_bash_explicit_timeout(project_root: Path) -> None:
+    # A small explicit timeout still cuts the command short.
+    out = asyncio.run(run_bash(project_root, "sleep 5", timeout=1))
+    assert "timed out after 1s" in out
+
+
+def test_run_bash_timeout_clamped_to_cap(project_root: Path) -> None:
+    # Values above BASH_MAX_TIMEOUT (60 min) are clamped down to the cap;
+    # the command finishes long before, so only the message is checked.
+    out = asyncio.run(run_bash(project_root, "echo hi", timeout=10**9))
+    assert out == "exit=0\nhi"
+
+
+def test_clamp_bash_timeout() -> None:
+    assert tools.clamp_bash_timeout(None) == tools.BASH_TIMEOUT
+    assert tools.clamp_bash_timeout(0) == tools.BASH_TIMEOUT
+    assert tools.clamp_bash_timeout(-5) == tools.BASH_TIMEOUT
+    assert tools.clamp_bash_timeout(30) == 30
+    assert tools.clamp_bash_timeout(tools.BASH_MAX_TIMEOUT) == tools.BASH_MAX_TIMEOUT
+    assert (
+        tools.clamp_bash_timeout(tools.BASH_MAX_TIMEOUT + 1) == tools.BASH_MAX_TIMEOUT
+    )
+
+
 def test_run_bash_output_truncated(project_root: Path, monkeypatch) -> None:
     monkeypatch.setattr(tools, "MAX_TOOL_OUTPUT", 100)
     out = asyncio.run(run_bash(project_root, "echo " + "x" * 500))

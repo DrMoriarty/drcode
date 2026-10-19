@@ -21,6 +21,9 @@ from pathlib import Path
 
 MAX_TOOL_OUTPUT = 10_000
 BASH_TIMEOUT = 120
+# Hard cap for a run_bash call: the agent may request a longer timeout than
+# the default, but never more than an hour — values above are clamped to it.
+BASH_MAX_TIMEOUT = 60 * 60
 
 # Extra scratch area: the model may create/edit files here even though it is
 # outside the project — a sandbox for testing hypotheses.
@@ -226,8 +229,20 @@ def check_command(root: Path, command: str) -> None:
                 raise _bash_violation(root, command, base, raw)
 
 
-async def run_bash(root: Path, command: str) -> str:
+def clamp_bash_timeout(timeout: float | None) -> float:
+    """Resolve the effective timeout of a run_bash call.
+
+    None (or a non-positive value) falls back to the default BASH_TIMEOUT;
+    anything above BASH_MAX_TIMEOUT is clamped down to the cap.
+    """
+    if timeout is None or timeout <= 0:
+        return BASH_TIMEOUT
+    return min(timeout, BASH_MAX_TIMEOUT)
+
+
+async def run_bash(root: Path, command: str, timeout: float | None = None) -> str:
     check_command(root, command)
+    effective = clamp_bash_timeout(timeout)
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,
@@ -235,13 +250,11 @@ async def run_bash(root: Path, command: str) -> str:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=BASH_TIMEOUT
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=effective)
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        return f"exit=-1\n(command timed out after {BASH_TIMEOUT}s)"
+        return f"exit=-1\n(command timed out after {effective}s)"
     except asyncio.CancelledError:
         # The run was aborted or the app is quitting: the child process must
         # not outlive the tool call. Kill it and let the event loop reap it

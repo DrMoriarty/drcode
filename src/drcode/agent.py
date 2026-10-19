@@ -86,6 +86,14 @@ user's assignment. All tools are available to you: read and search the codebase,
 create and edit files, and run shell commands. Explore the code thoroughly before
 answering or editing so your answer and changes reflect the actual implementation.
 Prefer minimal, focused changes. Never commit to git unless explicitly asked.
+
+You can also create new tasks in the backlog with create_bug_report (a bug report)
+and create_feature_request (a feature request). STRICT RULE: create a task only
+when the user explicitly asks for it ("file a bug", "create a task for this", …).
+If you notice a potential problem or an improvement opportunity on your own, do NOT
+create anything silently — ask the user first via ask_clarifying_question whether
+a task should be filed, describe what you found, and act only on their answer.
+
 If the request is ambiguous or missing a detail you cannot resolve from the code,
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
@@ -222,9 +230,10 @@ def build_agent(
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
-    new classes, documentation tasks answer questions / update docs. The tool
-    set is the same for all kinds. When the project root contains AGENTS.md,
-    its content is appended to the instructions."""
+    new classes, documentation tasks answer questions / update docs. The
+    documentation agent additionally gets the task-creation tools (bug reports
+    and feature requests). When the project root contains AGENTS.md, its
+    content is appended to the instructions."""
     model = build_model(config)
     base_prompt = {
         TaskKind.BUG: BUG_SYSTEM_PROMPT,
@@ -302,6 +311,43 @@ def build_agent(
         """Run a shell command in the project root and return its output (2 min timeout).
         rm/mv/cp are only allowed with paths inside the project root or /tmp."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
+
+    # Task-creation tools exist only for the documentation agent: coding
+    # agents (feature/bug) work on their own task and must not spawn more;
+    # the documentation agent can file bug reports and feature requests on
+    # the user's behalf. Placement follows the ordinary queue rules via
+    # TaskManager.create (bugs join the head of the bug block, everything
+    # else the tail of the queue).
+    if kind is TaskKind.DOCUMENTATION:
+
+        @agent.tool
+        def create_bug_report(
+            ctx: RunContext[AgentDeps], title: str, description: str
+        ) -> str:
+            """Create a bug report task in the backlog. Use ONLY when the user
+            explicitly asked for it — if you found a problem on your own, ask
+            via ask_clarifying_question whether a task should be filed.
+            `title` is a short imperative summary; `description` carries the
+            details: what is wrong, where (files/lines), and how it manifests."""
+            bug = ctx.deps.manager.create(title, description, kind=TaskKind.BUG)
+            return (
+                f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
+            )
+
+        @agent.tool
+        def create_feature_request(
+            ctx: RunContext[AgentDeps], title: str, description: str
+        ) -> str:
+            """Create a feature request task in the backlog. Use ONLY when the
+            user explicitly asked for it — if you spotted an improvement on
+            your own, ask via ask_clarifying_question whether a task should be
+            filed. `title` is a short summary of the desired change;
+            `description` details what should be done and why."""
+            feature = ctx.deps.manager.create(title, description, kind=TaskKind.FEATURE)
+            return (
+                f"Feature request #{feature.id} '{feature.title}' created at "
+                "the tail of the queue."
+            )
 
     @agent.tool
     def ask_clarifying_question(

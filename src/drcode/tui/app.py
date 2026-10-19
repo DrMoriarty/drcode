@@ -1608,6 +1608,12 @@ class DrCodeApp(App[None]):
         tester, promote_next() activations, …)."""
         if self._sidebar_fingerprint() != self._sidebar_snapshot:
             self.refresh_sidebar()
+            # The task status header (and the bottom statusbar) have no
+            # poller of their own: they are refreshed explicitly, and mid-run
+            # state changes (set_verification flips the viewed task to
+            # COMPLETED while its tester run is still finishing) would leave
+            # them stale until the run ends — or a view switch.
+            self.refresh_status()
 
     def _sidebar_sections(self) -> list[tuple[str, list[Task]]]:
         """Sidebar content: pipeline sections top to bottom, empty ones
@@ -1958,7 +1964,7 @@ class DrCodeApp(App[None]):
         self._show_event(
             task,
             f"{who} stalled for {self._fmt_age(int(stalled_for))} without any "
-            f"activity — aborting and restarting (stall limit: "
+            f"activity — aborting the run (stall limit: "
             f"{self.settings.stall_nudge.label})",
         )
         self._nudge_run(task)
@@ -1983,6 +1989,17 @@ class DrCodeApp(App[None]):
                 self.tester_running = False
                 self._current_tool = None
                 self.refresh_status()
+            self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
+        elif self.tester_running and self._tester_task_id == task.id:
+            # The run hung AFTER its useful work: set_verification already
+            # flipped the task to COMPLETED mid-run. Nothing to restart —
+            # but the hung worker keeps tester_running True, which blocks
+            # the whole pipeline (_advance is a no-op while testing runs),
+            # so it must be aborted and the pipeline re-advanced.
+            self.workers.cancel_group(self, "tester")
+            self.tester_running = False
+            self._current_tool = None
+            self.refresh_status()
             self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
 
     # -- chat pane ---------------------------------------------------------------
@@ -3306,9 +3323,13 @@ class DrCodeApp(App[None]):
                                 # answer comes from the end-of-round
                                 # re-render) and take the round's freshest
                                 # context reading once the request is final.
+                                # Every event is a sign of life: without the
+                                # touch a long (minutes) report generation
+                                # reads as "stalled" — and the stall watchdog
+                                # aborts a perfectly healthy run.
                                 async with node.stream(run.ctx) as stream:
                                     async for _event in stream:
-                                        pass
+                                        self._touch_activity()
                                 live_tokens = run_context_tokens(run)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
@@ -3399,6 +3420,13 @@ class DrCodeApp(App[None]):
                 # far, then re-raise so the worker teardown stays clean.
                 cancelled = True
                 self._persist_tester_messages(task, run)
+                if self.viewed_id == task_id:
+                    # Watchdog abort (or esc) of a hung run: re-render from
+                    # the persisted transcript, so the open view shows what
+                    # was actually done instead of stale blocks (e.g. a tool
+                    # call that never returned) until the user switches views.
+                    # Sync only — no awaits inside a cancelled coroutine.
+                    self.view_task(task_id)
                 raise
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
                 self._persist_tester_messages(task, run)

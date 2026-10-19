@@ -4512,8 +4512,12 @@ class DrCodeApp(App[None]):
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
+        # Capture the pre-run state: _advance() promotes the task to ACTIVE
+        # (promote_next) and flips its status, so the render check below must
+        # compare the ORIGINAL status, not the post-promotion one.
+        was_active = task.status is TaskStatus.ACTIVE
         self.manager.send(task.id, text)
-        if task.status is TaskStatus.ACTIVE:
+        if was_active:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back
             # to pending_input) and the new run resumes with the comment.
@@ -4525,9 +4529,11 @@ class DrCodeApp(App[None]):
             self._advance()
         self.refresh_sidebar()
         self.refresh_status()
-        # For an active task run_agent() renders the message itself.
+        # For an active task run_agent() renders the message itself. A
+        # non-active task keeps the queued comment visible even after the
+        # promotion flips it to ACTIVE — so use the captured original state.
         if (
-            task.status is not TaskStatus.ACTIVE
+            not was_active
             and self.viewed_id == task.id
             and not is_pending_retry(task.messages, text)
         ):

@@ -684,8 +684,12 @@ class SpacedCommandList(CommandList):
         )
 
     def render_line(self, y: int) -> Strip:
+        # y is viewport-relative; the line cache is indexed by absolute
+        # (scroll-adjusted) line number — same adjustment the base class
+        # makes in OptionList.render_line. Without it the spacer check
+        # below inspects the wrong row once the list is scrolled.
         try:
-            _, line_offset = self._lines[y]
+            _, line_offset = self._lines[self.scroll_offset.y + y]
         except IndexError:
             return Strip.blank(
                 self.scrollable_content_region.width,

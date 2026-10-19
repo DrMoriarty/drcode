@@ -15,6 +15,7 @@ absolute layer and is never shifted by the added content.
 from __future__ import annotations
 
 from textual.app import ComposeResult
+from textual.events import Click
 from textual.message import Message
 from textual.widgets import Static
 from textual.widgets._header import (
@@ -139,9 +140,14 @@ class ModelStatusHeader(Header):
         yield HeaderSessionInfo(id="header-sessions")
         yield HeaderTitle()
 
-    def _on_click(self) -> None:
-        # Stock behaviour (toggle -tall) plus a notification so the app can
-        # fill the expanded lines immediately instead of waiting for the
-        # next 1 s poll tick.
+    async def _on_click(self, event: Click) -> None:
+        # Textual dispatches `_on_click` for EVERY class in the MRO (see
+        # MessagePump._get_dispatch_methods), so the stock Header._on_click
+        # would run after this one and toggle -tall a second time — the two
+        # toggles cancel out and the click appears to do nothing. Prevent
+        # the remaining handlers and do the stock toggle here, plus a
+        # notification so the app can fill the expanded lines immediately
+        # instead of waiting for the next 1 s poll tick.
+        event.prevent_default()
         self.toggle_class("-tall")
         self.post_message(self.TallToggled(self.has_class("-tall")))

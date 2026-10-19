@@ -3224,6 +3224,13 @@ class DrCodeApp(App[None]):
                                     self._live_ctx_tokens[task_id] = ctx_tokens
                                     if self.viewed_id == task_id:
                                         self.refresh_task_status()
+                                # A model call went through: the rate-limit
+                                # retry budget for this task starts over, so
+                                # the NEXT 429 counts from one again — even
+                                # mid-run, where a single turn makes many
+                                # model requests.
+                                self._agent_429_count.pop(task_id, None)
+                                self._agent_429_retry_at.pop(task_id, None)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:

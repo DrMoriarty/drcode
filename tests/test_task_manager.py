@@ -160,10 +160,10 @@ def test_set_kind_feature_moves_to_tail(manager: TaskManager) -> None:
     assert manager.queued() == [b, c, a]
 
 
-def test_set_kind_documentation_keeps_position(manager: TaskManager) -> None:
+def test_set_kind_research_keeps_position(manager: TaskManager) -> None:
     a = manager.create("a", "x")
     b = manager.create("b", "x")
-    manager.set_kind(b.id, TaskKind.DOCUMENTATION)
+    manager.set_kind(b.id, TaskKind.RESEARCH)
     assert manager.queued() == [a, b]
 
 
@@ -354,8 +354,8 @@ def test_mark_done_feature_goes_to_testing(manager: TaskManager) -> None:
     assert task.completed_at is None
 
 
-def test_mark_done_documentation_completes(manager: TaskManager) -> None:
-    task = manager.create("t", "x", kind=TaskKind.DOCUMENTATION)
+def test_mark_done_research_completes(manager: TaskManager) -> None:
+    task = manager.create("t", "x", kind=TaskKind.RESEARCH)
     manager.mark_done(task.id)
     assert task.status is TaskStatus.COMPLETED
     assert task.completed_at is not None

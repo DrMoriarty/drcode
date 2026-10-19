@@ -122,7 +122,7 @@ class TaskManager:
     def set_kind(self, task_id: str, kind: TaskKind) -> Task:
         """Change the kind of a not-yet-started (QUEUED) task and re-position
         it in the queue: bug → head of the queue, feature → tail. Other kinds
-        (documentation) keep the current position. The caller is responsible
+        (research) keep the current position. The caller is responsible
         for only calling this on queued tasks."""
         task = self.get(task_id)
         if task.kind is kind:
@@ -269,12 +269,12 @@ class TaskManager:
         promotes). If the app dies while TESTING, the task is re-tested on
         the next startup before any queued task starts.
 
-        Documentation tasks skip the tester entirely: they are completed
+        Research tasks skip the tester entirely: they are completed
         right away."""
         task = self.get(task_id)
         task.status = (
             TaskStatus.COMPLETED
-            if task.kind is TaskKind.DOCUMENTATION
+            if task.kind is TaskKind.RESEARCH
             else TaskStatus.TESTING
         )
         if task.status is TaskStatus.COMPLETED:

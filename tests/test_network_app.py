@@ -104,7 +104,7 @@ async def test_queued_comments_merge_into_one_first_prompt(
     """The original brief plus comments typed before the run starts (while
     the task sat in the queue) reach the agent as ONE prompt, so it solves
     the task as a whole instead of one message per turn."""
-    task = net_app.manager.create("t", "original brief", kind=TaskKind.DOCUMENTATION)
+    task = net_app.manager.create("t", "original brief", kind=TaskKind.RESEARCH)
     net_app.manager.send(task.id, "first comment")
     net_app.manager.send(task.id, "second comment")
     scripted.steps = [text_response("done")]
@@ -113,7 +113,7 @@ async def test_queued_comments_merge_into_one_first_prompt(
         await wait_until(
             lambda: task.status is TaskStatus.COMPLETED,
             pilot,
-            what="documentation task completed",
+            what="research task completed",
         )
 
     assert task.pending_input == []
@@ -126,9 +126,7 @@ async def test_agent_tool_roundtrip_completes_task(
     net_app: DrCodeApp, scripted: ScriptedState, project_root: Path
 ) -> None:
     (project_root / "README.md").write_text("hello readme")
-    task = net_app.manager.create(
-        "docs", "summarize readme", kind=TaskKind.DOCUMENTATION
-    )
+    task = net_app.manager.create("docs", "summarize readme", kind=TaskKind.RESEARCH)
     scripted.steps = [
         tool_response("read_file", {"path": "README.md"}),
         text_response("readme says hello"),
@@ -138,7 +136,7 @@ async def test_agent_tool_roundtrip_completes_task(
         await wait_until(
             lambda: task.status is TaskStatus.COMPLETED,
             pilot,
-            what="documentation task completed",
+            what="research task completed",
         )
 
     assert task.pending_input == []
@@ -156,7 +154,7 @@ async def test_agent_tool_roundtrip_completes_task(
 async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
     net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
 ) -> None:
-    task = net_app.manager.create("limited", "do work", kind=TaskKind.DOCUMENTATION)
+    task = net_app.manager.create("limited", "do work", kind=TaskKind.RESEARCH)
     # 5 retries within the budget, then one more 429 that exhausts it.
     scripted.steps = [http_error(429) for _ in range(6)]
 
@@ -189,7 +187,7 @@ async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
 async def test_connection_outage_demotes_task_and_recovery_resumes_it(
     net_app: DrCodeApp, scripted: ScriptedState
 ) -> None:
-    task = net_app.manager.create("docs", "write the docs", kind=TaskKind.DOCUMENTATION)
+    task = net_app.manager.create("docs", "write the docs", kind=TaskKind.RESEARCH)
     scripted.steps = [api_error("Connection error.")]
 
     async with net_app.run_test() as pilot:
@@ -314,7 +312,7 @@ def _seed_transcript(app: DrCodeApp, prompt: str) -> Any:
     )
     from pydantic_ai.usage import RequestUsage
 
-    task = app.manager.create("docs", "", kind=TaskKind.DOCUMENTATION)
+    task = app.manager.create("docs", "", kind=TaskKind.RESEARCH)
     response = ModelResponse(
         parts=[TextPart("partial work")],
         usage=RequestUsage(input_tokens=2000, output_tokens=8),
@@ -406,9 +404,7 @@ async def test_mid_run_compaction_pauses_and_resumes(
     many model requests) stops the run at the next tool boundary, compacts
     and resumes via a continuation turn — the work is not lost."""
     (project_root / "README.md").write_text("hello readme")
-    task = net_app_small_ctx.manager.create(
-        "docs", "long task", kind=TaskKind.DOCUMENTATION
-    )
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
     scripted_fills([100, 900])
     scripted.steps = [
         # 100 of 1000 — below the 80% threshold, the run goes on.
@@ -464,9 +460,7 @@ async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
     break→continuation loop: after one failure the run continues
     uncompressed (turn-boundary compaction still retries next turn)."""
     (project_root / "README.md").write_text("hello readme")
-    task = net_app_small_ctx.manager.create(
-        "docs", "long task", kind=TaskKind.DOCUMENTATION
-    )
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
     scripted_fills([100, 900, 950])
     scripted.steps = [
         tool_response("read_file", {"path": "README.md"}, "c1"),
@@ -508,9 +502,7 @@ async def test_no_mid_run_pause_below_threshold(
     """A turn whose fill stays under the threshold runs to the end without
     a pause and without touching the summarizer."""
     (project_root / "README.md").write_text("hello readme")
-    task = net_app_small_ctx.manager.create(
-        "docs", "long task", kind=TaskKind.DOCUMENTATION
-    )
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
     scripted_fills([500])
     scripted.steps = [
         tool_response("read_file", {"path": "README.md"}, "c1"),

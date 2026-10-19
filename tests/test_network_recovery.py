@@ -45,7 +45,7 @@ def scripted(monkeypatch) -> ScriptedState:
 
 def build_doc_agent(root: Path):
     config = Config(project_root=root, model="mock-model", api_key="sk-test")
-    return agent_mod.build_agent(config, kind=TaskKind.DOCUMENTATION, root=root)
+    return agent_mod.build_agent(config, kind=TaskKind.RESEARCH, root=root)
 
 
 async def _run(

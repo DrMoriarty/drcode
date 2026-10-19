@@ -1,7 +1,7 @@
 # drcode
 
 Console AI coding agent (pydantic-ai + textual), inspired by opencode.
-The center is not a chat session, but a **task** (feature request, bug report, or documentation question):
+The center is not a chat session, but a **task** (feature request, bug report, or research question):
 
 - one task is *active* at a time — work on it looks like a dialog that starts with the task description;
 - while the agent works, you can create new tasks and put them in a **queue**;
@@ -66,7 +66,7 @@ Without `DRCODE_MODEL` / `DRCODE_API_KEY` the TUI starts fine, but every message
 
 Tasks flow through a pipeline, mirrored by the sidebar: QUEUE → NEEDS CLARIFICATION → ACTIVE → TESTING → COMPLETED, plus ON HOLD.
 
-- **Kinds** — every task is a `feature` (F), `bug` (B) or `documentation` (D). Each kind has a dedicated system prompt: feature tasks are encouraged to refactor and restructure, bug tasks must keep changes minimal, documentation tasks answer questions or update docs.
+- **Kinds** — every task is a `feature` (F), `bug` (B) or `research` (R). Each kind has a dedicated system prompt: feature tasks are encouraged to refactor and restructure, bug tasks must keep changes minimal, research tasks answer questions or update docs.
 - **Auto-completion** — when the agent finishes a run with nothing pending, the task moves on by itself (as if you pressed done). Documentation tasks skip testing and complete right away.
 - **Tester agent** — after every completed task a separate QA agent verifies the project: it detects available linters/tests/build commands, runs them, and labels the task ✅ passed or ❌ failed (only the tester can complete a task after testing). On success, in a git repository, it stages the changes and commits them with a message paraphrasing the original task. On failure it creates a **bug report task** at the head of the queue. Failed tester runs are retried automatically with capped exponential backoff.
 - **Pipeline gate** — while any task is awaiting verification, no new development starts: testing always has priority over the queue.
@@ -95,7 +95,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 - Model connection status, checked every 30 s; recovery from an outage un-blocks the tasks whose runs died with it.
 - Copy on select: selecting text in the chat copies it to the clipboard (with a toast; `pbcopy` fallback on macOS).
 - Multi-line chat input (Enter sends, Shift/Alt+Enter inserts a newline) that grows with the draft; the new-task form (Tab toggles the type, Ctrl+Enter creates).
-- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled documentation task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" / "Nudge stalled agent after" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit" (default — the tester verifies and commits the verified changes), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed).
+- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled research task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" / "Nudge stalled agent after" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit" (default — the tester verifies and commits the verified changes), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed).
 - Chat history is one chronological timeline: agent messages, tester rounds behind a "testing" separator, and service events (failures, skips, permission violations) with timestamps. None of the service lines ever reach the model context.
 
 ## Keys

@@ -81,7 +81,7 @@ def test_status_and_kind_values() -> None:
     assert TaskStatus.AWAITING_CLARIFICATION.value == "clarification"
     assert TaskKind.BUG.value == "bug"
     assert TaskKind.FEATURE.value == "feature"
-    assert TaskKind.DOCUMENTATION.value == "documentation"
+    assert TaskKind.RESEARCH.value == "research"
 
 
 def test_verification_labels() -> None:

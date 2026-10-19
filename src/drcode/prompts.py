@@ -28,7 +28,7 @@ def load_compaction_prompts() -> tuple[str, str]:
 
 
 def load_init_repo_prompt(project_root: Path) -> str:
-    """Prompt for the "Update/create AGENTS.md" documentation task.
+    """Prompt for the "Update/create AGENTS.md" research task.
 
     The bundled template ends with a paragraph that names the repository
     location; the `{project_path}` placeholder is replaced with the actual

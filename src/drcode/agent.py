@@ -78,8 +78,8 @@ paused awaiting the user's answer: end your turn immediately and do not call any
 more tools.\
 """
 
-DOCUMENTATION_SYSTEM_PROMPT = """\
-You are drcode, a documentation assistant working directly in the user's repository.
+RESEARCH_SYSTEM_PROMPT = """\
+You are drcode, a research assistant working directly in the user's repository.
 Your task is to answer the user's questions by studying the source code and the
 project's documentation, or to update the documentation in accordance with the
 user's assignment. All tools are available to you: read and search the codebase,
@@ -230,15 +230,15 @@ def build_agent(
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
-    new classes, documentation tasks answer questions / update docs. The
-    documentation agent additionally gets the task-creation tools (bug reports
-    and feature requests). When the project root contains AGENTS.md, its
-    content is appended to the instructions."""
+    new classes, research tasks answer questions / update docs. The research
+    agent additionally gets the task-creation tools (bug reports and feature
+    requests). When the project root contains AGENTS.md, its content is
+    appended to the instructions."""
     model = build_model(config)
     base_prompt = {
         TaskKind.BUG: BUG_SYSTEM_PROMPT,
         TaskKind.FEATURE: FEATURE_SYSTEM_PROMPT,
-        TaskKind.DOCUMENTATION: DOCUMENTATION_SYSTEM_PROMPT,
+        TaskKind.RESEARCH: RESEARCH_SYSTEM_PROMPT,
     }[kind]
     instructions = base_prompt
     if root is not None:
@@ -312,13 +312,13 @@ def build_agent(
         rm/mv/cp are only allowed with paths inside the project root or /tmp."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command)
 
-    # Task-creation tools exist only for the documentation agent: coding
+    # Task-creation tools exist only for the research agent: coding
     # agents (feature/bug) work on their own task and must not spawn more;
-    # the documentation agent can file bug reports and feature requests on
+    # the research agent can file bug reports and feature requests on
     # the user's behalf. Placement follows the ordinary queue rules via
     # TaskManager.create (bugs join the head of the bug block, everything
     # else the tail of the queue).
-    if kind is TaskKind.DOCUMENTATION:
+    if kind is TaskKind.RESEARCH:
 
         @agent.tool
         def create_bug_report(
@@ -1003,8 +1003,8 @@ def extract_display(
 __all__ = [
     "BUG_SYSTEM_PROMPT",
     "COMPACTION_SUMMARY_PREFIX",
-    "DOCUMENTATION_SYSTEM_PROMPT",
     "FEATURE_SYSTEM_PROMPT",
+    "RESEARCH_SYSTEM_PROMPT",
     "AgentDeps",
     "ModelRequest",
     "ModelResponse",

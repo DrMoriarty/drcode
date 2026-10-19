@@ -85,7 +85,7 @@ async def test_new_task_form_kind_switch_and_cancel(app: DrCodeApp) -> None:
         assert app.new_task_kind is TaskKind.BUG
 
         await pilot.press("tab")
-        assert app.new_task_kind is TaskKind.DOCUMENTATION
+        assert app.new_task_kind is TaskKind.RESEARCH
 
         # esc cancels the form without creating anything.
         await pilot.press("escape")
@@ -211,8 +211,8 @@ async def test_action_done_task_sends_to_testing(app: DrCodeApp) -> None:
         assert task.status is TaskStatus.TESTING
 
 
-async def test_action_done_task_documentation_completes(app: DrCodeApp) -> None:
-    task = app.manager.create("docs", "prompt", kind=TaskKind.DOCUMENTATION)
+async def test_action_done_task_research_completes(app: DrCodeApp) -> None:
+    task = app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.action_done_task()
@@ -246,9 +246,9 @@ async def test_action_cycle_task_kind(app: DrCodeApp) -> None:
         await pilot.pause()
         app.action_cycle_task_kind()  # feature → bug
         assert task.kind is TaskKind.BUG
-        app.action_cycle_task_kind()  # bug → documentation
-        assert task.kind is TaskKind.DOCUMENTATION
-        app.action_cycle_task_kind()  # documentation → feature
+        app.action_cycle_task_kind()  # bug → research
+        assert task.kind is TaskKind.RESEARCH
+        app.action_cycle_task_kind()  # research → feature
         assert task.kind is TaskKind.FEATURE
 
 

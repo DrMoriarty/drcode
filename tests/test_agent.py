@@ -454,15 +454,15 @@ def _instructions_text(ag) -> str:
 def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
     from drcode.agent import (
         BUG_SYSTEM_PROMPT,
-        DOCUMENTATION_SYSTEM_PROMPT,
         FEATURE_SYSTEM_PROMPT,
+        RESEARCH_SYSTEM_PROMPT,
         build_agent,
     )
 
     for kind, prompt in (
         (TaskKind.FEATURE, FEATURE_SYSTEM_PROMPT),
         (TaskKind.BUG, BUG_SYSTEM_PROMPT),
-        (TaskKind.DOCUMENTATION, DOCUMENTATION_SYSTEM_PROMPT),
+        (TaskKind.RESEARCH, RESEARCH_SYSTEM_PROMPT),
     ):
         ag = build_agent(fake_config, kind=kind)
         assert prompt in _instructions_text(ag)
@@ -522,11 +522,11 @@ def test_build_tester_agent_has_tester_tools(fake_config: Config) -> None:
 def test_system_prompts_distinct() -> None:
     from drcode.agent import (
         BUG_SYSTEM_PROMPT,
-        DOCUMENTATION_SYSTEM_PROMPT,
         FEATURE_SYSTEM_PROMPT,
+        RESEARCH_SYSTEM_PROMPT,
     )
 
-    prompts = {BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT, DOCUMENTATION_SYSTEM_PROMPT}
+    prompts = {BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT, RESEARCH_SYSTEM_PROMPT}
     assert len(prompts) == 3
     assert "fixing a BUG" in BUG_SYSTEM_PROMPT
     assert "implementing a FEATURE" in FEATURE_SYSTEM_PROMPT

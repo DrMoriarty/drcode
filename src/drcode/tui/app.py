@@ -745,7 +745,7 @@ class ServiceCommandsProvider(Provider):
         return [
             (
                 "Update/create AGENTS.md",
-                "documentation task: agent creates or refreshes AGENTS.md",
+                "research task: agent creates or refreshes AGENTS.md",
                 app.action_update_agents_md,
             ),
         ]
@@ -1049,7 +1049,7 @@ class DrCodeApp(App[None]):
     }
     #nt-kind-label.kind-feature { color: $success; }
     #nt-kind-label.kind-bug { color: $error; }
-    #nt-kind-label.kind-documentation { color: yellow; }
+    #nt-kind-label.kind-research { color: yellow; }
     #nt-hint { width: auto; color: $text-disabled; }
     """
     BINDINGS: ClassVar = [
@@ -1601,7 +1601,7 @@ class DrCodeApp(App[None]):
                 }.get(t.status.value, "⏳")
                 kind_letter = {
                     TaskKind.BUG: "[red]B[/]",
-                    TaskKind.DOCUMENTATION: "[yellow]D[/]",
+                    TaskKind.RESEARCH: "[yellow]R[/]",
                 }.get(t.kind, "[green]F[/]")
                 if t.verification is VerificationStatus.PASSED:
                     suffix = " ✅"
@@ -2276,7 +2276,7 @@ class DrCodeApp(App[None]):
         created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
         kind = {
             TaskKind.BUG: "[bold red]bug[/]",
-            TaskKind.DOCUMENTATION: "[bold yellow]documentation[/]",
+            TaskKind.RESEARCH: "[bold yellow]research[/]",
         }.get(task.kind, "[bold green]feature[/]")
         status_colors = {
             TaskStatus.QUEUED: "yellow",
@@ -3219,7 +3219,7 @@ class DrCodeApp(App[None]):
         self.chat_input.focus()
 
     # Tab cycles the new-task type through all three kinds.
-    _KIND_CYCLE: ClassVar = (TaskKind.FEATURE, TaskKind.BUG, TaskKind.DOCUMENTATION)
+    _KIND_CYCLE: ClassVar = (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH)
 
     def toggle_new_task_kind(self) -> None:
         idx = self._KIND_CYCLE.index(self.new_task_kind)
@@ -3228,13 +3228,13 @@ class DrCodeApp(App[None]):
 
     def _update_kind_label(self) -> None:
         label = self.query_one("#nt-kind-label", Static)
-        label.remove_class("kind-feature", "kind-bug", "kind-documentation")
+        label.remove_class("kind-feature", "kind-bug", "kind-research")
         if self.new_task_kind is TaskKind.BUG:
             label.update("type: bug")
             label.add_class("kind-bug")
-        elif self.new_task_kind is TaskKind.DOCUMENTATION:
-            label.update("type: documentation")
-            label.add_class("kind-documentation")
+        elif self.new_task_kind is TaskKind.RESEARCH:
+            label.update("type: research")
+            label.add_class("kind-research")
         else:
             label.update("type: feature")
             label.add_class("kind-feature")
@@ -3313,7 +3313,7 @@ class DrCodeApp(App[None]):
         self._nudge_run(task)
 
     def action_cycle_task_kind(self) -> None:
-        """Cycle the type of the viewed task (feature → bug → documentation).
+        """Cycle the type of the viewed task (feature → bug → research).
         Only a queued (not yet started) task can be re-typed; bug moves it
         to the head of the queue, feature — to the tail."""
         task = self.viewed
@@ -3514,16 +3514,16 @@ class DrCodeApp(App[None]):
         )
 
     def action_update_agents_md(self) -> None:
-        """Create a documentation task that writes/refreshes AGENTS.md.
+        """Create a research task that writes/refreshes AGENTS.md.
 
         The task is pre-filled with the bundled init-repo prompt (its final
         paragraph names the actual project directory) and runs with the
-        `documentation` kind: the tester is skipped and mark_done() completes
+        `research` kind: the tester is skipped and mark_done() completes
         it right away."""
         task = self.manager.create(
             "Update/create AGENTS.md",
             load_init_repo_prompt(self.project_root),
-            kind=TaskKind.DOCUMENTATION,
+            kind=TaskKind.RESEARCH,
         )
         self.refresh_sidebar()
         self.view_task(task.id)

@@ -34,9 +34,9 @@ class TaskStatus(str, enum.Enum):
 class TaskKind(str, enum.Enum):
     BUG = "bug"
     FEATURE = "feature"
-    # Documentation: agent studies code/docs to answer questions or update
-    # docs; never goes through the tester — mark_done() completes it.
-    DOCUMENTATION = "documentation"
+    # Research: agent studies code/docs to answer questions or update docs;
+    # never goes through the tester — mark_done() completes it.
+    RESEARCH = "research"
 
 
 class VerificationStatus(str, enum.Enum):
@@ -94,7 +94,7 @@ class Task(BaseModel):
     # User messages typed while the task is queued/not yet processed,
     # stamped with the moment they were typed (see PendingInput).
     pending_input: list[PendingInput] = Field(default_factory=list)
-    # When the task reached COMPLETED (tester verdict, documentation done or
+    # When the task reached COMPLETED (tester verdict, research done or
     # user cancel). Drives the startup auto-cleanup of old completed tasks
     # (see ProjectSettings.completed_retention); None while not completed.
     completed_at: datetime | None = None
@@ -120,12 +120,18 @@ class Task(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_legacy_pending_input(cls, data: Any) -> Any:
-        """Accept pre-timestamp tasks whose pending_input was list[str]:
-        wrap plain strings into PendingInput, all stamped with the same
-        wall-clock anchor (updated_at, i.e. the last queued comment) so the
-        stable timeline sort keeps their original relative order."""
+    def _migrate_legacy_fields(cls, data: Any) -> Any:
+        """Migrate legacy task files:
+        - pending_input was list[str]: wrap plain strings into PendingInput,
+          all stamped with the same wall-clock anchor (updated_at, i.e. the
+          last queued comment) so the stable timeline sort keeps their
+          original relative order.
+        - kind "documentation" was renamed to "research" (same behaviour:
+          no tester, mark_done() completes the task); remap the stored
+          value so old task files load instead of failing validation."""
         if isinstance(data, dict):
+            if data.get("kind") == "documentation":
+                data["kind"] = "research"
             pending = data.get("pending_input")
             if isinstance(pending, list) and any(
                 isinstance(item, str) for item in pending

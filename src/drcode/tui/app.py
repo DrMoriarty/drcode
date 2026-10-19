@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from functools import partial
 from operator import attrgetter
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
@@ -2409,7 +2409,11 @@ class DrCodeApp(App[None]):
         task.tester_messages[-1] = serialize_messages(messages)
         self.manager.storage.save(task)
 
-    def _compaction_due(self, task: Task) -> int | None:
+    def _fill_over_threshold(
+        self,
+        live_tokens: int | None,
+        messages: list[dict[str, Any]],
+    ) -> int | None:
         """Context fill (tokens) when the compaction threshold is reached
         (percent of max_context_tokens), None otherwise. Prefers the live
         reading of the running turn over the persisted transcript, whose
@@ -2418,12 +2422,18 @@ class DrCodeApp(App[None]):
         if max_tokens <= 0:
             return None
         threshold = min(max(self.config.compaction_threshold, 1), 100)
-        tokens = self._live_ctx_tokens.get(task.id)
+        tokens = live_tokens
         if tokens is None:
-            tokens = last_context_tokens(task.messages)
+            tokens = last_context_tokens(messages)
         if not tokens or tokens * 100 < threshold * max_tokens:
             return None
         return tokens
+
+    def _compaction_due(self, task: Task) -> int | None:
+        """Compaction threshold check for the main agent transcript."""
+        return self._fill_over_threshold(
+            self._live_ctx_tokens.get(task.id), task.messages
+        )
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -2480,6 +2490,73 @@ class DrCodeApp(App[None]):
         )
         if self.viewed_id == task.id:
             self.view_task(task.id)
+
+    async def _maybe_compact_tester_round(
+        self, task: Task, live_tokens: int | None
+    ) -> bool:
+        """Compaction gate for the current testing round, called after
+        run_tester paused the round at a tool boundary.
+
+        Mirrors _maybe_compact for the tester, with one crucial difference:
+        the summarizer rewrites the ROUND transcript
+        (`task.tester_messages[-1]`) in place — `task.messages` (the
+        developer transcript) is never touched, the two histories must not
+        mix (tester rounds are persisted separately precisely so they never
+        leak into the coding agent's model history).
+
+        Returns True when the round was compacted: run_tester must resume
+        it as a continuation turn from the compacted transcript (and drop
+        the stale live token reading). Returns False when compaction was
+        not possible — the threshold is not reached, there is nothing to
+        summarize (a no-op), or the summarizer failed — in which case the
+        round is resumed uncompressed and the caller adds the task to
+        `_compaction_failed`, so the mid-round gate stays off (a
+        persistently broken summarizer must not loop pause→resume
+        forever); turn-boundary compaction of the main agent still retries
+        on later turns.
+        """
+        round_messages = task.tester_messages[-1] if task.tester_messages else []
+        tokens = self._fill_over_threshold(live_tokens, round_messages)
+        if tokens is None:
+            return False
+        pct = round(tokens * 100 / self.config.max_context_tokens)
+        _, rest = split_original_prompts(round_messages)
+        if not any(not is_summary_message(m) for m in rest):
+            # Nothing to summarize (only the original prompt(s), possibly
+            # plus a previous summary): compacting again would be a no-op —
+            # resuming the round as-is would hit the gate again.
+            self._compaction_failed.add(task.id)
+            return False
+        self._show_event(
+            task,
+            f"Context fill {pct}% — compacting the testing round…",
+        )
+        try:
+            agent = build_compaction_agent(self.config)
+            prompt = build_compaction_prompt(
+                extract_previous_summary(round_messages),
+                render_history_for_summary(round_messages),
+                load_compaction_prompts()[1],
+            )
+            result = await agent.run(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the round
+            self._compaction_failed.add(task.id)
+            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+            return False
+        self._compaction_failed.discard(task.id)
+        task.tester_messages[-1] = compacted_messages(round_messages, result.output)
+        task.touch()
+        self.manager.storage.save(task)
+        self._show_event(
+            task,
+            "Context compacted: testing round summarized, original "
+            "prompt kept verbatim.",
+        )
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        return True
 
     @work(exclusive=True, group="agent")
     async def run_agent(self, task_id: str) -> None:
@@ -3092,58 +3169,138 @@ class DrCodeApp(App[None]):
                 original = first_user_prompt(task.messages)
                 if original and original != task.title:
                     prompt += f"\n\nOriginal task:\n{original}"
-                async with tester.iter(
-                    prompt,
-                    deps=deps,
-                    usage_limits=UsageLimits(request_limit=self.config.request_limit),
-                ) as run:
-                    async for node in run:
-                        if Agent.is_call_tools_node(node):
-                            async with node.stream(run.ctx) as stream:
-                                async for event in stream:
-                                    if isinstance(event, FunctionToolCallEvent):
-                                        self._touch_activity(event.part.tool_name)
-                                    elif isinstance(event, FunctionToolResultEvent):
-                                        # Result stops the spinner even when
-                                        # the task is off-screen.
-                                        self._tool_call_finished(
-                                            event.part.tool_call_id
-                                        )
-                                        self._touch_activity(done=True)
-                                    if self.viewed_id == task_id and isinstance(
-                                        event, FunctionToolCallEvent
-                                    ):
-                                        args = event.part.args
-                                        args_str = (
-                                            args
-                                            if isinstance(args, str)
-                                            else json.dumps(
-                                                args or {}, ensure_ascii=False
+                # Round continuation loop: a testing round is a single
+                # `tester.iter()` run, but it can make many model requests
+                # (each `read_file`/`run_bash` result grows the context).
+                # When the fill crosses the compaction threshold at a tool
+                # boundary, the run is stopped, the ROUND transcript is
+                # compacted in place (task.messages is never touched) and
+                # the round resumes as a continuation turn from the
+                # compacted transcript — otherwise a pathological tool
+                # result could blow the model window before the tester
+                # ever calls set_verification, looping the round in
+                # fruitless retries.
+                text: str | None = prompt
+                # Live context reading of the current round; the shared
+                # _live_ctx_tokens map belongs to the agent transcript and
+                # must not be polluted with the tester's.
+                live_tokens: int | None = None
+                while True:
+                    # Reset per attempt: if tester.iter() raises before the
+                    # `as run` binding, the except handlers must not
+                    # re-persist the PREVIOUS attempt's transcript over the
+                    # (possibly compacted) round.
+                    run = None
+                    history: list[Any] | None = None
+                    if text is None:
+                        # Continuation of a paused round: resume from the
+                        # stored round transcript (compacted, or — when the
+                        # summarizer failed — the original one with its
+                        # invalid tail trimmed).
+                        history = resumable_history(task.tester_messages[-1])
+                    paused = False
+                    async with tester.iter(
+                        text,
+                        message_history=history,
+                        deps=deps,
+                        usage_limits=UsageLimits(
+                            request_limit=self.config.request_limit
+                        ),
+                    ) as run:  # noqa: F811 - rebinding per attempt is intended
+                        async for node in run:
+                            if Agent.is_model_request_node(node):
+                                # Drain the stream (nothing to render — the
+                                # answer comes from the end-of-round
+                                # re-render) and take the round's freshest
+                                # context reading once the request is final.
+                                async with node.stream(run.ctx) as stream:
+                                    async for _event in stream:
+                                        pass
+                                live_tokens = run_context_tokens(run)
+                            elif Agent.is_call_tools_node(node):
+                                async with node.stream(run.ctx) as stream:
+                                    async for event in stream:
+                                        if isinstance(event, FunctionToolCallEvent):
+                                            self._touch_activity(event.part.tool_name)
+                                        elif isinstance(event, FunctionToolResultEvent):
+                                            # Result stops the spinner even when
+                                            # the task is off-screen.
+                                            self._tool_call_finished(
+                                                event.part.tool_call_id
                                             )
-                                        )
-                                        call_text = (
-                                            f"tester: {event.part.tool_name}"
-                                            f"({args_str})"
-                                        )
-                                        block = ToolCallBlock(call_text)
-                                        self._tool_call_started(
-                                            run_key,
-                                            task_id,
-                                            event.part.tool_call_id,
-                                            call_text,
-                                            block,
-                                        )
-                                        block.start_spinner()
-                                        self._write_chat(block)
-                        # Keep the stored history current while the test
-                        # runs: switching to the task mid-test shows the
-                        # tester's work done so far.
-                        self._persist_tester_messages(task, run)
-                if run.result is not None and self.viewed_id == task_id:
-                    # Re-render from the persisted transcript: the streamed
-                    # tool-call blocks above are replaced by the full history
-                    # view (separator + reasoning + tool calls + answer).
-                    self.view_task(task_id)
+                                            self._touch_activity(done=True)
+                                        if self.viewed_id == task_id and isinstance(
+                                            event, FunctionToolCallEvent
+                                        ):
+                                            args = event.part.args
+                                            args_str = (
+                                                args
+                                                if isinstance(args, str)
+                                                else json.dumps(
+                                                    args or {}, ensure_ascii=False
+                                                )
+                                            )
+                                            call_text = (
+                                                f"tester: {event.part.tool_name}"
+                                                f"({args_str})"
+                                            )
+                                            block = ToolCallBlock(call_text)
+                                            self._tool_call_started(
+                                                run_key,
+                                                task_id,
+                                                event.part.tool_call_id,
+                                                call_text,
+                                                block,
+                                            )
+                                            block.start_spinner()
+                                            self._write_chat(block)
+                                # Mid-round compaction gate: a tool boundary
+                                # is the only safe stopping point (same as
+                                # the agent's mid-run gate). Skipped when a
+                                # previous compaction attempt failed, or a
+                                # persistently broken summarizer would loop
+                                # pause→resume forever.
+                                tokens = self._fill_over_threshold(
+                                    live_tokens, task.tester_messages[-1]
+                                )
+                                if tokens is not None and (
+                                    task.id not in self._compaction_failed
+                                ):
+                                    pct = round(
+                                        tokens * 100 / self.config.max_context_tokens
+                                    )
+                                    self._show_event(
+                                        task,
+                                        f"Context fill {pct}% — pausing the "
+                                        "tester round to compact history…",
+                                    )
+                                    self._persist_tester_messages(task, run)
+                                    paused = True
+                                    break
+                            # Keep the stored history current while the test
+                            # runs: switching to the task mid-test shows the
+                            # tester's work done so far.
+                            self._persist_tester_messages(task, run)
+                    if paused:
+                        if await self._maybe_compact_tester_round(task, live_tokens):
+                            # The round transcript was replaced by the
+                            # original prompt plus the summary: the live
+                            # token reading belongs to the old transcript —
+                            # drop it so the counter falls back to the
+                            # compacted one (mirrors _maybe_compact).
+                            live_tokens = None
+                        # Either way (compacted, or the summarizer failed
+                        # and the gate is now disabled for this task) the
+                        # round resumes as a continuation turn: no new
+                        # text, history from the round transcript.
+                        text = None
+                        continue
+                    if run.result is not None and self.viewed_id == task_id:
+                        # Re-render from the persisted transcript: the streamed
+                        # tool-call blocks above are replaced by the full history
+                        # view (separator + reasoning + tool calls + answer).
+                        self.view_task(task_id)
+                    break
             except asyncio.CancelledError:
                 # Aborted (or superseded): keep whatever the tester did so
                 # far, then re-raise so the worker teardown stays clean.

@@ -527,6 +527,158 @@ async def test_no_mid_run_pause_below_threshold(
     assert not task.unfinished
 
 
+# -- tester round context compaction --------------------------------------------------------
+
+
+async def test_tester_round_compaction_replaces_round_transcript(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """A testing round whose fill crosses the threshold mid-round is paused
+    at the tool boundary, compacted and resumed as a continuation turn —
+    the round still reaches set_verification instead of looping in
+    context-overflow retries."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted_fills([100, 900])
+    scripted.steps = [
+        text_response("work done"),  # development run
+        # Tester request 1 reports 900 of 1000 — past the threshold:
+        # the round must pause after this tool round.
+        tool_response("read_file", {"path": "README.md"}),
+        text_response("THE SUMMARY BODY"),  # compaction summarizer
+        tool_response("set_verification", {"success": True}),  # continuation
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.tester_running
+            ),
+            pilot,
+            what="tester round completed after mid-round compaction",
+        )
+
+    texts = event_texts(task)
+    assert any(
+        t.startswith("Context fill 90% — pausing the tester round") for t in texts
+    )
+    assert any("Context compacted: testing round summarized" in t for t in texts)
+    assert task.verification is VerificationStatus.PASSED
+    # Five model round-trips: development, tester request, summarizer,
+    # continuation (set_verification), final summary. The summarizer saw
+    # the rendered ROUND transcript, the continuation started from the
+    # summary (plus the original verify prompt).
+    assert len(scripted.calls) == 5
+    # The summarizer's transcript is the paused round: prompt, tool call,
+    # (the just-executed round's result is uncommitted at the pause point —
+    # same price the agent's mid-run gate pays) and nothing else.
+    assert "[tool call] read_file" in scripted.calls[2]
+    assert scripted.calls[2].count("[user]") == 1
+    assert "[context summary]" in scripted.calls[3]
+    assert "THE SUMMARY BODY" in scripted.calls[3]
+    # The round transcript was replaced in place: original verify prompt
+    # verbatim + the summary (merged by pydantic-ai into one request).
+    final_round = task.tester_messages[-1]
+    prompts = [
+        p["content"]
+        for m in final_round
+        for p in m["parts"]
+        if p["part_kind"] == "user-prompt"
+    ]
+    assert prompts[0].startswith("Verify completed task #")
+    assert any("[context summary]" in c and "THE SUMMARY BODY" in c for c in prompts)
+
+
+async def test_tester_round_compaction_failure_is_not_fatal(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """A failing summarizer must not kill the round: it resumes
+    uncompressed as a continuation turn, the gate stays off for the task
+    (no pause→resume loop) and the verification still lands."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted_fills([100, 900])
+    scripted.steps = [
+        text_response("work done"),
+        tool_response("read_file", {"path": "README.md"}),  # fill 900 → pause
+        api_error("Connection error."),  # compaction summarizer dies
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.tester_running
+            ),
+            pilot,
+            what="tester round completed despite failing compaction",
+        )
+
+    texts = event_texts(task)
+    assert len([t for t in texts if t.startswith("compaction failed")]) == 1
+    assert len([t for t in texts if "pausing the tester round" in t]) == 1
+    assert not any("Context compacted" in t for t in texts)
+    assert task.verification is VerificationStatus.PASSED
+    # The round went through uncompressed: no summary message anywhere.
+    assert not any(is_summary_message(m) for m in task.messages)
+    assert not any(is_summary_message(m) for rnd in task.tester_messages for m in rnd)
+    assert len(scripted.calls) == 5
+
+
+async def test_tester_round_compaction_never_touches_agent_transcript(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """Compacting the testing round must leave task.messages — the coding
+    agent's transcript — byte-for-byte intact (the two histories never
+    mix)."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted_fills([100, 900])
+    scripted.steps = [
+        text_response("work done"),
+        tool_response("read_file", {"path": "README.md"}),
+        text_response("THE SUMMARY BODY"),
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.tester_running
+            ),
+            pilot,
+            what="tester round completed after mid-round compaction",
+        )
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    # The agent transcript is exactly the development exchange (original
+    # prompt + answer): no summary request, no tester tool calls leaked in.
+    assert [m["kind"] for m in task.messages] == ["request", "response"]
+    texts = [p["content"] for m in task.messages for p in m["parts"] if "content" in p]
+    assert any(c == "implement x" for c in texts)
+    assert any(c == "work done" for c in texts)
+    assert not any("[context summary]" in c or "read_file" in c for c in texts)
+    assert not any(is_summary_message(m) for m in task.messages)
+
+
 # -- connection probe (_check_model) ------------------------------------------------------
 
 

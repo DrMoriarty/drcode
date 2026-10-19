@@ -2327,8 +2327,8 @@ class DrCodeApp(App[None]):
         if max_tokens > 0:
             pct = round(tokens * 100 / max_tokens)
             text = (
-                f"🧠 {self._fmt_ctx_tokens(tokens)} / "
-                f"{self._fmt_ctx_tokens(max_tokens)} · {pct}%"
+                f"🧠 {self._fmt_ctx_tokens(tokens)}/"
+                f"{self._fmt_ctx_tokens(max_tokens)}·{pct}%"
             )
             # Red from the compaction threshold, yellow when the remaining
             # headroom is twice the red-zone headroom: threshold 80 →

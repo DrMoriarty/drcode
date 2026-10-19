@@ -1134,6 +1134,10 @@ class DrCodeApp(App[None]):
         # surfaced as a red "error ›" line and killed the first streamed run
         # after a startup resume).
         self._new_task_mode = False
+        # Task that was open in the chat when the new-task form was entered;
+        # cancel (ESC) restores its view (action_new_task() clears
+        # viewed_id, but the chat log keeps showing the previous task).
+        self._new_task_prev_id: str | None = None
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
@@ -3198,6 +3202,7 @@ class DrCodeApp(App[None]):
         self._new_task_mode = True
         # The form is not tied to any task: drop the viewed highlight so the
         # sidebar doesn't single out a task while the user composes a new one.
+        self._new_task_prev_id = self.viewed_id
         self.viewed_id = None
         self.refresh_sidebar()
         # The streaming preview belongs to the chat view, not the form: a
@@ -3222,6 +3227,16 @@ class DrCodeApp(App[None]):
 
     def cancel_new_task(self) -> None:
         self._leave_new_task_mode()
+        # The chat log still shows the task that was open before the form:
+        # restore its view so the status bar matches the visible content
+        # (action_new_task() cleared viewed_id, leaving the bar empty).
+        if self.viewed_id is None:
+            prev = self._new_task_prev_id
+            task = self.manager.tasks.get(prev) if prev else None
+            if task is None:
+                task = self._sidebar_top_task()
+            if task is not None:
+                self.view_task(task.id)
         self.chat_input.focus()
 
     # Tab cycles the new-task type through all three kinds.

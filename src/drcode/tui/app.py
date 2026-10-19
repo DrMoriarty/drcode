@@ -19,7 +19,7 @@ from typing import Any, ClassVar, cast
 
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -147,13 +147,35 @@ _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_INTERVAL = 0.12
 
-# Rate-limit (HTTP 429) handling for agent runs: a rate-limited run is
-# retried in place (the task stays ACTIVE) after a backoff delay, at most
-# RATE_LIMIT_RETRIES times — only when the budget is exhausted does the
-# run fall back to the ordinary failure path (requeue + session exclusion).
-RATE_LIMIT_RETRIES = 5
+# Transient network-failure handling for every agent's model calls (coding
+# agent and tester alike): a run that dies with a transport error
+# (ModelAPIError — connection refused, timeout, DNS failure) or HTTP 429
+# rate limiting is retried in place (the task keeps its status) after a
+# backoff delay, at most NETWORK_RETRIES times — only when the budget is
+# exhausted does the run fall back to the ordinary failure path (requeue +
+# session exclusion). The retry budget resets after any successful model
+# call (see the per-request counter resets in run_agent/run_tester).
+NETWORK_RETRIES = 5
 # Backoff: 5s doubling per failure, capped here (5, 10, 20, 40, 60).
-RATE_LIMIT_DELAY_MAX = 60.0
+NETWORK_DELAY_MAX = 60.0
+
+
+def _is_retryable_network_error(e: BaseException) -> bool:
+    """Transient network failures the in-place retry branch handles:
+    transport-level errors (any plain ModelAPIError: connection refused,
+    timeouts, DNS failures) and HTTP 429 rate limiting. ModelHTTPError
+    subclasses ModelAPIError, so the HTTP branch is checked first — every
+    other HTTP status (400/401/500/…) is not a network error and falls
+    through to the generic failure path."""
+    if isinstance(e, ModelHTTPError):
+        return e.status_code == 429
+    return isinstance(e, ModelAPIError)
+
+
+def _network_retry_delay(attempt: int) -> float:
+    """Backoff before retry `attempt` (1-based): 5s doubling, capped."""
+    return min(5 * 2 ** (attempt - 1), NETWORK_DELAY_MAX)
+
 
 # How many chat blocks one step of the batched history drain mounts before
 # yielding to the event loop (see _flush_chat_batch). ~1-2ms per block means
@@ -1272,29 +1294,31 @@ class DrCodeApp(App[None]):
         # block the whole pipeline, so they must eventually get their round.
         self._tester_fail_count: dict[str, int] = {}
         self._tester_retry_at: dict[str, float] = {}
-        # Rate-limit (HTTP 429) bookkeeping for tester runs (mirrors the
-        # agent's dicts below): a rate-limited testing round is retried in
-        # place — the round transcript is kept and the retry resumes it as
-        # a continuation turn — instead of restarting the round from
-        # scratch. `_tester_429_resume` marks tasks whose next tester run
-        # must continue the current round rather than start a new one.
-        self._tester_429_count: dict[str, int] = {}
-        self._tester_429_resume: set[str] = set()
+        # Network-retry bookkeeping for tester runs (mirrors the agent's
+        # dicts below): a testing round killed by a transient network error
+        # is retried in place — the round transcript is kept and the retry
+        # resumes it as a continuation turn — instead of restarting the
+        # round from scratch. `_tester_resume_round` marks tasks whose next
+        # tester run must continue the current round rather than start a
+        # new one.
+        self._tester_net_count: dict[str, int] = {}
+        self._tester_resume_round: set[str] = set()
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
         # dead gateway) doesn't loop the whole queue through the error.
         self._agent_failed: set[str] = set()
-        # Rate-limit (HTTP 429) bookkeeping for agent runs, per task:
-        # consecutive 429 failures this session (retry budget) and the
+        # Network-retry bookkeeping for agent runs, per task: consecutive
+        # transient network failures this session (retry budget) and the
         # earliest monotonic time the delayed re-run fires at. Unlike a
-        # generic failure (immediate requeue), a rate-limited run keeps
+        # generic failure (immediate requeue), a network-retried run keeps
         # the task ACTIVE and is retried after a backoff delay.
-        self._agent_429_count: dict[str, int] = {}
-        self._agent_429_retry_at: dict[str, float] = {}
-        # Total 429 backoffs this session (the per-task dict above holds
-        # only the current retry budgets); shown in the expanded header.
-        self._agent_429_total = 0
+        self._agent_net_count: dict[str, int] = {}
+        self._agent_net_retry_at: dict[str, float] = {}
+        # Total network-retry backoffs this session (the per-task dict above
+        # holds only the current retry budgets); shown in the expanded
+        # header.
+        self._net_retries_total = 0
         # Session statistics for the expanded header (never persisted):
         # tasks present at startup don't count as "created this session",
         # tasks already COMPLETED at startup don't count as "processed".
@@ -2054,7 +2078,7 @@ class DrCodeApp(App[None]):
     def _header_conn_text(self) -> str:
         """The expanded header's connection line: the connection label
         (dot + model, error detail on failures), URL, last probe
-        round-trip, consecutive probe failures and 429 retry counters."""
+        round-trip, consecutive probe failures and network retry counters."""
         if not self.config.is_ready:
             return "model not configured"
         url = self.config.base_url
@@ -2064,10 +2088,10 @@ class DrCodeApp(App[None]):
             else "probe —"
         )
         fails = f"probe fails: {self._probe_fail_streak}"
-        open_429 = sum(self._agent_429_count.values())
-        retries = f"429: {self._agent_429_total} total"
-        if open_429:
-            retries += f" / {open_429} active"
+        open_net = sum(self._agent_net_count.values())
+        retries = f"net retries: {self._net_retries_total} total"
+        if open_net:
+            retries += f" / {open_net} active"
         return f"{self._conn_label} · {url} · {probe} · {fails} · {retries}"
 
     def _header_stats_text(self) -> str:
@@ -2148,16 +2172,15 @@ class DrCodeApp(App[None]):
         if not (self.agent_running or self.tester_running):
             active = self.manager.active
             if active is not None:
-                # Rate-limited run waiting for its delayed retry: the task
+                # Network-retried run waiting for its delayed retry: the task
                 # is fine, the re-run timer just has not fired yet.
-                retry_at = self._agent_429_retry_at.get(active.id)
+                retry_at = self._agent_net_retry_at.get(active.id)
                 if retry_at is not None and retry_at > time.monotonic():
                     left = max(1, int(retry_at - time.monotonic()))
-                    attempt = self._agent_429_count.get(active.id, 0)
+                    attempt = self._agent_net_count.get(active.id, 0)
                     self._render_activity(
-                        "⏳ agent: 429 retry",
-                        f"#{active.id} attempt {attempt}/{RATE_LIMIT_RETRIES}"
-                        f" in {left}s",
+                        "⏳ agent: network retry",
+                        f"#{active.id} attempt {attempt}/{NETWORK_RETRIES} in {left}s",
                     )
                     return
                 # Task claims to be active but no worker owns it (e.g. the
@@ -2975,7 +2998,7 @@ class DrCodeApp(App[None]):
                 return
             self.agent_running = True
             self._agent_failed.discard(task_id)
-            self._agent_429_retry_at.pop(task_id, None)
+            self._agent_net_retry_at.pop(task_id, None)
             self._current_tool = None
             self._tps_samples.clear()
             self._touch_activity()
@@ -3232,13 +3255,13 @@ class DrCodeApp(App[None]):
                                     self._live_ctx_tokens[task_id] = ctx_tokens
                                     if self.viewed_id == task_id:
                                         self.refresh_task_status()
-                                # A model call went through: the rate-limit
-                                # retry budget for this task starts over, so
-                                # the NEXT 429 counts from one again — even
-                                # mid-run, where a single turn makes many
-                                # model requests.
-                                self._agent_429_count.pop(task_id, None)
-                                self._agent_429_retry_at.pop(task_id, None)
+                                # A model call went through: the network-retry
+                                # budget for this task starts over, so the
+                                # NEXT network error counts from one again —
+                                # even mid-run, where a single turn makes
+                                # many model requests.
+                                self._agent_net_count.pop(task_id, None)
+                                self._agent_net_retry_at.pop(task_id, None)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
@@ -3342,10 +3365,10 @@ class DrCodeApp(App[None]):
                         self.view_task(task_id)
                         view_dirty = False
                         synced_epoch = self._chat_epoch
-                    # The turn went through: the rate-limit retry budget for
+                    # The turn went through: the network-retry budget for
                     # this task starts over.
-                    self._agent_429_count.pop(task_id, None)
-                    self._agent_429_retry_at.pop(task_id, None)
+                    self._agent_net_count.pop(task_id, None)
+                    self._agent_net_retry_at.pop(task_id, None)
                 except asyncio.CancelledError:
                     # Interrupted (abort, nudge, or a newer run taking over).
                     # The consumed prompt is NOT re-queued — it stays in the
@@ -3380,24 +3403,25 @@ class DrCodeApp(App[None]):
                     self._drop_stream_preview(generation)
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
-                    # HTTP 429 (rate limit) is transient: instead of
-                    # requeueing the task right away, retry the run in place
-                    # after a backoff delay (5s doubling up to 60s), at most
-                    # RATE_LIMIT_RETRIES times. Only when the budget is
-                    # exhausted does the ordinary failure path below apply.
+                    # A transient network error (transport failure like a
+                    # connection refused/timeout, or HTTP 429 rate limiting)
+                    # is transient: instead of requeueing the task right
+                    # away, retry the run in place after a backoff delay
+                    # (5s doubling up to 60s), at most NETWORK_RETRIES times.
+                    # Only when the budget is exhausted does the ordinary
+                    # failure path below apply.
                     if (
-                        isinstance(e, ModelHTTPError)
-                        and e.status_code == 429
-                        and self._agent_429_count.get(task_id, 0) < RATE_LIMIT_RETRIES
+                        _is_retryable_network_error(e)
+                        and self._agent_net_count.get(task_id, 0) < NETWORK_RETRIES
                     ):
-                        attempt = self._agent_429_count.get(task_id, 0) + 1
-                        self._agent_429_count[task_id] = attempt
-                        self._agent_429_total += 1
-                        delay = min(5 * 2 ** (attempt - 1), RATE_LIMIT_DELAY_MAX)
+                        attempt = self._agent_net_count.get(task_id, 0) + 1
+                        self._agent_net_count[task_id] = attempt
+                        self._net_retries_total += 1
+                        delay = _network_retry_delay(attempt)
                         self._show_event(
                             task,
-                            f"HTTP 429 (rate limited): retry {attempt}/"
-                            f"{RATE_LIMIT_RETRIES} in {int(delay)} s",
+                            f"Network error ({type(e).__name__}): retry {attempt}/"
+                            f"{NETWORK_RETRIES} in {int(delay)} s",
                         )
                         if generation == self._agent_generation:
                             self._drop_stream_preview(generation)
@@ -3422,7 +3446,7 @@ class DrCodeApp(App[None]):
                             # The request is recorded in the transcript: the
                             # retry resumes the attempt without new text.
                             task.unfinished = True
-                        self._agent_429_retry_at[task_id] = time.monotonic() + delay
+                        self._agent_net_retry_at[task_id] = time.monotonic() + delay
                         # The task stays ACTIVE — no requeue, no pipeline
                         # advance; the delayed re-run below picks it up.
                         self.manager.storage.save(task)
@@ -3527,14 +3551,15 @@ class DrCodeApp(App[None]):
         self._tester_generation += 1
         run_key: tuple[str, int] = ("tester", self._tester_generation)
         task = self.manager.get(task_id)
-        # A 429 retry continues the current testing round in place instead
-        # of starting a new one (the flag is set by the 429 handler below).
+        # A network-retry continues the current testing round in place
+        # instead of starting a new one (the flag is set by the network
+        # handler below).
         # Ignored when the task left TESTING in the meantime: the round
         # would test stale state.
-        resume_round = task_id in self._tester_429_resume and (
+        resume_round = task_id in self._tester_resume_round and (
             task.status is TaskStatus.TESTING
         )
-        self._tester_429_resume.discard(task_id)
+        self._tester_resume_round.discard(task_id)
         # Initialized before the try: build_tester_agent() itself may raise,
         # and the handlers below reference `run`.
         run: AgentRun[TesterDeps, str] | None = None
@@ -3599,7 +3624,7 @@ class DrCodeApp(App[None]):
                 # A resumed round continues from the persisted round
                 # transcript (no new prompt — the while-loop below builds
                 # the continuation history from it); an empty round (the
-                # rate-limited request was never recorded) re-sends the
+                # failed request was never recorded) re-sends the
                 # prompt as usual.
                 text: str | None = (
                     None
@@ -3648,11 +3673,12 @@ class DrCodeApp(App[None]):
                                     async for _event in stream:
                                         self._touch_activity()
                                 live_tokens = run_context_tokens(run)
-                                # A model call went through: the 429 retry
+                                # A model call went through: the network-retry
                                 # budget for this testing round starts over,
-                                # so the NEXT 429 counts from one again
-                                # (mirrors the agent's per-request reset).
-                                self._tester_429_count.pop(task_id, None)
+                                # so the NEXT network error counts from one
+                                # again (mirrors the agent's per-request
+                                # reset).
+                                self._tester_net_count.pop(task_id, None)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
@@ -3751,34 +3777,35 @@ class DrCodeApp(App[None]):
                     self.view_task(task_id)
                 raise
             except Exception as e:  # noqa: BLE001 - show tester errors in the chat
-                # HTTP 429 (rate limit) is transient: instead of restarting
-                # the whole testing round, retry it in place (the task stays
-                # TESTING, the round transcript is kept and the retry
-                # resumes it as a continuation turn) after a backoff delay,
-                # at most RATE_LIMIT_RETRIES times — only when the budget is
-                # exhausted does the ordinary failure path below apply
-                # (mirrors run_agent's 429 handling).
+                # A transient network error (transport failure like a
+                # connection refused/timeout, or HTTP 429 rate limiting)
+                # is transient: instead of restarting the whole testing
+                # round, retry it in place (the task stays TESTING, the
+                # round transcript is kept and the retry resumes it as a
+                # continuation turn) after a backoff delay, at most
+                # NETWORK_RETRIES times — only when the budget is exhausted
+                # does the ordinary failure path below apply (mirrors
+                # run_agent's network handling).
                 if (
-                    isinstance(e, ModelHTTPError)
-                    and e.status_code == 429
-                    and self._tester_429_count.get(task_id, 0) < RATE_LIMIT_RETRIES
+                    _is_retryable_network_error(e)
+                    and self._tester_net_count.get(task_id, 0) < NETWORK_RETRIES
                 ):
-                    attempt = self._tester_429_count.get(task_id, 0) + 1
-                    self._tester_429_count[task_id] = attempt
-                    self._agent_429_total += 1
-                    delay = min(5 * 2 ** (attempt - 1), RATE_LIMIT_DELAY_MAX)
+                    attempt = self._tester_net_count.get(task_id, 0) + 1
+                    self._tester_net_count[task_id] = attempt
+                    self._net_retries_total += 1
+                    delay = _network_retry_delay(attempt)
                     self._show_event(
                         task,
-                        f"HTTP 429 (rate limited): tester retry {attempt}/"
-                        f"{RATE_LIMIT_RETRIES} in {int(delay)} s",
+                        f"Network error ({type(e).__name__}): tester retry "
+                        f"{attempt}/{NETWORK_RETRIES} in {int(delay)} s",
                     )
                     self._persist_tester_messages(task, run)
-                    self._tester_429_resume.add(task_id)
+                    self._tester_resume_round.add(task_id)
                     self._tester_retry_at[task_id] = time.monotonic() + delay
                     self.set_timer(delay, self._advance)
                     return
                 self._persist_tester_messages(task, run)
-                self._tester_429_resume.discard(task_id)
+                self._tester_resume_round.discard(task_id)
                 self._tester_fail_count[task_id] = (
                     self._tester_fail_count.get(task_id, 0) + 1
                 )
@@ -3794,10 +3821,10 @@ class DrCodeApp(App[None]):
             self.refresh_sidebar()
             if task.status is TaskStatus.COMPLETED:
                 # Success: give the next testing round of this task a fresh
-                # backoff and 429 budget.
+                # backoff and network-retry budget.
                 self._tester_fail_count.pop(task_id, None)
-                self._tester_429_count.pop(task_id, None)
-                self._tester_429_resume.discard(task_id)
+                self._tester_net_count.pop(task_id, None)
+                self._tester_resume_round.discard(task_id)
                 self._tester_retry_at.pop(task_id, None)
             # A cancelled run (user abort, or a newer tester taking over)
             # must not restart the pipeline.
@@ -3957,7 +3984,7 @@ class DrCodeApp(App[None]):
             self.tester_running = False
             self._current_tool = None
         self.manager.cancel(task.id)
-        self._tester_429_resume.discard(task.id)
+        self._tester_resume_round.discard(task.id)
         self._show_event(
             task,
             "Задача отменена пользователем — снята с конвейера без тестирования.",

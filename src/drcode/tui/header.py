@@ -65,7 +65,7 @@ class HeaderTallInfo(Static):
 
 class HeaderConnInfo(HeaderTallInfo):
     """Expanded-header top line: connection URL, model, probe latency and
-    error counters (consecutive probe failures, 429 retries)."""
+    error counters (consecutive probe failures, network retries)."""
 
     DEFAULT_CSS = """
     HeaderConnInfo {

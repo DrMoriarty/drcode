@@ -167,9 +167,9 @@ async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
         )
 
     texts = event_texts(task)
-    retries = [t for t in texts if t.startswith("HTTP 429")]
+    retries = [t for t in texts if t.startswith("Network error (ModelHTTPError)")]
     assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
-    # Backoff schedule 5s doubling, capped at 60 (RATE_LIMIT_RETRIES = 5).
+    # Backoff schedule 5s doubling, capped at 60 (NETWORK_RETRIES = 5).
     assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0]
     # The last failure fell through to the generic failure path.
     assert any(t.startswith("ModelHTTPError") for t in texts)
@@ -184,21 +184,28 @@ async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
 # -- agent run: connection outage -------------------------------------------------------
 
 
-async def test_connection_outage_demotes_task_and_recovery_resumes_it(
-    net_app: DrCodeApp, scripted: ScriptedState
+async def test_connection_outage_retried_then_demoted_and_recovery_resumes_it(
+    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
 ) -> None:
     task = net_app.manager.create("docs", "write the docs", kind=TaskKind.RESEARCH)
-    scripted.steps = [api_error("Connection error.")]
+    # 5 in-place retries within the budget, then one more connection error
+    # that exhausts it.
+    scripted.steps = [api_error("Connection error.") for _ in range(6)]
 
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
             lambda: task.status is TaskStatus.QUEUED and task.unfinished,
             pilot,
-            what="task demoted after connection failure",
+            what="task demoted after connection-retry budget exhausted",
         )
         assert task.id in net_app._agent_failed
-        assert any(t.startswith("ModelAPIError") for t in event_texts(task))
+        texts = event_texts(task)
+        retries = [t for t in texts if t.startswith("Network error (ModelAPIError)")]
+        assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
+        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0]
+        # The last failure fell through to the generic failure path.
+        assert any(t.startswith("ModelAPIError") for t in texts)
         # The consumed prompt lives in the sanitized transcript.
         assert len(task.messages) == 1
         assert ends_with_open_request(task.messages)
@@ -217,35 +224,39 @@ async def test_connection_outage_demotes_task_and_recovery_resumes_it(
     assert [
         text for _, role, text in extract_display(task.messages) if role == "user"
     ] == ["write the docs"]
-    assert scripted.calls == ["write the docs", "write the docs"]
+    # Six failed attempts (each resumed without re-sending text) plus the
+    # successful recovery call.
+    assert scripted.calls == ["write the docs"] * 7
 
 
 # -- tester run: network failure -------------------------------------------------------
 
 
 async def test_tester_network_failure_retried_then_verification_passes(
-    net_app: DrCodeApp, scripted: ScriptedState
+    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
 ) -> None:
     task = net_app.manager.create("feature", "implement x", kind=TaskKind.FEATURE)
     scripted.steps = [
         text_response("work done"),  # development run
         api_error("Connection error."),  # tester round 1 dies
-        tool_response("set_verification", {"success": True}),  # round 2
+        tool_response("set_verification", {"success": True}),  # resumed round
         text_response("all checks passed"),
     ]
 
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
-            lambda: any("tester failed" in t for t in event_texts(task)),
+            lambda: any("tester retry" in t for t in event_texts(task)),
             pilot,
-            what="tester failure logged",
+            what="tester network retry logged",
         )
         assert task.status is TaskStatus.TESTING
-        assert net_app._tester_fail_count[task.id] == 1
+        # The round is retried in place (like 429), not via the generic
+        # failure backoff.
+        assert task.id not in net_app._tester_fail_count
 
-        # Fast-forward the backoff window once the failed attempt has fully
-        # wound down, and let the pipeline retry.
+        # Fast-forward the retry window (the timer itself was recorded, not
+        # slept) and let the pipeline resume the round.
         net_app._tester_retry_at[task.id] = time.monotonic() - 1
         net_app._advance()
         await wait_until(
@@ -263,8 +274,15 @@ async def test_tester_network_failure_retried_then_verification_passes(
         )
 
     assert task.verification is VerificationStatus.PASSED
-    # Two testing rounds persisted (the failed one included).
-    assert len(task.tester_messages) == 2
+    # The failed round was resumed in place — one testing round total.
+    assert len(task.tester_messages) == 1
+    retries = [
+        t
+        for t in event_texts(task)
+        if t.startswith("Network error (ModelAPIError): tester retry")
+    ]
+    assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True]
+    assert instant_timers == [5.0]
     assert task.id not in net_app._tester_fail_count
     assert task.id not in net_app._tester_retry_at
 

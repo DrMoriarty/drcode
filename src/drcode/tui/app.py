@@ -2115,7 +2115,9 @@ class DrCodeApp(App[None]):
     def _header_conn_text(self) -> str:
         """The expanded header's connection line: the connection label
         (dot + model, error detail on failures), URL, last probe
-        round-trip, consecutive probe failures and network retry counters."""
+        round-trip, consecutive probe failures, network retry counters
+        and the exact cumulative token usage of every model call of the
+        session."""
         if not self.config.is_ready:
             return "model not configured"
         url = self.config.base_url
@@ -2129,34 +2131,34 @@ class DrCodeApp(App[None]):
         retries = f"net retries: {self._net_retries_total} total"
         if open_net:
             retries += f" / {open_net} active"
-        return f"{self._conn_label} · {url} · {probe} · {fails} · {retries}"
+        line = f"{self._conn_label} | {url} | {probe} | {fails} | {retries}"
+        usage = self._header_usage_text()
+        if usage:
+            line += f" | {usage}"
+        return line
 
     def _header_stats_text(self) -> str:
         """The expanded header's session-statistics line: tasks completed
-        this session, average/median activation→completion time, the
+        this session, average/median activation→completion time and the
         bugs:features ratio of the tasks created this session (research
         tasks are excluded from the ratio: they are neither bug fixes nor
-        implemented features) and the exact cumulative token usage of
-        every model call of the session."""
+        implemented features)."""
         durations = self._session_durations
         if durations:
             avg = statistics.fmean(durations)
             median = statistics.median(durations)
             times = (
-                f"avg {self._fmt_duration(avg)} · median {self._fmt_duration(median)}"
+                f"avg {self._fmt_duration(avg)} | median {self._fmt_duration(median)}"
             )
         else:
-            times = "avg — · median —"
+            times = "avg — | median —"
         bugs = self._session_created[TaskKind.BUG]
         features = self._session_created[TaskKind.FEATURE]
         line = (
-            f"tasks done: {self._session_completed} · {times} · "
+            f"tasks done: {self._session_completed} | {times} | "
             f"bugs:features {bugs}:{features}"
         )
-        usage = self._header_usage_text()
-        if usage:
-            line += f" · {usage}"
-        return f"{line} · {self._header_github_text()}"
+        return f"{line} | {self._header_github_text()}"
 
     def _header_github_text(self) -> str:
         """GitHub-integration status for the expanded header's bottom line:
@@ -2169,13 +2171,13 @@ class DrCodeApp(App[None]):
         if not settings.github_enabled:
             return "GitHub: configured, off"
         if self._github_syncing:
-            status = "GitHub: on · syncing…"
+            status = "GitHub: on | syncing…"
         else:
             last = self._github_state.last_sync
             stamp = last.astimezone().strftime("%d.%m.%Y %H:%M") if last else "never"
-            status = f"GitHub: on · last sync {stamp}"
+            status = f"GitHub: on | last sync {stamp}"
         if self._github_last_error:
-            status += f" · error: {self._github_last_error}"
+            status += f" | error: {self._github_last_error}"
         return status
 
     @staticmethod
@@ -2220,7 +2222,7 @@ class DrCodeApp(App[None]):
             )
         if u.output_tokens:
             parts.append(f"out {self._fmt_tokens(u.output_tokens)}")
-        return " · ".join(parts)
+        return " | ".join(parts)
 
     def _render_header_tall(self) -> None:
         """Refresh the two expanded-header lines (no-op while collapsed:

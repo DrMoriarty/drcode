@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import partial
 from operator import attrgetter
@@ -36,7 +36,12 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
 from textual import events, work
-from textual.app import App, ComposeResult, get_system_commands_provider
+from textual.app import (
+    App,
+    ComposeResult,
+    SystemCommand,
+    get_system_commands_provider,
+)
 from textual.binding import Binding
 from textual.command import (
     CommandInput,
@@ -52,6 +57,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.css.styles import RulesMap
 from textual.geometry import Size
+from textual.screen import Screen
 from textual.strip import Strip
 from textual.timer import Timer
 from textual.widget import Widget
@@ -979,6 +985,16 @@ class DrCodeApp(App[None]):
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
     }
+
+    # Drop the built-in "Maximize the focused widget" system command from the
+    # Settings palette: maximizing a single widget is of no use here (and the
+    # paired "Minimize" command never appears anyway, since nothing can get
+    # maximized without it).
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        for command in super().get_system_commands(screen):
+            if command.title == "Maximize":
+                continue
+            yield command
 
     CSS = """
     Screen { layers: base toast; }

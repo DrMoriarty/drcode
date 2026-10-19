@@ -1269,6 +1269,11 @@ class DrCodeApp(App[None]):
         self._github_state_store = GitHubSyncStateStore(project_root)
         self._github_state: GitHubSyncState = self._github_state_store.load()
         self._github_next_sync = time.monotonic() + 15.0
+        # Expanded-header bookkeeping: whether a sync cycle is in flight
+        # right now and the last cycle's failure reason (None = the last
+        # cycle either succeeded or has not run yet).
+        self._github_syncing = False
+        self._github_last_error: str | None = None
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
@@ -2113,8 +2118,28 @@ class DrCodeApp(App[None]):
         features = self._session_created[TaskKind.FEATURE]
         return (
             f"tasks done: {self._session_completed} · {times} · "
-            f"bugs:features {bugs}:{features}"
+            f"bugs:features {bugs}:{features} · {self._header_github_text()}"
         )
+
+    def _header_github_text(self) -> str:
+        """GitHub-integration status for the expanded header's bottom line:
+        configured/not configured (token + repository set), active (the
+        sync switch is on) and the date/time of the last successful sync
+        (or the failure reason of the last attempt)."""
+        settings = self.settings
+        if not (settings.github_token and settings.github_repo):
+            return "GitHub: not configured"
+        if not settings.github_enabled:
+            return "GitHub: configured, off"
+        if self._github_syncing:
+            status = "GitHub: on · syncing…"
+        else:
+            last = self._github_state.last_sync
+            stamp = last.astimezone().strftime("%d.%m.%Y %H:%M") if last else "never"
+            status = f"GitHub: on · last sync {stamp}"
+        if self._github_last_error:
+            status += f" · error: {self._github_last_error}"
+        return status
 
     def _render_header_tall(self) -> None:
         """Refresh the two expanded-header lines (no-op while collapsed:
@@ -4285,29 +4310,35 @@ class DrCodeApp(App[None]):
 
     async def _github_sync(self) -> None:
         client = GitHubClient(self.settings.github_token, self.settings.github_repo)
+        self._github_syncing = True
         try:
-            imported, skipped = await sync_issues(
-                self.manager, client, self._github_state
-            )
-        except GitHubError as e:
-            self.notify(
-                f"GitHub sync failed: {e}",
-                title="GitHub integration",
-                severity="warning",
-                timeout=8,
-            )
-            return
-        self._github_state_store.save(self._github_state)
-        if imported or skipped:
-            self.notify(
-                f"GitHub sync: {imported} new task(s) imported, {skipped} skipped",
-                title="GitHub integration",
-                timeout=6,
-            )
-            if imported:
-                self.refresh_sidebar()
-                # New tasks enter the pipeline (testing backlog first).
-                self._advance()
+            try:
+                imported, skipped = await sync_issues(
+                    self.manager, client, self._github_state
+                )
+            except GitHubError as e:
+                self._github_last_error = str(e)
+                self.notify(
+                    f"GitHub sync failed: {e}",
+                    title="GitHub integration",
+                    severity="warning",
+                    timeout=8,
+                )
+                return
+            self._github_last_error = None
+            self._github_state_store.save(self._github_state)
+            if imported or skipped:
+                self.notify(
+                    f"GitHub sync: {imported} new task(s) imported, {skipped} skipped",
+                    title="GitHub integration",
+                    timeout=6,
+                )
+                if imported:
+                    self.refresh_sidebar()
+                    # New tasks enter the pipeline (testing backlog first).
+                    self._advance()
+        finally:
+            self._github_syncing = False
 
     def action_update_agents_md(self) -> None:
         """Create a research task that writes/refreshes AGENTS.md.

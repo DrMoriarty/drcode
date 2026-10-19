@@ -8,6 +8,10 @@ The center is not a chat session, but a **task** (feature request, bug report, o
 - when the active task is marked done, the next queued task starts **automatically**;
 - you can browse completed tasks and write into one — it re-enters the queue (or becomes active immediately if nothing is running).
 
+## Appearance
+
+![drcode TUI](screenshot.png)
+
 ## Install & run
 
 From source (development):

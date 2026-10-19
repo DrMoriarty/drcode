@@ -960,9 +960,11 @@ class DrCodeApp(App[None]):
     #sidebar { height: 1fr; border: none; }
     # Sidebar bottom: project-info then activity-status, plain flow (no
     # dock) so they always stack in compose order under the list.
+    # project-info is the directory line plus one blank line; the activity
+    # line (agent status left, app name+version right) and the detail line
+    # below it are rendered by _render_activity().
     #project-info { height: auto; padding: 0 1; text-align: right; }
     #project-info .project-dir { color: $text-muted; }
-    #project-info .app-title { color: $accent; text-style: bold; }
     # Connection status lives in the header (see tui/header.py), docked
     # left between the icon and the title; the ok/warn/error classes are
     # set by _check_model().
@@ -971,7 +973,7 @@ class DrCodeApp(App[None]):
     #model-status.warn { color: $warning; }
     #model-status.error { color: $error; }
     #activity-status {
-        height: auto; padding: 0 1; margin-top: 1;
+        height: auto; padding: 0 1;
         color: $text-disabled;
     }
     #activity-status.fresh { color: $success; }
@@ -1505,13 +1507,12 @@ class DrCodeApp(App[None]):
 
     def refresh_project_info(self) -> None:
         """Top of the sidebar, above the model status: working directory
-        with the git branch (`~/pr/drcode:main`), then name and version."""
+        with the git branch (`~/pr/drcode:main`), then a blank line. The
+        app name/version moved onto the activity-status line below."""
         branch = self._git_branch()
         dir_text = escape(self._display_dir())
         where = f"{dir_text}:{branch}" if branch else dir_text
-        self.project_info.update(
-            f"[dim]{where}[/]\n[bold]DrCode[/] [dim]{APP_VERSION}[/]"
-        )
+        self.project_info.update(f"[dim]{where}[/]\n")
 
     def _sidebar_fingerprint(self) -> tuple:
         """Lightweight snapshot of everything the sidebar renders: status,
@@ -1781,7 +1782,9 @@ class DrCodeApp(App[None]):
         or has gone silent (hung model request, long tool, deadlock)."""
         try:
             self._render_model_status()
-            label = self.activity_status
+            # Touch the widget so the teardown race (the 1s timer ticking
+            # while the app is being dismantled) raises NoMatches here.
+            _ = self.activity_status
         except NoMatches:
             # Teardown race: the 1s timer can tick while the app is being
             # dismantled and its status widgets are already gone.
@@ -1795,24 +1798,23 @@ class DrCodeApp(App[None]):
                 if retry_at is not None and retry_at > time.monotonic():
                     left = max(1, int(retry_at - time.monotonic()))
                     attempt = self._agent_429_count.get(active.id, 0)
-                    label.remove_class("fresh", "stale")
-                    label.update(
-                        f"⏳ #{active.id} 429 retry {attempt}/"
-                        f"{RATE_LIMIT_RETRIES} in {left}s"
+                    self._render_activity(
+                        "⏳ agent: 429 retry",
+                        f"#{active.id} attempt {attempt}/{RATE_LIMIT_RETRIES}"
+                        f" in {left}s",
                     )
                     return
                 # Task claims to be active but no worker owns it (e.g. the
                 # user aborted the run, or an older build stranded it):
                 # surface the inconsistency instead of showing a fake idle.
-                label.remove_class("fresh")
-                label.add_class("stale")
-                label.update(
-                    f"⚠ #{active.id} active, nothing running — "
-                    "send a message or ctrl+r to (re)start"
+                self._render_activity(
+                    "⚠ agent: idle",
+                    f"#{active.id} active, nothing running — "
+                    "send a message or ctrl+r to (re)start",
+                    "stale",
                 )
                 return
-            label.remove_class("fresh", "stale")
-            label.update("○ idle")
+            self._render_activity("○ idle", "")
             return
         who = "agent" if self.agent_running else "tester"
         age = int(time.monotonic() - self._last_activity)
@@ -1821,23 +1823,37 @@ class DrCodeApp(App[None]):
         else:
             detail = f"last event {self._fmt_age(age)} ago"
         if age < 30:
-            label.remove_class("stale")
-            label.add_class("fresh")
-            label.update(f"▶ {who}: working · {detail}")
+            self._render_activity(f"▶ {who}: working", detail, "fresh")
         else:
-            label.remove_class("fresh")
-            label.add_class("stale")
             limit = self.settings.stall_nudge.minutes
             if limit is not None:
                 left = max(1, limit * 60 - age)
-                label.update(
-                    f"⚠ {who}: stalled · {detail} · auto-nudge in "
-                    f"{self._fmt_age(int(left))}"
-                )
+                detail += f" · auto-nudge in {self._fmt_age(int(left))}"
             else:
-                label.update(
-                    f"⚠ {who}: stalled · {detail} (esc to stop, ctrl+r to nudge)"
-                )
+                detail += " (esc to stop, ctrl+r to nudge)"
+            self._render_activity(f"⚠ {who}: stalled", detail, "stale")
+
+    def _render_activity(
+        self, status: str, detail: str, state: str | None = None
+    ) -> None:
+        """Sidebar bottom: agent/tester status on the left of one line, the
+        app name and version on the right; the live detail (current tool,
+        retry countdown, …) sits on the line below with no blank line in
+        between. `state` ("fresh"/"stale"/None) picks the status color.
+        """
+        label = self.activity_status
+        label.remove_class("fresh", "stale")
+        if state is not None:
+            label.add_class(state)
+        version = f"DrCode {APP_VERSION}"
+        # Content width (the widget's padding is already excluded); falls
+        # back to the composed sidebar width minus padding.
+        width = label.container_size.width or 34
+        pad = max(1, width - cell_len(status) - cell_len(version))
+        label.update(
+            f"{status}{' ' * pad}[bold $accent]DrCode[/] [dim]{APP_VERSION}[/]\n"
+            f"{detail}"
+        )
 
     # -- stall watchdog ---------------------------------------------------------
 

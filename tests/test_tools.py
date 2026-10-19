@@ -233,8 +233,27 @@ def test_grep_search_finds_lines(project_root: Path) -> None:
 def test_grep_search_include_filter(project_root: Path) -> None:
     (project_root / "a.py").write_text("needle\n")
     (project_root / "b.txt").write_text("needle\n")
-    results = grep_search(project_root, "needle", include=r"\.py$")
-    assert results == ["a.py:1: needle"]
+    (project_root / "sub").mkdir()
+    (project_root / "sub" / "c.py").write_text("needle\n")
+    # `include` is a glob mask over the project-relative path.
+    assert grep_search(project_root, "needle", include="*.py") == [
+        "a.py:1: needle",
+        "sub/c.py:1: needle",
+    ]
+    assert grep_search(project_root, "needle", include="src/**/*.py") == []
+
+
+def test_grep_search_include_nested_glob(project_root: Path) -> None:
+    (project_root / "a.txt").write_text("needle\n")
+    (project_root / "src").mkdir()
+    (project_root / "src" / "b.py").write_text("needle\n")
+    (project_root / "src" / "deep").mkdir()
+    (project_root / "src" / "deep" / "c.py").write_text("needle\n")
+    results = grep_search(project_root, "needle", include="src/**/*.py")
+    assert results == [
+        "src/b.py:1: needle",
+        "src/deep/c.py:1: needle",
+    ]
 
 
 def test_grep_search_skips_ignored_dirs(project_root: Path) -> None:

@@ -303,7 +303,8 @@ def build_agent(
     async def grep_search(
         ctx: RunContext[AgentDeps], pattern: str, include: str = ""
     ) -> list[str]:
-        """Regex search in file contents. `include` is an optional filename regex filter."""
+        """Regex search in file contents. `include` is an optional glob mask
+        filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool
@@ -476,7 +477,8 @@ def build_tester_agent(
     async def grep_search(
         ctx: RunContext[TesterDeps], pattern: str, include: str = ""
     ) -> list[str]:
-        """Regex search in file contents. `include` is an optional filename regex filter."""
+        """Regex search in file contents. `include` is an optional glob mask
+        filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
     @agent.tool

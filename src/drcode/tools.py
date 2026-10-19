@@ -137,16 +137,44 @@ def glob_files(root: Path, pattern: str) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in matches)[:200]
 
 
+def _include_matcher(glob: str) -> re.Pattern[str]:
+    """Translate a glob mask into a regex over the project-relative posix path.
+
+    `*` matches any characters including directory separators, so '*.py'
+    selects files at any depth; '**/' optionally spans directories, so
+    'src/**/*.py' selects every file under src/ at any depth. A glob cannot
+    produce an invalid regex (metacharacters are escaped), unlike a raw one.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out.append(r"(?:.*/)?")
+            i += 3
+        elif glob[i] == "*":
+            out.append(".*")
+            i += 1
+        elif glob[i] == "?":
+            out.append(".")
+            i += 1
+        else:
+            out.append(re.escape(glob[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
     regex = re.compile(pattern)
-    include_regex = re.compile(include) if include else None
+    include_re = _include_matcher(include) if include else None
     results: list[str] = []
     for dirpath, dirnames, filenames in root.walk():
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for name in filenames:
-            if include_regex and not include_regex.search(name):
-                continue
             f = Path(dirpath) / name
+            # `include` is a glob mask over the project-relative path (models
+            # naturally send "*.py" / "src/**/*.py", not regexes).
+            if include_re and not include_re.match(f.relative_to(root).as_posix()):
+                continue
             try:
                 for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
                     if regex.search(line):

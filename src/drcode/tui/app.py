@@ -359,6 +359,32 @@ class UserBlock(Static):
         super().__init__(Text(text), expand=True)
 
 
+def _header_line_width(widget: Static) -> int:
+    """Usable width of a block's header line (0 before layout → fallback)."""
+    return widget.content_size.width or widget.size.width or 80
+
+
+def _stamp_label(at: datetime | None) -> str:
+    """Right-side header stamp for a block, "" when no time is known."""
+    if at is None:
+        return ""
+    return at.astimezone().strftime("%H:%M:%S")
+
+
+def _append_stamp(header: Text, stamp: str, width: int) -> None:
+    """Push `stamp` to the right edge of a header line `width` cells wide.
+
+    Just enough padding is inserted between the header text and the stamp;
+    when the terminal is too narrow for both, the stamp still renders,
+    separated by the minimum gap (it may wrap/clip, which beats vanishing).
+    """
+    if not stamp:
+        return
+    pad = width - cell_len(header.plain) - len(stamp) - 1
+    header.append(" " * max(pad, 1), "dim")
+    header.append(stamp, "dim italic")
+
+
 class ReasoningBlock(Static):
     """Collapsible model-reasoning block; collapsed by default, click to toggle.
 
@@ -368,8 +394,9 @@ class ReasoningBlock(Static):
     model moved on from thinking to the answer text.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, at: datetime | None = None) -> None:
         super().__init__(classes="reasoning collapsed")
+        self.at = at or datetime.now()
         self._content = ""
         self._streaming = False
         self._flush_timer: Timer | None = None
@@ -439,6 +466,11 @@ class ReasoningBlock(Static):
         self.toggle_class("collapsed")
         self._redraw()
 
+    def on_resize(self) -> None:
+        # The stamp is pushed to the right edge by padding: re-pad on width
+        # changes (terminal resize).
+        self._redraw()
+
     def _redraw(self) -> None:
         # Body is passed as plain Text, never as a markup string: the model's
         # reasoning regularly contains bracket sequences ("[Binding(...") that
@@ -451,6 +483,7 @@ class ReasoningBlock(Static):
             else ""
         )
         text = Text.assemble((f"{arrow} Reasoning{status}", "bold dim"))
+        _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
         if not collapsed:
             text.append("\n")
             if self._content:
@@ -559,10 +592,11 @@ class ToolCallBlock(Static):
     _MAIN_PARAM_KEYS = ("path", "command", "pattern", "question")
     _MAX_ARG_LEN = 60
 
-    def __init__(self, call: str) -> None:
+    def __init__(self, call: str, at: datetime | None = None) -> None:
         super().__init__(classes="tool-call collapsed")
         self._header, self._args = self._split(call)
         self._header += self._primary_arg_suffix(self._args)
+        self.at = at or datetime.now()
         self._spin_timer: Timer | None = None
         self._spin_frame = 0
         self._redraw()
@@ -629,6 +663,11 @@ class ToolCallBlock(Static):
         self.toggle_class("collapsed")
         self._redraw()
 
+    def on_resize(self) -> None:
+        # The stamp is pushed to the right edge by padding: re-pad on width
+        # changes (terminal resize).
+        self._redraw()
+
     def _redraw(self) -> None:
         # Plain Text, not a markup string — tool arguments are model JSON and
         # may contain bracket sequences Textual's markup parser takes for tags.
@@ -637,6 +676,7 @@ class ToolCallBlock(Static):
             _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "⚙"
         )
         text = Text(f"{arrow} {marker} {self._header}")
+        _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
         if not self.has_class("collapsed") and self._args:
             text.append("\n").append(self._args)
         self.update(text)
@@ -2231,8 +2271,10 @@ class DrCodeApp(App[None]):
                 continue
             _add(entry.at, "user-pending", entry.text)
         timeline.sort(key=lambda item: item[:2])
-        for _, _, role, text in timeline:
-            block = self._write_history_line(role, text)
+        for at, _, role, text in timeline:
+            block = self._write_history_line(
+                role, text, None if at == _MIN_TIME else at
+            )
             if role == "tool-call" and isinstance(block, ToolCallBlock):
                 # A tool still executing (run in flight) gets its spinner
                 # back on the freshly rendered block.
@@ -2376,7 +2418,9 @@ class DrCodeApp(App[None]):
             self._chat_batch.clear()
             raise
 
-    def _write_history_line(self, role: str, text: str) -> Widget | None:
+    def _write_history_line(
+        self, role: str, text: str, at: datetime | None = None
+    ) -> Widget | None:
         """Render one history entry into the chat log.
 
         Returns the mounted block widget (None for markup-string lines) so
@@ -2390,10 +2434,10 @@ class DrCodeApp(App[None]):
             self._pending_rendered.append(text)
             block = UserBlock(text)
         elif role == "reasoning":
-            block = ReasoningBlock()
+            block = ReasoningBlock(at)
             block.set_content(text)
         elif role == "tool-call":
-            block = ToolCallBlock(text)
+            block = ToolCallBlock(text, at)
         elif role == "assistant":
             block = AssistantBlock(text)
         elif role == "tool":
@@ -2890,7 +2934,11 @@ class DrCodeApp(App[None]):
                                             ):
                                                 old, reasoning_block = (
                                                     reasoning_block,
-                                                    ReasoningBlock(),
+                                                    ReasoningBlock(
+                                                        reasoning_block.at
+                                                        if reasoning_block
+                                                        else None
+                                                    ),
                                                 )
                                                 reasoning_block.stream_epoch = (
                                                     self._chat_epoch

@@ -72,6 +72,7 @@ Tasks flow through a pipeline, mirrored by the sidebar: QUEUE → NEEDS CLARIFIC
 - **Pipeline gate** — while any task is awaiting verification, no new development starts: testing always has priority over the queue.
 - **Clarifying questions** — the agent can pause a task with a question (optionally with suggested answers rendered as clickable options). An answered task re-enters the pipeline at the head of the queue.
 - **Interrupted work is never lost** — aborting (Esc) or an agent error leaves the partial work in the transcript; the next activation resumes the attempt without re-sending the prompt. A task whose run crashed is demoted to the queue and retried, while a dead gateway can't loop the whole queue through the error.
+- **Stall watchdog** — a run that stops showing any sign of life (no stream deltas, no tool events) is aborted and restarted automatically after the configured stall limit (15/30 min, 1/2 hours, or never; 30 min by default, per project in `.drcode/settings.json`): the agent resumes via a continuation turn, the tester gets a fresh round. The same nudge is available manually with `ctrl+r` on an active or testing task. Every automatic nudge is logged into the task's service events.
 - **Restart-safe** — on startup, stale active tasks are re-queued, and tasks stuck in TESTING are re-tested first, before any queued task is taken into development.
 - **Queue ordering** — bug reports always come first (newest at the head, so tester-created bugs are picked up immediately); answered clarifications follow, then creation order. The kind of a still-queued task can be changed: re-typing to bug moves it to the head, to feature — to the tail.
 - **Hold / delete / cancel** — park a queued task out of the backlog (input keeps accumulating while held, and an unanswered clarification is preserved), delete a held task entirely, or cancel a task: pending input is dropped and it completes immediately, skipping the tester.
@@ -94,7 +95,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 - Model connection status, checked every 30 s; recovery from an outage un-blocks the tasks whose runs died with it.
 - Copy on select: selecting text in the chat copies it to the clipboard (with a toast; `pbcopy` fallback on macOS).
 - Multi-line chat input (Enter sends, Shift/Alt+Enter inserts a newline) that grows with the draft; the new-task form (Tab toggles the type, Ctrl+Enter creates).
-- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled documentation task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit" (default — the tester verifies and commits the verified changes), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed).
+- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled documentation task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" / "Nudge stalled agent after" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit" (default — the tester verifies and commits the verified changes), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed).
 - Chat history is one chronological timeline: agent messages, tester rounds behind a "testing" separator, and service events (failures, skips, permission violations) with timestamps. None of the service lines ever reach the model context.
 
 ## Keys
@@ -113,6 +114,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 | `ctrl+o` | Focus task sidebar (↑/↓ + Enter to switch tasks) |
 | `ctrl+i` | Focus chat input |
 | `escape` | Abort the running agent/tester |
+| `ctrl+r` | Nudge viewed task: abort its hung run and restart it (agent continues, tester re-verifies) |
 | `ctrl+q` | Quit |
 
 ## Storage

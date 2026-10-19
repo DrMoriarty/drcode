@@ -7,9 +7,11 @@ from pathlib import Path
 
 from drcode.settings import (
     RETENTION_OPTIONS,
+    STALL_NUDGE_OPTIONS,
     CompletedRetention,
     ProjectSettings,
     ProjectSettingsStore,
+    StallNudge,
 )
 
 # -- CompletedRetention -------------------------------------------------------
@@ -44,12 +46,50 @@ def test_retention_options_order() -> None:
     )
 
 
+# -- StallNudge ---------------------------------------------------------------
+
+
+def test_stall_nudge_minutes() -> None:
+    assert StallNudge.MIN_15.minutes == 15
+    assert StallNudge.MIN_30.minutes == 30
+    assert StallNudge.HOUR_1.minutes == 60
+    assert StallNudge.HOUR_2.minutes == 120
+    assert StallNudge.NEVER.minutes is None
+
+
+def test_stall_nudge_labels() -> None:
+    assert StallNudge.MIN_15.label == "15 min"
+    assert StallNudge.MIN_30.label == "30 min"
+    assert StallNudge.HOUR_1.label == "1 hour"
+    assert StallNudge.HOUR_2.label == "2 hours"
+    assert StallNudge.NEVER.label == "never"
+
+
+def test_stall_nudge_values_stable() -> None:
+    # Persisted in settings.json — must not change silently.
+    assert StallNudge.MIN_30.value == "30"
+    assert StallNudge.HOUR_1.value == "60"
+    assert StallNudge.NEVER.value == "never"
+
+
+def test_stall_nudge_options_order() -> None:
+    assert STALL_NUDGE_OPTIONS == (
+        StallNudge.MIN_15,
+        StallNudge.MIN_30,
+        StallNudge.HOUR_1,
+        StallNudge.HOUR_2,
+        StallNudge.NEVER,
+    )
+
+
 # -- ProjectSettings ------------------------------------------------------------
 
 
 def test_default_settings() -> None:
     settings = ProjectSettings()
     assert settings.completed_retention is CompletedRetention.DAYS_7
+    # A silent agent gets nudged after half an hour by default.
+    assert settings.stall_nudge is StallNudge.MIN_30
 
 
 def test_store_roundtrip(project_root: Path) -> None:
@@ -88,6 +128,17 @@ def test_store_invalid_enum_returns_defaults(project_root: Path) -> None:
     path.write_text(json.dumps({"completed_retention": "bogus"}))
     store = ProjectSettingsStore(project_root)
     assert store.load() == ProjectSettings()
+
+
+def test_store_stall_nudge_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(stall_nudge=StallNudge.HOUR_2))
+    assert store.load().stall_nudge is StallNudge.HOUR_2
+    # A stale/unknown value must not break the app either.
+    (project_root / ".drcode" / "settings.json").write_text(
+        json.dumps({"stall_nudge": "3"})
+    )
+    assert store.load().stall_nudge is StallNudge.MIN_30
 
 
 def test_store_overwrite(project_root: Path) -> None:

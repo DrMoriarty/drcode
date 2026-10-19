@@ -77,9 +77,51 @@ FINALIZATION_OPTIONS: tuple[TaskFinalization, ...] = (
 )
 
 
+class StallNudge(str, enum.Enum):
+    """How long an agent/tester run may stay without any sign of life
+    (no stream deltas, no tool events) before it is automatically aborted
+    and restarted ("nudged"). A stalled run blocks its task — and via the
+    pipeline gate, often the whole backlog — so the watchdog keeps an
+    overnight run going when the model silently hangs."""
+
+    MIN_15 = "15"
+    MIN_30 = "30"
+    HOUR_1 = "60"
+    HOUR_2 = "120"
+    NEVER = "never"
+
+    @property
+    def minutes(self) -> int | None:
+        """Stall limit in minutes, or None when runs are never nudged."""
+        if self is StallNudge.NEVER:
+            return None
+        return int(self.value)
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is StallNudge.NEVER:
+            return "never"
+        if self is StallNudge.HOUR_1:
+            return "1 hour"
+        if self is StallNudge.HOUR_2:
+            return "2 hours"
+        return f"{self.value} min"
+
+
+STALL_NUDGE_OPTIONS: tuple[StallNudge, ...] = (
+    StallNudge.MIN_15,
+    StallNudge.MIN_30,
+    StallNudge.HOUR_1,
+    StallNudge.HOUR_2,
+    StallNudge.NEVER,
+)
+
+
 class ProjectSettings(BaseModel):
     completed_retention: CompletedRetention = CompletedRetention.DAYS_7
     task_finalization: TaskFinalization = TaskFinalization.TESTING_COMMIT
+    stall_nudge: StallNudge = StallNudge.MIN_30
 
 
 class ProjectSettingsStore:

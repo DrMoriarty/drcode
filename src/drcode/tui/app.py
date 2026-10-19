@@ -104,9 +104,11 @@ from ..prompts import load_compaction_prompts, load_init_repo_prompt
 from ..settings import (
     FINALIZATION_OPTIONS,
     RETENTION_OPTIONS,
+    STALL_NUDGE_OPTIONS,
     CompletedRetention,
     ProjectSettings,
     ProjectSettingsStore,
+    StallNudge,
     TaskFinalization,
 )
 from ..task_manager import TaskManager
@@ -786,6 +788,14 @@ class ProjectSettingsCommandsProvider(Provider):
                 ),
                 app.action_change_task_finalization,
             ),
+            (
+                f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
+                (
+                    "Abort and restart an agent/tester run that has shown no "
+                    "activity for this long (project setting)"
+                ),
+                app.action_change_stall_nudge,
+            ),
         ]
 
     async def discover(self) -> Hits:
@@ -847,6 +857,36 @@ class FinalizationOptionsProvider(Provider):
                 partial(app.action_set_task_finalization, option),
             )
             for option in FINALIZATION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class StallNudgeOptionsProvider(Provider):
+    """Options of the "Nudge stalled agent" setting.
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option to
+    apply it immediately, Escape keeps the current one. The active option is
+    marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.stall_nudge
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_stall_nudge, option),
+            )
+            for option in STALL_NUDGE_OPTIONS
         ]
 
     async def discover(self) -> Hits:
@@ -992,6 +1032,7 @@ class DrCodeApp(App[None]):
         ("ctrl+h", "resume_task", "Resume"),
         ("ctrl+delete", "delete_task", "Delete held"),
         ("escape", "abort_run", "Stop agent"),
+        ("ctrl+r", "nudge_run", "Nudge agent"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -1179,6 +1220,9 @@ class DrCodeApp(App[None]):
         # finally-blocks) where no one calls refresh_sidebar().
         self.set_interval(1.0, self._poll_sidebar)
         self.set_interval(1.0, self._poll_activity)
+        # Stall watchdog: auto-nudge a run that stopped showing signs of
+        # life for the configured period (see _poll_stall).
+        self.set_interval(1.0, self._poll_stall)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is
@@ -1304,6 +1348,14 @@ class DrCodeApp(App[None]):
             return task is not None and task.status is TaskStatus.HOLD
         if action == "abort_run":
             return self.agent_running or self.tester_running
+        if action == "nudge_run":
+            # A nudge makes sense on a task the pipeline is (or was) working
+            # on: abort the hung run and restart it. Also the one-key resume
+            # for "active, nothing running" after a previous abort.
+            return task is not None and task.status in (
+                TaskStatus.ACTIVE,
+                TaskStatus.TESTING,
+            )
         return True
 
     # -- copy on select -------------------------------------------------------
@@ -1706,7 +1758,7 @@ class DrCodeApp(App[None]):
                 label.add_class("stale")
                 label.update(
                     f"⚠ #{active.id} active, nothing running — "
-                    "send a message to (re)start"
+                    "send a message or ctrl+r to (re)start"
                 )
                 return
             label.remove_class("fresh", "stale")
@@ -1725,7 +1777,77 @@ class DrCodeApp(App[None]):
         else:
             label.remove_class("fresh")
             label.add_class("stale")
-            label.update(f"⚠ {who}: stalled? · {detail} (esc to stop)")
+            limit = self.settings.stall_nudge.minutes
+            if limit is not None:
+                left = max(1, limit * 60 - age)
+                label.update(
+                    f"⚠ {who}: stalled · {detail} · auto-nudge in "
+                    f"{self._fmt_age(int(left))}"
+                )
+            else:
+                label.update(
+                    f"⚠ {who}: stalled · {detail} (esc to stop, ctrl+r to nudge)"
+                )
+
+    # -- stall watchdog ---------------------------------------------------------
+
+    # Delay between aborting a nudged run and starting its replacement: the
+    # cancelled worker's handlers (persist + sanitize the transcript) must
+    # finish before the resume run reads the task state.
+    _NUDGE_RESTART_DELAY = 1.0
+
+    def _poll_stall(self) -> None:
+        """Watchdog: when the running agent/tester has emitted nothing (no
+        stream deltas, no tool events) for the configured stall limit, abort
+        the hung run and restart it. A stalled run blocks its own task — and
+        through the pipeline gate, the whole backlog — so this keeps an
+        overnight run going without human intervention."""
+        limit = self.settings.stall_nudge.minutes
+        if limit is None:
+            return
+        if not (self.agent_running or self.tester_running):
+            return
+        stalled_for = time.monotonic() - self._last_activity
+        if stalled_for < limit * 60:
+            return
+        if self.agent_running:
+            task = self.manager.active
+        else:
+            task = (
+                self.manager.get(self._tester_task_id) if self._tester_task_id else None
+            )
+        if task is None:
+            return
+        who = "agent" if self.agent_running else "tester"
+        self._show_event(
+            task,
+            f"{who} stalled for {self._fmt_age(int(stalled_for))} without any "
+            f"activity — aborting and restarting (stall limit: "
+            f"{self.settings.stall_nudge.label})",
+        )
+        self._nudge_run(task)
+
+    def _nudge_run(self, task: Task) -> None:
+        """Abort the hung/stalled run for `task` (if one is in flight) and
+        schedule its restart: the agent resumes via a continuation turn (no
+        text is re-sent — `task.unfinished` marks the interrupted attempt),
+        the tester gets a fresh verification round via the pipeline gate
+        (`_advance` re-tests the still-TESTING task)."""
+        if task.status is TaskStatus.ACTIVE:
+            if self.agent_running:
+                self.workers.cancel_group(self, "agent")
+                self.agent_running = False
+                self._current_tool = None
+                self._clear_stream_label()
+                self.refresh_status()
+            self.set_timer(self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id))
+        elif task.status is TaskStatus.TESTING:
+            if self.tester_running:
+                self.workers.cancel_group(self, "tester")
+                self.tester_running = False
+                self._current_tool = None
+                self.refresh_status()
+            self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
 
     # -- chat pane ---------------------------------------------------------------
 
@@ -2699,8 +2821,8 @@ class DrCodeApp(App[None]):
                     self._agent_429_count.pop(task_id, None)
                     self._agent_429_retry_at.pop(task_id, None)
                 except asyncio.CancelledError:
-                    # Interrupted (abort, or a newer run taking over). The
-                    # consumed prompt is NOT re-queued — it stays in the
+                    # Interrupted (abort, nudge, or a newer run taking over).
+                    # The consumed prompt is NOT re-queued — it stays in the
                     # transcript at its chronological position;
                     # task.unfinished marks the possibly-undone attempt and
                     # the next activation resumes it without re-sending text.
@@ -2713,6 +2835,17 @@ class DrCodeApp(App[None]):
                         # calls without results, the empty interrupted
                         # request) so later messages can append in any order.
                         self._persist_task_messages(task, run)
+                        if run is None and consumed:
+                            # Cancelled before the run context was even
+                            # entered (e.g. during the compaction gate): the
+                            # prompts were popped from pending_input but
+                            # never reached the transcript — put them back,
+                            # or the nudge/abort would silently eat them.
+                            task.pending_input[:0] = consumed
+                            if self.viewed_id == task_id:
+                                for entry in consumed:
+                                    if entry.text not in self._pending_rendered:
+                                        self._pending_rendered.append(entry.text)
                         task.messages = sanitized_messages(task.messages)
                         task.unfinished = True
                         self.manager.storage.save(task)
@@ -3132,6 +3265,16 @@ class DrCodeApp(App[None]):
             self._clear_stream_label()
             self.refresh_status()
 
+    def action_nudge_run(self) -> None:
+        """Ctrl+R on the viewed ACTIVE/TESTING task: abort its hung or
+        stalled run and restart it — the same move the stall watchdog makes
+        automatically, and the one-key resume for a task left "active,
+        nothing running" by a previous abort."""
+        task = self.viewed
+        if task is None:
+            return
+        self._nudge_run(task)
+
     def action_cycle_task_kind(self) -> None:
         """Cycle the type of the viewed task (feature → bug → documentation).
         Only a queued (not yet started) task can be re-typed; bug moves it
@@ -3300,6 +3443,35 @@ class DrCodeApp(App[None]):
             SettingsPalette(
                 id="--finalization-palette",
                 providers=[FinalizationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_stall_nudge(self, nudge: StallNudge) -> None:
+        """Settings command: after how long without any activity a hung
+        agent/tester run is aborted and restarted. Persisted per project
+        (.drcode/settings.json); the watchdog picks the new value up on its
+        next 1-second tick ("never" disables it)."""
+        self.settings.stall_nudge = nudge
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Nudge stalled agent after: {nudge.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_stall_nudge(self) -> None:
+        """Stall-nudge picker, opened from the Settings entry ("Nudge
+        stalled agent after: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the five options; picking one applies
+        it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--stall-nudge-palette",
+                providers=[StallNudgeOptionsProvider],
                 placeholder="Search for options…",
             )
         )

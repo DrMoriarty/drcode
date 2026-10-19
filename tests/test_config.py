@@ -27,7 +27,9 @@ def _write_json(path: Path, payload: dict) -> None:
 
 def test_is_ready(project_root: Path) -> None:
     assert not Config(project_root=project_root).is_ready
-    assert not Config(project_root=project_root, model="m").is_ready
+    # base_url defaults to the OpenAI API and api_key is optional (keyless
+    # local gateways work): a model alone is enough to be ready.
+    assert Config(project_root=project_root, model="m").is_ready
     assert not Config(project_root=project_root, api_key="k").is_ready
     assert Config(project_root=project_root, model="m", api_key="k").is_ready
 

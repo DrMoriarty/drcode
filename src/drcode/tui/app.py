@@ -5,7 +5,6 @@ import io
 import json
 import math
 import shutil
-import ssl
 import subprocess
 import sys
 import time
@@ -15,7 +14,6 @@ from functools import partial
 from pathlib import Path
 from typing import ClassVar, cast
 
-import httpx
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.exceptions import ModelHTTPError
@@ -67,7 +65,6 @@ from textual.widgets import (
 )
 
 from ..agent import (
-    USER_AGENT,
     AgentDeps,
     TesterDeps,
     backdate_user_prompt,
@@ -83,6 +80,7 @@ from ..agent import (
     is_pending_retry,
     is_summary_message,
     last_context_tokens,
+    probe_model,
     render_history_for_summary,
     resumable_history,
     run_context_tokens,
@@ -112,6 +110,7 @@ from ..settings import (
 from ..task_manager import TaskManager
 from ..version import APP_VERSION
 from .header import ModelStatusHeader
+from .setup_dialog import ModelSetup, ModelSetupDialog
 
 # Sort anchor for history entries without a recorded timestamp (old
 # transcripts predating per-message stamps): they keep their relative
@@ -1162,7 +1161,55 @@ class DrCodeApp(App[None]):
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is
-        # promoted here.
+        # promoted here. With no model configured anywhere, the setup
+        # dialog takes precedence: the pipeline stays idle until the
+        # dialog is saved (or skipped with ESC — tasks can still be
+        # created and browsed, they just never start).
+        if self.config.is_ready:
+            self._advance()
+        else:
+            self.push_screen(
+                ModelSetupDialog(
+                    model=self.config.model,
+                    base_url=self.config.base_url,
+                    api_key=self.config.api_key,
+                    max_context_tokens=self.config.max_context_tokens,
+                ),
+                self._model_setup_done,
+            )
+
+    def _model_setup_done(self, setup: ModelSetup | None) -> None:
+        """Result of the first-start setup dialog.
+
+        None — the user skipped it (ESC): keep running without a model.
+        ModelSetup — the connection was probed successfully: apply the
+        values to the live config, persist them into
+        <project>/drcode.json and start the pipeline.
+        """
+        if setup is None:
+            return
+        self.config.model = setup.model
+        self.config.base_url = setup.base_url
+        self.config.api_key = setup.api_key
+        if setup.max_context_tokens is not None:
+            self.config.max_context_tokens = setup.max_context_tokens
+        try:
+            saved = self.config.save_to_project()
+        except OSError as e:
+            self.notify(
+                f"Could not write drcode.json: {e}",
+                title="Model setup",
+                severity="error",
+                timeout=8,
+            )
+        else:
+            self.notify(
+                f"Model saved to {saved.name}",
+                title="Model setup",
+                timeout=4,
+            )
+        self.refresh_connection()
+        self.refresh_status()
         self._advance()
 
     # -- widgets helpers ------------------------------------------------------
@@ -1486,47 +1533,17 @@ class DrCodeApp(App[None]):
             label.update("○ model not configured")
             return
         model = self.config.model
-        # Системное хранилище сертификатов: корпоративные CA (как у
-        # api-copilot.x5.ru) отсутствуют в certifi, из-за чего httpx даёт
-        # CERTIFICATE_VERIFY_FAILED, который оборачивается в ConnectError.
-        try:
-            import truststore
-
-            verify: ssl.SSLContext | bool = truststore.SSLContext(
-                ssl.PROTOCOL_TLS_CLIENT
-            )
-        except ImportError:
-            verify = True
-        try:
-            async with httpx.AsyncClient(timeout=5, verify=verify) as client:
-                # Зонд через chat/completions, а не /models: этот гейтвей не
-                # отдаёт /models (503). Пустой messages даёт 400 от бэкенда —
-                # значит TLS, ключ, UA и имя модели приняты.
-                resp = await client.post(
-                    f"{self.config.base_url.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.config.api_key}",
-                        "User-Agent": USER_AGENT,
-                    },
-                    json={"model": model, "messages": []},
-                )
-        except httpx.HTTPError as e:
+        ok, detail = await probe_model(model, self.config.base_url, self.config.api_key)
+        if not ok:
             label.remove_class("ok", "warn")
             label.add_class("error")
-            label.update(f"✗ {model} — unavailable ({type(e).__name__})")
+            label.update(f"✗ {model} — {detail}")
             return
         label.remove_class("warn", "error")
-        if resp.status_code in (401, 403):
-            label.add_class("error")
-            label.update(f"✗ {model} — auth failed (HTTP {resp.status_code})")
-        elif resp.status_code < 500:
-            label.add_class("ok")
-            label.update(f"● {model}")
-            if was_error:
-                self._recover_from_outage()
-        else:
-            label.add_class("error")
-            label.update(f"✗ {model} — unavailable (HTTP {resp.status_code})")
+        label.add_class("ok")
+        label.update(f"● {model}")
+        if was_error:
+            self._recover_from_outage()
 
     # -- run activity indicator ----------------------------------------------
 
@@ -2156,9 +2173,11 @@ class DrCodeApp(App[None]):
             if not self.config.is_ready:
                 self._show_event(
                     task,
-                    "Model is not configured. Set DRCODE_MODEL, DRCODE_BASE_URL "
-                    "and DRCODE_API_KEY (env vars or .env); the message is kept "
-                    "and will be sent once the model is available.",
+                    "Model is not configured. Restart drcode to open the setup "
+                    "dialog, or set model/base_url in drcode.json (project) / "
+                    "~/.config/drcode/drcode.json / DRCODE_* env vars; the "
+                    "message is kept and will be sent once the model is "
+                    "available.",
                 )
                 return
             self.agent_running = True

@@ -275,12 +275,22 @@ async def test_tester_network_failure_retried_then_verification_passes(
 
 
 async def test_model_not_configured_keeps_prompt_pending(project_root: Path) -> None:
-    """No model/key configured (conftest clears the env): the run stops at
-    the guard, the prompt is kept for a later send."""
+    """No model/key configured (conftest clears the env): the app opens the
+    first-start setup dialog instead of starting the pipeline; skipping it
+    (ESC) leaves the app usable, and the next advance stops at the guard —
+    the prompt is kept for a later send."""
+    from drcode.tui.setup_dialog import ModelSetupDialog
+
     app = DrCodeApp(project_root)
     task = app.manager.create("docs", "some prompt")
     async with app.run_test() as pilot:
         await pilot.pause()
+        assert isinstance(app.screen, ModelSetupDialog)
+        await pilot.press("escape")
+        await pilot.pause()
+        # The pipeline only advances once the dialog is saved/skipped and
+        # the user creates/queues work: trigger it like submit_new_task does.
+        app._advance()
         await wait_until(
             lambda: bool(event_texts(task)), pilot, what="guard event logged"
         )
@@ -538,7 +548,9 @@ def _patch_probe_transport(
             kwargs["transport"] = httpx.MockTransport(handler)
             super().__init__(**kwargs)
 
-    monkeypatch.setattr("drcode.tui.app.httpx.AsyncClient", PatchedAsyncClient)
+    # The probe lives in drcode.agent.probe_model since the first-start
+    # setup dialog refactor — patch its client, not the app's.
+    monkeypatch.setattr("drcode.agent.httpx.AsyncClient", PatchedAsyncClient)
 
 
 @pytest.mark.parametrize(

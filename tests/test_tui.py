@@ -50,6 +50,9 @@ async def test_app_mounts_sidebar_with_existing_tasks(project_root: Path) -> Non
 
 async def test_create_task_through_ui(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
         nt_input = app.query_one("#nt-input", TextArea)
         nt_input.text = "Build the thing\nwith details"
         await pilot.press("ctrl+enter")
@@ -70,6 +73,9 @@ async def test_create_task_through_ui(app: DrCodeApp) -> None:
 
 async def test_new_task_form_kind_switch_and_cancel(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
         nt_input = app.query_one("#nt-input", TextArea)
         nt_input.text = "a bug report"
         await pilot.press("tab")
@@ -224,6 +230,9 @@ async def test_sidebar_header_enter_and_space_collapse_section(app: DrCodeApp) -
     app.manager.create("task two", "")
     async with app.run_test() as pilot:
         await pilot.pause()
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
         sidebar = app.sidebar
         sidebar.focus()
         await pilot.pause()
@@ -258,6 +267,9 @@ async def test_sidebar_header_enter_and_space_collapse_section(app: DrCodeApp) -
 async def test_sidebar_header_click_toggles_section(app: DrCodeApp) -> None:
     app.manager.create("task one", "")
     async with app.run_test() as pilot:
+        await pilot.pause()
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
         await pilot.pause()
         sidebar = app.sidebar
         section = next(

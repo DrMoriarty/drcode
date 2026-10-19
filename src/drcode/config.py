@@ -117,6 +117,39 @@ class Config(BaseSettings):
     def project_config_file(self) -> Path:
         return self._project_root / PROJECT_CONFIG_FILENAME
 
+    def save_to_project(self) -> Path:
+        """Persist the model connection settings into <project>/drcode.json.
+
+        Used by the first-start setup dialog: the entered model/base_url/
+        api_key/max_context_tokens must survive restarts in the project
+        itself. Existing keys in the file are preserved (only the four
+        connection fields are updated), so unrelated project settings
+        (e.g. compaction_threshold) are not lost.
+        """
+        data: dict[str, object] = {}
+        try:
+            loaded = json.loads(self.project_config_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # Corrupted file: start fresh rather than crash the dialog —
+            # the values being saved are the source of truth anyway.
+            data = {}
+        data.update(
+            {
+                "model": self.model,
+                "base_url": self.base_url,
+                "api_key": self.api_key,
+                "max_context_tokens": self.max_context_tokens,
+            }
+        )
+        self.project_config_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        return self.project_config_file
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -144,7 +177,10 @@ class Config(BaseSettings):
 
     @property
     def is_ready(self) -> bool:
-        return bool(self.model and self.api_key)
+        """Model and endpoint are known. The API key is deliberately NOT
+        required here: local/OpenAI-compatible gateways often work without
+        one — the setup dialog asks for it as optional."""
+        return bool(self.model and self.base_url)
 
 
 def _parsable_or_none(path: Path) -> Path | None:

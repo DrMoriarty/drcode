@@ -6,12 +6,14 @@ import asyncio
 import json
 import re
 import shlex
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.agent import AgentRun
@@ -107,6 +109,47 @@ class AgentDeps:
 USER_AGENT = f"drcode/{APP_VERSION}"
 EXTRA_HEADERS = {"User-Agent": USER_AGENT}
 
+
+async def probe_model(
+    model: str, base_url: str, api_key: str, *, timeout: float = 5.0
+) -> tuple[bool, str]:
+    """Check that an OpenAI-compatible endpoint accepts the given settings.
+
+    Probes `POST {base_url}/chat/completions` with empty messages: the
+    backend answers 400 — which means TLS, key, user-agent and the model
+    id were all accepted — and that counts as a working connection.
+    Returns (ok, human-readable detail); `detail` is empty on success.
+    """
+    # Системное хранилище сертификатов: корпоративные CA отсутствуют в
+    # certifi, из-за чего httpx даёт CERTIFICATE_VERIFY_FAILED, который
+    # оборачивается в ConnectError.
+    try:
+        import truststore
+
+        verify: ssl.SSLContext | bool = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        verify = True
+    headers: dict[str, str] = {"User-Agent": USER_AGENT}
+    if api_key:
+        # An empty key must be omitted entirely: "Bearer " (trailing
+        # space) is an illegal header value for h11/httpx.
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout, verify=verify) as client:
+            resp = await client.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json={"model": model, "messages": []},
+            )
+    except httpx.HTTPError as e:
+        return False, f"unavailable ({type(e).__name__})"
+    if resp.status_code in (401, 403):
+        return False, f"auth failed (HTTP {resp.status_code})"
+    if resp.status_code >= 500:
+        return False, f"unavailable (HTTP {resp.status_code})"
+    return True, ""
+
+
 # Errors tools raise for situations the model can fix (bad path, missing
 # old_string, broken regex). pydantic-ai 2.x converts only ModelRetry and
 # arg-validation failures into retry prompts; any other exception crashes
@@ -158,7 +201,9 @@ async def _run_bash_logged(
 def build_model(config: Config):
     client = AsyncOpenAI(
         base_url=config.base_url,
-        api_key=config.api_key,
+        # Keyless gateways (local servers) still need a syntactically
+        # valid Authorization header: "Bearer " is rejected by httpx.
+        api_key=config.api_key or "no-key",
         default_headers=EXTRA_HEADERS,
     )
     return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
@@ -936,6 +981,7 @@ __all__ = [
     "last_context_tokens",
     "load_agents_md",
     "load_messages",
+    "probe_model",
     "render_history_for_summary",
     "resumable_history",
     "run_context_tokens",

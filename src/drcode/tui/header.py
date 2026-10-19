@@ -34,6 +34,22 @@ class HeaderModelStatus(Static):
 class ModelStatusHeader(Header):
     """Header showing the model-connection status after the icon."""
 
+    DEFAULT_CSS = """
+    ModelStatusHeader {
+        layers: title-layer _default;
+    }
+    ModelStatusHeader HeaderTitle {
+        /* The docked icon/status/clock shrink the flow layout, so an
+        in-flow, width:100% title would drift as the status text (and the
+        tok/s counter) changes width. Pin the title to its own layer
+        spanning the full header width to keep it centered. */
+        position: absolute;
+        layer: title-layer;
+        width: 100%;
+        offset: 0 0;
+    }
+    """
+
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderModelStatus(id="model-status")

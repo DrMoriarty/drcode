@@ -5,6 +5,7 @@ import io
 import json
 import math
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -132,7 +133,7 @@ from ..task_manager import TaskManager
 from ..version import APP_VERSION
 from .agents_dialog import AgentsMdDialog
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
-from .header import ModelStatusHeader
+from .header import HeaderConnInfo, HeaderSessionInfo, ModelStatusHeader
 from .setup_dialog import ModelSetup, ModelSetupDialog
 
 # Sort anchor for history entries without a recorded timestamp (old
@@ -1283,6 +1284,23 @@ class DrCodeApp(App[None]):
         # the task ACTIVE and is retried after a backoff delay.
         self._agent_429_count: dict[str, int] = {}
         self._agent_429_retry_at: dict[str, float] = {}
+        # Total 429 backoffs this session (the per-task dict above holds
+        # only the current retry budgets); shown in the expanded header.
+        self._agent_429_total = 0
+        # Session statistics for the expanded header (never persisted):
+        # tasks present at startup don't count as "created this session",
+        # tasks already COMPLETED at startup don't count as "processed".
+        self._session_known_ids: set[str] = set(self.manager.tasks)
+        self._session_completed_ids: set[str] = {
+            t.id
+            for t in self.manager.tasks.values()
+            if t.status is TaskStatus.COMPLETED
+        }
+        self._session_created: dict[TaskKind, int] = {kind: 0 for kind in TaskKind}
+        self._session_completed = 0
+        # Activation → completion spans (seconds) of the tasks completed
+        # this session; feeds the average/median figures.
+        self._session_durations: list[float] = []
         # True while the new-task form covers the chat view. Must exist from
         # the start: the streaming loop reads it on every text delta, and an
         # unset attribute would crash the run (it did — the AttributeError
@@ -1315,6 +1333,11 @@ class DrCodeApp(App[None]):
         # written by _check_model; _render_model_status appends the live
         # activity suffix (tok/s / waiting / testing) on top of it.
         self._conn_label = "○ checking…"
+        # Connection probe bookkeeping for the expanded header: last
+        # round-trip of probe_model in ms (None = no probe finished yet)
+        # and the streak of consecutive failed probes (reset on success).
+        self._last_probe_ms: int | None = None
+        self._probe_fail_streak = 0
         # Tool calls currently executing, per run (the run key is
         # ("agent"|"tester", generation)): tool_call_id ->
         # (task_id, rendered call text, live block with the spinner). The
@@ -1891,18 +1914,24 @@ class DrCodeApp(App[None]):
         was_error = label.has_class("error")
         if not self.config.is_ready:
             self._conn_label = "○ model not configured"
+            self._last_probe_ms = None
             label.remove_class("ok", "error")
             label.add_class("warn")
             self._render_model_status()
             return
         model = self.config.model
+        started = time.monotonic()
         ok, detail = await probe_model(model, self.config.base_url, self.config.api_key)
+        # Round-trip of the probe itself, shown on the expanded header line.
+        self._last_probe_ms = int((time.monotonic() - started) * 1000)
         if not ok:
+            self._probe_fail_streak += 1
             self._conn_label = f"✗ {model} — {detail}"
             label.remove_class("ok", "warn")
             label.add_class("error")
             self._render_model_status()
             return
+        self._probe_fail_streak = 0
         self._conn_label = f"● {model}"
         label.remove_class("warn", "error")
         label.add_class("ok")
@@ -1970,6 +1999,109 @@ class DrCodeApp(App[None]):
         else:
             label.update(self._conn_label)
 
+    # -- expanded (tall) header: connection details + session statistics ----
+
+    @property
+    def header_conn_info(self) -> Static:
+        return self.query_one("#header-conn", HeaderConnInfo)
+
+    @property
+    def header_session_info(self) -> Static:
+        return self.query_one("#header-sessions", HeaderSessionInfo)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Compact human duration for the header stats line (e.g. 45s, 6m12s)."""
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+
+    def _collect_session_stats(self) -> None:
+        """Fold task-tree changes into the session counters.
+
+        Runs on the 1 s poll: tasks that appeared since the previous tick
+        count as created this session (by kind), tasks that reached
+        COMPLETED count as processed, with the activation → completion
+        span (when both timestamps exist — a task cancelled straight from
+        the queue has no activation stamp and is counted without a
+        duration).
+        """
+        tasks = self.manager.tasks
+        for task_id in set(tasks) - self._session_known_ids:
+            self._session_known_ids.add(task_id)
+            self._session_created[tasks[task_id].kind] += 1
+        for task in tasks.values():
+            if (
+                task.status is TaskStatus.COMPLETED
+                and task.id not in self._session_completed_ids
+            ):
+                self._session_completed_ids.add(task.id)
+                self._session_completed += 1
+                if task.activated_at and task.completed_at:
+                    self._session_durations.append(
+                        (task.completed_at - task.activated_at).total_seconds()
+                    )
+
+    def _header_conn_text(self) -> str:
+        """The expanded header's connection line: the connection label
+        (dot + model, error detail on failures), URL, last probe
+        round-trip, consecutive probe failures and 429 retry counters."""
+        if not self.config.is_ready:
+            return "model not configured"
+        url = self.config.base_url
+        probe = (
+            f"probe {self._last_probe_ms} ms"
+            if self._last_probe_ms is not None
+            else "probe —"
+        )
+        fails = f"probe fails: {self._probe_fail_streak}"
+        open_429 = sum(self._agent_429_count.values())
+        retries = f"429: {self._agent_429_total} total"
+        if open_429:
+            retries += f" / {open_429} active"
+        return f"{self._conn_label} · {url} · {probe} · {fails} · {retries}"
+
+    def _header_stats_text(self) -> str:
+        """The expanded header's session-statistics line: tasks completed
+        this session, average/median activation→completion time and the
+        bugs:features ratio of the tasks created this session (research
+        tasks are excluded from the ratio: they are neither bug fixes nor
+        implemented features)."""
+        durations = self._session_durations
+        if durations:
+            avg = statistics.fmean(durations)
+            median = statistics.median(durations)
+            times = (
+                f"avg {self._fmt_duration(avg)} · median {self._fmt_duration(median)}"
+            )
+        else:
+            times = "avg — · median —"
+        bugs = self._session_created[TaskKind.BUG]
+        features = self._session_created[TaskKind.FEATURE]
+        return (
+            f"tasks done: {self._session_completed} · {times} · "
+            f"bugs:features {bugs}:{features}"
+        )
+
+    def _render_header_tall(self) -> None:
+        """Refresh the two expanded-header lines (no-op while collapsed:
+        the widgets are display:none and their content is refreshed on
+        toggle / by the next poll tick anyway)."""
+        header = self.query_one(ModelStatusHeader)
+        if not header.has_class("-tall"):
+            return
+        self.header_conn_info.update(self._header_conn_text())
+        self.header_session_info.update(self._header_stats_text())
+
+    def on_model_status_header_tall_toggled(
+        self, event: ModelStatusHeader.TallToggled
+    ) -> None:
+        """The header was clicked: fill the expanded lines immediately (the
+        1 s poll keeps them live afterwards)."""
+        if event.tall:
+            self._render_header_tall()
+
     # -- run activity indicator ----------------------------------------------
 
     def _touch_activity(self, tool: str | None = None, *, done: bool = False) -> None:
@@ -1993,6 +2125,11 @@ class DrCodeApp(App[None]):
         or has gone silent (hung model request, long tool, deadlock)."""
         try:
             self._render_model_status()
+            # Expanded header: fold task-tree changes into the session
+            # counters and refresh the two tall-only lines (no-op while
+            # the header is collapsed).
+            self._collect_session_stats()
+            self._render_header_tall()
             # Touch the widget so the teardown race (the 1s timer ticking
             # while the app is being dismantled) raises NoMatches here.
             _ = self.activity_status
@@ -3240,6 +3377,7 @@ class DrCodeApp(App[None]):
                     ):
                         attempt = self._agent_429_count.get(task_id, 0) + 1
                         self._agent_429_count[task_id] = attempt
+                        self._agent_429_total += 1
                         delay = min(5 * 2 ** (attempt - 1), RATE_LIMIT_DELAY_MAX)
                         self._show_event(
                             task,

@@ -296,6 +296,9 @@ class TaskManager:
             ):
                 t.status = TaskStatus.ACTIVE
                 t.queue_head = False
+                # Stamp the activation moment: the expanded-header session
+                # statistics measure activation → completion from it.
+                t.activated_at = _now()
                 t.touch()
                 self.storage.save(t)
                 return t

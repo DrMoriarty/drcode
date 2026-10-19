@@ -3,11 +3,19 @@
 The stock Textual `Header` renders icon → title → clock. `ModelStatusHeader`
 inserts a `HeaderModelStatus` widget right after the icon, so the indicator
 sits between the ⭘ button and the centered title.
+
+Clicking the header toggles the stock "tall" mode (1 → 3 lines). In the
+expanded state two extra lines appear (see `HeaderTallInfo`): the
+model-connection details on the top line and the per-session task
+statistics on the bottom line. Both are filled by the app's 1 s activity
+poller (`DrCodeApp._render_header_tall`); the centered title keeps its own
+absolute layer and is never shifted by the added content.
 """
 
 from __future__ import annotations
 
 from textual.app import ComposeResult
+from textual.message import Message
 from textual.widgets import Static
 from textual.widgets._header import (
     Header,
@@ -31,12 +39,72 @@ class HeaderModelStatus(Static):
     """
 
 
+class HeaderTallInfo(Static):
+    """Base for the extra lines shown only in the expanded (tall) header.
+
+    Hidden in the collapsed state so the single-line header keeps its
+    stock layout; docked top/bottom by the subclasses. The widgets are
+    composed after the left/right-docked icon and clock, so their 100%
+    width already excludes those columns — the text can't slide under
+    them and is ellipsized instead.
+    """
+
+    DEFAULT_CSS = """
+    HeaderTallInfo {
+        height: 1;
+        width: 100%;
+        padding: 0 1;
+        color: $text-muted;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    """
+
+
+class HeaderConnInfo(HeaderTallInfo):
+    """Expanded-header top line: connection URL, model, probe latency and
+    error counters (consecutive probe failures, 429 retries)."""
+
+    DEFAULT_CSS = """
+    HeaderConnInfo {
+        dock: top;
+    }
+    """
+
+
+class HeaderSessionInfo(HeaderTallInfo):
+    """Expanded-header bottom line: per-session task statistics (tasks
+    completed, average/median activation→completion time, bugs:features
+    ratio of the tasks created this session)."""
+
+    DEFAULT_CSS = """
+    HeaderSessionInfo {
+        dock: bottom;
+    }
+    """
+
+
 class ModelStatusHeader(Header):
     """Header showing the model-connection status after the icon."""
 
     DEFAULT_CSS = """
     ModelStatusHeader {
         layers: title-layer _default;
+    }
+    /* The extra tall-only lines are hidden in the collapsed state; the
+    display rules live here (not in HeaderTallInfo's own stylesheet) so
+    the -tall override reliably wins the cascade. */
+    ModelStatusHeader HeaderTallInfo {
+        display: none;
+    }
+    ModelStatusHeader.-tall HeaderTallInfo {
+        display: block;
+    }
+    /* Tall mode: the absolute title must span all three rows so its
+    center-middle alignment keeps "DrCode" on the middle line (its own
+    layer is untouched — the tall lines dock in the default layer). */
+    ModelStatusHeader.-tall HeaderTitle {
+        height: 100%;
     }
     ModelStatusHeader HeaderTitle {
         /* The docked icon/status/clock shrink the flow layout, so an
@@ -50,12 +118,30 @@ class ModelStatusHeader(Header):
     }
     """
 
+    class TallToggled(Message):
+        """The user clicked the header: tall mode is now `tall`."""
+
+        def __init__(self, tall: bool) -> None:
+            self.tall = tall
+            super().__init__()
+
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderModelStatus(id="model-status")
-        yield HeaderTitle()
         yield (
             HeaderClock().data_bind(Header.time_format)
             if self._show_clock
             else HeaderClockSpace()
         )
+        # The tall-only lines dock around the icon/clock columns (they are
+        # composed after those docks, see HeaderTallInfo).
+        yield HeaderConnInfo(id="header-conn")
+        yield HeaderSessionInfo(id="header-sessions")
+        yield HeaderTitle()
+
+    def _on_click(self) -> None:
+        # Stock behaviour (toggle -tall) plus a notification so the app can
+        # fill the expanded lines immediately instead of waiting for the
+        # next 1 s poll tick.
+        self.toggle_class("-tall")
+        self.post_message(self.TallToggled(self.has_class("-tall")))

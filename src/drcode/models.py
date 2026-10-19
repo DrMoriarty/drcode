@@ -98,6 +98,11 @@ class Task(BaseModel):
     # user cancel). Drives the startup auto-cleanup of old completed tasks
     # (see ProjectSettings.completed_retention); None while not completed.
     completed_at: datetime | None = None
+    # When the task last entered ACTIVE (stamped by promote_next; None
+    # while the task has never been activated). Session statistics measure
+    # the activation → completion span from this (see the expanded header);
+    # a re-queued completed task gets a fresh stamp on its next activation.
+    activated_at: datetime | None = None
     # True when the last agent attempt was interrupted (abort, error) and
     # may have left work undone. Replaces the old "re-queue the consumed
     # prompt" retry marker: the prompt stays in the transcript at its

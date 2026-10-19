@@ -1047,8 +1047,11 @@ class DrCodeApp(App[None]):
         margin-top: 1;
         text-style: bold;
     }
-    #nt-kind-label.kind-feature { color: $success; }
-    #nt-kind-label.kind-bug { color: $error; }
+    # Literal colors: they must match the markup colors used for the kind
+    # descriptions (#nt-kinds, _KIND_COLOR) and the task status bar — the
+    # theme's $success/$error are different shades and would not line up.
+    #nt-kind-label.kind-feature { color: green; }
+    #nt-kind-label.kind-bug { color: red; }
     #nt-kind-label.kind-research { color: yellow; }
     #nt-hint { width: auto; color: $text-disabled; }
     #nt-kinds {

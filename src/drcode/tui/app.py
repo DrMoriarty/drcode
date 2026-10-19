@@ -944,6 +944,11 @@ class DrCodeApp(App[None]):
     # settings binding.
     ENABLE_COMMAND_PALETTE: ClassVar[bool] = False
 
+    # Header title: the stock Textual default is the class name (DrCodeApp).
+    # Unannotated on purpose — Textual declares TITLE as an instance
+    # variable, so a ClassVar override trips pyright.
+    TITLE = "DrCode"
+
     # Providers for the Settings palette (it passes no explicit providers,
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends).

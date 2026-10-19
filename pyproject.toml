@@ -1,6 +1,6 @@
 [project]
 name = "drcode"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Task-centric console AI coding agent (pydantic-ai + textual)"
 readme = "README.md"
 authors = [
@@ -21,8 +21,20 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [build-system]
-requires = ["uv_build>=0.13.0,<0.14.0"]
-build-backend = "uv_build"
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+# The `version` file at the repo root is the single source of truth for the
+# application version (see src/drcode/version.py); the build backend reads
+# it so the package metadata can never drift from it.
+[tool.hatch.version]
+path = "version"
+# The file contains nothing but a bare version string ("0.3.0"); the default
+# hatchling pattern expects a `__version__ = "..."` Python assignment.
+pattern = "^(?P<version>[^\\s]+)$"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drcode"]
 
 [dependency-groups]
 dev = [

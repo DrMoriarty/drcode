@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
+from operator import attrgetter
 from pathlib import Path
 from typing import ClassVar, cast
 
@@ -52,7 +53,6 @@ from textual.css.query import NoMatches
 from textual.css.styles import RulesMap
 from textual.geometry import Size
 from textual.strip import Strip
-from textual.theme import ThemeProvider
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
@@ -857,6 +857,39 @@ class FinalizationOptionsProvider(Provider):
                 partial(app.action_set_task_finalization, option),
             )
             for option in FINALIZATION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class ThemeOptionsProvider(Provider):
+    """Options of the theme picker.
+
+    Same selection-palette UX as the other option providers: pick a theme to
+    apply it immediately, Escape keeps the current one. The currently active
+    theme is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        themes = self.app.available_themes
+
+        def set_app_theme(name: str) -> None:
+            self.app.theme = name
+
+        return [
+            (
+                theme.name + (" (current)" if theme.name == self.app.theme else ""),
+                partial(set_app_theme, theme.name),
+            )
+            for theme in sorted(themes.values(), key=attrgetter("name"))
         ]
 
     async def discover(self) -> Hits:
@@ -3506,7 +3539,7 @@ class DrCodeApp(App[None]):
         self.push_screen(
             SettingsPalette(
                 id="--theme-palette",
-                providers=[ThemeProvider],
+                providers=[ThemeOptionsProvider],
                 placeholder="Search for themes…",
             )
         )

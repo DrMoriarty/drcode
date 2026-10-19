@@ -242,6 +242,18 @@ async def run_bash(root: Path, command: str) -> str:
         proc.kill()
         await proc.wait()
         return f"exit=-1\n(command timed out after {BASH_TIMEOUT}s)"
+    except asyncio.CancelledError:
+        # The run was aborted or the app is quitting: the child process must
+        # not outlive the tool call. Kill it and let the event loop reap it
+        # and close its transport — otherwise the transport's __del__ later
+        # tries to close pipes on an already-closed loop and prints
+        # "RuntimeError: Event loop is closed" to the console.
+        proc.kill()
+        try:
+            await asyncio.shield(proc.wait())
+        except asyncio.CancelledError:
+            pass
+        raise
     out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()[
         :MAX_TOOL_OUTPUT
     ]

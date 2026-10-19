@@ -71,6 +71,10 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         padding: 1 2;
         background: $panel;
         border: thick $accent;
+        /* When the terminal is too short for the whole form (a wrapped
+           connection-error line adds height), the form scrolls — the
+           buttons stay pinned at the bottom and remain reachable. */
+        overflow-y: auto;
     }
     #gh-title { color: $text; margin-bottom: 1; text-style: bold; }
     .gh-label {
@@ -80,10 +84,19 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         text-style: bold;
     }
     .gh-opt { color: $text-disabled; text-style: italic; }
-    #gh-enabled-row { height: auto; margin-top: 1; }
+    #gh-enabled-row { height: auto; }
     #gh-enabled-row Switch { margin-right: 1; }
     #gh-token { margin-bottom: 0; }
-    #gh-interval { margin-top: 1; border: none; padding: 0; background: transparent; }
+    /* One row instead of three stacked options — saves vertical space
+       for the live connection-status line below. */
+    #gh-interval {
+        margin-top: 1;
+        height: auto;
+        layout: horizontal;
+        border: none;
+        padding: 0;
+        background: transparent;
+    }
     #gh-status {
         height: auto;
         min-height: 1;
@@ -92,7 +105,15 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
     }
     #gh-status.ok { color: $success; }
     #gh-status.error { color: $error; }
-    #gh-buttons { height: auto; margin-top: 1; }
+    /* Pinned to the bottom of the dialog: even when the content above
+       is clipped/scrolling (short terminal, 2-line error message), the
+       Save button itself is always fully visible. */
+    #gh-buttons {
+        dock: bottom;
+        height: auto;
+        margin-top: 1;
+        background: $panel;
+    }
     #gh-save { width: auto; }
     #gh-hint {
         width: 1fr;
@@ -124,9 +145,9 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         with Vertical(id="gh-dialog"):
             yield Static("GitHub integration", id="gh-title")
             yield Static(
-                "Periodically imports open issues from a GitHub repository: "
-                "[b]bug[/b] → bug report, [b]enhancement[/b] → feature "
-                "request; [b]invalid[/b]/[b]wontfix[/b] are skipped.",
+                "Periodically imports open GitHub issues: [b]bug[/b] → bug "
+                "report, [b]enhancement[/b] → feature request; "
+                "[b]invalid[/b]/[b]wontfix[/b] are skipped.",
                 id="gh-note",
             )
             with Horizontal(id="gh-enabled-row"):

@@ -22,7 +22,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from drcode import agent as agent_mod
+from drcode import agent_model
 from drcode.agent import (
     ends_with_open_request,
     extract_display,
@@ -75,7 +75,7 @@ def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     """The model layer of every agent drcode builds (coding, tester and
     compaction alike) is a FunctionModel consuming `state.steps`."""
     state = ScriptedState()
-    monkeypatch.setattr(agent_mod, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
     return state
 
 
@@ -350,7 +350,7 @@ async def test_compaction_failure_is_not_fatal(
     def failing(messages: list, info: Any) -> Any:
         raise api_error("Connection error.")
 
-    monkeypatch.setattr(agent_mod, "build_model", lambda cfg: FunctionModel(failing))
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: FunctionModel(failing))
     task = _seed_transcript(net_app_small_ctx, "long task " * 200)
 
     async with net_app_small_ctx.run_test() as pilot:
@@ -373,7 +373,7 @@ async def test_compaction_success_replaces_history(
 
     state = ScriptedState()
     state.steps = [text_response("THE SUMMARY BODY")]
-    monkeypatch.setattr(agent_mod, "build_model", lambda cfg: FunctionModel(state.fn))
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: FunctionModel(state.fn))
     prompt = "long task " * 200
     task = _seed_transcript(net_app_small_ctx, prompt)
 
@@ -710,9 +710,9 @@ def _patch_probe_transport(
             kwargs["transport"] = httpx.MockTransport(handler)
             super().__init__(**kwargs)
 
-    # The probe lives in drcode.agent.probe_model since the first-start
-    # setup dialog refactor — patch its client, not the app's.
-    monkeypatch.setattr("drcode.agent.httpx.AsyncClient", PatchedAsyncClient)
+    # The probe lives in drcode.agent_model.probe_model since the model
+    # layer was split out of `agent` — patch its client, not the app's.
+    monkeypatch.setattr("drcode.agent_model.httpx.AsyncClient", PatchedAsyncClient)
 
 
 @pytest.mark.parametrize(

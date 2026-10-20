@@ -35,6 +35,9 @@ pattern = "^(?P<version>[^\\s]+)$"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/drcode"]
+# Bundle the bundled template prompts (system prompts, compaction + init_repo
+# templates) as package data inside the wheel.
+include = ["src/drcode/prompts/**"]
 
 [dependency-groups]
 dev = [

@@ -1,10 +1,10 @@
-import re
 from pathlib import Path
 
 import pytest
+
+from drcode.agent import is_pending_retry
 from drcode.models import TaskStatus
 from drcode.tui.app import DrCodeApp
-from drcode.agent import is_pending_retry
 
 
 @pytest.fixture

@@ -19,7 +19,7 @@ from openai import AsyncOpenAI
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
-from drcode import agent as agent_mod
+from drcode import agent_model
 from drcode.config import Config
 from drcode.version import APP_VERSION
 from tests.network_mocks import (
@@ -97,7 +97,7 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
         seen["ua"] = request.headers.get("user-agent")
         return httpx.Response(200, json=completion_payload("ok"))
 
-    real_cls = agent_mod.AsyncOpenAI
+    real_cls = agent_model.AsyncOpenAI
 
     def factory(**kwargs: object) -> AsyncOpenAI:
         kwargs["http_client"] = httpx.AsyncClient(
@@ -106,8 +106,8 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
         kwargs["max_retries"] = 0
         return real_cls(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(agent_mod, "AsyncOpenAI", factory)
-    model = agent_mod.build_model(make_config(api_key="sk-secret"))
+    monkeypatch.setattr(agent_model, "AsyncOpenAI", factory)
+    model = agent_model.build_model(make_config(api_key="sk-secret"))
 
     resp = asyncio.run(
         model.client.chat.completions.create(
@@ -124,7 +124,7 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
 
 
 def test_build_model_default_base_url_is_openai() -> None:
-    model = agent_mod.build_model(make_config(base_url="https://api.openai.com/v1"))
+    model = agent_model.build_model(make_config(base_url="https://api.openai.com/v1"))
     assert str(model.client.base_url).rstrip("/").endswith("/v1")
 
 

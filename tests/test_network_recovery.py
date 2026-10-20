@@ -16,6 +16,7 @@ from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import ModelMessage
 
 from drcode import agent as agent_mod
+from drcode import agent_model
 from drcode.agent import (
     AgentDeps,
     ends_with_open_request,
@@ -39,7 +40,7 @@ from tests.network_mocks import (
 @pytest.fixture
 def scripted(monkeypatch) -> ScriptedState:
     state = ScriptedState()
-    monkeypatch.setattr(agent_mod, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
     return state
 
 

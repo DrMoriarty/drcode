@@ -209,6 +209,11 @@ class SessionTokenUsage:
 # yielding to the event loop (see _flush_chat_batch). ~1-2ms per block means
 # a step stays around a 60ms frame even on the slowest widgets.
 _CHAT_MOUNT_CHUNK = 16
+# Slack (in lines) below the viewport edge that still counts as "following"
+# the chat tail. Markdown reflow can suddenly add a couple of rows and a new
+# text chunk arrives at the same time; without this buffer a 1-line tolerance
+# would falsely report "not at bottom" and stop auto-scrolling the tail.
+_SCROLL_FOLLOW_THRESHOLD = 4
 
 
 class TaskItem(ListItem):
@@ -2661,12 +2666,19 @@ class DrCodeApp(App[None]):
             self._rendered_clarification = task.clarification
 
     def _chat_at_bottom(self) -> bool:
-        """True when the last line of the chat log is in the viewport.
+        """True when the reader is tracking the chat tail (auto-scroll follows).
 
-        Tolerance of 1 line absorbs rounding of fractional scroll offsets.
+        Allows a small threshold of trailing rows below the viewport edge:
+        markdown reflow can suddenly add a couple of lines and a fresh model
+        chunk arrives at the same time, so the tail edge jumps below the
+        visible area. A 1-line tolerance would then falsely report "not at
+        bottom" and stop following the tail; within this threshold we still
+        treat the reader as tracking the tail.
+
+        Tolerance absorbs rounding of fractional scroll offsets.
         """
         log = self.chat_log
-        return log.scroll_offset.y >= log.max_scroll_y - 1
+        return log.scroll_offset.y >= log.max_scroll_y - _SCROLL_FOLLOW_THRESHOLD
 
     def _stream_follow(self) -> None:
         """Keep the chat tail visible while streaming, coalesced to ~10 Hz.

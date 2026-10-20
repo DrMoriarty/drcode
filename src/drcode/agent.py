@@ -924,19 +924,21 @@ def ends_with_open_request(data: list[dict[str, Any]]) -> bool:
     return last.get("kind") == "request" or last.get("role") == "request"
 
 
-def _usage_context_tokens(input_tokens: int, cache_read: int, cache_write: int) -> int:
-    """Tokens the model actually saw in that request: uncached prompt +
-    cache reads + cache writes (Anthropic-style accounting splits the prompt
-    across the three fields)."""
-    return input_tokens + cache_read + cache_write
+def _usage_context_tokens(input_tokens: int, output_tokens: int) -> int:
+    """Tokens held by the model's context slot: prompt + generated output,
+    matching llama.cpp's slot `n_tokens`. pydantic-ai normalizes usage from
+    all providers, so `input_tokens` already INCLUDES cache reads/writes
+    (cache fields must not be added on top)."""
+    return input_tokens + output_tokens
 
 
 def last_context_tokens(data: list[dict[str, Any]]) -> int | None:
     """Context fill (tokens) at the end of a serialized transcript.
 
     Each ModelResponse carries the usage of the request that produced it,
-    and its input side is the full context the model saw (history + tools +
-    prompt). The last response with non-zero usage therefore gives the
+    and its input + output tokens are the full context the model holds
+    (history + tools + prompt + generated output). The last response with
+    non-zero usage therefore gives the
     final context fill of the task — for finished tasks as well, since the
     transcript with usage is persisted in the task history.
     """
@@ -946,8 +948,7 @@ def last_context_tokens(data: list[dict[str, Any]]) -> int | None:
         usage = msg.get("usage") or {}
         tokens = _usage_context_tokens(
             usage.get("input_tokens") or 0,
-            usage.get("cache_read_tokens") or 0,
-            usage.get("cache_write_tokens") or 0,
+            usage.get("output_tokens") or 0,
         )
         if tokens:
             return tokens
@@ -964,9 +965,7 @@ def run_context_tokens(run: AgentRun[Any, Any]) -> int | None:
     for msg in reversed(messages):
         if isinstance(msg, ModelResponse):
             usage = msg.usage
-            tokens = _usage_context_tokens(
-                usage.input_tokens, usage.cache_read_tokens, usage.cache_write_tokens
-            )
+            tokens = _usage_context_tokens(usage.input_tokens, usage.output_tokens)
             if tokens:
                 return tokens
     return None

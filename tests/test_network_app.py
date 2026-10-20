@@ -363,7 +363,7 @@ async def test_compaction_failure_is_not_fatal(
     )
     # Uncompressed history: the run continues with what it has.
     assert not any(is_summary_message(m) for m in task.messages)
-    assert last_context_tokens(task.messages) == 2000
+    assert last_context_tokens(task.messages) == 2008  # 2000 input + 8 output
 
 
 async def test_compaction_success_replaces_history(

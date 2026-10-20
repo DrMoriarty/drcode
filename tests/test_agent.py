@@ -166,12 +166,32 @@ def test_last_context_tokens() -> None:
             "kind": "response",
             "usage": {
                 "input_tokens": 100,
-                "cache_read_tokens": 50,
-                "cache_write_tokens": 25,
+                "output_tokens": 25,
             },
         }
     ]
-    assert last_context_tokens(data) == 175
+    # Context fill = prompt + generated output (input_tokens already
+    # includes cache reads/writes in pydantic-ai's normalized usage).
+    assert last_context_tokens(data) == 125
+
+
+def test_last_context_tokens_no_cache_double_count() -> None:
+    # Regression: OpenAI-style usage where the provider prompt includes
+    # cached tokens. pydantic-ai normalizes this to input_tokens=41030
+    # (cache_read_tokens=40000 included), which must NOT be added again —
+    # the old formula reported ~2x the real slot fill.
+    data = [
+        {
+            "kind": "response",
+            "usage": {
+                "input_tokens": 41030,
+                "cache_read_tokens": 40000,
+                "cache_write_tokens": 0,
+                "output_tokens": 30,
+            },
+        }
+    ]
+    assert last_context_tokens(data) == 41060
 
 
 def test_last_context_tokens_zero_usage_skipped() -> None:

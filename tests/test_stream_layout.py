@@ -38,3 +38,39 @@ def test_streaming_assistant_block_grows(project_root) -> None:
     import asyncio
 
     asyncio.run(run())
+
+
+def test_reasoning_block_applies_markdown() -> None:
+    """Reasoning content is rendered as markdown (bold, code, links),
+    not as plain text."""
+    from rich.text import Text
+
+    from drcode.tui.app import ReasoningBlock
+
+    def _styled_spans(body: Text) -> list[str]:
+        return [str(s) for s in body.spans]
+
+    # Finished: full markdown render — Rich parses bold / code / links.
+    block = ReasoningBlock()
+    block._content = "**bold** and `code` and [url]link[/]"
+    block._streaming = False
+    body = block._render_body()
+    assert body is not None
+    styles = _styled_spans(body)
+    assert any("bold=True" in s for s in styles), "bold markup not styled"
+    assert any("cyan" in s for s in styles), "code markup not styled"
+
+    # Streaming: complete fragments highlighted live, partial tail stays raw.
+    block2 = ReasoningBlock()
+    block2._content = "**bold** end\nstill producing **tail**"
+    block2._streaming = True
+    body2 = block2._render_body()
+    assert body2 is not None
+    rendered2 = str(body2)
+    # The complete first line is highlighted (markdown applied): the bold
+    # markers are consumed, so it renders as the plain "bold end". The
+    # still-producing tail stays raw: its "**tail**" markers are preserved.
+    assert "bold end" in rendered2
+    assert "**tail**" in rendered2
+    assert any("bold=True" in s for s in _styled_spans(body2))
+

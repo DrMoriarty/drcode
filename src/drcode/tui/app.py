@@ -453,6 +453,11 @@ class ReasoningBlock(Static):
         self._flush_timer: Timer | None = None
         self._spin_timer: Timer | None = None
         self._spin_frame = 0
+        # Markdown render of the body, cached and invalidated on content
+        # change (see _render_body): a full markdown parse on every throttled
+        # repaint would starve the event loop that drives the UI.
+        self._body_key: tuple[Any, ...] = ()
+        self._body_text: Text | None = None
         # Chat-view epoch this block belongs to; a mid-node view_task()
         # wipes the log and bumps the app's epoch, orphaning the block.
         self.stream_epoch = -1
@@ -523,9 +528,6 @@ class ReasoningBlock(Static):
         self._redraw()
 
     def _redraw(self) -> None:
-        # Body is passed as plain Text, never as a markup string: the model's
-        # reasoning regularly contains bracket sequences ("[Binding(...") that
-        # Textual's markup parser accepts as tags (unlike Rich's escape()).
         collapsed = self.has_class("collapsed")
         arrow = "▸" if collapsed else "▾"
         status = (
@@ -537,11 +539,29 @@ class ReasoningBlock(Static):
         _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
         if not collapsed:
             text.append("\n")
-            if self._content:
-                text.append(self._content)
-            else:
-                text.append("(empty)", "dim italic")
+            body = self._render_body()
+            if body is not None:
+                text.append(body)
         self.update(text)
+
+    def _render_body(self) -> Text | None:
+        """Markdown render of the accumulated reasoning content.
+
+        Live-highlight the already-received complete fragments while the model
+        still streams; render the finished block as full markdown. The cache
+        key (streaming flag, content, rendered width) re-renders only when the
+        body actually changed — the animated spinner lives in the header, not
+        in the body.
+        """
+        if not self._content:
+            return Text("(empty)", "dim italic")
+        width = self.content_size.width or self.size.width or 80
+        if self._body_key == (self._streaming, self._content, width):
+            return self._body_text
+        renderer = _streamable_markdown if self._streaming else _markdown_text
+        self._body_key = (self._streaming, self._content, width)
+        self._body_text = renderer(self._content, width)
+        return self._body_text
 
 
 def _markdown_text(text: str, width: int) -> Text:

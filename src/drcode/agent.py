@@ -365,7 +365,10 @@ def build_agent(
         model,
         instructions=instructions,
         deps_type=AgentDeps,
-        model_settings={"extra_headers": EXTRA_HEADERS},
+        model_settings={
+            "extra_headers": EXTRA_HEADERS,
+            "max_tokens": config.max_tokens,
+        },
         retries=10,
     )
 
@@ -601,7 +604,10 @@ def build_tester_agent(
             TESTER_SYSTEM_PROMPT if allow_commit else TESTER_SYSTEM_PROMPT_NO_COMMIT
         ),
         deps_type=TesterDeps,
-        model_settings={"extra_headers": EXTRA_HEADERS},
+        model_settings={
+            "extra_headers": EXTRA_HEADERS,
+            "max_tokens": config.max_tokens,
+        },
         retries=10,
     )
 
@@ -725,7 +731,10 @@ def build_compaction_agent(config: Config) -> Agent[None, str]:
     return Agent(
         build_model(config),
         instructions=system_prompt,
-        model_settings={"extra_headers": EXTRA_HEADERS},
+        model_settings={
+            "extra_headers": EXTRA_HEADERS,
+            "max_tokens": config.max_tokens,
+        },
     )
 
 

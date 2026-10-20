@@ -1623,6 +1623,7 @@ class DrCodeApp(App[None]):
                     base_url=self.config.base_url,
                     api_key=self.config.api_key,
                     max_context_tokens=self.config.max_context_tokens,
+                    max_tokens=self.config.max_tokens,
                 ),
                 self._model_setup_done,
             )
@@ -1643,6 +1644,8 @@ class DrCodeApp(App[None]):
         self.config.health_check_url = setup.health_check_url
         if setup.max_context_tokens is not None:
             self.config.max_context_tokens = setup.max_context_tokens
+        if setup.max_tokens is not None:
+            self.config.max_tokens = setup.max_tokens
         try:
             saved = self.config.save_to_project()
         except OSError as e:

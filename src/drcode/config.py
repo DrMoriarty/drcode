@@ -95,6 +95,15 @@ class Config(BaseSettings):
     # fill as a percentage of this. Providers rarely report it — set via
     # DRCODE_MAX_CONTEXT_TOKENS when the default doesn't match the model.
     max_context_tokens: int = 200_000
+    # Per-response output token cap (tokens): the `max_tokens` model setting of
+    # pydantic-ai's OpenAIChatModel, distinct from max_context_tokens (the whole
+    # context window). It caps a single model response's output length. With
+    # no explicit value the provider's default is used, which for many gateways
+    # is far too small and fails with
+    # "Model token limit (provider default) exceeded before any response was
+    # generated." Set via DRCODE_MAX_TOKENS when the default doesn't match the
+    # model; keep it at or below max_context_tokens.
+    max_tokens: int = 8192
     # Context fill (percent of max_context_tokens) at which the agent's
     # history is compacted before the next turn: a tool-less summarizer
     # agent rewrites the transcript into a structured summary while the
@@ -171,6 +180,7 @@ class Config(BaseSettings):
                 "api_key": self.api_key,
                 "health_check_url": self.health_check_url,
                 "max_context_tokens": self.max_context_tokens,
+                "max_tokens": self.max_tokens,
             }
         )
         self.project_config_file.parent.mkdir(parents=True, exist_ok=True)

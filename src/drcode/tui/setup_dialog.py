@@ -41,6 +41,7 @@ class ModelSetup:
     base_url: str
     api_key: str
     max_context_tokens: int | None  # None = keep the default
+    max_tokens: int | None  # None = keep the default
     health_check_url: str = ""  # verified availability endpoint, cached for later runs
 
 
@@ -98,12 +99,14 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         base_url: str = "",
         api_key: str = "",
         max_context_tokens: int = 200_000,
+        max_tokens: int = 8192,
     ) -> None:
         super().__init__()
         self._initial_model = model
         self._initial_base_url = base_url
         self._initial_api_key = api_key
         self._initial_max_context_tokens = max_context_tokens
+        self._initial_max_tokens = max_tokens
         # Re-entrancy guard: Enter in an input and the Save button must
         # not start two probes in parallel.
         self._checking = False
@@ -141,6 +144,12 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 value=str(self._initial_max_context_tokens),
                 id="sd-ctx",
             )
+            yield Static("Max output tokens (optional)", classes="sd-label sd-opt")
+            yield Input(
+                placeholder=str(self._initial_max_tokens),
+                value=str(self._initial_max_tokens),
+                id="sd-tokens",
+            )
             yield Static("", id="sd-error")
             with Horizontal(id="sd-buttons"):
                 yield Button("Save", variant="primary", id="sd-save")
@@ -165,6 +174,7 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         base_url = self.query_one("#sd-url", Input).value.strip()
         api_key = self.query_one("#sd-key", Input).value.strip()
         ctx_raw = self.query_one("#sd-ctx", Input).value.strip()
+        tokens_raw = self.query_one("#sd-tokens", Input).value.strip()
         error = self.query_one("#sd-error", Static)
 
         if not model:
@@ -182,6 +192,17 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 return
             if max_context_tokens <= 0:
                 self._fail("Max context tokens must be a positive integer.", "#sd-ctx")
+                return
+
+        max_tokens: int | None = None
+        if tokens_raw:
+            try:
+                max_tokens = int(tokens_raw)
+            except ValueError:
+                self._fail("Max output tokens must be a positive integer.", "#sd-tokens")
+                return
+            if max_tokens <= 0:
+                self._fail("Max output tokens must be a positive integer.", "#sd-tokens")
                 return
 
         error.update("Checking connection…")
@@ -206,8 +227,9 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
-                health_check_url=checked_url,
                 max_context_tokens=max_context_tokens,
+                max_tokens=max_tokens,
+                health_check_url=checked_url,
             )
         )
 

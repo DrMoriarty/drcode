@@ -274,9 +274,9 @@ async def probe_model(
 TOOL_RETRY_ERRORS = (ValueError, OSError, re.error)
 
 
-async def _run_tool(fn: Callable[..., Any], *args: Any) -> Any:
+async def _run_tool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
-        return await asyncio.to_thread(fn, *args)
+        return await asyncio.to_thread(fn, *args, **kwargs)
     except TOOL_RETRY_ERRORS as e:
         raise ModelRetry(str(e) or type(e).__name__) from e
 
@@ -299,12 +299,16 @@ def _log_violation(deps: AgentDeps | TesterDeps, tool: str, error: str) -> None:
 
 
 async def _run_tool_logged(
-    deps: AgentDeps | TesterDeps, tool: str, fn: Callable[..., Any], *args: Any
+    deps: AgentDeps | TesterDeps,
+    tool: str,
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
 ) -> Any:
     """Run a tool and turn a PathViolation into a retry prompt for the model,
     logging the refusal into the task history first."""
     try:
-        return await _run_tool(fn, *args)
+        return await _run_tool(fn, *args, **kwargs)
     except PathViolation as e:
         _log_violation(deps, tool, str(e))
         raise ModelRetry(str(e)) from e
@@ -382,8 +386,18 @@ def build_agent(
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
         (1-based), up to `limit` lines."""
+        current_usage = ctx.usage.input_tokens + ctx.usage.output_tokens
         return await _run_tool_logged(
-            ctx.deps, "read_file", tools.read_file, ctx.deps.root, path, offset, limit
+            ctx.deps,
+            "read_file",
+            tools.read_file,
+            ctx.deps.root,
+            path,
+            offset,
+            limit,
+            current_usage=current_usage,
+            max_context_tokens=config.max_context_tokens,
+            compaction_threshold=config.compaction_threshold,
         )
 
     @agent.tool
@@ -618,8 +632,18 @@ def build_tester_agent(
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
         (1-based), up to `limit` lines."""
+        current_usage = ctx.usage.input_tokens + ctx.usage.output_tokens
         return await _run_tool_logged(
-            ctx.deps, "read_file", tools.read_file, ctx.deps.root, path, offset, limit
+            ctx.deps,
+            "read_file",
+            tools.read_file,
+            ctx.deps.root,
+            path,
+            offset,
+            limit,
+            current_usage=current_usage,
+            max_context_tokens=config.max_context_tokens,
+            compaction_threshold=config.compaction_threshold,
         )
 
     @agent.tool

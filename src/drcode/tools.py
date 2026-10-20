@@ -24,6 +24,16 @@ BASH_TIMEOUT = 120
 # Hard cap for a run_bash call: the agent may request a longer timeout than
 # the default, but never more than an hour — values above are clamped to it.
 BASH_MAX_TIMEOUT = 60 * 60
+# Hard cap on a single read_file result: a read larger than this (200 KiB) is
+# refused outright. The model must read the file in smaller pieces via
+# `offset`/`limit` instead — a single chunk must stay under the cap.
+MAX_READ_CHUNK_BYTES = 200 * 1024
+# Defaults for the context-budget check (overridden per run by the caller):
+# a fresh agent starts with empty context, and the default compaction threshold
+# matches Config.compaction_threshold (80).
+DEFAULT_CURRENT_USAGE = 0
+DEFAULT_MAX_CONTEXT_TOKENS = 200_000
+DEFAULT_COMPACTION_THRESHOLD = 80
 
 # Extra scratch area: the model may create/edit files here even though it is
 # outside the project — a sandbox for testing hypotheses.
@@ -102,13 +112,77 @@ def resolve_edit_path(root: Path, path: str, action: str = "write to") -> Path:
     raise _write_violation(root, path, action)
 
 
-def read_file(root: Path, path: str, offset: int = 1, limit: int = 2000) -> str:
+def _fmt_bytes(n: int) -> str:
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "Kb"
+    return f"{n}b"
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
+    return str(n)
+
+
+def _token_estimate(text_bytes: int) -> int:
+    """Rough chars→tokens heuristic (~4 bytes/token, the common rule of thumb
+    for OpenAI-compatible models). Deliberately imprecise: it only warns about
+    oversized reads, it never counts exactly."""
+    return max(1, text_bytes // 4)
+
+
+def read_file(
+    root: Path,
+    path: str,
+    offset: int = 1,
+    limit: int = 2000,
+    *,
+    current_usage: int = DEFAULT_CURRENT_USAGE,
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+) -> str:
+    """Read a text file from anywhere on the filesystem (relative paths resolve
+    against the project root). Lines are numbered, starting from `offset`
+    (1-based), up to `limit` lines.
+
+    Refuses a read that risks blowing up the model context: a single result
+    larger than the hard cap (200 KiB) is refused outright (read the file in
+    smaller pieces via `offset`/`limit`), and a read that would push the
+    context fill past the compaction threshold is also refused — the token
+    estimate of the piece is checked against the current context usage and the
+    current compaction threshold (default 80% of the context window)."""
     p = resolve_read_path(root, path)
     lines = p.read_text(errors="replace").splitlines()
     start = max(offset - 1, 0)
     chunk = lines[start : start + limit]
     numbered = [f"{start + i + 1}: {line}" for i, line in enumerate(chunk)]
-    return "\n".join(numbered) or "(empty file)"
+    text = "\n".join(numbered)
+    chunk_bytes = len(text.encode("utf-8"))
+    # Hard cap: a single read result larger than 200 KiB is refused outright;
+    # read the file in smaller pieces via `offset`/`limit`.
+    if chunk_bytes > MAX_READ_CHUNK_BYTES:
+        return (
+            f"Refusing to read '{path}': this read would return about "
+            f"{_fmt_bytes(chunk_bytes)} — more than the {_fmt_bytes(MAX_READ_CHUNK_BYTES)} "
+            f"read cap. Read the file in smaller pieces by adjusting `offset` and `limit`."
+        )
+    # Context-budget check: does this read risk exceeding the compaction
+    # threshold? `current_usage` is the tokens the model already holds.
+    threshold = min(max(compaction_threshold, 1), 100)
+    if (
+        max_context_tokens > 0
+        and current_usage + _token_estimate(chunk_bytes)
+        > threshold * max_context_tokens // 100
+    ):
+        return (
+            f"Refusing to read '{path}': this read would add about "
+            f"{_fmt_tokens(_token_estimate(chunk_bytes))} tokens, pushing the context fill "
+            f"from {_fmt_tokens(current_usage)} toward its {threshold}% compaction threshold "
+            f"({_fmt_tokens(threshold * max_context_tokens // 100)} of "
+            f"{_fmt_tokens(max_context_tokens)} tokens). "
+            f"Reduce `limit` or raise `offset` and retry to read a smaller piece."
+        )
+    return text or "(empty file)"
 
 
 def write_file(root: Path, path: str, content: str) -> str:

@@ -560,6 +560,49 @@ def _markdown_text(text: str, width: int) -> Text:
     return result
 
 
+def _streamable_markdown(text: str, width: int) -> Text:
+    """Render markdown on the longest complete prefix of *text*.
+
+    Rich parses markdown as a whole document, so it can't be streamed token
+    by token. Instead, format only the portion of *text* that ends at a
+    newline and sits outside any *unclosed* fenced code block (```/~~~), and
+    leave the partial remainder as raw text. Already-received complete
+    fragments get live highlighting; the still-producing tail stays plain —
+    an acceptable trade-off while the model is still streaming.
+    """
+    # A fenced code block is tracked via its opening/closing fences (runs of
+    # three or more backticks or tildes): while the stack is non-empty we are
+    # inside an open block, so a newline there is not a safe formatting
+    # boundary. Inline code spans (1-2 backticks) are ignored here and left
+    # to Rich (an unterminated one renders as literal text).
+    fences: list[str] = []
+    i, n = 0, len(text)
+    last_safe = -1
+    while i < n:
+        c = text[i]
+        if c in ("`", "~"):
+            run = 1
+            while i + run < n and text[i + run] == c:
+                run += 1
+            if run >= 3:
+                if fences and fences[0] == c:
+                    fences.pop()
+                elif not fences:
+                    fences.append(c)
+                # A mismatched-char fence inside a block is literal code.
+        elif c == "\n":
+            if not fences:
+                last_safe = i
+        i += 1
+
+    if last_safe == -1:
+        return Text(text)
+
+    result = _markdown_text(text[: last_safe + 1], width)
+    result.append(text[last_safe + 1 :])
+    return result
+
+
 class AssistantBlock(Static):
     """Live assistant answer, streamed directly into the chat log.
 
@@ -622,7 +665,9 @@ class AssistantBlock(Static):
         width = self.content_size.width or self.size.width or 80
         if self._text is None or self._width != width:
             if self._streaming:
-                self._text = Text(self._content)
+                # Format the already-received complete lines live; the
+                # still-producing tail streams in as raw text.
+                self._text = _streamable_markdown(self._content, width)
             else:
                 self._text = _markdown_text(self._content, width)
             self._width = width

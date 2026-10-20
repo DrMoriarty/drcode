@@ -942,6 +942,42 @@ class ServiceCommandsProvider(Provider):
                 yield Hit(score, matcher.highlight(name), callback, help=help_text)
 
 
+class ModelConfigCommandProvider(Provider):
+    """Model-connection entry in the Settings palette.
+
+    Re-opens the first-start model setup dialog, pre-filled with the
+    current model/base_url/api_key/context-size, so the user can change the
+    connection on demand (not only on first start). Save applies the new
+    values live and persists them (see `_model_setup_done`); Escape dismisses
+    without changing anything. The current status ("configured" /
+    "not configured") is shown after the colon.
+    """
+
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app = cast("DrCodeApp", self.app)
+        status = "configured" if app.config.is_ready else "not configured"
+        return [
+            (
+                f"Model settings: {status}",
+                (
+                    "Change the model id, base URL, API key and context-window "
+                    "size, then apply them immediately (user setting)"
+                ),
+                app.action_open_model_setup,
+            ),
+        ]
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._commands():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback, help=help_text)
+
+
 class ProjectSettingsCommandsProvider(Provider):
     """Project-preference commands in the Settings palette.
 
@@ -1204,6 +1240,7 @@ class DrCodeApp(App[None]):
     # own service commands (AGENTS.md refresh and friends).
     COMMANDS: ClassVar = {
         get_system_commands_provider,
+        ModelConfigCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
     }
@@ -4343,6 +4380,27 @@ class DrCodeApp(App[None]):
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
+
+    def action_open_model_setup(self) -> None:
+        """Re-open the model setup dialog on demand (a Settings entry).
+
+        Pre-filled with the current model/base_url/api_key/context-size, so
+        the user can edit the connection anytime, not just on first start.
+        The result is handled by `_model_setup_done`, which applies the new
+        values to the live config immediately and persists them.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            ModelSetupDialog(
+                model=self.config.model,
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                max_context_tokens=self.config.max_context_tokens,
+                max_tokens=self.config.max_tokens,
+            ),
+            self._model_setup_done,
+        )
 
     def action_set_completed_retention(self, retention: CompletedRetention) -> None:
         """Settings command: after how long completed tasks are deleted at

@@ -3254,7 +3254,14 @@ class DrCodeApp(App[None]):
                     # next turn is loaded, the fill is checked against the
                     # threshold; when exceeded, the transcript is summarized
                     # in place (history is computed AFTER compaction).
-                    await self._maybe_compact(task)
+                    # Check compaction early to avoid one-turn lag in detection
+                    compaction_due = self._compaction_due(task)
+                    if compaction_due is not None:
+                        # Compaction is due, trigger it now to avoid delay
+                        await self._maybe_compact(task)
+                    else:
+                        # Normal execution path
+                        await self._maybe_compact(task)
                     history = resumable_history(task.messages)
                     async with agent.iter(
                         text,

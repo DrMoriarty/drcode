@@ -118,12 +118,6 @@ def _fmt_bytes(n: int) -> str:
     return f"{n}b"
 
 
-def _fmt_tokens(n: int) -> str:
-    if n >= 1000:
-        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
-    return str(n)
-
-
 def _token_estimate(text_bytes: int) -> int:
     """Rough chars→tokens heuristic (~4 bytes/token, the common rule of thumb
     for OpenAI-compatible models). Deliberately imprecise: it only warns about
@@ -174,13 +168,15 @@ def read_file(
         and current_usage + _token_estimate(chunk_bytes)
         > threshold * max_context_tokens // 100
     ):
+        # The refusal stays neutral on purpose: exposing the absolute token
+        # count, the current fill and the compaction threshold would feed the
+        # model a "context is nearly full" signal it then worries about. The
+        # gate still protects the window — the read is refused — but the message
+        # only tells the model *that* the budget is taken, not *how much*.
         return (
-            f"Refusing to read '{path}': this read would add about "
-            f"{_fmt_tokens(_token_estimate(chunk_bytes))} tokens, pushing the context fill "
-            f"from {_fmt_tokens(current_usage)} toward its {threshold}% compaction threshold "
-            f"({_fmt_tokens(threshold * max_context_tokens // 100)} of "
-            f"{_fmt_tokens(max_context_tokens)} tokens). "
-            f"Reduce `limit` or raise `offset` and retry to read a smaller piece."
+            f"Refusing to read '{path}': this read would exceed the model's "
+            f"current context budget. Read the file in smaller pieces by lowering "
+            f"`limit` or raising `offset`, then retry."
         )
     return text or "(empty file)"
 

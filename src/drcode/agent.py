@@ -401,6 +401,21 @@ def build_agent(
         )
 
     @agent.tool
+    async def context_status(ctx: RunContext[AgentDeps]) -> str:
+        """Report the current context fill for this run: how many tokens the
+        model already holds (input + output) out of the configured maximum, the
+        percent used and how many tokens remain before the compaction threshold.
+        Use it when you are unsure how much room you have — it gives the exact
+        current numbers so you can decide when to stop reading, without having
+        to guess or fret over a vague "nearly full" signal."""
+        tokens = ctx.usage.input_tokens + ctx.usage.output_tokens
+        return _context_status(
+            tokens,
+            config.max_context_tokens,
+            config.compaction_threshold,
+        )
+
+    @agent.tool
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file. Only the project root (with all subdirectories)
         and /tmp (with all subdirectories) are writable; use /tmp to test hypotheses."""
@@ -644,6 +659,21 @@ def build_tester_agent(
             current_usage=current_usage,
             max_context_tokens=config.max_context_tokens,
             compaction_threshold=config.compaction_threshold,
+        )
+
+    @agent.tool
+    async def context_status(ctx: RunContext[TesterDeps]) -> str:
+        """Report the current context fill for this round: how many tokens the
+        model already holds (input + output) out of the configured maximum, the
+        percent used and how many tokens remain before the compaction threshold.
+        Use it when you are unsure how much room you have — it gives the exact
+        current numbers so you can decide when to stop reading, without having
+        to guess or fret over a vague "nearly full" signal."""
+        tokens = ctx.usage.input_tokens + ctx.usage.output_tokens
+        return _context_status(
+            tokens,
+            config.max_context_tokens,
+            config.compaction_threshold,
         )
 
     @agent.tool
@@ -954,6 +984,28 @@ def _usage_context_tokens(input_tokens: int, output_tokens: int) -> int:
     all providers, so `input_tokens` already INCLUDES cache reads/writes
     (cache fields must not be added on top)."""
     return input_tokens + output_tokens
+
+
+def _context_status(
+    tokens: int | None, max_tokens: int, compaction_threshold: int
+) -> str:
+    """Calm context-fill report for the model: how many tokens it already
+    holds, what percent of the window that is, and how many tokens remain
+    before the compaction threshold. Only states the numbers — never alarms —
+    so the model can manage its own reading instead of guessing, or fretting
+    over a leaky "nearly full" signal."""
+    if not tokens:
+        return "Context fill: empty (0 tokens loaded)."
+    if max_tokens <= 0:
+        return f"Context fill: {tokens} tokens loaded (no maximum configured)."
+    pct = round(tokens * 100 / max_tokens)
+    threshold_tokens = round(compaction_threshold * max_tokens / 100)
+    headroom = threshold_tokens - tokens
+    return (
+        f"Context fill: {tokens} tokens loaded of {max_tokens} "
+        f"({pct}% used). {headroom} tokens of headroom before the "
+        f"{compaction_threshold}% compaction threshold ({threshold_tokens} tokens)."
+    )
 
 
 def last_context_tokens(data: list[dict[str, Any]]) -> int | None:

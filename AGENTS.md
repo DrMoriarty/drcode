@@ -20,12 +20,13 @@ No CI or pre-commit hooks exist — verify changes with ruff + pyright + pytest,
 - System/compaction/init prompts are package data in `src/drcode/prompts/`, read as text at import time (`prompts.py`) and shipped in the wheel via the pyproject `include`.
 - Standalone binary: `bash scripts/build-binary.sh` (provisions PyInstaller via `uv sync --group build`; platform-specific, no cross-compilation). Onedir on purpose — see README for why; `DRCODE_ONEFILE=1` builds the legacy single-file. `drcode_entry.py` is the PyInstaller stub; it sets `PYDANTIC_DISABLE_PLUGINS=logfire-plugin,logfire` because the logfire pydantic plugin crashes in a frozen app.
 - Headless CLI (entry point `drcode:main`): `drcode --bug-report DESC` / `--feature-request DESC` create a task without the TUI; `--git-hub-sync` runs one GitHub Issues sync cycle.
+- Releases are tag-driven: pushing a `v*` tag runs `.github/workflows/build-binaries.yml`, which builds the onedir bundle per platform (macOS arm64, Linux x86_64/arm64, Windows) and attaches archives to a GitHub Release. No CI runs tests — local `ruff` + `pyright` + `pytest` is the only gate.
 
 ## Configuration gotcha
 
 The agent needs `model` and `base_url`; `api_key` is optional (keyless local gateways work). Settings are layered (higher wins): `DRCODE_*` env vars > project `.env` / project `.drcode/drcode.json` > user-level `~/.config/drcode/drcode.json` (XDG_CONFIG_HOME-aware) > built-in defaults (see `src/drcode/config.py`; a corrupted json file is skipped, never fatal). On first start the user config dir is scaffolded with `drcode.json.example` built from the `Config` fields — when adding a new user-configurable field without a sensible default, add a placeholder to `_EXAMPLE_PLACEHOLDERS` in `config.py`. When nothing anywhere provides model/base_url, the TUI opens a modal setup dialog on startup: model and URL are required, ESC skips (app runs without a model — tasks still work, pipeline stays idle); Save probes the endpoint live and persists the values into `<project>/.drcode/drcode.json` (`Config.save_to_project`, merged with existing keys). `base_url` defaults to the OpenAI API; any OpenAI-compatible endpoint works.
 
-Project-scoped user preferences (retention, task finalization, stall nudge, GitHub sync) live separately in `<project>/.drcode/settings.json` (`src/drcode/settings.py`, `ProjectSettings`) — deliberately NOT part of `Config`, which is env-driven model/API settings.
+Project-scoped user preferences (retention, task finalization, stall nudge, GitHub sync, ntfy notifications) live separately in `<project>/.drcode/settings.json` (`src/drcode/settings.py`, `ProjectSettings`) — deliberately NOT part of `Config`, which is env-driven model/API settings.
 
 ## Architecture
 
@@ -45,4 +46,4 @@ Task-centric coding agent (pydantic-ai + textual), inspired by opencode. Single 
 
 ## Testing quirks
 
-`tests/conftest.py` has an autouse fixture that sandboxes every test: the user config dir (`config._USER_CONFIG_DIR` and friends) is monkeypatched into a tmp path, the dotenv source is disabled (the repo's own `.env` must not leak), and all `DRCODE_*` variables are stripped — keep this in mind when adding config-layering tests. Common fixtures: `project_root` (fresh tmp dir, the agent's writable root), `manager` (TaskManager over it), `user_config_dir`.
+`tests/conftest.py` has an autouse fixture that sandboxes every test: the user config dir (`config._USER_CONFIG_DIR` and friends) is monkeypatched into a tmp path, the dotenv source is disabled (the repo's own `.env` must not leak), and all `DRCODE_*` variables are stripped — keep this in mind when adding config-layering tests. Common fixtures: `project_root` (fresh tmp dir, the agent's writable root), `manager` (TaskManager over it), `user_config_dir`. The `test_network_*` suite exercises model/network failures (outages, retries, recovery) exclusively through the stubs in `tests/network_mocks.py` — no real API access is needed anywhere.

@@ -536,7 +536,10 @@ class ModelCatalogApp(App[None]):
     TITLE = "drcode models"
 
     def on_mount(self) -> None:
-        self.push_screen(ModelCatalogScreen())
+        # The catalog screen is the whole UI here: dismissing it (esc) is
+        # the same as quitting — without this the app would linger on an
+        # empty black screen, forcing the user to guess for ctrl+q.
+        self.push_screen(ModelCatalogScreen(), callback=lambda _: self.exit())
 
 
 def main() -> None:

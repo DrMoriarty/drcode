@@ -166,3 +166,16 @@ async def test_seeded_screen_escape_discards_seed(tmp_path: Path) -> None:
         # Quitting without saving: no models.json is created, the flat
         # config keeps working as before.
         assert not path.exists()
+
+
+async def test_standalone_app_escape_quits() -> None:
+    """The `drcode-models` utility has the catalog screen as its whole UI:
+    pressing esc must exit the app, not leave an empty black terminal."""
+    from drcode.tui.model_setup_app import ModelCatalogApp
+
+    app = ModelCatalogApp()
+    async with app.run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.return_code == 0

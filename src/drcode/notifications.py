@@ -121,27 +121,27 @@ class PendingNotification(BaseModel):
 
 
 def _status_text(status: TaskStatus, task: Task) -> str:
-    """Human-readable one-liner for a status transition (Russian, matching
+    """Human-readable one-liner for a status transition (English, matching
     the rest of the user-facing strings of the app)."""
     if status.value == "active":
-        return "взята в разработку"
+        return "taken into development"
     if status.value == "testing":
-        return "разработка завершена — ожидает тестирования"
+        return "development finished — awaiting testing"
     if status.value == "completed":
         verdict = ""
         if task.verification is not None:
             verdict = (
-                " (тестирование пройдено)"
+                " (testing passed)"
                 if task.verification is VerificationStatus.PASSED
-                else " (тестирование ПРОВАЛЕНО)"
+                else " (testing FAILED)"
             )
-        return f"завершена{verdict}"
+        return f"completed{verdict}"
     if status.value == "clarification":
-        return "ждёт ответа на уточняющий вопрос"
+        return "awaiting an answer to a clarifying question"
     if status.value == "hold":
-        return "приостановлена (hold)"
+        return "on hold"
     if status.value == "queued":
-        return "возвращена в очередь"
+        return "returned to the queue"
     return status.value
 
 
@@ -263,8 +263,8 @@ class Notifier:
             return entry.message
         return (
             f"{entry.message}\n"
-            f"⏰ отложенное уведомление: возникло "
-            f"{entry.created_at:%d.%m.%Y %H:%M:%S}, отправлено с задержкой"
+            f"⏰ deferred notification: arose at "
+            f"{entry.created_at:%d.%m.%Y %H:%M:%S}, delivered late"
         )
 
     def _attempt_send(self, entry: PendingNotification) -> bool:
@@ -440,9 +440,10 @@ class Notifier:
             return
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
+        # Текст уведомления: "задача <status>" / "#{id} «{title}» — <описание статуса>".
         self.notify(
-            self._title(f"задача {new.value}"),
-            f"#{task.id} «{task.title}» — {_status_text(new, task)}",
+            self._title(f"task {new.value}"),
+            f'#{task.id} "{task.title}" — {_status_text(new, task)}',
             tags=["clipboard" if new.value == "completed" else "hammer_and_wrench"],
             priority=(
                 Priority.HIGH
@@ -454,10 +455,10 @@ class Notifier:
     def github_sync(self, imported: int, skipped: int) -> None:
         """A completed GitHub Issues sync cycle with its outcome."""
         self.notify(
-            self._title("синхронизация GitHub"),
+            self._title("GitHub sync"),
             (
-                f"Синхронизация с GitHub завершена: импортировано задач — "
-                f"{imported}, пропущено — {skipped}."
+                f"GitHub sync finished: tasks imported — "
+                f"{imported}, skipped — {skipped}."
             ),
             tags=["github"],
         )
@@ -482,15 +483,15 @@ class Notifier:
         self._settled_state = state
         if blocked:
             self.notify(
-                self._title("конвейер простаивает"),
-                f"Нет задач, которые можно взять в разработку. {detail}",
+                self._title("pipeline idle"),
+                f"No tasks can be taken into development. {detail}",
                 tags=["warning"],
                 priority=Priority.HIGH,
             )
         else:
             self.notify(
-                self._title("очередь пуста"),
-                "Все задачи обработаны — новых задач в очереди нет.",
+                self._title("queue empty"),
+                "All tasks processed — no new tasks in the queue.",
                 tags=["white_check_mark"],
                 priority=Priority.HIGH,
             )
@@ -501,9 +502,9 @@ class Notifier:
         error exclusion was forcibly lifted from all of them and they are
         back in development by the ordinary priority rules."""
         self.notify(
-            self._title("задачи с ошибкой вернулись в разработку"),
-            f"В очереди не осталось задач без ошибок: задач с ошибкой — "
-            f"{count}. Все они снова возвращены в разработку.",
+            self._title("failed tasks back in development"),
+            f"No error-free tasks left in the queue: failed tasks — "
+            f"{count}. All of them are back in development.",
             tags=["arrows_counterclockwise"],
             priority=Priority.HIGH,
         )

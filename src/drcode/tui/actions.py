@@ -284,9 +284,10 @@ class ActionsLayer(DrCodeState):
             self._current_tool = None
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
+        # Сервисное событие: "Задача отменена пользователем — снята с конвейера без тестирования".
         self._show_event(
             task,
-            "Задача отменена пользователем — снята с конвейера без тестирования.",
+            "Task cancelled by the user — removed from the pipeline without testing.",
         )
         self.refresh_sidebar()
         self.refresh_status()
@@ -642,9 +643,9 @@ class ActionsLayer(DrCodeState):
             # A test push right away: the user sees the channel works (or
             # that the topic is wrong) without waiting for a real event.
             self.notifier.notify(
-                "DrCode: уведомления включены",
-                f"Проект «{self.project_root.name}»: проверочное "
-                "уведомление — канал работает.",
+                "DrCode: notifications enabled",
+                f"Project \"{self.project_root.name}\": test "
+                "notification — the channel works.",
                 tags=["bell"],
             )
 
@@ -819,5 +820,3 @@ class ActionsLayer(DrCodeState):
         if not 0 <= index < len(task.clarification.options):
             return
         self._submit_user_text(task, task.clarification.options[index])
-
-

@@ -827,7 +827,7 @@ async def test_all_failed_queue_is_rescued_and_redeveloped(
     rescue_events = [
         t
         for t in event_texts(a) + event_texts(b)
-        if "исключение снято" in t
+        if "exclusion lifted" in t
     ]
     assert len(rescue_events) == 2
     # Each brief was sent exactly once (the failure never re-queues text).

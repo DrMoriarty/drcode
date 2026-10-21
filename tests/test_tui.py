@@ -456,7 +456,7 @@ async def test_pipeline_settled_notification_primes_then_sends(
         app._advance()
         await pilot.pause()
         assert len(sent) == 1
-        assert "пуста" in sent[0][0]
+        assert "empty" in sent[0][0]
         # Another _advance() with the same (empty) state: deduplicated.
         app._advance()
         await pilot.pause()

@@ -85,8 +85,8 @@ def test_status_and_kind_values() -> None:
 
 
 def test_verification_labels() -> None:
-    assert VerificationStatus.PASSED.value == "Проверено успешно"
-    assert VerificationStatus.FAILED.value == "Проверено с ошибками"
+    assert VerificationStatus.PASSED.value == "Verified successfully"
+    assert VerificationStatus.FAILED.value == "Verification failed"
 
 
 def test_task_event_defaults() -> None:

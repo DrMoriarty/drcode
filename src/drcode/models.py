@@ -40,8 +40,9 @@ class TaskKind(str, enum.Enum):
 
 
 class VerificationStatus(str, enum.Enum):
-    PASSED = "Проверено успешно"
-    FAILED = "Проверено с ошибками"
+    # Метка, которую тестировщик ставит задаче: "Проверено успешно" / "Проверено с ошибками".
+    PASSED = "Verified successfully"
+    FAILED = "Verification failed"
 
 
 class TaskEvent(BaseModel):

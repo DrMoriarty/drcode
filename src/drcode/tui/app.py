@@ -504,7 +504,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         try:
             self.call_from_thread(
                 self.notify,
-                f"Не удалось отправить уведомление: {text}",
+                f"Failed to send notification: {text}",
                 title="Notifications",
                 severity="warning",
                 timeout=6,
@@ -529,9 +529,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # The startup cleanup removed something — say so, so deleted
             # history never "silently vanishes".
             self.notify(
-                f"Удалено завершённых задач: {len(self._purged_tasks)} "
+                f"Deleted completed tasks: {len(self._purged_tasks)} "
                 f"({self.settings.completed_retention.label})",
-                title="Автоочистка",
+                title="Auto cleanup",
                 timeout=6,
             )
         self.refresh_project_info()

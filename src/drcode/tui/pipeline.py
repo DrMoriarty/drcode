@@ -265,9 +265,9 @@ class PipelineLayer(DrCodeState):
             self._agent_failed.discard(t.id)
             self._show_event(
                 t,
-                "Задача завершалась ошибкой и была исключена из разработки "
-                "до конца сессии; в очереди не осталось задач без ошибок — "
-                "исключение снято, задача снова возвращена в разработку.",
+                "Task failed and was excluded from development "
+                "for the rest of the session; no error-free tasks remain "
+                "in the queue — exclusion lifted, task back in development.",
             )
         self.notifier.failed_tasks_requeued(len(queued))
         return self.manager.promote_next()
@@ -308,15 +308,15 @@ class PipelineLayer(DrCodeState):
         reasons: list[str] = []
         held = sum(1 for t in remaining if t.status is TaskStatus.HOLD)
         if held:
-            reasons.append(f"на удержании (hold): {held}")
+            reasons.append(f"on hold: {held}")
         awaiting = sum(
             1 for t in remaining if t.status is TaskStatus.AWAITING_CLARIFICATION
         )
         if awaiting:
-            reasons.append(f"ждут уточняющего вопроса: {awaiting}")
+            reasons.append(f"awaiting a clarifying question: {awaiting}")
         failed = sum(1 for t in remaining if t.id in self._agent_failed)
         if failed:
-            reasons.append(f"завершились ошибкой в этой сессии: {failed}")
+            reasons.append(f"failed this session: {failed}")
         idle = sum(
             1
             for t in remaining
@@ -326,10 +326,10 @@ class PipelineLayer(DrCodeState):
             and not t.unfinished
         )
         if idle:
-            reasons.append(f"в очереди без текста задачи: {idle}")
+            reasons.append(f"queued without task text: {idle}")
         self.notifier.pipeline_idle(
             blocked=True,
-            detail=("Причины: " + ", ".join(reasons) + ".") if reasons else "",
+            detail=("Reasons: " + ", ".join(reasons) + ".") if reasons else "",
             prime=not self._notifications_primed,
         )
         self._notifications_primed = True
@@ -1439,4 +1439,3 @@ class PipelineLayer(DrCodeState):
     # -- actions ---------------------------------------------------------------------
 
     # -- new task mode ---------------------------------------------------------------
-

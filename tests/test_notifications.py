@@ -108,13 +108,13 @@ def test_notifier_publishes_json_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = ProjectSettings(notifications_enabled=True, ntfy_topic="topic1")
     notifier = Notifier(lambda: settings, ntfy_base="https://ntfy.sh/")
 
-    notifier.notify("заголовок", "сообщение", tags=["bell"], priority=Priority.HIGH)
+    notifier.notify("tïtle", "messäge", tags=["bell"], priority=Priority.HIGH)
     assert len(sent) == 1
     payload = sent[0]
     assert payload["topic"] == "topic1"
     # Non-ASCII titles/messages must survive (JSON publish, not headers).
-    assert payload["title"] == "заголовок"
-    assert payload["message"] == "сообщение"
+    assert payload["title"] == "tïtle"
+    assert payload["message"] == "messäge"
     assert payload["tags"] == ["bell"]
     assert payload["priority"] == 4  # ntfy JSON publish: priority must be an int
 
@@ -205,14 +205,14 @@ def test_failed_send_is_persisted_with_timestamp(
     notifier = _notifier(settings, project_root)
 
     before = datetime.now().astimezone()
-    notifier.notify("заголовок", "сообщение", tags=["bell"], priority=Priority.HIGH)
+    notifier.notify("tïtle", "messäge", tags=["bell"], priority=Priority.HIGH)
 
     raw = _read_pending_file(project_root)
     assert len(raw) == 1
     entry = raw[0]
     assert entry["topic"] == "topic1"
-    assert entry["title"] == "заголовок"
-    assert entry["message"] == "сообщение"
+    assert entry["title"] == "tïtle"
+    assert entry["message"] == "messäge"
     assert entry["tags"] == ["bell"]
     assert entry["priority"] == 4
     # The timestamp of the moment the notification arose is stored.
@@ -220,7 +220,7 @@ def test_failed_send_is_persisted_with_timestamp(
     assert abs((created - before).total_seconds()) < 60
     # The pending copy keeps the original text; the delay note is added
     # only when the notification is actually re-sent.
-    assert "задержк" not in entry["message"]
+    assert "deferred" not in entry["message"]
 
 
 def test_new_notifications_queue_behind_unsent_ones(
@@ -266,9 +266,9 @@ def test_retry_delivers_in_order_with_delay_note_then_clears_file(
     assert _wait_until(lambda: len(notifier._pending) == 0)
     assert [e["title"] for e in _sent] == ["first", "second"]
     # Both re-sends say they are late and when each notification arose.
-    assert "задержк" in _sent[0]["message"]
-    assert "отложенное" in _sent[0]["message"]
-    assert "задержк" in _sent[1]["message"]
+    assert "deferred" in _sent[0]["message"]
+    assert "delivered late" in _sent[0]["message"]
+    assert "deferred" in _sent[1]["message"]
     # Success: the file is removed.
     assert not (project_root / ".drcode" / "pending_notifications.json").exists()
 
@@ -298,7 +298,7 @@ def test_startup_flushes_saved_pending_file(
     # And a new notification is delivered right after the backlog.
     restarted.notify("third", "m3")
     assert [e["title"] for e in _sent] == ["first", "second", "third"]
-    assert "задержк" not in _sent[2]["message"]  # it was not delayed
+    assert "deferred" not in _sent[2]["message"]  # it was not delayed
 
 
 def test_startup_preserves_arisen_at_timestamp(
@@ -316,10 +316,10 @@ def test_startup_preserves_arisen_at_timestamp(
     monkeypatch.setattr(mod.httpx, "post", _capture_post)
     _sent.clear()
     _notifier(settings, project_root)
-    assert "задержк" in _sent[0]["message"]
+    assert "deferred" in _sent[0]["message"]
     # The delay note carries the original arisen-at moment, not the
     # restart moment.
-    stamp = _sent[0]["message"].split("возникло ")[1].split(",")[0]
+    stamp = _sent[0]["message"].split("arose at ")[1].split(",")[0]
     restored = datetime.strptime(stamp, "%d.%m.%Y %H:%M:%S").astimezone()
     assert abs((restored - before).total_seconds()) < 60
 
@@ -374,12 +374,12 @@ def test_title_includes_project_folder(monkeypatch: pytest.MonkeyPatch) -> None:
 
     notifier.task_status(_task(), TaskStatus.QUEUED, TaskStatus.ACTIVE, "system")
     assert len(sent) == 1
-    assert sent[0]["title"] == "DrCode (myproject): задача active"
+    assert sent[0]["title"] == "DrCode (myproject): task active"
 
     # Without a project the plain "DrCode:" prefix is kept.
     notifier = Notifier(lambda: settings)
     notifier.task_status(_task(), TaskStatus.QUEUED, TaskStatus.ACTIVE, "system")
-    assert sent[1]["title"] == "DrCode: задача active"
+    assert sent[1]["title"] == "DrCode: task active"
 
 
 # -- event semantics ----------------------------------------------------------
@@ -425,18 +425,18 @@ def test_completion_verdict_matches_verification_label(
     passed = _task()
     passed.verification = VerificationStatus.PASSED
     notifier.task_status(passed, TaskStatus.TESTING, TaskStatus.COMPLETED, "system")
-    assert "тестирование пройдено" in sent[0]["message"]
-    assert "ПРОВАЛЕНО" not in sent[0]["message"]
+    assert "testing passed" in sent[0]["message"]
+    assert "FAILED" not in sent[0]["message"]
 
     failed = _task()
     failed.verification = VerificationStatus.FAILED
     notifier.task_status(failed, TaskStatus.TESTING, TaskStatus.COMPLETED, "system")
-    assert "тестирование ПРОВАЛЕНО" in sent[1]["message"]
+    assert "testing FAILED" in sent[1]["message"]
 
     # No verdict at all (completed without the tester): no verdict suffix.
     plain = _task()
     notifier.task_status(plain, TaskStatus.ACTIVE, TaskStatus.COMPLETED, "system")
-    assert "тестирование" not in sent[2]["message"]
+    assert "testing" not in sent[2]["message"]
 
 
 def test_github_sync_notification(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -461,11 +461,11 @@ def test_pipeline_idle_dedup_and_priming(monkeypatch: pytest.MonkeyPatch) -> Non
     notifier.pipeline_idle(blocked=False, detail="")
     assert sent == []
     # Transition empty -> blocked -> empty: two notifications.
-    notifier.pipeline_idle(blocked=True, detail="Причины: на удержании (hold): 1.")
+    notifier.pipeline_idle(blocked=True, detail="Reasons: on hold: 1.")
     notifier.pipeline_idle(blocked=False, detail="")
     assert len(sent) == 2
-    assert "удержании" in sent[0]["message"]
-    assert "пуста" in sent[1]["title"]
+    assert "on hold" in sent[0]["message"]
+    assert "empty" in sent[1]["title"]
 
 
 # -- TaskManager observer wiring -----------------------------------------------

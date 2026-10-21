@@ -31,7 +31,6 @@ from drcode.agent import (
     serialize_messages,
 )
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
-from drcode.tui import app as app_module
 from drcode.tui import pipeline as pipeline_module
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (

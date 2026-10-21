@@ -177,6 +177,37 @@ def test_task_status_skips_user_origin(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(sent) == 1
 
 
+def test_completion_verdict_matches_verification_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the verdict in the completion notification must follow
+    the actual verification label (the enum values are Russian strings —
+    comparing them against "passed" silently marked every passed task as
+    ПРОВАЛЕНО)."""
+    from drcode.models import VerificationStatus
+
+    _run_notifier_now(monkeypatch)
+    sent = _capture_deliver(monkeypatch)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = Notifier(lambda: settings)
+
+    passed = _task()
+    passed.verification = VerificationStatus.PASSED
+    notifier.task_status(passed, TaskStatus.TESTING, TaskStatus.COMPLETED, "system")
+    assert "тестирование пройдено" in sent[0]["message"]
+    assert "ПРОВАЛЕНО" not in sent[0]["message"]
+
+    failed = _task()
+    failed.verification = VerificationStatus.FAILED
+    notifier.task_status(failed, TaskStatus.TESTING, TaskStatus.COMPLETED, "system")
+    assert "тестирование ПРОВАЛЕНО" in sent[1]["message"]
+
+    # No verdict at all (completed without the tester): no verdict suffix.
+    plain = _task()
+    notifier.task_status(plain, TaskStatus.ACTIVE, TaskStatus.COMPLETED, "system")
+    assert "тестирование" not in sent[2]["message"]
+
+
 def test_github_sync_notification(monkeypatch: pytest.MonkeyPatch) -> None:
     _run_notifier_now(monkeypatch)
     sent = _capture_deliver(monkeypatch)

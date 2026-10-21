@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .models import VerificationStatus
+
 if TYPE_CHECKING:
     from .models import Task, TaskStatus
     from .settings import ProjectSettings
@@ -74,7 +76,7 @@ def _status_text(status: TaskStatus, task: Task) -> str:
         if task.verification is not None:
             verdict = (
                 " (тестирование пройдено)"
-                if task.verification.value == "passed"
+                if task.verification is VerificationStatus.PASSED
                 else " (тестирование ПРОВАЛЕНО)"
             )
         return f"завершена{verdict}"

@@ -24,6 +24,7 @@ from textual import work
 from ..agent import (
     AgentDeps,
     TesterDeps,
+    all_user_prompts,
     backdate_user_prompt,
     build_agent,
     build_compaction_agent,
@@ -32,7 +33,6 @@ from ..agent import (
     compacted_messages,
     ends_with_open_request,
     extract_previous_summary,
-    first_user_prompt,
     is_pending_retry,
     is_summary_message,
     last_context_tokens,
@@ -71,7 +71,6 @@ from .usage import (
 
 
 class PipelineLayer(DrCodeState):
-
     async def _check_model(self) -> None:
         label = self.model_status
         was_error = label.has_class("error")
@@ -118,7 +117,6 @@ class PipelineLayer(DrCodeState):
     _TPS_WINDOW = 6.0
     _TPS_MIN_SPAN = 1.5
 
-
     def _record_stream_tokens(self, text: str) -> None:
         """Record a streamed delta for the live tok/s estimate.
 
@@ -131,13 +129,11 @@ class PipelineLayer(DrCodeState):
         self._tps_samples.append((now, max(1, len(text) // 4)))
         self._prune_tps_samples(now)
 
-
     def _prune_tps_samples(self, now: float) -> None:
         cutoff = now - self._TPS_WINDOW
         samples = self._tps_samples
         while samples and samples[0][0] < cutoff:
             samples.popleft()
-
 
     def _tokens_per_second(self) -> float | None:
         """Output rate over the sliding window (None = nothing measurable:
@@ -151,7 +147,6 @@ class PipelineLayer(DrCodeState):
         if span < self._TPS_MIN_SPAN:
             return None
         return sum(n for _, n in samples) / span
-
 
     def _next_testing(self) -> Task | None:
         """Oldest task in TESTING (crash/abort mid-test) whose retry backoff
@@ -167,7 +162,6 @@ class PipelineLayer(DrCodeState):
             ),
             None,
         )
-
 
     def _advance(self) -> None:
         """The single pipeline gate: testing always has absolute priority.
@@ -292,9 +286,7 @@ class PipelineLayer(DrCodeState):
         if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
             return
         remaining = [
-            t
-            for t in self.manager.all_tasks()
-            if t.status is not TaskStatus.COMPLETED
+            t for t in self.manager.all_tasks() if t.status is not TaskStatus.COMPLETED
         ]
         if not remaining:
             self.notifier.pipeline_idle(
@@ -335,7 +327,6 @@ class PipelineLayer(DrCodeState):
         )
         self._notifications_primed = True
 
-
     def _persist_task_messages(
         self, task: Task, run: AgentRun[AgentDeps, str] | None
     ) -> None:
@@ -368,7 +359,6 @@ class PipelineLayer(DrCodeState):
         task.messages = serialize_messages(messages)
         self.manager.storage.save(task)
 
-
     def _persist_tester_messages(
         self, task: Task, run: AgentRun[TesterDeps, str] | None
     ) -> None:
@@ -391,7 +381,6 @@ class PipelineLayer(DrCodeState):
         task.tester_messages[-1] = serialize_messages(messages)
         self.manager.storage.save(task)
 
-
     def _fill_over_threshold(
         self,
         live_tokens: int | None,
@@ -412,13 +401,11 @@ class PipelineLayer(DrCodeState):
             return None
         return tokens
 
-
     def _compaction_due(self, task: Task) -> int | None:
         """Compaction threshold check for the main agent transcript."""
         return self._fill_over_threshold(
             self._live_ctx_tokens.get(task.id), task.messages
         )
-
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -477,7 +464,6 @@ class PipelineLayer(DrCodeState):
         )
         if self.viewed_id == task.id:
             self.view_task(task.id)
-
 
     async def _maybe_compact_tester_round(
         self, task: Task, live_tokens: int | None
@@ -547,7 +533,6 @@ class PipelineLayer(DrCodeState):
         if self.viewed_id == task.id:
             self.view_task(task.id)
         return True
-
 
     @work(exclusive=True, group="agent")
     async def run_agent(self, task_id: str) -> None:
@@ -1137,7 +1122,6 @@ class PipelineLayer(DrCodeState):
 
     # -- tester run ------------------------------------------------------------------
 
-
     def _schedule_tester_retry(self, task_id: str) -> None:
         """Backoff before the next tester attempt for a failed task.
 
@@ -1148,7 +1132,6 @@ class PipelineLayer(DrCodeState):
         delay = min(5 * 2 ** (count - 1), 300)
         self._tester_retry_at[task_id] = time.monotonic() + delay
         self.set_timer(delay, self._advance)
-
 
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
@@ -1207,11 +1190,22 @@ class PipelineLayer(DrCodeState):
             )
             try:
                 prompt = f"Verify completed task #{task.id}: {task.title}"
-                # The tester needs the original assignment to paraphrase it
-                # into a commit message (see the git_commit step in its prompt).
-                original = first_user_prompt(task.messages)
-                if original and original != task.title:
-                    prompt += f"\n\nOriginal task:\n{original}"
+                # The tester needs the original assignment (to paraphrase it
+                # into a commit message — see the git_commit step in its
+                # prompt) plus every clarification the user sent while the
+                # task was being worked on, so the verification targets the
+                # CURRENT intent, not a stale initial one.
+                user_prompts = [
+                    p for p in all_user_prompts(task.messages) if p != task.title
+                ]
+                if user_prompts:
+                    prompt += f"\n\nOriginal task:\n{user_prompts[0]}"
+                if len(user_prompts) > 1:
+                    prompt += (
+                        "\n\nUser clarifications sent during development "
+                        "(in order, latest last):\n"
+                        + "\n\n".join(f"- {c}" for c in user_prompts[1:])
+                    )
                 # A GitHub-imported task must link its commit back to the
                 # originating issue ("Fixes #N" keyword in the message).
                 if task.github_issue is not None:

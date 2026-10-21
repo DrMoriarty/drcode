@@ -234,9 +234,7 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     return True
 
 
-def backdate_user_prompt(
-    messages: list[ModelMessage], text: str, at: datetime
-) -> None:
+def backdate_user_prompt(messages: list[ModelMessage], text: str, at: datetime) -> None:
     """Stamp the user request carrying `text` with `at` — the moment the
     user typed the prompt — in place.
 
@@ -271,6 +269,30 @@ def first_user_prompt(messages: list[dict[str, Any]]) -> str:
                 if isinstance(content, str) and content.strip():
                     return content.strip()
     return ""
+
+
+def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
+    """All user prompts of a serialized transcript, in chronological order.
+
+    The original assignment plus every later clarification the user sent
+    while the task was being worked on. Used to hand the tester the full
+    user-side context (the first prompt alone can be stale once the task
+    was refined mid-flight). Synthetic compaction-summary requests are not
+    user prompts and are skipped.
+    """
+    prompts: list[str] = []
+    for msg in messages:
+        if msg.get("kind") != "request" and msg.get("role") != "request":
+            continue
+        for part in msg.get("parts", []):
+            if part.get("part_kind") == "user-prompt":
+                content = part.get("content")
+                if isinstance(content, str) and content.strip():
+                    text = content.strip()
+                    if text.startswith(COMPACTION_SUMMARY_PREFIX):
+                        continue
+                    prompts.append(text)
+    return prompts
 
 
 def _message_time(msg: dict[str, Any]) -> datetime | None:

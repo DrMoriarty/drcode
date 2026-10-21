@@ -59,6 +59,7 @@ from .tool_runtime import (
 from .transcript import (
     COMPACTION_SUMMARY_PREFIX,
     _context_status,
+    all_user_prompts,
     backdate_user_prompt,
     ctx_context_tokens,
     ends_with_open_request,
@@ -91,6 +92,7 @@ __all__ = [
     "_run_bash_logged",
     "_run_tool",
     "_run_tool_logged",
+    "all_user_prompts",
     "backdate_user_prompt",
     "build_agent",
     "build_compaction_agent",
@@ -293,9 +295,7 @@ def build_agent(
             your own, ask via ask_clarifying_question whether a task should be
             filed. `title` is a short summary of the desired change;
             `description` details what should be done and why."""
-            feature = ctx.deps.manager.create(
-                title, description, kind=TaskKind.FEATURE
-            )
+            feature = ctx.deps.manager.create(title, description, kind=TaskKind.FEATURE)
             return (
                 f"Feature request #{feature.id} '{feature.title}' created at "
                 "the tail of the queue."

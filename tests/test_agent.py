@@ -21,6 +21,7 @@ from drcode import agent as agent_mod
 from drcode.agent import (
     COMPACTION_SUMMARY_PREFIX,
     AgentDeps,
+    all_user_prompts,
     build_compaction_prompt,
     compacted_messages,
     ends_with_open_request,
@@ -155,6 +156,37 @@ def test_first_user_prompt() -> None:
     data = serialize_messages([user_msg("  the task  "), text_response("x")])
     assert first_user_prompt(data) == "the task"
     assert first_user_prompt([]) == ""
+
+
+def test_all_user_prompts() -> None:
+    data = serialize_messages(
+        [
+            user_msg("  the task  "),
+            text_response("x"),
+            user_msg("actually use sqlite"),
+            tool_call_response(),
+            tool_return_msg(),
+            text_response("ok"),
+            user_msg("and add tests"),
+        ]
+    )
+    assert all_user_prompts(data) == [
+        "the task",
+        "actually use sqlite",
+        "and add tests",
+    ]
+    assert all_user_prompts([]) == []
+
+
+def test_all_user_prompts_skips_compaction_summary() -> None:
+    data = serialize_messages(
+        [
+            user_msg("the task"),
+            user_msg(f"{COMPACTION_SUMMARY_PREFIX}\n\nsummary text"),
+            text_response("done"),
+        ]
+    )
+    assert all_user_prompts(data) == ["the task"]
 
 
 # -- context tokens --------------------------------------------------------------

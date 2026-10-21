@@ -113,3 +113,56 @@ async def test_escape_closes_without_saving(tmp_path: Path) -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert not path.exists()
+
+
+# -- seeding from the user-level drcode.json --------------------------------------
+
+
+def _write_user_drcode_json(data: dict[str, object]) -> None:
+    import drcode.config as config_module
+
+    config_module.USER_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config_module.USER_CONFIG_FILE.write_text(json.dumps(data))
+
+
+async def test_screen_seeded_from_user_config_and_saved_explicitly(
+    tmp_path: Path,
+) -> None:
+    _write_user_drcode_json(
+        {"model": "qwen3-coder-30b", "base_url": "http://localhost:8080/v1"}
+    )
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        # The seeded provider is already in the list and shown in the form…
+        options = screen.query_one("#mc-providers", OptionList)
+        assert any((option.id or "") == "prov:localhost" for option in options.options)
+        assert screen.query_one("#mc-name", Input).value == "localhost"
+        assert screen.query_one("#mc-url", Input).value == "http://localhost:8080/v1"
+        status = screen.query_one("#mc-status")
+        assert "Pre-filled" in str(status.render())
+        # …but nothing is written until the user saves.
+        assert not path.exists()
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        assert path.exists()
+        data = json.loads(path.read_text())
+        provider = data["providers"][0]
+        assert provider["name"] == "localhost"
+        assert provider["models"][0]["id"] == "qwen3-coder-30b"
+
+
+async def test_seeded_screen_escape_discards_seed(tmp_path: Path) -> None:
+    _write_user_drcode_json({"model": "flat-m", "base_url": "http://x/v1"})
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        # Quitting without saving: no models.json is created, the flat
+        # config keeps working as before.
+        assert not path.exists()

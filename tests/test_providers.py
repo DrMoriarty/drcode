@@ -18,6 +18,7 @@ from drcode.providers import (
     UserModelsConfig,
     UserModelsStore,
     load_project_model_refs,
+    load_seeded_catalog,
     resolve,
     set_project_model,
 )
@@ -265,6 +266,99 @@ def test_store_missing_file_is_empty(user_config_dir: Path) -> None:
     assert loaded.providers == []
     assert loaded.defaults == {}
     assert loader.last_warning is None
+
+
+# -- seeding from the user-level flat config -------------------------------------
+
+
+def _write_user_drcode_json(user_config_dir: Path, data: dict[str, object]) -> None:
+    import drcode.config as config_module
+
+    config_module.USER_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config_module.USER_CONFIG_FILE.write_text(json.dumps(data))
+
+
+def test_seed_from_user_config_when_models_json_missing(
+    user_config_dir: Path,
+) -> None:
+    _write_user_drcode_json(
+        user_config_dir,
+        {
+            "model": "qwen3-coder-30b",
+            "base_url": "http://localhost:8080/v1",
+            "api_key": "key-1",
+            "health_check_url": "http://localhost:8080/v1/models",
+            "max_context_tokens": 131072,
+            "max_tokens": 4096,
+        },
+    )
+    store = UserModelsStore()
+    catalog, note = load_seeded_catalog(store)
+    assert not store.path.exists()  # nothing persisted by loading alone
+    assert note is not None
+    assert len(catalog.providers) == 1
+    provider = catalog.providers[0]
+    assert provider.name == "localhost"
+    assert provider.base_url == "http://localhost:8080/v1"
+    assert provider.api_key == "key-1"
+    assert provider.health_check_url == "http://localhost:8080/v1/models"
+    assert provider.models == [
+        ModelEntry(
+            id="qwen3-coder-30b",
+            max_context_tokens=131072,
+            max_tokens=4096,
+            context_reported=False,
+        )
+    ]
+
+
+def test_seed_fills_defaults_for_omitted_fields(user_config_dir: Path) -> None:
+    _write_user_drcode_json(user_config_dir, {"model": "gpt-4o"})
+    catalog, note = load_seeded_catalog(UserModelsStore())
+    assert note is not None
+    provider = catalog.providers[0]
+    assert provider.name == "api.openai.com"
+    assert provider.base_url == "https://api.openai.com/v1"
+    assert provider.api_key == ""
+    assert provider.models[0].max_context_tokens == 200_000
+    assert provider.models[0].max_tokens is None
+    assert provider.models[0].context_reported is False
+
+
+def test_seed_survives_save(user_config_dir: Path) -> None:
+    _write_user_drcode_json(
+        user_config_dir, {"model": "m1", "base_url": "http://x:9000/v1"}
+    )
+    store = UserModelsStore()
+    catalog, _ = load_seeded_catalog(store)
+    store.save(catalog)
+    reloaded = UserModelsStore().load()
+    assert reloaded == catalog
+    # The seeded provider name has no "/" so it is a valid reference head.
+    assert "/" not in reloaded.providers[0].name
+
+
+def test_seed_skipped_when_models_json_exists(user_config_dir: Path) -> None:
+    _write_user_drcode_json(user_config_dir, {"model": "flat-m"})
+    store = UserModelsStore()
+    # Even an empty-but-existing catalog file is the source of truth.
+    store.save(UserModelsConfig())
+    catalog, note = load_seeded_catalog(store)
+    assert note is None
+    assert catalog.providers == []
+
+
+def test_seed_skipped_without_user_drcode_json(user_config_dir: Path) -> None:
+    catalog, note = load_seeded_catalog(UserModelsStore())
+    assert note is None
+    assert catalog.providers == []
+
+
+def test_seed_skipped_when_user_config_has_no_model(user_config_dir: Path) -> None:
+    _write_user_drcode_json(user_config_dir, {"base_url": "http://x/v1"})
+    catalog, note = load_seeded_catalog(UserModelsStore())
+    assert note is None
+    assert catalog.providers == []
 
 
 # -- fetch_models ------------------------------------------------------------------

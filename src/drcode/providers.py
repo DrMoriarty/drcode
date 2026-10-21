@@ -8,7 +8,11 @@ connection (shared by every agent), this module adds two more layers:
    base URL, API key, cached health-check endpoint and a list of models
    (auto-discovered via `agent_model.fetch_models` or entered by hand).
    The file is written exclusively by the `drcode-models` utility (or the
-   catalog screen mounted inside the main TUI) — never by hand.
+   catalog screen mounted inside the main TUI) — never by hand. When the
+   file does not exist yet but the user-level drcode.json already
+   describes a model, the catalog screen pre-fills itself with one
+   provider/model built from that data (`load_seeded_catalog`) — in
+   memory only, until the user saves.
 2. A project-level selection of the model per agent role (coding / tester /
    compaction) stored under the optional `models` key of
    `<project>/.drcode/drcode.json`, values of the form
@@ -46,6 +50,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ValidationError
 
@@ -293,6 +298,80 @@ class UserModelsStore:
             if os.path.exists(tmp):
                 os.unlink(tmp)
         return self.path
+
+
+# -- one-time seeding from the user-level flat config -------------------------
+
+
+def _provider_name_for(base_url: str) -> str:
+    """Derive a provider name from the endpoint: its host (without port,
+    credentials or path), e.g. `https://api.openai.com/v1` → `api.openai.com`.
+    Falls back to a generic name for unparseable URLs."""
+    netloc = urlsplit(base_url).netloc
+    # Drop userinfo ("user:pass@host") and the port ("host:8080").
+    host = netloc.rsplit("@", 1)[-1].rsplit(":", 1)[0].strip()
+    return host or "provider"
+
+
+def load_seeded_catalog(
+    store: UserModelsStore,
+) -> tuple[UserModelsConfig, str | None]:
+    """Load the catalog, pre-filling it from the user-level drcode.json.
+
+    Migration convenience for `drcode-models` (and the main TUI's catalog
+    screen): when the catalog file does not exist yet but the user-level
+    drcode.json already describes the model in use, an in-memory catalog
+    with a single provider and its single model is built from that data
+    (the provider name is derived from the base URL host; the flat config
+    defaults fill in whatever the file omits).
+
+    Nothing is persisted here — models.json appears only when the user
+    explicitly saves the catalog screen; quitting without saving discards
+    the seed and the flat config keeps working as before.
+
+    Returns the catalog plus an optional human-readable note for the UI
+    (set when the seed actually happened).
+    """
+    catalog = store.load()
+    if store.path.exists():
+        # A catalog already exists — it is the source of truth, never reseed.
+        return catalog, None
+    data = _read_json(_config.USER_CONFIG_FILE)
+    model = str(data.get("model") or "").strip()
+    if not model:
+        # Nothing (usable) described in the flat config — empty catalog.
+        return catalog, None
+    base_url = str(data.get("base_url") or "").strip() or str(
+        Config.model_fields["base_url"].default
+    )
+    max_context = data.get("max_context_tokens")
+    if not isinstance(max_context, int) or max_context <= 0:
+        max_context = ModelEntry.model_fields["max_context_tokens"].default
+    max_tokens = data.get("max_tokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = None
+    provider = Provider(
+        name=_provider_name_for(base_url),
+        base_url=base_url,
+        api_key=str(data.get("api_key") or ""),
+        health_check_url=str(data.get("health_check_url") or ""),
+        models=[
+            ModelEntry(
+                id=model,
+                max_context_tokens=max_context,
+                max_tokens=max_tokens,
+                # The flat config value is not a gateway report — keep the
+                # "confirm by hand" flag of a hand-entered entry.
+                context_reported=False,
+            )
+        ],
+    )
+    catalog.providers.append(provider)
+    note = (
+        f"Pre-filled from drcode.json: provider “{provider.name}”, model "
+        f"“{model}”. Not saved yet — press Save to write {USER_MODELS_FILENAME}."
+    )
+    return catalog, note
 
 
 # -- resolution ---------------------------------------------------------------

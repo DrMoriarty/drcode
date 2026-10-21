@@ -15,6 +15,11 @@ editable model table (context sizes; entries whose context size the
 gateway did not report are flagged for manual confirmation). Per agent
 role (coding / tester / compaction) a default model can be picked from the
 catalog — used when the project does not pin its own.
+
+When models.json does not exist yet but the user-level drcode.json already
+describes a model, the screen starts pre-filled with one provider/model
+seeded from that data (`providers.load_seeded_catalog`); the file is only
+written when the user explicitly saves.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from ..providers import (
     Provider,
     UserModelsConfig,
     UserModelsStore,
+    load_seeded_catalog,
 )
 
 _PROBE_TIMEOUT = 15.0
@@ -112,7 +118,12 @@ class ModelCatalogScreen(ModalScreen[None]):
     def __init__(self, store: UserModelsStore | None = None) -> None:
         super().__init__()
         self.store = store or UserModelsStore()
-        self.catalog: UserModelsConfig = self.store.load()
+        # Load the catalog, pre-filling it from the user-level drcode.json
+        # when the catalog file does not exist yet (one-time migration aid;
+        # in-memory only until the user presses Save).
+        self.catalog: UserModelsConfig
+        self.seed_note: str | None
+        self.catalog, self.seed_note = load_seeded_catalog(self.store)
         self._current: str | None = None
         self._selected_model: str | None = None
         # Guards against re-entrant commits while a fetch/probe runs.
@@ -288,6 +299,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         self._refresh_providers()
         self._load_form(self._current)
         self._refresh_roles()
+        if self.store.last_warning:
+            # Re-assert after _load_form (it clears the status line).
+            self._status(f"⚠ {self.store.last_warning}")
+        elif self.seed_note:
+            self._status(f"ℹ {self.seed_note}")
         self.query_one("#mc-providers", OptionList).focus()
 
     def action_close(self) -> None:

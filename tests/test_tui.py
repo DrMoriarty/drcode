@@ -207,7 +207,55 @@ async def test_action_cancel_task(app: DrCodeApp) -> None:
         assert task.pending_input == []
 
 
-async def test_action_done_task_sends_to_testing(app: DrCodeApp) -> None:
+async def test_task_action_keys_work_while_chat_input_focused(app: DrCodeApp) -> None:
+    """ctrl+x / ctrl+d must reach the app actions even when the chat input
+    (a TextArea subclass) is focused: its built-in `cut`/`delete_right`
+    bindings must not shadow the app-level task actions."""
+    async with app.run_test() as pilot:
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.text = "active task"
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        task = app.manager.all_tasks()[0]
+        # No model configured: the run stops at the guard and the task
+        # stays active with its prompt kept.
+        assert task.status is TaskStatus.ACTIVE
+
+        app.chat_input.focus()
+        await pilot.pause()
+        assert app.focused is app.chat_input
+
+        # The footer resolves both keys to the app actions, not to the
+        # TextArea's hidden `cut`/`delete_right` bindings.
+        bindings = app.screen.active_bindings
+        assert bindings["ctrl+x"].binding.action == "app.cancel_task"
+        assert bindings["ctrl+d"].binding.action == "app.done_task"
+
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+        assert task.status is TaskStatus.COMPLETED
+        assert app.chat_input.text == ""  # draft was not cut into clipboard
+
+
+async def test_done_key_while_chat_input_focused_sends_to_testing(
+    app: DrCodeApp,
+) -> None:
+    task = app.manager.create("feature", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.view_task(task.id)
+        app.chat_input.focus()
+        await pilot.pause()
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert task.status is TaskStatus.TESTING
+
+
+async def test_done_task_sends_to_testing(app: DrCodeApp) -> None:
     task = app.manager.create("feature", "prompt")
     async with app.run_test() as pilot:
         await pilot.pause()

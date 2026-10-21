@@ -21,6 +21,16 @@ class WordNavTextArea(TextArea):
     """
 
     BINDINGS: ClassVar = [
+        # TextArea's built-in `cut` (ctrl+x) and `delete_right` (ctrl+d)
+        # bindings would shadow the app-level task actions whenever this
+        # input has focus: Screen.active_bindings resolves a key conflict in
+        # favor of the widget closest to the focus, and the keyboard event
+        # never reaches the app. Re-declaring the keys here on the `app`
+        # namespace displaces the TextArea bindings; visibility/disabled
+        # state is still gated by the app's check_action (COMPLETED tasks
+        # hide both, new-task mode hides both).
+        Binding("ctrl+x", "app.cancel_task", "Cancel task"),
+        Binding("ctrl+d", "app.done_task", "Done"),
         Binding("alt+left,alt+b", "cursor_word_left", "Cursor word left", show=False),
         Binding(
             "alt+right,alt+f", "cursor_word_right", "Cursor word right", show=False

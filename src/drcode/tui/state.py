@@ -36,6 +36,7 @@ from ..agent import AgentDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..models import Clarification, Task, TaskEvent, TaskKind
+from ..notifications import Notifier
 from ..settings import (
     CompletedRetention,
     ProjectSettings,
@@ -422,6 +423,10 @@ class DrCodeState(App[None]):
     _github_syncing: bool
     _github_last_error: str | None
     _purged_tasks: list[Task]
+
+    # -- ntfy.sh notifications ------------------------------------------------
+    notifier: Notifier
+    _notifications_primed: bool
 
     # -- run state ----------------------------------------------------------
     viewed_id: str | None

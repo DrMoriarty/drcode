@@ -369,3 +369,95 @@ async def test_sidebar_task_row_click_still_opens_task(app: DrCodeApp) -> None:
         await pilot.click(row)
         await pilot.pause()
         assert app.viewed_id == task.id
+
+
+# -- notifications ---------------------------------------------------------------
+
+
+async def test_notifications_dialog_saves_project_settings(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    from textual.widgets import Input, Switch
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.notifications_dialog import NotificationsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.pause()
+        app.action_change_notifications()
+        await pilot.pause()
+        assert isinstance(app.screen, NotificationsDialog)
+        app.screen.query_one("#ntf-enabled", Switch).value = True
+        app.screen.query_one("#ntf-topic", Input).value = "my-secret-topic"
+        await pilot.pause()
+        await pilot.click("#ntf-save")
+        await pilot.pause()
+        settings = ProjectSettingsStore(project_root).load()
+        assert settings.notifications_enabled is True
+        assert settings.ntfy_topic == "my-secret-topic"
+
+
+async def test_notifications_dialog_escape_keeps_settings(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    from textual.widgets import Input, Switch
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.notifications_dialog import NotificationsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.pause()
+        # Pre-existing saved values: the dialog opens pre-filled with them.
+        app.settings.notifications_enabled = True
+        app.settings.ntfy_topic = "topic-a"
+        app.settings_store.save(app.settings)
+        app.action_change_notifications()
+        await pilot.pause()
+        assert isinstance(app.screen, NotificationsDialog)
+        app.screen.query_one("#ntf-enabled", Switch).value = False
+        app.screen.query_one("#ntf-topic", Input).value = "changed"
+        await pilot.press("escape")
+        await pilot.pause()
+        settings = ProjectSettingsStore(project_root).load()
+        assert settings.notifications_enabled is True
+        assert settings.ntfy_topic == "topic-a"
+
+
+async def test_pipeline_settled_notification_primes_then_sends(
+    app: DrCodeApp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held task blocks the pipeline (blocked state, primed at startup —
+    nothing sent); after the user finishes it off the empty queue is
+    announced once."""
+    from drcode.models import Task
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        app.notifier, "notify", lambda title, message, **kw: sent.append((title, message))
+    )
+
+    held = Task(title="parked", status=TaskStatus.HOLD)
+    app.manager.tasks[held.id] = held
+    app.manager.storage.save(held)
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.pause()
+        # First _advance(): primes the "blocked" settled state, nothing sent.
+        app._advance()
+        await pilot.pause()
+        assert sent == []
+        # User finishes the parked task: the queue becomes empty — the
+        # settled-state transition is announced.
+        app.manager.cancel(held.id)
+        app._advance()
+        await pilot.pause()
+        assert len(sent) == 1
+        assert "пуста" in sent[0][0]
+        # Another _advance() with the same (empty) state: deduplicated.
+        app._advance()
+        await pilot.pause()
+        assert len(sent) == 1

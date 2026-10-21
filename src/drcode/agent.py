@@ -38,8 +38,6 @@ from .models import (
     Clarification,
     TaskKind,
     TaskStatus,
-    VerificationStatus,
-    _now,
 )
 from .prompts import (
     BUG_SYSTEM_PROMPT,
@@ -456,15 +454,11 @@ def build_tester_agent(
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:
         """Set the verification label on the verified task (passed or failed)
         and finish its testing: the task becomes completed."""
-        task = ctx.deps.manager.get(ctx.deps.task_id)
-        task.verification = (
-            VerificationStatus.PASSED if success else VerificationStatus.FAILED
-        )
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = _now()
-        task.touch()
-        ctx.deps.manager.storage.save(task)
-        return f"Verification label set: {task.verification.value}; task completed."
+        ctx.deps.manager.set_verification(ctx.deps.task_id, success)
+        # The label is stamped by the manager; formatting it from `success`
+        # (not from the optional `task.verification`) keeps pyright happy.
+        verdict = "passed" if success else "failed"
+        return f"Verification label set: {verdict}; task completed."
 
     return agent
 

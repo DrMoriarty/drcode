@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from .models import PendingInput, Task, TaskKind, TaskStatus, _now
+from .models import (
+    PendingInput,
+    Task,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+    _now,
+)
 from .storage import Storage
+
+# Status-change observer: (task, old status, new status, origin). Origin is
+# "user" when the transition was directly initiated by the user sitting at
+# the computer (typing a message, cancelling, holding, pressing Done) and
+# "system" when the pipeline changed it on its own (auto-completion,
+# promotion, the tester's verdict, an agent error). Listeners must never
+# raise: a broken observer must not break the state machine.
+StatusListener = Callable[[Task, TaskStatus, TaskStatus, str], None]
 
 
 class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
+        self._status_listeners: list[StatusListener] = []
         self.tasks: dict[str, Task] = {t.id: t for t in self.storage.load_all()}
         # Monotonic queue-position counter: bumped when a task is explicitly
         # re-positioned in the queue (kind change to bug → head, to feature
@@ -34,6 +52,35 @@ class TaskManager:
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
         return self._queue_seq
+
+    # -- status-change observers ---------------------------------------------
+
+    def add_status_listener(self, listener: StatusListener) -> None:
+        """Register an observer of status transitions (used by the
+        notifications feature). Listeners are called synchronously — possibly
+        from a worker thread (the tester's tools run via asyncio.to_thread) —
+        and must be fast and non-raising."""
+        self._status_listeners.append(listener)
+
+    def fire_status_change(self, task: Task, old: TaskStatus, origin: str) -> None:
+        """Public hook for status mutations that happen outside the manager
+        (e.g. the pipeline demoting a failed run's task directly). Call it
+        AFTER the new status has been assigned to `task`."""
+        if task.status is old:
+            return
+        for listener in list(self._status_listeners):
+            try:
+                listener(task, old, task.status, origin)
+            except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
+                print(
+                    f"drcode: status listener failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
+    def _save_changed(self, task: Task, old: TaskStatus, origin: str) -> None:
+        """Persist a status mutation and notify the observers."""
+        self.storage.save(task)
+        self.fire_status_change(task, old, origin)
 
     # -- queries ------------------------------------------------------------
 
@@ -97,6 +144,7 @@ class TaskManager:
         task = self.get(task_id)
         task.pending_input.append(PendingInput(text=text.strip()))
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
+            old = task.status
             task.status = TaskStatus.QUEUED
             # Old verification label no longer applies: the task will be
             # tested again after its next development round.
@@ -105,13 +153,13 @@ class TaskManager:
             # anchor) restarts with the eventual new completion.
             task.completed_at = None
             task.touch()
-            self.storage.save(task)
+            self._save_changed(task, old, "user")
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
             task.status = TaskStatus.QUEUED
             task.queue_head = True
             task.clarification = None
             task.touch()
-            self.storage.save(task)
+            self._save_changed(task, TaskStatus.AWAITING_CLARIFICATION, "user")
         else:
             # QUEUED/ACTIVE: just accumulate input (also when the model is not
             # configured — the agent picks it up on the next activation).
@@ -240,6 +288,7 @@ class TaskManager:
         while the task was held, the answer counts as an answered
         clarification (head of the queue), mirroring send()'s transition."""
         task = self.get(task_id)
+        old = task.status
         if on and task.status in (
             TaskStatus.QUEUED,
             TaskStatus.AWAITING_CLARIFICATION,
@@ -259,10 +308,10 @@ class TaskManager:
             else:
                 task.status = TaskStatus.QUEUED
         task.touch()
-        self.storage.save(task)
+        self._save_changed(task, old, "user")
         return task
 
-    def mark_done(self, task_id: str) -> Task:
+    def mark_done(self, task_id: str, origin: str = "system") -> Task:
         """Development is finished: move the task to TESTING. Only the tester
         promotes it to COMPLETED (via set_verification). Promotion of the next
         task is up to the caller (the app runs the tester first, then
@@ -270,8 +319,13 @@ class TaskManager:
         the next startup before any queued task starts.
 
         Research tasks skip the tester entirely: they are completed
-        right away."""
+        right away.
+
+        `origin` tells observers who initiated the transition: "user"
+        (the Ctrl+D shortcut) or "system" (the automatic end-of-run
+        completion in the pipeline)."""
         task = self.get(task_id)
+        old = task.status
         task.status = (
             TaskStatus.COMPLETED
             if task.kind is TaskKind.RESEARCH
@@ -280,7 +334,7 @@ class TaskManager:
         if task.status is TaskStatus.COMPLETED:
             task.completed_at = _now()
         task.touch()
-        self.storage.save(task)
+        self._save_changed(task, old, origin)
         return task
 
     def promote_next(self, exclude: set[str] | None = None) -> Task | None:
@@ -300,7 +354,7 @@ class TaskManager:
                 # statistics measure activation → completion from it.
                 t.activated_at = _now()
                 t.touch()
-                self.storage.save(t)
+                self._save_changed(t, TaskStatus.QUEUED, "system")
                 return t
         return None
 
@@ -309,11 +363,12 @@ class TaskManager:
         "Task finalization: None"): a task that reached TESTING is completed
         right away, with no verification label."""
         task = self.get(task_id)
+        old = task.status
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.unfinished = False
         task.touch()
-        self.storage.save(task)
+        self._save_changed(task, old, "system")
         return task
 
     def cancel(self, task_id: str) -> Task:
@@ -321,6 +376,7 @@ class TaskManager:
         input, clear the resume flag and complete it immediately — the
         tester is skipped everywhere a finished task would run it."""
         task = self.get(task_id)
+        old = task.status
         task.pending_input.clear()
         task.unfinished = False
         task.clarification = None
@@ -328,7 +384,23 @@ class TaskManager:
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.touch()
-        self.storage.save(task)
+        self._save_changed(task, old, "user")
+        return task
+
+    def set_verification(self, task_id: str, success: bool) -> Task:
+        """The tester's verdict: stamp the verification label and complete
+        the task. Used by the tester's `set_verification` tool (which runs
+        in a worker thread — see tool_runtime) so the transition goes
+        through the same observer mechanism as every other status change."""
+        task = self.get(task_id)
+        old = task.status
+        task.verification = (
+            VerificationStatus.PASSED if success else VerificationStatus.FAILED
+        )
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
+        task.touch()
+        self._save_changed(task, old, "system")
         return task
 
     def requeue_answered_clarification(self, task_id: str) -> None:
@@ -345,4 +417,4 @@ class TaskManager:
         task.queue_head = True
         task.clarification = None
         task.touch()
-        self.storage.save(task)
+        self._save_changed(task, TaskStatus.AWAITING_CLARIFICATION, "system")

@@ -41,6 +41,7 @@ from .command_providers import (
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
 from .inputs import NewTaskInput
+from .notifications_dialog import NotificationsDialog, NotificationsSetup
 from .setup_dialog import ModelSetup, ModelSetupDialog
 from .sidebar import TaskItem
 from .state import DrCodeState
@@ -257,7 +258,9 @@ class ActionsLayer(DrCodeState):
             return
         self.workers.cancel_group(self, "agent")
         self.agent_running = False
-        self.manager.mark_done(task.id)
+        # The user pressed Done right here: the status observers
+        # (notifications) must not report this transition.
+        self.manager.mark_done(task.id, origin="user")
         self.refresh_sidebar()
         self.view_task(task.id)
         # Testing backlog first (possibly an older TESTING task), then queue.
@@ -601,6 +604,50 @@ class ActionsLayer(DrCodeState):
             self._poll_github_sync()
         self.refresh_status()
 
+    # -- notifications (ntfy.sh) -----------------------------------------------
+
+
+    def action_change_notifications(self) -> None:
+        """Notifications dialog, opened from the Settings entry
+        ("Notifications: on/off"). Collects the enable switch and the
+        ntfy.sh topic; Save persists the values into the project settings
+        and fires a test notification when the feature is turned on, so the
+        user can immediately check the subscription on the phone."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            NotificationsDialog(
+                enabled=self.settings.notifications_enabled,
+                topic=self.settings.ntfy_topic,
+            ),
+            self._notifications_settings_done,
+        )
+
+
+    def _notifications_settings_done(
+        self, setup: NotificationsSetup | None
+    ) -> None:
+        if setup is None:
+            return
+        self.settings.notifications_enabled = setup.enabled
+        self.settings.ntfy_topic = setup.topic
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Notifications: {'on' if setup.enabled else 'off'}"
+            + (f" (ntfy.sh/{setup.topic})" if setup.enabled and setup.topic else ""),
+            title="Project settings",
+            timeout=4,
+        )
+        if setup.enabled and setup.topic:
+            # A test push right away: the user sees the channel works (or
+            # that the topic is wrong) without waiting for a real event.
+            self.notifier.notify(
+                "DrCode: уведомления включены",
+                f"Проект «{self.project_root.name}»: проверочное "
+                "уведомление — канал работает.",
+                tags=["bell"],
+            )
+
     # -- GitHub Issues sync ----------------------------------------------------
 
 
@@ -643,6 +690,11 @@ class ActionsLayer(DrCodeState):
                 return
             self._github_last_error = None
             self._github_state_store.save(self._github_state)
+            # Every successful cycle is reported (with the counts of what
+            # was taken into the local task store), not only the cycles
+            # that imported something: a silent "nothing new" sync is also
+            # an event the user asked to be told about.
+            self.notifier.github_sync(imported, skipped)
             if imported or skipped:
                 self.notify(
                     f"GitHub sync: {imported} new task(s) imported, {skipped} skipped",

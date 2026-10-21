@@ -260,6 +260,18 @@ class ProjectSettingsCommandsProvider(Provider):
                 ),
                 app.action_change_github,
             ),
+            (
+                (
+                    "Notifications: "
+                    f"{'on' if app.settings.notifications_enabled else 'off'}"
+                ),
+                (
+                    "Push notifications about important pipeline events "
+                    "(task status changes, GitHub sync, an idle pipeline) "
+                    "via ntfy.sh (project setting)"
+                ),
+                app.action_change_notifications,
+            ),
         ]
 
     async def discover(self) -> Hits:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -25,6 +26,7 @@ from textual.widgets import (
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..models import Clarification, Task, TaskKind, TaskStatus
+from ..notifications import Notifier
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
 from .actions import ActionsLayer
@@ -227,6 +229,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # cycle either succeeded or has not run yet).
         self._github_syncing = False
         self._github_last_error: str | None = None
+        # ntfy.sh push notifications: the notifier reads the project
+        # settings on every event, so a change made in the settings dialog
+        # applies immediately. Delivery failures are surfaced as in-app
+        # toasts (the delivery itself runs in a daemon thread).
+        self.notifier = Notifier(lambda: self.settings, on_error=self._notify_error)
+        # The "queue empty" / "pipeline blocked" notifications are sent only
+        # on state transitions; the very first pipeline evaluation after
+        # startup only primes the state (a cold start on an empty queue
+        # must not announce "queue is empty").
+        self._notifications_primed = False
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
@@ -423,6 +435,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             driver.write(f"\x1b]0;{title}\x07")
             driver.flush()
 
+    def _notify_error(self, text: str) -> None:
+        """Delivery failures of the notifications module, surfaced in-app.
+
+        Called from the delivery's daemon thread: hop into the app thread
+        (a broken ntfy.sh must never crash anything, hence the blanket
+        except — the failure is already on stderr at that point)."""
+        try:
+            self.call_from_thread(
+                self.notify,
+                f"Не удалось отправить уведомление: {text}",
+                title="Notifications",
+                severity="warning",
+                timeout=6,
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort surface only
+            print(f"drcode: notification error surfacing failed: {e}", file=sys.stderr)
+
     def on_unmount(self) -> None:
         # Clear the tab title so "DrCode — <project>" doesn't stick around
         # in the terminal after the app has exited.
@@ -430,6 +459,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     def on_mount(self) -> None:
         self._set_terminal_title(f"{self.TERMINAL_TITLE} — {self.project_root.name}")
+        # Status observers (notifications): wired on mount, so the startup
+        # demotions in TaskManager.__init__ never produce events.
+        self.manager.add_status_listener(self.notifier.task_status)
         if self._purged_tasks:
             # The startup cleanup removed something — say so, so deleted
             # history never "silently vanishes".

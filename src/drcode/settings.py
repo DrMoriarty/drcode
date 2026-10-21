@@ -157,6 +157,14 @@ class ProjectSettings(BaseModel):
     # Full repository name "owner/repo" (a pasted URL is normalized on save).
     github_repo: str = ""
     github_sync_interval: GitHubSyncInterval = GitHubSyncInterval.HOUR_1
+    # -- ntfy.sh push notifications -------------------------------------------
+    # Enabled may be switched on with no topic set: the notifier simply
+    # stays silent (and the settings dialog warns about the missing topic)
+    # until a topic is provided.
+    notifications_enabled: bool = False
+    # Public ntfy.sh topic name to publish to (see https://ntfy.sh). Anyone
+    # who knows the topic can read its messages — pick an unguessable one.
+    ntfy_topic: str = ""
 
 
 class ProjectSettingsStore:

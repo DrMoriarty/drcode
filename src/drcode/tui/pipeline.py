@@ -204,8 +204,73 @@ class PipelineLayer(DrCodeState):
             return
         promoted = self.manager.promote_next(exclude=self._agent_failed)
         if promoted:
+            self.notifier.pipeline_busy()
             self.run_agent(promoted.id)
+        else:
+            self._notify_pipeline_settled()
         self.refresh_status()
+
+    def _notify_pipeline_settled(self) -> None:
+        """Notifications: the gate settled without starting anything.
+
+        Only meaningful when the pipeline is really idle — nothing is being
+        developed or tested and no task is active. Then either the queue is
+        empty (everything processed) or tasks remain that cannot be taken
+        into development right now (all held / awaiting clarification /
+        failed this session / queued without any input). Both states are
+        reported once per transition — the notifier deduplicates; the very
+        first evaluation after app startup only primes the state (a cold
+        start on an empty queue must not announce "queue is empty").
+        """
+        if self.tester_running or self.agent_running:
+            return
+        if self.manager.active is not None:
+            return
+        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+            return
+        remaining = [
+            t
+            for t in self.manager.all_tasks()
+            if t.status is not TaskStatus.COMPLETED
+        ]
+        if not remaining:
+            self.notifier.pipeline_idle(
+                blocked=False,
+                detail="",
+                prime=not self._notifications_primed,
+            )
+            self._notifications_primed = True
+            return
+        # Tasks remain, but promote_next() found nothing to activate:
+        # explain why none of them can be taken into development.
+        reasons: list[str] = []
+        held = sum(1 for t in remaining if t.status is TaskStatus.HOLD)
+        if held:
+            reasons.append(f"на удержании (hold): {held}")
+        awaiting = sum(
+            1 for t in remaining if t.status is TaskStatus.AWAITING_CLARIFICATION
+        )
+        if awaiting:
+            reasons.append(f"ждут уточняющего вопроса: {awaiting}")
+        failed = sum(1 for t in remaining if t.id in self._agent_failed)
+        if failed:
+            reasons.append(f"завершились ошибкой в этой сессии: {failed}")
+        idle = sum(
+            1
+            for t in remaining
+            if t.status is TaskStatus.QUEUED
+            and t.id not in self._agent_failed
+            and not t.pending_input
+            and not t.unfinished
+        )
+        if idle:
+            reasons.append(f"в очереди без текста задачи: {idle}")
+        self.notifier.pipeline_idle(
+            blocked=True,
+            detail=("Причины: " + ", ".join(reasons) + ".") if reasons else "",
+            prime=not self._notifications_primed,
+        )
+        self._notifications_primed = True
 
 
     def _persist_task_messages(
@@ -934,6 +999,9 @@ class PipelineLayer(DrCodeState):
                     task.status = TaskStatus.QUEUED
                     self._agent_failed.add(task_id)
                     self.manager.storage.save(task)
+                    # The transition happened outside the manager — report it
+                    # to the status observers (notifications) explicitly.
+                    self.manager.fire_status_change(task, TaskStatus.ACTIVE, "system")
                     break
         finally:
             # Stop any spinner whose result event was lost to an abort or a

@@ -451,6 +451,13 @@ class ToolCallBlock(Static):
         return f" {text}"
 
     def on_click(self) -> None:
+        # A mouse-up that lands on the block after a drag-selection still
+        # fires `Click`, but collapsing here re-renders the widget and
+        # invalidates the in-progress selection on the parent scrollable,
+        # so the selected text is dropped instead of copied. Honour the
+        # selection instead of toggling when one is active.
+        if self.screen.selections:
+            return
         self.toggle_class("collapsed")
         self._redraw()
 

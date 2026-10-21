@@ -461,3 +461,63 @@ async def test_pipeline_settled_notification_primes_then_sends(
         app._advance()
         await pilot.pause()
         assert len(sent) == 1
+
+
+# -- terminal tab title ---------------------------------------------------------
+
+
+async def test_terminal_title_tracks_working_agent(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tab title reflects which agent is working: F/B/R for an active
+    development task (by kind), T while the tester runs, and no badge at all
+    when the pipeline is idle. The title is refreshed on status changes."""
+    written: list[str] = []
+    monkeypatch.setattr(
+        DrCodeApp, "_set_terminal_title", lambda self, title: written.append(title)
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        base = f"DrCode — {app.project_root.name}"
+        assert written[-1] == base  # idle: no agent badge
+
+        # Feature goes active → development agent F.
+        feature = app.manager.create("feature task", "build it")
+        app.manager.send(feature.id, "go")
+        app.manager.promote_next()
+        await pilot.pause()
+        assert written[-1] == f"DrCode [F] — {app.project_root.name}"
+
+        # Development finished → tester T.
+        app.manager.mark_done(feature.id)
+        await pilot.pause()
+        assert written[-1] == f"DrCode [T] — {app.project_root.name}"
+
+        # Tester passed → completed, pipeline idle again.
+        app.manager.set_verification(feature.id, success=True)
+        await pilot.pause()
+        assert written[-1] == base
+
+        # Bug task active → B (mark_done → tester T → passed → idle).
+        bug = app.manager.create("bug task", "fix it", kind=TaskKind.BUG)
+        app.manager.send(bug.id, "go")
+        app.manager.promote_next()
+        await pilot.pause()
+        assert written[-1] == f"DrCode [B] — {app.project_root.name}"
+        app.manager.mark_done(bug.id)
+        await pilot.pause()
+        assert written[-1] == f"DrCode [T] — {app.project_root.name}"
+        app.manager.set_verification(bug.id, success=True)
+        await pilot.pause()
+        assert written[-1] == base
+
+        # Research task active → R; it completes right away (no tester).
+        research = app.manager.create("research task", "do it", kind=TaskKind.RESEARCH)
+        app.manager.send(research.id, "go")
+        app.manager.promote_next()
+        await pilot.pause()
+        assert written[-1] == f"DrCode [R] — {app.project_root.name}"
+        app.manager.mark_done(research.id)
+        await pilot.pause()
+        assert written[-1] == base

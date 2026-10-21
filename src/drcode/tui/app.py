@@ -441,6 +441,51 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             driver.write(f"\x1b]0;{title}\x07")
             driver.flush()
 
+    def _agent_badge(self) -> str:
+        """Letter of the agent currently working, empty when idle.
+
+        Mirrors the pipeline: an ACTIVE task means the development agent runs
+        (its letter is the task kind's, same F/B/R the sidebar uses), any
+        TESTING task means the tester runs. Everything else — queued, held,
+        awaiting clarification, completed — is idle: no agent letter.
+        """
+        active = self.manager.active
+        if active is not None:
+            return {
+                TaskKind.FEATURE: "F",
+                TaskKind.BUG: "B",
+                TaskKind.RESEARCH: "R",
+            }[active.kind]
+        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+            return "T"
+        return ""
+
+    def _update_terminal_title(self) -> None:
+        """Recompute the tab title from the current pipeline state.
+
+        Runs on the app thread (status listeners hop here via call_later,
+        since they may fire from worker threads).
+        """
+        badge = self._agent_badge()
+        base = f"{self.TERMINAL_TITLE} — {self.project_root.name}"
+        self._set_terminal_title(
+            f"{self.TERMINAL_TITLE} [{badge}] — {self.project_root.name}"
+            if badge
+            else base
+        )
+
+    def _on_title_status_change(
+        self, task: Task, old: TaskStatus, new: TaskStatus, origin: str
+    ) -> None:
+        """Status listener keeping the tab title in sync with the pipeline.
+
+        The title must reflect the agent switch at the exact moment a task
+        changes status. Listeners may be called from worker threads, so the
+        actual redraw is scheduled onto the app thread (post_message is
+        thread-safe); it is a no-op once the app is shutting down.
+        """
+        self.call_later(self._update_terminal_title)
+
     def _notify_error(self, text: str) -> None:
         """Delivery failures of the notifications module, surfaced in-app.
 
@@ -464,7 +509,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._set_terminal_title("")
 
     def on_mount(self) -> None:
-        self._set_terminal_title(f"{self.TERMINAL_TITLE} — {self.project_root.name}")
+        self._update_terminal_title()
+        # Keep the tab title's agent badge in sync with the pipeline: every
+        # status transition (active/testing/queued/…) re-renders the title.
+        self.manager.add_status_listener(self._on_title_status_change)
         # Status observers (notifications): wired on mount, so the startup
         # demotions in TaskManager.__init__ never produce events.
         self.manager.add_status_listener(self.notifier.task_status)

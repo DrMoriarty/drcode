@@ -8,6 +8,7 @@ from typing import Any
 from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.syntax import Syntax
 from rich.text import Text
 from textual.timer import Timer
 from textual.widgets import Static
@@ -17,6 +18,7 @@ from textual.widgets import Static
 # the tool is executing.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_INTERVAL = 0.12
+
 
 class UserBlock(Static):
     """User message: full-width background with an accent bar on the left.
@@ -256,6 +258,41 @@ def _streamable_markdown(text: str, width: int) -> Text:
     return result
 
 
+def _json_text(text: str) -> Text:
+    """Syntax-highlight a JSON snippet (tool-call arguments).
+
+    Valid JSON is re-indented for readability (display only — the stored
+    transcript keeps the original bytes) and colored via pygments: keys,
+    strings, numbers and punctuation each get their own ansi color.
+    Anything unparsable (a truncated or non-JSON argument string) falls
+    back to plain text. Rendered through a detached Console into a plain
+    Text — the same trick as _markdown_text — so Textual's mouse selection
+    still works over the block.
+    """
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return Text(text)
+    if isinstance(parsed, (dict, list)):
+        text = json.dumps(parsed, indent=2, ensure_ascii=False)
+    console = Console(
+        width=_JSON_RENDER_WIDTH, legacy_windows=False, file=io.StringIO()
+    )
+    options = console.options.update(width=_JSON_RENDER_WIDTH)
+    result = Text()
+    for segment in console.render(Syntax(text, "json", theme="ansi_dark"), options):
+        result.append(segment.text, segment.style)
+    if result.plain.endswith("\n"):
+        result.right_crop(1)
+    return result
+
+
+# Width the JSON is lexed at: large enough that pygments never hard-wraps a
+# line (the widget soft-wraps instead), so the highlighted Text is
+# width-independent and can be cached for the block's lifetime.
+_JSON_RENDER_WIDTH = 10_000
+
+
 class AssistantBlock(Static):
     """Live assistant answer, streamed directly into the chat log.
 
@@ -332,7 +369,8 @@ class ToolCallBlock(Static):
 
     Header shows the tool name plus the value of its primary argument
     ("⚙ edit_file src/drcode/agent.py") in gray; expanding reveals the
-    full arguments, also in gray.
+    full arguments as syntax-highlighted JSON (keys, strings, numbers and
+    punctuation in their own colors; unparsable arguments stay plain).
     """
 
     # Which parameter carries the "main" value when a tool takes several
@@ -348,6 +386,10 @@ class ToolCallBlock(Static):
         self.at = at or datetime.now()
         self._spin_timer: Timer | None = None
         self._spin_frame = 0
+        # Highlighted-JSON body, computed lazily on first expand (the
+        # pygments pass is not free and a collapsed block never shows it);
+        # width-independent, so it survives terminal resizes.
+        self._body: Text | None = None
         self._redraw()
 
     def start_spinner(self) -> None:
@@ -427,6 +469,7 @@ class ToolCallBlock(Static):
         text = Text(f"{arrow} {marker} {self._header}")
         _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
         if not self.has_class("collapsed") and self._args:
-            text.append("\n").append(self._args)
+            if self._body is None:
+                self._body = _json_text(self._args)
+            text.append("\n").append(self._body)
         self.update(text)
-

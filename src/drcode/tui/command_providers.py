@@ -262,7 +262,8 @@ class ModelConfigCommandProvider(Provider):
                 f"Model settings: {status}",
                 (
                     "Change the model id, base URL, API key and context-window "
-                    "size, then apply them immediately (user setting)"
+                    "size, then apply them immediately (project setting, saved "
+                    "to .drcode/drcode.json)"
                 ),
                 app.action_open_model_setup,
             ),

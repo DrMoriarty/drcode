@@ -122,10 +122,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         min-height: 2;
         padding: 0 1;
         border: none;
-        background: $surface;
+        # Always visibly distinct from the $surface chat log above, even
+        # without focus; focus brightens it one more step.
+        background: $surface-lighten-1;
     }
     #chat-input:focus {
-        background: $surface-lighten-1;
+        background: $surface-lighten-2;
     }
     .reasoning { padding: 0 4; color: $text-muted; }
     .reasoning:hover { background: $panel; }

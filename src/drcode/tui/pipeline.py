@@ -33,6 +33,7 @@ from ..agent import (
     ends_with_open_request,
     extract_previous_summary,
     first_user_prompt,
+    is_pending_retry,
     is_summary_message,
     last_context_tokens,
     last_response_usage,
@@ -610,7 +611,10 @@ class PipelineLayer(DrCodeState):
                             if entry.text in self._pending_rendered:
                                 # Already shown as a queued block; don't repeat it.
                                 self._pending_rendered.remove(entry.text)
-                            else:
+                            elif not is_pending_retry(task.messages, entry.text):
+                                # Not already visible from the transcript either
+                                # (an unfinished attempt's prompt renders from
+                                # there) — draw the user block once.
                                 self._write_history_line("user", entry.text)
                 elif task.unfinished:
                     if not ends_with_open_request(task.messages):

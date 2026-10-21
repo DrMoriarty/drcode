@@ -6,7 +6,10 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydantic_ai import ModelRequest, ModelResponse
+from pydantic_ai.messages import TextPart, UserPromptPart
 
+from drcode.agent import serialize_messages
 from drcode.models import (
     PendingInput,
     Task,
@@ -138,6 +141,54 @@ def test_send_to_awaiting_clarification_sets_queue_head(
 def test_send_strips_whitespace(manager: TaskManager) -> None:
     task = manager.create("t", "  padded  ")
     assert [e.text for e in task.pending_input] == ["padded"]
+
+
+def test_send_ignores_duplicate_of_queued_text(manager: TaskManager) -> None:
+    """A re-send of a text that is still sitting in pending_input is a
+    no-op: the user re-typing a comment the busy pipeline has not visibly
+    reacted to must not queue (and later render/send) the message twice."""
+    task = manager.create("t", "x")
+    manager.send(task.id, "comment")
+    manager.send(task.id, "comment")
+    assert [e.text for e in task.pending_input] == ["x", "comment"]
+
+
+def test_send_ignores_duplicate_of_in_flight_prompt(manager: TaskManager) -> None:
+    """A re-send while the identical text is already the transcript's
+    unfinished prompt (a run is processing it) is a no-op: the prompt
+    must not reach the model twice."""
+    task = manager.create("t", "x")
+    manager.promote_next()
+    task.messages = serialize_messages(
+        [ModelRequest(parts=[UserPromptPart(content="comment")])]
+    )
+    task.pending_input.clear()
+    manager.send(task.id, "comment")
+    assert task.pending_input == []
+    assert task.status is TaskStatus.ACTIVE
+
+
+def test_send_repeat_after_completion_requeues(manager: TaskManager) -> None:
+    """A text whose transcript attempt is FINISHED (answered long ago) is
+    not a duplicate: re-sending it after completion re-queues the task —
+    only the still-unfinished/in-flight copies are deduplicated."""
+    task = manager.create("t", "x")
+    # The run consumed the original brief long ago.
+    task.pending_input.clear()
+    task.messages = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="comment")]),
+            ModelResponse(parts=[TextPart(content="done")]),
+        ]
+    )
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.completed_at = _now()
+
+    manager.send(task.id, "comment")
+    assert task.status is TaskStatus.QUEUED
+    assert task.verification is None
+    assert [e.text for e in task.pending_input] == ["comment"]
 
 
 # -- set_kind -----------------------------------------------------------------

@@ -16,6 +16,7 @@ from .models import (
     _now,
 )
 from .storage import Storage
+from .transcript import is_pending_retry
 
 # Status-change observer: (task, old status, new status, origin). Origin is
 # "user" when the transition was directly initiated by the user sitting at
@@ -140,9 +141,23 @@ class TaskManager:
         clarification goes to the head of the queue. Promotion (activation)
         is up to the caller: the app advances the pipeline through
         _advance(), which never starts new development while any testing is
-        incomplete."""
+        incomplete.
+
+        A re-send of a text that is still queued in `pending_input` — or
+        already sitting in the transcript as the prompt of an unfinished
+        attempt — is ignored: the user re-typing a comment that the busy
+        pipeline has not visibly reacted to yet must not duplicate the
+        message (it would show twice in the chat history and reach the
+        model twice)."""
         task = self.get(task_id)
-        task.pending_input.append(PendingInput(text=text.strip()))
+        stripped = text.strip()
+        if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
+            task.messages, stripped
+        ):
+            task.touch()
+            self.storage.save(task)
+            return task
+        task.pending_input.append(PendingInput(text=stripped))
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             old = task.status
             task.status = TaskStatus.QUEUED

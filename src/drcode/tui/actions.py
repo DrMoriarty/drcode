@@ -784,6 +784,15 @@ class ActionsLayer(DrCodeState):
 
 
     def _submit_user_text(self, task: Task, text: str) -> None:
+        # A re-send of a text that is still queued (an identical entry sits
+        # in pending_input) or already in flight (the transcript holds it as
+        # the prompt of the unfinished attempt) is a no-op: send() ignores
+        # it, and drawing/promoting it again would show the comment twice.
+        stripped = text.strip()
+        if any(
+            e.text == stripped for e in task.pending_input
+        ) or is_pending_retry(task.messages, stripped):
+            return
         # Capture the pre-run state: _advance() promotes the task to ACTIVE
         # (promote_next) and flips its status, so the render check below must
         # compare the ORIGINAL status, not the post-promotion one.

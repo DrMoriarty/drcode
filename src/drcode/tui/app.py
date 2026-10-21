@@ -236,6 +236,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self.notifier = Notifier(
             lambda: self.settings,
             project=project_root.name,
+            project_root=project_root,
             on_error=self._notify_error,
         )
         # The "queue empty" / "pipeline blocked" notifications are sent only

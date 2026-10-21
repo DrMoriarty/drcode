@@ -5,7 +5,9 @@ dedup."""
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -20,9 +22,13 @@ def _capture_deliver(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     """Replace the HTTP delivery with an in-memory recorder."""
     sent: list[dict] = []
 
-    def fake_post(url: str, json: dict, timeout: float) -> object:
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_post(url: str, json: dict, timeout: float) -> _FakeResponse:
         sent.append(json)
-        return object()
+        return _FakeResponse()
 
     import drcode.notifications as mod
 
@@ -125,14 +131,239 @@ def test_notifier_delivery_failure_is_swallowed(
     monkeypatch.setattr(mod.httpx, "post", failing_post)
     settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
     errors: list[str] = []
-    notifier = Notifier(lambda: settings, on_error=errors.append)
+    notifier = Notifier(lambda: settings, on_error=errors.append, retry_interval=3600)
 
     notifier.notify("t", "m")  # synchronous via _ImmediateThread
     assert len(errors) == 1 and "boom" in errors[0]
-    # Fallback: never raises, reports to stderr.
+    # Fallback: never raises, reports to stderr. (The failed notification
+    # itself stays pending — a second notify() would only queue behind it,
+    # so the queue is emptied here to provoke a fresh delivery attempt.)
     notifier._on_error = None
+    notifier._pending.clear()
     notifier.notify("t", "m")
     assert "drcode notifications" in capsys.readouterr().err
+
+
+# -- deferred delivery (pending queue) ----------------------------------------
+
+_sent: list[dict] = []
+
+
+def _failing_post(url: str, json: dict, timeout: float) -> object:
+    raise RuntimeError("network unreachable")
+
+
+def _capture_post(url: str, json: dict, timeout: float) -> object:
+    _sent.append(json)
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    return _FakeResponse()
+
+
+def _notifier(
+    settings: ProjectSettings,
+    project_root: Path | None = None,
+    retry_interval: float = 3600.0,
+) -> Notifier:
+    return Notifier(
+        lambda: settings,
+        project_root=project_root,
+        retry_interval=retry_interval,
+    )
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Poll a condition set by a background thread (the retry waiter runs
+    in a real thread even when delivery is made synchronous)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _read_pending_file(project_root: Path) -> list[dict]:
+    path = project_root / ".drcode" / "pending_notifications.json"
+    return json.loads(path.read_text())
+
+
+def test_failed_send_is_persisted_with_timestamp(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path
+) -> None:
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    def failing_post(url: str, json: dict, timeout: float) -> object:
+        raise TimeoutError("network unreachable")
+
+    monkeypatch.setattr(mod.httpx, "post", failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="topic1")
+    notifier = _notifier(settings, project_root)
+
+    before = datetime.now().astimezone()
+    notifier.notify("заголовок", "сообщение", tags=["bell"], priority=Priority.HIGH)
+
+    raw = _read_pending_file(project_root)
+    assert len(raw) == 1
+    entry = raw[0]
+    assert entry["topic"] == "topic1"
+    assert entry["title"] == "заголовок"
+    assert entry["message"] == "сообщение"
+    assert entry["tags"] == ["bell"]
+    assert entry["priority"] == 4
+    # The timestamp of the moment the notification arose is stored.
+    created = datetime.fromisoformat(entry["created_at"])
+    assert abs((created - before).total_seconds()) < 60
+    # The pending copy keeps the original text; the delay note is added
+    # only when the notification is actually re-sent.
+    assert "задержк" not in entry["message"]
+
+
+def test_new_notifications_queue_behind_unsent_ones(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path
+) -> None:
+    """While an older notification is unsent, new ones are never attempted
+    — they only join the tail of the queue, in arrival order."""
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    def failing_post(url: str, json: dict, timeout: float) -> object:
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(mod.httpx, "post", failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, project_root)
+
+    notifier.notify("first", "m1")
+    notifier.notify("second", "m2")
+    notifier.notify("third", "m3")
+
+    raw = _read_pending_file(project_root)
+    assert [e["title"] for e in raw] == ["first", "second", "third"]
+
+
+def test_retry_delivers_in_order_with_delay_note_then_clears_file(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path
+) -> None:
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    monkeypatch.setattr(mod.httpx, "post", _failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, project_root, retry_interval=0.05)
+
+    notifier.notify("first", "m1")
+    notifier.notify("second", "m2")
+
+    # Network comes back: the waiter retries after retry_interval and both
+    # notifications are delivered in their original order.
+    monkeypatch.setattr(mod.httpx, "post", _capture_post)
+    _sent.clear()
+    assert _wait_until(lambda: len(notifier._pending) == 0)
+    assert [e["title"] for e in _sent] == ["first", "second"]
+    # Both re-sends say they are late and when each notification arose.
+    assert "задержк" in _sent[0]["message"]
+    assert "отложенное" in _sent[0]["message"]
+    assert "задержк" in _sent[1]["message"]
+    # Success: the file is removed.
+    assert not (project_root / ".drcode" / "pending_notifications.json").exists()
+
+
+def test_startup_flushes_saved_pending_file(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path
+) -> None:
+    """At startup a saved pending file is loaded and delivered in order."""
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    monkeypatch.setattr(mod.httpx, "post", _failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, project_root)
+    notifier.notify("first", "m1")
+    notifier.notify("second", "m2")
+
+    # "Restart": a fresh notifier over the same project root, healthy
+    # network — the saved notifications must go out before anything new.
+    monkeypatch.setattr(mod.httpx, "post", _capture_post)
+    _sent.clear()
+    restarted = _notifier(settings, project_root)
+    assert [e["title"] for e in _sent] == ["first", "second"]
+    assert restarted._pending == []
+    assert not (project_root / ".drcode" / "pending_notifications.json").exists()
+
+    # And a new notification is delivered right after the backlog.
+    restarted.notify("third", "m3")
+    assert [e["title"] for e in _sent] == ["first", "second", "third"]
+    assert "задержк" not in _sent[2]["message"]  # it was not delayed
+
+
+def test_startup_preserves_arisen_at_timestamp(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path
+) -> None:
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    monkeypatch.setattr(mod.httpx, "post", _failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, project_root)
+    before = datetime.now().astimezone()
+    notifier.notify("first", "m1")
+
+    monkeypatch.setattr(mod.httpx, "post", _capture_post)
+    _sent.clear()
+    _notifier(settings, project_root)
+    assert "задержк" in _sent[0]["message"]
+    # The delay note carries the original arisen-at moment, not the
+    # restart moment.
+    stamp = _sent[0]["message"].split("возникло ")[1].split(",")[0]
+    restored = datetime.strptime(stamp, "%d.%m.%Y %H:%M:%S").astimezone()
+    assert abs((restored - before).total_seconds()) < 60
+
+
+def test_corrupt_pending_file_moves_aside(
+    monkeypatch: pytest.MonkeyPatch, project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pending_dir = project_root / ".drcode"
+    pending_dir.mkdir()
+    (pending_dir / "pending_notifications.json").write_text("{not json")
+
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    monkeypatch.setattr(mod.httpx, "post", _capture_post)
+    _sent.clear()
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, project_root)
+    assert notifier._pending == []
+    assert (pending_dir / "pending_notifications.json.bak").exists()
+    assert "drcode notifications" in capsys.readouterr().err
+    # The app keeps working: a fresh notification is delivered normally.
+    notifier.notify("t", "m")
+    assert [e["title"] for e in _sent] == ["t"]
+
+
+def test_in_memory_queue_without_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a project root the queue still works, only in memory."""
+    _run_notifier_now(monkeypatch)
+    import drcode.notifications as mod
+
+    monkeypatch.setattr(mod.httpx, "post", _failing_post)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = _notifier(settings, retry_interval=0.05)
+    notifier.notify("first", "m1")
+    notifier.notify("second", "m2")
+    assert [e.title for e in notifier._pending] == ["first", "second"]
+
+    monkeypatch.setattr(mod.httpx, "post", _capture_post)
+    _sent.clear()
+    assert _wait_until(lambda: len(notifier._pending) == 0)
+    assert [e["title"] for e in _sent] == ["first", "second"]
 
 
 def test_title_includes_project_folder(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -13,6 +13,22 @@ without ever disturbing the caller:
 - every failure is swallowed and logged (stderr / an optional callback):
   a broken notification channel must never break the pipeline.
 
+Deferred delivery: when a notification cannot be sent right away (the
+network is down, the request times out), it is not lost — it is persisted
+in `<project>/.drcode/pending_notifications.json` together with the
+timestamp of the moment it arose, and re-delivery is retried every
+`RETRY_INTERVAL` (15 minutes). The strict rules of the pending queue:
+
+- notifications are always delivered in the order they arose in the system
+  (a single FIFO queue);
+- while at least one older notification is unsent, no new notification is
+  attempted — a new one can only join the tail of the queue;
+- a notification re-sent after a delay says so in its message, along with
+  the moment it originally arose;
+- a successfully sent notification is removed from the file;
+- at startup a saved pending file is loaded and its notifications are
+  delivered (in order) before anything new.
+
 Three kinds of events are reported:
 
 1. task status changes — except those directly initiated by the user who
@@ -30,12 +46,19 @@ Three kinds of events are reported:
 from __future__ import annotations
 
 import enum
+import json
+import os
 import sys
+import tempfile
 import threading
+import time
 from collections.abc import Callable, Sequence
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from .models import VerificationStatus
 
@@ -50,6 +73,18 @@ NTFY_BASE = "https://ntfy.sh"
 # send runs in its own daemon thread.
 SEND_TIMEOUT = 10.0
 
+# How often delivery of the pending (deferred) notifications is retried.
+RETRY_INTERVAL = 15 * 60.0
+
+# Name of the deferred-notifications file inside `<project>/.drcode/`.
+PENDING_FILENAME = "pending_notifications.json"
+
+# Captured at import time on purpose: the retry waiter must stay a real
+# background thread even in tests that make the delivery itself
+# synchronous by monkeypatching `threading.Thread` — otherwise the
+# 15-minute wait would run inline and hang the test.
+_THREAD = threading.Thread
+
 
 class Priority(int, enum.Enum):
     """ntfy.sh message priorities (the ones worth distinguishing here).
@@ -62,6 +97,27 @@ class Priority(int, enum.Enum):
     DEFAULT = 3
     HIGH = 4
     URGENT = 5
+
+
+class PendingNotification(BaseModel):
+    """A notification that could not be delivered immediately.
+
+    `created_at` is the moment the event arose in the system (not the
+    moment of the failed send) — it is stamped once, survives restarts in
+    the pending file and is shown to the recipient when the notification
+    is finally delivered with a delay. `topic` is snapshotted at creation
+    time so a settings change between the failed attempt and the retry
+    cannot silently redirect the old notification elsewhere."""
+
+    topic: str
+    title: str
+    message: str
+    tags: list[str] = []
+    priority: int = Priority.DEFAULT.value
+    created_at: datetime
+    # Set after the first failed delivery attempt: the re-send must say
+    # that it is arriving late (see _delivery_message).
+    delayed: bool = False
 
 
 def _status_text(status: TaskStatus, task: Task) -> str:
@@ -95,6 +151,11 @@ class Notifier:
 
     `settings_getter` is read on every event, so a settings change made in
     the dialog applies immediately without rebuilding anything.
+
+    `project_root` enables the deferred-delivery queue (see the module
+    docstring): failed sends are persisted in `<project>/.drcode/` and
+    retried every 15 minutes. Without it the queue still works, but only
+    in memory (it dies with the process).
     """
 
     def __init__(
@@ -102,7 +163,9 @@ class Notifier:
         settings_getter: Callable[[], ProjectSettings],
         *,
         project: str = "",
+        project_root: Path | None = None,
         ntfy_base: str = NTFY_BASE,
+        retry_interval: float = RETRY_INTERVAL,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
         self._settings_getter = settings_getter
@@ -111,11 +174,30 @@ class Notifier:
         # drcode instances sharing one ntfy topic stay distinguishable.
         self.project = project
         self.ntfy_base = ntfy_base.rstrip("/")
+        self._retry_interval = retry_interval
         self._on_error = on_error
+        # Deferred-delivery queue: strict FIFO, guarded by _lock. Every
+        # delivery attempt (immediate or retried) goes through it, which
+        # guarantees both the original ordering and that nothing new is
+        # ever attempted while an older notification is unsent.
+        self._lock = threading.Lock()
+        self._pending: list[PendingNotification] = []
+        self._flushing = False
+        self._retry_waiter: _THREAD | None = None
+        self._pending_path = (
+            project_root / ".drcode" / PENDING_FILENAME if project_root else None
+        )
+        self._pending = self._load_pending()
         # Last settled pipeline state already reported (None = a run is
         # active / nothing settled yet): dedup of the empty/blocked
         # notifications — see pipeline_idle().
         self._settled_state: str | None = None
+        # Startup: a saved pending file must be delivered before anything
+        # new — the freshly loaded notifications are flushed right away.
+        if self._pending:
+            with self._lock:
+                self._flushing = True
+            self._spawn_flush()
 
     # -- low-level delivery ---------------------------------------------------
 
@@ -143,38 +225,192 @@ class Notifier:
         priority: Priority = Priority.DEFAULT,
     ) -> None:
         """Fire-and-forget send. Safe to call from any thread (worker
-        threads included): the delivery runs in its own daemon thread."""
+        threads included): the delivery runs in its own daemon thread.
+
+        The notification always joins the tail of the FIFO queue: if older
+        notifications are still unsent, this one is only stored (and
+        persisted, when a project root is known) — never attempted before
+        them."""
         topic = self._topic()
         if not topic:
             return
-        thread = threading.Thread(
-            target=self._deliver,
-            args=(topic, title, message, tuple(tags), priority.value),
-            daemon=True,
-            name="drcode-notify",
+        entry = PendingNotification(
+            topic=topic,
+            title=title,
+            message=message,
+            tags=list(tags),
+            priority=priority.value,
+            created_at=datetime.now().astimezone(),
         )
-        thread.start()
+        with self._lock:
+            self._pending.append(entry)
+            kick = not self._flushing
+            if kick:
+                self._flushing = True
+            if self._pending[:-1]:
+                # Older notifications are still unsent: persist the new
+                # tail right away so nothing is lost, but do not attempt
+                # any send — the running flush or the retry waiter owns
+                # the delivery now.
+                self._persist_locked()
+        if kick:
+            self._spawn_flush()
 
-    def _deliver(
-        self, topic: str, title: str, message: str, tags: tuple[str, ...], priority: str
-    ) -> None:
+    def _delivery_message(self, entry: PendingNotification) -> str:
+        """Message text for the wire: a deferred re-send announces the
+        delay and the moment the notification originally arose."""
+        if not entry.delayed:
+            return entry.message
+        return (
+            f"{entry.message}\n"
+            f"⏰ отложенное уведомление: возникло "
+            f"{entry.created_at:%d.%m.%Y %H:%M:%S}, отправлено с задержкой"
+        )
+
+    def _attempt_send(self, entry: PendingNotification) -> bool:
+        """One delivery attempt. Never raises: True = delivered, False =
+        the notification stays pending (and will be retried)."""
         try:
             response = httpx.post(
                 self.ntfy_base,
                 # JSON publish (POST to the root): unlike header-based
                 # publishing it carries non-ASCII titles/messages safely.
                 json={
-                    "topic": topic,
-                    "title": title,
-                    "message": message,
-                    "tags": list(tags),
-                    "priority": priority,
+                    "topic": entry.topic,
+                    "title": entry.title,
+                    "message": self._delivery_message(entry),
+                    "tags": entry.tags,
+                    "priority": entry.priority,
                 },
                 timeout=SEND_TIMEOUT,
             )
             response.raise_for_status()
+            return True
         except Exception as e:  # noqa: BLE001 - notifications must never crash anything
             self._report_error(f"{type(e).__name__}: {e}")
+            return False
+
+    def _spawn_flush(self) -> None:
+        """Run the flush loop in a daemon thread (a hanging ntfy.sh must
+        never stall the caller)."""
+        threading.Thread(
+            target=self._flush_owned, daemon=True, name="drcode-notify"
+        ).start()
+
+    def _flush_owned(self) -> None:
+        """Deliver pending notifications strictly in order until the queue
+        is empty or a send fails. Exactly one flush loop runs at a time
+        (the `_flushing` flag): everyone else just queues and relies on
+        the running loop — or the retry waiter — to pick the tail up."""
+        retry_scheduled = False
+        try:
+            while True:
+                with self._lock:
+                    entry = self._pending[0] if self._pending else None
+                if entry is None:
+                    return
+                if not self._attempt_send(entry):
+                    # Keep the notification (with the arisen-at timestamp)
+                    # and everything queued behind it; retry later. All of
+                    # them become "delayed": nothing behind the stuck head
+                    # can be delivered on time anymore — the queue is
+                    # strict FIFO.
+                    with self._lock:
+                        for pending in self._pending:
+                            pending.delayed = True
+                        self._persist_locked()
+                        self._schedule_retry_locked()
+                    retry_scheduled = True
+                    return
+                with self._lock:
+                    self._pending.pop(0)
+                    # Success: the sent notification leaves the file.
+                    self._persist_locked()
+        finally:
+            with self._lock:
+                self._flushing = False
+                # A notification may have been queued while this loop was
+                # finishing; if nothing owns the delivery now, take it
+                # again. After a failed send the retry waiter owns it.
+                restart = bool(self._pending) and not retry_scheduled
+                if restart:
+                    self._flushing = True
+            if restart:
+                self._spawn_flush()
+
+    def _schedule_retry_locked(self) -> None:
+        """Arrange a retry of the whole pending queue in `retry_interval`
+        seconds. Caller holds `_lock`. At most one waiter sleeps at a
+        time — an existing one already covers everything queued now."""
+        if self._retry_waiter is not None:
+            return
+
+        def _wait_and_flush() -> None:
+            time.sleep(self._retry_interval)
+            with self._lock:
+                self._retry_waiter = None
+                if self._flushing or not self._pending:
+                    return
+                self._flushing = True
+            self._flush_owned()
+
+        waiter = _THREAD(
+            target=_wait_and_flush, daemon=True, name="drcode-notify-retry"
+        )
+        self._retry_waiter = waiter
+        waiter.start()
+
+    # -- pending-queue persistence ---------------------------------------------
+
+    def _load_pending(self) -> list[PendingNotification]:
+        """Read the deferred queue from disk (startup recovery). A corrupt
+        file is moved aside (`.bak`), never fatal."""
+        if self._pending_path is None:
+            return []
+        try:
+            raw = self._pending_path.read_text()
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            self._report_error(f"pending notifications unreadable: {e}")
+            return []
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                raise TypeError("pending notifications: expected a list")
+            return [PendingNotification.model_validate(item) for item in data]
+        except (json.JSONDecodeError, ValidationError, TypeError) as e:
+            backup = self._pending_path.with_name(self._pending_path.name + ".bak")
+            try:
+                self._pending_path.replace(backup)
+            except OSError:
+                pass
+            self._report_error(
+                f"pending notifications file corrupted, moved to {backup.name}: {e}"
+            )
+            return []
+
+    def _persist_locked(self) -> None:
+        """Write the whole pending queue atomically. An empty queue
+        removes the file. Caller holds `_lock`."""
+        if self._pending_path is None:
+            return
+        try:
+            if not self._pending:
+                self._pending_path.unlink(missing_ok=True)
+                return
+            self._pending_path.parent.mkdir(parents=True, exist_ok=True)
+            body = ",\n".join(e.model_dump_json() for e in self._pending)
+            fd, tmp = tempfile.mkstemp(dir=self._pending_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(f"[\n{body}\n]\n")
+                os.replace(tmp, self._pending_path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        except OSError as e:
+            self._report_error(f"pending notifications not saved: {e}")
 
     def _report_error(self, text: str) -> None:
         if self._on_error is not None:

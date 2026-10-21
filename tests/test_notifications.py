@@ -110,7 +110,7 @@ def test_notifier_publishes_json_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> Non
     assert payload["title"] == "заголовок"
     assert payload["message"] == "сообщение"
     assert payload["tags"] == ["bell"]
-    assert payload["priority"] == "high"
+    assert payload["priority"] == 4  # ntfy JSON publish: priority must be an int
 
 
 def test_notifier_delivery_failure_is_swallowed(

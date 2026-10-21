@@ -49,13 +49,17 @@ NTFY_BASE = "https://ntfy.sh"
 SEND_TIMEOUT = 10.0
 
 
-class Priority(str, enum.Enum):
-    """ntfy.sh message priorities (the ones worth distinguishing here)."""
+class Priority(int, enum.Enum):
+    """ntfy.sh message priorities (the ones worth distinguishing here).
 
-    MIN = "min"
-    DEFAULT = "default"
-    HIGH = "high"
-    URGENT = "urgent"
+    Numeric on purpose: the JSON publish API accepts `priority` only as an
+    int (1..5) — a string like "high" makes ntfy.sh answer 400
+    "request body must be valid JSON"."""
+
+    MIN = 1
+    DEFAULT = 3
+    HIGH = 4
+    URGENT = 5
 
 
 def _status_text(status: TaskStatus, task: Task) -> str:

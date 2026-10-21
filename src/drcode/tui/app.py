@@ -233,7 +233,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # settings on every event, so a change made in the settings dialog
         # applies immediately. Delivery failures are surfaced as in-app
         # toasts (the delivery itself runs in a daemon thread).
-        self.notifier = Notifier(lambda: self.settings, on_error=self._notify_error)
+        self.notifier = Notifier(
+            lambda: self.settings,
+            project=project_root.name,
+            on_error=self._notify_error,
+        )
         # The "queue empty" / "pipeline blocked" notifications are sent only
         # on state transitions; the very first pipeline evaluation after
         # startup only primes the state (a cold start on an empty queue

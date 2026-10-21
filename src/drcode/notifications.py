@@ -99,10 +99,15 @@ class Notifier:
         self,
         settings_getter: Callable[[], ProjectSettings],
         *,
+        project: str = "",
         ntfy_base: str = NTFY_BASE,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
         self._settings_getter = settings_getter
+        # Name of the project folder the app works in: prepended to every
+        # title ("DrCode (myproject): ...") so notifications from several
+        # drcode instances sharing one ntfy topic stay distinguishable.
+        self.project = project
         self.ntfy_base = ntfy_base.rstrip("/")
         self._on_error = on_error
         # Last settled pipeline state already reported (None = a run is
@@ -111,6 +116,14 @@ class Notifier:
         self._settled_state: str | None = None
 
     # -- low-level delivery ---------------------------------------------------
+
+    def _title(self, text: str) -> str:
+        """Title with the app prefix — and, when known, the project folder
+        name, so instances working in different folders (but publishing to
+        one topic) can be told apart."""
+        if self.project:
+            return f"DrCode ({self.project}): {text}"
+        return f"DrCode: {text}"
 
     def _topic(self) -> str:
         """Configured ntfy topic, or "" when notifications are off."""
@@ -190,7 +203,7 @@ class Notifier:
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
         self.notify(
-            f"DrCode: задача {new.value}",
+            self._title(f"задача {new.value}"),
             f"#{task.id} «{task.title}» — {_status_text(new, task)}",
             tags=["clipboard" if new.value == "completed" else "hammer_and_wrench"],
             priority=(
@@ -203,7 +216,7 @@ class Notifier:
     def github_sync(self, imported: int, skipped: int) -> None:
         """A completed GitHub Issues sync cycle with its outcome."""
         self.notify(
-            "DrCode: синхронизация GitHub",
+            self._title("синхронизация GitHub"),
             (
                 f"Синхронизация с GitHub завершена: импортировано задач — "
                 f"{imported}, пропущено — {skipped}."
@@ -231,14 +244,14 @@ class Notifier:
         self._settled_state = state
         if blocked:
             self.notify(
-                "DrCode: конвейер простаивает",
+                self._title("конвейер простаивает"),
                 f"Нет задач, которые можно взять в разработку. {detail}",
                 tags=["warning"],
                 priority=Priority.HIGH,
             )
         else:
             self.notify(
-                "DrCode: очередь пуста",
+                self._title("очередь пуста"),
                 "Все задачи обработаны — новых задач в очереди нет.",
                 tags=["white_check_mark"],
                 priority=Priority.HIGH,
@@ -250,7 +263,7 @@ class Notifier:
         error exclusion was forcibly lifted from all of them and they are
         back in development by the ordinary priority rules."""
         self.notify(
-            "DrCode: задачи с ошибкой вернулись в разработку",
+            self._title("задачи с ошибкой вернулись в разработку"),
             f"В очереди не осталось задач без ошибок: задач с ошибкой — "
             f"{count}. Все они снова возвращены в разработку.",
             tags=["arrows_counterclockwise"],

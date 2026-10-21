@@ -135,6 +135,22 @@ def test_notifier_delivery_failure_is_swallowed(
     assert "drcode notifications" in capsys.readouterr().err
 
 
+def test_title_includes_project_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    _run_notifier_now(monkeypatch)
+    sent = _capture_deliver(monkeypatch)
+    settings = ProjectSettings(notifications_enabled=True, ntfy_topic="t")
+    notifier = Notifier(lambda: settings, project="myproject")
+
+    notifier.task_status(_task(), TaskStatus.QUEUED, TaskStatus.ACTIVE, "system")
+    assert len(sent) == 1
+    assert sent[0]["title"] == "DrCode (myproject): задача active"
+
+    # Without a project the plain "DrCode:" prefix is kept.
+    notifier = Notifier(lambda: settings)
+    notifier.task_status(_task(), TaskStatus.QUEUED, TaskStatus.ACTIVE, "system")
+    assert sent[1]["title"] == "DrCode: задача active"
+
+
 # -- event semantics ----------------------------------------------------------
 
 

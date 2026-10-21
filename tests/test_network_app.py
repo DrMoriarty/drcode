@@ -32,6 +32,7 @@ from drcode.agent import (
 )
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.tui import app as app_module
+from drcode.tui import pipeline as pipeline_module
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (
     ScriptedState,
@@ -406,7 +407,7 @@ def scripted_fills(monkeypatch: pytest.MonkeyPatch):
     def install(fills: list[int]) -> None:
         queue = iter(fills)
         monkeypatch.setattr(
-            app_module, "run_context_tokens", lambda run: next(queue, None)
+            pipeline_module, "run_context_tokens", lambda run: next(queue, None)
         )
 
     return install

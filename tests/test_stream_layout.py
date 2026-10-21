@@ -8,7 +8,8 @@ until the view was rebuilt. `_flush`/`finish` must request a layout.
 
 from __future__ import annotations
 
-from drcode.tui.app import AssistantBlock, DrCodeApp
+from drcode.tui.app import DrCodeApp
+from drcode.tui.blocks import AssistantBlock
 from tests.network_mocks import wait_until
 
 
@@ -45,7 +46,7 @@ def test_reasoning_block_applies_markdown() -> None:
     not as plain text."""
     from rich.text import Text
 
-    from drcode.tui.app import ReasoningBlock
+    from drcode.tui.blocks import ReasoningBlock
 
     def _styled_spans(body: Text) -> list[str]:
         return [str(s) for s in body.spans]

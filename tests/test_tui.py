@@ -19,7 +19,8 @@ from textual.widgets import ListView, TextArea
 from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
 from drcode.storage import Storage
-from drcode.tui.app import DrCodeApp, TaskItem
+from drcode.tui.app import DrCodeApp
+from drcode.tui.sidebar import TaskItem
 
 
 @pytest.fixture

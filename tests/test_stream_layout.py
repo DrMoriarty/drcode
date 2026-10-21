@@ -74,4 +74,3 @@ def test_reasoning_block_applies_markdown() -> None:
     assert "bold end" in rendered2
     assert "**tail**" in rendered2
     assert any("bold=True" in s for s in _styled_spans(body2))
-

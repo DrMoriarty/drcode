@@ -31,7 +31,9 @@ async def test_pending_comment_survives_view_switch(app: DrCodeApp) -> None:
         print("batching:", app._chat_batching, "batch:", app._chat_batch)
         print("pending_rendered:", app._pending_rendered)
 
-        rendered_a = "\n".join(str(w.render()) for w in app.query_one("#chat-log").children)
+        rendered_a = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
         print("\n=== CHAT AFTER SUBMIT ===")
         print(repr(rendered_a))
 
@@ -46,7 +48,9 @@ async def test_pending_comment_survives_view_switch(app: DrCodeApp) -> None:
             if not app._chat_batching:
                 break
 
-        rendered_a2 = "\n".join(str(w.render()) for w in app.query_one("#chat-log").children)
+        rendered_a2 = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
         print("\n=== CHAT AFTER SWITCH AWAY & BACK TO A ===")
         print(repr(rendered_a2))
         print("PENDING_INPUT:", [e.text for e in a.pending_input])

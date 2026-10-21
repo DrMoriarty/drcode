@@ -47,7 +47,6 @@ from .state import DrCodeState
 
 
 class ChatViewLayer(DrCodeState):
-
     def refresh_project_info(self) -> None:
         """Top of the sidebar, above the model status: working directory
         with the git branch (`~/pr/drcode:main`), then a blank line. The
@@ -56,7 +55,6 @@ class ChatViewLayer(DrCodeState):
         dir_text = escape(self._display_dir())
         where = f"{dir_text}:{branch}" if branch else dir_text
         self.project_info.update(f"[dim]{where}[/]\n")
-
 
     def _display_dir(self) -> str:
         """Working directory with the home prefix collapsed to `~`."""
@@ -120,7 +118,6 @@ class ChatViewLayer(DrCodeState):
             for t in self.manager.all_tasks()
         )
 
-
     def _poll_sidebar(self) -> None:
         """Redraw the sidebar only when the underlying task state changed
         since the last render (status transitions, new bug reports from the
@@ -133,7 +130,6 @@ class ChatViewLayer(DrCodeState):
             # COMPLETED while its tester run is still finishing) would leave
             # them stale until the run ends — or a view switch.
             self.refresh_status()
-
 
     def _sidebar_sections(self) -> list[tuple[str, list[Task]]]:
         """Sidebar content: pipeline sections top to bottom, empty ones
@@ -180,14 +176,12 @@ class ChatViewLayer(DrCodeState):
         ]
         return [(name, tasks) for name, tasks in sections if tasks]
 
-
     def _sidebar_top_task(self) -> Task | None:
         """First task of the first non-empty sidebar section — what the
         chat pane opens on startup."""
         for _name, tasks in self._sidebar_sections():
             return tasks[0]
         return None
-
 
     def refresh_sidebar(self) -> None:
         sidebar = self.sidebar
@@ -233,7 +227,6 @@ class ChatViewLayer(DrCodeState):
         sidebar.refresh()
         self._sidebar_snapshot = self._sidebar_fingerprint()
 
-
     def toggle_sidebar_section(self, section: str) -> None:
         """Collapse/expand one sidebar category (its header row).
 
@@ -251,7 +244,6 @@ class ChatViewLayer(DrCodeState):
                 sidebar.index = index
                 break
 
-
     def _refocus_sidebar_task(self, task_id: str) -> None:
         """Put the ListView cursor back onto a task's row after a sidebar
         rebuild (the rebuild resets it), so a series of reorder/hold keys
@@ -263,7 +255,6 @@ class ChatViewLayer(DrCodeState):
                 break
 
     # -- model connection status ---------------------------------------------
-
 
     def _recover_from_outage(self) -> None:
         """Error → connected transition: the outage is over, so un-block the
@@ -278,10 +269,8 @@ class ChatViewLayer(DrCodeState):
         self._failed_queue_retry_at = 0.0
         self._advance()
 
-
     def refresh_connection(self) -> None:
         self.run_worker(self._check_model(), exclusive=True, group="model-check")
-
 
     def _render_model_status(self) -> None:
         """Header connection label + live activity suffix.
@@ -306,16 +295,13 @@ class ChatViewLayer(DrCodeState):
 
     # -- expanded (tall) header: connection details + session statistics ----
 
-
     @property
     def header_conn_info(self) -> Static:
         return self.query_one("#header-conn", HeaderConnInfo)
 
-
     @property
     def header_session_info(self) -> Static:
         return self.query_one("#header-sessions", HeaderSessionInfo)
-
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
@@ -324,7 +310,6 @@ class ChatViewLayer(DrCodeState):
         if seconds < 60:
             return f"{seconds}s"
         return f"{seconds // 60}m{seconds % 60:02d}s"
-
 
     def _collect_session_stats(self) -> None:
         """Fold task-tree changes into the session counters.
@@ -352,7 +337,6 @@ class ChatViewLayer(DrCodeState):
                         (task.completed_at - task.activated_at).total_seconds()
                     )
 
-
     def _header_conn_text(self) -> str:
         """The expanded header's connection line: the connection label
         (dot + model, error detail on failures), URL, last probe
@@ -378,7 +362,6 @@ class ChatViewLayer(DrCodeState):
             line += f" | {usage}"
         return line
 
-
     def _header_stats_text(self) -> str:
         """The expanded header's session-statistics line: tasks completed
         this session, average/median activation→completion time and the
@@ -402,7 +385,6 @@ class ChatViewLayer(DrCodeState):
         )
         return f"{line} | {self._header_github_text()}"
 
-
     def _header_github_text(self) -> str:
         """GitHub-integration status for the expanded header's bottom line:
         configured/not configured (token + repository set), active (the
@@ -423,7 +405,6 @@ class ChatViewLayer(DrCodeState):
             status += f" | error: {self._github_last_error}"
         return status
 
-
     @staticmethod
     def _fmt_tokens(n: int) -> str:
         """Compact human token count for the header (e.g. 45k, 1.2M, 980)."""
@@ -440,7 +421,6 @@ class ChatViewLayer(DrCodeState):
             return fmt(n / 1_000_000, "M")
         return str(n)
 
-
     def _record_session_usage(self, usage: RunUsage | None) -> None:
         """Fold one model call's exact token usage into the session
         totals (main agent, tester and compaction summarizer alike) and
@@ -450,7 +430,6 @@ class ChatViewLayer(DrCodeState):
             return
         self._session_usage.add(usage)
         self._render_header_tall()
-
 
     def _header_usage_text(self) -> str:
         """Exact cumulative token usage of the session, compactly: the
@@ -470,7 +449,6 @@ class ChatViewLayer(DrCodeState):
             parts.append(f"out {self._fmt_tokens(u.output_tokens)}")
         return " | ".join(parts)
 
-
     def _render_header_tall(self) -> None:
         """Refresh the two expanded-header lines (no-op while collapsed:
         the widgets are display:none and their content is refreshed on
@@ -480,7 +458,6 @@ class ChatViewLayer(DrCodeState):
             return
         self.header_conn_info.update(self._header_conn_text())
         self.header_session_info.update(self._header_stats_text())
-
 
     def on_model_status_header_tall_toggled(
         self, event: ModelStatusHeader.TallToggled
@@ -492,7 +469,6 @@ class ChatViewLayer(DrCodeState):
 
     # -- run activity indicator ----------------------------------------------
 
-
     def _touch_activity(self, tool: str | None = None, *, done: bool = False) -> None:
         """Record a sign of life from the agent/tester run. `tool` marks a
         tool call start; `done` clears the current-tool marker (result
@@ -503,13 +479,11 @@ class ChatViewLayer(DrCodeState):
         elif tool is not None:
             self._current_tool = tool
 
-
     @staticmethod
     def _fmt_age(seconds: int) -> str:
         if seconds < 60:
             return f"{seconds}s"
         return f"{seconds // 60}m{seconds % 60:02d}s"
-
 
     def _poll_activity(self) -> None:
         """Every second, show in the sidebar whether the run makes progress
@@ -571,7 +545,6 @@ class ChatViewLayer(DrCodeState):
                 detail += " (esc to stop, ctrl+r to nudge)"
             self._render_activity(f"⚠ {who}: stalled", detail, "stale")
 
-
     def _render_activity(
         self, status: str, detail: str, state: str | None = None
     ) -> None:
@@ -600,7 +573,6 @@ class ChatViewLayer(DrCodeState):
     # cancelled worker's handlers (persist + sanitize the transcript) must
     # finish before the resume run reads the task state.
     _NUDGE_RESTART_DELAY = 1.0
-
 
     def _poll_stall(self) -> None:
         """Watchdog: when the running agent/tester has emitted nothing (no
@@ -632,7 +604,6 @@ class ChatViewLayer(DrCodeState):
             f"{self.settings.stall_nudge.label})",
         )
         self._nudge_run(task)
-
 
     def _nudge_run(self, task: Task) -> None:
         """Abort the hung/stalled run for `task` (if one is in flight) and
@@ -669,7 +640,6 @@ class ChatViewLayer(DrCodeState):
 
     # -- chat pane ---------------------------------------------------------------
 
-
     def _log_event(self, task: Task, text: str, *, kind: str = "system") -> None:
         """Persist a service event into the task's event log.
 
@@ -681,19 +651,16 @@ class ChatViewLayer(DrCodeState):
         task.touch()
         self.manager.storage.save(task)
 
-
     @staticmethod
     def _format_event(event: TaskEvent) -> str:
         ts = event.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         return f"[dim]{ts}[/] {escape(event.text)}"
-
 
     def _show_event(self, task: Task, text: str, *, kind: str = "system") -> None:
         """Persist an event and, if the task is open, render it live."""
         self._log_event(task, text, kind=kind)
         if self.viewed_id == task.id:
             self._write_history_line("event", self._format_event(task.events[-1]))
-
 
     def view_task(self, task_id: str) -> None:
         # Opening a task cancels a pending new-task creation: the click on a
@@ -723,7 +690,6 @@ class ChatViewLayer(DrCodeState):
             self._flush_chat_batch()
         self.refresh_sidebar()
         self.refresh_status()
-
 
     def _render_task_history(self, task: Task, task_id: str) -> None:
         """Write the task's full history into the (batched) chat log."""
@@ -788,7 +754,6 @@ class ChatViewLayer(DrCodeState):
             self._write_clarification(task.clarification)
             self._rendered_clarification = task.clarification
 
-
     def _chat_at_bottom(self) -> bool:
         """True when the reader is tracking the chat tail (auto-scroll follows).
 
@@ -804,7 +769,6 @@ class ChatViewLayer(DrCodeState):
         log = self.chat_log
         return log.scroll_offset.y >= log.max_scroll_y - _SCROLL_FOLLOW_THRESHOLD
 
-
     def _stream_follow(self) -> None:
         """Keep the chat tail visible while streaming, coalesced to ~10 Hz.
 
@@ -818,7 +782,6 @@ class ChatViewLayer(DrCodeState):
             self.chat_log.call_after_refresh(self.chat_log.scroll_end, animate=False)
 
     # -- tool-call spinners ------------------------------------------------------
-
 
     def _tool_call_started(
         self,
@@ -835,7 +798,6 @@ class ChatViewLayer(DrCodeState):
             block,
         )
 
-
     def _tool_call_finished(self, call_id: str) -> None:
         """Tool result arrived: stop the spinner of its block (in whichever
         run registered it — agent and tester never overlap, but the lookup
@@ -845,13 +807,11 @@ class ChatViewLayer(DrCodeState):
             if entry is not None:
                 entry[2].stop_spinner()
 
-
     def _stop_run_tools(self, run_key: tuple[str, int]) -> None:
         """End-of-run cleanup: anything still marked running for this run
         (a result event lost to an abort/error) loses its spinner."""
         for _task_id, _text, block in self._active_tools.pop(run_key, {}).values():
             block.stop_spinner()
-
 
     def _reattach_tool_spinner(
         self, block: ToolCallBlock, call_text: str, task_id: str
@@ -865,7 +825,6 @@ class ChatViewLayer(DrCodeState):
                     per_run[call_id] = (tid, text, block)
                     block.start_spinner()
                     return
-
 
     def _write_chat(
         self, content: RenderableType | Widget, *, expand: bool = False
@@ -894,7 +853,6 @@ class ChatViewLayer(DrCodeState):
             self.chat_log.scroll_end(animate=False)
         self._chat_has_content = True
 
-
     def _flush_chat_batch(self) -> None:
         """Start mounting the blocks collected by a batched history rebuild.
 
@@ -909,7 +867,6 @@ class ChatViewLayer(DrCodeState):
         self._chat_batching = True
         self._chat_batch_epoch = self._chat_epoch
         self._drain_chat_batch()
-
 
     def _drain_chat_batch(self) -> None:
         """Mount one chunk of the pending batch, reschedule for the rest."""
@@ -938,7 +895,6 @@ class ChatViewLayer(DrCodeState):
             self._chat_batching = False
             self._chat_batch.clear()
             raise
-
 
     def _write_history_line(
         self, role: str, text: str, at: datetime | None = None
@@ -983,7 +939,6 @@ class ChatViewLayer(DrCodeState):
             self._write_chat(block)
         return block
 
-
     def _write_clarification(self, clarification: Clarification) -> None:
         lines = [f"[bold blue]drcode ❓[/] {escape(clarification.question)}"]
         for i, option in enumerate(clarification.options):
@@ -993,7 +948,6 @@ class ChatViewLayer(DrCodeState):
             )
         lines.append("[dim]Click an option or answer in the input below.[/]")
         self._write_chat("\n".join(lines))
-
 
     def refresh_status(self) -> None:
         active = self.manager.active
@@ -1010,7 +964,6 @@ class ChatViewLayer(DrCodeState):
             f"agent: {state}   tester: {tester}   model: {model} "
         )
         self.refresh_task_status()
-
 
     def refresh_task_status(self) -> None:
         # The footer mirrors the state check_action() gates on (viewed task,
@@ -1056,13 +1009,11 @@ class ChatViewLayer(DrCodeState):
         left.update("   ".join(parts))
         self._update_ctx_counter(right, task)
 
-
     @staticmethod
     def _fmt_ctx_tokens(n: int) -> str:
         if n >= 1000:
             return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
         return str(n)
-
 
     def _update_ctx_counter(self, right: Static, task: Task) -> None:
         """Right corner of the task status bar: current context fill in
@@ -1090,8 +1041,10 @@ class ChatViewLayer(DrCodeState):
             )
             # Red from the compaction threshold, yellow when the remaining
             # headroom is twice the red-zone headroom: threshold 80 →
-            # yellow from 60, threshold 90 → yellow from 80.
-            threshold = min(max(self.config.compaction_threshold, 1), 100)
+            # yellow from 60, threshold 90 → yellow from 80. The threshold
+            # follows the CODING model's resolved config, so a per-model
+            # compaction limit from the catalog is reflected here too.
+            threshold = min(max(self._coding_config().compaction_threshold, 1), 100)
             warn_pct = 2 * threshold - 100
             if pct >= threshold:
                 right.add_class("ctx-crit")
@@ -1102,4 +1055,3 @@ class ChatViewLayer(DrCodeState):
         right.update(text)
 
     # -- agent run -----------------------------------------------------------------
-

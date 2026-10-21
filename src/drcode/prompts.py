@@ -22,11 +22,13 @@ SYSTEM_PROMPTS_DIR = _PROMPTS_DIR / "system"
 # text directly (e.g. the test-suite asserts on their content).
 FEATURE_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "feature.md").read_text(encoding="utf-8")
 BUG_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "bug.md").read_text(encoding="utf-8")
-RESEARCH_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "research.md").read_text(encoding="utf-8")
+RESEARCH_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "research.md").read_text(
+    encoding="utf-8"
+)
 TESTER_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "tester.md").read_text(encoding="utf-8")
-TESTER_SYSTEM_PROMPT_NO_COMMIT = (
-    SYSTEM_PROMPTS_DIR / "tester_no_commit.md"
-).read_text(encoding="utf-8")
+TESTER_SYSTEM_PROMPT_NO_COMMIT = (SYSTEM_PROMPTS_DIR / "tester_no_commit.md").read_text(
+    encoding="utf-8"
+)
 
 # Placeholder in the templates, replaced with the actual project directory.
 PROJECT_PATH_PLACEHOLDER = "{project_path}"

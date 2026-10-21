@@ -199,10 +199,14 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
             try:
                 max_tokens = int(tokens_raw)
             except ValueError:
-                self._fail("Max output tokens must be a positive integer.", "#sd-tokens")
+                self._fail(
+                    "Max output tokens must be a positive integer.", "#sd-tokens"
+                )
                 return
             if max_tokens <= 0:
-                self._fail("Max output tokens must be a positive integer.", "#sd-tokens")
+                self._fail(
+                    "Max output tokens must be a positive integer.", "#sd-tokens"
+                )
                 return
 
         error.update("Checking connection…")

@@ -73,7 +73,6 @@ from .usage import (
 
 
 class PipelineLayer(DrCodeState):
-
     def _coding_config(self) -> Config:
         """Effective model connection of the coding agent (resolved against
         the project's per-role selection and the user-level catalog)."""
@@ -396,15 +395,22 @@ class PipelineLayer(DrCodeState):
         self,
         live_tokens: int | None,
         messages: list[dict[str, Any]],
+        role: AgentRole = AgentRole.CODING,
     ) -> int | None:
         """Context fill (tokens) when the compaction threshold is reached
         (percent of max_context_tokens), None otherwise. Prefers the live
         reading of the running turn over the persisted transcript, whose
-        usage lags behind by the not-yet-persisted requests."""
-        max_tokens = self._coding_config().max_context_tokens
+        usage lags behind by the not-yet-persisted requests.
+
+        Both the context size and the threshold come from the resolved
+        config of `role` — the model actually serving the transcript — so
+        a per-model compaction limit from the catalog (models.json) is
+        honored instead of the flat config's value."""
+        config = self.resolved_config(role)
+        max_tokens = config.max_context_tokens
         if max_tokens <= 0:
             return None
-        threshold = min(max(self.config.compaction_threshold, 1), 100)
+        threshold = min(max(config.compaction_threshold, 1), 100)
         tokens = live_tokens
         if tokens is None:
             tokens = last_context_tokens(messages)
@@ -415,7 +421,7 @@ class PipelineLayer(DrCodeState):
     def _compaction_due(self, task: Task) -> int | None:
         """Compaction threshold check for the main agent transcript."""
         return self._fill_over_threshold(
-            self._live_ctx_tokens.get(task.id), task.messages
+            self._live_ctx_tokens.get(task.id), task.messages, AgentRole.CODING
         )
 
     async def _maybe_compact(self, task: Task) -> None:
@@ -1343,7 +1349,9 @@ class PipelineLayer(DrCodeState):
                                 # persistently broken summarizer would loop
                                 # pause→resume forever.
                                 tokens = self._fill_over_threshold(
-                                    live_tokens, task.tester_messages[-1]
+                                    live_tokens,
+                                    task.tester_messages[-1],
+                                    AgentRole.TESTER,
                                 )
                                 if tokens is not None and (
                                     task.id not in self._compaction_failed
@@ -1351,7 +1359,9 @@ class PipelineLayer(DrCodeState):
                                     pct = round(
                                         tokens
                                         * 100
-                                        / self._coding_config().max_context_tokens
+                                        / self.resolved_config(
+                                            AgentRole.TESTER
+                                        ).max_context_tokens
                                     )
                                     self._show_event(
                                         task,

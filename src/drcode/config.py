@@ -109,7 +109,10 @@ class Config(BaseSettings):
     # agent rewrites the transcript into a structured summary while the
     # original user prompt(s) stay verbatim. Also drives the status-bar
     # colors: red from this fill, yellow from half the remaining headroom
-    # (2 * threshold - 100, e.g. 60% at the default 80).
+    # (2 * threshold - 100, e.g. 60% at the default 80). A model entry in
+    # the user-level catalog (models.json, see drcode.providers) may carry
+    # its own `compaction_threshold`, which overrides this value for every
+    # agent role the model is assigned to.
     compaction_threshold: int = 80
     # Cap on model turns (model responses acted upon) per agent/tester run —
     # pydantic-ai's UsageLimits.request_limit. Its built-in default of 50 is
@@ -310,6 +313,7 @@ def ensure_user_config_dir() -> None:
                                         "id": "qwen3-coder-30b",
                                         "max_context_tokens": 200000,
                                         "max_tokens": None,
+                                        "compaction_threshold": None,
                                         "context_reported": False,
                                     }
                                 ],

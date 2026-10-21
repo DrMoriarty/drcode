@@ -325,7 +325,9 @@ def test_startup_preserves_arisen_at_timestamp(
 
 
 def test_corrupt_pending_file_moves_aside(
-    monkeypatch: pytest.MonkeyPatch, project_root: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     pending_dir = project_root / ".drcode"
     pending_dir.mkdir()

@@ -59,4 +59,3 @@ class SessionTokenUsage:
         self.cache_read_tokens += usage.cache_read_tokens or 0
         self.cache_write_tokens += usage.cache_write_tokens or 0
         self.output_tokens += usage.output_tokens or 0
-

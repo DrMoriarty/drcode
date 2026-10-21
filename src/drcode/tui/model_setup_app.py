@@ -101,6 +101,7 @@ class ModelCatalogScreen(ModalScreen[None]):
         margin-top: 1;
     }
     #mc-ctx, #mc-new-model { width: 16; }
+    #mc-pct { width: 16; }
     #mc-roles { height: auto; margin-top: 1; }
     #mc-roles Select { width: 1fr; margin-right: 1; }
     #mc-footer {
@@ -168,6 +169,11 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Set ctx", id="mc-ctx-set")
                         yield Button("Remove", id="mc-model-del")
                     with Horizontal(classes="mc-btnrow"):
+                        yield Input(
+                            id="mc-pct", placeholder="compact % (empty = inherit)"
+                        )
+                        yield Button("Set pct", id="mc-pct-set")
+                    with Horizontal(classes="mc-btnrow"):
                         yield Input(id="mc-new-model", placeholder="add model id")
                         yield Button("Add model", id="mc-model-add")
             with Horizontal(id="mc-roles"):
@@ -182,7 +188,8 @@ class ModelCatalogScreen(ModalScreen[None]):
                 yield Button("Save", variant="primary", id="mc-save")
                 yield Static(
                     "esc — close without saving · model table: Enter/click "
-                    "selects a row, then set its context size",
+                    "selects a row, then set its context size and compaction "
+                    "limit (compact %, empty = inherit the global setting)",
                     id="mc-hint",
                 )
 
@@ -444,6 +451,8 @@ class ModelCatalogScreen(ModalScreen[None]):
         entry = next((m for m in provider.models if m.id == model_id), None)
         if entry is not None:
             self.query_one("#mc-ctx", Input).value = str(entry.max_context_tokens)
+            pct = entry.compaction_threshold
+            self.query_one("#mc-pct", Input).value = "" if pct is None else str(pct)
             self.query_one("#mc-ctx", Input).focus()
 
     def _current_model_entry(self) -> ModelEntry | None:
@@ -473,6 +482,38 @@ class ModelCatalogScreen(ModalScreen[None]):
         entry.context_reported = True
         self._refresh_models()
         self._status(f"✓ {entry.id}: context set to {value}")
+
+    @on(Button.Pressed, "#mc-pct-set")
+    def _set_compaction_threshold(self) -> None:
+        self._apply_compaction_threshold()
+
+    @on(Input.Submitted, "#mc-pct")
+    def _compaction_threshold_submitted(self) -> None:
+        self._apply_compaction_threshold()
+
+    def _apply_compaction_threshold(self) -> None:
+        entry = self._current_model_entry()
+        if entry is None:
+            self._status("Select a model row first (Enter or click).")
+            return
+        raw = self.query_one("#mc-pct", Input).value.strip()
+        if not raw:
+            # Empty = inherit: drop the per-model override.
+            entry.compaction_threshold = None
+            self._refresh_models()
+            self._status(f"✓ {entry.id}: compaction limit cleared (inherits)")
+            return
+        try:
+            value = int(raw)
+        except ValueError:
+            self._status("✗ compact % must be an integer between 1 and 100")
+            return
+        if not 1 <= value <= 100:
+            self._status("✗ compact % must be an integer between 1 and 100")
+            return
+        entry.compaction_threshold = value
+        self._refresh_models()
+        self._status(f"✓ {entry.id}: compaction at {value}% of context")
 
     @on(Button.Pressed, "#mc-model-del")
     def _remove_model(self) -> None:

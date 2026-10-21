@@ -58,7 +58,6 @@ from .state import DrCodeState
 
 
 class ActionsLayer(DrCodeState):
-
     def _model_setup_done(self, setup: ModelSetup | None) -> None:
         """Result of the first-start setup dialog.
 
@@ -101,7 +100,6 @@ class ActionsLayer(DrCodeState):
         # applies as well.
         self._maybe_offer_agents_md()
 
-
     def _maybe_offer_agents_md(self) -> None:
         """Startup offer: model configured, project root has no AGENTS.md.
 
@@ -123,7 +121,6 @@ class ActionsLayer(DrCodeState):
             return
         self.push_screen(AgentsMdDialog(), self._agents_md_answered)
 
-
     def _agents_md_answered(self, create: bool | None) -> None:
         # Textual's dismissal type includes None (ESC without a result);
         # the dialog always answers with True/False, treat None as "no".
@@ -132,11 +129,9 @@ class ActionsLayer(DrCodeState):
 
     # -- widgets helpers ------------------------------------------------------
 
-
     @property
     def new_task_input(self) -> NewTaskInput:
         return self.query_one("#nt-input", NewTaskInput)
-
 
     def _clear_stream_label(self) -> None:
         """Legacy hook of the removed streaming-preview widget.
@@ -145,13 +140,11 @@ class ActionsLayer(DrCodeState):
         clear — kept as a no-op so abort/new-task paths stay simple.
         """
 
-
     def _drop_stream_preview(self, generation: int) -> None:
         """Clear the streaming preview after an agent run ends, but only if
         no newer run has (already) taken over the label."""
         if generation == self._agent_generation:
             self._clear_stream_label()
-
 
     def action_new_task(self) -> None:
         # Every entry into the new-task screen starts from a clean editor.
@@ -172,7 +165,6 @@ class ActionsLayer(DrCodeState):
         self.refresh_task_status()
         self.new_task_input.focus()
 
-
     def _leave_new_task_mode(self) -> None:
         self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
@@ -182,7 +174,6 @@ class ActionsLayer(DrCodeState):
         self._clear_stream_label()
         self.chat_input.remove_class("hidden")
         self.refresh_task_status()
-
 
     def cancel_new_task(self) -> None:
         self._leave_new_task_mode()
@@ -217,12 +208,10 @@ class ActionsLayer(DrCodeState):
         TaskKind.RESEARCH: "yellow",
     }
 
-
     def toggle_new_task_kind(self) -> None:
         idx = self._KIND_CYCLE.index(self.new_task_kind)
         self.new_task_kind = self._KIND_CYCLE[(idx + 1) % len(self._KIND_CYCLE)]
         self._update_kind_label()
-
 
     def _update_kind_label(self) -> None:
         label = self.query_one("#nt-kind-label", Static)
@@ -238,7 +227,6 @@ class ActionsLayer(DrCodeState):
             label.add_class("kind-feature")
         self._update_kind_descriptions()
 
-
     def _update_kind_descriptions(self) -> None:
         lines = []
         for kind in self._KIND_CYCLE:
@@ -249,7 +237,6 @@ class ActionsLayer(DrCodeState):
             marker = "▸" if active else " "
             lines.append(f"{marker} {name} — {self._KIND_DESCRIPTIONS[kind]}")
         self.query_one("#nt-kinds", Static).update("\n".join(lines))
-
 
     def submit_new_task(self) -> None:
         text = self.new_task_input.text.strip()
@@ -262,7 +249,6 @@ class ActionsLayer(DrCodeState):
         self.chat_input.focus()
         # Starts immediately unless testing is pending or the queue is busy.
         self._advance()
-
 
     def action_done_task(self) -> None:
         task = self.viewed
@@ -277,7 +263,6 @@ class ActionsLayer(DrCodeState):
         self.view_task(task.id)
         # Testing backlog first (possibly an older TESTING task), then queue.
         self._advance()
-
 
     def action_cancel_task(self) -> None:
         """User cancels the viewed task (not relevant anymore): drop all
@@ -318,7 +303,6 @@ class ActionsLayer(DrCodeState):
         # The pipeline continues: testing backlog first, then the queue.
         self._advance()
 
-
     def action_abort_run(self) -> None:
         if self.agent_running or self.tester_running:
             self.workers.cancel_group(self, "agent")
@@ -331,7 +315,6 @@ class ActionsLayer(DrCodeState):
             self._clear_stream_label()
             self.refresh_status()
 
-
     def action_nudge_run(self) -> None:
         """Ctrl+R on the viewed ACTIVE/TESTING task: abort its hung or
         stalled run and restart it — the same move the stall watchdog makes
@@ -341,7 +324,6 @@ class ActionsLayer(DrCodeState):
         if task is None:
             return
         self._nudge_run(task)
-
 
     def action_cycle_task_kind(self) -> None:
         """Cycle the type of the viewed task (feature → bug → research).
@@ -358,19 +340,16 @@ class ActionsLayer(DrCodeState):
         if self.viewed_id == task.id:
             self.refresh_task_status()
 
-
     def action_move_task_up(self) -> None:
         """Move the viewed queued task one step up the backlog — away from
         execution (the list runs top = farthest, bottom = next to run)."""
         self._move_viewed_task(up=True)
-
 
     def action_move_task_down(self) -> None:
         """Move the viewed queued task one step down the backlog — closer
         to execution (swaps it with the task the pipeline would pick
         before it)."""
         self._move_viewed_task(up=False)
-
 
     def _move_viewed_task(self, *, up: bool) -> None:
         task = self.viewed
@@ -383,7 +362,6 @@ class ActionsLayer(DrCodeState):
         # The Move up/Move down footer buttons hide at the queue edges and
         # at the bug-block boundary — re-evaluate the visible bindings.
         self.refresh_bindings()
-
 
     def action_hold_task(self) -> None:
         """Park the viewed task out of the backlog (hold). Works for queued
@@ -402,7 +380,6 @@ class ActionsLayer(DrCodeState):
         if self.viewed_id == task.id:
             self.refresh_task_status()
 
-
     def action_resume_task(self) -> None:
         """Return a held task to where it was (queued or awaiting
         clarification, whichever it was parked from)."""
@@ -415,7 +392,6 @@ class ActionsLayer(DrCodeState):
         self.refresh_status()
         if self.viewed_id == task.id:
             self.refresh_task_status()
-
 
     def action_delete_task(self) -> None:
         """Fully remove the viewed held task — from the sidebar and from disk
@@ -443,10 +419,8 @@ class ActionsLayer(DrCodeState):
             self.refresh_status()
             self.refresh_task_status()
 
-
     def action_focus_sidebar(self) -> None:
         self.sidebar.focus()
-
 
     def action_focus_input(self) -> None:
         # The new-task form replaces the chat input while it is open: the
@@ -457,13 +431,11 @@ class ActionsLayer(DrCodeState):
         else:
             self.chat_input.focus()
 
-
     def action_settings(self) -> None:
         """Open the Settings modal (the command palette, Ctrl+S)."""
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
-
 
     def action_open_model_setup(self) -> None:
         """Re-open the model setup dialog on demand (a Settings entry).
@@ -584,7 +556,6 @@ class ActionsLayer(DrCodeState):
         self.invalidate_resolved_configs()
         self._model_setup_done(setup)
 
-
     def action_set_completed_retention(self, retention: CompletedRetention) -> None:
         """Settings command: after how long completed tasks are deleted at
         startup. Persisted per project (.drcode/settings.json); the cleanup
@@ -596,7 +567,6 @@ class ActionsLayer(DrCodeState):
             title="Project settings",
             timeout=4,
         )
-
 
     def action_change_completed_retention(self) -> None:
         """Completed-tasks auto-cleanup picker, opened from the single
@@ -616,7 +586,6 @@ class ActionsLayer(DrCodeState):
             )
         )
 
-
     def action_set_task_finalization(self, finalization: TaskFinalization) -> None:
         """Settings command: what happens after a development round finishes
         (tester + commit / tester / nothing). Persisted per project
@@ -631,7 +600,6 @@ class ActionsLayer(DrCodeState):
             timeout=4,
         )
         self._advance()
-
 
     def action_change_task_finalization(self) -> None:
         """Task-finalization picker, opened from the Settings entry
@@ -649,7 +617,6 @@ class ActionsLayer(DrCodeState):
             )
         )
 
-
     def action_set_stall_nudge(self, nudge: StallNudge) -> None:
         """Settings command: after how long without any activity a hung
         agent/tester run is aborted and restarted. Persisted per project
@@ -662,7 +629,6 @@ class ActionsLayer(DrCodeState):
             title="Project settings",
             timeout=4,
         )
-
 
     def action_change_stall_nudge(self) -> None:
         """Stall-nudge picker, opened from the Settings entry ("Nudge
@@ -679,7 +645,6 @@ class ActionsLayer(DrCodeState):
                 placeholder="Search for options…",
             )
         )
-
 
     def action_change_github(self) -> None:
         """GitHub-integration dialog, opened from the Settings entry
@@ -698,7 +663,6 @@ class ActionsLayer(DrCodeState):
             ),
             self._github_settings_done,
         )
-
 
     def _github_settings_done(self, setup: GitHubSetup | None) -> None:
         if setup is None:
@@ -727,7 +691,6 @@ class ActionsLayer(DrCodeState):
 
     # -- notifications (ntfy.sh) -----------------------------------------------
 
-
     def action_change_notifications(self) -> None:
         """Notifications dialog, opened from the Settings entry
         ("Notifications: on/off"). Collects the enable switch and the
@@ -744,10 +707,7 @@ class ActionsLayer(DrCodeState):
             self._notifications_settings_done,
         )
 
-
-    def _notifications_settings_done(
-        self, setup: NotificationsSetup | None
-    ) -> None:
+    def _notifications_settings_done(self, setup: NotificationsSetup | None) -> None:
         if setup is None:
             return
         self.settings.notifications_enabled = setup.enabled
@@ -764,13 +724,12 @@ class ActionsLayer(DrCodeState):
             # that the topic is wrong) without waiting for a real event.
             self.notifier.notify(
                 "DrCode: notifications enabled",
-                f"Project \"{self.project_root.name}\": test "
+                f'Project "{self.project_root.name}": test '
                 "notification — the channel works.",
                 tags=["bell"],
             )
 
     # -- GitHub Issues sync ----------------------------------------------------
-
 
     def _poll_github_sync(self) -> None:
         """Scheduler tick (every 30s): when the integration is enabled and
@@ -790,7 +749,6 @@ class ActionsLayer(DrCodeState):
             time.monotonic() + self.settings.github_sync_interval.hours * 3600
         )
         self.run_worker(self._github_sync(), exclusive=True, group="github-sync")
-
 
     async def _github_sync(self) -> None:
         client = GitHubClient(self.settings.github_token, self.settings.github_repo)
@@ -829,7 +787,6 @@ class ActionsLayer(DrCodeState):
         finally:
             self._github_syncing = False
 
-
     def action_update_agents_md(self) -> None:
         """Create a research task that writes/refreshes AGENTS.md.
 
@@ -838,7 +795,6 @@ class ActionsLayer(DrCodeState):
         `research` kind: the tester is skipped and mark_done() completes
         it right away."""
         self._create_agents_task()
-
 
     def _create_agents_task(self) -> None:
         """Shared body of the Settings action and the startup AGENTS.md
@@ -853,7 +809,6 @@ class ActionsLayer(DrCodeState):
         self.chat_input.focus()
         # Starts immediately unless testing is pending or the queue is busy.
         self._advance()
-
 
     def action_change_theme(self) -> None:
         """Theme picker, opened from the Settings palette ("Theme" command).
@@ -875,7 +830,6 @@ class ActionsLayer(DrCodeState):
 
     # -- events -------------------------------------------------------------------------
 
-
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem):
@@ -890,7 +844,6 @@ class ActionsLayer(DrCodeState):
                 self.view_task(item.task_id)
                 self.chat_input.focus()
 
-
     def submit_chat_input(self) -> None:
         """Send the chat editor's content (Enter in the chat input)."""
         text = self.chat_input.text.strip()
@@ -902,16 +855,15 @@ class ActionsLayer(DrCodeState):
         self.chat_input.clear()
         self._submit_user_text(task, text)
 
-
     def _submit_user_text(self, task: Task, text: str) -> None:
         # A re-send of a text that is still queued (an identical entry sits
         # in pending_input) or already in flight (the transcript holds it as
         # the prompt of the unfinished attempt) is a no-op: send() ignores
         # it, and drawing/promoting it again would show the comment twice.
         stripped = text.strip()
-        if any(
-            e.text == stripped for e in task.pending_input
-        ) or is_pending_retry(task.messages, stripped):
+        if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
+            task.messages, stripped
+        ):
             return
         # Capture the pre-run state: _advance() promotes the task to ACTIVE
         # (promote_next) and flips its status, so the render decision below
@@ -943,7 +895,6 @@ class ActionsLayer(DrCodeState):
             self._advance()
         self.refresh_sidebar()
         self.refresh_status()
-
 
     def action_pick_option(self, index: int) -> None:
         """User clicked a clarifying-question option: submit it as their answer."""

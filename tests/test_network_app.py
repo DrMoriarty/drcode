@@ -814,7 +814,9 @@ async def test_all_failed_queue_is_rescued_and_redeveloped(
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
-            lambda: a.status is TaskStatus.COMPLETED and b.status is TaskStatus.COMPLETED,
+            lambda: (
+                a.status is TaskStatus.COMPLETED and b.status is TaskStatus.COMPLETED
+            ),
             pilot,
             what="both rescued tasks completed",
         )
@@ -825,9 +827,7 @@ async def test_all_failed_queue_is_rescued_and_redeveloped(
     assert rescued == [2]
     assert not {a.id, b.id} & net_app._agent_failed
     rescue_events = [
-        t
-        for t in event_texts(a) + event_texts(b)
-        if "exclusion lifted" in t
+        t for t in event_texts(a) + event_texts(b) if "exclusion lifted" in t
     ]
     assert len(rescue_events) == 2
     # Each brief was sent exactly once (the failure never re-queues text).
@@ -888,8 +888,9 @@ async def test_repeated_failed_queue_rescue_backs_off(
         scripted.steps = [text_response("done a"), text_response("done b")]
         net_app._advance()
         await wait_until(
-            lambda: a.status is TaskStatus.COMPLETED
-            and b.status is TaskStatus.COMPLETED,
+            lambda: (
+                a.status is TaskStatus.COMPLETED and b.status is TaskStatus.COMPLETED
+            ),
             pilot,
             what="both tasks completed by the second rescue round",
         )

@@ -87,6 +87,12 @@ class ModelEntry(BaseModel):
     # Per-response output cap; None = keep whatever the flat config / the
     # provider default says.
     max_tokens: int | None = None
+    # Context fill (percent of max_context_tokens) at which THIS model's
+    # transcript is compacted; None = inherit the flat config's
+    # `compaction_threshold`. Stored on the model entry (not per role) so
+    # the model–context–compaction-limit triple is one indivisible unit:
+    # assigning the model to an agent role brings all three with it.
+    compaction_threshold: int | None = None
     # True when the gateway itself reported the context size (trusted);
     # False = the default above, confirm/adjust by hand in the UI.
     context_reported: bool = False
@@ -350,6 +356,15 @@ def load_seeded_catalog(
     max_tokens = data.get("max_tokens")
     if not isinstance(max_tokens, int) or max_tokens <= 0:
         max_tokens = None
+    # The compaction limit is only carried over when the user set it
+    # explicitly; otherwise the entry stays `None` (= inherit), so the
+    # flat config / project setting keeps applying until the user pins a
+    # per-model value in the catalog UI.
+    compaction_threshold = data.get("compaction_threshold")
+    if not isinstance(compaction_threshold, int) or not (
+        1 <= compaction_threshold <= 100
+    ):
+        compaction_threshold = None
     provider = Provider(
         name=_provider_name_for(base_url),
         base_url=base_url,
@@ -360,6 +375,7 @@ def load_seeded_catalog(
                 id=model,
                 max_context_tokens=max_context,
                 max_tokens=max_tokens,
+                compaction_threshold=compaction_threshold,
                 # The flat config value is not a gateway report — keep the
                 # "confirm by hand" flag of a hand-entered entry.
                 context_reported=False,
@@ -425,4 +441,8 @@ def resolve(config: Config, role: AgentRole) -> Config:
         update["max_context_tokens"] = entry.max_context_tokens
         if entry.max_tokens is not None:
             update["max_tokens"] = entry.max_tokens
+        # The compaction limit rides with the model: an entry-level value
+        # overrides the flat config, None keeps it (project/user setting).
+        if entry.compaction_threshold is not None:
+            update["compaction_threshold"] = entry.compaction_threshold
     return config.model_copy(update=update)

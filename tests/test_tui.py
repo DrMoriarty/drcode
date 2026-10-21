@@ -539,7 +539,9 @@ async def test_pipeline_settled_notification_primes_then_sends(
 
     sent: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        app.notifier, "notify", lambda title, message, **kw: sent.append((title, message))
+        app.notifier,
+        "notify",
+        lambda title, message, **kw: sent.append((title, message)),
     )
 
     held = Task(title="parked", status=TaskStatus.HOLD)

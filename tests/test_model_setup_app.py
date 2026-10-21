@@ -12,7 +12,12 @@ from pathlib import Path
 from textual.app import App
 from textual.widgets import Input, OptionList, Select
 
-from drcode.providers import Provider, UserModelsConfig, UserModelsStore
+from drcode.providers import (
+    ModelEntry,
+    Provider,
+    UserModelsConfig,
+    UserModelsStore,
+)
 from drcode.tui.model_setup_app import ModelCatalogScreen
 
 
@@ -84,6 +89,77 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         assert entry["id"] == "my-model"
         assert entry["max_context_tokens"] == 131072
         assert data["defaults"]["coding"] == {"provider": "p", "model": "my-model"}
+
+
+async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.click("#mc-add")
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        screen.query_one("#mc-name", Input).value = "p"
+        screen.query_one("#mc-url", Input).value = "http://p/v1"
+        screen.query_one("#mc-new-model", Input).value = "my-model"
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        # Select its row and set the per-model compaction limit.
+        screen._selected_model = "my-model"
+        pct_input = screen.query_one("#mc-pct", Input)
+        pct_input.value = "60"
+        await pilot.click("#mc-pct-set")
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].compaction_threshold == 60
+        # Enter in the field applies the value too: clearing it removes the
+        # override (inherit again).
+        pct_input.focus()
+        pct_input.value = ""
+        await pilot.press("enter")
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].compaction_threshold is None
+        # Set it again and save.
+        pct_input.value = "75"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].compaction_threshold == 75
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        entry = json.loads(path.read_text())["providers"][0]["models"][0]
+        assert entry["compaction_threshold"] == 75
+
+
+async def test_compaction_threshold_input_validation(tmp_path: Path) -> None:
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[ModelEntry(id="m")],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        screen._selected_model = "m"
+        pct_input = screen.query_one("#mc-pct", Input)
+        pct_input.focus()
+        screen.query_one("#mc-pct", Input).value = "not-a-number"
+        await pilot.press("enter")
+        await pilot.pause()
+        status = screen.query_one("#mc-status")
+        assert "between 1 and 100" in str(status.render())
+        screen.query_one("#mc-pct", Input).value = "150"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "between 1 and 100" in str(status.render())
+        assert screen.catalog.providers[0].models[0].compaction_threshold is None
 
 
 async def test_duplicate_provider_name_rejected(tmp_path: Path) -> None:

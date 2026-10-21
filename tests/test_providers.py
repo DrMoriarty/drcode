@@ -148,6 +148,42 @@ def test_resolve_env_override_wins_for_all_roles(
         assert resolved.base_url == "http://flat/v1"
 
 
+def test_resolve_carries_per_model_compaction_threshold(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    catalog.providers[0].models[0].compaction_threshold = 60
+    UserModelsStore().save(catalog)
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve(config, AgentRole.CODING)
+    assert resolved.compaction_threshold == 60
+
+
+def test_resolve_threshold_none_inherits_flat_config(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    # Model entry without a compaction override: the flat config's value
+    # (default 80, or whatever the project/user files set) must survive.
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    assert resolve(config, AgentRole.CODING).compaction_threshold == 80
+    config = make_config(
+        project_root,
+        model="flat-m",
+        base_url="http://flat/v1",
+        compaction_threshold=90,
+    )
+    assert resolve(config, AgentRole.CODING).compaction_threshold == 90
+
+
 def test_resolve_does_not_mutate_original(
     project_root: Path, catalog: UserModelsConfig
 ) -> None:
@@ -323,6 +359,26 @@ def test_seed_fills_defaults_for_omitted_fields(user_config_dir: Path) -> None:
     assert provider.models[0].max_context_tokens == 200_000
     assert provider.models[0].max_tokens is None
     assert provider.models[0].context_reported is False
+
+
+def test_seed_carries_explicit_compaction_threshold(user_config_dir: Path) -> None:
+    _write_user_drcode_json(
+        user_config_dir,
+        {"model": "m1", "compaction_threshold": 65},
+    )
+    catalog, note = load_seeded_catalog(UserModelsStore())
+    assert note is not None
+    assert catalog.providers[0].models[0].compaction_threshold == 65
+
+
+def test_seed_leaves_compaction_threshold_unset_when_absent(
+    user_config_dir: Path,
+) -> None:
+    _write_user_drcode_json(user_config_dir, {"model": "m1"})
+    catalog, _ = load_seeded_catalog(UserModelsStore())
+    # None = inherit: the flat config keeps applying until the user pins
+    # a per-model value in the catalog UI.
+    assert catalog.providers[0].models[0].compaction_threshold is None
 
 
 def test_seed_survives_save(user_config_dir: Path) -> None:

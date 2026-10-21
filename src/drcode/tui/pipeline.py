@@ -1207,6 +1207,7 @@ class PipelineLayer(DrCodeState):
                 allow_commit=(
                     self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
                 ),
+                root=self.project_root,
             )
             deps = TesterDeps(
                 root=self.project_root, manager=self.manager, task_id=task_id

@@ -162,7 +162,7 @@ def build_agent(
     requests). When the project root contains AGENTS.md, its content is
     appended to the instructions."""
     model = agent_model.build_model(config)
-    instructions = load_system_prompt(kind)
+    instructions = load_system_prompt(kind, project_root=root)
     if root is not None:
         agents_md = load_agents_md(root)
         if agents_md.strip():
@@ -330,20 +330,20 @@ def build_agent(
 
 
 def build_tester_agent(
-    config: Config, *, allow_commit: bool = True
+    config: Config, *, allow_commit: bool = True, root: Path | None = None
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
     `allow_commit=False` (project setting "Task finalization: Testing")
     selects the commit-free system prompt and does not register the
-    git_commit tool, so verified changes are left uncommitted.
+    git_commit tool, so verified changes are left uncommitted. When `root`
+    is given, its actual path is substituted into the system prompt header
+    (the `{project_path}` placeholder).
     """
     model = agent_model.build_model(config)
     agent = Agent(
         model,
-        instructions=(
-            TESTER_SYSTEM_PROMPT if allow_commit else TESTER_SYSTEM_PROMPT_NO_COMMIT
-        ),
+        instructions=load_tester_prompt(allow_commit, project_root=root),
         deps_type=TesterDeps,
         model_settings={
             "extra_headers": EXTRA_HEADERS,

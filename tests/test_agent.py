@@ -574,20 +574,14 @@ def _instructions_text(ag) -> str:
 
 
 def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
-    from drcode.agent import (
-        BUG_SYSTEM_PROMPT,
-        FEATURE_SYSTEM_PROMPT,
-        RESEARCH_SYSTEM_PROMPT,
-        build_agent,
-    )
+    from drcode.agent import build_agent
+    from drcode.prompts import load_system_prompt
 
-    for kind, prompt in (
-        (TaskKind.FEATURE, FEATURE_SYSTEM_PROMPT),
-        (TaskKind.BUG, BUG_SYSTEM_PROMPT),
-        (TaskKind.RESEARCH, RESEARCH_SYSTEM_PROMPT),
-    ):
+    for kind in (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH):
         ag = build_agent(fake_config, kind=kind)
-        assert prompt in _instructions_text(ag)
+        # build_agent without a root substitutes the neutral marker, exactly
+        # like load_system_prompt(kind) does.
+        assert load_system_prompt(kind) in _instructions_text(ag)
     # All kinds share the same tool set.
     ag = build_agent(fake_config, kind=TaskKind.BUG)
     assert {
@@ -602,12 +596,16 @@ def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
 
 
 def test_build_agent_appends_agents_md(fake_config: Config, project_root: Path) -> None:
-    from drcode.agent import FEATURE_SYSTEM_PROMPT, build_agent
+    from drcode.agent import build_agent
+    from drcode.prompts import load_system_prompt
 
     (project_root / "AGENTS.md").write_text("PROJECT SPECIFIC RULE")
     ag = build_agent(fake_config, kind=TaskKind.FEATURE, root=project_root)
     instructions = _instructions_text(ag)
-    assert FEATURE_SYSTEM_PROMPT in instructions
+    assert (
+        load_system_prompt(TaskKind.FEATURE, project_root=project_root) in instructions
+    )
+    assert str(project_root) in instructions
     assert "Project instructions (AGENTS.md)" in instructions
     assert "PROJECT SPECIFIC RULE" in instructions
 
@@ -639,6 +637,21 @@ def test_build_tester_agent_has_tester_tools(fake_config: Config) -> None:
     # Tester must not have write access: no write_file/edit_file tools.
     assert "write_file" not in tool_names
     assert "edit_file" not in tool_names
+
+
+def test_build_tester_agent_substitutes_project_path(
+    fake_config: Config, project_root: Path
+) -> None:
+    from drcode.agent import build_tester_agent
+    from drcode.prompts import PROJECT_PATH_PLACEHOLDER
+
+    ag = build_tester_agent(fake_config, root=project_root)
+    instructions = _instructions_text(ag)
+    assert str(project_root) in instructions
+    assert PROJECT_PATH_PLACEHOLDER not in instructions
+    # The commit-free variant carries the same header.
+    ag2 = build_tester_agent(fake_config, allow_commit=False, root=project_root)
+    assert str(project_root) in _instructions_text(ag2)
 
 
 def test_system_prompts_distinct() -> None:

@@ -70,15 +70,12 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         assert isinstance(screen, ModelCatalogScreen)
         screen.query_one("#mc-name", Input).value = "p"
         screen.query_one("#mc-url", Input).value = "http://p/v1"
-        # Add a model by hand.
-        screen.query_one("#mc-new-model", Input).value = "my-model"
+        # Add a model by hand from the editor fields (id + context size).
+        screen.query_one("#mc-model-id", Input).value = "my-model"
+        screen.query_one("#mc-ctx", Input).value = "131072"
         await pilot.click("#mc-model-add")
         await pilot.pause()
-        # Select its row and set the context size.
-        screen._selected_model = "my-model"
-        screen.query_one("#mc-ctx", Input).value = "131072"
-        await pilot.click("#mc-model-update")
-        await pilot.pause()
+        assert screen._selected_model == "my-model"
         # Save with the model picked as the coding default.
         select = screen.query_one("#mc-role-coding", Select)
         select.value = "p/my-model"
@@ -102,11 +99,16 @@ async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
         assert isinstance(screen, ModelCatalogScreen)
         screen.query_one("#mc-name", Input).value = "p"
         screen.query_one("#mc-url", Input).value = "http://p/v1"
-        screen.query_one("#mc-new-model", Input).value = "my-model"
+        screen.query_one("#mc-model-id", Input).value = "my-model"
+        screen.query_one("#mc-ctx", Input).value = "131072"
+        # Add a model by hand with a per-model compaction limit straight
+        # from the editor fields.
+        screen.query_one("#mc-pct", Input).value = "60"
         await pilot.click("#mc-model-add")
         await pilot.pause()
-        # Select its row and set the per-model compaction limit.
-        screen._selected_model = "my-model"
+        assert screen.catalog.providers[0].models[0].compaction_threshold == 60
+        # The model row stays selected: editing the limit via Update works.
+        assert screen._selected_model == "my-model"
         pct_input = screen.query_one("#mc-pct", Input)
         pct_input.value = "60"
         await pilot.click("#mc-model-update")
@@ -128,6 +130,57 @@ async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
         await pilot.pause()
         entry = json.loads(path.read_text())["providers"][0]["models"][0]
         assert entry["compaction_threshold"] == 75
+
+
+async def test_add_model_validation(tmp_path: Path) -> None:
+    """Add model creates a new entry from the editor fields; missing id,
+    duplicate id and a bad context size are rejected."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        status = screen.query_one("#mc-status")
+        # Empty id (clear the editor first — mounting the table
+        # auto-fills it with the first row).
+        screen.query_one("#mc-model-id", Input).value = ""
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        assert "Enter a model id" in str(status.render())
+        # Duplicate id. (Consecutive clicks on the same button need a real
+        # delay: the press animation swallows clicks for ~0.2s.)
+        screen.query_one("#mc-model-id", Input).value = "m"
+        await pilot.pause(0.3)
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        assert "already exists" in str(status.render())
+        # Bad context size.
+        screen.query_one("#mc-model-id", Input).value = "new-m"
+        screen.query_one("#mc-ctx", Input).value = "zero"
+        await pilot.pause(0.3)
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        assert "positive integer" in str(status.render())
+        # Valid: the model is created with the entered caps.
+        screen.query_one("#mc-ctx", Input).value = "8192"
+        screen.query_one("#mc-pct", Input).value = "50"
+        await pilot.pause(0.3)
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        provider = screen.catalog.providers[0]
+        added = provider.models[-1]
+        assert added.id == "new-m"
+        assert added.max_context_tokens == 8192
+        assert added.compaction_threshold == 50
+        assert added.context_reported is True
+        assert "added new-m" in str(status.render())
 
 
 async def test_compaction_threshold_input_validation(tmp_path: Path) -> None:

@@ -14,7 +14,8 @@ existing entries keep their manual edits, new ones are appended) and an
 editable model table: selecting a row (single click or arrow keys — no
 double click needed) fills the editor line below it with the model's id,
 context size and compaction limit; "Update" writes the edited values back
-to the selected model, "Remove" deletes it. Per agent role (coding /
+to the selected model, "Add model" creates a new model from the same
+fields, "Remove" deletes it. Per agent role (coding /
 tester / compaction) a default model can be picked from the catalog —
 used when the project does not pin its own.
 
@@ -102,7 +103,6 @@ class ModelCatalogScreen(ModalScreen[None]):
         height: 8;
         margin-top: 1;
     }
-    #mc-new-model { width: 16; }
     #mc-model-row { height: auto; }
     #mc-model-row Input { height: 3; }
     #mc-model-id { width: 1fr; }
@@ -182,8 +182,6 @@ class ModelCatalogScreen(ModalScreen[None]):
                     with Horizontal(classes="mc-btnrow"):
                         yield Button("Update", id="mc-model-update")
                         yield Button("Remove", id="mc-model-del")
-                    with Horizontal(classes="mc-btnrow"):
-                        yield Input(id="mc-new-model", placeholder="add model id")
                         yield Button("Add model", id="mc-model-add")
             with Horizontal(id="mc-roles"):
                 for role in _ROLES:
@@ -198,7 +196,8 @@ class ModelCatalogScreen(ModalScreen[None]):
                 yield Static(
                     "esc — close without saving · model table: click or arrow "
                     "keys select a row and fill the editor; Update writes the "
-                    "edited id/context/limit back, Remove deletes the model",
+                    "edited id/context/limit back, Add model creates a new "
+                    "model from the same fields, Remove deletes it",
                     id="mc-hint",
                 )
 
@@ -301,8 +300,7 @@ class ModelCatalogScreen(ModalScreen[None]):
         self.query_one("#mc-name", Input).value = provider.name if provider else ""
         self.query_one("#mc-url", Input).value = provider.base_url if provider else ""
         self.query_one("#mc-key", Input).value = provider.api_key if provider else ""
-        self.query_one("#mc-ctx", Input).value = ""
-        self.query_one("#mc-new-model", Input).value = ""
+        self._clear_model_inputs()
         self._refresh_models()
         self._status("")
 
@@ -504,6 +502,32 @@ class ModelCatalogScreen(ModalScreen[None]):
     def _model_input_submitted(self) -> None:
         self._update_model()
 
+    def _parse_caps(self) -> tuple[int, int | None] | None:
+        """Parse the context / compaction-limit editor fields into
+        (context_tokens, compaction_threshold); None on a validation error
+        (the status line explains)."""
+        raw_ctx = self.query_one("#mc-ctx", Input).value.strip()
+        try:
+            ctx = int(raw_ctx)
+        except ValueError:
+            self._status("✗ context tokens must be a positive integer")
+            return None
+        if ctx <= 0:
+            self._status("✗ context tokens must be a positive integer")
+            return None
+        raw_pct = self.query_one("#mc-pct", Input).value.strip()
+        pct: int | None = None
+        if raw_pct:
+            try:
+                pct = int(raw_pct)
+            except ValueError:
+                self._status("✗ compact % must be an integer between 1 and 100")
+                return None
+            if not 1 <= pct <= 100:
+                self._status("✗ compact % must be an integer between 1 and 100")
+                return None
+        return ctx, pct
+
     def _update_model(self) -> None:
         """Write the edited id / context / compaction limit back into the
         selected model."""
@@ -514,26 +538,10 @@ class ModelCatalogScreen(ModalScreen[None]):
         provider = self._provider()
         assert provider is not None
         new_id = self.query_one("#mc-model-id", Input).value.strip() or entry.id
-        raw_ctx = self.query_one("#mc-ctx", Input).value.strip()
-        try:
-            ctx = int(raw_ctx)
-        except ValueError:
-            self._status("✗ context tokens must be a positive integer")
+        caps = self._parse_caps()
+        if caps is None:
             return
-        if ctx <= 0:
-            self._status("✗ context tokens must be a positive integer")
-            return
-        raw_pct = self.query_one("#mc-pct", Input).value.strip()
-        pct: int | None = None
-        if raw_pct:
-            try:
-                pct = int(raw_pct)
-            except ValueError:
-                self._status("✗ compact % must be an integer between 1 and 100")
-                return
-            if not 1 <= pct <= 100:
-                self._status("✗ compact % must be an integer between 1 and 100")
-                return
+        ctx, pct = caps
         if new_id != entry.id:
             if any(m.id == new_id for m in provider.models):
                 self._status(f"✗ model '{new_id}' already exists")
@@ -579,24 +587,39 @@ class ModelCatalogScreen(ModalScreen[None]):
 
     @on(Button.Pressed, "#mc-model-add")
     def _add_model(self) -> None:
+        """Create a new model from the editor fields (id, context, limit) —
+        the same inputs the row selection fills for editing."""
         if not self._commit_form():
             return
         provider = self._provider()
         if provider is None:
             return
-        model_id = self.query_one("#mc-new-model", Input).value.strip()
+        model_id = self.query_one("#mc-model-id", Input).value.strip()
         if not model_id:
             self._status("Enter a model id to add.")
             return
         if any(m.id == model_id for m in provider.models):
             self._status(f"✗ model '{model_id}' already exists")
             return
-        provider.models.append(ModelEntry(id=model_id))
+        caps = self._parse_caps()
+        if caps is None:
+            return
+        ctx, pct = caps
+        provider.models.append(
+            ModelEntry(
+                id=model_id,
+                max_context_tokens=ctx,
+                compaction_threshold=pct,
+                # A hand-entered context size counts as confirmed.
+                context_reported=True,
+            )
+        )
+        self._selected_model = model_id
         self._refresh_models()
         self._refresh_providers()
         self._refresh_roles()
-        self.query_one("#mc-new-model", Input).value = ""
-        self._status(f"✓ added {model_id}")
+        limit = f"{pct}% of context" if pct is not None else "inherits"
+        self._status(f"✓ added {model_id}: context {ctx}, compaction {limit}")
 
     # -- role defaults & save -------------------------------------------------------
 

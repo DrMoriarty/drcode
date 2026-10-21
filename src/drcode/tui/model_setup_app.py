@@ -11,10 +11,12 @@ editing is ever needed. Two entry points share this one screen:
 Per provider: name / base URL / API key editing with a live connection
 check (`probe_model`), one-click model auto-discovery (`fetch_models`,
 existing entries keep their manual edits, new ones are appended) and an
-editable model table (context sizes; entries whose context size the
-gateway did not report are flagged for manual confirmation). Per agent
-role (coding / tester / compaction) a default model can be picked from the
-catalog — used when the project does not pin its own.
+editable model table: selecting a row (single click or arrow keys — no
+double click needed) fills the editor line below it with the model's id,
+context size and compaction limit; "Update" writes the edited values back
+to the selected model, "Remove" deletes it. Per agent role (coding /
+tester / compaction) a default model can be picked from the catalog —
+used when the project does not pin its own.
 
 When models.json does not exist yet but the user-level drcode.json already
 describes a model, the screen starts pre-filled with one provider/model
@@ -100,8 +102,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         height: 8;
         margin-top: 1;
     }
-    #mc-ctx, #mc-new-model { width: 16; }
-    #mc-pct { width: 16; }
+    #mc-new-model { width: 16; }
+    #mc-model-row { height: auto; }
+    #mc-model-row Input { height: 3; }
+    #mc-model-id { width: 1fr; }
+    #mc-ctx, #mc-pct { width: 14; }
     #mc-roles { height: auto; margin-top: 1; }
     #mc-roles Select { width: 1fr; margin-right: 1; }
     #mc-footer {
@@ -127,6 +132,10 @@ class ModelCatalogScreen(ModalScreen[None]):
         self.catalog, self.seed_note = load_seeded_catalog(self.store)
         self._current: str | None = None
         self._selected_model: str | None = None
+        # Set while removing a model: the table rebuild queues a
+        # RowHighlighted event for the next row, which must not refill the
+        # editor (Remove always ends with empty inputs).
+        self._suppress_highlight = False
         # Guards against re-entrant commits while a fetch/probe runs.
         self._busy = False
 
@@ -164,15 +173,15 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Fetch models", id="mc-fetch")
                     yield Static("", id="mc-status")
                     yield DataTable(id="mc-models", cursor_type="row")
-                    with Horizontal(classes="mc-btnrow"):
+                    with Horizontal(id="mc-model-row"):
+                        yield Input(id="mc-model-id", placeholder="model id")
                         yield Input(id="mc-ctx", placeholder="context tokens")
-                        yield Button("Set ctx", id="mc-ctx-set")
-                        yield Button("Remove", id="mc-model-del")
-                    with Horizontal(classes="mc-btnrow"):
                         yield Input(
                             id="mc-pct", placeholder="compact % (empty = inherit)"
                         )
-                        yield Button("Set pct", id="mc-pct-set")
+                    with Horizontal(classes="mc-btnrow"):
+                        yield Button("Update", id="mc-model-update")
+                        yield Button("Remove", id="mc-model-del")
                     with Horizontal(classes="mc-btnrow"):
                         yield Input(id="mc-new-model", placeholder="add model id")
                         yield Button("Add model", id="mc-model-add")
@@ -187,9 +196,9 @@ class ModelCatalogScreen(ModalScreen[None]):
             with Horizontal(id="mc-footer"):
                 yield Button("Save", variant="primary", id="mc-save")
                 yield Static(
-                    "esc — close without saving · model table: Enter/click "
-                    "selects a row, then set its context size and compaction "
-                    "limit (compact %, empty = inherit the global setting)",
+                    "esc — close without saving · model table: click or arrow "
+                    "keys select a row and fill the editor; Update writes the "
+                    "edited id/context/limit back, Remove deletes the model",
                     id="mc-hint",
                 )
 
@@ -258,15 +267,16 @@ class ModelCatalogScreen(ModalScreen[None]):
     def _refresh_models(self) -> None:
         table = self.query_one("#mc-models", DataTable)
         table.clear(columns=True)
-        table.add_columns("model id", "context", "context size")
+        table.add_columns("model id", "context", "compact limit")
         provider = self._provider()
         if provider is None:
             return
         for entry in provider.models:
+            pct = entry.compaction_threshold
             table.add_row(
                 entry.id,
                 str(entry.max_context_tokens),
-                "from gateway" if entry.context_reported else "default — confirm!",
+                "inherit" if pct is None else f"{pct}%",
                 key=entry.id,
             )
 
@@ -439,21 +449,39 @@ class ModelCatalogScreen(ModalScreen[None]):
 
     # -- model table -----------------------------------------------------------------
 
-    @on(DataTable.RowSelected, "#mc-models")
-    def _model_row_selected(self, event: DataTable.RowSelected) -> None:
-        model_id = event.row_key.value
+    def _select_model(self, model_id: str | None) -> None:
+        """Mark a table row as selected and fill the editor line with the
+        model's actual values (called on single click / arrow keys too,
+        not only on the double-click Enter selection)."""
         if not model_id:
             return
-        self._selected_model = model_id
         provider = self._provider()
-        if provider is None:
+        entry = (
+            next((m for m in provider.models if m.id == model_id), None)
+            if provider is not None
+            else None
+        )
+        if entry is None:
             return
-        entry = next((m for m in provider.models if m.id == model_id), None)
-        if entry is not None:
-            self.query_one("#mc-ctx", Input).value = str(entry.max_context_tokens)
-            pct = entry.compaction_threshold
-            self.query_one("#mc-pct", Input).value = "" if pct is None else str(pct)
-            self.query_one("#mc-ctx", Input).focus()
+        self._selected_model = model_id
+        self.query_one("#mc-model-id", Input).value = entry.id
+        self.query_one("#mc-ctx", Input).value = str(entry.max_context_tokens)
+        pct = entry.compaction_threshold
+        self.query_one("#mc-pct", Input).value = "" if pct is None else str(pct)
+
+    @on(DataTable.RowHighlighted, "#mc-models")
+    def _model_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._suppress_highlight:
+            # Swallow the re-highlight queued by the Remove rebuild.
+            self._suppress_highlight = False
+            return
+        self._select_model(event.row_key.value)
+
+    @on(DataTable.RowSelected, "#mc-models")
+    def _model_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._select_model(event.row_key.value)
+        if self._current_model_entry() is not None:
+            self.query_one("#mc-model-id", Input).focus()
 
     def _current_model_entry(self) -> ModelEntry | None:
         provider = self._provider()
@@ -462,69 +490,91 @@ class ModelCatalogScreen(ModalScreen[None]):
             return None
         return next((m for m in provider.models if m.id == model_id), None)
 
-    @on(Button.Pressed, "#mc-ctx-set")
-    def _set_context(self) -> None:
-        entry = self._current_model_entry()
-        if entry is None:
-            self._status("Select a model row first (Enter or click).")
-            return
-        raw = self.query_one("#mc-ctx", Input).value.strip()
-        try:
-            value = int(raw)
-        except ValueError:
-            self._status("✗ context tokens must be a positive integer")
-            return
-        if value <= 0:
-            self._status("✗ context tokens must be a positive integer")
-            return
-        entry.max_context_tokens = value
-        # A hand-entered value is by definition confirmed.
-        entry.context_reported = True
-        self._refresh_models()
-        self._status(f"✓ {entry.id}: context set to {value}")
+    def _clear_model_inputs(self) -> None:
+        for input_id in ("#mc-model-id", "#mc-ctx", "#mc-pct"):
+            self.query_one(input_id, Input).value = ""
 
-    @on(Button.Pressed, "#mc-pct-set")
-    def _set_compaction_threshold(self) -> None:
-        self._apply_compaction_threshold()
+    @on(Button.Pressed, "#mc-model-update")
+    def _update_clicked(self) -> None:
+        self._update_model()
 
+    @on(Input.Submitted, "#mc-model-id")
+    @on(Input.Submitted, "#mc-ctx")
     @on(Input.Submitted, "#mc-pct")
-    def _compaction_threshold_submitted(self) -> None:
-        self._apply_compaction_threshold()
+    def _model_input_submitted(self) -> None:
+        self._update_model()
 
-    def _apply_compaction_threshold(self) -> None:
+    def _update_model(self) -> None:
+        """Write the edited id / context / compaction limit back into the
+        selected model."""
         entry = self._current_model_entry()
         if entry is None:
-            self._status("Select a model row first (Enter or click).")
+            self._status("Select a model row first (click or arrow keys).")
             return
-        raw = self.query_one("#mc-pct", Input).value.strip()
-        if not raw:
-            # Empty = inherit: drop the per-model override.
-            entry.compaction_threshold = None
-            self._refresh_models()
-            self._status(f"✓ {entry.id}: compaction limit cleared (inherits)")
-            return
+        provider = self._provider()
+        assert provider is not None
+        new_id = self.query_one("#mc-model-id", Input).value.strip() or entry.id
+        raw_ctx = self.query_one("#mc-ctx", Input).value.strip()
         try:
-            value = int(raw)
+            ctx = int(raw_ctx)
         except ValueError:
-            self._status("✗ compact % must be an integer between 1 and 100")
+            self._status("✗ context tokens must be a positive integer")
             return
-        if not 1 <= value <= 100:
-            self._status("✗ compact % must be an integer between 1 and 100")
+        if ctx <= 0:
+            self._status("✗ context tokens must be a positive integer")
             return
-        entry.compaction_threshold = value
+        raw_pct = self.query_one("#mc-pct", Input).value.strip()
+        pct: int | None = None
+        if raw_pct:
+            try:
+                pct = int(raw_pct)
+            except ValueError:
+                self._status("✗ compact % must be an integer between 1 and 100")
+                return
+            if not 1 <= pct <= 100:
+                self._status("✗ compact % must be an integer between 1 and 100")
+                return
+        if new_id != entry.id:
+            if any(m.id == new_id for m in provider.models):
+                self._status(f"✗ model '{new_id}' already exists")
+                return
+            # Rename: keep the role-default references pointing at the
+            # same model.
+            old = entry.id
+            entry.id = new_id
+            for ref in self.catalog.defaults.values():
+                if (
+                    ref is not None
+                    and ref.provider == provider.name
+                    and ref.model == old
+                ):
+                    ref.model = new_id
+            self._selected_model = new_id
+        if ctx != entry.max_context_tokens:
+            entry.max_context_tokens = ctx
+            # A hand-entered value is by definition confirmed.
+            entry.context_reported = True
+        entry.compaction_threshold = pct
         self._refresh_models()
-        self._status(f"✓ {entry.id}: compaction at {value}% of context")
+        self._refresh_roles()
+        limit = f"{pct}% of context" if pct is not None else "inherits"
+        self._status(f"✓ {entry.id}: context {ctx}, compaction {limit}")
 
     @on(Button.Pressed, "#mc-model-del")
     def _remove_model(self) -> None:
         provider = self._provider()
         entry = self._current_model_entry()
         if provider is None or entry is None:
-            self._status("Select a model row first (Enter or click).")
+            self._status("Select a model row first (click or arrow keys).")
             return
         provider.models = [m for m in provider.models if m.id != entry.id]
         self._refresh_models()
         self._refresh_roles()
+        self._selected_model = None
+        # The rebuild queues a RowHighlighted for the next row — swallow
+        # it, so Remove always ends with empty editor inputs.
+        self._suppress_highlight = True
+        self._clear_model_inputs()
         self._status(f"✓ removed {entry.id}")
 
     @on(Button.Pressed, "#mc-model-add")

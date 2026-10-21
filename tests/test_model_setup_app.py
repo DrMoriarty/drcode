@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Select
+from textual.widgets import DataTable, Input, OptionList, Select
 
 from drcode.providers import (
     ModelEntry,
@@ -77,7 +77,7 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         # Select its row and set the context size.
         screen._selected_model = "my-model"
         screen.query_one("#mc-ctx", Input).value = "131072"
-        await pilot.click("#mc-ctx-set")
+        await pilot.click("#mc-model-update")
         await pilot.pause()
         # Save with the model picked as the coding default.
         select = screen.query_one("#mc-role-coding", Select)
@@ -109,7 +109,7 @@ async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
         screen._selected_model = "my-model"
         pct_input = screen.query_one("#mc-pct", Input)
         pct_input.value = "60"
-        await pilot.click("#mc-pct-set")
+        await pilot.click("#mc-model-update")
         await pilot.pause()
         assert screen.catalog.providers[0].models[0].compaction_threshold == 60
         # Enter in the field applies the value too: clearing it removes the
@@ -160,6 +160,65 @@ async def test_compaction_threshold_input_validation(tmp_path: Path) -> None:
         await pilot.pause()
         assert "between 1 and 100" in str(status.render())
         assert screen.catalog.providers[0].models[0].compaction_threshold is None
+
+
+async def test_row_selection_fills_editor_and_update_remove(tmp_path: Path) -> None:
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[
+                        ModelEntry(
+                            id="m1",
+                            max_context_tokens=100_000,
+                            compaction_threshold=60,
+                        ),
+                        ModelEntry(id="m2"),
+                    ],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        # Single selection (arrow keys — no double click) fills all three
+        # editor inputs with the selected model's actual values.
+        table = screen.query_one("#mc-models", DataTable)
+        table.focus()
+        await pilot.press("down")
+        await pilot.pause()
+        # m2: default context, no per-model limit (inherit).
+        assert screen.query_one("#mc-model-id", Input).value == "m2"
+        assert screen.query_one("#mc-ctx", Input).value == "200000"
+        assert screen.query_one("#mc-pct", Input).value == ""
+        await pilot.press("up")
+        await pilot.pause()
+        # m1: its actual context size and compaction limit.
+        assert screen.query_one("#mc-model-id", Input).value == "m1"
+        assert screen.query_one("#mc-ctx", Input).value == "100000"
+        assert screen.query_one("#mc-pct", Input).value == "60"
+        # Edit the id and the limit, then Update: the model is renamed
+        # (role-default references follow) and the limit is applied.
+        screen.query_one("#mc-model-id", Input).value = "m1-renamed"
+        screen.query_one("#mc-pct", Input).value = "70"
+        await pilot.click("#mc-model-update")
+        await pilot.pause()
+        provider = screen.catalog.providers[0]
+        assert [m.id for m in provider.models] == ["m1-renamed", "m2"]
+        assert provider.models[0].compaction_threshold == 70
+        assert provider.models[0].max_context_tokens == 100_000
+        # Remove: the model is gone and the editor inputs are cleared.
+        await pilot.click("#mc-model-del")
+        await pilot.pause()
+        assert [m.id for m in provider.models] == ["m2"]
+        assert screen.query_one("#mc-model-id", Input).value == ""
+        assert screen.query_one("#mc-ctx", Input).value == ""
+        assert screen.query_one("#mc-pct", Input).value == ""
 
 
 async def test_duplicate_provider_name_rejected(tmp_path: Path) -> None:

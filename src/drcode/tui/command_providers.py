@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from functools import partial
 from operator import attrgetter
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.color import Color
 from textual.command import (
@@ -123,6 +124,14 @@ class SettingsPalette(CommandPalette):
     below 60 columns (on a narrow terminal 60 wins and may overflow). It
     also swaps in a SpacedCommandList so palette entries are separated by a
     blank line.
+
+    Entry order is fixed, not alphabetical and not provider-dependent:
+    Textual streams the hits of all providers through one shared queue in
+    completion order, and `DrCodeApp.COMMANDS` is a set — so without the
+    re-sort below the menu order would differ from run to run. Instead the
+    aggregated hits are ordered by `ENTRY_ORDER` (see its comment); in
+    search mode Textual's relevance sort (`_refresh_command_list`) still
+    wins, this only fixes the discovery (empty-query) listing.
     """
 
     DEFAULT_CSS = """
@@ -131,6 +140,66 @@ class SettingsPalette(CommandPalette):
         min-width: 60;
     }
     """
+
+    # Logical display order of the Settings entries — the single source of
+    # truth for the menu layout. Entries are matched top-to-bottom by name
+    # *prefix* (dynamic values like "…: on" are appended after the colon, so
+    # prefixes must include it where present). Reordering lines here — or
+    # adding prefixes for new entries — rearranges the menu arbitrarily;
+    # anything not matching a prefix slots in right before the last entry
+    # ("Quit"). Head block per the current UX convention: Keys, Screenshot,
+    # Theme; Quit is pinned to the very end.
+    ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
+        "Keys",
+        "Screenshot",
+        "Theme",
+        "Update/create AGENTS.md",
+        "Model settings:",
+        "Auto-delete completed tasks:",
+        "Task finalization:",
+        "Nudge stalled agent after:",
+        "GitHub integration:",
+        "Notifications:",
+        "Maximize",
+        "Minimize",
+        "Quit",
+    )
+
+    def _entry_rank(self, name: str) -> int:
+        """Position of an entry in the menu: index of the first matching
+        `ENTRY_ORDER` prefix, or just before the last entry for anything
+        unknown."""
+        for rank, prefix in enumerate(self.ENTRY_ORDER):
+            if name.startswith(prefix):
+                return rank
+        return max(0, len(self.ENTRY_ORDER) - 1)
+
+    @staticmethod
+    def _hit_name(hit: DiscoveryHit | Hit) -> str:
+        """Plain-text name of a hit (the prompt can be Text/Content)."""
+        display = hit.prompt
+        if isinstance(display, str):
+            return display
+        if isinstance(display, Text | Content):
+            return display.plain
+        return str(display)
+
+    async def _search_for(
+        self, search_value: str
+    ) -> AsyncGenerator[DiscoveryHit | Hit, bool]:
+        # Buffer every hit from all providers, then re-emit them in
+        # ENTRY_ORDER. The parent streams hits from concurrently running
+        # provider tasks in completion order; buffering costs nothing here
+        # (all providers are local and instant) and makes the listing
+        # deterministic. Cancellation still works: the gather loop checks
+        # `worker.is_cancelled` itself, and closing this generator closes
+        # the parent one via `aclose`.
+        hits: list[DiscoveryHit | Hit] = []
+        async for hit in super()._search_for(search_value):
+            hits.append(hit)
+        hits.sort(key=lambda hit: self._entry_rank(self._hit_name(hit)))
+        for hit in hits:
+            yield hit
 
     def compose(self) -> ComposeResult:
         # Same as CommandPalette.compose, but with the spaced command list.
@@ -459,6 +528,3 @@ class StallNudgeOptionsProvider(Provider):
         for name, callback in self._commands():
             if (match := matcher.match(name)) > 0:
                 yield Hit(match, matcher.highlight(name), callback)
-
-                yield Hit(match, matcher.highlight(name), callback)
-

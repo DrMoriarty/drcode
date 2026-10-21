@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
+from textual.command import CommandList
 from textual.geometry import Offset
 from textual.widgets import ListView, TextArea
 from textual.widgets._list_item import ListItem
@@ -22,6 +23,7 @@ from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
+from drcode.tui.command_providers import SettingsPalette
 from drcode.tui.sidebar import TaskItem
 
 
@@ -514,6 +516,41 @@ async def test_pipeline_settled_notification_primes_then_sends(
         app._advance()
         await pilot.pause()
         assert len(sent) == 1
+
+
+# -- settings palette -----------------------------------------------------------
+
+
+async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
+    """The Settings menu lists its entries in the fixed logical order
+    (Keys, Screenshot, Theme, …, Quit) — never alphabetically and never in
+    the provider-completion order, which would differ from run to run."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        app.action_settings()
+        await pilot.pause()
+        palette = app.screen
+        assert isinstance(palette, SettingsPalette)
+        command_list = palette.query_one(CommandList)
+        # Wait for the palette's gather worker to finish (it adds "-ready").
+        for _ in range(100):
+            if "-ready" in palette.classes and command_list.option_count:
+                break
+            await pilot.pause()
+        await pilot.pause()
+        names = [command.hit.text for command in command_list._options]
+
+        order = SettingsPalette.ENTRY_ORDER
+        ranks = [
+            next(i for i, prefix in enumerate(order) if n.startswith(prefix))
+            for n in names
+        ]
+        assert ranks == sorted(ranks)
+        # Head block and pinned tail, exactly as the UX specifies.
+        assert names[0] == "Keys"
+        assert names[1] == "Screenshot"
+        assert names[2] == "Theme"
+        assert names[-1] == "Quit"
 
 
 # -- terminal tab title ---------------------------------------------------------

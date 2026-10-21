@@ -396,6 +396,10 @@ class TaskManager:
         task.unfinished = False
         task.clarification = None
         task.queue_head = False
+        # Cancelling from TESTING (or a re-queued round): a stale passed/
+        # failed label from an earlier testing round no longer applies —
+        # the task completes without verification.
+        task.verification = None
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.touch()
@@ -406,8 +410,15 @@ class TaskManager:
         """The tester's verdict: stamp the verification label and complete
         the task. Used by the tester's `set_verification` tool (which runs
         in a worker thread — see tool_runtime) so the transition goes
-        through the same observer mechanism as every other status change."""
+        through the same observer mechanism as every other status change.
+
+        A no-op when the task is no longer TESTING: while the tool call was
+        in flight the user may have cancelled the task (Ctrl+X) or sent new
+        input to it (which re-queues it) — a stale verdict must neither
+        complete the cancelled task nor swallow the re-queued one."""
         task = self.get(task_id)
+        if task.status is not TaskStatus.TESTING:
+            return task
         old = task.status
         task.verification = (
             VerificationStatus.PASSED if success else VerificationStatus.FAILED

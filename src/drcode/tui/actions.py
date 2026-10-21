@@ -284,6 +284,16 @@ class ActionsLayer(DrCodeState):
             self._current_tool = None
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
+        # The task was possibly in TESTING: drop its tester pipeline state.
+        # With a live tester run this is done by the cancelled worker's
+        # `finally` (idempotent); without one (retry backoff, failed round)
+        # nobody else would clear it — and the stale backoff/retry entries
+        # and the stale `_tester_task_id` would linger until restart.
+        self._tester_fail_count.pop(task.id, None)
+        self._tester_retry_at.pop(task.id, None)
+        self._tester_net_count.pop(task.id, None)
+        if self._tester_task_id == task.id and not self.tester_running:
+            self._tester_task_id = None
         # Сервисное событие: "Задача отменена пользователем — снята с конвейера без тестирования".
         self._show_event(
             task,

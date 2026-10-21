@@ -219,7 +219,12 @@ def build_agent(
             config.compaction_threshold,
         )
 
-    @agent.tool
+    # Muting-file tools are barriers: pydantic-ai runs tool calls of one
+    # model response in parallel, so two concurrent edits of the same file
+    # would both read the original snapshot and the later write would
+    # silently overwrite the earlier edit (lost update). `sequential=True`
+    # makes each of these run alone, never overlapping other tool calls.
+    @agent.tool(sequential=True)
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file. Only the project root (with all subdirectories)
         and /tmp (with all subdirectories) are writable; use /tmp to test hypotheses."""
@@ -227,7 +232,7 @@ def build_agent(
             ctx.deps, "write_file", tools.write_file, ctx.deps.root, path, content
         )
 
-    @agent.tool
+    @agent.tool(sequential=True)
     async def edit_file(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:

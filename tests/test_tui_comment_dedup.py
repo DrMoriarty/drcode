@@ -8,6 +8,16 @@ processed by a run: the pending bubble plus the consuming run's "user"
 block (or the second copy persisted into the transcript) draw the comment
 twice. The fix deduplicates identical submissions in `TaskManager.send()`
 and skips the re-send in `_submit_user_text`.
+
+A second doubling shape (task #671d6541): a message that re-queues a
+COMPLETED task (or answers a clarifying question). Textual installs
+asyncio.eager_task_factory, so the run worker started by `_advance()`
+executes synchronously down to its first await — including the
+pending-input consumption and its "user" draw — BEFORE `_submit_user_text`
+gets to draw its own "user-pending" bubble (whose is_pending_retry guard
+is still False: the transcript is not persisted yet). The fix draws the
+bubble before advancing the pipeline, so the consuming run sees the text
+in `_pending_rendered` and skips its own draw.
 """
 
 from __future__ import annotations
@@ -212,3 +222,86 @@ async def test_retype_while_active_reaches_model_once(
     # The superseded run's held request never fired; the retry run sent
     # the comment exactly once.
     assert scripted.calls == ["extra note"]
+
+
+async def test_requeue_message_rendered_once_with_eager_worker(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that re-queues a COMPLETED task must show exactly once.
+
+    The pilot test loop does not install Textual's eager task factory, so it
+    is set explicitly: with it, the run worker started by `_advance()`
+    consumes the pending input synchronously inside `_submit_user_text` —
+    the exact production timing in which the pre-fix code drew the message
+    twice (the run's "user" block, then the submit's "user-pending" bubble).
+    """
+    app = DrCodeApp(project_root)
+    task = app.manager.create("research", "изучи проблему", kind=TaskKind.RESEARCH)
+    answer = "заведи отдельную задачу на реализацию пункта 1"
+
+    onscreen = {"n": 0, "max": 0}
+    orig_line = DrCodeApp._write_history_line
+
+    def spy_line(self: DrCodeApp, role: str, text: str, at: Any = None) -> Any:
+        if answer in str(text):
+            onscreen["n"] += 1
+            onscreen["max"] = max(onscreen["max"], onscreen["n"])
+        return orig_line(self, role, text, at)
+
+    monkeypatch.setattr(DrCodeApp, "_write_history_line", spy_line)
+
+    orig_view = DrCodeApp.view_task
+
+    def spy_view(self: DrCodeApp, task_id: str) -> None:
+        if task_id == task.id:
+            onscreen["n"] = 0
+        return orig_view(self, task_id)
+
+    monkeypatch.setattr(DrCodeApp, "view_task", spy_view)
+
+    scripted.steps = [
+        text_response("Разобрался. Вот что я нашёл — жду решения."),
+    ]
+    async with app.run_test() as pilot:
+        # Emulate the production loop: Textual's real app installs
+        # asyncio.eager_task_factory, the pilot env does not.
+        asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
+        await pilot.pause()
+        app.view_task(task.id)
+        app._advance()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED and not app.agent_running,
+            pilot,
+            what="research completed",
+        )
+        await pilot.pause()
+        assert onscreen["n"] == 0
+
+        # The message re-queues the completed task (research: straight back
+        # into development). The run streams long enough for the double to
+        # be visible — assert on the live draw count between view wipes.
+        scripted.steps.append(text_response("Создаю задачи."))
+        app._submit_user_text(task, answer)
+        for _ in range(5):
+            await pilot.pause()
+            assert onscreen["max"] <= 1, "the message was drawn twice live"
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED and not app.agent_running,
+            pilot,
+            what="answered run completed",
+        )
+        await pilot.pause()
+
+        # Fresh re-render (what reopening the task shows): exactly once.
+        app.view_task(task.id)
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        hits = sum(
+            1 for w in app.query_one("#chat-log").children if answer in str(w.render())
+        )
+        assert hits == 1

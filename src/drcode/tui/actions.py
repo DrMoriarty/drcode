@@ -804,10 +804,23 @@ class ActionsLayer(DrCodeState):
         ) or is_pending_retry(task.messages, stripped):
             return
         # Capture the pre-run state: _advance() promotes the task to ACTIVE
-        # (promote_next) and flips its status, so the render check below must
-        # compare the ORIGINAL status, not the post-promotion one.
+        # (promote_next) and flips its status, so the render decision below
+        # must use the ORIGINAL status, not the post-promotion one.
         was_active = task.status is TaskStatus.ACTIVE
         self.manager.send(task.id, text)
+        if not was_active and self.viewed_id == task.id:
+            # Draw the queued message BEFORE advancing the pipeline. The run
+            # worker started by _advance() executes eagerly (Textual installs
+            # asyncio.eager_task_factory): its pending-input loop can run
+            # synchronously inside _advance() and would draw the "user" block
+            # itself — at that point the message is neither in
+            # _pending_rendered nor in the persisted transcript yet, so the
+            # run cannot know it is already on screen. Drawing here first
+            # registers the text in _pending_rendered; the consuming run then
+            # skips it and the bubble shows exactly once. For an active task
+            # run_agent() renders the message itself (see the was_active
+            # branch below), so no pre-draw there.
+            self._write_history_line("user-pending", text)
         if was_active:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back
@@ -820,15 +833,6 @@ class ActionsLayer(DrCodeState):
             self._advance()
         self.refresh_sidebar()
         self.refresh_status()
-        # For an active task run_agent() renders the message itself. A
-        # non-active task keeps the queued comment visible even after the
-        # promotion flips it to ACTIVE — so use the captured original state.
-        if (
-            not was_active
-            and self.viewed_id == task.id
-            and not is_pending_retry(task.messages, text)
-        ):
-            self._write_history_line("user-pending", text)
 
 
     def action_pick_option(self, index: int) -> None:

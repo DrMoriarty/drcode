@@ -271,6 +271,11 @@ class ChatViewLayer(DrCodeState):
         _agent_failed and would stay stranded until restart otherwise. If
         nothing is running, the pipeline picks the next task immediately."""
         self._agent_failed.clear()
+        # The connection is back: a later failed-queue rescue (see
+        # _promote_failed_queue) must fire immediately, not after a stale
+        # backoff window accumulated during the outage.
+        self._failed_queue_rounds = 0
+        self._failed_queue_retry_at = 0.0
         self._advance()
 
 

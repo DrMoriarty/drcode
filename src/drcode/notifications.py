@@ -240,6 +240,19 @@ class Notifier:
                 priority=Priority.HIGH,
             )
 
+    def failed_tasks_requeued(self, count: int) -> None:
+        """The failed-queue deadlock escape fired: every queued task had
+        failed earlier this session and none could be promoted, so the
+        error exclusion was forcibly lifted from all of them and they are
+        back in development by the ordinary priority rules."""
+        self.notify(
+            "DrCode: задачи с ошибкой вернулись в разработку",
+            f"В очереди не осталось задач без ошибок: задач с ошибкой — "
+            f"{count}. Все они снова возвращены в разработку.",
+            tags=["arrows_counterclockwise"],
+            priority=Priority.HIGH,
+        )
+
     def pipeline_busy(self) -> None:
         """A run started (development or testing): reset the settled-state
         dedup so the next idle transition notifies again."""

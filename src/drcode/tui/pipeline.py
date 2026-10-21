@@ -203,12 +203,74 @@ class PipelineLayer(DrCodeState):
             # holds even then — the retry timer will call _advance() again.
             return
         promoted = self.manager.promote_next(exclude=self._agent_failed)
+        if promoted is None:
+            # Deadlock escape: the queue is not empty, but every task in it
+            # failed earlier this session (see _promote_failed_queue).
+            promoted = self._promote_failed_queue()
         if promoted:
             self.notifier.pipeline_busy()
             self.run_agent(promoted.id)
         else:
             self._notify_pipeline_settled()
         self.refresh_status()
+
+    # Backoff schedule of the failed-queue deadlock escape (see
+    # _promote_failed_queue): rescue rounds of a queue that keeps failing
+    # grow from this base up to the cap, so a persistently broken model
+    # cannot hot-loop the whole backlog (an instantly failing task would
+    # otherwise cycle error → promote next → error forever).
+    _FAILED_QUEUE_RETRY_BASE = 60.0
+    _FAILED_QUEUE_RETRY_CAP = 600.0
+
+    def _promote_failed_queue(self) -> Task | None:
+        """Deadlock escape for a queue of session-failed tasks.
+
+        A task whose run crashed (network outage, model error) is demoted
+        back to the queue and excluded from promotion via _agent_failed for
+        the rest of the session, so one broken task can't loop the queue.
+        That exclusion is session-only (not persisted), which used to make
+        the situation where EVERY queued task is failed a dead end: nothing
+        can be promoted until the app is restarted (or the connection probe
+        recovers and _recover_from_outage fires).
+
+        Now, when nothing is active, nothing is being tested and every
+        queued task carries the error flag, the flag is forcibly lifted
+        from all of them and the next task is promoted by the ordinary
+        priority rules — the queue keeps working instead of stalling. A
+        notification reports how many tasks were rescued this way.
+
+        Returns the promoted task, or None when the escape does not apply
+        (an active task exists, the queue holds a non-failed task, or the
+        next rescue round is still within its backoff window — a timer
+        re-enters _advance() when the window expires).
+        """
+        if self.manager.active is not None:
+            return None
+        queued = self.manager.queued()
+        if not queued or any(t.id not in self._agent_failed for t in queued):
+            return None
+        now = time.monotonic()
+        if now < self._failed_queue_retry_at:
+            # This rescue round must still wait out its backoff: settle for
+            # now — the timer scheduled below re-calls _advance() in time.
+            return None
+        self._failed_queue_rounds += 1
+        delay = min(
+            self._FAILED_QUEUE_RETRY_BASE * 2 ** (self._failed_queue_rounds - 1),
+            self._FAILED_QUEUE_RETRY_CAP,
+        )
+        self._failed_queue_retry_at = now + delay
+        self.set_timer(delay, self._advance)
+        for t in queued:
+            self._agent_failed.discard(t.id)
+            self._show_event(
+                t,
+                "Задача завершалась ошибкой и была исключена из разработки "
+                "до конца сессии; в очереди не осталось задач без ошибок — "
+                "исключение снято, задача снова возвращена в разработку.",
+            )
+        self.notifier.failed_tasks_requeued(len(queued))
+        return self.manager.promote_next()
 
     def _notify_pipeline_settled(self) -> None:
         """Notifications: the gate settled without starting anything.
@@ -787,6 +849,13 @@ class PipelineLayer(DrCodeState):
                                 # many model requests.
                                 self._agent_net_count.pop(task_id, None)
                                 self._agent_net_retry_at.pop(task_id, None)
+                                # The model works again: the failed-queue
+                                # rescue backoff (see _promote_failed_queue)
+                                # starts over, so a later single failure is
+                                # rescued immediately, not after a stale
+                                # backoff window.
+                                self._failed_queue_rounds = 0
+                                self._failed_queue_retry_at = 0.0
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
@@ -891,9 +960,12 @@ class PipelineLayer(DrCodeState):
                         view_dirty = False
                         synced_epoch = self._chat_epoch
                     # The turn went through: the network-retry budget for
-                    # this task starts over.
+                    # this task starts over (and the failed-queue rescue
+                    # backoff with it — see the model-request branch above).
                     self._agent_net_count.pop(task_id, None)
                     self._agent_net_retry_at.pop(task_id, None)
+                    self._failed_queue_rounds = 0
+                    self._failed_queue_retry_at = 0.0
                 except asyncio.CancelledError:
                     # Interrupted (abort, nudge, or a newer run taking over).
                     # The consumed prompt is NOT re-queued — it stays in the

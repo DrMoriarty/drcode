@@ -278,6 +278,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # promote_next for the rest of the session, so one broken task (or a
         # dead gateway) doesn't loop the whole queue through the error.
         self._agent_failed: set[str] = set()
+        # Deadlock escape for a queue where every task failed this session
+        # (see PipelineLayer._promote_failed_queue): the rescue-round counter
+        # (backoff base 60s doubling, capped) and the earliest monotonic time
+        # the next rescue may fire at. Reset when a model call succeeds.
+        self._failed_queue_rounds = 0
+        self._failed_queue_retry_at = 0.0
         # Network-retry bookkeeping for agent runs, per task: consecutive
         # transient network failures this session (retry budget) and the
         # earliest monotonic time the delayed re-run fires at. Unlike a

@@ -170,8 +170,10 @@ async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
     texts = event_texts(task)
     retries = [t for t in texts if t.startswith("Network error (ModelHTTPError)")]
     assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
-    # Backoff schedule 5s doubling, capped at 60 (NETWORK_RETRIES = 5).
-    assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0]
+    # Backoff schedule 5s doubling, capped at 60 (NETWORK_RETRIES = 5),
+    # plus the failed-queue rescue window (the task is the only queued one
+    # and is failed, so the deadlock escape arms its 60s backoff timer).
+    assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
     # The last failure fell through to the generic failure path.
     assert any(t.startswith("ModelHTTPError") for t in texts)
     assert task.unfinished
@@ -196,15 +198,23 @@ async def test_connection_outage_retried_then_demoted_and_recovery_resumes_it(
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
-            lambda: task.status is TaskStatus.QUEUED and task.unfinished,
+            lambda: (
+                task.status is TaskStatus.QUEUED
+                and task.unfinished
+                # The failed-queue rescue fired too (the task is the only
+                # queued one): it re-ran the attempt, which failed on the
+                # now-empty script and was re-excluded with a backoff.
+                and net_app._failed_queue_rounds == 1
+            ),
             pilot,
             what="task demoted after connection-retry budget exhausted",
         )
+        await pilot.pause()
         assert task.id in net_app._agent_failed
         texts = event_texts(task)
         retries = [t for t in texts if t.startswith("Network error (ModelAPIError)")]
         assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
-        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0]
+        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
         # The last failure fell through to the generic failure path.
         assert any(t.startswith("ModelAPIError") for t in texts)
         # The consumed prompt lives in the sanitized transcript.
@@ -225,9 +235,10 @@ async def test_connection_outage_retried_then_demoted_and_recovery_resumes_it(
     assert [
         text for _, role, text in extract_display(task.messages) if role == "user"
     ] == ["write the docs"]
-    # Six failed attempts (each resumed without re-sending text) plus the
+    # Six failed attempts (each resumed without re-sending text), the
+    # failed-queue rescue attempt (failed on the empty script) and the
     # successful recovery call.
-    assert scripted.calls == ["write the docs"] * 7
+    assert scripted.calls == ["write the docs"] * 8
 
 
 # -- tester run: network failure -------------------------------------------------------
@@ -775,3 +786,117 @@ async def test_check_model_ok_after_outage_triggers_recovery(
         await pilot.pause()
         assert "● mock-model" in str(net_app.model_status.render())
     assert recoveries == [1]
+
+
+# -- failed-queue deadlock escape (_promote_failed_queue) --------------------------
+
+
+async def test_all_failed_queue_is_rescued_and_redeveloped(
+    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
+) -> None:
+    """When every queued task has failed this session and nothing is
+    active, the error exclusion is lifted from all of them (with a
+    notification) and development resumes by the ordinary priority rules
+    — no restart needed."""
+    a = net_app.manager.create("a", "brief a", kind=TaskKind.RESEARCH)
+    b = net_app.manager.create("b", "brief b", kind=TaskKind.RESEARCH)
+    # Both tasks fail instantly and non-retryably (HTTP 500), exhausting
+    # the queue; then the rescue round re-runs them successfully.
+    scripted.steps = [
+        http_error(500),
+        http_error(500),
+        text_response("done a"),
+        text_response("done b"),
+    ]
+    rescued: list[int] = []
+    monkeypatch_ref = net_app.notifier
+    monkeypatch_ref.failed_tasks_requeued = lambda count: rescued.append(count)  # type: ignore[method-assign]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: a.status is TaskStatus.COMPLETED and b.status is TaskStatus.COMPLETED,
+            pilot,
+            what="both rescued tasks completed",
+        )
+        # The backoff state was reset by the successful model calls: a
+        # later single failure must be rescued immediately again.
+        assert net_app._failed_queue_rounds == 0
+
+    assert rescued == [2]
+    assert not {a.id, b.id} & net_app._agent_failed
+    rescue_events = [
+        t
+        for t in event_texts(a) + event_texts(b)
+        if "исключение снято" in t
+    ]
+    assert len(rescue_events) == 2
+    # Each brief was sent exactly once (the failure never re-queues text).
+    assert scripted.calls == ["brief a", "brief b", "brief a", "brief b"]
+
+
+async def test_repeated_failed_queue_rescue_backs_off(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a rescue round whose tasks fail again, the next rescue waits
+    out a doubled backoff (60s → 120s): a persistently broken model must
+    not hot-loop the backlog."""
+    a = net_app.manager.create("a", "brief a", kind=TaskKind.RESEARCH)
+    b = net_app.manager.create("b", "brief b", kind=TaskKind.RESEARCH)
+    # task1 fails, task2 fails, rescue round 1: both fail again — the
+    # second rescue round must now wait out its backoff.
+    scripted.steps = [http_error(500)] * 4
+    rescued: list[int] = []
+    net_app.notifier.failed_tasks_requeued = lambda count: rescued.append(count)  # type: ignore[method-assign]
+
+    # Controllable clock for the pipeline's backoff windows (the stdlib
+    # `time` module is replaced only in the pipeline's namespace, so real
+    # timers and the test's own wait_until keep working).
+    class _FakeTime:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    fake_time = _FakeTime()
+    monkeypatch.setattr(pipeline_module, "time", fake_time)
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                a.status is TaskStatus.QUEUED
+                and b.status is TaskStatus.QUEUED
+                and {a.id, b.id} <= net_app._agent_failed
+                # Rescue round 1 fired (immediately) and failed again.
+                and net_app._failed_queue_rounds == 1
+            ),
+            pilot,
+            what="queue settled after the first rescue failed again",
+        )
+        await pilot.pause()
+        assert rescued == [2]
+        assert instant_timers == [60.0]
+        assert a.unfinished and b.unfinished
+
+        # The 60s window expires: the re-advance fires rescue round 2,
+        # which succeeds — the queue drains without a restart.
+        fake_time.now += 130.0
+        scripted.steps = [text_response("done a"), text_response("done b")]
+        net_app._advance()
+        await wait_until(
+            lambda: a.status is TaskStatus.COMPLETED
+            and b.status is TaskStatus.COMPLETED,
+            pilot,
+            what="both tasks completed by the second rescue round",
+        )
+
+    assert rescued == [2, 2]
+    # The second round was scheduled behind the doubled delay.
+    assert instant_timers == [60.0, 120.0]
+    # Successful model calls reset the rescue backoff.
+    assert net_app._failed_queue_rounds == 0

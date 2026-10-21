@@ -452,6 +452,11 @@ class DrCodeState(App[None]):
     _agent_net_count: dict[str, int]
     _agent_net_retry_at: dict[str, float]
     _net_retries_total: int
+    # Failed-queue deadlock escape (see PipelineLayer._promote_failed_queue):
+    # how many rescue rounds have fired this session and the earliest
+    # monotonic time the next one may fire at.
+    _failed_queue_rounds: int
+    _failed_queue_retry_at: float
 
     # -- session statistics (expanded header, session-scoped) ---------------
     _session_known_ids: set[str]

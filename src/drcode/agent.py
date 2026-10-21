@@ -60,6 +60,7 @@ from .transcript import (
     COMPACTION_SUMMARY_PREFIX,
     _context_status,
     backdate_user_prompt,
+    ctx_context_tokens,
     ends_with_open_request,
     extract_display,
     first_user_prompt,
@@ -183,7 +184,7 @@ def build_agent(
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
         (1-based), up to `limit` lines."""
-        current_usage = ctx.usage.input_tokens + ctx.usage.output_tokens
+        current_usage = ctx_context_tokens(ctx) or 0
         return await _run_tool_logged(
             ctx.deps,
             "read_file",
@@ -199,15 +200,15 @@ def build_agent(
 
     @agent.tool
     async def context_status(ctx: RunContext[AgentDeps]) -> str:
-        """Report the current context fill for this run: how many tokens the
-        model already holds (input + output) out of the configured maximum, the
-        percent used and how many tokens remain before the compaction threshold.
-        Use it when you are unsure how much room you have — it gives the exact
-        current numbers so you can decide when to stop reading, without having
-        to guess or fret over a vague "nearly full" signal."""
-        tokens = ctx.usage.input_tokens + ctx.usage.output_tokens
+        """Report the current context fill: how many tokens the model's context
+        slot holds at the latest request (prompt history + generated output) out
+        of the configured maximum, the percent used and how many tokens remain
+        before the compaction threshold. Use it when you are unsure how much
+        room you have — it gives the exact current numbers so you can decide
+        when to stop reading, without having to guess or fret over a vague
+        "nearly full" signal."""
         return _context_status(
-            tokens,
+            ctx_context_tokens(ctx),
             config.max_context_tokens,
             config.compaction_threshold,
         )
@@ -354,7 +355,7 @@ def build_tester_agent(
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
         (1-based), up to `limit` lines."""
-        current_usage = ctx.usage.input_tokens + ctx.usage.output_tokens
+        current_usage = ctx_context_tokens(ctx) or 0
         return await _run_tool_logged(
             ctx.deps,
             "read_file",
@@ -370,15 +371,15 @@ def build_tester_agent(
 
     @agent.tool
     async def context_status(ctx: RunContext[TesterDeps]) -> str:
-        """Report the current context fill for this round: how many tokens the
-        model already holds (input + output) out of the configured maximum, the
-        percent used and how many tokens remain before the compaction threshold.
-        Use it when you are unsure how much room you have — it gives the exact
-        current numbers so you can decide when to stop reading, without having
-        to guess or fret over a vague "nearly full" signal."""
-        tokens = ctx.usage.input_tokens + ctx.usage.output_tokens
+        """Report the current context fill: how many tokens the model's context
+        slot holds at the latest request (prompt history + generated output) out
+        of the configured maximum, the percent used and how many tokens remain
+        before the compaction threshold. Use it when you are unsure how much
+        room you have — it gives the exact current numbers so you can decide
+        when to stop reading, without having to guess or fret over a vague
+        "nearly full" signal."""
         return _context_status(
-            tokens,
+            ctx_context_tokens(ctx),
             config.max_context_tokens,
             config.compaction_threshold,
         )

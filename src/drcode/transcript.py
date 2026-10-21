@@ -129,6 +129,25 @@ def run_context_tokens(run: AgentRun[Any, Any]) -> int | None:
     return None
 
 
+def ctx_context_tokens(ctx: Any) -> int | None:
+    """Context fill (tokens) of the model's context slot for a live
+    `RunContext` — same semantics as `run_context_tokens`, but read from
+    the run transcript the context carries instead of the run object.
+
+    `RunContext.usage` is a cumulative counter over the whole run (every
+    model response adds to it), while the actual window fill is the
+    input + output tokens of the *latest* request — so tools must not
+    consult `ctx.usage` directly.
+    """
+    for msg in reversed(ctx.messages):
+        if isinstance(msg, ModelResponse):
+            usage = msg.usage
+            tokens = _usage_context_tokens(usage.input_tokens, usage.output_tokens)
+            if tokens:
+                return tokens
+    return None
+
+
 def last_response_usage(run: AgentRun[Any, Any]) -> RunUsage | None:
     """Exact token usage of the latest completed model request of a live run.
 

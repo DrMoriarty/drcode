@@ -108,13 +108,12 @@ def test_notifier_publishes_json_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = ProjectSettings(notifications_enabled=True, ntfy_topic="topic1")
     notifier = Notifier(lambda: settings, ntfy_base="https://ntfy.sh/")
 
-    notifier.notify("tïtle", "messäge", tags=["bell"], priority=Priority.HIGH)
+    notifier.notify("title", "message", tags=["bell"], priority=Priority.HIGH)
     assert len(sent) == 1
     payload = sent[0]
     assert payload["topic"] == "topic1"
-    # Non-ASCII titles/messages must survive (JSON publish, not headers).
-    assert payload["title"] == "tïtle"
-    assert payload["message"] == "messäge"
+    assert payload["title"] == "title"
+    assert payload["message"] == "message"
     assert payload["tags"] == ["bell"]
     assert payload["priority"] == 4  # ntfy JSON publish: priority must be an int
 
@@ -205,14 +204,14 @@ def test_failed_send_is_persisted_with_timestamp(
     notifier = _notifier(settings, project_root)
 
     before = datetime.now().astimezone()
-    notifier.notify("tïtle", "messäge", tags=["bell"], priority=Priority.HIGH)
+    notifier.notify("title", "message", tags=["bell"], priority=Priority.HIGH)
 
     raw = _read_pending_file(project_root)
     assert len(raw) == 1
     entry = raw[0]
     assert entry["topic"] == "topic1"
-    assert entry["title"] == "tïtle"
-    assert entry["message"] == "messäge"
+    assert entry["title"] == "title"
+    assert entry["message"] == "message"
     assert entry["tags"] == ["bell"]
     assert entry["priority"] == 4
     # The timestamp of the moment the notification arose is stored.

@@ -6,7 +6,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
-from drcode.models import PendingInput, Task, _now
+from drcode.models import PendingInput, Task, VerificationStatus, _now
 from drcode.storage import Storage
 
 
@@ -72,6 +72,28 @@ def test_invalid_schema_backed_up(project_root: Path) -> None:
     loaded = storage.load_all()
     assert loaded == []
     assert bad.with_suffix(".json.bak").is_file()
+
+
+def test_legacy_russian_verification_labels_load(project_root: Path) -> None:
+    # Before the Russian→English translation the enum values were Russian
+    # strings; persisted tasks carrying them must not be treated as corrupted.
+    storage = Storage(project_root)
+    for name, legacy in (
+        ("passed", "Проверено успешно"),
+        ("failed", "Проверено с ошибками"),
+    ):
+        path = storage.tasks_dir / f"{name}.json"
+        path.write_text(json.dumps({"id": name, "title": name, "verification": legacy}))
+
+    loaded = {t.id: t for t in storage.load_all()}
+    assert loaded["passed"].verification is VerificationStatus.PASSED
+    assert loaded["failed"].verification is VerificationStatus.FAILED
+    # And the round-trip persists the current (English) values.
+    storage.save(loaded["passed"])
+    assert (
+        json.loads((storage.tasks_dir / "passed.json").read_text())["verification"]
+        == "Verified successfully"
+    )
 
 
 def test_delete_removes_file(project_root: Path) -> None:

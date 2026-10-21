@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _now() -> datetime:
@@ -43,6 +43,14 @@ class VerificationStatus(str, enum.Enum):
     # Метка, которую тестировщик ставит задаче: "Проверено успешно" / "Проверено с ошибками".
     PASSED = "Verified successfully"
     FAILED = "Verification failed"
+
+
+# Values the enum carried before the Russian→English translation (c7d474e).
+# Tasks persisted with them must keep loading; mapped back in Task below.
+_LEGACY_VERIFICATION_VALUES = {
+    "Проверено успешно": VerificationStatus.PASSED,
+    "Проверено с ошибками": VerificationStatus.FAILED,
+}
 
 
 class TaskEvent(BaseModel):
@@ -83,6 +91,14 @@ class Task(BaseModel):
     kind: TaskKind = TaskKind.FEATURE
     status: TaskStatus = TaskStatus.QUEUED
     verification: VerificationStatus | None = None
+
+    @field_validator("verification", mode="before")
+    @classmethod
+    def _migrate_legacy_verification(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return _LEGACY_VERIFICATION_VALUES.get(v, v)
+        return v
+
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
     # Serialized pydantic-ai ModelMessages (full transcript incl. tool calls).

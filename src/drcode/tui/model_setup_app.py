@@ -75,7 +75,7 @@ class ModelCatalogScreen(ModalScreen[None]):
         text-style: bold;
     }
     #mc-main { height: auto; }
-    #mc-left { width: 28; margin-right: 2; height: 22; }
+    #mc-left { width: 34; margin-right: 2; height: 22; }
     #mc-providers { height: 1fr; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }
     #mc-name, #mc-url, #mc-key { height: 3; }

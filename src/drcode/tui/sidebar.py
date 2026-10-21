@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import ClassVar, cast
 
+from textual import events
 from textual.binding import Binding
+from textual.geometry import Offset
 from textual.widgets import Label, ListItem, ListView
 
 
@@ -36,6 +38,14 @@ class Sidebar(ListView):
         Binding("space", "toggle_section", "Expand/collapse", show=False),
     ]
 
+    # Where the current mouse press started (screen coordinates); None
+    # while no button is held. Used to tell a drag (text selection) apart
+    # from a click.
+    _mouse_down_offset: Offset | None = None
+
+    async def _on_mouse_down(self, event: events.MouseDown) -> None:
+        self._mouse_down_offset = event.screen_offset
+
     def action_toggle_section(self) -> None:
         item = self.highlighted_child
         if isinstance(item, TaskItem) and item.section is not None:
@@ -60,4 +70,15 @@ class Sidebar(ListView):
         if event.item not in self.children:
             event.stop()
             event.prevent_default()
-
+            return
+        # A press-and-drag (text selection inside the row) ends on the same
+        # widget as it started, so Textual still synthesizes a Click from it.
+        # The mouse has moved between press and release though — suppress
+        # the selection so it doesn't open the task; only a click where the
+        # pointer didn't move navigates.
+        if (
+            self._mouse_down_offset is not None
+            and self.app.mouse_position != self._mouse_down_offset
+        ):
+            event.stop()
+            event.prevent_default()

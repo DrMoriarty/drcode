@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
+from textual.geometry import Offset
 from textual.widgets import ListView, TextArea
+from textual.widgets._list_item import ListItem
 
 from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
@@ -278,6 +280,57 @@ async def test_sidebar_shows_task_statuses(app: DrCodeApp) -> None:
         app._poll_sidebar()
         items = app.query("TaskItem")
         assert items
+
+
+async def test_sidebar_click_opens_task_and_cancels_new_task(app: DrCodeApp) -> None:
+    """A plain click on a sidebar task opens it, leaving the new-task form."""
+    task = app.manager.create("clickable", "")
+    async with app.run_test() as pilot:
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.viewed_id == task.id  # on_mount opened the only task
+        app.action_new_task()
+        await pilot.pause()
+        assert app._new_task_mode
+
+        item = next(i for i in app.query("TaskItem") if i.task_id == task.id)
+        await pilot.click(item)
+        await pilot.pause()
+        assert not app._new_task_mode
+        assert app.viewed_id == task.id
+
+
+async def test_sidebar_drag_selection_does_not_navigate(app: DrCodeApp) -> None:
+    """Selecting text in a sidebar row (press-and-drag) must not open the task.
+
+    Textual synthesizes a Click at the release point even for a drag, as
+    long as press and release land on the same widget — the sidebar tells
+    the two apart and suppresses the synthetic click.
+    """
+    task = app.manager.create("selectable", "")
+    async with app.run_test() as pilot:
+        # Skip the first-start setup dialog (no model configured in tests).
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_new_task()
+        await pilot.pause()
+        assert app._new_task_mode
+
+        item = next(i for i in app.query("TaskItem") if i.task_id == task.id)
+        # Press on the row…
+        await pilot.mouse_down(item, offset=(1, 0))
+        await pilot.pause()
+        sidebar = app.sidebar
+        assert sidebar._mouse_down_offset is not None
+        # …and release a few cells to the right (same widget → synthesized
+        # Click): the mouse moved between press and release, so it was a
+        # selection, not a click.
+        app.mouse_position = sidebar._mouse_down_offset + Offset(3, 0)
+        sidebar.post_message(ListItem._ChildClicked(item))
+        await pilot.pause()
+        # Still in the new-task form — no navigation happened.
+        assert app._new_task_mode
 
 
 # -- sidebar collapsible sections -------------------------------------------------

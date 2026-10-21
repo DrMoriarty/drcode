@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from functools import partial
 from typing import ClassVar
 
 from textual.command import (
@@ -26,6 +27,13 @@ from ..models import (
     TaskStatus,
 )
 from ..prompts import load_init_repo_prompt
+from ..providers import (
+    AgentRole,
+    ModelRef,
+    UserModelsStore,
+    load_project_model_refs,
+    set_project_model,
+)
 from ..settings import (
     CompletedRetention,
     StallNudge,
@@ -38,9 +46,11 @@ from .command_providers import (
     SettingsPalette,
     StallNudgeOptionsProvider,
     ThemeOptionsProvider,
+    role_model_options_provider,
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
 from .inputs import NewTaskInput
+from .model_setup_app import ModelCatalogScreen
 from .notifications_dialog import NotificationsDialog, NotificationsSetup
 from .setup_dialog import ModelSetup, ModelSetupDialog
 from .sidebar import TaskItem
@@ -60,6 +70,8 @@ class ActionsLayer(DrCodeState):
         if setup is None:
             return
         self.config.model = setup.model
+        # The flat connection changed: per-role resolutions are stale.
+        self.invalidate_resolved_configs()
         self.config.base_url = setup.base_url
         self.config.api_key = setup.api_key
         self.config.health_check_url = setup.health_check_url
@@ -473,6 +485,104 @@ class ActionsLayer(DrCodeState):
             ),
             self._model_setup_done,
         )
+
+    # -- per-role model selection ---------------------------------------------
+
+    def action_open_model_catalog(self) -> None:
+        """Open the provider/model catalog editor (user-level models.json)
+        as a modal screen. Shared with the standalone `drcode-models`
+        utility; on close the per-role resolutions are recomputed."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(ModelCatalogScreen(), self._model_catalog_done)
+
+    def _model_catalog_done(self, _result: object) -> None:
+        self.invalidate_resolved_configs()
+        self.refresh_connection()
+
+    def role_model_label(self, role: AgentRole) -> str:
+        """Human-readable effective model of a role, for the Settings
+        palette entries: "provider/model" when selected (project slot or
+        user default), else the flat model id, else "not set"."""
+        ref = load_project_model_refs(self.project_root).get(role)
+        if ref is None:
+            ref = UserModelsStore().load().defaults.get(role)
+        if ref is not None:
+            return f"{ref.provider}/{ref.model}"
+        return self.config.model or "not set"
+
+    def action_change_coding_model(self) -> None:
+        self._open_role_model_picker(AgentRole.CODING)
+
+    def action_change_tester_model(self) -> None:
+        self._open_role_model_picker(AgentRole.TESTER)
+
+    def action_change_compaction_model(self) -> None:
+        self._open_role_model_picker(AgentRole.COMPACTION)
+
+    def _open_role_model_picker(self, role: AgentRole) -> None:
+        """Selection palette with the catalog models for a role (grouped by
+        provider) plus the "Custom…" free-form entry."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id=f"--role-model-{role.value}",
+                providers=[role_model_options_provider(role)],
+                placeholder=f"Pick the {role.value} model…",
+            )
+        )
+
+    def action_set_role_model(self, role: AgentRole, ref: ModelRef | None) -> None:
+        """Persist one role's model choice into the project's
+        drcode.json ("models" key) and apply it live."""
+        try:
+            set_project_model(self.project_root, role, ref)
+        except OSError as e:
+            self.notify(
+                f"Could not write drcode.json: {e}",
+                title="Model selection",
+                severity="error",
+                timeout=8,
+            )
+            return
+        self.invalidate_resolved_configs()
+        self.refresh_connection()
+        label = f"{ref.provider}/{ref.model}" if ref else "user default / flat config"
+        self.notify(
+            f"{role.value} model: {label}",
+            title="Model selection",
+            timeout=4,
+        )
+
+    def action_custom_role_model(self, role: AgentRole) -> None:
+        """Free-form model for a role: the ordinary ModelSetupDialog, which
+        writes the flat connection keys; this role's slot is cleared so the
+        flat model is actually what the role resolves to."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            ModelSetupDialog(
+                model=self.config.model,
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                max_context_tokens=self.config.max_context_tokens,
+                max_tokens=self.config.max_tokens,
+            ),
+            partial(self._custom_role_model_done, role),
+        )
+
+    def _custom_role_model_done(
+        self, role: AgentRole, setup: ModelSetup | None
+    ) -> None:
+        if setup is None:
+            return
+        try:
+            set_project_model(self.project_root, role, None)
+        except OSError:
+            pass  # the flat save below still applies the model
+        self.invalidate_resolved_configs()
+        self._model_setup_done(setup)
 
 
     def action_set_completed_retention(self, retention: CompletedRetention) -> None:

@@ -37,6 +37,7 @@ from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..models import Clarification, Task, TaskEvent, TaskKind
 from ..notifications import Notifier
+from ..providers import AgentRole, ModelRef
 from ..settings import (
     CompletedRetention,
     ProjectSettings,
@@ -234,6 +235,38 @@ class DrCodeState(App[None]):
 
 
     def _model_setup_done(self, setup: ModelSetup | None) -> None: ...
+
+
+    # -- per-role model resolution (implemented in DrCodeApp / ActionsLayer) --
+
+    def resolved_config(self, role: AgentRole) -> Config: ...
+
+
+    def invalidate_resolved_configs(self) -> None: ...
+
+
+    def _coding_config(self) -> Config: ...
+
+
+    def role_model_label(self, role: AgentRole) -> str: ...
+
+
+    def action_open_model_catalog(self) -> None: ...
+
+
+    def action_change_coding_model(self) -> None: ...
+
+
+    def action_change_tester_model(self) -> None: ...
+
+
+    def action_change_compaction_model(self) -> None: ...
+
+
+    def action_set_role_model(self, role: AgentRole, ref: ModelRef | None) -> None: ...
+
+
+    def action_custom_role_model(self, role: AgentRole) -> None: ...
 
 
     def _maybe_offer_agents_md(self) -> None: ...

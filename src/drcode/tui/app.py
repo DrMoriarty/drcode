@@ -31,6 +31,8 @@ from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..models import Clarification, Task, TaskKind, TaskStatus
 from ..notifications import Notifier
+from ..providers import AgentRole
+from ..providers import resolve as resolve_model_config
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
 from .actions import ActionsLayer
@@ -407,6 +409,28 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # that a view_task() re-render has already put on screen (which
         # used to show the question twice while the dialog stayed open).
         self._rendered_clarification: Clarification | None = None
+        # Per-role resolved model connections (see drcode.providers.resolve),
+        # cached: resolution reads the project config + the user-level
+        # catalog from disk. Invalidated whenever the flat config, the
+        # project `models` slots or the catalog change.
+        self._resolved_configs: dict[AgentRole, Config] = {}
+
+    # -- per-role model resolution -------------------------------------------
+
+    def resolved_config(self, role: AgentRole) -> Config:
+        """Effective model connection for an agent role (coding / tester /
+        compaction): project `models[role]` > user-level default > the flat
+        config. Cached until invalidated."""
+        cached = self._resolved_configs.get(role)
+        if cached is None:
+            cached = resolve_model_config(self.config, role)
+            self._resolved_configs[role] = cached
+        return cached
+
+    def invalidate_resolved_configs(self) -> None:
+        """Drop the cached per-role resolutions (after any change to the
+        flat config, the project model slots or the user catalog)."""
+        self._resolved_configs.clear()
 
     # -- layout -------------------------------------------------------------
 

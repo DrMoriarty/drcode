@@ -45,6 +45,7 @@ from ..agent import (
     serialize_messages,
     split_original_prompts,
 )
+from ..config import Config
 from ..github import (
     issue_commit_hint,
 )
@@ -54,6 +55,7 @@ from ..models import (
     TaskStatus,
 )
 from ..prompts import load_compaction_prompts
+from ..providers import AgentRole
 from ..settings import (
     TaskFinalization,
 )
@@ -71,26 +73,35 @@ from .usage import (
 
 
 class PipelineLayer(DrCodeState):
+
+    def _coding_config(self) -> Config:
+        """Effective model connection of the coding agent (resolved against
+        the project's per-role selection and the user-level catalog)."""
+        return self.resolved_config(AgentRole.CODING)
+
     async def _check_model(self) -> None:
         label = self.model_status
         was_error = label.has_class("error")
-        if not self.config.is_ready:
+        # The header shows the CODING model's connection: the role the
+        # pipeline spends most of its life in.
+        config = self._coding_config()
+        if not config.is_ready:
             self._conn_label = "○ model not configured"
             self._last_probe_ms = None
             label.remove_class("ok", "error")
             label.add_class("warn")
             self._render_model_status()
             return
-        model = self.config.model
+        model = config.model
         started = time.monotonic()
         # The cached health_check_url is probed first (cheaper, no generation);
         # the checked_url itself is discarded here — the header only needs the
         # ok/detail status.
         ok, detail, _checked_url = await probe_model(
             model,
-            self.config.base_url,
-            self.config.api_key,
-            health_check_url=self.config.health_check_url,
+            config.base_url,
+            config.api_key,
+            health_check_url=config.health_check_url,
         )
         # Round-trip of the probe itself, shown on the expanded header line.
         self._last_probe_ms = int((time.monotonic() - started) * 1000)
@@ -390,7 +401,7 @@ class PipelineLayer(DrCodeState):
         (percent of max_context_tokens), None otherwise. Prefers the live
         reading of the running turn over the persisted transcript, whose
         usage lags behind by the not-yet-persisted requests."""
-        max_tokens = self.config.max_context_tokens
+        max_tokens = self._coding_config().max_context_tokens
         if max_tokens <= 0:
             return None
         threshold = min(max(self.config.compaction_threshold, 1), 100)
@@ -423,7 +434,7 @@ class PipelineLayer(DrCodeState):
         tokens = self._compaction_due(task)
         if tokens is None:
             return
-        pct = round(tokens * 100 / self.config.max_context_tokens)
+        pct = round(tokens * 100 / self._coding_config().max_context_tokens)
         _, rest = split_original_prompts(task.messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
@@ -434,7 +445,7 @@ class PipelineLayer(DrCodeState):
             f"Context fill {pct}% — pausing the agent and compacting history…",
         )
         try:
-            agent = build_compaction_agent(self.config)
+            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
             prompt = build_compaction_prompt(
                 extract_previous_summary(task.messages),
                 render_history_for_summary(task.messages),
@@ -493,7 +504,7 @@ class PipelineLayer(DrCodeState):
         tokens = self._fill_over_threshold(live_tokens, round_messages)
         if tokens is None:
             return False
-        pct = round(tokens * 100 / self.config.max_context_tokens)
+        pct = round(tokens * 100 / self._coding_config().max_context_tokens)
         _, rest = split_original_prompts(round_messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
@@ -506,7 +517,7 @@ class PipelineLayer(DrCodeState):
             f"Context fill {pct}% — compacting the testing round…",
         )
         try:
-            agent = build_compaction_agent(self.config)
+            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
             prompt = build_compaction_prompt(
                 extract_previous_summary(round_messages),
                 render_history_for_summary(round_messages),
@@ -566,7 +577,11 @@ class PipelineLayer(DrCodeState):
             self._tps_samples.clear()
             self._touch_activity()
             self.refresh_status()
-            agent = build_agent(self.config, kind=task.kind, root=self.project_root)
+            agent = build_agent(
+                self.resolved_config(AgentRole.CODING),
+                kind=task.kind,
+                root=self.project_root,
+            )
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
             # once and is NEVER re-queued/re-sent. Each activation first
@@ -910,7 +925,9 @@ class PipelineLayer(DrCodeState):
                                     task.id not in self._compaction_failed
                                 ):
                                     pct = round(
-                                        tokens * 100 / self.config.max_context_tokens
+                                        tokens
+                                        * 100
+                                        / self._coding_config().max_context_tokens
                                     )
                                     self._show_event(
                                         task,
@@ -1180,7 +1197,7 @@ class PipelineLayer(DrCodeState):
                 if self.viewed_id == task_id:
                     self._write_history_line("testing-sep", "")
             tester = build_tester_agent(
-                self.config,
+                self.resolved_config(AgentRole.TESTER),
                 allow_commit=(
                     self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
                 ),
@@ -1332,7 +1349,9 @@ class PipelineLayer(DrCodeState):
                                     task.id not in self._compaction_failed
                                 ):
                                     pct = round(
-                                        tokens * 100 / self.config.max_context_tokens
+                                        tokens
+                                        * 100
+                                        / self._coding_config().max_context_tokens
                                     )
                                     self._show_event(
                                         task,

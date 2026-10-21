@@ -22,6 +22,8 @@ from . import agent_model, tools
 from .agent_model import (
     EXTRA_HEADERS,
     AsyncOpenAI,
+    ModelFetchError,
+    fetch_models,
     probe_model,
 )
 from .compaction import (
@@ -84,6 +86,7 @@ __all__ = [
     "TESTER_SYSTEM_PROMPT_NO_COMMIT",
     "AgentDeps",
     "AsyncOpenAI",
+    "ModelFetchError",
     "TaskManager",
     "TesterDeps",
     "_context_status",
@@ -102,6 +105,7 @@ __all__ = [
     "ends_with_open_request",
     "extract_display",
     "extract_previous_summary",
+    "fetch_models",
     "first_user_prompt",
     "is_pending_retry",
     "is_summary_message",

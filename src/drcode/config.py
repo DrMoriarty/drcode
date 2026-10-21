@@ -292,6 +292,43 @@ def ensure_user_config_dir() -> None:
             # First start (or the user deleted the template): drop it next
             # to where the user config would live, so it's discoverable.
             USER_CONFIG_EXAMPLE_FILE.write_text(payload)
+        # One-line hint for the user-level model catalog (written/managed
+        # exclusively by the `drcode-models` utility or the main TUI's
+        # "Provider catalog…" screen — never by hand).
+        if not (_USER_CONFIG_DIR / "models.json.example").exists():
+            (_USER_CONFIG_DIR / "models.json.example").write_text(
+                json.dumps(
+                    {
+                        "providers": [
+                            {
+                                "name": "local-swap",
+                                "base_url": "http://localhost:8080/v1",
+                                "api_key": "",
+                                "health_check_url": "",
+                                "models": [
+                                    {
+                                        "id": "qwen3-coder-30b",
+                                        "max_context_tokens": 200000,
+                                        "max_tokens": None,
+                                        "context_reported": False,
+                                    }
+                                ],
+                            }
+                        ],
+                        "defaults": {
+                            "coding": {
+                                "provider": "local-swap",
+                                "model": "qwen3-coder-30b",
+                            },
+                            "tester": None,
+                            "compaction": None,
+                        },
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
     except OSError:
         # Read-only home or exotic sandbox — user-level config is optional.
         pass

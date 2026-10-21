@@ -35,6 +35,7 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         "DRCODE_BASE_URL",
         "DRCODE_API_KEY",
         "DRCODE_MAX_CONTEXT_TOKENS",
+        "DRCODE_MAX_TOKENS",
         "DRCODE_COMPACTION_THRESHOLD",
     ):
         monkeypatch.delenv(name, raising=False)

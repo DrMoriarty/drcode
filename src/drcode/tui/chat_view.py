@@ -1081,7 +1081,7 @@ class ChatViewLayer(DrCodeState):
         if not tokens:
             right.update("")
             return
-        max_tokens = self.config.max_context_tokens
+        max_tokens = self._coding_config().max_context_tokens
         if max_tokens > 0:
             pct = round(tokens * 100 / max_tokens)
             text = (

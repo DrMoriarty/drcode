@@ -26,6 +26,12 @@ from textual.strip import Strip
 from textual.theme import Theme
 from textual.widgets import Button, LoadingIndicator
 
+from ..providers import (
+    AgentRole,
+    ModelRef,
+    UserModelsStore,
+    load_project_model_refs,
+)
 from ..settings import (
     FINALIZATION_OPTIONS,
     RETENTION_OPTIONS,
@@ -155,6 +161,10 @@ class SettingsPalette(CommandPalette):
         "Theme",
         "Update/create AGENTS.md",
         "Model settings:",
+        "Provider catalog…",
+        "Coding model:",
+        "Tester model:",
+        "Compaction model:",
         "Auto-delete completed tasks:",
         "Task finalization:",
         "Nudge stalled agent after:",
@@ -267,6 +277,15 @@ class ModelConfigCommandProvider(Provider):
                 ),
                 app.action_open_model_setup,
             ),
+            (
+                "Provider catalog…",
+                (
+                    "Edit the user-level catalog of OpenAI-compatible providers "
+                    "and their models (auto-discovery, context sizes, per-role "
+                    "defaults) — stored in ~/.config/drcode/models.json"
+                ),
+                app.action_open_model_catalog,
+            ),
         ]
 
     async def discover(self) -> Hits:
@@ -294,6 +313,32 @@ class ProjectSettingsCommandsProvider(Provider):
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
         app = cast("DrCodeApp", self.app)
         return [
+            (
+                f"Coding model: {app.role_model_label(AgentRole.CODING)}",
+                (
+                    "Model the development agent runs on; pick from the "
+                    "user-level provider catalog (saved to the project's "
+                    "drcode.json)"
+                ),
+                app.action_change_coding_model,
+            ),
+            (
+                f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
+                (
+                    "Model the QA tester runs on; pick from the user-level "
+                    "provider catalog (saved to the project's drcode.json)"
+                ),
+                app.action_change_tester_model,
+            ),
+            (
+                f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
+                (
+                    "Model that summarizes the history when the context "
+                    "fill hits the threshold; pick from the user-level "
+                    "provider catalog (saved to the project's drcode.json)"
+                ),
+                app.action_change_compaction_model,
+            ),
             (
                 f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
                 (
@@ -529,3 +574,49 @@ class StallNudgeOptionsProvider(Provider):
         for name, callback in self._commands():
             if (match := matcher.match(name)) > 0:
                 yield Hit(match, matcher.highlight(name), callback)
+
+
+def role_model_options_provider(role: AgentRole) -> type[Provider]:
+    """Selection palette listing the catalog models available for one agent
+    role, grouped by provider ("provider/model" entries, the current one
+    marked), plus "(none — user default / flat config)" to clear the
+    project slot and "Custom…" for a free-form model via the ordinary
+    ModelSetupDialog (writes the flat keys and clears the slot)."""
+
+    class RoleModelOptions(Provider):
+        def _commands(self) -> list[tuple[str, Callable[[], object]]]:
+            app = cast("DrCodeApp", self.app)
+            catalog = UserModelsStore().load()
+            refs = load_project_model_refs(app.project_root)
+            current = refs.get(role) or catalog.defaults.get(role)
+            commands: list[tuple[str, Callable[[], object]]] = []
+            for provider in catalog.providers:
+                for entry in provider.models:
+                    ref = ModelRef(provider=provider.name, model=entry.id)
+                    label = f"{provider.name}/{entry.id}"
+                    if ref == current:
+                        label += " (current)"
+                    commands.append(
+                        (label, partial(app.action_set_role_model, role, ref))
+                    )
+            if current is not None:
+                commands.append(
+                    (
+                        "(none — user default / flat config)",
+                        partial(app.action_set_role_model, role, None),
+                    )
+                )
+            commands.append(("Custom…", partial(app.action_custom_role_model, role)))
+            return commands
+
+        async def discover(self) -> Hits:
+            for name, callback in self._commands():
+                yield DiscoveryHit(name, callback)
+
+        async def search(self, query: str) -> Hits:
+            matcher = self.matcher(query)
+            for name, callback in self._commands():
+                if (match := matcher.match(name)) > 0:
+                    yield Hit(match, matcher.highlight(name), callback)
+
+    return RoleModelOptions

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import time
 from collections import deque
@@ -7,6 +9,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import ClassVar
 
+from rich.markup import escape
+from textual import events
 from textual.app import (
     App,
     ComposeResult,
@@ -655,6 +659,53 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         return True
 
     # -- copy on select -------------------------------------------------------
+
+    def _selected_text(self) -> str | None:
+        """Extract the currently selected text from rendered lines.
+
+        Done at the app level instead of Widget.get_selection, which works on
+        logical (unwrapped) text and returns garbled results for wrapped lines.
+        """
+        parts: list[str] = []
+        for widget, selection in self.screen.selections.items():
+            if not widget.is_attached:
+                continue
+            lines: list[str] = []
+            for y in range(widget.size.height):
+                span = selection.get_span(y)
+                if span is None:
+                    continue
+                start, end = span
+                line = widget.render_line(y).text
+                lines.append((line[start:] if end == -1 else line[start:end]).rstrip())
+            if lines:
+                parts.append("\n".join(lines).rstrip())
+        if not parts:
+            return None
+        return "\n".join(parts)
+
+    def _copy_with_fallback(self, text: str) -> None:
+        # copy_to_clipboard uses OSC52, which macOS Terminal.app ignores;
+        # pbcopy always works there.
+        self.copy_to_clipboard(text)
+        if sys.platform == "darwin" and shutil.which("pbcopy"):
+            subprocess.run(["pbcopy"], input=text.encode(), check=False)
+
+    def _show_copy_toast(self, text: str) -> None:
+        preview = escape(text if len(text) <= 40 else text[:39] + "…")
+        toast = self.query_one("#copy-toast", Static)
+        toast.update(f"✓ copied: {preview}")
+        toast.remove_class("hidden")
+        if self._copy_toast_timer is not None:
+            self._copy_toast_timer.stop()
+        self._copy_toast_timer = self.set_timer(2.0, lambda: toast.add_class("hidden"))
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        text = self._selected_text()
+        if not text:
+            return
+        self._copy_with_fallback(text)
+        self._show_copy_toast(text)
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         for command in super().get_system_commands(screen):

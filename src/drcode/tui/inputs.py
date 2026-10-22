@@ -5,12 +5,14 @@ from typing import ClassVar
 
 from rich.cells import cell_len
 from textual import events
+from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.widgets import TextArea
 
 
 class WordNavTextArea(TextArea):
-    """TextArea with macOS-style Option+Arrow word navigation.
+    """TextArea with macOS-style Option+Arrow word navigation, a working
+    copy/cut and edit-time cursor scrolling.
 
     Terminals report Option+Left/Right as `alt+left`/`alt+right` (kitty
     keyboard protocol or CSI 1;3x sequences), but stock TextArea only binds
@@ -49,6 +51,48 @@ class WordNavTextArea(TextArea):
         ),
     ]
 
+    def _app(self):
+        from .app import DrCodeApp
+
+        app = self.app
+        assert isinstance(app, DrCodeApp)
+        return app
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        # Editing scrolls the cursor into view while virtual_size is still
+        # stale (the layout hasn't caught up with the new line count yet):
+        # scroll_to_region clamps against the old size, so the first scroll
+        # is a no-op and the cursor stays below the fold — the next
+        # keystroke finally scrolls. Re-running after the refresh settles
+        # makes the cursor visible immediately (an empty new line, a paste,
+        # a wrap that pushes the cursor down).
+        self.call_after_refresh(self.scroll_cursor_visible)
+
+    def action_copy(self) -> None:
+        """Copy the selection via the app's clipboard fallback.
+
+        The stock action only writes OSC 52, which macOS Terminal.app and
+        iTerm2 (default settings) silently ignore — the copy then does
+        nothing. _copy_with_fallback adds pbcopy, and the toast confirms
+        that something was actually copied.
+        """
+        text = self.selected_text
+        if not text:
+            raise SkipAction()
+        app = self._app()
+        app._copy_with_fallback(text)
+        app._show_copy_toast(text)
+
+    def action_cut(self) -> None:
+        # Super deletes the selection (or the cursor line) and copies via
+        # OSC 52; add the system-clipboard fallback and the toast on top.
+        text = self.selected_text
+        super().action_cut()
+        if text:
+            app = self._app()
+            app._copy_with_fallback(text)
+            app._show_copy_toast(text)
+
 
 class NewTaskInput(WordNavTextArea):
     """Multi-line editor for a new task; Tab toggles the task type."""
@@ -58,13 +102,6 @@ class NewTaskInput(WordNavTextArea):
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
-
-    def _app(self):
-        from .app import DrCodeApp
-
-        app = self.app
-        assert isinstance(app, DrCodeApp)
-        return app
 
     def action_toggle_kind(self) -> None:
         self._app().toggle_new_task_kind()
@@ -98,13 +135,6 @@ class ChatInput(WordNavTextArea):
             **kwargs,  # type: ignore[arg-type]
         )
 
-    def _app(self):
-        from .app import DrCodeApp
-
-        app = self.app
-        assert isinstance(app, DrCodeApp)
-        return app
-
     def action_submit(self) -> None:
         self._app().submit_chat_input()
 
@@ -123,6 +153,7 @@ class ChatInput(WordNavTextArea):
         await super()._on_key(event)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        super().on_text_area_changed(event)
         self._update_height()
 
     def on_resize(self) -> None:

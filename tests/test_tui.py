@@ -661,3 +661,78 @@ async def test_terminal_title_tracks_working_agent(
         app.manager.mark_done(research.id)
         await pilot.pause()
         assert written[-1] == base
+
+
+# -- new-task input: cursor scrolling & clipboard ---------------------------------
+
+
+def _wrapped_row(input: TextArea) -> int:
+    """Visual (soft-wrapped) row of the cursor inside the input."""
+    return input.wrapped_document.location_to_offset(input.cursor_location).y
+
+
+async def test_new_task_input_keeps_cursor_visible_after_edit(app: DrCodeApp) -> None:
+    """Pressing Enter past the bottom of the input must scroll immediately.
+
+    The stock TextArea scrolls the cursor into view before the layout
+    refreshes virtual_size, so the first scroll is clamped to the old
+    size and the cursor stays below the fold until the next keystroke.
+    """
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.focus()
+        await pilot.pause()
+        # Six logical lines, each soft-wrapping to two visual lines: more
+        # than the 10-row (8 inner) input can show at once.
+        nt_input.insert("\n".join("word " * 16 for _ in range(6)))
+        await pilot.pause()
+        inner_h = nt_input.scrollable_content_region.height
+        nt_input.move_cursor((0, 0))
+        nt_input.scroll_to(0, 0, animate=False)
+        await pilot.pause()
+
+        # Arrow down through every visual row: the cursor must always stay
+        # inside the visible window.
+        for _ in range(14):
+            await pilot.press("down")
+            await pilot.pause()
+            row_in_view = _wrapped_row(nt_input) - nt_input.scroll_offset.y
+            assert 0 <= row_in_view < inner_h
+
+        # Enter at the very end appends empty lines below the fold; each
+        # one must immediately bring the cursor into view.
+        for _ in range(4):
+            await pilot.press("enter")
+            await pilot.pause()
+            row_in_view = _wrapped_row(nt_input) - nt_input.scroll_offset.y
+            assert 0 <= row_in_view < inner_h
+
+
+async def test_new_task_input_copy_uses_clipboard_fallback(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl+C in the input copies the selection and shows the toast.
+
+    The stock TextArea copy only emits OSC 52, which macOS Terminal.app
+    and iTerm2 ignore — the input must route through the app's fallback.
+    """
+    # Neutralize pbcopy so the test is deterministic on macOS too (the
+    # OSC 52 write into app._clipboard is what we assert on).
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.focus()
+        nt_input.insert("hello copyable world")
+        nt_input.selection = ((0, 0), (0, 5))
+        await pilot.pause()
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        assert app._clipboard == "hello"
+        toast = app.query_one("#copy-toast")
+        assert not toast.has_class("hidden")

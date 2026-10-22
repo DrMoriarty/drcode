@@ -18,6 +18,7 @@ from .models import (
 )
 from .storage import Storage
 from .transcript import is_pending_retry
+from .workflow import ensure_workflow_examples
 
 # Status-change observer: (task, old status, new status, origin). Origin is
 # "user" when the transition was directly initiated by the user sitting at
@@ -31,6 +32,9 @@ StatusListener = Callable[[Task, TaskStatus, TaskStatus, str], None]
 class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
+        # Scaffold the workflow templates (.drcode/workflow.py.example,
+        # .drcode/git-workflow.md.example) — idempotent, never overwrites.
+        ensure_workflow_examples(project_root)
         self._status_listeners: list[StatusListener] = []
         # Serializes reload_new_tasks(): it runs both on the app thread
         # (the periodic disk poll) and on worker threads (promote_next in

@@ -1,7 +1,9 @@
 """Custom team workflow: `.drcode/workflow.py` hooks and `.drcode/git-workflow.md` rules.
 
 Two independent layers, each enabled by the mere presence of the file in
-`<project>/.drcode/`:
+`<project>/.drcode/` (template scaffolds `workflow.py.example` and
+`git-workflow.md.example` are written on every app start and never
+overwritten — see `ensure_workflow_examples`):
 
 - **`.drcode/git-workflow.md`** — declarative process rules written by the
   team in plain prose. When present, it replaces the "Never commit to git"
@@ -114,6 +116,137 @@ from .models import Task
 
 WORKFLOW_SCRIPT = "workflow.py"
 GIT_WORKFLOW_FILE = "git-workflow.md"
+
+# Template files scaffolded on app start (never overwritten): the user
+# activates a workflow layer by renaming the template to the real name.
+WORKFLOW_EXAMPLE_FILE = "workflow.py.example"
+GIT_WORKFLOW_EXAMPLE_FILE = "git-workflow.md.example"
+
+# The workflow.py template: the hook contract in miniature, every hook
+# commented out so a renamed file defines no hooks until edited.
+WORKFLOW_EXAMPLE_CONTENT = '''\
+"""drcode workflow hooks (template).
+
+ACTIVATION: rename this file to `workflow.py` (keep it in the project's
+`.drcode/` directory) and uncomment the hooks you need. drcode scaffolds
+this template on every start, but NEVER overwrites it — edit it in place.
+
+What it gives you: hard gates at fixed lifecycle points of the task
+pipeline. Each defined hook runs in an isolated subprocess (cwd = project
+root) and receives one JSON payload:
+
+    {"hook": "<name>",
+     "task": {"id", "title", "kind", "github_issue"},
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>}}
+
+Every hook is optional — an absent function simply skips its step. A hook
+failure (non-zero exit, timeout, malformed output) is NEVER fatal: it is
+written into the task's service-event log and the pipeline moves on — with
+one exception: on_review fails CLOSED (the task waits, the review is
+retried with backoff), because an unreachable reviewer must not wave a
+change through.
+
+SECURITY: workflow.py is arbitrary code executed with your full
+permissions. Only activate a workflow file you have read and trust.
+"""
+
+# import subprocess
+#
+#
+# def on_task_start(task):
+#     """Before the FIRST activation of a task (e.g. check out a feature
+#     branch). MUST be idempotent: an abort leaves a dirty tree on the
+#     branch. Return {"instructions": "..."} to inject text into the coding
+#     agent's first prompt."""
+#     subprocess.run(
+#         ["git", "checkout", "-B", f"task/{task['task']['id']}"], check=True
+#     )
+#     return {
+#         "instructions": f"Commit your work to branch task/{task['task']['id']}."
+#     }
+#
+#
+# def on_development_done(task):
+#     """Development finished, before testing (push, `gh pr create`, ...).
+#     Return {"text": "..."} to append context to the tester's prompt."""
+#
+#
+# def on_tester_passed(task):
+#     """Right after the tester stamped the task PASSED and it is finalized
+#     (runs on every path to COMPLETED-after-PASSED) — the unconditional
+#     post-verification hook: install / deploy here. Research tasks never
+#     trigger it (they skip testing). Return {"text": "..."} for the
+#     task's service-event log."""
+#
+#
+# def on_review(task):
+#     """External code review after the tester passed. Return
+#     {"verdict": "accept"} — the task completes (and on_accepted runs);
+#     {"verdict": "reject", "comment": "..."} — the task is re-queued with
+#     the comment as new user input (3 consecutive rejects park it on
+#     hold); {"verdict": "pending"} (or None) — the task completes with
+#     review_pending set and this hook is re-polled every 60 s until a
+#     final verdict arrives (a long human review never blocks the queue)."""
+#     if subprocess.run(["gh", "pr", "checks"]).returncode != 0:
+#         return {"verdict": "pending"}
+#     return {"verdict": "accept"}
+#
+#
+# def on_accepted(task):
+#     """After an accept (merge the PR, delete the branch). Return
+#     {"text": "..."} for the task's service-event log."""
+'''
+
+# The git-workflow.md template: prose rules replacing the built-in
+# "never commit to git" agent instruction once activated.
+GIT_WORKFLOW_EXAMPLE_CONTENT = """\
+<!-- drcode git workflow rules (template).
+
+     ACTIVATION: rename this file to `git-workflow.md` (keep it in the
+     project's `.drcode/` directory) and edit the rules below. drcode
+     scaffolds this template on every start, but NEVER overwrites it.
+
+     What it gives you: when present, these rules REPLACE the built-in
+     "never commit to git" instruction in the coding agents' system
+     prompts (commits become part of the workflow) and are appended to
+     the tester's prompt. Write plain prose — branching model, commit
+     conventions, PR rules — the agents follow it literally. -->
+
+# Git workflow rules
+
+- Work on a feature branch named `task/<id>`; never commit directly to `main`.
+- Commit messages: imperative mood, reference the task id — `feat: add X (#<id>)`.
+- Keep commits atomic: no unrelated changes in one commit.
+- After development, push the branch and open a PR (`gh pr create`).
+"""
+
+
+def ensure_workflow_examples(project_root: Path) -> None:
+    """Scaffold the two workflow templates in `<project>/.drcode/`.
+
+    On every app start the project's `.drcode/` gets `workflow.py.example`
+    and `git-workflow.md.example` — short, ready-to-edit templates that
+    document the user-activatable workflow features (hooks / git rules).
+    Existing files are NEVER overwritten (a user's edited template or an
+    already-renamed real file stays untouched; a real `workflow.py` /
+    `git-workflow.md` does not suppress the template — the pair is
+    independent documentation). Never raises: an unwritable project
+    directory just means no templates.
+    """
+    drcode_dir = project_root / ".drcode"
+    try:
+        drcode_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in (
+            (WORKFLOW_EXAMPLE_FILE, WORKFLOW_EXAMPLE_CONTENT),
+            (GIT_WORKFLOW_EXAMPLE_FILE, GIT_WORKFLOW_EXAMPLE_CONTENT),
+        ):
+            path = drcode_dir / name
+            if path.exists():
+                continue
+            path.write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
 
 # Every hook the pipeline may call (in lifecycle order).
 HOOK_NAMES: tuple[str, ...] = (

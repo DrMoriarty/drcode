@@ -24,10 +24,13 @@ from drcode.prompts import (
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
 from drcode.workflow import (
+    GIT_WORKFLOW_EXAMPLE_FILE,
     HOOK_TIMEOUT,
     MAX_REVIEW_REJECTIONS,
+    WORKFLOW_EXAMPLE_FILE,
     WorkflowHooks,
     describe_project_workflow,
+    ensure_workflow_examples,
     load_git_workflow,
     load_hooks,
 )
@@ -120,6 +123,49 @@ def make_hooks(project_root: Path) -> WorkflowHooks:
 
 def test_load_hooks_none_without_file(project_root: Path) -> None:
     assert load_hooks(project_root) is None
+    assert describe_project_workflow(project_root) == "default"
+
+
+# -- example scaffolding --------------------------------------------------------------
+
+
+def test_examples_scaffolded_on_manager_init(project_root: Path) -> None:
+    TaskManager(project_root)
+    workflow_ex = project_root / ".drcode" / WORKFLOW_EXAMPLE_FILE
+    git_ex = project_root / ".drcode" / GIT_WORKFLOW_EXAMPLE_FILE
+    assert workflow_ex.is_file()
+    assert git_ex.is_file()
+    # The templates document activation (rename) and mention every hook.
+    text = workflow_ex.read_text(encoding="utf-8")
+    for hook in (
+        "on_task_start",
+        "on_development_done",
+        "on_tester_passed",
+        "on_review",
+        "on_accepted",
+    ):
+        assert hook in text
+    assert "workflow.py" in text
+    assert "git-workflow.md" in git_ex.read_text(encoding="utf-8")
+
+
+def test_examples_not_overwritten(project_root: Path) -> None:
+    drcode = project_root / ".drcode"
+    drcode.mkdir(parents=True, exist_ok=True)
+    workflow_ex = drcode / WORKFLOW_EXAMPLE_FILE
+    git_ex = drcode / GIT_WORKFLOW_EXAMPLE_FILE
+    workflow_ex.write_text("# my edits\n")
+    git_ex.write_text("my rules\n")
+    TaskManager(project_root)
+    ensure_workflow_examples(project_root)  # direct repeat: still untouched
+    assert workflow_ex.read_text(encoding="utf-8") == "# my edits\n"
+    assert git_ex.read_text(encoding="utf-8") == "my rules\n"
+
+
+def test_examples_do_not_activate_workflow(project_root: Path) -> None:
+    ensure_workflow_examples(project_root)
+    assert load_hooks(project_root) is None
+    assert load_git_workflow(project_root) is None
     assert describe_project_workflow(project_root) == "default"
 
 

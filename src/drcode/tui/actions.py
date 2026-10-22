@@ -47,7 +47,10 @@ from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
     FinalizationOptionsProvider,
+    ModelCatalogCommandProvider,
+    ModelSettingsPalette,
     RetentionOptionsProvider,
+    RoleModelsCommandsProvider,
     SettingsPalette,
     StallNudgeOptionsProvider,
     ThemeOptionsProvider,
@@ -569,6 +572,22 @@ class ActionsLayer(DrCodeState):
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
+
+    def action_open_model_settings(self) -> None:
+        """Open the "Model settings…" sub-menu: the provider catalog editor
+        and one model picker per agent role, in one palette. Runs as the
+        callback of a palette entry — the palette has already dismissed
+        itself by the time this executes, so pushing the sub-palette is
+        safe."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            ModelSettingsPalette(
+                id="--model-settings-palette",
+                providers=[ModelCatalogCommandProvider, RoleModelsCommandsProvider],
+                placeholder="Model settings…",
+            )
+        )
 
     # -- per-role model selection ---------------------------------------------
 

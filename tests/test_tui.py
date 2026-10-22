@@ -1178,22 +1178,62 @@ async def test_role_model_label_variants(app: DrCodeApp, project_root: Path) -> 
     assert app.role_model_label(AgentRole.TESTER) == "custom-m"
 
 
-async def test_settings_menu_has_no_model_settings_entry(
-    app: DrCodeApp,
-) -> None:
+async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
+    """The main Settings menu collapses all model-related entries into one
+    "Model settings…" item, which opens the sub-menu with the provider
+    catalog editor and the per-role model pickers."""
+    from textual.command import CommandList
+
     from drcode.tui.command_providers import (
         ModelCatalogCommandProvider,
+        ModelSettingsCommandProvider,
+        ModelSettingsPalette,
+        RoleModelsCommandsProvider,
         SettingsPalette,
     )
 
-    assert "Model settings:" not in SettingsPalette.ENTRY_ORDER
+    # The main menu has no direct model entries anymore.
+    assert "Model settings" in SettingsPalette.ENTRY_ORDER
+    assert "Provider catalog…" not in SettingsPalette.ENTRY_ORDER
+    assert "Coding model:" not in SettingsPalette.ENTRY_ORDER
+
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        provider = ModelCatalogCommandProvider(app.screen)
+        provider = ModelSettingsCommandProvider(app.screen)
         commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        names = [name for name, _help, _cb in commands]
-        assert names == ["Provider catalog…"]
+        assert [(name, cb) for name, _help, cb in commands] == [
+            ("Model settings…", app.action_open_model_settings)
+        ]
+        app.action_open_model_settings()
+        await pilot.pause()
+        palette = app.screen
+        assert isinstance(palette, ModelSettingsPalette)
+        # Wait for the palette's gather worker to finish.
+        command_list = palette.query_one(CommandList)
+        for _ in range(100):
+            if "-ready" in palette.classes and command_list.option_count:
+                break
+            await pilot.pause()
+        await pilot.pause()
+        names = [
+            cast(Command, command).hit.text or "" for command in command_list._options
+        ]
+        assert names == [
+            "Provider catalog…",
+            f"Coding model: {app.role_model_label(AgentRole.CODING)}",
+            f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
+            f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
+            f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
+        ]
+        # Sub-menu providers: the catalog editor plus the role pickers,
+        # nothing else (project preferences stay in the main menu).
+        commands = RoleModelsCommandsProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert next(name for name, _help, _cb in commands) == (
+            f"Coding model: {app.role_model_label(AgentRole.CODING)}"
+        )
+        catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _help, _cb in catalog] == ["Provider catalog…"]
 
 
 async def test_custom_role_model_dialog_prefills_and_saves(

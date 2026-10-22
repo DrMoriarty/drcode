@@ -46,7 +46,7 @@ from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
-    ModelCatalogCommandProvider,
+    ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
 )
@@ -78,10 +78,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     # Providers for the Settings palette (it passes no explicit providers,
     # so it reads this set): the system commands (theme, quit, …) plus our
-    # own service commands (AGENTS.md refresh and friends).
+    # own service commands (AGENTS.md refresh and friends). The model
+    # entries (provider catalog, per-role picks) live in the "Model
+    # settings…" sub-menu, whose providers are passed explicitly by
+    # action_open_model_settings.
     COMMANDS: ClassVar = {
         get_system_commands_provider,
-        ModelCatalogCommandProvider,
+        ModelSettingsCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
     }

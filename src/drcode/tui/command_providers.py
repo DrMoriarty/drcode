@@ -155,17 +155,15 @@ class SettingsPalette(CommandPalette):
     # adding prefixes for new entries — rearranges the menu arbitrarily;
     # anything not matching a prefix slots in right before the last entry
     # ("Quit"). Head block per the current UX convention: Keys, Screenshot,
-    # Theme; Quit is pinned to the very end.
+    # Theme; Quit is pinned to the very end. The model-related entries
+    # (provider catalog + per-role picks) live in the "Model settings…"
+    # sub-menu (ModelSettingsPalette), not here.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Keys",
         "Screenshot",
         "Theme",
         "Update/create AGENTS.md",
-        "Provider catalog…",
-        "Coding model:",
-        "Research model:",
-        "Tester model:",
-        "Compaction model:",
+        "Model settings",
         "Auto-delete completed tasks:",
         "Task finalization:",
         "Nudge stalled agent after:",
@@ -226,6 +224,28 @@ class SettingsPalette(CommandPalette):
                 yield LoadingIndicator()
 
 
+class ModelSettingsPalette(SettingsPalette):
+    """Sub-menu of the Settings palette with the model-related entries.
+
+    Opened from the single "Model settings…" entry of the main Settings
+    menu: the user-level provider catalog editor plus one model picker per
+    agent role. Same narrowed layout and spaced list as the parent; the
+    entry order is its own (model entries only), so the shared prefix-sort
+    in `SettingsPalette._entry_rank` orders this menu independently.
+    """
+
+    # Same prefix-matching contract as SettingsPalette.ENTRY_ORDER, but
+    # scoped to this sub-menu: the provider-catalog entry first, then the
+    # four role pickers in pipeline order.
+    ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
+        "Provider catalog…",
+        "Coding model:",
+        "Research model:",
+        "Tester model:",
+        "Compaction model:",
+    )
+
+
 class ServiceCommandsProvider(Provider):
     """App-specific commands in the Settings palette.
 
@@ -256,7 +276,7 @@ class ServiceCommandsProvider(Provider):
 
 
 class ModelCatalogCommandProvider(Provider):
-    """Provider-catalog entry in the Settings palette.
+    """Provider-catalog entry in the "Model settings…" sub-menu.
 
     Always visible (independent of any configuration state): opens the
     user-level provider/model catalog editor
@@ -288,15 +308,44 @@ class ModelCatalogCommandProvider(Provider):
                 yield Hit(match, matcher.highlight(name), callback, help=help_text)
 
 
-class ProjectSettingsCommandsProvider(Provider):
-    """Project-preference commands in the Settings palette.
+class ModelSettingsCommandProvider(Provider):
+    """The single "Model settings…" entry in the main Settings palette.
 
-    One entry per project preference; its current value is shown after the
-    ":". Picking an entry opens the option-selection palette (same UX as the
-    theme picker); choosing an option there persists it into
-    `<project>/.drcode/settings.json`, so the choice is scoped to the
-    project, not the user. Escape dismisses the selection window and keeps
-    the current value.
+    Opens the ModelSettingsPalette sub-menu with the provider catalog
+    editor and the per-role model pickers.
+    """
+
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app = cast("DrCodeApp", self.app)
+        return [
+            (
+                "Model settings…",
+                (
+                    "Provider catalog and per-agent model selection "
+                    "(coding / research / tester / compaction)"
+                ),
+                app.action_open_model_settings,
+            ),
+        ]
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._commands():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback, help=help_text)
+
+
+class RoleModelsCommandsProvider(Provider):
+    """Per-role model pickers of the "Model settings…" sub-menu.
+
+    One entry per agent role; its current effective model is shown after
+    the ":". Picking an entry opens the role's selection palette (same UX
+    as the option pickers); Escape dismisses it and keeps the current
+    model.
     """
 
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
@@ -339,6 +388,34 @@ class ProjectSettingsCommandsProvider(Provider):
                 ),
                 app.action_change_compaction_model,
             ),
+        ]
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._commands():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._commands():
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
+class ProjectSettingsCommandsProvider(Provider):
+    """Project-preference commands in the Settings palette.
+
+    One entry per project preference; its current value is shown after the
+    ":". Picking an entry opens the option-selection palette (same UX as the
+    theme picker); choosing an option there persists it into
+    `<project>/.drcode/settings.json`, so the choice is scoped to the
+    project, not the user. Escape dismisses the selection window and keeps
+    the current value.
+    """
+
+    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+        app = cast("DrCodeApp", self.app)
+        return [
             (
                 f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
                 (

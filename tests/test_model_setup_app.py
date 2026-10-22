@@ -13,6 +13,7 @@ from textual.app import App
 from textual.widgets import DataTable, Input, OptionList, Select
 
 from drcode.providers import (
+    AgentRole,
     ModelEntry,
     Provider,
     UserModelsConfig,
@@ -24,12 +25,17 @@ from drcode.tui.model_setup_app import ModelCatalogScreen
 class _Host(App):
     """Minimal host pushing the catalog screen (mirrors both entry points)."""
 
-    def __init__(self, store: UserModelsStore) -> None:
+    def __init__(
+        self, store: UserModelsStore, project_root: Path | None = None
+    ) -> None:
         super().__init__()
         self._store = store
+        self._project_root = project_root
 
     def on_mount(self) -> None:
-        self.push_screen(ModelCatalogScreen(store=self._store))
+        self.push_screen(
+            ModelCatalogScreen(store=self._store, project_root=self._project_root)
+        )
 
 
 async def test_mount_empty_catalog(tmp_path: Path) -> None:
@@ -396,3 +402,71 @@ async def test_standalone_app_escape_quits() -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert app.return_code == 0
+
+
+# -- seeding from the project custom models ---------------------------------------
+
+
+async def test_screen_seeded_from_project_custom_models_only_on_save(
+    tmp_path: Path, project_root: Path
+) -> None:
+    """No models.json, but the project has custom models: the catalog
+    screen pre-fills itself from them — in memory only; the file appears
+    solely after an explicit Save (and no role defaults are derived)."""
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(
+            model="qwen3-coder-30b",
+            base_url="http://localhost:8080/v1",
+            api_key="key-1",
+        ),
+    )
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store, project_root=project_root).run_test(
+        size=(120, 56)
+    ) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        options = screen.query_one("#mc-providers", OptionList)
+        assert any((option.id or "") == "prov:localhost" for option in options.options)
+        assert screen.query_one("#mc-name", Input).value == "localhost"
+        status = screen.query_one("#mc-status")
+        assert "custom models" in str(status.render())
+        # Nothing written yet.
+        assert not path.exists()
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        assert path.exists()
+        data = json.loads(path.read_text())
+        provider = data["providers"][0]
+        assert provider["name"] == "localhost"
+        assert provider["base_url"] == "http://localhost:8080/v1"
+        assert provider["api_key"] == "key-1"
+        assert provider["models"][0]["id"] == "qwen3-coder-30b"
+        # No role defaults derived from the seed.
+        assert data.get("defaults", {}) == {}
+
+
+async def test_screen_not_seeded_from_project_when_catalog_exists(
+    tmp_path: Path, project_root: Path
+) -> None:
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(model="m", base_url="http://x/v1"),
+    )
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    store.save(UserModelsConfig())  # an existing catalog is the truth
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        assert screen.catalog.providers == []

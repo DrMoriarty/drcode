@@ -19,14 +19,16 @@ fields, "Remove" deletes it. Per agent role (coding /
 tester / compaction) a default model can be picked from the catalog —
 used when the project does not pin its own.
 
-When models.json does not exist yet but the user-level drcode.json already
-describes a model, the screen starts pre-filled with one provider/model
-seeded from that data (`providers.load_seeded_catalog`); the file is only
-written when the user explicitly saves.
+When models.json does not exist yet but a legacy flat config (user-level
+drcode.json) or the project's `custom_models` describe models, the screen
+starts pre-filled with providers seeded from that data
+(`providers.load_seeded_catalog`); the file is only written when the user
+explicitly saves.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import ClassVar
 
 from textual import on
@@ -121,15 +123,23 @@ class ModelCatalogScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, store: UserModelsStore | None = None) -> None:
+    def __init__(
+        self,
+        store: UserModelsStore | None = None,
+        project_root: Path | None = None,
+    ) -> None:
         super().__init__()
         self.store = store or UserModelsStore()
-        # Load the catalog, pre-filling it from the user-level drcode.json
-        # when the catalog file does not exist yet (one-time migration aid;
-        # in-memory only until the user presses Save).
+        self.project_root = project_root
+        # Load the catalog, pre-filling it from the legacy user-level flat
+        # config and the project's custom models when the catalog file does
+        # not exist yet (one-time migration aid; in-memory only until the
+        # user presses Save).
         self.catalog: UserModelsConfig
         self.seed_note: str | None
-        self.catalog, self.seed_note = load_seeded_catalog(self.store)
+        self.catalog, self.seed_note = load_seeded_catalog(
+            self.store, project_root=project_root
+        )
         self._current: str | None = None
         self._selected_model: str | None = None
         # Set while removing a model: the table rebuild queues a

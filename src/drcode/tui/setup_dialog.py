@@ -114,9 +114,11 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-dialog"):
             yield Static(
-                "Model connection is not configured. Enter the settings for "
-                "this project — they will be saved to [b].drcode/drcode.json[/b]. "
-                "Fields marked [b]*[/b] are required.",
+                "Model connection is not configured. Enter the settings — "
+                "they will be saved as a [b]custom model for each agent "
+                "role[/b] (coding, tester, compaction) into "
+                "[b].drcode/drcode.json[/b]. Fields marked [b]*[/b] are "
+                "required.",
                 id="sd-note",
             )
             yield Static("Model *", classes="sd-label")

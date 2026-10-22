@@ -9,6 +9,7 @@ no network access happens.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -21,9 +22,14 @@ from textual.widgets._list_item import ListItem
 
 from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
+from drcode.providers import AgentRole
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
-from drcode.tui.command_providers import SettingsPalette
+from drcode.tui.command_providers import (
+    SettingsPalette,
+    role_model_options_provider,
+)
+from drcode.tui.setup_dialog import ModelSetupDialog
 from drcode.tui.sidebar import TaskItem
 
 
@@ -736,3 +742,336 @@ async def test_new_task_input_copy_uses_clipboard_fallback(
         assert app._clipboard == "hello"
         toast = app.query_one("#copy-toast")
         assert not toast.has_class("hidden")
+
+
+# -- per-role model selection (slots, custom models, picker) ---------------------
+
+
+def _picker_names(app: DrCodeApp, role: AgentRole) -> list[str]:
+    """Discovery entries of the role's model picker (fresh instance)."""
+    provider_cls = role_model_options_provider(role)
+    provider = provider_cls(app.screen)
+    commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+    return [name for name, _callback in commands]
+
+
+def _write_user_catalog(
+    role: AgentRole = AgentRole.CODING,
+    model_id: str = "qwen3-coder-30b",
+    with_default: bool = True,
+) -> None:
+    from drcode.providers import (
+        ModelEntry,
+        ModelRef,
+        Provider,
+        UserModelsConfig,
+        UserModelsStore,
+    )
+
+    catalog = UserModelsConfig(
+        providers=[
+            Provider(
+                name="local-swap",
+                base_url="http://localhost:8080/v1",
+                models=[ModelEntry(id=model_id), ModelEntry(id="small")],
+            )
+        ]
+    )
+    if with_default:
+        catalog.defaults[role] = ModelRef(provider="local-swap", model=model_id)
+    UserModelsStore().save(catalog)
+
+
+def _project_json(project_root: Path) -> dict:
+    return json.loads((project_root / ".drcode" / "drcode.json").read_text())
+
+
+async def test_no_setup_dialog_when_user_catalog_has_providers(
+    project_root: Path,
+) -> None:
+    from drcode.tui.app import DrCodeApp
+
+    _write_user_catalog()
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not isinstance(app.screen, ModelSetupDialog)
+
+
+async def test_no_setup_dialog_when_project_has_custom_models(
+    project_root: Path,
+) -> None:
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+    from drcode.tui.app import DrCodeApp
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(model="m", base_url="http://x/v1"),
+    )
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not isinstance(app.screen, ModelSetupDialog)
+
+
+async def test_setup_dialog_condition_skips_dialog_with_env(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from drcode.tui.app import DrCodeApp
+
+    monkeypatch.setenv("DRCODE_MODEL", "env-m")
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not isinstance(app.screen, ModelSetupDialog)
+
+
+async def test_setup_dialog_saves_three_independent_custom_models(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    from drcode.providers import load_project_custom_models
+    from drcode.tui.setup_dialog import ModelSetup
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the dialog, call the callback directly
+        await pilot.pause()
+        app._model_setup_done(
+            ModelSetup(
+                model="first-m",
+                base_url="http://x/v1",
+                api_key="k",
+                max_context_tokens=123456,
+                max_tokens=2048,
+                health_check_url="http://x/health",
+            )
+        )
+        await pilot.pause()
+    data = _project_json(project_root)
+    # Three "custom" slots, three separate copies, no flat model keys.
+    assert data["models"] == {
+        "coding": "custom",
+        "tester": "custom",
+        "compaction": "custom",
+    }
+    customs = load_project_custom_models(project_root)
+    assert len(customs) == 3
+    for entry in customs.values():
+        assert entry.model == "first-m"
+        assert entry.base_url == "http://x/v1"
+        assert entry.max_context_tokens == 123456
+    for key in ("model", "base_url", "api_key", "max_context_tokens", "max_tokens"):
+        assert key not in data
+    # Independence: the entries are distinct objects.
+    values = list(customs.values())
+    assert values[0] is not values[1]
+    # The coding model is live: the header/statusbar show it.
+    assert app.resolved_config(AgentRole.CODING).model == "first-m"
+
+
+async def test_role_picker_marks_default_and_clears_slot(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    from drcode.providers import ModelRef, load_project_model_slots, set_project_model
+
+    _write_user_catalog()
+    ref = ModelRef(provider="local-swap", model="qwen3-coder-30b")
+    set_project_model(project_root, AgentRole.CODING, ref)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        names = _picker_names(app, AgentRole.CODING)
+        assert "local-swap/qwen3-coder-30b (default) (current)" in names
+        assert "local-swap/small" in names
+        assert "(default — user catalog)" in names
+        assert "Custom…" in names
+        # Selecting the "(default — user catalog)" entry removes the
+        # project override; the user default becomes effective again.
+        provider = role_model_options_provider(AgentRole.CODING)(app.screen)
+        commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        callback = next(
+            cb for name, cb in commands if name == "(default — user catalog)"
+        )
+        callback()
+        await pilot.pause()
+        assert load_project_model_slots(project_root) == {}
+        assert app.resolved_config(AgentRole.CODING).model == "qwen3-coder-30b"
+
+
+async def test_role_picker_custom_toggle_roundtrip(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    from drcode.providers import (
+        CustomModelEntry,
+        ModelRef,
+        load_project_custom_models,
+        set_project_custom_model,
+        set_project_model,
+    )
+
+    entry = CustomModelEntry(
+        model="custom-m", base_url="http://custom/v1", api_key="ck"
+    )
+    set_project_custom_model(project_root, AgentRole.TESTER, entry)
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    _write_user_catalog(role=AgentRole.TESTER, model_id="small")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        names = _picker_names(app, AgentRole.TESTER)
+        # The saved custom model is listed although a catalog ref is active.
+        assert "Custom: custom-m" in names
+        # "small" is both the user default for the role and the effective
+        # model (the project slot points at it): both marks.
+        assert "local-swap/small (default) (current)" in names
+        provider = role_model_options_provider(AgentRole.TESTER)(app.screen)
+        commands = dict(
+            provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        # Switch back to the custom model: slot flips to "custom", the
+        # entry is reused without re-entering anything.
+        commands["Custom: custom-m"]()
+        await pilot.pause()
+        assert app.resolved_config(AgentRole.TESTER).model == "custom-m"
+        assert _project_json(project_root)["models"]["tester"] == "custom"
+        # And to the catalog again: the custom entry survives ("parked").
+        provider = role_model_options_provider(AgentRole.TESTER)(app.screen)
+        names = _picker_names(app, AgentRole.TESTER)
+        assert "Custom: custom-m (current)" in names
+        commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        catalog_switch = next(
+            cb for name, cb in commands if name.startswith("local-swap/small")
+        )
+        catalog_switch()
+        await pilot.pause()
+        assert load_project_custom_models(project_root)[AgentRole.TESTER] == entry
+        assert app.resolved_config(AgentRole.TESTER).model == "small"
+
+
+async def test_role_picker_activate_custom_with_broken_entry_warns(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """models[role]="custom" pointing at a broken entry: activation warns
+    and the file is not silently rewritten."""
+    cfg_file = project_root / ".drcode" / "drcode.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        json.dumps({"models": {"tester": "custom"}, "custom_models": {"tester": {}}})
+    )
+    notified: list[str] = []
+    app.notify = lambda message, **kw: notified.append(str(message))  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_activate_role_custom(AgentRole.TESTER)
+        await pilot.pause()
+    assert any("No valid custom model" in n for n in notified)
+    data = json.loads(cfg_file.read_text())
+    assert data["custom_models"] == {"tester": {}}
+
+
+async def test_role_picker_empty_catalog_opens_custom_dialog(
+    app: DrCodeApp,
+) -> None:
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app._open_role_model_picker(AgentRole.COMPACTION)
+        await pilot.pause()
+        assert isinstance(app.screen, ModelSetupDialog)
+
+
+async def test_role_model_label_variants(app: DrCodeApp, project_root: Path) -> None:
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+
+    assert app.role_model_label(AgentRole.CODING) == "not set"
+    _write_user_catalog()
+    assert app.role_model_label(AgentRole.CODING) == "local-swap/qwen3-coder-30b"
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(model="custom-m", base_url="http://c/v1"),
+    )
+    assert app.role_model_label(AgentRole.TESTER) == "custom-m"
+
+
+async def test_settings_menu_has_no_model_settings_entry(
+    app: DrCodeApp,
+) -> None:
+    from drcode.tui.command_providers import (
+        ModelCatalogCommandProvider,
+        SettingsPalette,
+    )
+
+    assert "Model settings:" not in SettingsPalette.ENTRY_ORDER
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        provider = ModelCatalogCommandProvider(app.screen)
+        commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        names = [name for name, _help, _cb in commands]
+        assert names == ["Provider catalog…"]
+
+
+async def test_custom_role_model_dialog_prefills_and_saves(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The per-role "Custom…" dialog: pre-filled from the saved custom
+    model; saving overwrites the entry and keeps the role's slot custom."""
+    from textual.widgets import Input
+
+    from drcode.providers import (
+        CustomModelEntry,
+        load_project_custom_models,
+        set_project_custom_model,
+    )
+    from drcode.tui.setup_dialog import ModelSetup
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.COMPACTION,
+        CustomModelEntry(
+            model="old-m",
+            base_url="http://old/v1",
+            api_key="ok",
+            max_context_tokens=32000,
+        ),
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_custom_role_model(AgentRole.COMPACTION)
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ModelSetupDialog)
+        assert dialog.query_one("#sd-model", Input).value == "old-m"
+        assert dialog.query_one("#sd-url", Input).value == "http://old/v1"
+        assert dialog.query_one("#sd-key", Input).value == "ok"
+        assert dialog.query_one("#sd-ctx", Input).value == "32000"
+        # A fresh role starts with an empty form.
+        app.action_custom_role_model(AgentRole.CODING)
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ModelSetupDialog)
+        assert dialog.query_one("#sd-model", Input).value == ""
+        # Save (the callback is invoked directly — the probe is bypassed).
+        dialog.dismiss(
+            ModelSetup(
+                model="new-m",
+                base_url="http://new/v1",
+                api_key="nk",
+                max_context_tokens=64000,
+                max_tokens=None,
+            )
+        )
+        await pilot.pause()
+    customs = load_project_custom_models(project_root)
+    assert customs[AgentRole.CODING].model == "new-m"
+    assert customs[AgentRole.CODING].max_context_tokens == 64000
+    # Untouched by the coding edit: the compaction entry stays as it was —
+    # custom models of different roles never mix.
+    assert customs[AgentRole.COMPACTION].model == "old-m"
+    assert customs[AgentRole.COMPACTION].max_context_tokens == 32000
+    assert _project_json(project_root)["models"]["coding"] == "custom"

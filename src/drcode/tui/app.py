@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,13 @@ from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..models import Clarification, Task, TaskKind, TaskStatus
 from ..notifications import Notifier
-from ..providers import AgentRole
+from ..providers import (
+    AgentRole,
+    UserModelsStore,
+    migrate_project_config,
+    migrate_user_config,
+    project_has_model_selection,
+)
 from ..providers import resolve as resolve_model_config
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
@@ -39,7 +46,7 @@ from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
-    ModelConfigCommandProvider,
+    ModelCatalogCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
 )
@@ -74,7 +81,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # own service commands (AGENTS.md refresh and friends).
     COMMANDS: ClassVar = {
         get_system_commands_provider,
-        ModelConfigCommandProvider,
+        ModelCatalogCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
     }
@@ -216,9 +223,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     def __init__(self, project_root: Path) -> None:
         super().__init__()
         self.project_root = project_root
+        # One-time migrations BEFORE the config is built: legacy flat model
+        # keys in the user-level / project drcode.json move into the user
+        # catalog and the project's per-role custom models, and are removed
+        # from the json files (both idempotent, never fatal).
+        migrate_user_config()
+        migrate_project_config(project_root)
         # Layered config: env > project (.env / drcode.json) >
-        # ~/.config/drcode/drcode.json > defaults. The user config dir is
-        # scaffolded (with drcode.json.example) on first start inside Config.
+        # ~/.config/drcode/drcode.json > defaults. The json layers carry
+        # only non-provider settings; the model comes from the catalog /
+        # project selections / env (see drcode.providers.resolve).
         self.config = Config(project_root=project_root)
         self.manager = TaskManager(project_root)
         # Project-scoped preferences (<project>/.drcode/settings.json), then
@@ -591,23 +605,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # dialog takes precedence: the pipeline stays idle until the
         # dialog is saved (or skipped with ESC — tasks can still be
         # created and browsed, they just never start).
-        if self.config.is_ready:
+        #
+        # Dialog condition: the env vars suppress it as before; after the
+        # startup migrations it only appears when the user catalog has no
+        # providers AND the project has no active model entry (catalog
+        # reference or valid custom model for at least one role).
+        if not (
+            os.environ.get("DRCODE_MODEL")
+            or os.environ.get("DRCODE_BASE_URL")
+            or UserModelsStore().load().providers
+            or project_has_model_selection(self.project_root)
+        ):
+            self.push_screen(ModelSetupDialog(), self._model_setup_done)
+        elif self.resolved_config(AgentRole.CODING).is_ready:
             self._advance()
             # Model settings exist — offer to create AGENTS.md if the
             # project has none (the setup-dialog path offers it too,
             # right after the settings are saved).
             self._maybe_offer_agents_md()
-        else:
-            self.push_screen(
-                ModelSetupDialog(
-                    model=self.config.model,
-                    base_url=self.config.base_url,
-                    api_key=self.config.api_key,
-                    max_context_tokens=self.config.max_context_tokens,
-                    max_tokens=self.config.max_tokens,
-                ),
-                self._model_setup_done,
-            )
 
     @property
     def chat_input(self) -> ChatInput:

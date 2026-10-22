@@ -21,6 +21,7 @@ from ..agent import (
     is_pending_retry,
     last_context_tokens,
 )
+from ..providers import AgentRole
 from .blocks import (
     AssistantBlock,
     ReasoningBlock,
@@ -343,9 +344,10 @@ class ChatViewLayer(DrCodeState):
         round-trip, consecutive probe failures, network retry counters
         and the exact cumulative token usage of every model call of the
         session."""
-        if not self.config.is_ready:
+        coding = self.resolved_config(AgentRole.CODING)
+        if not coding.is_ready:
             return "model not configured"
-        url = self.config.base_url
+        url = coding.base_url
         probe = (
             f"probe {self._last_probe_ms} ms"
             if self._last_probe_ms is not None
@@ -958,7 +960,9 @@ class ChatViewLayer(DrCodeState):
         state = "running" if self.agent_running else "idle"
         tester = "running" if self.tester_running else "idle"
         who = f"#{active.id} {active.title_display}" if active else "none"
-        model = self.config.model or "(model not configured)"
+        model = self.resolved_config(AgentRole.CODING).model or (
+            "(model not configured)"
+        )
         self.query_one("#statusbar", Static).update(
             f" active: {who}   queue: {queue_len}   testing: {testing_len}   "
             f"agent: {state}   tester: {tester}   model: {model} "

@@ -1,7 +1,8 @@
 """User-level model catalog and per-role model resolution.
 
-While `config.Config` stays a flat, env-driven description of ONE model
-connection (shared by every agent), this module adds two more layers:
+While `config.Config` remains the flat, env-driven container of ONE model
+connection (the json layers no longer provide its model fields — see
+`drcode.config._PROVIDER_FIELDS`), this module adds two more layers:
 
 1. A user-level catalog of OpenAI-compatible providers
    (`~/.config/drcode/models.json`, XDG_CONFIG_HOME-aware), each with its
@@ -9,16 +10,20 @@ connection (shared by every agent), this module adds two more layers:
    (auto-discovered via `agent_model.fetch_models` or entered by hand).
    The file is written exclusively by the `drcode-models` utility (or the
    catalog screen mounted inside the main TUI) — never by hand. When the
-   file does not exist yet but the user-level drcode.json already
-   describes a model, the catalog screen pre-fills itself with one
-   provider/model built from that data (`load_seeded_catalog`) — in
-   memory only, until the user saves.
+   file does not exist yet but the user-level drcode.json (legacy flat
+   config) or the project's `custom_models` already describe models, the
+   catalog screen pre-fills itself from that data (`load_seeded_catalog`)
+   — in memory only, until the user saves.
 2. A project-level selection of the model per agent role (coding / tester /
    compaction) stored under the optional `models` key of
-   `<project>/.drcode/drcode.json`, values of the form
-   `"<provider-name>/<model-id>"` (neither provider names nor model ids
-   may contain `/`). A `null` / absent slot means "use the user-level
-   default, else the flat config".
+   `<project>/.drcode/drcode.json`: either a catalog reference of the form
+   `"<provider-name>/<model-id>"` (neither provider names nor model ids may
+   contain `/`) or the string `"custom"` — use the per-role free-form model
+   stored under the sibling `custom_models[role]` key (all six connection
+   fields: model/base_url/api_key/health_check_url/max_context_tokens/
+   max_tokens). A `null` / absent slot means "use the user-level default".
+   A `"custom"` slot without a valid `custom_models[role]` entry is treated
+   as "nothing selected" (the same as `null`).
 
 Resolution precedence for a role (`resolve`):
 
@@ -27,9 +32,14 @@ Resolution precedence for a role (`resolve`):
    contract and the simple single-model scenario stay intact; note that
    project `.env` files flow through the ordinary Config layering and do
    NOT trigger this branch).
-2. the project `models[role]` slot;
+2. the project `models[role]` slot (catalog reference or `"custom"`);
 3. `UserModelsConfig.defaults[role]`;
-4. the flat config as-is (backward compatibility).
+4. nothing — the role resolves to "model not set" (an empty `model` in the
+   returned config): the header shows "not configured" and the pipeline
+   stays idle. The flat config's model fields are deliberately NOT a
+   fallback anymore; on startup `migrate_user_config` /
+   `migrate_project_config` move any legacy flat keys into the catalog /
+   project custom models and remove them from the json files.
 
 The resolver returns a `config.model_copy(update={...})` so
 `agent_model.build_model(config)` keeps working unchanged — and so the
@@ -57,6 +67,7 @@ from pydantic import BaseModel, ValidationError, field_serializer, field_validat
 from . import config as _config
 from .config import (
     _LEGACY_PROJECT_CONFIG_FILENAME,
+    PROJECT_CONFIG_FILENAME,
     PROJECT_STATE_DIRNAME,
     Config,
 )
@@ -67,6 +78,19 @@ from .gitignore import ensure_drcode_gitignored
 # import time) so tests can redirect the whole user config dir by
 # monkeypatching `config._USER_CONFIG_DIR`.
 USER_MODELS_FILENAME = "models.json"
+
+# Legacy flat model keys of a drcode.json: after the migrations (see
+# `migrate_user_config` / `migrate_project_config`) these are no longer
+# read as settings from any json layer — the model comes from the user
+# catalog, the project slots/custom models or the DRCODE_* env instead.
+_FLAT_MODEL_KEYS: tuple[str, ...] = (
+    "model",
+    "base_url",
+    "api_key",
+    "health_check_url",
+    "max_context_tokens",
+    "max_tokens",
+)
 
 
 def user_models_file() -> Path:
@@ -147,6 +171,33 @@ class ModelRef(BaseModel):
         return f"{self.provider}/{self.model}"
 
 
+class CustomModelEntry(BaseModel):
+    """A project-level free-form ("custom") model of one agent role.
+
+    The full connection description lives in the project's drcode.json
+    under `custom_models[role]`; the role's `models[role]` slot holds the
+    string "custom" to activate it. Unlike catalog entries, custom models
+    are per-role: the tester's and the coding agent's custom models never
+    mix. `compaction_threshold` is deliberately absent — a non-provider
+    setting, it stays with the ordinary Config layering.
+    """
+
+    model: str
+    base_url: str
+    api_key: str = ""
+    health_check_url: str = ""
+    max_context_tokens: int = 200_000
+    # None = keep whatever the flat config / env provides.
+    max_tokens: int | None = None
+
+    @field_validator("model", "base_url")
+    @classmethod
+    def _required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+
 class UserModelsConfig(BaseModel):
     """The whole user-level catalog as persisted in models.json."""
 
@@ -218,38 +269,75 @@ def _parse_ref(value: object) -> ModelRef | None:
     return None
 
 
-def load_project_model_refs(project_root: Path) -> dict[AgentRole, ModelRef]:
-    """The per-role model selection of the project (absent slots omitted)."""
+def load_project_model_slots(
+    project_root: Path,
+) -> dict[AgentRole, ModelRef | str]:
+    """The per-role model selection of the project (absent slots omitted).
+
+    A slot is either a `ModelRef` (a catalog reference "provider/model")
+    or the string "custom" (use `custom_models[role]`). Anything else
+    (null, unparsable) is omitted — the same as "nothing selected".
+    """
     models = _read_json(_project_config_path(project_root)).get("models")
     if not isinstance(models, dict):
         return {}
-    out: dict[AgentRole, ModelRef] = {}
+    out: dict[AgentRole, ModelRef | str] = {}
     for role in AgentRole:
-        ref = _parse_ref(models.get(role.value))
+        raw = models.get(role.value)
+        if raw == "custom":
+            out[role] = "custom"
+            continue
+        ref = _parse_ref(raw)
         if ref is not None:
             out[role] = ref
     return out
 
 
-def set_project_model(
-    project_root: Path, role: AgentRole, ref: ModelRef | None
-) -> Path:
-    """Persist one role's model selection into `.drcode/drcode.json`.
+def load_project_model_refs(project_root: Path) -> dict[AgentRole, ModelRef]:
+    """The per-role catalog references of the project (absent slots and
+    "custom" slots omitted)."""
+    return {
+        role: slot
+        for role, slot in load_project_model_slots(project_root).items()
+        if isinstance(slot, ModelRef)
+    }
 
-    Only the role's own slot is touched; every other key (including the
-    other two role slots) is preserved. `ref=None` clears the slot (null =
-    user-level default / flat config). Returns the written path.
+
+def load_project_custom_models(
+    project_root: Path,
+) -> dict[AgentRole, CustomModelEntry]:
+    """The per-role custom models of the project (`custom_models` key).
+
+    Broken entries (missing model/base_url, wrong types) are silently
+    skipped here — they read as "nothing selected"; the UI surfaces a
+    warning when the user tries to select such a role.
     """
-    path = _project_config_path(project_root)
-    data = _read_json(path)
-    models_raw = data.get("models")
-    models = dict(models_raw) if isinstance(models_raw, dict) else {}
-    models[role.value] = None if ref is None else f"{ref.provider}/{ref.model}"
-    if any(v is not None for v in models.values()):
-        data["models"] = models
-    else:
-        # Every slot is null: drop the key entirely (absence == null).
-        data.pop("models", None)
+    customs = _read_json(_project_config_path(project_root)).get("custom_models")
+    if not isinstance(customs, dict):
+        return {}
+    out: dict[AgentRole, CustomModelEntry] = {}
+    for role in AgentRole:
+        try:
+            out[role] = CustomModelEntry.model_validate(customs.get(role.value))
+        except ValidationError:
+            continue
+    return out
+
+
+def project_has_model_selection(project_root: Path) -> bool:
+    """Whether the project has at least one ACTIVE model entry: a catalog
+    reference in `models[role]` or a VALID `custom_models[role]`. Drives
+    the first-start setup dialog condition."""
+    slots = load_project_model_slots(project_root)
+    customs = load_project_custom_models(project_root)
+    return bool(customs) or any(isinstance(s, ModelRef) for s in slots.values())
+
+
+def _write_project_json(project_root: Path, data: dict[str, object]) -> Path:
+    """Atomically persist `data` as the project's drcode.json (the legacy
+    root-level file is left alone — migrated data always lands in
+    `.drcode/`)."""
+    path = project_root / PROJECT_STATE_DIRNAME / PROJECT_CONFIG_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
@@ -264,6 +352,60 @@ def set_project_model(
     # (no-op outside a git repository).
     ensure_drcode_gitignored(project_root)
     return path
+
+
+def _apply_project_slot(data: dict[str, object], role: AgentRole, raw: object) -> None:
+    """Write one `models[role]` slot into a raw json dict, keeping the
+    "no non-null slots → drop the key" invariant."""
+    models_raw = data.get("models")
+    models = dict(models_raw) if isinstance(models_raw, dict) else {}
+    models[role.value] = raw
+    if any(v is not None for v in models.values()):
+        data["models"] = models
+    else:
+        # Every slot is null: drop the key entirely (absence == null).
+        data.pop("models", None)
+
+
+def set_project_model(
+    project_root: Path, role: AgentRole, ref: ModelRef | None
+) -> Path:
+    """Persist one role's model selection into `.drcode/drcode.json`.
+
+    Only the role's own slot is touched; every other key (including the
+    other two role slots and the custom_models entries) is preserved.
+    `ref=None` clears the slot (null = user-level default); a saved
+    custom model of the role survives — it can be re-activated from the
+    picker. Returns the written path.
+    """
+    path = _project_config_path(project_root)
+    data = _read_json(path)
+    _apply_project_slot(
+        data, role, None if ref is None else f"{ref.provider}/{ref.model}"
+    )
+    return _write_project_json(project_root, data)
+
+
+def set_project_custom_active(project_root: Path, role: AgentRole) -> Path:
+    """Activate the role's saved custom model (`models[role] = "custom"`),
+    without touching the stored `custom_models[role]` entry."""
+    data = _read_json(_project_config_path(project_root))
+    _apply_project_slot(data, role, "custom")
+    return _write_project_json(project_root, data)
+
+
+def set_project_custom_model(
+    project_root: Path, role: AgentRole, entry: CustomModelEntry
+) -> Path:
+    """Store (or overwrite) the role's custom model AND activate it
+    (`models[role] = "custom"`) in one atomic write."""
+    data = _read_json(_project_config_path(project_root))
+    _apply_project_slot(data, role, "custom")
+    customs_raw = data.get("custom_models")
+    customs = dict(customs_raw) if isinstance(customs_raw, dict) else {}
+    customs[role.value] = json.loads(entry.model_dump_json())
+    data["custom_models"] = customs
+    return _write_project_json(project_root, data)
 
 
 # -- user-level catalog store -------------------------------------------------
@@ -345,7 +487,7 @@ class UserModelsStore:
         return self.path
 
 
-# -- one-time seeding from the user-level flat config -------------------------
+# -- one-time seeding from legacy flat configs --------------------------------
 
 
 def _provider_name_for(base_url: str) -> str:
@@ -358,35 +500,16 @@ def _provider_name_for(base_url: str) -> str:
     return host or "provider"
 
 
-def load_seeded_catalog(
-    store: UserModelsStore,
-) -> tuple[UserModelsConfig, str | None]:
-    """Load the catalog, pre-filling it from the user-level drcode.json.
-
-    Migration convenience for `drcode-models` (and the main TUI's catalog
-    screen): when the catalog file does not exist yet but the user-level
-    drcode.json already describes the model in use, an in-memory catalog
-    with a single provider and its single model is built from that data
-    (the provider name is derived from the base URL host; the flat config
-    defaults fill in whatever the file omits).
-
-    Nothing is persisted here — models.json appears only when the user
-    explicitly saves the catalog screen; quitting without saving discards
-    the seed and the flat config keeps working as before.
-
-    Returns the catalog plus an optional human-readable note for the UI
-    (set when the seed actually happened).
-    """
-    catalog = store.load()
-    if store.path.exists():
-        # A catalog already exists — it is the source of truth, never reseed.
-        return catalog, None
-    data = _read_json(_config.USER_CONFIG_FILE)
+def _provider_from_flat(
+    data: dict[str, object], *, carry_compaction: bool = True
+) -> Provider | None:
+    """Build one provider/model from a legacy flat-config dict (the model
+    keys of an old drcode.json), or None when it describes no model."""
     model = str(data.get("model") or "").strip()
     if not model or "/" in model:
-        # Nothing (usable) described in the flat config — or a model id
-        # with "/", which the reference format forbids. Empty catalog.
-        return catalog, None
+        # Nothing (usable) described — or a model id with "/", which the
+        # reference format forbids.
+        return None
     base_url = str(data.get("base_url") or "").strip() or str(
         Config.model_fields["base_url"].default
     )
@@ -399,13 +522,17 @@ def load_seeded_catalog(
     # The compaction limit is only carried over when the user set it
     # explicitly; otherwise the entry stays `None` (= inherit), so the
     # flat config / project setting keeps applying until the user pins a
-    # per-model value in the catalog UI.
+    # per-model value in the catalog UI. The startup migrations pass
+    # carry_compaction=False: the setting stays in the json files there,
+    # so baking it into the catalog entry would freeze it.
     compaction_threshold = data.get("compaction_threshold")
-    if not isinstance(compaction_threshold, int) or not (
-        1 <= compaction_threshold <= 100
+    if (
+        not carry_compaction
+        or not isinstance(compaction_threshold, int)
+        or not (1 <= compaction_threshold <= 100)
     ):
         compaction_threshold = None
-    provider = Provider(
+    return Provider(
         name=_provider_name_for(base_url),
         base_url=base_url,
         api_key=str(data.get("api_key") or ""),
@@ -419,10 +546,86 @@ def load_seeded_catalog(
             )
         ],
     )
-    catalog.providers.append(provider)
+
+
+def _providers_from_custom_models(project_root: Path) -> list[Provider]:
+    """Build catalog providers from the project's `custom_models` entries
+    (used to seed an empty catalog): one provider per distinct connection
+    (base_url/api_key/health_check_url), named after the base URL host;
+    same-connection models are merged into one provider. Role defaults
+    are NOT derived — the seeding only lists what exists."""
+    out: list[Provider] = []
+    for entry in load_project_custom_models(project_root).values():
+        for provider in out:
+            if (
+                provider.base_url == entry.base_url
+                and provider.api_key == entry.api_key
+                and provider.health_check_url == entry.health_check_url
+            ):
+                if not any(m.id == entry.model for m in provider.models):
+                    provider.models.append(ModelEntry(id=entry.model))
+                break
+        else:
+            name = _provider_name_for(entry.base_url)
+            base = name
+            n = 2
+            while any(p.name == name for p in out):
+                name = f"{base}-{n}"
+                n += 1
+            out.append(
+                Provider(
+                    name=name,
+                    base_url=entry.base_url,
+                    api_key=entry.api_key,
+                    health_check_url=entry.health_check_url,
+                    models=[ModelEntry(id=entry.model)],
+                )
+            )
+    return out
+
+
+def load_seeded_catalog(
+    store: UserModelsStore, project_root: Path | None = None
+) -> tuple[UserModelsConfig, str | None]:
+    """Load the catalog, pre-filling it from legacy flat model data.
+
+    Migration convenience for `drcode-models` (and the main TUI's catalog
+    screen): when the catalog file does not exist yet but the user-level
+    drcode.json and/or the project's `custom_models` already describe
+    models, an in-memory catalog with the corresponding providers is built
+    from that data (the provider name is derived from the base URL host).
+
+    Nothing is persisted here — models.json appears only when the user
+    explicitly saves the catalog screen; quitting without saving discards
+    the seed. Role defaults are never derived from the seed (the startup
+    migration `migrate_user_config` sets them when it creates the file).
+
+    Returns the catalog plus an optional human-readable note for the UI
+    (set when the seed actually happened).
+    """
+    catalog = store.load()
+    if store.path.exists():
+        # A catalog already exists — it is the source of truth, never reseed.
+        return catalog, None
+    seeded: list[Provider] = []
+    notes: list[str] = []
+    data = _read_json(_config.USER_CONFIG_FILE)
+    flat = _provider_from_flat(data)
+    if flat is not None:
+        seeded.append(flat)
+        notes.append(
+            f"provider “{flat.name}”, model “{flat.models[0].id}” (from drcode.json)"
+        )
+    if project_root is not None:
+        for provider in _providers_from_custom_models(project_root):
+            seeded.append(provider)
+            notes.append(f"provider “{provider.name}” (from project custom models)")
+    if not seeded:
+        return catalog, None
+    catalog.providers.extend(seeded)
     note = (
-        f"Pre-filled from drcode.json: provider “{provider.name}”, model "
-        f"“{model}”. Not saved yet — press Save to write {USER_MODELS_FILENAME}."
+        f"Pre-filled: {'; '.join(notes)}. Not saved yet — press Save to "
+        f"write {USER_MODELS_FILENAME}."
     )
     return catalog, note
 
@@ -434,8 +637,10 @@ def resolve(config: Config, role: AgentRole) -> Config:
     """Resolve the effective model connection for one agent role.
 
     See the module docstring for the precedence. Always returns a `Config`
-    (the input unchanged when nothing overrides it), so callers can feed it
-    straight into `agent_model.build_model`.
+    (the input unchanged when only the env layer applies), so callers can
+    feed it straight into `agent_model.build_model`. A role with no
+    selection anywhere resolves to "model not set": an empty `model` in
+    the returned config (`is_ready` is False).
     """
     # 1. Env override: DRCODE_MODEL / DRCODE_BASE_URL win globally for all
     #    roles — they are already baked into `config` by the ordinary
@@ -443,43 +648,182 @@ def resolve(config: Config, role: AgentRole) -> Config:
     if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
         return config
 
+    project_root = config._project_root
     catalog = UserModelsStore().load()
-    # 2. Project-level selection, 3. user-level default: the first slot
-    #    whose provider still exists in the catalog wins (a dangling
-    #    reference — provider renamed/deleted — falls through instead of
-    #    breaking the run).
-    candidates = [
-        load_project_model_refs(config._project_root).get(role),
-        catalog.defaults.get(role),
-    ]
-    provider: Provider | None = None
-    ref: ModelRef | None = None
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        provider = next(
-            (p for p in catalog.providers if p.name == candidate.provider), None
-        )
-        if provider is not None:
-            ref = candidate
-            break
-    if provider is None or ref is None:
-        # 4. Flat config as-is.
-        return config
 
-    update: dict[str, object] = {
-        "model": ref.model,
-        "base_url": provider.base_url,
-        "api_key": provider.api_key,
-        "health_check_url": provider.health_check_url,
-    }
-    entry = next((m for m in provider.models if m.id == ref.model), None)
-    if entry is not None:
-        update["max_context_tokens"] = entry.max_context_tokens
-        if entry.max_tokens is not None:
-            update["max_tokens"] = entry.max_tokens
-        # The compaction limit rides with the model: an entry-level value
-        # overrides the flat config, None keeps it (project/user setting).
-        if entry.compaction_threshold is not None:
-            update["compaction_threshold"] = entry.compaction_threshold
-    return config.model_copy(update=update)
+    def apply_provider(ref: ModelRef, provider: Provider) -> Config:
+        update: dict[str, object] = {
+            "model": ref.model,
+            "base_url": provider.base_url,
+            "api_key": provider.api_key,
+            "health_check_url": provider.health_check_url,
+        }
+        entry = next((m for m in provider.models if m.id == ref.model), None)
+        if entry is not None:
+            update["max_context_tokens"] = entry.max_context_tokens
+            if entry.max_tokens is not None:
+                update["max_tokens"] = entry.max_tokens
+            # The compaction limit rides with the model: an entry-level
+            # value overrides the flat config, None keeps it (project/user
+            # setting).
+            if entry.compaction_threshold is not None:
+                update["compaction_threshold"] = entry.compaction_threshold
+        return config.model_copy(update=update)
+
+    # 2. Project-level selection: a catalog reference (the provider must
+    #    still exist — a dangling reference falls through) or the role's
+    #    custom model.
+    slot = load_project_model_slots(project_root).get(role)
+    if isinstance(slot, ModelRef):
+        provider = next((p for p in catalog.providers if p.name == slot.provider), None)
+        if provider is not None:
+            return apply_provider(slot, provider)
+    elif slot == "custom":
+        custom = load_project_custom_models(project_root).get(role)
+        if custom is not None:
+            update: dict[str, object] = {
+                "model": custom.model,
+                "base_url": custom.base_url,
+                "api_key": custom.api_key,
+                "health_check_url": custom.health_check_url,
+                "max_context_tokens": custom.max_context_tokens,
+            }
+            if custom.max_tokens is not None:
+                update["max_tokens"] = custom.max_tokens
+            return config.model_copy(update=update)
+
+    # 3. User-level default.
+    ref = catalog.defaults.get(role)
+    if ref is not None:
+        provider = next((p for p in catalog.providers if p.name == ref.provider), None)
+        if provider is not None:
+            return apply_provider(ref, provider)
+
+    # 4. Nothing selected for this role: "model not set".
+    return config.model_copy(update={"model": ""})
+
+
+# -- one-time migrations of legacy flat configs --------------------------------
+
+
+def migrate_user_config() -> bool:
+    """Move the user-level flat model config into the catalog.
+
+    When `~/.config/drcode/drcode.json` still carries the legacy flat
+    model keys and `models.json` does not exist yet, a catalog with one
+    provider/model built from the flat data is written, with ALL three
+    role defaults pointed at it (otherwise the roles would end up without
+    a model after the flat fallback was removed). The flat model keys are
+    then stripped from the user drcode.json (non-provider settings like
+    compaction_threshold/request_limit stay).
+
+    Idempotent (a second run is a no-op); every write failure is swallowed
+    — the worst case is that the legacy keys stay and are simply ignored
+    by the new resolution scheme.
+    """
+    data = _read_json(_config.USER_CONFIG_FILE)
+    if "model" not in data:
+        return False
+    store = UserModelsStore()
+    if not store.path.exists():
+        flat = _provider_from_flat(data, carry_compaction=False)
+        if flat is not None:
+            catalog = UserModelsConfig(providers=[flat])
+            ref = ModelRef(provider=flat.name, model=flat.models[0].id)
+            catalog.defaults = dict.fromkeys(AgentRole, ref)
+            try:
+                store.save(catalog)
+            except OSError:
+                # Could not write the catalog: keep the flat keys so
+                # nothing the user configured is lost.
+                return False
+    _strip_flat_model_keys(_config.USER_CONFIG_FILE, data)
+    return True
+
+
+def migrate_project_config(project_root: Path) -> bool:
+    """Move the project's legacy flat model config into per-role custom
+    models.
+
+    When the project's drcode.json (or the legacy root-level one) carries
+    the flat model keys, they are converted into `custom_models[role]` for
+    all three roles with `models[role] = "custom"` — three independent
+    copies. A slot that already holds a catalog reference stays active;
+    the converted flat config is parked in `custom_models[role]` without
+    activation. The flat keys are then removed from the json file
+    (non-provider settings survive). The legacy root-level `drcode.json`
+    is migrated into `.drcode/drcode.json` and deleted, as before.
+
+    Idempotent; write failures are swallowed (never fatal at startup).
+    """
+    current = project_root / PROJECT_STATE_DIRNAME / PROJECT_CONFIG_FILENAME
+    legacy = project_root / _LEGACY_PROJECT_CONFIG_FILENAME
+    if current.is_file():
+        path, legacy_only = current, False
+    elif legacy.is_file():
+        path, legacy_only = legacy, True
+    else:
+        return False
+    data = _read_json(path)
+    has_flat = "model" in data or "base_url" in data
+    if has_flat:
+        flat = _provider_from_flat(data)
+        if flat is not None:
+            entry = CustomModelEntry(
+                model=flat.models[0].id,
+                base_url=flat.base_url,
+                api_key=flat.api_key,
+                health_check_url=flat.health_check_url,
+                max_context_tokens=flat.models[0].max_context_tokens,
+                max_tokens=flat.models[0].max_tokens,
+            )
+            customs_raw = data.get("custom_models")
+            customs = dict(customs_raw) if isinstance(customs_raw, dict) else {}
+            models_raw = data.get("models")
+            for role in AgentRole:
+                customs[role.value] = json.loads(entry.model_dump_json())
+                # A catalog reference already in the slot stays active;
+                # only an unpinned slot activates the migrated custom
+                # model.
+                existing = (
+                    models_raw.get(role.value) if isinstance(models_raw, dict) else None
+                )
+                if _parse_ref(existing) is None:
+                    _apply_project_slot(data, role, "custom")
+            data["custom_models"] = customs
+        _strip_flat_model_keys(path, data)
+    if legacy_only:
+        # The legacy root-level file moves into `.drcode/` wholesale (the
+        # same transfer the old save path performed), so the root copy
+        # can't shadow anything.
+        try:
+            _write_project_json(project_root, data)
+            legacy.unlink()
+        except OSError:
+            pass
+    return has_flat or legacy_only
+
+
+def _strip_flat_model_keys(path: Path, data: dict[str, object]) -> None:
+    """Remove the legacy flat model keys from a drcode.json (best-effort;
+    all other keys are preserved)."""
+    changed = False
+    for key in _FLAT_MODEL_KEYS:
+        if key in data:
+            del data[key]
+            changed = True
+    if not changed:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except OSError:
+        pass  # never fatal: the flat keys are simply ignored by resolve

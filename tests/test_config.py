@@ -126,29 +126,32 @@ def test_current_config_beats_legacy(project_root: Path) -> None:
     assert cfg.compaction_threshold == 22
 
 
-def test_save_migrates_legacy_config(project_root: Path) -> None:
-    legacy = project_root / "drcode.json"
-    _write_json(legacy, {"model": "old-model", "compaction_threshold": 42})
+def test_json_layers_never_provide_model_fields(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The flat model keys of a drcode.json are ignored as settings (they
+    are consumed by the startup migrations instead): only env/dotenv and
+    the catalog/project selections provide the model."""
+    _write_json(
+        _project_config(project_root),
+        {
+            "model": "flat-m",
+            "base_url": "http://flat/v1",
+            "api_key": "flat-key",
+            "compaction_threshold": 42,
+        },
+    )
+    _write_json(
+        user_config_dir / "drcode.json",
+        {"model": "user-m", "max_context_tokens": 123},
+    )
     cfg = Config(project_root=project_root)
-    cfg.model = "new-model"
-    cfg.base_url = "https://example.com/v1"
-    saved = cfg.save_to_project()
-    assert saved == _project_config(project_root)
-    assert saved.is_file()
-    data = json.loads(saved.read_text())
-    # Connection fields updated, unrelated keys preserved.
-    assert data["model"] == "new-model"
-    assert data["compaction_threshold"] == 42
-    # The stale legacy copy is gone after migration.
-    assert not legacy.exists()
-
-
-def test_save_creates_drcode_dir(project_root: Path) -> None:
-    cfg = Config(project_root=project_root)
-    cfg.model = "m"
-    cfg.base_url = "https://example.com/v1"
-    assert cfg.save_to_project().is_file()
-    assert (project_root / ".drcode" / "drcode.json").is_file()
+    assert cfg.model == ""
+    assert cfg.api_key == ""
+    assert cfg.base_url == "https://api.openai.com/v1"  # built-in default
+    assert cfg.max_context_tokens == 200_000  # not taken from user json
+    # Non-provider settings still flow through the json layers.
+    assert cfg.compaction_threshold == 42
 
 
 # -- _parsable_or_none ---------------------------------------------------------------
@@ -175,15 +178,18 @@ def test_parsable_or_none(tmp_path: Path) -> None:
 
 
 def test_ensure_user_config_dir_creates_example(user_config_dir: Path) -> None:
+    from drcode.config import _PROVIDER_FIELDS
+
     ensure_user_config_dir()
     example_file = config_module.USER_CONFIG_EXAMPLE_FILE
     assert example_file.is_file()
     data = json.loads(example_file.read_text())
-    # Every configurable field is present.
-    assert set(data) == set(Config.model_fields)
-    # Fields without a sensible default get fake placeholders.
-    assert data["api_key"] == "sk-your-api-key-here"
-    assert data["model"] == "gpt-4o"
+    # Every non-provider configurable field is present.
+    assert set(data) == set(Config.model_fields) - _PROVIDER_FIELDS
+    # The model/provider fields are deliberately absent: models live in
+    # the user catalog / project selections / env.
+    for name in _PROVIDER_FIELDS:
+        assert name not in data
 
 
 def test_ensure_user_config_dir_idempotent(user_config_dir: Path) -> None:
@@ -198,23 +204,17 @@ def test_ensure_user_config_dir_idempotent(user_config_dir: Path) -> None:
 def test_ensure_user_config_dir_defaults_in_example(user_config_dir: Path) -> None:
     ensure_user_config_dir()
     data = json.loads(config_module.USER_CONFIG_EXAMPLE_FILE.read_text())
-    assert data["base_url"] == "https://api.openai.com/v1"
     assert data["compaction_threshold"] == 80
+    assert data["request_limit"] == 500
 
 
 def test_example_values_use_placeholders() -> None:
     # Fields listed in _EXAMPLE_PLACEHOLDERS get the fake value in the
-    # generated example; everything else gets its built-in default.
+    # generated example; everything else gets its built-in default. The
+    # placeholders currently hold no entries: the provider/model fields are
+    # excluded from the example entirely, the rest have sensible defaults.
     fields = Config.model_fields
-    assert (
-        config_module._example_value("api_key", fields["api_key"])
-        == "sk-your-api-key-here"
-    )
-    assert config_module._example_value("model", fields["model"]) == "gpt-4o"
-    assert (
-        config_module._example_value("base_url", fields["base_url"])
-        == "https://api.openai.com/v1"
-    )
+    assert config_module._EXAMPLE_PLACEHOLDERS == {}
     assert (
         config_module._example_value(
             "compaction_threshold", fields["compaction_threshold"]

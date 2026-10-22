@@ -72,7 +72,12 @@ installed package.
 
 ## Configuration
 
-Point it to any OpenAI-compatible API via env vars (or a `.env` file in the project root):
+Model selection is two-level:
+
+- **User level** (`~/.config/drcode/`) — the provider/model catalog `models.json`, edited via Settings → **Provider catalog…** (or the standalone `drcode-models` utility): OpenAI-compatible endpoints with their API keys, auto-discovered or hand-entered models (with context sizes and optional per-model compaction limits) and per-role defaults. The catalog is shared by every project.
+- **Project level** (`.drcode/drcode.json`) — a model per agent role (coding / tester / compaction), chosen in Settings ("Coding model: …" etc.) either from the catalog or as a **custom model** (a free-form connection stored under `custom_models[role]`, one independent entry per role). Switching a role to a catalog model parks its custom model — the picker offers it back as "Custom: <model-id>" without re-entering anything.
+
+A plain env override still wins over both levels (or a `.env` file in the project root):
 
 ```bash
 DRCODE_MODEL=gpt-4o
@@ -83,9 +88,11 @@ DRCODE_MAX_TOKENS=8192                      # per-response output cap
 DRCODE_COMPACTION_THRESHOLD=80              # % fill at which history is compacted
 ```
 
-If nothing anywhere provides a model and base URL, the TUI opens a **first-start setup dialog**: model and endpoint are required, the API key and context size are optional; Save probes the endpoint live (the verified availability endpoint is cached for cheaper later checks) and the values are persisted into `<project>/.drcode/drcode.json`. ESC skips it — the app stays usable without a model (tasks can be created and browsed, nothing runs).
+Non-provider settings (`DRCODE_COMPACTION_THRESHOLD`, `DRCODE_REQUEST_LIMIT`) may also live in `~/.config/drcode/drcode.json` or `<project>/.drcode/drcode.json` (env > project json > user json > defaults).
 
-Without `DRCODE_MODEL` / `DRCODE_API_KEY` every message fails with "Model is not configured". If the project root contains an **AGENTS.md**, its content is appended to the agent's instructions — and if it doesn't, the app offers on startup to create one with a pre-filled research task (the same one the Settings palette's "Update/create AGENTS.md" entry runs).
+If nothing anywhere provides a model (no env vars, an empty catalog and no project selection), the TUI opens a **first-start setup dialog**: model and endpoint are required, the API key and context size are optional; Save probes the endpoint live (the verified availability endpoint is cached for cheaper later checks) and stores the model as a custom model for each of the three agent roles into `<project>/.drcode/drcode.json`. ESC skips it — the app stays usable without a model (tasks can be created and browsed, nothing runs). Projects/configs from older versions with flat model keys in their drcode.json files are migrated automatically on startup (user flat config → catalog with all role defaults; project flat config → three per-role custom models), and the flat keys are then ignored.
+
+Without a configured model every message fails with "Model is not configured". If the project root contains an **AGENTS.md**, its content is appended to the agent's instructions — and if it doesn't, the app offers on startup to create one with a pre-filled research task (the same one the Settings palette's "Update/create AGENTS.md" entry runs).
 
 ## Task pipeline
 

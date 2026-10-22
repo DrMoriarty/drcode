@@ -9,9 +9,12 @@ Sources, from highest to lowest priority (a higher layer wins):
 4. built-in defaults.
 
 On first start `ensure_user_config_dir()` creates the user config directory
-and seeds it with a `drcode.json.example` listing every user-configurable
-parameter with its default (or a fake placeholder when there is no sensible
-default, e.g. the API key).
+and seeds it with a `drcode.json.example` listing the user-configurable
+non-provider parameters (compaction_threshold, request_limit, …) with their
+defaults. The per-model connection settings deliberately live elsewhere: in
+the user-level model catalog (`~/.config/drcode/models.json`, see
+`drcode.providers`), in the project's per-role selections
+(`.drcode/drcode.json`) or in `DRCODE_*` environment variables.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from pydantic import PrivateAttr
 from pydantic.fields import FieldInfo
@@ -28,8 +32,7 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
-
-from .gitignore import ensure_drcode_gitignored
+from pydantic_settings.sources import ConfigFileSourceType
 
 # env_file в pydantic-settings резолвится относительно cwd, а TUI может быть
 # запущен из любой директории — якоримся на корень репозитория через __file__.
@@ -64,17 +67,36 @@ _LEGACY_PROJECT_CONFIG_FILENAME = "drcode.json"
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # NOTE for maintainers: whenever you add/change a user-configurable field of
-# `Config` below, ALSO add it to `_EXAMPLE_PLACEHOLDERS` (for fields without a
-# sensible default) — the generated `drcode.json.example` is built from the
-# model fields, so new fields appear there automatically, but fake placeholder
-# values for defaultless fields (secrets, model ids) must be listed by hand.
+# `Config` below, ALSO check the example-file generation in
+# `ensure_user_config_dir` (fields without a sensible default need a fake
+# placeholder in `_EXAMPLE_PLACEHOLDERS`) — the generated
+# `drcode.json.example` is built from the model fields.
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # Fake/placeholder values for example-file fields that have no meaningful
 # default; fields not listed here get their built-in default in the example.
-_EXAMPLE_PLACEHOLDERS: dict[str, str] = {
-    "model": "gpt-4o",
-    "api_key": "sk-your-api-key-here",
-}
+# The model/provider fields are not part of the user-level example at all
+# (see `_PROVIDER_FIELDS`): models live in the user catalog
+# (~/.config/drcode/models.json) or in the project's per-role selections.
+_EXAMPLE_PLACEHOLDERS: dict[str, str] = {}
+
+# The per-model connection fields of `Config`. They stay on the model (the
+# env/dotenv layers still populate them — DRCODE_MODEL etc. — and
+# `drcode.providers.resolve` writes its result into a copy of Config), but
+# they are deliberately NOT read from any json layer: the model selection
+# lives in the user-level catalog and the project's `models` /
+# `custom_models` keys. Legacy flat keys inside a drcode.json are consumed
+# by the startup migrations (`drcode.providers.migrate_user_config` /
+# `migrate_project_config`) instead.
+_PROVIDER_FIELDS: frozenset[str] = frozenset(
+    {
+        "model",
+        "base_url",
+        "api_key",
+        "health_check_url",
+        "max_context_tokens",
+        "max_tokens",
+    }
+)
 
 
 class Config(BaseSettings):
@@ -141,67 +163,6 @@ class Config(BaseSettings):
     def project_config_file(self) -> Path:
         return self._project_root / PROJECT_STATE_DIRNAME / PROJECT_CONFIG_FILENAME
 
-    def save_to_project(self) -> Path:
-        """Persist the model connection settings into `.drcode/drcode.json`.
-
-        Used by the first-start setup dialog: the entered model/base_url/
-        api_key/max_context_tokens must survive restarts in the project
-        itself. Existing keys in the file are preserved (only the four
-        connection fields are updated), so unrelated project settings
-        (e.g. compaction_threshold) are not lost. A config left by an
-        older version in the project root is merged in and removed — the
-        `.drcode/drcode.json` file becomes the single source of truth.
-        """
-        data: dict[str, object] = {}
-        legacy = self._project_root / _LEGACY_PROJECT_CONFIG_FILENAME
-        try:
-            loaded = json.loads(self.project_config_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except FileNotFoundError:
-            # Fresh project: pick up a legacy root-level config, if any,
-            # so nothing the user configured there is lost.
-            try:
-                loaded = json.loads(legacy.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except (
-                FileNotFoundError,
-                OSError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-            ):
-                pass
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            # Corrupted file: start fresh rather than crash the dialog —
-            # the values being saved are the source of truth anyway.
-            data = {}
-        data.update(
-            {
-                "model": self.model,
-                "base_url": self.base_url,
-                "api_key": self.api_key,
-                "health_check_url": self.health_check_url,
-                "max_context_tokens": self.max_context_tokens,
-                "max_tokens": self.max_tokens,
-            }
-        )
-        self.project_config_file.parent.mkdir(parents=True, exist_ok=True)
-        self.project_config_file.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
-        # The config now lives in `.drcode/`; drop the stale legacy copy
-        # so it can't shadow or confuse (it is no longer read once the
-        # new file exists).
-        if legacy.is_file():
-            try:
-                legacy.unlink()
-            except OSError:
-                pass
-        # `.drcode/` also holds task storage — make sure git ignores it.
-        ensure_drcode_gitignored(self._project_root)
-        return self.project_config_file
-
     @classmethod
     def settings_customise_sources(
         cls,
@@ -214,14 +175,17 @@ class Config(BaseSettings):
         # Earlier sources win. Project files override the user-level file;
         # env/dotenv override both; defaults come last. A corrupted json
         # file must not keep the app from starting — it's skipped instead.
+        # The json sources deliberately never provide the model/provider
+        # fields (see `_PROVIDER_FIELDS`): the model selection lives in the
+        # user catalog / project slots / env, not in drcode.json.
         return (
             init_settings,
             env_settings,
             dotenv_settings,
-            JsonConfigSettingsSource(
+            _NonProviderJsonSource(
                 settings_cls, json_file=_parsable_or_none(_project_json_file())
             ),
-            JsonConfigSettingsSource(
+            _NonProviderJsonSource(
                 settings_cls, json_file=_parsable_or_none(USER_CONFIG_FILE)
             ),
             file_secret_settings,
@@ -233,6 +197,22 @@ class Config(BaseSettings):
         required here: local/OpenAI-compatible gateways often work without
         one — the setup dialog asks for it as optional."""
         return bool(self.model and self.base_url)
+
+
+class _NonProviderJsonSource(JsonConfigSettingsSource):
+    """Json settings source that never provides the model/provider fields.
+
+    The per-model connection keys of a legacy drcode.json are ignored as
+    settings (they are consumed by the startup migrations in
+    `drcode.providers` instead); only the non-provider fields
+    (compaction_threshold, request_limit, …) flow through.
+    """
+
+    def _read_files(
+        self, files: ConfigFileSourceType | None, deep_merge: bool = False
+    ) -> dict[str, Any]:
+        data = super()._read_files(files, deep_merge=deep_merge)
+        return {k: v for k, v in data.items() if k not in _PROVIDER_FIELDS}
 
 
 def _parsable_or_none(path: Path) -> Path | None:
@@ -286,7 +266,11 @@ def ensure_user_config_dir() -> None:
     an unwritable home just means no user-level config file."""
 
     example = {
-        name: _example_value(name, field) for name, field in Config.model_fields.items()
+        name: _example_value(name, field)
+        for name, field in Config.model_fields.items()
+        # The provider/model fields are not user-level json settings:
+        # models live in the catalog / project selections / env.
+        if name not in _PROVIDER_FIELDS
     }
     payload = json.dumps(example, indent=2, ensure_ascii=False) + "\n"
     try:

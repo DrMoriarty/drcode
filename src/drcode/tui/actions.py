@@ -29,9 +29,13 @@ from ..models import (
 from ..prompts import load_init_repo_prompt
 from ..providers import (
     AgentRole,
+    CustomModelEntry,
     ModelRef,
     UserModelsStore,
-    load_project_model_refs,
+    load_project_custom_models,
+    load_project_model_slots,
+    set_project_custom_active,
+    set_project_custom_model,
     set_project_model,
 )
 from ..settings import (
@@ -58,16 +62,32 @@ from .state import DrCodeState
 
 
 class ActionsLayer(DrCodeState):
+    @staticmethod
+    def _custom_entry_from_setup(setup: ModelSetup) -> CustomModelEntry:
+        """The dialog result as a per-role custom model entry (a None cap
+        from the dialog means "keep the default"/"no cap")."""
+        return CustomModelEntry(
+            model=setup.model,
+            base_url=setup.base_url,
+            api_key=setup.api_key,
+            health_check_url=setup.health_check_url,
+            max_context_tokens=setup.max_context_tokens or 200_000,
+            max_tokens=setup.max_tokens,
+        )
+
     def _model_setup_done(self, setup: ModelSetup | None) -> None:
         """Result of the first-start setup dialog.
 
         None — the user skipped it (ESC): keep running without a model.
-        ModelSetup — the connection was probed successfully: apply the
-        values to the live config, persist them into
-        <project>/drcode.json and start the pipeline.
+        ModelSetup — the connection was probed successfully: it is saved
+        as a CUSTOM model for EACH of the three agent roles (three
+        independent copies in .drcode/drcode.json — each editable
+        separately later) and applied to the live config.
         """
         if setup is None:
             return
+        # Apply to the flat config as well: it is the live container the
+        # env layer writes into (the project slots resolve on top of it).
         self.config.model = setup.model
         # The flat connection changed: per-role resolutions are stale.
         self.invalidate_resolved_configs()
@@ -78,8 +98,10 @@ class ActionsLayer(DrCodeState):
             self.config.max_context_tokens = setup.max_context_tokens
         if setup.max_tokens is not None:
             self.config.max_tokens = setup.max_tokens
+        entry = self._custom_entry_from_setup(setup)
         try:
-            saved = self.config.save_to_project()
+            for role in AgentRole:
+                set_project_custom_model(self.project_root, role, entry)
         except OSError as e:
             self.notify(
                 f"Could not write drcode.json: {e}",
@@ -89,7 +111,7 @@ class ActionsLayer(DrCodeState):
             )
         else:
             self.notify(
-                f"Model saved to {saved.name}",
+                "Custom model saved for all roles (coding, tester, compaction)",
                 title="Model setup",
                 timeout=4,
             )
@@ -110,7 +132,7 @@ class ActionsLayer(DrCodeState):
         already exists, or when such a research task is already in the
         backlog.
         """
-        if not self.config.is_ready:
+        if not self.resolved_config(AgentRole.CODING).is_ready:
             return
         if (self.project_root / "AGENTS.md").exists():
             return
@@ -437,36 +459,20 @@ class ActionsLayer(DrCodeState):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
 
-    def action_open_model_setup(self) -> None:
-        """Re-open the model setup dialog on demand (a Settings entry).
-
-        Pre-filled with the current model/base_url/api_key/context-size, so
-        the user can edit the connection anytime, not just on first start.
-        The result is handled by `_model_setup_done`, which applies the new
-        values to the live config immediately and persists them.
-        """
-        if isinstance(self.screen, CommandPalette):
-            return
-        self.push_screen(
-            ModelSetupDialog(
-                model=self.config.model,
-                base_url=self.config.base_url,
-                api_key=self.config.api_key,
-                max_context_tokens=self.config.max_context_tokens,
-                max_tokens=self.config.max_tokens,
-            ),
-            self._model_setup_done,
-        )
-
     # -- per-role model selection ---------------------------------------------
 
     def action_open_model_catalog(self) -> None:
         """Open the provider/model catalog editor (user-level models.json)
         as a modal screen. Shared with the standalone `drcode-models`
-        utility; on close the per-role resolutions are recomputed."""
+        utility; when no catalog exists yet, the screen pre-fills itself
+        from this project's custom models (saved only on explicit Save).
+        On close the per-role resolutions are recomputed."""
         if isinstance(self.screen, CommandPalette):
             return
-        self.push_screen(ModelCatalogScreen(), self._model_catalog_done)
+        self.push_screen(
+            ModelCatalogScreen(project_root=self.project_root),
+            self._model_catalog_done,
+        )
 
     def _model_catalog_done(self, _result: object) -> None:
         self.invalidate_resolved_configs()
@@ -474,14 +480,18 @@ class ActionsLayer(DrCodeState):
 
     def role_model_label(self, role: AgentRole) -> str:
         """Human-readable effective model of a role, for the Settings
-        palette entries: "provider/model" when selected (project slot or
-        user default), else the flat model id, else "not set"."""
-        ref = load_project_model_refs(self.project_root).get(role)
-        if ref is None:
-            ref = UserModelsStore().load().defaults.get(role)
+        palette entries: the project slot (catalog reference or the role's
+        custom model id), else the user-level default, else "not set"."""
+        slot = load_project_model_slots(self.project_root).get(role)
+        if isinstance(slot, ModelRef):
+            return f"{slot.provider}/{slot.model}"
+        if slot == "custom":
+            custom = load_project_custom_models(self.project_root).get(role)
+            return custom.model if custom is not None else "not set"
+        ref = UserModelsStore().load().defaults.get(role)
         if ref is not None:
             return f"{ref.provider}/{ref.model}"
-        return self.config.model or "not set"
+        return "not set"
 
     def action_change_coding_model(self) -> None:
         self._open_role_model_picker(AgentRole.CODING)
@@ -496,6 +506,13 @@ class ActionsLayer(DrCodeState):
         """Selection palette with the catalog models for a role (grouped by
         provider) plus the "Custom…" free-form entry."""
         if isinstance(self.screen, CommandPalette):
+            return
+        catalog = UserModelsStore().load()
+        if not any(p.models for p in catalog.providers):
+            # No catalog models to choose from: skip the (empty) list and
+            # open the custom-model dialog right away. "Provider catalog…"
+            # stays available from the main Settings menu.
+            self.action_custom_role_model(role)
             return
         self.push_screen(
             SettingsPalette(
@@ -520,26 +537,65 @@ class ActionsLayer(DrCodeState):
             return
         self.invalidate_resolved_configs()
         self.refresh_connection()
-        label = f"{ref.provider}/{ref.model}" if ref else "user default / flat config"
+        label = f"{ref.provider}/{ref.model}" if ref else "user default"
         self.notify(
             f"{role.value} model: {label}",
             title="Model selection",
             timeout=4,
         )
 
+    def action_activate_role_custom(self, role: AgentRole) -> None:
+        """Re-activate the role's saved custom model (picker item
+        "Custom: <model-id>"): only the `models[role]` slot flips back to
+        "custom" — the stored custom model is reused as-is, no re-entry."""
+        customs = load_project_custom_models(self.project_root)
+        if role not in customs:
+            # Broken/missing custom_models[role] (a slot pointing at it is
+            # treated as "nothing selected"): never silently rewritten —
+            # tell the user instead.
+            self.notify(
+                f"No valid custom model saved for the {role.value} role — "
+                "use “Custom…” to configure one.",
+                title="Model selection",
+                severity="warning",
+                timeout=8,
+            )
+            return
+        try:
+            set_project_custom_active(self.project_root, role)
+        except OSError as e:
+            self.notify(
+                f"Could not write drcode.json: {e}",
+                title="Model selection",
+                severity="error",
+                timeout=8,
+            )
+            return
+        self.invalidate_resolved_configs()
+        self.refresh_connection()
+        self.notify(
+            f"{role.value} model: {customs[role].model}",
+            title="Model selection",
+            timeout=4,
+        )
+
     def action_custom_role_model(self, role: AgentRole) -> None:
-        """Free-form model for a role: the ordinary ModelSetupDialog, which
-        writes the flat connection keys; this role's slot is cleared so the
-        flat model is actually what the role resolves to."""
+        """Free-form model for a role: the ModelSetupDialog, pre-filled
+        from the role's saved custom model (if any). The result is stored
+        under `custom_models[role]` and activated (`models[role] =
+        "custom"`) — custom models of different roles never mix."""
         if isinstance(self.screen, CommandPalette):
             return
+        custom = load_project_custom_models(self.project_root).get(role)
         self.push_screen(
             ModelSetupDialog(
-                model=self.config.model,
-                base_url=self.config.base_url,
-                api_key=self.config.api_key,
-                max_context_tokens=self.config.max_context_tokens,
-                max_tokens=self.config.max_tokens,
+                model=custom.model if custom else "",
+                base_url=custom.base_url if custom else "",
+                api_key=custom.api_key if custom else "",
+                max_context_tokens=(custom.max_context_tokens if custom else 200_000),
+                max_tokens=(
+                    custom.max_tokens if custom and custom.max_tokens else 8192
+                ),
             ),
             partial(self._custom_role_model_done, role),
         )
@@ -550,11 +606,26 @@ class ActionsLayer(DrCodeState):
         if setup is None:
             return
         try:
-            set_project_model(self.project_root, role, None)
-        except OSError:
-            pass  # the flat save below still applies the model
+            set_project_custom_model(
+                self.project_root, role, self._custom_entry_from_setup(setup)
+            )
+        except OSError as e:
+            self.notify(
+                f"Could not write drcode.json: {e}",
+                title="Model selection",
+                severity="error",
+                timeout=8,
+            )
+            return
         self.invalidate_resolved_configs()
-        self._model_setup_done(setup)
+        self.refresh_connection()
+        self.refresh_status()
+        self._advance()
+        self.notify(
+            f"{role.value} model: {setup.model}",
+            title="Model selection",
+            timeout=4,
+        )
 
     def action_set_completed_retention(self, retention: CompletedRetention) -> None:
         """Settings command: after how long completed tasks are deleted at

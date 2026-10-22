@@ -30,7 +30,8 @@ from ..providers import (
     AgentRole,
     ModelRef,
     UserModelsStore,
-    load_project_model_refs,
+    load_project_custom_models,
+    load_project_model_slots,
 )
 from ..settings import (
     FINALIZATION_OPTIONS,
@@ -160,7 +161,6 @@ class SettingsPalette(CommandPalette):
         "Screenshot",
         "Theme",
         "Update/create AGENTS.md",
-        "Model settings:",
         "Provider catalog…",
         "Coding model:",
         "Tester model:",
@@ -253,30 +253,17 @@ class ServiceCommandsProvider(Provider):
                 yield Hit(score, matcher.highlight(name), callback, help=help_text)
 
 
-class ModelConfigCommandProvider(Provider):
-    """Model-connection entry in the Settings palette.
+class ModelCatalogCommandProvider(Provider):
+    """Provider-catalog entry in the Settings palette.
 
-    Re-opens the first-start model setup dialog, pre-filled with the
-    current model/base_url/api_key/context-size, so the user can change the
-    connection on demand (not only on first start). Save applies the new
-    values live and persists them (see `_model_setup_done`); Escape dismisses
-    without changing anything. The current status ("configured" /
-    "not configured") is shown after the colon.
+    Always visible (independent of any configuration state): opens the
+    user-level provider/model catalog editor
+    (`~/.config/drcode/models.json`).
     """
 
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
         app = cast("DrCodeApp", self.app)
-        status = "configured" if app.config.is_ready else "not configured"
         return [
-            (
-                f"Model settings: {status}",
-                (
-                    "Change the model id, base URL, API key and context-window "
-                    "size, then apply them immediately (project setting, saved "
-                    "to .drcode/drcode.json)"
-                ),
-                app.action_open_model_setup,
-            ),
             (
                 "Provider catalog…",
                 (
@@ -578,31 +565,44 @@ class StallNudgeOptionsProvider(Provider):
 
 def role_model_options_provider(role: AgentRole) -> type[Provider]:
     """Selection palette listing the catalog models available for one agent
-    role, grouped by provider ("provider/model" entries, the current one
-    marked), plus "(none — user default / flat config)" to clear the
-    project slot and "Custom…" for a free-form model via the ordinary
-    ModelSetupDialog (writes the flat keys and clears the slot)."""
+    role ("provider/model" entries; the user-level default is marked
+    "(default)", the effective one "(current)"), the saved custom model of
+    the role as "Custom: <model-id>" (selecting it re-activates it without
+    re-entering anything), "(default — user catalog)" to drop the project
+    override (only when a user default exists) and "Custom…" to enter a
+    free-form model via ModelSetupDialog."""
 
     class RoleModelOptions(Provider):
         def _commands(self) -> list[tuple[str, Callable[[], object]]]:
             app = cast("DrCodeApp", self.app)
             catalog = UserModelsStore().load()
-            refs = load_project_model_refs(app.project_root)
-            current = refs.get(role) or catalog.defaults.get(role)
+            slots = load_project_model_slots(app.project_root)
+            slot = slots.get(role)
+            current_ref = slot if isinstance(slot, ModelRef) else None
+            current_custom = slot == "custom"
+            user_default = catalog.defaults.get(role)
             commands: list[tuple[str, Callable[[], object]]] = []
             for provider in catalog.providers:
                 for entry in provider.models:
                     ref = ModelRef(provider=provider.name, model=entry.id)
                     label = f"{provider.name}/{entry.id}"
-                    if ref == current:
+                    if ref == user_default:
+                        label += " (default)"
+                    if ref == current_ref:
                         label += " (current)"
                     commands.append(
                         (label, partial(app.action_set_role_model, role, ref))
                     )
-            if current is not None:
+            customs = load_project_custom_models(app.project_root)
+            if role in customs:
+                label = f"Custom: {customs[role].model}"
+                if current_custom:
+                    label += " (current)"
+                commands.append((label, partial(app.action_activate_role_custom, role)))
+            if user_default is not None:
                 commands.append(
                     (
-                        "(none — user default / flat config)",
+                        "(default — user catalog)",
                         partial(app.action_set_role_model, role, None),
                     )
                 )

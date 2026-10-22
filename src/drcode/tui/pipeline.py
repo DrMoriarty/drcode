@@ -565,13 +565,12 @@ class PipelineLayer(DrCodeState):
         run: AgentRun[AgentDeps, str] | None = None
         cancelled = False
         try:
-            if not self.config.is_ready:
+            if not self.resolved_config(AgentRole.CODING).is_ready:
                 self._show_event(
                     task,
                     "Model is not configured. Restart drcode to open the setup "
-                    "dialog, or set model/base_url in .drcode/drcode.json "
-                    "(project) / "
-                    "~/.config/drcode/drcode.json / DRCODE_* env vars; the "
+                    "dialog, or pick a model for the coding role in Settings "
+                    "(or set DRCODE_MODEL / DRCODE_BASE_URL env vars); the "
                     "message is kept and will be sent once the model is "
                     "available.",
                 )
@@ -1177,15 +1176,16 @@ class PipelineLayer(DrCodeState):
         run: AgentRun[TesterDeps, str] | None = None
         cancelled = False
         try:
-            if not self.config.is_ready:
+            if not self.resolved_config(AgentRole.TESTER).is_ready:
                 self._tester_fail_count[task_id] = (
                     self._tester_fail_count.get(task_id, 0) + 1
                 )
                 self._schedule_tester_retry(task_id)
                 self._show_event(
                     task,
-                    "Tester skipped: model is not configured. Set DRCODE_MODEL, "
-                    "DRCODE_BASE_URL and DRCODE_API_KEY (env vars or .env).",
+                    "Tester skipped: model is not configured. Pick a model "
+                    "for the tester role in Settings (or set DRCODE_MODEL / "
+                    "DRCODE_BASE_URL env vars).",
                 )
                 return
             # Idempotent: _advance() sets this before starting the worker so

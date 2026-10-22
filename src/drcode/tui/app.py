@@ -29,7 +29,7 @@ from textual.widgets import (
 
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
-from ..models import Clarification, Task, TaskKind, TaskStatus
+from ..models import Clarification, PendingInput, Task, TaskKind, TaskStatus
 from ..notifications import Notifier
 from ..providers import (
     AgentRole,
@@ -306,6 +306,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Pending messages already drawn in the current chat view, so the
         # agent run doesn't re-render them when it consumes them.
         self._pending_rendered: list[str] = []
+        # Per task: the prompt a run consumed (merged pending input) that is
+        # not persisted into the transcript yet — see _consumed_prompts in
+        # state.py and the consumption in run_agent.
+        self._consumed_prompts: dict[str, tuple[str, list[PendingInput]]] = {}
         # Whether the chat log currently holds at least one block.
         self._chat_has_content = False
         # Auto-hide timer for the "copied" toast.

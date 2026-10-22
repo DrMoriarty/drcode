@@ -17,6 +17,7 @@ from textual.widgets import (
 )
 
 from ..agent import (
+    all_user_prompts,
     extract_display,
     is_pending_retry,
     last_context_tokens,
@@ -743,6 +744,17 @@ class ChatViewLayer(DrCodeState):
                 # above — writing the pending copy again duplicates it.
                 continue
             _add(entry.at, "user-pending", entry.text)
+        # A prompt a running agent has already consumed (popped from
+        # pending_input) but that is not persisted into the transcript yet
+        # (the first node boundary saves it): without this record a
+        # re-render in between shows an empty chat — the brief would
+        # disappear from the screen until the next re-render.
+        in_flight = self._consumed_prompts.get(task_id)
+        if in_flight is not None and in_flight[0] not in all_user_prompts(
+            task.messages
+        ):
+            for entry in in_flight[1]:
+                _add(entry.at, "user-pending", entry.text)
         timeline.sort(key=lambda item: item[:2])
         for at, _, role, text in timeline:
             block = self._write_history_line(

@@ -35,7 +35,7 @@ from textual.widgets import ListView, Static
 from ..agent import AgentDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
-from ..models import Clarification, Task, TaskEvent, TaskKind
+from ..models import Clarification, PendingInput, Task, TaskEvent, TaskKind
 from ..notifications import Notifier
 from ..providers import AgentRole, ModelRef
 from ..settings import (
@@ -399,6 +399,12 @@ class DrCodeState(App[None]):
     new_task_kind: TaskKind
     _agent_generation: int
     _pending_rendered: list[str]
+    # Prompts a run has already consumed (popped from pending_input) but
+    # that are not persisted into the transcript yet: the first node
+    # boundary is what saves them. Until then a view_task() re-render finds
+    # neither copy and would wipe the prompt from the chat — the record
+    # lets _render_task_history draw it anyway. See run_agent's consumption.
+    _consumed_prompts: dict[str, tuple[str, list[PendingInput]]]
     _chat_has_content: bool
 
     # -- copy toast ---------------------------------------------------------

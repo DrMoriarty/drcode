@@ -712,6 +712,13 @@ class PipelineLayer(DrCodeState):
                             f"{workflow_instructions}\n\n{text}"
                         )
                         workflow_instructions = None
+                    # Remember the consumed batch until the transcript picks
+                    # it up (the first node-boundary persist): a view_task()
+                    # re-render in between finds neither copy and wipes the
+                    # prompt from the chat — the record lets
+                    # _render_task_history draw it anyway. Dropped when the
+                    # run ends or the batch is re-queued (below).
+                    self._consumed_prompts[task_id] = (text, list(consumed))
                     if self.viewed_id == task_id:
                         for entry in consumed:
                             if entry.text in self._pending_rendered:
@@ -1100,6 +1107,9 @@ class PipelineLayer(DrCodeState):
                             # never reached the transcript — put them back,
                             # or the nudge/abort would silently eat them.
                             task.pending_input[:0] = consumed
+                            # Back to pending: the pending-input render owns
+                            # the bubbles again, drop the in-flight record.
+                            self._consumed_prompts.pop(task_id, None)
                             if self.viewed_id == task_id:
                                 for entry in consumed:
                                     if entry.text not in self._pending_rendered:
@@ -1144,6 +1154,9 @@ class PipelineLayer(DrCodeState):
                             # queue so the retry re-sends them verbatim (with
                             # their original "typed at" stamps).
                             task.pending_input[:0] = consumed
+                            # Back to pending: the pending-input render owns
+                            # the bubbles again, drop the in-flight record.
+                            self._consumed_prompts.pop(task_id, None)
                             # They were already rendered as user blocks when
                             # they were popped: the retry must not draw them
                             # twice.
@@ -1194,6 +1207,11 @@ class PipelineLayer(DrCodeState):
             if generation == self._agent_generation:
                 self.agent_running = False
                 self.refresh_status()
+                # The run is over: the consumed prompt is either persisted in
+                # the transcript or back in pending_input — the in-flight
+                # record has served its purpose. (Guarded: a superseded run
+                # must not drop a newer run's record.)
+                self._consumed_prompts.pop(task_id, None)
             # A cancelled run (user abort, or a newer run taking over) must
             # not restart the pipeline: the abort stops everything until the
             # user acts, and the newer run advances on its own completion.

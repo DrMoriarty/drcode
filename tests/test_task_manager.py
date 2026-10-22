@@ -378,6 +378,95 @@ def test_hold_non_holdable_status_ignored(manager: TaskManager) -> None:
     assert task.status is TaskStatus.TESTING
 
 
+# -- create on hold / edit condition --------------------------------------------
+
+
+def test_create_on_hold(manager: TaskManager) -> None:
+    task = manager.create("parked", "the prompt", hold=True)
+    assert task.status is TaskStatus.HOLD
+    # The prompt stays queued in pending_input, like a held-after-the-fact
+    # task; it must never be promoted while held.
+    assert [e.text for e in task.pending_input] == ["the prompt"]
+    assert task not in manager.queued()
+    assert manager.promote_next() is None
+
+    manager.set_hold(task.id, on=False)
+    assert task.status is TaskStatus.QUEUED
+
+
+def test_editable_condition_merges_comments(manager: TaskManager) -> None:
+    task = manager.create("t", "original condition")
+    manager.send(task.id, "extra comment 1")
+    manager.send(task.id, "extra comment 2")
+    assert manager.editable_condition(task.id) == (
+        "original condition\n\nextra comment 1\n\nextra comment 2"
+    )
+
+
+def test_edit_task_replaces_condition_and_comments(manager: TaskManager) -> None:
+    task = manager.create("t", "original condition")
+    manager.send(task.id, "extra comment")
+    manager.set_hold(task.id, on=True)
+
+    manager.edit_task(task.id, "rewritten condition\nwith details")
+    assert task.status is TaskStatus.HOLD
+    # The separate comment is gone — its content is expected to be folded
+    # into the new condition by the user.
+    assert [e.text for e in task.pending_input] == ["rewritten condition\nwith details"]
+    # The title is re-derived from the first line, like on creation.
+    assert task.title == "rewritten condition"
+
+    # Back into the queue after the edit.
+    manager.set_hold(task.id, on=False)
+    assert task.status is TaskStatus.QUEUED
+    assert manager.queued() == [task]
+
+
+def test_edit_task_drops_answered_clarification(manager: TaskManager) -> None:
+    from drcode.models import Clarification
+
+    task = manager.create("t", "condition")
+    task.status = TaskStatus.AWAITING_CLARIFICATION
+    task.clarification = Clarification(question="q?")
+    manager.set_hold(task.id, on=True)
+    manager.send(task.id, "partial answer")
+
+    manager.edit_task(task.id, "full rewritten condition")
+    # The old question and its partial answer were folded into the edited
+    # text: the stale question must not resurface on resume.
+    assert task.clarification is None
+    manager.set_hold(task.id, on=False)
+    assert task.status is TaskStatus.QUEUED
+
+
+def test_edit_task_changes_kind_with_repositioning(manager: TaskManager) -> None:
+    old = manager.create("old", "x")
+    task = manager.create("held feature", "condition", hold=True)
+
+    manager.edit_task(task.id, "new condition", kind=TaskKind.BUG)
+    assert task.kind is TaskKind.BUG
+    assert task.queue_head is True
+
+    # Same kind: the edit keeps the task where it is.
+    seq = task.queue_seq
+    manager.edit_task(task.id, "another rewrite")
+    assert task.kind is TaskKind.BUG
+    assert task.queue_seq == seq
+
+    # Feature after bug → the tail of the queue (behind the older task).
+    manager.edit_task(task.id, "third rewrite", kind=TaskKind.FEATURE)
+    assert task.kind is TaskKind.FEATURE
+    manager.set_hold(task.id, on=False)
+    assert manager.queued() == [old, task]
+
+
+def test_edit_task_empty_text_is_noop(manager: TaskManager) -> None:
+    task = manager.create("t", "condition", hold=True)
+    manager.edit_task(task.id, "   ")
+    assert [e.text for e in task.pending_input] == ["condition"]
+    assert task.status is TaskStatus.HOLD
+
+
 def test_resume_not_held_is_noop(manager: TaskManager) -> None:
     task = manager.create("t", "x")
     manager.set_hold(task.id, on=False)

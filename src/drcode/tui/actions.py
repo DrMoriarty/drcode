@@ -170,6 +170,7 @@ class ActionsLayer(DrCodeState):
 
     def action_new_task(self) -> None:
         # Every entry into the new-task screen starts from a clean editor.
+        self._editing_task_id = None
         self.new_task_input.clear()
         self._new_task_mode = True
         # The form is not tied to any task: drop the viewed highlight so the
@@ -183,6 +184,58 @@ class ActionsLayer(DrCodeState):
         self.chat_log.add_class("hidden")
         self.chat_input.add_class("hidden")
         self.query_one("#new-task", Vertical).remove_class("hidden")
+        self._new_task_chrome()
+        self._update_kind_label()
+        self.refresh_task_status()
+        self.new_task_input.focus()
+
+    # -- editing a held task ---------------------------------------------------
+
+    def _new_task_chrome(self) -> None:
+        """Note + hint line of the new-task form, per mode: fresh creation
+        vs editing a held task (the same editor, different wording)."""
+        note = self.query_one("#nt-note", Static)
+        hint = self.query_one("#nt-hint", Static)
+        if self._editing_task_id is not None:
+            note.update(
+                "Editing a held task — its original text and queued comments "
+                "are merged below; save it back on hold or into the queue."
+            )
+            hint.update(
+                "tab — switch type   ctrl+enter — save & queue   "
+                "ctrl+h — save on hold   esc — cancel"
+            )
+        else:
+            note.update(
+                "This is not a live chat with the agent — "
+                "you are composing a task to be executed later."
+            )
+            hint.update(
+                "tab — switch type   ctrl+enter — create   "
+                "ctrl+h — create on hold   esc — cancel"
+            )
+
+    def action_edit_task(self) -> None:
+        """Edit the condition of the viewed held task: the original text and
+        every additional comment still queued in pending_input are merged
+        into the new-task editor. On save the merged text replaces them (the
+        separate comments are gone), the type can be changed like on
+        creation, and the task either stays on hold or re-enters the queue."""
+        task = self.viewed
+        if task is None or task.status is not TaskStatus.HOLD:
+            return
+        self._editing_task_id = task.id
+        self.new_task_input.load_text(self.manager.editable_condition(task.id))
+        self.new_task_kind = task.kind
+        self._new_task_mode = True
+        self._new_task_prev_id = self.viewed_id
+        self.viewed_id = None
+        self.refresh_sidebar()
+        self._clear_stream_label()
+        self.chat_log.add_class("hidden")
+        self.chat_input.add_class("hidden")
+        self.query_one("#new-task", Vertical).remove_class("hidden")
+        self._new_task_chrome()
         self._update_kind_label()
         self.refresh_task_status()
         self.new_task_input.focus()
@@ -198,6 +251,7 @@ class ActionsLayer(DrCodeState):
         self.refresh_task_status()
 
     def cancel_new_task(self) -> None:
+        self._editing_task_id = None
         self._leave_new_task_mode()
         # The chat log still shows the task that was open before the form:
         # restore its view so the status bar matches the visible content
@@ -261,16 +315,63 @@ class ActionsLayer(DrCodeState):
         self.query_one("#nt-kinds", Static).update("\n".join(lines))
 
     def submit_new_task(self) -> None:
+        """Ctrl+Enter in the form: create a task (or save the edited held
+        one) and put it into the queue."""
+        self._submit_new_form(hold=False)
+
+    def action_submit_new_task_hold(self) -> None:
+        """Ctrl+H in the form: create the task directly on hold — or, while
+        editing a held task, save it back on hold (still out of the
+        pipeline). Same behaviour as save_task_edit_hold; the two actions
+        exist so the footer can label the key per mode."""
+        self._submit_new_form(hold=True)
+
+    def action_save_task_edit_hold(self) -> None:
+        """Ctrl+H while editing a held task: save it back on hold."""
+        self._submit_new_form(hold=True)
+
+    def _submit_new_form(self, *, hold: bool) -> None:
+        if self._editing_task_id is not None:
+            self._finish_task_edit(queue=not hold)
+            return
         text = self.new_task_input.text.strip()
         if not text:
             return
-        task = self.manager.create("", text, kind=self.new_task_kind)
+        task = self.manager.create("", text, kind=self.new_task_kind, hold=hold)
         self._leave_new_task_mode()
         self.refresh_sidebar()
         self.view_task(task.id)
         self.chat_input.focus()
-        # Starts immediately unless testing is pending or the queue is busy.
+        # Starts immediately unless testing is pending, the queue is busy —
+        # or the task was created on hold.
         self._advance()
+
+    def _finish_task_edit(self, *, queue: bool) -> None:
+        """Save the edited held task: the merged text replaces the old
+        condition and comments; `queue` decides between re-entering the
+        pipeline and staying parked on hold."""
+        task_id = self._editing_task_id
+        task = self.manager.tasks.get(task_id) if task_id else None
+        if task is None:
+            # The task vanished while the form was open (deleted elsewhere):
+            # just close the editor.
+            self._editing_task_id = None
+            self.cancel_new_task()
+            return
+        text = self.new_task_input.text.strip()
+        if not text:
+            return
+        self.manager.edit_task(task.id, text, kind=self.new_task_kind)
+        self._editing_task_id = None
+        self._leave_new_task_mode()
+        if queue:
+            # Back to where the task was parked from (its clarification, if
+            # any, was dropped by edit_task — so this lands in the queue).
+            self.manager.set_hold(task.id, on=False)
+            self._advance()
+        self.refresh_sidebar()
+        self.view_task(task.id)
+        self.chat_input.focus()
 
     def action_done_task(self) -> None:
         task = self.viewed

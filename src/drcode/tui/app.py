@@ -208,10 +208,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+t", "cycle_task_kind", "Change type"),
         ("ctrl+up", "move_task_up", "Move up"),
         ("ctrl+down", "move_task_down", "Move down"),
+        ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+s", "settings", "Settings"),
-        # Two bindings on one key: the footer (and the key dispatch) picks
-        # the first one whose check_action allows it — so exactly one of
-        # Hold/Resume is shown, depending on the viewed task's status.
+        # Three bindings on ctrl+h plus two on the held-task keys: the
+        # footer (and the key dispatch) picks the first one whose
+        # check_action allows it — so exactly one of Create on hold /
+        # Save on hold / Hold / Resume is shown, depending on whether the
+        # new-task form is open (fresh vs editing) and the viewed task's
+        # status. The TextArea does not bind ctrl+h, so the key reaches the
+        # app while the form editor is focused.
+        ("ctrl+h", "submit_new_task_hold", "Create on hold"),
+        ("ctrl+h", "save_task_edit_hold", "Save on hold"),
         ("ctrl+h", "hold_task", "Hold"),
         ("ctrl+h", "resume_task", "Resume"),
         ("ctrl+delete", "delete_task", "Delete held"),
@@ -350,6 +357,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # cancel (ESC) restores its view (action_new_task() clears
         # viewed_id, but the chat log keeps showing the previous task).
         self._new_task_prev_id: str | None = None
+        # While the form edits an existing held task (instead of composing a
+        # new one): the id of that task, None otherwise. submit/hold keys
+        # branch on it (create vs merge-and-save).
+        self._editing_task_id: str | None = None
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
@@ -470,7 +481,8 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     yield NewTaskInput(placeholder="Describe the task…", id="nt-input")
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
-                        "tab — switch type   ctrl+enter — create   esc — cancel",
+                        "tab — switch type   ctrl+enter — create   "
+                        "ctrl+h — create on hold   esc — cancel",
                         id="nt-hint",
                     )
                     yield Static("", id="nt-kinds")
@@ -678,6 +690,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             if not 0 <= j < len(order):
                 return False
             return (order[j].kind is TaskKind.BUG) == (task.kind is TaskKind.BUG)
+        if action == "edit_task":
+            # Only a held task can be edited: the editor merges its text and
+            # comments; nothing is running for a parked task.
+            return task is not None and task.status is TaskStatus.HOLD
+        if action == "submit_new_task_hold":
+            return self._new_task_mode and self._editing_task_id is None
+        if action == "save_task_edit_hold":
+            return self._new_task_mode and self._editing_task_id is not None
         if action == "hold_task":
             return task is not None and task.status in (
                 TaskStatus.QUEUED,

@@ -321,6 +321,115 @@ async def test_action_new_task_reopens_form(app: DrCodeApp) -> None:
         assert app._new_task_mode
 
 
+# -- create on hold / edit held task ----------------------------------------------
+
+
+async def test_create_task_on_hold_through_ui(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.text = "parked work\nwith details"
+        await pilot.press("ctrl+h")
+        await pilot.pause()
+
+        tasks = app.manager.all_tasks()
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task.status is TaskStatus.HOLD
+        assert [e.text for e in task.pending_input] == ["parked work\nwith details"]
+        assert not app._new_task_mode
+        # The created task is opened in the chat pane.
+        assert app.viewed_id == task.id
+
+
+async def test_edit_held_task_merges_and_queues(app: DrCodeApp) -> None:
+    task = app.manager.create("held", "original condition")
+    app.manager.send(task.id, "extra comment")
+    app.manager.set_hold(task.id, on=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        # on_mount opened the only task (the held one).
+        assert app.viewed_id == task.id
+        app.action_edit_task()
+        await pilot.pause()
+        assert app._new_task_mode
+        assert app._editing_task_id == task.id
+        # The condition and the comment are merged into the editor.
+        assert app.new_task_input.text == "original condition\n\nextra comment"
+        assert app.new_task_kind is task.kind
+
+        # The user rewrites everything and switches the type, then queues.
+        app.new_task_input.text = "rewritten condition"
+        await pilot.press("tab")  # feature → bug
+        assert app.new_task_kind is TaskKind.BUG
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+
+        assert not app._new_task_mode
+        # Out of hold and into the pipeline (with no model configured the
+        # promotion leaves it active with the prompt kept).
+        assert task.status is not TaskStatus.HOLD
+        assert task.kind is TaskKind.BUG
+        # The separate comment is gone — folded into the merged condition.
+        assert [e.text for e in task.pending_input] == ["rewritten condition"]
+        assert task.title == "rewritten condition"
+
+
+async def test_edit_held_task_save_back_on_hold(app: DrCodeApp) -> None:
+    task = app.manager.create("held", "condition")
+    app.manager.set_hold(task.id, on=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_edit_task()
+        await pilot.pause()
+        app.new_task_input.text = "edited condition"
+        await pilot.press("ctrl+h")
+        await pilot.pause()
+
+        assert not app._new_task_mode
+        assert task.status is TaskStatus.HOLD
+        assert [e.text for e in task.pending_input] == ["edited condition"]
+        # The task stays out of the pipeline.
+        assert app.manager.promote_next() is None
+
+
+async def test_edit_form_cancel_keeps_task_untouched(app: DrCodeApp) -> None:
+    task = app.manager.create("held", "condition")
+    app.manager.set_hold(task.id, on=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_edit_task()
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert not app._new_task_mode
+        assert app._editing_task_id is None
+        assert task.status is TaskStatus.HOLD
+        assert [e.text for e in task.pending_input] == ["condition"]
+
+
+async def test_edit_binding_only_for_held_tasks(app: DrCodeApp) -> None:
+    queued = app.manager.create("queued", "prompt")
+    held = app.manager.create("held", "prompt", hold=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.view_task(queued.id)
+        await pilot.pause()
+        assert app.check_action("edit_task", ()) is False
+        app.view_task(held.id)
+        await pilot.pause()
+        assert app.check_action("edit_task", ()) is True
+        binding = app.screen.active_bindings["ctrl+e"]
+        assert binding.binding is not None
+        assert binding.binding.action in ("edit_task", "app.edit_task")
+
+
 # -- sidebar / status rendering -------------------------------------------------------
 
 

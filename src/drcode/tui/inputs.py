@@ -33,6 +33,11 @@ class WordNavTextArea(TextArea):
         # hide both, new-task mode hides both).
         Binding("ctrl+x", "app.cancel_task", "Cancel task"),
         Binding("ctrl+d", "app.done_task", "Done"),
+        # Same story: the stock TextArea binding (cursor_line_end) would
+        # shadow the app-level "Edit held" action while this input is
+        # focused — and a TextArea stops unhandled keys entirely, so the
+        # app-level binding alone would never fire.
+        Binding("ctrl+e", "app.edit_task", "Edit held"),
         Binding("alt+left,alt+b", "cursor_word_left", "Cursor word left", show=False),
         Binding(
             "alt+right,alt+f", "cursor_word_right", "Cursor word right", show=False
@@ -95,11 +100,19 @@ class WordNavTextArea(TextArea):
 
 
 class NewTaskInput(WordNavTextArea):
-    """Multi-line editor for a new task; Tab toggles the task type."""
+    """Multi-line editor for a new task; Tab toggles the task type.
+
+    Ctrl+H creates the task directly on hold (or, while editing a held
+    task, saves it back on hold). The binding lives on the widget because
+    a focused TextArea stops unhandled key events before they reach the
+    app; which of the two same-key bindings fires is gated by the app's
+    check_action on the editing mode (the footer then shows exactly one)."""
 
     BINDINGS: ClassVar = [
         Binding("tab", "toggle_kind", "Toggle type", priority=True),
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
+        Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
+        Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 

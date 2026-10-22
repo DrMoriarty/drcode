@@ -119,7 +119,12 @@ class TaskManager:
     # -- mutations ------------------------------------------------------------
 
     def create(
-        self, title: str, first_message: str, kind: TaskKind = TaskKind.FEATURE
+        self,
+        title: str,
+        first_message: str,
+        kind: TaskKind = TaskKind.FEATURE,
+        *,
+        hold: bool = False,
     ) -> Task:
         first_line = (
             first_message.splitlines()[0][:60] if first_message.splitlines() else ""
@@ -131,7 +136,54 @@ class TaskManager:
         )
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
+        if hold:
+            # Parked right away: the prompt stays in pending_input (the same
+            # state a queued-then-held task is in) and the pipeline never
+            # picks the task up until it is resumed. The status is assigned
+            # directly — no observers yet, and a "created → held" toast
+            # would only be noise.
+            task.status = TaskStatus.HOLD
         self.tasks[task.id] = task
+        self.storage.save(task)
+        return task
+
+    def editable_condition(self, task_id: str) -> str:
+        """The task's editable condition: every user text still queued in
+        `pending_input` (the original prompt plus each additional comment)
+        merged into one block, separated by blank lines.
+
+        Texts already consumed into the transcript (a started attempt) are
+        not part of it — they cannot be edited without breaking the message
+        history."""
+        task = self.get(task_id)
+        return "\n\n".join(entry.text for entry in task.pending_input).strip()
+
+    def edit_task(self, task_id: str, text: str, kind: TaskKind | None = None) -> Task:
+        """Rewrite the condition of a held task.
+
+        The merged editable text (see editable_condition) is replaced by a
+        single new pending input — the previously separate additional
+        comments are gone, their content now lives in the main text. The
+        title is re-derived from the first line, and the kind can be changed
+        like on creation (bug → head of the queue, feature → tail). An open
+        clarifying question is dropped together with the texts it belonged
+        to: the rewritten condition supersedes it.
+
+        Empty text is a no-op (the caller keeps the form open instead).
+        """
+        task = self.get(task_id)
+        stripped = text.strip()
+        if not stripped:
+            return task
+        task.pending_input.clear()
+        task.pending_input.append(PendingInput(text=stripped))
+        task.clarification = None
+        task.title = stripped.splitlines()[0][:60]
+        # Reuses the queue repositioning rules of set_kind (which does
+        # not check the status: held tasks are not started either).
+        if kind is not None and task.kind is not kind:
+            self.set_kind(task_id, kind)
+        task.touch()
         self.storage.save(task)
         return task
 
@@ -183,10 +235,10 @@ class TaskManager:
         return task
 
     def set_kind(self, task_id: str, kind: TaskKind) -> Task:
-        """Change the kind of a not-yet-started (QUEUED) task and re-position
-        it in the queue: bug → head of the queue, feature → tail. Other kinds
-        (research) keep the current position. The caller is responsible
-        for only calling this on queued tasks."""
+        """Change the kind of a not-yet-started (QUEUED or HOLD) task and
+        re-position it in the queue: bug → head of the queue, feature →
+        tail. Other kinds (research) keep the current position. The caller
+        is responsible for only calling this on queued/held tasks."""
         task = self.get(task_id)
         if task.kind is kind:
             return task

@@ -21,9 +21,22 @@ push problem in your summary. If the project is not a git repository, skip the
 commit entirely.
 4. Call set_verification(success=True) and give a short summary of what you ran
 (and whether a commit was made and pushed).
-5. If anything fails, call set_verification(success=False), then call create_bug_report
-with a clear title and a description containing what failed, the exact command and the
-error output, and give a short summary.
+5. If anything fails, first decide who owns the failure:
+   - The failure is caused by THIS task's own changes (broken behaviour, tests this
+     change should have kept green, regressions of previously working functionality):
+     call set_verification(success=False, retry_here=True, report="<what failed: the
+     exact command and the error output>"). The task returns to development in its
+     own worktree and the coding agent fixes the bug there in the full context of
+     its previous work — do NOT call create_bug_report in this case. The tool result
+     tells you what happened: if the fix-round cap is reached (the task has already
+     failed its maximum number of consecutive development rounds), the task
+     completes as failed and you MUST call create_bug_report after all.
+   - The failure is unrelated to the task's changes or environmental (pre-existing
+     linter debt, CI/network issues, a broken dependency — anything that also fails
+     without this task's changes): call set_verification(success=False,
+     retry_here=False), then call create_bug_report with a clear title and a
+     description containing what failed, the exact command and the error output.
+   Then give a short summary.
 
 Your filesystem tools are read-only and you must not modify any files; run_bash is for
 running checks only. The single exception is git_commit, used only after all checks

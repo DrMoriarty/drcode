@@ -34,10 +34,12 @@ from ..providers import (
     load_project_model_slots,
 )
 from ..settings import (
+    DEV_ROUNDS_OPTIONS,
     FINALIZATION_OPTIONS,
     ISOLATION_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    dev_rounds_label,
 )
 
 if TYPE_CHECKING:
@@ -167,6 +169,7 @@ class SettingsPalette(CommandPalette):
         "Model settings",
         "Auto-delete completed tasks:",
         "Task finalization:",
+        "Max development rounds:",
         "Nudge stalled agent after:",
         "Task isolation:",
         "Workflow:",
@@ -435,6 +438,17 @@ class ProjectSettingsCommandsProvider(Provider):
                 app.action_change_task_finalization,
             ),
             (
+                f"Max development rounds: {app.settings.max_dev_rounds}",
+                (
+                    "How many consecutive failed development rounds a task "
+                    "gets when the tester attributes the failure to the "
+                    "task's own changes, before the failure completes the "
+                    "task as failed and a bug report is created instead "
+                    "(project setting)"
+                ),
+                app.action_change_max_dev_rounds,
+            ),
+            (
                 f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
                 (
                     "Abort and restart an agent/tester run that has shown no "
@@ -559,6 +573,35 @@ class FinalizationOptionsProvider(Provider):
         for name, callback in self._commands():
             if (match := matcher.match(name)) > 0:
                 yield Hit(match, matcher.highlight(name), callback)
+
+
+class DevRoundsOptionsProvider(Provider):
+    """Options of the "Max development rounds" setting (the fix-loop cap).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option to
+    apply it immediately, Escape keeps the current one. The active option is
+    marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.max_dev_rounds
+        return [
+            (
+                dev_rounds_label(rounds) + (" (current)" if rounds == current else ""),
+                partial(app.action_set_max_dev_rounds, rounds),
+            )
+            for rounds in DEV_ROUNDS_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        for name, callback in self._commands():
+            if (match := self.matcher(query).match(name)) > 0:
+                yield Hit(match, self.matcher(query).highlight(name), callback)
 
 
 class IsolationOptionsProvider(Provider):

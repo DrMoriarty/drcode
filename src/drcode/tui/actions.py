@@ -47,6 +47,7 @@ from ..settings import (
 from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
+    DevRoundsOptionsProvider,
     FinalizationOptionsProvider,
     IsolationOptionsProvider,
     ModelCatalogCommandProvider,
@@ -823,6 +824,36 @@ class ActionsLayer(DrCodeState):
             SettingsPalette(
                 id="--finalization-palette",
                 providers=[FinalizationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_max_dev_rounds(self, rounds: int) -> None:
+        """Settings command: how many consecutive failed development rounds
+        (tester failures attributed to the task's own changes) a task gets
+        before the failure completes it as failed and the tester creates a
+        bug report instead. Persisted per project (.drcode/settings.json);
+        applies from the next testing round on."""
+        self.settings.max_dev_rounds = max(1, rounds)
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Max development rounds: {self.settings.max_dev_rounds}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_max_dev_rounds(self) -> None:
+        """Max-development-rounds picker, opened from the Settings entry
+        ("Max development rounds: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the options; picking one applies it,
+        Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--dev-rounds-palette",
+                providers=[DevRoundsOptionsProvider],
                 placeholder="Search for options…",
             )
         )

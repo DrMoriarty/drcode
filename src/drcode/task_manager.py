@@ -11,6 +11,7 @@ from pathlib import Path
 from .models import (
     PendingInput,
     Task,
+    TaskEvent,
     TaskKind,
     TaskStatus,
     VerificationStatus,
@@ -307,6 +308,9 @@ class TaskManager:
             # review ping-pong loop.
             task.review_pending = False
             task.review_rejections = 0
+            # Human intervention breaks the fix loop too: the consecutive
+            # failed development rounds restart.
+            task.fix_rounds = 0
             task.touch()
             self._save_changed(task, old, "user")
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
@@ -594,6 +598,10 @@ class TaskManager:
         task.verification = (
             VerificationStatus.PASSED if success else VerificationStatus.FAILED
         )
+        if success:
+            # A passed testing round ends the fix loop: the consecutive
+            # failed-development-rounds counter starts over.
+            task.fix_rounds = 0
         if success and review_gate:
             # Passed, but the final completion waits for the external
             # review: the TESTING status keeps the pipeline blocked (no new
@@ -622,9 +630,73 @@ class TaskManager:
         task.completed_at = _now()
         task.unfinished = False
         task.review_rejections = 0
+        task.fix_rounds = 0
         remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, origin)
+        return task
+
+    def requeue_failed_fix(self, task_id: str, report: str, *, max_rounds: int) -> Task:
+        """The tester failed the task but attributed the failure to the
+        task's OWN changes (the ``retry_here=True`` verdict of its
+        `set_verification` tool): instead of completing the task with a bug
+        report, send it back to development — the tester's failure report
+        becomes the task's next input and the coding agent fixes the bug in
+        the same transcript and the same (worktree) environment where the
+        work happened. With per-task worktree isolation `ensure_root`
+        reuses the existing worktree untouched, so the fix round sees the
+        full context of its previous work (a foreign bug report, in
+        contrast, branches from clean HEAD).
+
+        Mirrors requeue_review_rejection. The consecutive fix-round count
+        grows (`task.fix_rounds`); once `max_rounds` development rounds have
+        failed in a row (project setting `max_dev_rounds`), the failure
+        completes the task as FAILED instead of re-queueing it — the bug
+        survived its dedicated fix rounds, so the tester's bug report
+        legitimately branches from clean HEAD. A no-op when the task is no
+        longer TESTING (the user re-queued or cancelled it while the verdict
+        was in flight)."""
+        task = self.get(task_id)
+        if task.status is not TaskStatus.TESTING:
+            return task
+        rounds_limit = max(1, max_rounds)
+        if task.fix_rounds + 1 >= rounds_limit:
+            # Cap reached: an ordinary FAILED completion — the tester
+            # creates the bug report separately.
+            completed = self.set_verification(task_id, False)
+            completed.events.append(
+                TaskEvent(
+                    kind="testing",
+                    text=(
+                        f"testing failed {task.fix_rounds + 1} development "
+                        f"rounds in a row — the fix-round cap "
+                        f"({rounds_limit}) is reached; the task completed "
+                        "as FAILED."
+                    ),
+                )
+            )
+            completed.touch()
+            self.storage.save(completed)
+            return completed
+        stripped = report.strip()
+        if stripped:
+            task.pending_input.append(PendingInput(text=stripped))
+        old = task.status
+        task.status = TaskStatus.QUEUED
+        task.verification = None
+        task.completed_at = None
+        task.fix_rounds += 1
+        task.events.append(
+            TaskEvent(
+                kind="testing",
+                text=(
+                    "testing failed — returned for another development "
+                    f"round (round {task.fix_rounds + 1}/{rounds_limit})"
+                ),
+            )
+        )
+        task.touch()
+        self._save_changed(task, old, "system")
         return task
 
     def requeue_review_rejection(self, task_id: str, comment: str) -> Task:

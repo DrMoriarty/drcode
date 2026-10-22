@@ -157,6 +157,15 @@ class Task(BaseModel):
     # cancelling) — after MAX_REVIEW_REJECTIONS consecutive rejects the
     # pipeline parks the task on hold instead of looping forever.
     review_rejections: int = 0
+    # How many development rounds in a row the tester has failed with a
+    # verdict "the bug is caused by THIS task's own changes" (the
+    # retry_here=True path of set_verification): the task returns to
+    # development in its own worktree instead of completing with a bug
+    # report. Reset by a PASSED verdict or by the user taking a
+    # COMPLETED/TESTING task back (send) — after `max_dev_rounds`
+    # consecutive failed rounds (project setting) the tester's failure
+    # completes the task as FAILED and the bug report is created as usual.
+    fix_rounds: int = 0
     # True while a COMPLETED task awaits an ASYNCHRONOUS external review
     # verdict (workflow with on_development_done but no on_review: the task
     # completes with an open PR and the verdict arrives via the periodic

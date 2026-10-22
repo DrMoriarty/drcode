@@ -87,8 +87,8 @@ class ModelCatalogScreen(ModalScreen[None]):
         text-style: bold;
     }
     #mc-main { height: auto; }
-    #mc-left { width: 34; margin-right: 2; height: 22; }
-    #mc-providers { height: 1fr; margin-top: 1; }
+    #mc-left { width: 34; margin-right: 2; height: auto; }
+    #mc-providers { height: 6; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }
     #mc-name, #mc-url, #mc-key { height: 3; }
     .mc-btnrow {
@@ -111,16 +111,16 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
     #mc-roles { height: auto; margin-top: 1; }
-    #mc-roles Select { width: 1fr; margin-right: 1; }
+    #mc-roles Select { width: 1fr; height: 3; }
     #mc-footer {
         height: auto;
         margin-top: 1;
+        align-horizontal: right;
     }
     #mc-hint {
         width: 1fr;
-        padding: 1 0 0 1;
+        padding: 1 2 0 2;
         color: $text-disabled;
-        text-align: right;
     }
     """
 
@@ -166,6 +166,14 @@ class ModelCatalogScreen(ModalScreen[None]):
                     with Horizontal(classes="mc-btnrow"):
                         yield Button("+ Add", id="mc-add")
                         yield Button("Delete", id="mc-del-provider")
+                    with Vertical(id="mc-roles"):
+                        for role in _ROLES:
+                            yield Select(
+                                [(f"{role.value}: (none)", "")],
+                                prompt=f"{role.value}:",
+                                id=f"mc-role-{role.value}",
+                                allow_blank=True,
+                            )
                 with Vertical(id="mc-right"):
                     yield Input(
                         id="mc-name", placeholder="provider name, e.g. local-swap"
@@ -194,23 +202,15 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Update", id="mc-model-update")
                         yield Button("Remove", id="mc-model-del")
                         yield Button("Add model", id="mc-model-add")
-            with Horizontal(id="mc-roles"):
-                for role in _ROLES:
-                    yield Select(
-                        [(f"{role.value}: (none)", "")],
-                        prompt=f"{role.value}:",
-                        id=f"mc-role-{role.value}",
-                        allow_blank=True,
-                    )
+            yield Static(
+                "esc — close without saving · model table: click or arrow "
+                "keys select a row and fill the editor; Update writes the "
+                "edited id/context/limit back, Add model creates a new "
+                "model from the same fields, Remove deletes it",
+                id="mc-hint",
+            )
             with Horizontal(id="mc-footer"):
                 yield Button("Save", variant="primary", id="mc-save")
-                yield Static(
-                    "esc — close without saving · model table: click or arrow "
-                    "keys select a row and fill the editor; Update writes the "
-                    "edited id/context/limit back, Add model creates a new "
-                    "model from the same fields, Remove deletes it",
-                    id="mc-hint",
-                )
 
     # -- helpers ------------------------------------------------------------
 
@@ -256,6 +256,20 @@ class ModelCatalogScreen(ModalScreen[None]):
                 if ref is not None and ref.provider == old:
                     ref.provider = name
             self._current = name
+            # The role selects list "provider/model" options: rebuild them
+            # so the renamed provider is addressable without a reopen —
+            # but keep the (possibly not yet saved) user's picks, renaming
+            # the ones that referenced the old provider name.
+            picks = {
+                role: str(self.query_one(f"#mc-role-{role.value}", Select).value or "")
+                for role in _ROLES
+            }
+            self._refresh_roles()
+            for role, value in picks.items():
+                if value:
+                    if value.startswith(f"{old}/"):
+                        value = f"{name}/{value.partition('/')[2]}"
+                    self.query_one(f"#mc-role-{role.value}", Select).value = value
         provider.base_url = url
         provider.api_key = key
         return True
@@ -449,6 +463,7 @@ class ModelCatalogScreen(ModalScreen[None]):
             provider.models.extend(fresh)
             self._refresh_models()
             self._refresh_providers()
+            self._refresh_roles()
             self._status(f"✓ fetched {len(entries)} models ({len(fresh)} new)")
         finally:
             self._busy = False

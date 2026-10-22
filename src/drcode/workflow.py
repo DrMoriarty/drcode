@@ -113,6 +113,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import Task
+from .tools import sanitized_env
 
 WORKFLOW_SCRIPT = "workflow.py"
 GIT_WORKFLOW_FILE = "git-workflow.md"
@@ -404,6 +405,7 @@ class WorkflowHooks:
                 _BOOTSTRAP,
                 str(self.script),
                 cwd=self.project_root,
+                env=sanitized_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

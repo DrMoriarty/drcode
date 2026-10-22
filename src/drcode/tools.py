@@ -15,6 +15,7 @@ the model as a retry prompt.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 from pathlib import Path
@@ -258,6 +259,32 @@ def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
     return results
 
 
+# -- child-process environment sanitation ------------------------------------
+
+# Environment variables that leak the shell's "foreign project" context into
+# child processes: when drcode is launched from a shell with another project's
+# venv/conda activated, these point outside the current project. They make
+# tools like `uv` print foreign paths into tool-returns and — worst case — let
+# `uv run --active` delete and recreate the foreign venv. They are stripped
+# from the environment of every subprocess the agent spawns. Everything else
+# (PATH, HOME, DRCODE_*, …) is passed through unchanged.
+STRIPPED_ENV_VARS = (
+    "VIRTUAL_ENV",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+)
+
+
+def sanitized_env() -> dict[str, str]:
+    """os.environ without variables identifying a foreign project's env."""
+    env = dict(os.environ)
+    for var in STRIPPED_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 # -- run_bash command inspection ---------------------------------------------
 
 # Destructive/overwriting commands whose path arguments must stay inside the
@@ -344,6 +371,7 @@ async def run_bash(root: Path, command: str, timeout: float | None = None) -> st
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,
+        env=sanitized_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

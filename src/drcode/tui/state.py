@@ -44,7 +44,9 @@ from ..settings import (
     ProjectSettingsStore,
     StallNudge,
     TaskFinalization,
+    TaskIsolation,
 )
+from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..workflow import WorkflowHooks
 from .blocks import ToolCallBlock
@@ -296,6 +298,12 @@ class DrCodeState(App[None]):
 
     def action_change_stall_nudge(self) -> None: ...
 
+    def action_set_task_isolation(self, isolation: TaskIsolation) -> None: ...
+
+    def action_change_task_isolation(self) -> None: ...
+
+    def _task_isolation_label(self) -> str: ...
+
     def workflow_status_label(self) -> str: ...
 
     def action_workflow_info(self) -> None: ...
@@ -376,6 +384,9 @@ class DrCodeState(App[None]):
     manager: TaskManager
     settings_store: ProjectSettingsStore
     settings: ProjectSettings
+    # Per-task worktree isolation (project setting `task_isolation`); the
+    # optional root the agent/tester runs in comes from here.
+    task_env: TaskEnvironment
     # Custom team workflow (.drcode/workflow.py hooks); None = absent.
     workflow: WorkflowHooks | None
 

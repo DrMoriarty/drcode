@@ -51,7 +51,21 @@ skips its step; `task` is the payload dict described below):
 The `task` argument is one JSON object:
     {"hook": "<name>",
      "task": {"id", "title", "kind", "github_issue"},
-     "git":  {"branch": "<current branch or null>", "dirty": <bool>}}
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>},
+     "worktree": {"path": "...", "branch": "drcode/<task-id>"}}
+
+`worktree` is present only when per-task worktree isolation is on for the
+project (`.drcode/settings.json` `task_isolation: worktree`, see
+`drcode.task_env`): every hook then runs INSIDE the task's worktree (the
+subprocess cwd, and the tree `git.branch`/`git.dirty` above describe) —
+`on_task_start`'s branch checkout operates on the task's dedicated branch
+`drcode/<task-id>`, not on the user's main checkout. Without isolation
+the hooks run in the project directory as before and the key is absent.
+
+With isolation on, drcode itself never merges the task's branch back into
+the user's base branch: the commits stay on `drcode/<task-id>` and
+merging/PR-management is the team's decision — do it in `on_accepted`
+(merge the branch, delete it), which runs on every accept path.
 
 A typical script looks like:
 
@@ -134,11 +148,13 @@ this template on every start, but NEVER overwrites it — edit it in place.
 
 What it gives you: hard gates at fixed lifecycle points of the task
 pipeline. Each defined hook runs in an isolated subprocess (cwd = project
-root) and receives one JSON payload:
+root, or the task's worktree when per-task worktree isolation is on) and
+receives one JSON payload:
 
     {"hook": "<name>",
      "task": {"id", "title", "kind", "github_issue"},
-     "git":  {"branch": "<current branch or null>", "dirty": <bool>}}
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>},
+     "worktree": {"path", "branch"}   # only with task isolation on}
 
 Every hook is optional — an absent function simply skips its step. A hook
 failure (non-zero exit, timeout, malformed output) is NEVER fatal: it is
@@ -374,13 +390,27 @@ class WorkflowHooks:
         return f"custom (.drcode/{WORKFLOW_SCRIPT}: {hooks})"
 
     async def call(
-        self, hook: str, task: Task, timeout: float = HOOK_TIMEOUT
+        self,
+        hook: str,
+        task: Task,
+        timeout: float = HOOK_TIMEOUT,
+        *,
+        cwd: Path | None = None,
+        worktree: dict[str, Any] | None = None,
     ) -> HookResult:
         """Run one hook: `python -c <bootstrap> <script>` in a subprocess
-        with cwd = project root; the bootstrap imports the script, feeds it
-        the JSON payload on stdin and prints the hook's return value as a
-        JSON object. The script itself never has to write dispatch code —
-        it just defines the hook functions (see the module docstring).
+        with cwd = project root (or the task's worktree — see below); the
+        bootstrap imports the script, feeds it the JSON payload on stdin
+        and prints the hook's return value as a JSON object. The script
+        itself never has to write dispatch code — it just defines the hook
+        functions (see the module docstring).
+
+        ``cwd`` (the pipeline passes the task's worktree root when
+        per-task worktree isolation is on) is where the hook subprocess
+        runs and what `git.branch`/`git.dirty` in the payload describe.
+        ``worktree`` ({"path", "branch"}, when the task is isolated) is
+        copied into the payload as the `worktree` key so the script can
+        address the task's tree/branch explicitly.
 
         Never raises (except cancellation — an aborted run must kill the
         child and unwind); every failure comes back as
@@ -388,7 +418,7 @@ class WorkflowHooks:
         """
         if not self.has(hook):
             return HookResult(ok=False, error=f"hook {hook} is not defined")
-        payload = {
+        payload: dict[str, Any] = {
             "hook": hook,
             "task": {
                 "id": task.id,
@@ -396,15 +426,17 @@ class WorkflowHooks:
                 "kind": task.kind.value,
                 "github_issue": task.github_issue,
             },
-            "git": await self._git_state(),
+            "git": await self._git_state(cwd or self.project_root),
         }
+        if worktree is not None:
+            payload["worktree"] = worktree
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-c",
                 _BOOTSTRAP,
                 str(self.script),
-                cwd=self.project_root,
+                cwd=cwd or self.project_root,
                 env=sanitized_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -455,20 +487,19 @@ class WorkflowHooks:
             )
         return HookResult(ok=True, output=output)
 
-    async def _git_state(self) -> dict[str, Any]:
-        """Current git state of the project (branch, dirty or not) for the
-        hook payload. Best-effort: outside a repository the branch is None
-        and the tree counts as clean."""
+    async def _git_state(self, cwd: Path) -> dict[str, Any]:
+        """Current git state of `cwd` (the project root, or the task's
+        worktree under worktree isolation — the tree the hook runs in) for
+        the hook payload: branch, dirty or not. Best-effort: outside a
+        repository the branch is None and the tree counts as clean."""
         from . import tools  # local import: keeps the module import graph flat
 
-        head = await tools.run_bash(
-            self.project_root, "git rev-parse --abbrev-ref HEAD"
-        )
+        head = await tools.run_bash(cwd, "git rev-parse --abbrev-ref HEAD")
         branch: str | None = None
         if head.startswith("exit=0"):
             name = head.removeprefix("exit=0").strip()
             branch = name or None
-        status = await tools.run_bash(self.project_root, "git status --porcelain")
+        status = await tools.run_bash(cwd, "git status --porcelain")
         dirty = bool(status.removeprefix("exit=0").strip())
         return {"branch": branch, "dirty": dirty}
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -39,7 +40,8 @@ from ..providers import (
     project_has_model_selection,
 )
 from ..providers import resolve_effective as resolve_model_config
-from ..settings import ProjectSettings, ProjectSettingsStore
+from ..settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
+from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
 from ..workflow import load_hooks
@@ -251,6 +253,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # setting are removed before anything is shown or resumed.
         self.settings_store = ProjectSettingsStore(project_root)
         self.settings: ProjectSettings = self.settings_store.load()
+        # Per-task worktree isolation (project setting `task_isolation`,
+        # default off): holds the LIVE settings instance, so toggling the
+        # setting in the dialog applies from the next activation. Removal
+        # of a task (cancel/delete/purge) tears its worktree down here.
+        self.task_env = TaskEnvironment(project_root, self.settings)
+        self.manager.add_removal_listener(self.task_env.remove)
         # GitHub Issues sync: persisted bookkeeping (last sync, seen issue
         # numbers) and the monotonic time of the next scheduled cycle. The
         # first cycle runs shortly after startup.
@@ -618,6 +626,31 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 title="Auto cleanup",
                 timeout=6,
             )
+        if self.settings.task_isolation is TaskIsolation.WORKTREE:
+            # Worktree isolation is persisted even without a git repo (the
+            # user's choice is never rewritten silently) — but then it is
+            # dormant: warn at EVERY startup until the situation resolves
+            # (git init, or the setting switched back to off).
+            if not self.task_env.available:
+                self.notify(
+                    "Task isolation is set to worktree, but this project "
+                    "has no git repository — the mode will not work and "
+                    "tasks run in the project directory. Run `git init` "
+                    "(and commit) or switch the setting to off in "
+                    "Settings (Ctrl+S).",
+                    title="Task isolation",
+                    severity="warning",
+                    timeout=12,
+                )
+            else:
+                # Sweep worktrees/branches of tasks that no longer exist
+                # (crashed session, retention cleanup) off the startup
+                # path: a few git calls in a worker thread.
+                self.run_worker(
+                    self._worktree_startup_cleanup,
+                    exclusive=True,
+                    group="worktree-cleanup",
+                )
         self.refresh_project_info()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty
@@ -679,6 +712,21 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     @property
     def chat_input(self) -> ChatInput:
         return self.query_one("#chat-input", ChatInput)
+
+    async def _worktree_startup_cleanup(self) -> None:
+        """Startup sweep of the worktree environment: worktree directories
+        and `drcode/*` branches whose task no longer exists are removed
+        (see drcode.task_env.cleanup_orphans). Blocking git calls — run in
+        this worker, off the startup path."""
+        removed = await asyncio.to_thread(
+            self.task_env.cleanup_orphans, set(self.manager.tasks)
+        )
+        if removed:
+            self.notify(
+                f"Removed orphaned task worktrees: {len(removed)}",
+                title="Task isolation",
+                timeout=6,
+            )
 
     @property
     def sidebar(self) -> Sidebar:

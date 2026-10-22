@@ -29,6 +29,12 @@ from .workflow import ensure_workflow_examples
 # raise: a broken observer must not break the state machine.
 StatusListener = Callable[[Task, TaskStatus, TaskStatus, str], None]
 
+# Removal observer: (task id) — fired AFTER the task is gone (cancelled or
+# deleted, including the retention auto-cleanup), so per-task resources
+# (the optional worktree, see drcode.task_env) can be torn down. Sync,
+# like the status listeners: must be fast and non-raising.
+RemovalListener = Callable[[str], None]
+
 
 class TaskManager:
     def __init__(self, project_root: Path) -> None:
@@ -37,6 +43,9 @@ class TaskManager:
         # .drcode/git-workflow.md.example) — idempotent, never overwrites.
         ensure_workflow_examples(project_root)
         self._status_listeners: list[StatusListener] = []
+        # Observers of task removal (cancel/delete/purge): the optional
+        # worktree environment cleans its per-task resources here.
+        self._removal_listeners: list[RemovalListener] = []
         # Serializes reload_new_tasks(): it runs both on the app thread
         # (the periodic disk poll) and on worker threads (promote_next in
         # the run's finally-blocks) — two concurrent scans must not load
@@ -73,6 +82,23 @@ class TaskManager:
         from a worker thread (the tester's tools run via asyncio.to_thread) —
         and must be fast and non-raising."""
         self._status_listeners.append(listener)
+
+    def add_removal_listener(self, listener: RemovalListener) -> None:
+        """Register an observer of task removal (cancel/delete/purge) —
+        the worktree environment tears the task's branch and tree down
+        here. Same contract as the status listeners: sync, fast,
+        non-raising."""
+        self._removal_listeners.append(listener)
+
+    def _fire_removed(self, task_id: str) -> None:
+        for listener in list(self._removal_listeners):
+            try:
+                listener(task_id)
+            except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
+                print(
+                    f"drcode: removal listener failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
 
     def fire_status_change(self, task: Task, old: TaskStatus, origin: str) -> None:
         """Public hook for status mutations that happen outside the manager
@@ -382,6 +408,7 @@ class TaskManager:
         self.tasks.pop(task_id, None)
         self.storage.delete(task_id)
         remove_scratch(task_id)
+        self._fire_removed(task_id)
 
     def purge_expired_completed(self, retention_days: int | None) -> list[Task]:
         """Delete COMPLETED tasks older than the retention period.
@@ -515,7 +542,11 @@ class TaskManager:
     def cancel(self, task_id: str) -> Task:
         """User cancelled the task (not relevant anymore): drop all queued
         input, clear the resume flag and complete it immediately — the
-        tester is skipped everywhere a finished task would run it."""
+        tester is skipped everywhere a finished task would run it.
+
+        Unlike an ordinary completion, the task's worktree environment is
+        torn down here (a cancelled task's work is not wanted): the
+        removal listeners run after the transition."""
         task = self.get(task_id)
         old = task.status
         task.pending_input.clear()
@@ -531,6 +562,7 @@ class TaskManager:
         task.review_pending = False
         task.review_rejections = 0
         remove_scratch(task_id)
+        self._fire_removed(task_id)
         task.touch()
         self._save_changed(task, old, "user")
         return task

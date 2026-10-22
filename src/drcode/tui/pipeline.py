@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from pydantic_ai import Agent
@@ -674,14 +675,33 @@ class PipelineLayer(DrCodeState):
             self._tps_samples.clear()
             self._touch_activity()
             self.refresh_status()
+            # Per-task worktree isolation (project setting
+            # `task_isolation: worktree`, see drcode.task_env): the whole
+            # run — tools, prompts, tester commit — happens in the task's
+            # own worktree, so an interrupted (unfinished) task never
+            # hands its dirty tree to the next one in the queue. The
+            # worktree is created when missing and reused as-is (an
+            # unfinished task resumes its own snapshot).
+            root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+            if root != self.project_root:
+                message = f"Task isolated in worktree {root} (branch drcode/{task_id})."
+                if iso_note:
+                    message += f" ({iso_note})"
+                self._show_event(task, message)
+            elif iso_note:
+                # Isolation is on but the worktree could not be created:
+                # the task falls back to the project directory — say so.
+                self._show_event(task, f"Task isolation unavailable: {iso_note}")
             # Custom workflow (`.drcode/workflow.py`): the on_task_start
             # hook runs before the first activation (branch checkout etc.);
             # its instructions are prepended to the first consumed prompt.
+            # With isolation on the hook runs INSIDE the worktree (see
+            # _hook_env).
             workflow_instructions = await self._run_task_start_hook(task)
             agent = build_agent(
                 self.resolved_config(role),
                 kind=task.kind,
-                root=self.project_root,
+                root=root,
             )
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
@@ -761,7 +781,7 @@ class PipelineLayer(DrCodeState):
                         text,
                         message_history=history,
                         deps=AgentDeps(
-                            root=self.project_root,
+                            root=root,
                             manager=self.manager,
                             task_id=task_id,
                             scratch=scratch_dir(task_id),
@@ -1329,12 +1349,21 @@ class PipelineLayer(DrCodeState):
                 task.tester_messages.append([])
                 if self.viewed_id == task_id:
                     self._write_history_line("testing-sep", "")
+            # The tester verifies the task in ITS worktree (per-task
+            # worktree isolation, see run_agent): the round runs against
+            # exactly the tree the development agent worked in, and the
+            # TESTING_COMMIT finalization commits onto the task's branch.
+            # A worktree lost to a manual deletion is recreated here (the
+            # branch with the task's commits is re-checked-out).
+            root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+            if iso_note:
+                self._show_event(task, f"Task isolation unavailable: {iso_note}")
             tester = build_tester_agent(
                 self.resolved_config(AgentRole.TESTER),
                 allow_commit=(
                     self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
                 ),
-                root=self.project_root,
+                root=root,
                 # The external review (`.drcode/workflow.py` on_review)
                 # splits "the tester passed" from "the task is accepted":
                 # a PASSED verdict then leaves the task TESTING.
@@ -1343,7 +1372,7 @@ class PipelineLayer(DrCodeState):
                 ),
             )
             deps = TesterDeps(
-                root=self.project_root,
+                root=root,
                 manager=self.manager,
                 task_id=task_id,
                 scratch=scratch_dir(task_id),
@@ -1626,6 +1655,16 @@ class PipelineLayer(DrCodeState):
 
     # -- external review (.drcode/workflow.py hooks) -----------------------------------
 
+    def _hook_env(self, task: Task) -> tuple[Path, dict[str, str] | None]:
+        """Where a workflow hook for `task` runs: with per-task worktree
+        isolation on — inside the task's worktree (the payload describes
+        that tree in `git.*` and carries the `worktree` path/branch entry);
+        without it — the project directory as before."""
+        info = self.task_env.worktree_info(task.id)
+        if info is not None:
+            return Path(info["path"]), info
+        return self.project_root, None
+
     async def _run_task_start_hook(self, task: Task) -> str | None:
         """`on_task_start` before the first activation: branch checkout and
         friends. Returns the hook's "instructions" text (injected into the
@@ -1639,7 +1678,8 @@ class PipelineLayer(DrCodeState):
             return None
         if task.messages:
             return None  # not the first activation
-        result = await workflow.call("on_task_start", task)
+        cwd, wt = self._hook_env(task)
+        result = await workflow.call("on_task_start", task, cwd=cwd, worktree=wt)
         if not result.ok:
             self._show_event(
                 task,
@@ -1670,7 +1710,8 @@ class PipelineLayer(DrCodeState):
             return
         if task.kind is TaskKind.RESEARCH:
             return  # research tasks never go through testing/finalization
-        result = await workflow.call("on_development_done", task)
+        cwd, wt = self._hook_env(task)
+        result = await workflow.call("on_development_done", task, cwd=cwd, worktree=wt)
         if not result.ok:
             self._show_event(
                 task,
@@ -1697,7 +1738,8 @@ class PipelineLayer(DrCodeState):
             return
         if task.kind is TaskKind.RESEARCH:
             return  # research tasks never go through testing/finalization
-        result = await workflow.call("on_tester_passed", task)
+        cwd, wt = self._hook_env(task)
+        result = await workflow.call("on_tester_passed", task, cwd=cwd, worktree=wt)
         if not result.ok:
             self._show_event(
                 task,
@@ -1715,7 +1757,8 @@ class PipelineLayer(DrCodeState):
         workflow = self.workflow
         if workflow is None or not workflow.has("on_accepted"):
             return
-        result = await workflow.call("on_accepted", task)
+        cwd, wt = self._hook_env(task)
+        result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
         if not result.ok:
             self._show_event(
                 task,
@@ -1751,10 +1794,11 @@ class PipelineLayer(DrCodeState):
         waiting (fail-closed) and schedules a retry."""
         task = self.manager.get(task_id)
         workflow = self.workflow
+        cwd, wt = self._hook_env(task)
         try:
             if workflow is None:
                 return
-            result = await workflow.call("on_review", task)
+            result = await workflow.call("on_review", task, cwd=cwd, worktree=wt)
         finally:
             self._review_running = False
             self._review_task_id = None

@@ -35,6 +35,7 @@ from ..providers import (
 )
 from ..settings import (
     FINALIZATION_OPTIONS,
+    ISOLATION_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
 )
@@ -167,6 +168,7 @@ class SettingsPalette(CommandPalette):
         "Auto-delete completed tasks:",
         "Task finalization:",
         "Nudge stalled agent after:",
+        "Task isolation:",
         "Workflow:",
         "GitHub integration:",
         "Notifications:",
@@ -441,6 +443,17 @@ class ProjectSettingsCommandsProvider(Provider):
                 app.action_change_stall_nudge,
             ),
             (
+                f"Task isolation: {app._task_isolation_label()}",
+                (
+                    "Give each task its own git worktree (.drcode/"
+                    "worktrees/<id>, branch drcode/<id>) so an interrupted "
+                    "task never leaves its changes to the next one — needs "
+                    "a git repository, otherwise tasks run in the shared "
+                    "project directory (project setting)"
+                ),
+                app.action_change_task_isolation,
+            ),
+            (
                 f"Workflow: {app.workflow_status_label()}",
                 (
                     "Custom branching/review rules: .drcode/git-workflow.md "
@@ -535,6 +548,36 @@ class FinalizationOptionsProvider(Provider):
                 partial(app.action_set_task_finalization, option),
             )
             for option in FINALIZATION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class IsolationOptionsProvider(Provider):
+    """Options of the "Task isolation" setting (off / git worktree).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.task_isolation
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_task_isolation, option),
+            )
+            for option in ISOLATION_OPTIONS
         ]
 
     async def discover(self) -> Hits:

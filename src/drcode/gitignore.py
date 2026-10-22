@@ -27,6 +27,7 @@ GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/tasks/",
     ".drcode/settings.json",
     ".drcode/github_state.json",
+    ".drcode/worktrees/",
 )
 
 # Spellings of the legacy whole-directory entry older drcode versions

@@ -78,6 +78,41 @@ FINALIZATION_OPTIONS: tuple[TaskFinalization, ...] = (
 )
 
 
+class TaskIsolation(str, enum.Enum):
+    """Where a task's development happens.
+
+    OFF (the default): every task works directly in the project directory
+    (the historical "everything in one tree" behaviour — an interrupted
+    task leaves its changes behind for the next one). WORKTREE: each task
+    gets its own git worktree under `.drcode/worktrees/<task-id>` on a
+    dedicated branch `drcode/<task-id>` (see `drcode.task_env`), so an
+    interrupted (unfinished) task never hands a dirty tree to the next
+    task in the queue.
+
+    WORKTREE needs a git repository in the project. The setting is still
+    saved when the project has none — the app warns at every startup (and
+    when the value is picked) that the mode stays dormant until a
+    repository appears (or the setting is turned off again); without git
+    tasks simply keep running in the project directory.
+    """
+
+    OFF = "off"
+    WORKTREE = "worktree"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is TaskIsolation.WORKTREE:
+            return "worktree (git)"
+        return "off (shared directory)"
+
+
+ISOLATION_OPTIONS: tuple[TaskIsolation, ...] = (
+    TaskIsolation.OFF,
+    TaskIsolation.WORKTREE,
+)
+
+
 class StallNudge(str, enum.Enum):
     """How long an agent/tester run may stay without any sign of life
     (no stream deltas, no tool events) before it is automatically aborted
@@ -147,6 +182,11 @@ class ProjectSettings(BaseModel):
     completed_retention: CompletedRetention = CompletedRetention.DAYS_7
     task_finalization: TaskFinalization = TaskFinalization.TESTING_COMMIT
     stall_nudge: StallNudge = StallNudge.MIN_30
+    # Per-task worktree isolation (TaskIsolation docstring): a value that
+    # the project cannot currently honour (worktree without a git repo) is
+    # still persisted — the app warns about the dormant mode at every
+    # startup instead of silently rewriting the user's choice.
+    task_isolation: TaskIsolation = TaskIsolation.OFF
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
     # connection check fails): the sync simply logs an error each cycle

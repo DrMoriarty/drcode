@@ -42,11 +42,13 @@ from ..settings import (
     CompletedRetention,
     StallNudge,
     TaskFinalization,
+    TaskIsolation,
 )
 from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
     FinalizationOptionsProvider,
+    IsolationOptionsProvider,
     ModelCatalogCommandProvider,
     ModelSettingsPalette,
     RetentionOptionsProvider,
@@ -850,6 +852,65 @@ class ActionsLayer(DrCodeState):
             SettingsPalette(
                 id="--stall-nudge-palette",
                 providers=[StallNudgeOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def _task_isolation_label(self) -> str:
+        """The Settings-entry label of the task-isolation setting: the
+        option's own label, plus the dormant marker when worktree is
+        selected but the project has no git repository."""
+        label = self.settings.task_isolation.label
+        if (
+            self.settings.task_isolation is TaskIsolation.WORKTREE
+            and not self.task_env.available
+        ):
+            label += " — no git repo, inactive"
+        return label
+
+    def action_set_task_isolation(self, isolation: TaskIsolation) -> None:
+        """Settings command: whether each task develops in its own git
+        worktree (`drcode.task_env`) or directly in the project directory.
+        Persisted per project (.drcode/settings.json); applies from the
+        next task activation on (running tasks keep their root).
+
+        A worktree value is saved even when the project has no git
+        repository — the user's choice is never silently rewritten — but
+        the mode stays dormant: tasks keep running in the project
+        directory and a warning is shown here AND at every app startup
+        until either a repository appears or the setting is turned off.
+        """
+        self.settings.task_isolation = isolation
+        self.settings_store.save(self.settings)
+        if isolation is TaskIsolation.WORKTREE and not self.task_env.available:
+            self.notify(
+                "Task isolation: worktree — saved, but this project has no "
+                "git repository, so the mode will NOT work: tasks keep "
+                "running in the project directory. Init git (git init) or "
+                "switch the setting back to off.",
+                title="Project settings",
+                severity="warning",
+                timeout=10,
+            )
+        else:
+            self.notify(
+                f"Task isolation: {isolation.label}",
+                title="Project settings",
+                timeout=4,
+            )
+
+    def action_change_task_isolation(self) -> None:
+        """Task-isolation picker, opened from the Settings entry ("Task
+        isolation: …"). Same UX as the retention picker: the narrowed
+        SettingsPalette with the two options; picking one applies it,
+        Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--task-isolation-palette",
+                providers=[IsolationOptionsProvider],
                 placeholder="Search for options…",
             )
         )

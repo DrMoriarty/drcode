@@ -117,8 +117,9 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 "Model connection is not configured. Enter the settings — "
                 "they will be saved as a [b]custom model for each agent "
                 "role[/b] (coding, tester, compaction) into "
-                "[b].drcode/drcode.json[/b]. Fields marked [b]*[/b] are "
-                "required.",
+                "[b].drcode/drcode.json[/b]. Research tasks follow the "
+                "coding model until a separate research model is picked "
+                "in Settings. Fields marked [b]*[/b] are required.",
                 id="sd-note",
             )
             yield Static("Model *", classes="sd-label")

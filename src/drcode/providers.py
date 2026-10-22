@@ -14,8 +14,8 @@ connection (the json layers no longer provide its model fields — see
    config) or the project's `custom_models` already describe models, the
    catalog screen pre-fills itself from that data (`load_seeded_catalog`)
    — in memory only, until the user saves.
-2. A project-level selection of the model per agent role (coding / tester /
-   compaction) stored under the optional `models` key of
+2. A project-level selection of the model per agent role (coding / research /
+   tester / compaction) stored under the optional `models` key of
    `<project>/.drcode/drcode.json`: either a catalog reference of the form
    `"<provider-name>/<model-id>"` (neither provider names nor model ids may
    contain `/`) or the string `"custom"` — use the per-role free-form model
@@ -154,9 +154,17 @@ class Provider(BaseModel):
 
 
 class AgentRole(str, enum.Enum):
-    """Agent roles a model can be selected for."""
+    """Agent roles a model can be selected for.
+
+    RESEARCH serves research tasks (analysis/docs load profile: read-heavy,
+    long tool chains — a cheap-input large-window model beats the best
+    codegen model there). When nothing is selected for it anywhere, research
+    tasks fall back to the coding model (`resolve_effective`), so existing
+    configs keep working unchanged.
+    """
 
     CODING = "coding"
+    RESEARCH = "research"
     TESTER = "tester"
     COMPACTION = "compaction"
 
@@ -703,6 +711,24 @@ def resolve(config: Config, role: AgentRole) -> Config:
     return config.model_copy(update={"model": ""})
 
 
+def resolve_effective(config: Config, role: AgentRole) -> Config:
+    """Resolve the effective model for a role, with the research fallback.
+
+    The RESEARCH role has no default of its own: when nothing is selected
+    for it (project slot, custom model, catalog default — all unset), it
+    falls back to the resolved CODING model, so research tasks transparently
+    run on whatever the coding role uses and existing configs keep working.
+    The env override (`DRCODE_MODEL` / `DRCODE_BASE_URL`) applies to research
+    exactly as to every other role — and makes the fallback unreachable,
+    since the env layer leaves every role ready. Every other role resolves
+    as usual (`resolve`).
+    """
+    resolved = resolve(config, role)
+    if role is AgentRole.RESEARCH and not resolved.is_ready:
+        return resolve(config, AgentRole.CODING)
+    return resolved
+
+
 # -- one-time migrations of legacy flat configs --------------------------------
 
 
@@ -711,9 +737,12 @@ def migrate_user_config() -> bool:
 
     When `~/.config/drcode/drcode.json` still carries the legacy flat
     model keys and `models.json` does not exist yet, a catalog with one
-    provider/model built from the flat data is written, with ALL three
-    role defaults pointed at it (otherwise the roles would end up without
-    a model after the flat fallback was removed). The flat model keys are
+    provider/model built from the flat data is written, with every role
+    default (coding, research, tester, compaction) pointed at it
+    (otherwise the roles would end up without a model after the flat
+    fallback was removed; research additionally falls back to the coding
+    model via `resolve_effective`, so its default is a convenience, not
+    a requirement). The flat model keys are
     then stripped from the user drcode.json (non-provider settings like
     compaction_threshold/request_limit stay).
 
@@ -747,7 +776,8 @@ def migrate_project_config(project_root: Path) -> bool:
 
     When the project's drcode.json (or the legacy root-level one) carries
     the flat model keys, they are converted into `custom_models[role]` for
-    all three roles with `models[role] = "custom"` — three independent
+    every role (coding, research, tester, compaction) with
+    `models[role] = "custom"` — independent
     copies. A slot that already holds a catalog reference stays active;
     the converted flat config is parked in `custom_models[role]` without
     activation. The flat keys are then removed from the json file

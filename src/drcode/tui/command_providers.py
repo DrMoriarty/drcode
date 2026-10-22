@@ -163,6 +163,7 @@ class SettingsPalette(CommandPalette):
         "Update/create AGENTS.md",
         "Provider catalog…",
         "Coding model:",
+        "Research model:",
         "Tester model:",
         "Compaction model:",
         "Auto-delete completed tasks:",
@@ -309,6 +310,17 @@ class ProjectSettingsCommandsProvider(Provider):
                     "drcode.json)"
                 ),
                 app.action_change_coding_model,
+            ),
+            (
+                f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
+                (
+                    "Model research tasks run on (analysis/docs profile: "
+                    "reads a lot, writes little — a cheap-input "
+                    "large-context model works well); falls back to the "
+                    "coding model when not set; pick from the user-level "
+                    "provider catalog (saved to the project's drcode.json)"
+                ),
+                app.action_change_research_model,
             ),
             (
                 f"Tester model: {app.role_model_label(AgentRole.TESTER)}",

@@ -28,6 +28,7 @@ from drcode.providers import (
     migrate_user_config,
     project_has_model_selection,
     resolve,
+    resolve_effective,
     set_project_custom_active,
     set_project_custom_model,
     set_project_model,
@@ -266,6 +267,100 @@ def test_resolve_does_not_mutate_original(
     config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
     resolve(config, AgentRole.CODING)
     assert config.model == "flat-m"
+
+
+# -- resolve_effective (research fallback) --------------------------------------
+
+
+def test_resolve_effective_research_falls_back_to_coding(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """Nothing selected for the research role anywhere: it inherits the
+    resolved CODING model — existing configs keep working unchanged."""
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    assert resolve(config, AgentRole.RESEARCH).model == ""  # plain resolve: unset
+    resolved = resolve_effective(config, AgentRole.RESEARCH)
+    assert resolved.model == "qwen3-coder-30b"
+    assert resolved.base_url == "http://localhost:8080/v1"
+    assert resolved.max_context_tokens == 131072
+    assert resolved.max_tokens == 4096
+
+
+def test_resolve_effective_research_uses_own_selection(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """A dedicated research selection wins over the coding fallback — the
+    whole point of the role: a different load profile, a different model."""
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    set_project_custom_model(
+        project_root,
+        AgentRole.RESEARCH,
+        CustomModelEntry(
+            model="research-m",
+            base_url="http://research/v1",
+            max_context_tokens=400_000,
+        ),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve_effective(config, AgentRole.RESEARCH)
+    assert resolved.model == "research-m"
+    assert resolved.base_url == "http://research/v1"
+    assert resolved.max_context_tokens == 400_000
+
+
+def test_resolve_effective_research_fallback_tracks_coding_changes(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The fallback is live: changing the coding selection changes what
+    research runs on (unlike custom models, which never mix)."""
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    assert resolve_effective(config, AgentRole.RESEARCH).model == "small"
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    assert resolve_effective(config, AgentRole.RESEARCH).model == "qwen3-coder-30b"
+
+
+def test_resolve_effective_other_roles_have_no_fallback(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """Only research inherits coding: tester/compaction stay "not set" so
+    the header shows the truth and the pipeline idles for them."""
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    for role in (AgentRole.TESTER, AgentRole.COMPACTION):
+        assert not resolve_effective(config, role).is_ready
+
+
+def test_resolve_effective_research_env_override_still_wins(
+    project_root: Path, catalog: UserModelsConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env layer applies to research exactly as to every role (and
+    makes the coding fallback unreachable — every role is ready)."""
+    monkeypatch.setenv("DRCODE_MODEL", "env-model")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://env/v1")
+    config = make_config(project_root)
+    resolved = resolve_effective(config, AgentRole.RESEARCH)
+    assert resolved.model == "env-model"
+    assert resolved.base_url == "http://env/v1"
 
 
 # -- project models key --------------------------------------------------------

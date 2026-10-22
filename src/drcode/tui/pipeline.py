@@ -81,6 +81,16 @@ class PipelineLayer(DrCodeState):
         the project's per-role selection and the user-level catalog)."""
         return self.resolved_config(AgentRole.CODING)
 
+    @staticmethod
+    def _task_role(task: Task) -> AgentRole:
+        """The agent role serving the task's main transcript: research
+        tasks run on the research role (which falls back to the coding
+        model when nothing is selected for it — see
+        `providers.resolve_effective`), everything else on the coding role."""
+        return (
+            AgentRole.RESEARCH if task.kind is TaskKind.RESEARCH else AgentRole.CODING
+        )
+
     async def _check_model(self) -> None:
         label = self.model_status
         was_error = label.has_class("error")
@@ -487,9 +497,12 @@ class PipelineLayer(DrCodeState):
         return tokens
 
     def _compaction_due(self, task: Task) -> int | None:
-        """Compaction threshold check for the main agent transcript."""
+        """Compaction threshold check for the main agent transcript,
+        measured against the model actually serving it (research tasks use
+        the research role's resolved config, everything else the coding
+        one)."""
         return self._fill_over_threshold(
-            self._live_ctx_tokens.get(task.id), task.messages, AgentRole.CODING
+            self._live_ctx_tokens.get(task.id), task.messages, self._task_role(task)
         )
 
     async def _maybe_compact(self, task: Task) -> None:
@@ -508,7 +521,8 @@ class PipelineLayer(DrCodeState):
         tokens = self._compaction_due(task)
         if tokens is None:
             return
-        pct = round(tokens * 100 / self._coding_config().max_context_tokens)
+        role_config = self.resolved_config(self._task_role(task))
+        pct = round(tokens * 100 / role_config.max_context_tokens)
         _, rest = split_original_prompts(task.messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
@@ -575,10 +589,14 @@ class PipelineLayer(DrCodeState):
         on later turns.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
-        tokens = self._fill_over_threshold(live_tokens, round_messages)
+        tokens = self._fill_over_threshold(
+            live_tokens, round_messages, AgentRole.TESTER
+        )
         if tokens is None:
             return False
-        pct = round(tokens * 100 / self._coding_config().max_context_tokens)
+        pct = round(
+            tokens * 100 / self.resolved_config(AgentRole.TESTER).max_context_tokens
+        )
         _, rest = split_original_prompts(round_messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
@@ -632,8 +650,13 @@ class PipelineLayer(DrCodeState):
         # Initialized before the try: build_agent() itself may raise.
         run: AgentRun[AgentDeps, str] | None = None
         cancelled = False
+        # The role serving this task's transcript: research tasks run on the
+        # research model (falling back to the coding one when unset), the
+        # other kinds on the coding model. Everything below — the readiness
+        # check, the agent build and the compaction gates — uses it.
+        role = self._task_role(task)
         try:
-            if not self.resolved_config(AgentRole.CODING).is_ready:
+            if not self.resolved_config(role).is_ready:
                 self._show_event(
                     task,
                     "Model is not configured. Restart drcode to open the setup "
@@ -655,7 +678,7 @@ class PipelineLayer(DrCodeState):
             # its instructions are prepended to the first consumed prompt.
             workflow_instructions = await self._run_task_start_hook(task)
             agent = build_agent(
-                self.resolved_config(AgentRole.CODING),
+                self.resolved_config(role),
                 kind=task.kind,
                 root=self.project_root,
             )
@@ -1010,7 +1033,7 @@ class PipelineLayer(DrCodeState):
                                     pct = round(
                                         tokens
                                         * 100
-                                        / self._coding_config().max_context_tokens
+                                        / self.resolved_config(role).max_context_tokens
                                     )
                                     self._show_event(
                                         task,

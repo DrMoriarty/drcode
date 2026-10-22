@@ -940,7 +940,7 @@ async def test_setup_dialog_condition_skips_dialog_with_env(
         assert not isinstance(app.screen, ModelSetupDialog)
 
 
-async def test_setup_dialog_saves_three_independent_custom_models(
+async def test_setup_dialog_saves_three_custom_models_research_inherits(
     app: DrCodeApp, project_root: Path
 ) -> None:
     from drcode.providers import load_project_custom_models
@@ -961,7 +961,9 @@ async def test_setup_dialog_saves_three_independent_custom_models(
         )
         await pilot.pause()
     data = _project_json(project_root)
-    # Three "custom" slots, three separate copies, no flat model keys.
+    # Three "custom" slots (coding/tester/compaction), three separate
+    # copies, no flat model keys. The research role stays unpinned: it
+    # inherits the coding model via the resolve_effective fallback.
     assert data["models"] == {
         "coding": "custom",
         "tester": "custom",
@@ -978,8 +980,74 @@ async def test_setup_dialog_saves_three_independent_custom_models(
     # Independence: the entries are distinct objects.
     values = list(customs.values())
     assert values[0] is not values[1]
-    # The coding model is live: the header/statusbar show it.
+    # The coding model is live: the header/statusbar show it; research
+    # transparently runs on the same connection.
     assert app.resolved_config(AgentRole.CODING).model == "first-m"
+    assert app.resolved_config(AgentRole.RESEARCH).model == "first-m"
+
+
+async def test_research_role_resolves_with_coding_fallback(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The app-level resolution: with no research selection, the research
+    role transparently resolves to the coding model; a dedicated research
+    custom model overrides it while coding keeps its own."""
+    _write_user_catalog()
+    app.invalidate_resolved_configs()
+    assert app.resolved_config(AgentRole.CODING).model == "qwen3-coder-30b"
+    assert app.resolved_config(AgentRole.RESEARCH).model == "qwen3-coder-30b"
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.RESEARCH,
+        CustomModelEntry(
+            model="research-m",
+            base_url="http://research/v1",
+            max_context_tokens=400_000,
+        ),
+    )
+    app.invalidate_resolved_configs()
+    assert app.resolved_config(AgentRole.RESEARCH).model == "research-m"
+    assert app.resolved_config(AgentRole.RESEARCH).max_context_tokens == 400_000
+    # Coding is untouched by the research entry.
+    assert app.resolved_config(AgentRole.CODING).model == "qwen3-coder-30b"
+
+
+async def test_task_role_follows_kind_and_compaction_uses_serving_role(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """Research tasks map to the RESEARCH role (`_task_role`), and the
+    compaction gate measures their transcript against the research model's
+    window — not the coding model's."""
+    from drcode.providers import CustomModelEntry, set_project_custom_model
+
+    _write_user_catalog()
+    set_project_custom_model(
+        project_root,
+        AgentRole.RESEARCH,
+        CustomModelEntry(
+            model="research-m",
+            base_url="http://research/v1",
+            max_context_tokens=1000,
+        ),
+    )
+    app.invalidate_resolved_configs()
+    research = app.manager.create("r", "prompt", kind=TaskKind.RESEARCH)
+    feature = app.manager.create("f", "prompt", kind=TaskKind.FEATURE)
+    assert app._task_role(research) is AgentRole.RESEARCH
+    assert app._task_role(feature) is AgentRole.CODING
+    # A transcript whose last reading is 900 tokens: under the coding
+    # model's 200k window the gate stays off for the feature task, but
+    # the research task (1000-token window, default 80% threshold) is due.
+    msg = [
+        {"kind": "request", "role": "user", "parts": []},
+        {"kind": "response", "usage": {"input_tokens": 850, "output_tokens": 50}},
+    ]
+    research.messages = msg
+    feature.messages = msg
+    assert app._compaction_due(research) == 900
+    assert app._compaction_due(feature) is None
 
 
 async def test_role_picker_marks_default_and_clears_slot(

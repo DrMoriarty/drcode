@@ -148,6 +148,57 @@ async def test_agent_tool_roundtrip_completes_task(
     assert not [t for t in event_texts(task) if "failed" in t or "Error" in t]
 
 
+async def test_research_task_builds_agent_with_research_role_config(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_agent resolves the role per task kind: a research task gets the
+    RESEARCH role's resolved config (here a dedicated research custom
+    model), so a project can serve research from a different endpoint than
+    coding. No env override — the env layer would win for all roles."""
+    from drcode.providers import AgentRole, CustomModelEntry, set_project_custom_model
+
+    state = ScriptedState()
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    seen: list[tuple[str, str, str]] = []
+    real_build_agent = pipeline_module.build_agent
+
+    def spy_build_agent(config: Any, *, kind: Any = TaskKind.FEATURE, root: Any = None):
+        seen.append((kind.value, config.model, config.base_url))
+        return real_build_agent(config, kind=kind, root=root)
+
+    monkeypatch.setattr(pipeline_module, "build_agent", spy_build_agent)
+    set_project_custom_model(
+        project_root,
+        AgentRole.RESEARCH,
+        CustomModelEntry(
+            model="research-m",
+            base_url="http://research/v1",
+            max_context_tokens=12345,
+        ),
+    )
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(model="coding-m", base_url="http://coding/v1"),
+    )
+    app = DrCodeApp(project_root)
+    # Sanity: the two roles resolve independently.
+    assert app.resolved_config(AgentRole.RESEARCH).model == "research-m"
+    assert app.resolved_config(AgentRole.CODING).model == "coding-m"
+
+    task = app.manager.create("r", "look around", kind=TaskKind.RESEARCH)
+    state.steps = [text_response("analysis done")]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="research task completed",
+        )
+
+    assert seen == [("research", "research-m", "http://research/v1")]
+
+
 # -- agent run: rate limiting ---------------------------------------------------------
 
 

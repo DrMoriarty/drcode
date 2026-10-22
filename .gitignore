@@ -10,5 +10,8 @@ wheels/
 .venv
 
 # drcode task storage
-.drcode/
 .env
+
+.drcode/tasks/
+.drcode/settings.json
+.drcode/github_state.json

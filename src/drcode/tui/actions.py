@@ -81,9 +81,13 @@ class ActionsLayer(DrCodeState):
 
         None — the user skipped it (ESC): keep running without a model.
         ModelSetup — the connection was probed successfully: it is saved
-        as a CUSTOM model for EACH of the three agent roles (three
-        independent copies in .drcode/drcode.json — each editable
-        separately later) and applied to the live config.
+        as a CUSTOM model for each of the coding / tester / compaction
+        roles (independent copies in .drcode/drcode.json — each editable
+        separately later) and applied to the live config. The research
+        role is deliberately left unpinned: it inherits the coding model
+        via the `resolve_effective` fallback, so improving the coding
+        model later also improves research until a dedicated research
+        model is picked.
         """
         if setup is None:
             return
@@ -102,6 +106,10 @@ class ActionsLayer(DrCodeState):
         entry = self._custom_entry_from_setup(setup)
         try:
             for role in AgentRole:
+                if role is AgentRole.RESEARCH:
+                    # Unpinned on purpose: research falls back to the
+                    # coding model (see providers.resolve_effective).
+                    continue
                 set_project_custom_model(self.project_root, role, entry)
         except OSError as e:
             self.notify(
@@ -112,7 +120,8 @@ class ActionsLayer(DrCodeState):
             )
         else:
             self.notify(
-                "Custom model saved for all roles (coding, tester, compaction)",
+                "Custom model saved for coding, tester and compaction "
+                "(research follows the coding model)",
                 title="Model setup",
                 timeout=4,
             )
@@ -583,7 +592,9 @@ class ActionsLayer(DrCodeState):
     def role_model_label(self, role: AgentRole) -> str:
         """Human-readable effective model of a role, for the Settings
         palette entries: the project slot (catalog reference or the role's
-        custom model id), else the user-level default, else "not set"."""
+        custom model id), else the user-level default, else "not set".
+        The research role falls back to the coding model when unpinned —
+        the label says so instead of the bare "not set"."""
         slot = load_project_model_slots(self.project_root).get(role)
         if isinstance(slot, ModelRef):
             return f"{slot.provider}/{slot.model}"
@@ -593,10 +604,15 @@ class ActionsLayer(DrCodeState):
         ref = UserModelsStore().load().defaults.get(role)
         if ref is not None:
             return f"{ref.provider}/{ref.model}"
+        if role is AgentRole.RESEARCH:
+            return f"{self.role_model_label(AgentRole.CODING)} (inherits coding)"
         return "not set"
 
     def action_change_coding_model(self) -> None:
         self._open_role_model_picker(AgentRole.CODING)
+
+    def action_change_research_model(self) -> None:
+        self._open_role_model_picker(AgentRole.RESEARCH)
 
     def action_change_tester_model(self) -> None:
         self._open_role_model_picker(AgentRole.TESTER)

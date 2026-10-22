@@ -38,7 +38,7 @@ from ..providers import (
     migrate_user_config,
     project_has_model_selection,
 )
-from ..providers import resolve as resolve_model_config
+from ..providers import resolve_effective as resolve_model_config
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
 from ..workflow import load_hooks
@@ -461,9 +461,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # -- per-role model resolution -------------------------------------------
 
     def resolved_config(self, role: AgentRole) -> Config:
-        """Effective model connection for an agent role (coding / tester /
-        compaction): project `models[role]` > user-level default > the flat
-        config. Cached until invalidated."""
+        """Effective model connection for an agent role (coding / research /
+        tester / compaction): project `models[role]` > user-level default >
+        the flat config. The research role falls back to the coding model
+        when nothing is selected for it (`providers.resolve_effective`).
+        Cached until invalidated."""
         cached = self._resolved_configs.get(role)
         if cached is None:
             cached = resolve_model_config(self.config, role)

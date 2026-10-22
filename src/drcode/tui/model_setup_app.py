@@ -16,7 +16,7 @@ double click needed) fills the editor line below it with the model's id,
 context size and compaction limit; "Update" writes the edited values back
 to the selected model, "Add model" creates a new model from the same
 fields, "Remove" deletes it. Per agent role (coding /
-tester / compaction) a default model can be picked from the catalog —
+research / tester / compaction) a default model can be picked from the catalog —
 used when the project does not pin its own.
 
 When models.json does not exist yet but a legacy flat config (user-level
@@ -55,6 +55,7 @@ _PROBE_TIMEOUT = 15.0
 
 _ROLES: tuple[AgentRole, ...] = (
     AgentRole.CODING,
+    AgentRole.RESEARCH,
     AgentRole.TESTER,
     AgentRole.COMPACTION,
 )

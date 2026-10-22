@@ -1036,7 +1036,7 @@ class ChatViewLayer(DrCodeState):
         if not tokens:
             right.update("")
             return
-        max_tokens = self._coding_config().max_context_tokens
+        max_tokens = self.resolved_config(self._task_role(task)).max_context_tokens
         if max_tokens > 0:
             pct = round(tokens * 100 / max_tokens)
             text = (
@@ -1046,9 +1046,11 @@ class ChatViewLayer(DrCodeState):
             # Red from the compaction threshold, yellow when the remaining
             # headroom is twice the red-zone headroom: threshold 80 →
             # yellow from 60, threshold 90 → yellow from 80. The threshold
-            # follows the CODING model's resolved config, so a per-model
-            # compaction limit from the catalog is reflected here too.
-            threshold = min(max(self._coding_config().compaction_threshold, 1), 100)
+            # follows the task's serving role's resolved config (research
+            # tasks use the research model), so a per-model compaction
+            # limit from the catalog is reflected here too.
+            role_config = self.resolved_config(self._task_role(task))
+            threshold = min(max(role_config.compaction_threshold, 1), 100)
             warn_pct = 2 * threshold - 100
             if pct >= threshold:
                 right.add_class("ctx-crit")

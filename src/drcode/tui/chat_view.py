@@ -133,6 +133,42 @@ class ChatViewLayer(DrCodeState):
             # them stale until the run ends — or a view switch.
             self.refresh_status()
 
+    def _poll_new_tasks(self) -> None:
+        """Watch `<project>/.drcode/tasks/` for tasks created by other
+        processes while the app is running (`drcode --feature-request DESC`
+        in a second terminal, a one-shot GitHub sync).
+
+        promote_next() reloads new files itself, but only when the pipeline
+        actively searches the queue — a settled idle pipeline has nothing
+        left to trigger it. This poller closes that gap: external tasks
+        appear in the sidebar and, when the pipeline is idle, are promoted
+        right away instead of idling until a restart. The reload is a cheap
+        directory scan (known files are not re-read), so a 1s interval is
+        safe; a failed scan just waits for the next tick.
+        """
+        try:
+            new = self.manager.reload_new_tasks()
+        except Exception:  # noqa: BLE001 - a broken scan must not kill the poller
+            return
+        if not new:
+            return
+        for task in new:
+            self._show_event(
+                task,
+                "Task created outside this session "
+                "(e.g. `drcode --feature-request`) — loaded from the "
+                "project directory.",
+            )
+        self.refresh_sidebar()
+        self.refresh_status()
+        # Same gate as the startup advance (on_mount): without a configured
+        # model the queue stays parked — the tasks remain visible in the
+        # sidebar and are promoted once a model is picked. Advancing into
+        # run_agent anyway would promote a task to ACTIVE and strand it
+        # there (run_agent's not-configured branch leaves it be).
+        if self.resolved_config(AgentRole.CODING).is_ready:
+            self._advance()
+
     def _sidebar_sections(self) -> list[tuple[str, list[Task]]]:
         """Sidebar content: pipeline sections top to bottom, empty ones
         dropped (the sidebar shows only the stages that have tasks).

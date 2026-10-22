@@ -23,15 +23,33 @@ class Storage:
         # commit it (the helper is a no-op outside a git repository).
         ensure_drcode_gitignored(project_root)
 
-    def load_all(self) -> list[Task]:
-        tasks: list[Task] = []
-        for path in sorted(self.tasks_dir.glob("*.json")):
+    def load_one(self, path: Path) -> Task | None:
+        """Parse a single task file; None on failure.
+
+        A corrupted file is backed up (`.json.bak`), never fatal; a file
+        that vanished between the glob and the read (removed externally
+        mid-scan) is silently skipped. Never raises on unreadable input —
+        callers run inside the pipeline's hot paths.
+        """
+        try:
+            return Task.model_validate(json.loads(path.read_text()))
+        except (json.JSONDecodeError, ValidationError):
+            # Corrupted task file: keep a backup, don't crash the app.
             try:
-                tasks.append(Task.model_validate(json.loads(path.read_text())))
-            except (json.JSONDecodeError, ValidationError):
-                # Corrupted task file: keep a backup, don't crash the app.
-                backup = path.with_suffix(".json.bak")
-                os.replace(path, backup)
+                os.replace(path, path.with_suffix(".json.bak"))
+            except OSError:
+                pass
+            return None
+        except OSError:
+            # Unreadable / disappeared between the glob and the read.
+            return None
+
+    def load_all(self) -> list[Task]:
+        tasks = [
+            t
+            for t in (self.load_one(p) for p in sorted(self.tasks_dir.glob("*.json")))
+            if t is not None
+        ]
         tasks.sort(key=lambda t: t.created_at)
         return tasks
 

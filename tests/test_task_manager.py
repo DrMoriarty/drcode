@@ -730,3 +730,112 @@ def test_active_returns_the_active_task(manager: TaskManager) -> None:
     task = manager.create("t", "x")
     manager.promote_next()
     assert manager.active is task
+
+
+# -- external task pickup (reload_new_tasks) ------------------------------------
+
+
+def _external_create(project_root: Path, title: str) -> Task:
+    """Simulate `drcode --feature-request DESC` from another process: a
+    fresh TaskManager (like the CLI builds) writes a new task file."""
+    return TaskManager(project_root).create(title, f"body of {title}")
+
+
+def test_reload_new_tasks_picks_up_external_task(
+    manager: TaskManager, project_root: Path
+) -> None:
+    manager.create("own", "x")
+    external = _external_create(project_root, "external")
+    assert external.id not in manager.tasks
+
+    added = manager.reload_new_tasks()
+    assert [t.id for t in added] == [external.id]
+    # The loaded copy is a fresh object (parsed from the peer's file), not
+    # the peer's in-memory instance.
+    picked_up = manager.get(external.id)
+    assert picked_up is not external
+    assert picked_up.status is TaskStatus.QUEUED
+    assert [e.text for e in picked_up.pending_input] == ["body of external"]
+    # Stamped into the queue like a fresh creation: sorts after the
+    # existing non-bug tasks.
+    assert manager.queued()[-1].id == external.id
+
+
+def test_reload_is_idempotent(manager: TaskManager, project_root: Path) -> None:
+    external = _external_create(project_root, "external")
+    assert len(manager.reload_new_tasks()) == 1
+    assert manager.reload_new_tasks() == []
+    assert manager.queued() == [external]
+
+
+def test_reload_does_not_overwrite_in_memory_state(
+    manager: TaskManager, project_root: Path
+) -> None:
+    """Known files are never re-read: a task whose pending input was
+    consumed into the transcript mid-run (persisted later, by save) must
+    not get its input resurrected by a disk scan."""
+    task = manager.create("own", "to consume")
+    manager.promote_next()
+    task.pending_input.clear()
+    task.status = TaskStatus.ACTIVE
+    _external_create(project_root, "external")
+
+    assert manager.reload_new_tasks() != []
+    reloaded = manager.get(task.id)
+    assert reloaded is task
+    assert reloaded.pending_input == []
+    assert reloaded.status is TaskStatus.ACTIVE
+
+
+def test_reload_demotes_foreign_active_task(
+    manager: TaskManager, project_root: Path
+) -> None:
+    """A stale ACTIVE file (a crashed peer instance) must not block the
+    local pipeline: on pickup it is demoted to QUEUED, like at startup."""
+    peer = TaskManager(project_root)
+    stale = peer.create("stale", "x")
+    stale.status = TaskStatus.ACTIVE
+    peer.storage.save(stale)
+
+    (added,) = manager.reload_new_tasks()
+    assert added is manager.get(stale.id)
+    assert added.status is TaskStatus.QUEUED
+    # The demotion is persisted, not just in memory.
+    fresh = TaskManager(project_root)
+    assert fresh.get(stale.id).status is TaskStatus.QUEUED
+
+
+def test_promote_next_picks_up_external_task(
+    manager: TaskManager, project_root: Path
+) -> None:
+    """The reported bug: an idle pipeline promotes a task created by
+    another process without a restart — the disk scan happens inside the
+    promotion search itself."""
+    _external_create(project_root, "external")
+    promoted = manager.promote_next()
+    assert promoted is not None
+    assert promoted.title == "external"
+    assert promoted.status is TaskStatus.ACTIVE
+
+
+def test_reload_survives_corrupted_file(
+    manager: TaskManager, project_root: Path
+) -> None:
+    tasks_dir = project_root / ".drcode" / "tasks"
+    (tasks_dir / "broken.json").write_text("{not json")
+    external = _external_create(project_root, "external")
+
+    added = manager.reload_new_tasks()
+    assert [t.id for t in added] == [external.id]
+    assert (tasks_dir / "broken.json.bak").is_file()
+    assert not (tasks_dir / "broken.json").exists()
+
+
+def test_reload_orders_multiple_external_tasks_by_creation(
+    manager: TaskManager, project_root: Path
+) -> None:
+    first = _external_create(project_root, "first")
+    second = _external_create(project_root, "second")
+    added = manager.reload_new_tasks()
+    assert [t.id for t in added] == [first.id, second.id]
+    assert manager.queued() == [first, second]

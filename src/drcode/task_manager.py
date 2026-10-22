@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -31,6 +32,11 @@ class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
         self._status_listeners: list[StatusListener] = []
+        # Serializes reload_new_tasks(): it runs both on the app thread
+        # (the periodic disk poll) and on worker threads (promote_next in
+        # the run's finally-blocks) — two concurrent scans must not load
+        # the same new file twice.
+        self._disk_lock = threading.Lock()
         self.tasks: dict[str, Task] = {t.id: t for t in self.storage.load_all()}
         # Monotonic queue-position counter: bumped when a task is explicitly
         # re-positioned in the queue (kind change to bug → head, to feature
@@ -115,6 +121,50 @@ class TaskManager:
 
         tasks.sort(key=_queue_key)
         return tasks
+
+    def reload_new_tasks(self) -> list[Task]:
+        """Pick up task files that appeared on disk since the last check.
+
+        Another process (`drcode --feature-request DESC` in a second
+        terminal, a one-shot GitHub sync) writes tasks straight into
+        `<project>/.drcode/tasks/` — the running app used to notice them
+        only after a restart. Called whenever the pipeline searches the
+        queue for the next task to promote (promote_next) and by the
+        app's periodic disk poll, so external tasks join the backlog
+        without a restart.
+
+        Loaded tasks are stamped into the queue like fresh creations
+        (queue_seq in created_at order) and a stale ACTIVE status — left
+        by an instance that died or a crashed peer — is demoted to QUEUED,
+        mirroring the startup rule (a local idle pipeline must not wait
+        for a foreign active task that will never finish). Files already
+        known are not re-read, so in-memory state (transcripts consumed
+        mid-run) is never overwritten from disk. Returns the tasks that
+        were added.
+        """
+        with self._disk_lock:
+            known = set(self.tasks)
+            new: list[Task] = []
+            for path in sorted(self.storage.tasks_dir.glob("*.json")):
+                if path.stem in known:
+                    continue
+                task = self.storage.load_one(path)
+                if task is None:
+                    continue
+                known.add(task.id)
+                new.append(task)
+            for t in sorted(new, key=lambda t: t.created_at):
+                changed = False
+                if t.queue_seq is None:
+                    t.queue_seq = self._next_queue_seq()
+                    changed = True
+                if t.status is TaskStatus.ACTIVE:
+                    t.status = TaskStatus.QUEUED
+                    changed = True
+                self.tasks[t.id] = t
+                if changed:
+                    self.storage.save(t)
+            return new
 
     # -- mutations ------------------------------------------------------------
 
@@ -419,6 +469,11 @@ class TaskManager:
         pending input or an interrupted attempt to resume.
         `exclude` skips tasks that already failed this session (bounded
         retries: a failing task must not stall the whole queue in a loop)."""
+        # New tasks may have appeared on disk since the last look (created
+        # by another process, e.g. drcode --feature-request): pick them up
+        # before searching the queue, so the promotion acts on the full
+        # backlog, not just on what this instance loaded earlier.
+        self.reload_new_tasks()
         if self.active is not None:
             return None
         for t in self.queued():

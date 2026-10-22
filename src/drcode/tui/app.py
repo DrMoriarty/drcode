@@ -627,6 +627,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # also mutate mid-run (agent tools, promote_next in the worker
         # finally-blocks) where no one calls refresh_sidebar().
         self.set_interval(1.0, self._poll_sidebar)
+        # External task pickup: task files written by other processes
+        # (drcode --feature-request, one-shot GitHub sync) join the running
+        # app's queue without a restart (see _poll_new_tasks).
+        self.set_interval(1.0, self._poll_new_tasks)
         self.set_interval(1.0, self._poll_activity)
         # Stall watchdog: auto-nudge a run that stopped showing signs of
         # life for the configured period (see _poll_stall).

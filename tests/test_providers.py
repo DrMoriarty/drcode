@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from drcode.agent_model import ModelFetchError, fetch_models
 from drcode.config import Config
@@ -46,7 +47,6 @@ def catalog(user_config_dir: Path) -> UserModelsConfig:
                         id="qwen3-coder-30b",
                         max_context_tokens=131072,
                         max_tokens=4096,
-                        context_reported=True,
                     ),
                     ModelEntry(id="small"),
                 ],
@@ -237,14 +237,17 @@ def test_set_project_model_roundtrip_and_preserves_other_keys(
     assert "models" not in data
 
 
-def test_project_ref_with_slashed_model_id(project_root: Path) -> None:
-    set_project_model(
-        project_root,
-        AgentRole.CODING,
-        ModelRef(provider="openrouter", model="meta-llama/llama-3"),
+def test_provider_and_model_names_reject_slash() -> None:
+    """Neither provider names nor model ids may contain '/': it is the
+    separator of the "provider/model" reference format."""
+    with pytest.raises(ValidationError):
+        Provider(name="a/b", base_url="http://x/v1")
+    with pytest.raises(ValidationError):
+        ModelEntry(id="a/b")
+    # A valid pair passes.
+    Provider(
+        name="openrouter", base_url="http://x/v1", models=[ModelEntry(id="llama-3")]
     )
-    refs = load_project_model_refs(project_root)
-    assert refs[AgentRole.CODING].model == "meta-llama/llama-3"
 
 
 # -- user catalog store ----------------------------------------------------------
@@ -261,6 +264,62 @@ def test_store_save_load_roundtrip(user_config_dir: Path) -> None:
     store.save(cfg)
     loaded = UserModelsStore().load()
     assert loaded == cfg
+    assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
+    assert UserModelsStore().last_warning is None
+
+
+def test_store_defaults_saved_as_strings(user_config_dir: Path) -> None:
+    """Each defaults slot is persisted as one "provider/model" string."""
+    store = UserModelsStore()
+    cfg = UserModelsConfig(
+        providers=[
+            Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
+        ],
+        defaults={AgentRole.CODING: ModelRef(provider="p", model="m")},
+    )
+    store.save(cfg)
+    data = json.loads(store.path.read_text())
+    assert data["defaults"]["coding"] == "p/m"
+
+
+def test_store_loads_string_defaults(user_config_dir: Path) -> None:
+    """The persisted string form parses back into ModelRef slots."""
+    store = UserModelsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {"name": "p", "base_url": "http://p/v1", "models": [{"id": "m"}]}
+                ],
+                "defaults": {"coding": "p/m", "tester": None},
+            }
+        )
+    )
+    loaded = UserModelsStore().load()
+    assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
+    assert loaded.defaults[AgentRole.TESTER] is None
+    assert UserModelsStore().last_warning is None
+
+
+def test_store_loads_legacy_object_defaults(user_config_dir: Path) -> None:
+    """The pre-string format ({"provider": …, "model": …} objects) still
+    loads, so an old models.json survives the format change."""
+    store = UserModelsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {"name": "p", "base_url": "http://p/v1", "models": [{"id": "m"}]}
+                ],
+                "defaults": {
+                    "coding": {"provider": "p", "model": "m"},
+                },
+            }
+        )
+    )
+    loaded = UserModelsStore().load()
     assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
     assert UserModelsStore().last_warning is None
 
@@ -343,7 +402,6 @@ def test_seed_from_user_config_when_models_json_missing(
             id="qwen3-coder-30b",
             max_context_tokens=131072,
             max_tokens=4096,
-            context_reported=False,
         )
     ]
 
@@ -358,7 +416,6 @@ def test_seed_fills_defaults_for_omitted_fields(user_config_dir: Path) -> None:
     assert provider.api_key == ""
     assert provider.models[0].max_context_tokens == 200_000
     assert provider.models[0].max_tokens is None
-    assert provider.models[0].context_reported is False
 
 
 def test_seed_carries_explicit_compaction_threshold(user_config_dir: Path) -> None:
@@ -444,9 +501,7 @@ async def test_fetch_models_canonical_payload() -> None:
     entries = await fetch_models("http://x/v1", "k", _transport=_transport(handler))
     assert [e.id for e in entries] == ["a", "b", "c", "d"]
     assert entries[0].max_context_tokens == 4096
-    assert entries[0].context_reported is True
     assert entries[1].max_context_tokens == 200_000
-    assert entries[1].context_reported is False
     assert entries[2].max_context_tokens == 8192
     assert entries[3].max_context_tokens == 200_000
 

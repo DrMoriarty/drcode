@@ -16,8 +16,8 @@ connection (shared by every agent), this module adds two more layers:
 2. A project-level selection of the model per agent role (coding / tester /
    compaction) stored under the optional `models` key of
    `<project>/.drcode/drcode.json`, values of the form
-   `"<provider-name>/<model-id>"` (provider names must not contain `/`;
-   model ids may). A `null` / absent slot means "use the user-level
+   `"<provider-name>/<model-id>"` (neither provider names nor model ids
+   may contain `/`). A `null` / absent slot means "use the user-level
    default, else the flat config".
 
 Resolution precedence for a role (`resolve`):
@@ -52,7 +52,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_serializer, field_validator
 
 from . import config as _config
 from .config import (
@@ -74,15 +74,25 @@ def user_models_file() -> Path:
     return _config._USER_CONFIG_DIR / USER_MODELS_FILENAME
 
 
+def _reject_slash(value: str) -> str:
+    """Shared validator body: `/` is the separator of the
+    "<provider>/<model-id>" reference format and is forbidden in both
+    halves."""
+    if "/" in value:
+        raise ValueError("must not contain '/'")
+    return value
+
+
 class ModelEntry(BaseModel):
     """One model of a provider: its id at the provider plus the token caps."""
 
+    # Unique id at the provider, e.g. "qwen3-coder-30b"; must not contain
+    # "/" (it is the tail of the "<provider>/<model-id>" reference format).
     id: str
     # Context window of the model, tokens: drives the context-fill display
     # and the compaction threshold. Gateways rarely report it — when
-    # auto-discovery cannot find it, the default below is used and the
-    # entry is flagged (`context_reported=False`) as needing manual
-    # confirmation in the catalog UI.
+    # auto-discovery cannot find it, the default below is used (adjust by
+    # hand in the catalog UI if needed).
     max_context_tokens: int = 200_000
     # Per-response output cap; None = keep whatever the flat config / the
     # provider default says.
@@ -93,9 +103,11 @@ class ModelEntry(BaseModel):
     # the model–context–compaction-limit triple is one indivisible unit:
     # assigning the model to an agent role brings all three with it.
     compaction_threshold: int | None = None
-    # True when the gateway itself reported the context size (trusted);
-    # False = the default above, confirm/adjust by hand in the UI.
-    context_reported: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def _id_no_slash(cls, value: str) -> str:
+        return _reject_slash(value)
 
 
 class Provider(BaseModel):
@@ -110,6 +122,11 @@ class Provider(BaseModel):
     # Config.health_check_url): probed first on later availability checks.
     health_check_url: str = ""
     models: list[ModelEntry] = []
+
+    @field_validator("name")
+    @classmethod
+    def _name_no_slash(cls, value: str) -> str:
+        return _reject_slash(value)
 
 
 class AgentRole(str, enum.Enum):
@@ -135,7 +152,30 @@ class UserModelsConfig(BaseModel):
 
     providers: list[Provider] = []
     # Per-role fallback when the project does not pin a model itself.
+    # Persisted as one string per slot, "provider/model" (null = no
+    # default); the string form is parsed back into a ModelRef on load.
     defaults: dict[AgentRole, ModelRef | None] = {}
+
+    @field_validator("defaults", mode="before")
+    @classmethod
+    def _parse_default_slots(cls, value: object) -> object:
+        """Accept the persisted per-slot string "provider/model" (and the
+        legacy `{"provider": …, "model": …}` object) instead of ModelRef."""
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: slot if isinstance(slot, ModelRef) else _parse_ref(slot)
+            for key, slot in value.items()
+        }
+
+    @field_serializer("defaults", when_used="json")
+    def _serialize_default_slots(
+        self, value: dict[AgentRole, ModelRef | None]
+    ) -> dict[str, str | None]:
+        return {
+            role.value: (str(ref) if ref is not None else None)
+            for role, ref in value.items()
+        }
 
 
 # -- project-level selection (.drcode/drcode.json "models" key) --------------
@@ -160,15 +200,14 @@ def _read_json(path: Path) -> dict[str, object]:
 
 
 def _parse_ref(value: object) -> ModelRef | None:
-    """Parse one `models[role]` value: "provider/model" (string), a
-    {"provider": …, "model": …} object, or None."""
+    """Parse one `models[role]` / `defaults[role]` slot: "provider/model"
+    (string, exactly one "/"), a {"provider": …, "model": …} object
+    (legacy), or None."""
     if value is None:
         return None
     if isinstance(value, str):
-        if "/" not in value:
-            return None
-        provider, _, model = value.partition("/")
-        if not provider or not model:
+        provider, sep, model = value.partition("/")
+        if not sep or not provider or not model or "/" in model:
             return None
         return ModelRef(provider=provider, model=model)
     if isinstance(value, dict):
@@ -344,8 +383,9 @@ def load_seeded_catalog(
         return catalog, None
     data = _read_json(_config.USER_CONFIG_FILE)
     model = str(data.get("model") or "").strip()
-    if not model:
-        # Nothing (usable) described in the flat config — empty catalog.
+    if not model or "/" in model:
+        # Nothing (usable) described in the flat config — or a model id
+        # with "/", which the reference format forbids. Empty catalog.
         return catalog, None
     base_url = str(data.get("base_url") or "").strip() or str(
         Config.model_fields["base_url"].default
@@ -376,9 +416,6 @@ def load_seeded_catalog(
                 max_context_tokens=max_context,
                 max_tokens=max_tokens,
                 compaction_threshold=compaction_threshold,
-                # The flat config value is not a gateway report — keep the
-                # "confirm by hand" flag of a hand-entered entry.
-                context_reported=False,
             )
         ],
     )

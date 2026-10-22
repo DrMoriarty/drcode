@@ -314,16 +314,12 @@ def ensure_user_config_dir() -> None:
                                         "max_context_tokens": 200000,
                                         "max_tokens": None,
                                         "compaction_threshold": None,
-                                        "context_reported": False,
                                     }
                                 ],
                             }
                         ],
                         "defaults": {
-                            "coding": {
-                                "provider": "local-swap",
-                                "model": "qwen3-coder-30b",
-                            },
+                            "coding": "local-swap/qwen3-coder-30b",
                             "tester": None,
                             "compaction": None,
                         },

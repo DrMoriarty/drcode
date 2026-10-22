@@ -85,7 +85,7 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         entry = data["providers"][0]["models"][0]
         assert entry["id"] == "my-model"
         assert entry["max_context_tokens"] == 131072
-        assert data["defaults"]["coding"] == {"provider": "p", "model": "my-model"}
+        assert data["defaults"]["coding"] == "p/my-model"
 
 
 async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
@@ -179,7 +179,6 @@ async def test_add_model_validation(tmp_path: Path) -> None:
         assert added.id == "new-m"
         assert added.max_context_tokens == 8192
         assert added.compaction_threshold == 50
-        assert added.context_reported is True
         assert "added new-m" in str(status.render())
 
 
@@ -272,6 +271,36 @@ async def test_row_selection_fills_editor_and_update_remove(tmp_path: Path) -> N
         assert screen.query_one("#mc-model-id", Input).value == ""
         assert screen.query_one("#mc-ctx", Input).value == ""
         assert screen.query_one("#mc-pct", Input).value == ""
+
+
+async def test_slash_rejected_in_provider_and_model_names(tmp_path: Path) -> None:
+    """'/' is the provider/model reference separator: the catalog screen
+    refuses it both in the provider name and in the model id."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        status = screen.query_one("#mc-status")
+        # Provider name with a slash.
+        screen.query_one("#mc-name", Input).value = "a/b"
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        assert "provider name must not contain '/'" in str(status.render())
+        # Model id with a slash (Add model path).
+        screen.query_one("#mc-name", Input).value = "p"
+        screen.query_one("#mc-model-id", Input).value = "x/y"
+        await pilot.click("#mc-model-add")
+        await pilot.pause()
+        assert "model id must not contain '/'" in str(status.render())
+        assert [m.id for m in screen.catalog.providers[0].models] == ["m"]
 
 
 async def test_duplicate_provider_name_rejected(tmp_path: Path) -> None:

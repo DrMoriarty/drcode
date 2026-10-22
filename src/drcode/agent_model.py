@@ -222,18 +222,18 @@ def _models_urls(base_url: str) -> list[str]:
     return urls
 
 
-def _entry_context(item: dict[str, Any]) -> tuple[int, bool]:
-    """(context_tokens, reported_by_gateway) of one /models entry."""
+def _entry_context(item: dict[str, Any]) -> int:
+    """Context size (tokens) of one /models entry."""
     for key in _CONTEXT_KEYS:
         value = item.get(key)
         if isinstance(value, int) and value > 0:
-            return value, True
+            return value
     meta = item.get("meta")
     if isinstance(meta, dict):
         value = meta.get("n_ctx")  # llama.cpp
         if isinstance(value, int) and value > 0:
-            return value, True
-    return 200_000, False
+            return value
+    return 200_000
 
 
 def _parse_models_payload(payload: Any) -> list[ModelEntry]:
@@ -256,12 +256,11 @@ def _parse_models_payload(payload: Any) -> list[ModelEntry]:
         model_id = item.get("id")
         if not isinstance(model_id, str) or not model_id:
             continue
-        context, reported = _entry_context(item)
+        context = _entry_context(item)
         entries.append(
             ModelEntry(
                 id=model_id,
                 max_context_tokens=context,
-                context_reported=reported,
             )
         )
     return entries
@@ -280,8 +279,7 @@ async def fetch_models(
     base_url has no /v1 suffix) and parses `data[].id`. Context sizes are
     taken from optional gateway-specific keys when present
     (`_CONTEXT_KEYS` / llama.cpp `meta.n_ctx`); otherwise the entry gets
-    the 200_000 default and `context_reported=False` ("needs manual
-    confirmation" in the catalog UI).
+    the 200_000 default (adjust by hand in the catalog UI if needed).
 
     Raises `ModelFetchError` when no endpoint answers with a model list.
     The `_transport` parameter exists for tests (httpx.MockTransport).

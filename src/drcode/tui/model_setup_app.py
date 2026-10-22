@@ -225,6 +225,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         if not name:
             self._status("✗ provider name must not be empty")
             return False
+        if "/" in name:
+            self._status("✗ provider name must not contain '/'")
+            return False
         if not url:
             self._status("✗ base URL must not be empty")
             return False
@@ -435,13 +438,7 @@ class ModelCatalogScreen(ModalScreen[None]):
             provider.models.extend(fresh)
             self._refresh_models()
             self._refresh_providers()
-            unconfirmed = sum(1 for e in fresh if not e.context_reported)
-            note = (
-                f"; {unconfirmed} context size(s) not reported — confirm by hand"
-                if unconfirmed
-                else ""
-            )
-            self._status(f"✓ fetched {len(entries)} models ({len(fresh)} new){note}")
+            self._status(f"✓ fetched {len(entries)} models ({len(fresh)} new)")
         finally:
             self._busy = False
 
@@ -538,6 +535,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         provider = self._provider()
         assert provider is not None
         new_id = self.query_one("#mc-model-id", Input).value.strip() or entry.id
+        if "/" in new_id:
+            self._status("✗ model id must not contain '/'")
+            return
         caps = self._parse_caps()
         if caps is None:
             return
@@ -560,8 +560,6 @@ class ModelCatalogScreen(ModalScreen[None]):
             self._selected_model = new_id
         if ctx != entry.max_context_tokens:
             entry.max_context_tokens = ctx
-            # A hand-entered value is by definition confirmed.
-            entry.context_reported = True
         entry.compaction_threshold = pct
         self._refresh_models()
         self._refresh_roles()
@@ -598,6 +596,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         if not model_id:
             self._status("Enter a model id to add.")
             return
+        if "/" in model_id:
+            self._status("✗ model id must not contain '/'")
+            return
         if any(m.id == model_id for m in provider.models):
             self._status(f"✗ model '{model_id}' already exists")
             return
@@ -610,8 +611,6 @@ class ModelCatalogScreen(ModalScreen[None]):
                 id=model_id,
                 max_context_tokens=ctx,
                 compaction_threshold=pct,
-                # A hand-entered context size counts as confirmed.
-                context_reported=True,
             )
         )
         self._selected_model = model_id

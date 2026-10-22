@@ -754,28 +754,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # -- copy on select -------------------------------------------------------
 
     def _selected_text(self) -> str | None:
-        """Extract the currently selected text from rendered lines.
+        """Extract the currently selected text.
 
-        Done at the app level instead of Widget.get_selection, which works on
-        logical (unwrapped) text and returns garbled results for wrapped lines.
+        Screen.get_selected_text maps the selection through the per-cell
+        meta offsets of the rendered strips, so wrapped display rows and
+        content lines stay aligned (a row-based extraction here drifts by
+        every padding/wrapped row above the selection).
         """
-        parts: list[str] = []
-        for widget, selection in self.screen.selections.items():
-            if not widget.is_attached:
-                continue
-            lines: list[str] = []
-            for y in range(widget.size.height):
-                span = selection.get_span(y)
-                if span is None:
-                    continue
-                start, end = span
-                line = widget.render_line(y).text
-                lines.append((line[start:] if end == -1 else line[start:end]).rstrip())
-            if lines:
-                parts.append("\n".join(lines).rstrip())
-        if not parts:
-            return None
-        return "\n".join(parts)
+        return self.screen.get_selected_text()
 
     def _copy_with_fallback(self, text: str) -> None:
         # copy_to_clipboard uses OSC52, which macOS Terminal.app ignores;

@@ -1256,3 +1256,75 @@ async def test_custom_role_model_dialog_prefills_and_saves(
     assert customs[AgentRole.COMPACTION].model == "old-m"
     assert customs[AgentRole.COMPACTION].max_context_tokens == 32000
     assert _project_json(project_root)["models"]["coding"] == "custom"
+
+
+# -- copy on select -----------------------------------------------------------------
+
+
+async def test_copy_on_select_matches_visual_selection(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mouse-selecting a code fragment inside a wrapped user prompt copies
+    exactly that fragment: the selection offsets are content coordinates,
+    so the extraction must not index them against display rows (padding
+    and soft-wrapped rows above the selection would shift the fragment)."""
+    long_prompt = (
+        "The custom workflow layer has no hook for a post-verification step. "
+        "The closest hook, `on_accepted`, is only reachable through the "
+        "external-review gate:\n"
+        "\n"
+        "- `_run_accepted_hook` is called from exactly one place — inside "
+        "`run_external_review` (`src/drcode/tui/pipeline.py:1749`);\n"
+        "- the external review only starts when the script defines `on_review`.\n"
+        "\n"
+        'So a user who just wants "after the tester PASSED the task, run '
+        '`uv tool install . --force`" must define a fake review gate:\n'
+        "\n"
+        "```python\n"
+        "def on_review(task):\n"
+        '    return {"verdict": "accept"}   # dummy, only to unlock on_accepted\n'
+        "\n"
+        "def on_accepted(task):\n"
+        '    subprocess.run(["uv", "tool", "install", ".", "--force"], check=True)\n'
+        "```\n"
+    )
+    task = app.manager.create("hook task", long_prompt)
+    copied: list[str] = []
+    monkeypatch.setattr(app, "_copy_with_fallback", copied.append)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        assert app.viewed_id == task.id
+        # The rendered user block: locate the display rows of the code
+        # fragment the user would drag over.
+        block = next(
+            w
+            for w in app.query_one("#chat-log").children
+            if "```python" in str(w.render())
+        )
+        fence_row = close_row = None
+        for y in range(block.size.height):
+            line = block.render_line(y).text
+            if "```python" in line:
+                fence_row = y
+            if line.rstrip() == "```":
+                close_row = y
+        assert fence_row is not None and close_row is not None
+        content = block.content_region
+        await pilot.mouse_down(offset=(content.x, content.y + fence_row))
+        # Drag to just past the closing fence (as a user selecting the whole
+        # displayed fragment would).
+        await pilot.mouse_up(offset=(content.x + 4, content.y + close_row))
+        await pilot.pause()
+    assert copied == [
+        (
+            "```python\n"
+            "def on_review(task):\n"
+            '    return {"verdict": "accept"}   # dummy, only to unlock on_accepted\n'
+            "\n"
+            "def on_accepted(task):\n"
+            '    subprocess.run(["uv", "tool", "install", ".", "--force"], check=True)\n'
+            "```"
+        )
+    ]

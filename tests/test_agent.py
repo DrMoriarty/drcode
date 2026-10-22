@@ -440,7 +440,12 @@ def test_load_agents_md_missing(tmp_path: Path) -> None:
 def deps(project_root: Path) -> AgentDeps:
     manager = TaskManager(project_root)
     task = manager.create("t", "x")
-    return AgentDeps(root=project_root, manager=manager, task_id=task.id)
+    return AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
 
 def test_log_violation_appends_event(deps: AgentDeps, project_root: Path) -> None:
@@ -508,7 +513,12 @@ def _git(repo: Path, *args: str) -> None:
 def _tester_deps(root: Path) -> agent_mod.TesterDeps:
     manager = TaskManager(root)
     task = manager.create("t", "x")
-    return agent_mod.TesterDeps(root=root, manager=manager, task_id=task.id)
+    return agent_mod.TesterDeps(
+        root=root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
 
 async def test_git_push_skips_without_remote(tmp_path: Path) -> None:
@@ -563,7 +573,12 @@ async def test_git_push_success_with_bare_remote(tmp_path: Path) -> None:
 def _research_deps(root: Path) -> agent_mod.AgentDeps:
     manager = TaskManager(root)
     task = manager.create("docs", "write docs", kind=TaskKind.RESEARCH)
-    return agent_mod.AgentDeps(root=root, manager=manager, task_id=task.id)
+    return agent_mod.AgentDeps(
+        root=root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
 
 def _committed_files(repo: Path) -> list[str]:
@@ -685,7 +700,12 @@ def test_track_edited_file(tmp_path: Path) -> None:
 def test_track_edited_file_ignores_non_research(tmp_path: Path) -> None:
     manager = TaskManager(tmp_path)
     task = manager.create("f", "x", kind=TaskKind.FEATURE)
-    deps = agent_mod.AgentDeps(root=tmp_path, manager=manager, task_id=task.id)
+    deps = agent_mod.AgentDeps(
+        root=tmp_path,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
     agent_mod._track_edited_file(deps, tmp_path / "README.md")
     assert manager.get(task.id).edited_files == []
 

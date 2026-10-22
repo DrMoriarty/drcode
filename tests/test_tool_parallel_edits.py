@@ -45,8 +45,10 @@ def racy_edit(monkeypatch):
     snapshot; with the sequential barrier the calls never overlap."""
     from drcode.tools import resolve_edit_path
 
-    def slow_edit(root: Path, path: str, old_string: str, new_string: str) -> str:
-        p = resolve_edit_path(root, path, "edit")
+    def slow_edit(
+        root: Path, path: str, old_string: str, new_string: str, **_: object
+    ) -> str:
+        p = resolve_edit_path(root, path, "edit", extra_writable=root / ".scratch")
         text = p.read_text(errors="replace")
         time.sleep(0.3)
         p.write_text(text.replace(old_string, new_string, 1))
@@ -81,7 +83,12 @@ async def test_pair_of_edits_in_one_response_both_apply(
     mgr = TaskManager(project_root)
     mgr.create("docs", "the task")
     task = mgr.all_tasks()[0]
-    deps = AgentDeps(root=project_root, manager=mgr, task_id=task.id)
+    deps = AgentDeps(
+        root=project_root,
+        manager=mgr,
+        task_id=task.id,
+        scratch=tools.scratch_dir(task.id),
+    )
 
     scripted.steps = [two_edit_response(), ModelResponse(parts=[TextPart("done")])]
     async with ag.iter("the task", deps=deps) as run:

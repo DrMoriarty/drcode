@@ -115,7 +115,8 @@ class Task(BaseModel):
     # write_file/edit_file (tracked in agent._track_edited_file). The
     # research-only git_commit_docs tool stages exactly these paths — never
     # any other change in the working tree — and clears the list after a
-    # successful commit. /tmp scratch files are never recorded here.
+    # successful commit. Scratch files under /tmp/drcode/<task-id> are never
+    # recorded here.
     edited_files: list[str] = Field(default_factory=list)
     # When the task reached COMPLETED (tester verdict, research done or
     # user cancel). Drives the startup auto-cleanup of old completed tasks

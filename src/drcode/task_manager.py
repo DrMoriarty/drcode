@@ -17,6 +17,7 @@ from .models import (
     _now,
 )
 from .storage import Storage
+from .tools import remove_scratch
 from .transcript import is_pending_retry
 from .workflow import ensure_workflow_examples
 
@@ -380,6 +381,7 @@ class TaskManager:
         may be deleted."""
         self.tasks.pop(task_id, None)
         self.storage.delete(task_id)
+        remove_scratch(task_id)
 
     def purge_expired_completed(self, retention_days: int | None) -> list[Task]:
         """Delete COMPLETED tasks older than the retention period.
@@ -465,6 +467,7 @@ class TaskManager:
         )
         if task.status is TaskStatus.COMPLETED:
             task.completed_at = _now()
+            remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, origin)
         return task
@@ -504,6 +507,7 @@ class TaskManager:
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.unfinished = False
+        remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -526,6 +530,7 @@ class TaskManager:
         task.completed_at = _now()
         task.review_pending = False
         task.review_rejections = 0
+        remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, "user")
         return task
@@ -567,6 +572,7 @@ class TaskManager:
             return task
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
+        remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -584,6 +590,7 @@ class TaskManager:
         task.completed_at = _now()
         task.unfinished = False
         task.review_rejections = 0
+        remove_scratch(task_id)
         task.touch()
         self._save_changed(task, old, origin)
         return task

@@ -839,3 +839,62 @@ def test_reload_orders_multiple_external_tasks_by_creation(
     added = manager.reload_new_tasks()
     assert [t.id for t in added] == [first.id, second.id]
     assert manager.queued() == [first, second]
+
+
+# -- scratch-directory lifecycle ---------------------------------------------------
+
+
+@pytest.fixture
+def scratch_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the /tmp/drcode scratch base into the test's tmp dir."""
+    base = tmp_path / "drcode-scratch"
+    monkeypatch.setattr("drcode.tools.SCRATCH_ROOT", base)
+    return base
+
+
+def _touch_scratch(base: Path, task_id: str) -> Path:
+    scratch = base / task_id
+    scratch.mkdir(parents=True, exist_ok=True)
+    (scratch / "f.txt").write_text("scratch")
+    return scratch
+
+
+def test_completion_removes_scratch(manager: TaskManager, scratch_base: Path) -> None:
+    task = manager.create("t", "x", kind=TaskKind.RESEARCH)
+    scratch = _touch_scratch(scratch_base, task.id)
+    manager.mark_done(task.id)  # research: straight to COMPLETED
+    assert not scratch.exists()
+
+
+def test_mark_done_to_testing_keeps_scratch(
+    manager: TaskManager, scratch_base: Path
+) -> None:
+    # A feature task goes to TESTING first; the tester may still need the
+    # scratch files (and an unfinished/re-queued task must keep them too).
+    task = manager.create("t", "x")
+    scratch = _touch_scratch(scratch_base, task.id)
+    manager.mark_done(task.id)
+    assert scratch.is_dir()
+    manager.set_verification(task.id, success=True)
+    assert not scratch.exists()
+
+
+def test_cancel_removes_scratch_but_requeue_keeps_it(
+    manager: TaskManager, scratch_base: Path
+) -> None:
+    task = manager.create("t", "x")
+    scratch = _touch_scratch(scratch_base, task.id)
+    # Re-queue (user message on a completed task): the task may resume work
+    # with its scratch files — nothing is removed.
+    manager.send(task.id, "one more round")
+    assert scratch.is_dir()
+    manager.cancel(task.id)
+    assert not scratch.exists()
+
+
+def test_delete_removes_scratch(manager: TaskManager, scratch_base: Path) -> None:
+    task = manager.create("t", "x")
+    manager.set_hold(task.id, on=True)
+    scratch = _touch_scratch(scratch_base, task.id)
+    manager.delete(task.id)
+    assert not scratch.exists()

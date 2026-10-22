@@ -130,16 +130,24 @@ __all__ = [
 
 @dataclass
 class AgentDeps:
-    """Dependencies for the coding agent: project root, task manager, task id."""
+    """Dependencies for the coding agent: project root, task manager, task id.
+
+    `scratch` is the task's personal writable scratch directory
+    (/tmp/drcode/<task-id>, see tools.scratch_dir): the only place outside
+    the project root the tools may write to."""
 
     root: Path
     manager: TaskManager
     task_id: str
+    scratch: Path
 
 
 @dataclass
 class TesterDeps:
     """Dependencies for the tester agent: project root, task manager, verified task.
+
+    `scratch` is the task's personal writable scratch directory
+    (/tmp/drcode/<task-id>, see tools.scratch_dir).
 
     `review_gate` mirrors the project's external-review hook
     (`.drcode/workflow.py` defines on_review): a PASSED verdict then leaves
@@ -149,6 +157,7 @@ class TesterDeps:
     root: Path
     manager: TaskManager
     task_id: str
+    scratch: Path
     review_gate: bool = False
 
 
@@ -235,12 +244,25 @@ def build_agent(
     @agent.tool(sequential=True)
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file. Only the project root (with all subdirectories)
-        and /tmp (with all subdirectories) are writable; use /tmp to test hypotheses."""
+        and your scratch directory /tmp/drcode/<task-id> are writable; use the scratch
+        directory to test hypotheses."""
         result = await _run_tool_logged(
-            ctx.deps, "write_file", tools.write_file, ctx.deps.root, path, content
+            ctx.deps,
+            "write_file",
+            tools.write_file,
+            ctx.deps.root,
+            path,
+            content,
+            extra_writable=ctx.deps.scratch,
         )
         _track_edited_file(
-            ctx.deps, tools.resolve_edit_path(ctx.deps.root, path, "create/overwrite")
+            ctx.deps,
+            tools.resolve_edit_path(
+                ctx.deps.root,
+                path,
+                "create/overwrite",
+                extra_writable=ctx.deps.scratch,
+            ),
         )
         return result
 
@@ -249,8 +271,8 @@ def build_agent(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
         """Replace an exact unique substring in a file. old_string must match exactly once.
-        Only the project root (with all subdirectories) and /tmp (with all subdirectories)
-        are writable; use /tmp to test hypotheses."""
+        Only the project root (with all subdirectories) and your scratch directory
+        /tmp/drcode/<task-id> are writable; use the scratch directory to test hypotheses."""
         result = await _run_tool_logged(
             ctx.deps,
             "edit_file",
@@ -259,8 +281,14 @@ def build_agent(
             path,
             old_string,
             new_string,
+            extra_writable=ctx.deps.scratch,
         )
-        _track_edited_file(ctx.deps, tools.resolve_edit_path(ctx.deps.root, path))
+        _track_edited_file(
+            ctx.deps,
+            tools.resolve_edit_path(
+                ctx.deps.root, path, extra_writable=ctx.deps.scratch
+            ),
+        )
         return result
 
     @agent.tool
@@ -284,7 +312,8 @@ def build_agent(
         The command is killed after `timeout` seconds (default 120); pass a
         larger timeout for long-running commands (builds, test suites) —
         values above 3600 (60 minutes) are clamped to 3600.
-        rm/mv/cp are only allowed with paths inside the project root or /tmp."""
+        rm/mv/cp are only allowed with paths inside the project root or your
+        scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     # Task-creation tools exist only for the research agent: coding
@@ -449,7 +478,8 @@ def build_tester_agent(
         The command is killed after `timeout` seconds (default 120); pass a
         larger timeout for long-running checks (full test suites, builds) —
         values above 3600 (60 minutes) are clamped to 3600.
-        rm/mv/cp are only allowed with paths inside the project root or /tmp."""
+        rm/mv/cp are only allowed with paths inside the project root or your
+        scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     @agent.tool
@@ -478,20 +508,36 @@ def build_tester_agent(
             message = message.strip().strip("'\"")
             if not message:
                 return "Empty commit message — nothing committed."
-            inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
+            inside = await tools.run_bash(
+                root,
+                "git rev-parse --is-inside-work-tree",
+                extra_writable=ctx.deps.scratch,
+            )
             if not inside.startswith("exit=0") or "true" not in inside:
                 return "Not a git repository — nothing committed."
-            await tools.run_bash(root, "git add -A -- . ':(exclude).drcode'")
-            staged = await tools.run_bash(root, "git diff --cached --name-only")
+            await tools.run_bash(
+                root,
+                "git add -A -- . ':(exclude).drcode'",
+                extra_writable=ctx.deps.scratch,
+            )
+            staged = await tools.run_bash(
+                root, "git diff --cached --name-only", extra_writable=ctx.deps.scratch
+            )
             if (
                 staged.startswith("exit=0")
                 and not staged.removeprefix("exit=0").strip()
             ):
                 return "Nothing to commit — the working tree is clean."
-            commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
+            commit = await tools.run_bash(
+                root,
+                f"git commit -m {shlex.quote(message)}",
+                extra_writable=ctx.deps.scratch,
+            )
             if not commit.startswith("exit=0"):
                 return f"Commit failed:\n{commit}"
-            head = await tools.run_bash(root, "git log -1 --oneline")
+            head = await tools.run_bash(
+                root, "git log -1 --oneline", extra_writable=ctx.deps.scratch
+            )
             result = f"Committed successfully.\n{head}"
             return result + await _git_push(ctx.deps, root)
 
@@ -524,17 +570,19 @@ async def _git_push(deps: AgentDeps | TesterDeps, root: Path) -> str:
     the task's service-event log and reported back to the model as a note, so
     the tester still passes the task and the research agent still finishes
     its documentation assignment with the commit safe locally."""
-    remotes = await tools.run_bash(root, "git remote")
+    remotes = await tools.run_bash(root, "git remote", extra_writable=deps.scratch)
     names = remotes.removeprefix("exit=0").strip()
     if not remotes.startswith("exit=0") or not names or names == "(no output)":
         log_service_event(deps, "git", "git push skipped: no remote configured.")
         return "\ngit push skipped: no remote configured."
-    push = await tools.run_bash(root, "git push")
+    push = await tools.run_bash(root, "git push", extra_writable=deps.scratch)
     if push.startswith("exit=0"):
         return "\nPushed successfully."
     if "no upstream" in push:
         # Fresh branch without tracking: retry once, setting the upstream.
-        push = await tools.run_bash(root, "git push --set-upstream origin HEAD")
+        push = await tools.run_bash(
+            root, "git push --set-upstream origin HEAD", extra_writable=deps.scratch
+        )
         if push.startswith("exit=0"):
             return "\nPushed successfully (set upstream to origin/HEAD)."
     detail = push.removeprefix("exit=0").strip() or "(no output)"
@@ -553,8 +601,9 @@ def _track_edited_file(deps: AgentDeps, resolved: Path) -> None:
 
     Only research tasks are tracked: the coding agent's feature/bug changes
     are committed by the tester, not by the agent itself. Paths outside the
-    project root (/tmp scratch files) are ignored — they can never become
-    commit candidates. The list persists with the task, so tracking survives
+    project root (scratch files under /tmp/drcode/<task-id>) are ignored —
+    they can never become commit candidates. The list persists with the
+    task, so tracking survives
     restarts and the multi-turn loop of one run (a new AgentDeps is built per
     `agent.iter`, the task field is the shared accumulator). Duplicates are
     collapsed, keeping the first-seen order.
@@ -593,23 +642,33 @@ async def _commit_tracked_files(deps: AgentDeps, root: Path, message: str) -> st
             "this task yourself. Only files you changed are ever committed; "
             "other project changes are never staged."
         )
-    inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
+    inside = await tools.run_bash(
+        root, "git rev-parse --is-inside-work-tree", extra_writable=deps.scratch
+    )
     if not inside.startswith("exit=0") or "true" not in inside:
         return "Not a git repository — nothing committed."
     quoted = " ".join(shlex.quote(f) for f in files)
-    add = await tools.run_bash(root, f"git add -A -- {quoted}")
+    add = await tools.run_bash(
+        root, f"git add -A -- {quoted}", extra_writable=deps.scratch
+    )
     if not add.startswith("exit=0"):
         return f"Staging failed:\n{add}"
-    staged = await tools.run_bash(root, "git diff --cached --name-only")
+    staged = await tools.run_bash(
+        root, "git diff --cached --name-only", extra_writable=deps.scratch
+    )
     if staged.startswith("exit=0") and not staged.removeprefix("exit=0").strip():
         return (
             "Nothing to commit — the files you edited carry no changes "
             "against HEAD (already committed or untouched)."
         )
-    commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
+    commit = await tools.run_bash(
+        root, f"git commit -m {shlex.quote(message)}", extra_writable=deps.scratch
+    )
     if not commit.startswith("exit=0"):
         return f"Commit failed:\n{commit}"
-    head = await tools.run_bash(root, "git log -1 --oneline")
+    head = await tools.run_bash(
+        root, "git log -1 --oneline", extra_writable=deps.scratch
+    )
     task.edited_files.clear()
     task.touch()
     deps.manager.storage.save(task)

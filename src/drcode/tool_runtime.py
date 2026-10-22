@@ -58,7 +58,7 @@ async def _run_bash_logged(
     deps: AgentDeps | TesterDeps, root: Path, command: str, timeout: float | None = None
 ) -> str:
     try:
-        return await tools.run_bash(root, command, timeout)
+        return await tools.run_bash(root, command, timeout, extra_writable=deps.scratch)
     except PathViolation as e:
         log_violation(deps, "run_bash", str(e))
         raise ModelRetry(str(e)) from e

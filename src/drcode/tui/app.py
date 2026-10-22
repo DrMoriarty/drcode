@@ -41,6 +41,7 @@ from ..providers import (
 from ..providers import resolve_effective as resolve_model_config
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
+from ..tools import cleanup_orphan_scratches
 from ..workflow import load_hooks
 from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
@@ -279,6 +280,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
+        # Scratch hygiene: remove /tmp/drcode/<id> directories whose task no
+        # longer exists — leftovers from a crashed previous session (scratch
+        # directories of live tasks, including interrupted ones, are kept).
+        cleanup_orphan_scratches(set(self.manager.tasks))
         # Custom team workflow (opt-in by file presence): .drcode/workflow.py
         # hooks (branch checkout, dev-done, external review, accept) and
         # .drcode/git-workflow.md rules (read at prompt-build time). None =

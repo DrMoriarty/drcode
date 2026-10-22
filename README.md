@@ -161,7 +161,7 @@ drcode --git-hub-sync             # run one GitHub Issues sync cycle and exit
 
 The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`, `glob_files`, `grep_search`, `run_bash`, `ask_clarifying_question`.
 
-- Reading and searching work anywhere; writing is jailed to the project root and `/tmp` (symlink-aware). Violations are refused, logged into the task's service-event history and returned to the model as a retry prompt.
+- Reading and searching work anywhere; writing is jailed to the project root and the task's personal scratch directory `/tmp/drcode/<task-id>` (symlink-aware, so `/private/tmp` on macOS counts too) — the rest of `/tmp`, including other tasks' scratch directories, is off-limits. Violations are refused, logged into the task's service-event history and returned to the model as a retry prompt. The scratch directory is created lazily on first use, removed when the task completes or is deleted, and `run_bash` points the child process's `TMPDIR` at it.
 - `run_bash` inspects the command first and refuses `rm`/`mv`/`cp` whose path arguments escape the writable area.
 - The tester runs with read-only tools; its single write exception is `git_commit`, allowed only after all checks passed.
 

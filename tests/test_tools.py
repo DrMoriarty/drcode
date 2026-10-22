@@ -28,6 +28,15 @@ from drcode.tools import (
 # -- path resolution & permissions ----------------------------------------------
 
 
+@pytest.fixture
+def scratch_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the /tmp/drcode scratch base into the test's tmp dir, so the
+    per-task scratch tests never touch the real /tmp."""
+    root = tmp_path / "drcode-scratch"
+    monkeypatch.setattr(tools, "SCRATCH_ROOT", root)
+    return root
+
+
 def test_resolve_read_path_relative_against_root(project_root: Path) -> None:
     p = resolve_read_path(project_root, "src/main.py")
     assert p == (project_root / "src/main.py").resolve()
@@ -48,8 +57,21 @@ def test_is_writable_inside_root(project_root: Path) -> None:
     assert is_writable(project_root, project_root / "src" / "main.py")
 
 
-def test_is_writable_tmp(project_root: Path) -> None:
-    assert is_writable(project_root, Path("/tmp/scratch/x.txt"))
+def test_is_writable_own_scratch(project_root: Path, scratch_root: Path) -> None:
+    scratch = tools.scratch_dir("abc12345")
+    assert is_writable(project_root, scratch, scratch)
+    assert is_writable(project_root, scratch / "sub" / "x.txt", scratch)
+
+
+def test_is_writable_tmp_outside_own_scratch_refused(
+    project_root: Path, scratch_root: Path
+) -> None:
+    scratch = tools.scratch_dir("abc12345")
+    # Foreign scratch directories and the rest of /tmp are NOT writable.
+    assert not is_writable(project_root, tools.scratch_dir("other"), scratch)
+    assert not is_writable(project_root, Path("/tmp/scratch/x.txt"), scratch)
+    # Without a scratch area nothing under /tmp is writable at all.
+    assert not is_writable(project_root, Path("/tmp/scratch/x.txt"))
 
 
 def test_is_writable_outside(project_root: Path) -> None:
@@ -58,39 +80,71 @@ def test_is_writable_outside(project_root: Path) -> None:
     assert not is_writable(project_root, Path("/tmpfoo/x.txt"))
 
 
-def test_resolve_edit_path_outside_raises(project_root: Path) -> None:
+def test_resolve_edit_path_outside_raises(
+    project_root: Path, scratch_root: Path
+) -> None:
     with pytest.raises(PathViolation):
-        resolve_edit_path(project_root, "/etc/hosts")
+        resolve_edit_path(
+            project_root,
+            "/etc/hosts",
+            extra_writable=tools.scratch_dir("abc12345"),
+        )
 
 
-def test_resolve_edit_path_symlink_escape_raises(project_root: Path) -> None:
+def test_resolve_edit_path_symlink_escape_raises(
+    project_root: Path, scratch_root: Path
+) -> None:
     outside = project_root.parent / "outside.txt"
     outside.write_text("secret")
     link = project_root / "link.txt"
     link.symlink_to(outside)
     with pytest.raises(PathViolation):
-        resolve_edit_path(project_root, "link.txt")
+        resolve_edit_path(
+            project_root, "link.txt", extra_writable=tools.scratch_dir("abc12345")
+        )
 
 
-def test_resolve_edit_path_symlink_into_root_ok(project_root: Path) -> None:
+def test_resolve_edit_path_symlink_into_root_ok(
+    project_root: Path, scratch_root: Path
+) -> None:
     target = project_root / "real.txt"
     target.write_text("ok")
     link = project_root / "link.txt"
     link.symlink_to(target)
-    assert resolve_edit_path(project_root, "link.txt") == target.resolve()
-
-
-def test_resolve_edit_path_relative(project_root: Path) -> None:
     assert (
-        resolve_edit_path(project_root, "a/b.txt")
+        resolve_edit_path(
+            project_root, "link.txt", extra_writable=tools.scratch_dir("abc12345")
+        )
+        == target.resolve()
+    )
+
+
+def test_resolve_edit_path_relative(project_root: Path, scratch_root: Path) -> None:
+    assert (
+        resolve_edit_path(
+            project_root, "a/b.txt", extra_writable=tools.scratch_dir("abc12345")
+        )
         == (project_root / "a/b.txt").resolve()
     )
 
 
-def test_resolve_edit_path_macos_tmp_symlink(project_root: Path) -> None:
-    # /tmp may resolve elsewhere; both literal and resolved must be accepted.
-    resolved = Path("/tmp").resolve()
-    assert is_writable(project_root, resolved / "x.txt")
+def test_resolve_edit_path_macos_tmp_symlink(
+    project_root: Path, scratch_root: Path
+) -> None:
+    # /tmp may resolve elsewhere (macOS: /tmp -> /private/tmp); both the
+    # literal and the resolved scratch location must be accepted.
+    scratch = tools.scratch_dir("abc12345")
+    assert is_writable(project_root, scratch, scratch.resolve())
+    assert is_writable(project_root, scratch.resolve(), scratch)
+
+
+def test_resolve_edit_path_foreign_scratch_raises(
+    project_root: Path, scratch_root: Path
+) -> None:
+    own = tools.scratch_dir("mine")
+    foreign = tools.scratch_dir("theirs")
+    with pytest.raises(PathViolation):
+        resolve_edit_path(project_root, str(foreign / "f.txt"), extra_writable=own)
 
 
 # -- read_file ------------------------------------------------------------------
@@ -133,65 +187,96 @@ def test_read_file_missing_raises(project_root: Path) -> None:
 # -- write_file ------------------------------------------------------------------
 
 
-def test_write_file_creates_parents(project_root: Path) -> None:
-    msg = write_file(project_root, "deep/nested/f.txt", "hello")
+def test_write_file_creates_parents(project_root: Path, scratch_root: Path) -> None:
+    msg = write_file(
+        project_root,
+        "deep/nested/f.txt",
+        "hello",
+        extra_writable=tools.scratch_dir("t"),
+    )
     assert (project_root / "deep/nested/f.txt").read_text() == "hello"
     assert "5 chars" in msg  # char count mentioned in the reply
 
 
-def test_write_file_overwrites(project_root: Path) -> None:
+def test_write_file_overwrites(project_root: Path, scratch_root: Path) -> None:
     (project_root / "f.txt").write_text("old")
-    write_file(project_root, "f.txt", "new")
+    write_file(project_root, "f.txt", "new", extra_writable=tools.scratch_dir("t"))
     assert (project_root / "f.txt").read_text() == "new"
 
 
-def test_write_file_to_tmp_allowed(project_root: Path, tmp_path: Path) -> None:
-    # /tmp (with all subdirectories) is a writable scratch area.
-    scratch = tools.TMP_ROOT / f"drcode_test_{os.getpid()}"
-    try:
-        write_file(project_root, str(scratch / "f.txt"), "data")
-        assert (scratch / "f.txt").read_text() == "data"
-    finally:
-        import shutil
+def test_write_file_to_own_scratch_allowed(
+    project_root: Path, scratch_root: Path
+) -> None:
+    # The task's own scratch directory is writable and is created lazily
+    # on the first write.
+    scratch = tools.scratch_dir("abc12345")
+    assert not scratch.exists()
+    write_file(project_root, str(scratch / "f.txt"), "data", extra_writable=scratch)
+    assert (scratch / "f.txt").read_text() == "data"
 
-        shutil.rmtree(scratch, ignore_errors=True)
 
-
-def test_write_file_outside_refused(project_root: Path) -> None:
+def test_write_file_to_foreign_scratch_refused(
+    project_root: Path, scratch_root: Path
+) -> None:
+    # The soft isolation boundary: another task's scratch directory must not
+    # be writable — two tasks cannot interfere through shared scratch files.
+    own = tools.scratch_dir("mine")
+    foreign = tools.scratch_dir("theirs")
     with pytest.raises(PathViolation):
-        write_file(project_root, "../evil.txt", "nope")
-
-
-def test_write_file_home_refused(project_root: Path) -> None:
+        write_file(project_root, str(foreign / "f.txt"), "nope", extra_writable=own)
+    assert not foreign.exists()
+    # And plain /tmp is off-limits too.
     with pytest.raises(PathViolation):
-        write_file(project_root, "~/evil.txt", "nope")
+        write_file(project_root, "/tmp/loose.txt", "nope", extra_writable=own)
+
+
+def test_write_file_outside_refused(project_root: Path, scratch_root: Path) -> None:
+    with pytest.raises(PathViolation):
+        write_file(
+            project_root, "../evil.txt", "nope", extra_writable=tools.scratch_dir("t")
+        )
+
+
+def test_write_file_home_refused(project_root: Path, scratch_root: Path) -> None:
+    with pytest.raises(PathViolation):
+        write_file(
+            project_root, "~/evil.txt", "nope", extra_writable=tools.scratch_dir("t")
+        )
 
 
 # -- edit_file ------------------------------------------------------------------
 
 
-def test_edit_file_replaces_unique(project_root: Path) -> None:
+def test_edit_file_replaces_unique(project_root: Path, scratch_root: Path) -> None:
     (project_root / "f.txt").write_text("hello world")
-    msg = edit_file(project_root, "f.txt", "world", "there")
+    msg = edit_file(
+        project_root, "f.txt", "world", "there", extra_writable=tools.scratch_dir("t")
+    )
     assert (project_root / "f.txt").read_text() == "hello there"
     assert "edited" in msg
 
 
-def test_edit_file_not_found(project_root: Path) -> None:
+def test_edit_file_not_found(project_root: Path, scratch_root: Path) -> None:
     (project_root / "f.txt").write_text("hello")
     with pytest.raises(ValueError, match="not found"):
-        edit_file(project_root, "f.txt", "missing", "x")
+        edit_file(
+            project_root, "f.txt", "missing", "x", extra_writable=tools.scratch_dir("t")
+        )
 
 
-def test_edit_file_multiple_matches(project_root: Path) -> None:
+def test_edit_file_multiple_matches(project_root: Path, scratch_root: Path) -> None:
     (project_root / "f.txt").write_text("a a")
     with pytest.raises(ValueError, match="2 locations"):
-        edit_file(project_root, "f.txt", "a", "b")
+        edit_file(
+            project_root, "f.txt", "a", "b", extra_writable=tools.scratch_dir("t")
+        )
 
 
-def test_edit_file_outside_refused(project_root: Path) -> None:
+def test_edit_file_outside_refused(project_root: Path, scratch_root: Path) -> None:
     with pytest.raises(PathViolation):
-        edit_file(project_root, "/etc/hosts", "x", "y")
+        edit_file(
+            project_root, "/etc/hosts", "x", "y", extra_writable=tools.scratch_dir("t")
+        )
 
 
 # -- glob_files / grep_search ------------------------------------------------------
@@ -289,11 +374,31 @@ def test_check_command_allows_safe_commands(project_root: Path) -> None:
     check_command(project_root, "grep rm file.txt")
 
 
-def test_check_command_allows_destructive_inside_root(project_root: Path) -> None:
-    check_command(project_root, "rm -rf build")
-    check_command(project_root, "mv a.txt b.txt")
-    check_command(project_root, "cp src/dst.py dst.py")
-    check_command(project_root, "rm /tmp/scratch/x")
+def test_check_command_allows_destructive_inside_root(
+    project_root: Path, scratch_root: Path
+) -> None:
+    own = tools.scratch_dir("abc12345")
+    check_command(project_root, "rm -rf build", own)
+    check_command(project_root, "mv a.txt b.txt", own)
+    check_command(project_root, "cp src/dst.py dst.py", own)
+    check_command(project_root, f"rm {own}/scratch/x", own)
+
+
+def test_check_command_scratch_boundaries(
+    project_root: Path, scratch_root: Path
+) -> None:
+    own = tools.scratch_dir("mine")
+    foreign = tools.scratch_dir("theirs")
+    # rm/mv/cp inside the task's own scratch directory are fine...
+    check_command(project_root, f"rm -rf {own}/build", own)
+    # ...touching another task's scratch (or the rest of /tmp) is not.
+    with pytest.raises(PathViolation):
+        check_command(project_root, f"rm -rf {foreign}/build", own)
+    with pytest.raises(PathViolation):
+        check_command(project_root, "rm -rf /tmp/loose", own)
+    # Without a scratch area nothing under /tmp passes the check.
+    with pytest.raises(PathViolation):
+        check_command(project_root, "rm -rf /tmp/loose")
 
 
 def test_check_command_refuses_outside_paths(project_root: Path) -> None:
@@ -397,6 +502,21 @@ def test_run_bash_refuses_destructive_outside(project_root: Path) -> None:
         asyncio.run(run_bash(project_root, "rm -rf /"))
 
 
+def test_run_bash_sets_task_tmpdir(project_root: Path, scratch_root: Path) -> None:
+    # Child processes get TMPDIR pointed at the task's scratch directory,
+    # which is created lazily on the first run_bash call.
+    scratch = tools.scratch_dir("abc12345")
+    out = asyncio.run(run_bash(project_root, "echo $TMPDIR", extra_writable=scratch))
+    assert out == f"exit=0\n{scratch}"
+    assert scratch.is_dir()
+
+
+def test_run_bash_without_scratch_keeps_env(project_root: Path) -> None:
+    # Internal calls without a scratch area leave TMPDIR untouched.
+    out = asyncio.run(run_bash(project_root, "echo ${TMPDIR:-unset}"))
+    assert out == f"exit=0\n{os.environ.get('TMPDIR', 'unset')}"
+
+
 def test_run_bash_timeout_message(project_root: Path, monkeypatch) -> None:
     monkeypatch.setattr(tools, "BASH_TIMEOUT", 1)
     out = asyncio.run(run_bash(project_root, "sleep 5"))
@@ -445,3 +565,29 @@ def test_env_variable_not_picked_as_wrapper_word(project_root: Path) -> None:
     # A variable assignment alone (no command) must not crash the checker.
     check_command(project_root, "FOO=bar")
     check_command(project_root, "FOO=bar baz=qux ls")
+
+
+# -- scratch lifecycle ---------------------------------------------------------------
+
+
+def test_cleanup_orphan_scratches_removes_unknown_ids(scratch_root: Path) -> None:
+    (scratch_root / "live").mkdir(parents=True)
+    (scratch_root / "dead").mkdir(parents=True)
+    (scratch_root / "not-a-dir").write_text("x")
+    removed = tools.cleanup_orphan_scratches({"live"})
+    assert removed == ["dead"]
+    assert (scratch_root / "live").is_dir()
+    assert not (scratch_root / "dead").exists()
+
+
+def test_cleanup_orphan_scratches_no_base(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(tools, "SCRATCH_ROOT", tmp_path / "absent")
+    assert tools.cleanup_orphan_scratches(set()) == []
+
+
+def test_remove_scratch_is_best_effort(scratch_root: Path) -> None:
+    tools.remove_scratch("never-created")  # no error when absent
+    scratch = scratch_root / "gone"
+    scratch.mkdir(parents=True)
+    tools.remove_scratch("gone")
+    assert not scratch.exists()

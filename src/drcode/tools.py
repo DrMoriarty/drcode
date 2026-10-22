@@ -3,9 +3,12 @@
 Permission model:
 - reading (read_file) works anywhere on the filesystem;
 - writing (write_file / edit_file) is allowed only inside the project root
-  (with all subdirectories) and inside /tmp (with all subdirectories);
+  (with all subdirectories) and inside the task's personal scratch directory
+  /tmp/drcode/<task-id> — /tmp outside that directory is NOT writable, so two
+  tasks cannot interfere through shared scratch files;
 - run_bash inspects the command and refuses rm/mv/cp whose path arguments
-  escape that writable area.
+  escape that writable area, and points the child process's TMPDIR at the
+  task's scratch directory.
 
 Every refusal raises PathViolation with a model-friendly message; the agent
 layer logs it into the task's service-event history before returning it to
@@ -18,6 +21,7 @@ import asyncio
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 
 MAX_TOOL_OUTPUT = 10_000
@@ -36,9 +40,22 @@ DEFAULT_CURRENT_USAGE = 0
 DEFAULT_MAX_CONTEXT_TOKENS = 200_000
 DEFAULT_COMPACTION_THRESHOLD = 80
 
-# Extra scratch area: the model may create/edit files here even though it is
-# outside the project — a sandbox for testing hypotheses.
-TMP_ROOT = Path("/tmp")
+# Extra scratch area: every task gets a PERSONAL scratch directory
+# /tmp/drcode/<task-id> — the model may create/edit files there even though
+# it is outside the project, a sandbox for testing hypotheses. Directories
+# are created lazily on the first write and removed when the task completes
+# or is deleted. /tmp outside the task's own scratch directory is NOT
+# writable: a shared /tmp would let two tasks interfere through scratch
+# files, and closing that hole needs no OS-level sandbox — only a narrower
+# writable area.
+SCRATCH_ROOT = Path("/tmp") / "drcode"
+
+
+def scratch_dir(task_id: str) -> Path:
+    """The per-task scratch directory under /tmp/drcode (not created here:
+    it appears lazily on the first write or run_bash call)."""
+    return SCRATCH_ROOT / task_id
+
 
 IGNORED_DIRS = {
     ".git",
@@ -55,28 +72,44 @@ class PathViolation(Exception):
     """A tool tried to touch a path outside the allowed area."""
 
 
-def _writable_hint(root: Path) -> str:
+def _writable_hint(root: Path, extra_writable: Path | None) -> str:
+    scratch = (
+        f", and your scratch directory '{extra_writable}'"
+        if extra_writable is not None
+        else ""
+    )
+    tip = (
+        " (tip: the scratch directory is yours alone — test hypotheses there; "
+        "it is removed when the task completes)"
+        if extra_writable is not None
+        else ""
+    )
     return (
         f"Allowed locations: the project root ('{root}') with all its "
-        f"subdirectories, and '/tmp' with all its subdirectories "
-        f"(tip: /tmp is available for scratch work — test hypotheses there)."
+        f"subdirectories{scratch}{tip}."
     )
 
 
-def _write_violation(root: Path, path: str, action: str) -> PathViolation:
+def _write_violation(
+    root: Path, path: str, action: str, extra_writable: Path | None
+) -> PathViolation:
     return PathViolation(
         f"Permission denied: cannot {action} '{path}' — it is outside the "
-        f"allowed locations. {_writable_hint(root)}"
+        f"allowed locations. {_writable_hint(root, extra_writable)}"
     )
 
 
 def _bash_violation(
-    root: Path, command: str, cmd: str, path: str | None
+    root: Path,
+    command: str,
+    cmd: str,
+    path: str | None,
+    extra_writable: Path | None,
 ) -> PathViolation:
     target = f" with path '{path}'" if path else ""
     return PathViolation(
         f"Command refused: '{command}': {cmd}{target} would touch files outside "
-        f"the allowed locations. {_writable_hint(root)}"
+        f"the allowed locations. {_writable_hint(root, extra_writable)}"
     )
 
 
@@ -89,28 +122,32 @@ def resolve_read_path(root: Path, path: str) -> Path:
     return p.resolve()
 
 
-def is_writable(root: Path, p: Path) -> bool:
+def is_writable(root: Path, p: Path, extra_writable: Path | None = None) -> bool:
     if p == root or root in p.parents:
         return True
-    # /tmp may be a symlink (macOS: /tmp -> /private/tmp) — accept both the
-    # literal and the resolved location.
-    for t in {TMP_ROOT, TMP_ROOT.resolve()}:
-        if p == t or t in p.parents:
-            return True
+    if extra_writable is not None:
+        # /tmp may be a symlink (macOS: /tmp -> /private/tmp) — accept both
+        # the literal and the resolved location.
+        for t in {extra_writable, extra_writable.resolve()}:
+            if p == t or t in p.parents:
+                return True
     return False
 
 
-def resolve_edit_path(root: Path, path: str, action: str = "write to") -> Path:
+def resolve_edit_path(
+    root: Path, path: str, action: str = "write to", *, extra_writable: Path
+) -> Path:
     """Resolve `path` for a modifying operation; refuse anything outside
-    the project root and /tmp (symlinks are resolved first, so a symlink
-    inside the project pointing outside is refused too)."""
+    the project root and the task's scratch directory `extra_writable`
+    (symlinks are resolved first, so a symlink inside the project pointing
+    outside is refused too)."""
     p = Path(path).expanduser()
     if not p.is_absolute():
         p = root / p
     p = p.resolve()
-    if is_writable(root, p):
+    if is_writable(root, p, extra_writable):
         return p
-    raise _write_violation(root, path, action)
+    raise _write_violation(root, path, action, extra_writable)
 
 
 def _fmt_bytes(n: int) -> str:
@@ -182,15 +219,18 @@ def read_file(
     return text or "(empty file)"
 
 
-def write_file(root: Path, path: str, content: str) -> str:
-    p = resolve_edit_path(root, path, "create/overwrite")
+def write_file(root: Path, path: str, content: str, *, extra_writable: Path) -> str:
+    p = resolve_edit_path(root, path, "create/overwrite", extra_writable=extra_writable)
+    # Also creates the scratch directory lazily on the first write into it.
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return f"written {len(content)} chars to {path}"
 
 
-def edit_file(root: Path, path: str, old_string: str, new_string: str) -> str:
-    p = resolve_edit_path(root, path, "edit")
+def edit_file(
+    root: Path, path: str, old_string: str, new_string: str, *, extra_writable: Path
+) -> str:
+    p = resolve_edit_path(root, path, "edit", extra_writable=extra_writable)
     text = p.read_text(errors="replace")
     count = text.count(old_string)
     if count == 0:
@@ -298,15 +338,16 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _DESTRUCTIVE_WORD = re.compile(r"(?:^|[\s;&|(])(sudo\s+)?(rm|mv|cp)\b")
 
 
-def check_command(root: Path, command: str) -> None:
+def check_command(root: Path, command: str, extra_writable: Path | None = None) -> None:
     """Refuse rm/mv/cp whose path arguments escape the writable area.
 
     The command line is split into shell segments (`;`, `&&`, `||`, `|`,
     newlines) and the leading command of each is inspected — after env
     assignments (VAR=…) and common wrappers (sudo, nohup, …). For a
     destructive command every non-flag argument is treated as a path and
-    checked against the writable area. Nested command substitution
-    (`echo $(rm …)`) is not analysed; only top-level invocations are.
+    checked against the writable area (project root + `extra_writable`).
+    Nested command substitution (`echo $(rm …)`) is not analysed; only
+    top-level invocations are.
     """
     for segment in _SEGMENT_SPLIT.split(command):
         segment = segment.strip()
@@ -318,7 +359,9 @@ def check_command(root: Path, command: str) -> None:
             # Unparsable quoting: if a destructive command seems to be in
             # there, refuse conservatively rather than execute blind.
             if _DESTRUCTIVE_WORD.search(segment):
-                raise _bash_violation(root, command, "rm/mv/cp", None) from None
+                raise _bash_violation(
+                    root, command, "rm/mv/cp", None, extra_writable
+                ) from None
             continue
         i = 0
         # Strip leading env assignments and wrappers in any order
@@ -350,8 +393,8 @@ def check_command(root: Path, command: str) -> None:
             if not p.is_absolute():
                 p = root / p
             p = p.resolve()
-            if not is_writable(root, p):
-                raise _bash_violation(root, command, base, raw)
+            if not is_writable(root, p, extra_writable):
+                raise _bash_violation(root, command, base, raw, extra_writable)
 
 
 def clamp_bash_timeout(timeout: float | None) -> float:
@@ -365,13 +408,26 @@ def clamp_bash_timeout(timeout: float | None) -> float:
     return min(timeout, BASH_MAX_TIMEOUT)
 
 
-async def run_bash(root: Path, command: str, timeout: float | None = None) -> str:
-    check_command(root, command)
+async def run_bash(
+    root: Path,
+    command: str,
+    timeout: float | None = None,
+    *,
+    extra_writable: Path | None = None,
+) -> str:
+    check_command(root, command, extra_writable)
     effective = clamp_bash_timeout(timeout)
+    env = sanitized_env()
+    if extra_writable is not None:
+        # The child process's temporary files land in the task's scratch
+        # directory too (created lazily here on the first run_bash call) —
+        # third-party tools then cannot clash with another task's temps.
+        extra_writable.mkdir(parents=True, exist_ok=True, mode=0o700)
+        env["TMPDIR"] = str(extra_writable)
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,
-        env=sanitized_env(),
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -397,3 +453,34 @@ async def run_bash(root: Path, command: str, timeout: float | None = None) -> st
         :MAX_TOOL_OUTPUT
     ]
     return f"exit={proc.returncode}\n{out or '(no output)'}"
+
+
+# -- scratch lifecycle ---------------------------------------------------------
+
+
+def remove_scratch(task_id: str) -> None:
+    """Best-effort removal of a task's scratch directory.
+
+    Called when the task reaches COMPLETED or is deleted. It is NOT called
+    on an interrupted/re-queued task: the next activation resumes the work
+    and may still need the scratch files from the interrupted attempt.
+    """
+    shutil.rmtree(scratch_dir(task_id), ignore_errors=True)
+
+
+def cleanup_orphan_scratches(live_task_ids: set[str]) -> list[str]:
+    """Remove scratch directories of tasks that no longer exist.
+
+    Runs once at app startup: directories under /tmp/drcode whose name does
+    not match a live task id are leftovers from a crashed previous session.
+    Returns the removed directory names.
+    """
+    if not SCRATCH_ROOT.is_dir():
+        return []
+    removed: list[str] = []
+    for entry in SCRATCH_ROOT.iterdir():
+        if not entry.is_dir() or entry.name in live_task_ids:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(entry.name)
+    return removed

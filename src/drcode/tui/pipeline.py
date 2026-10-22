@@ -61,6 +61,7 @@ from ..providers import AgentRole
 from ..settings import (
     TaskFinalization,
 )
+from ..tools import scratch_dir
 from ..workflow import MAX_REVIEW_REJECTIONS
 from .blocks import (
     AssistantBlock,
@@ -763,6 +764,7 @@ class PipelineLayer(DrCodeState):
                             root=self.project_root,
                             manager=self.manager,
                             task_id=task_id,
+                            scratch=scratch_dir(task_id),
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -1344,6 +1346,7 @@ class PipelineLayer(DrCodeState):
                 root=self.project_root,
                 manager=self.manager,
                 task_id=task_id,
+                scratch=scratch_dir(task_id),
                 review_gate=(
                     self.workflow is not None and self.workflow.has("on_review")
                 ),

@@ -88,7 +88,12 @@ async def test_http_error_after_tool_call_leaves_resumable_transcript(
     mgr = TaskManager(project_root)
     mgr.create("docs", "the task")
     task = mgr.all_tasks()[0]
-    deps = AgentDeps(root=project_root, manager=mgr, task_id=task.id)
+    deps = AgentDeps(
+        root=project_root,
+        manager=mgr,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
     scripted.steps = [
         tool_response("read_file", {"path": "README.md"}),
@@ -127,7 +132,12 @@ async def test_timeout_before_first_response_is_fully_recoverable(
     mgr = TaskManager(project_root)
     mgr.create("t", "the task")
     task = mgr.all_tasks()[0]
-    deps = AgentDeps(root=project_root, manager=mgr, task_id=task.id)
+    deps = AgentDeps(
+        root=project_root,
+        manager=mgr,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
     scripted.steps = [api_error("Request timed out.")]
     error, run = await drive_expect_failure(ag, "the task", None, deps)
@@ -155,7 +165,12 @@ async def test_rate_limit_error_mid_run_does_not_corrupt_transcript(
     mgr = TaskManager(project_root)
     mgr.create("t", "the task")
     task = mgr.all_tasks()[0]
-    deps = AgentDeps(root=project_root, manager=mgr, task_id=task.id)
+    deps = AgentDeps(
+        root=project_root,
+        manager=mgr,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
 
     scripted.steps = [http_error(429)]
     error, run = await drive_expect_failure(ag, "the task", None, deps)

@@ -24,7 +24,6 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Footer,
-    ListView,
     Static,
 )
 
@@ -641,8 +640,8 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         return self.query_one("#chat-input", ChatInput)
 
     @property
-    def sidebar(self) -> ListView:
-        return self.query_one("#sidebar", ListView)
+    def sidebar(self) -> Sidebar:
+        return self.query_one("#sidebar", Sidebar)
 
     @property
     def project_info(self) -> Static:

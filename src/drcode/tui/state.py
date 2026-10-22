@@ -51,6 +51,7 @@ from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
 from .setup_dialog import ModelSetup
+from .sidebar import Sidebar
 from .usage import SessionTokenUsage
 
 
@@ -438,7 +439,7 @@ class DrCodeState(App[None]):
     def chat_input(self) -> ChatInput: ...
 
     @property
-    def sidebar(self) -> ListView: ...
+    def sidebar(self) -> Sidebar: ...
 
     @property
     def project_info(self) -> Static: ...

@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
-from textual.command import CommandList
+from textual.command import Command, CommandList
 from textual.geometry import Offset
 from textual.widgets import ListView, TextArea
 from textual.widgets._list_item import ListItem
+from textual.widgets.text_area import Selection
 
 from drcode.agent import serialize_messages
 from drcode.models import TaskKind, TaskStatus
@@ -459,7 +461,7 @@ async def test_sidebar_click_opens_task_and_cancels_new_task(app: DrCodeApp) -> 
         await pilot.pause()
         assert app._new_task_mode
 
-        item = next(i for i in app.query("TaskItem") if i.task_id == task.id)
+        item = next(i for i in app.query(TaskItem) if i.task_id == task.id)
         await pilot.click(item)
         await pilot.pause()
         assert not app._new_task_mode
@@ -482,7 +484,7 @@ async def test_sidebar_drag_selection_does_not_navigate(app: DrCodeApp) -> None:
         await pilot.pause()
         assert app._new_task_mode
 
-        item = next(i for i in app.query("TaskItem") if i.task_id == task.id)
+        item = next(i for i in app.query(TaskItem) if i.task_id == task.id)
         # Press on the row…
         await pilot.mouse_down(item, offset=(1, 0))
         await pilot.pause()
@@ -703,7 +705,9 @@ async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
                 break
             await pilot.pause()
         await pilot.pause()
-        names = [command.hit.text for command in command_list._options]
+        names = [
+            cast(Command, command).hit.text or "" for command in command_list._options
+        ]
 
         order = SettingsPalette.ENTRY_ORDER
         ranks = [
@@ -842,7 +846,7 @@ async def test_new_task_input_copy_uses_clipboard_fallback(
         nt_input = app.query_one("#nt-input", TextArea)
         nt_input.focus()
         nt_input.insert("hello copyable world")
-        nt_input.selection = ((0, 0), (0, 5))
+        nt_input.selection = Selection((0, 0), (0, 5))
         await pilot.pause()
 
         await pilot.press("ctrl+c")

@@ -144,6 +144,19 @@ class Task(BaseModel):
     # "Fixes #N" keyword to its commit message so GitHub links the commit
     # back to the issue.
     github_issue: int | None = None
+    # External code-review gate (.drcode/workflow.py hooks): how many times
+    # in a row the external review rejected this task. Reset when the review
+    # finally accepts (or when the user intervenes by sending input /
+    # cancelling) — after MAX_REVIEW_REJECTIONS consecutive rejects the
+    # pipeline parks the task on hold instead of looping forever.
+    review_rejections: int = 0
+    # True while a COMPLETED task awaits an ASYNCHRONOUS external review
+    # verdict (workflow with on_development_done but no on_review: the task
+    # completes with an open PR and the verdict arrives via the periodic
+    # review poll). Such tasks are excluded from the startup auto-cleanup,
+    # so a verdict arriving days later still finds its task; cleared when
+    # the verdict is applied or the user re-queues/cancels the task.
+    review_pending: bool = False
 
     @model_validator(mode="before")
     @classmethod

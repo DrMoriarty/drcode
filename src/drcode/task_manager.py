@@ -219,6 +219,12 @@ class TaskManager:
             # Fresh pipeline run: the completion timestamp (auto-cleanup
             # anchor) restarts with the eventual new completion.
             task.completed_at = None
+            # Any pending asynchronous review verdict is moot now: the user
+            # took the task back into development by hand. The consecutive
+            # rejection count restarts too — human intervention breaks the
+            # review ping-pong loop.
+            task.review_pending = False
+            task.review_rejections = 0
             task.touch()
             self._save_changed(task, old, "user")
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
@@ -326,8 +332,11 @@ class TaskManager:
         Runs once at app startup. `retention_days` None (setting "never")
         disables the cleanup. Age anchor: `completed_at` (set on every
         transition to COMPLETED); for tasks completed by an older build
-        without the timestamp, `updated_at` is used as a fallback. Returns
-        the removed tasks so the caller can report the cleanup.
+        without the timestamp, `updated_at` is used as a fallback. Tasks
+        still awaiting an asynchronous external review verdict
+        (`review_pending` — a COMPLETED task with an open PR) are skipped:
+        a verdict arriving after N days must not resurrect a deleted task.
+        Returns the removed tasks so the caller can report the cleanup.
         """
         if retention_days is None:
             return []
@@ -336,6 +345,7 @@ class TaskManager:
             t
             for t in self.tasks.values()
             if t.status is TaskStatus.COMPLETED
+            and not t.review_pending
             and (t.completed_at or t.updated_at) < cutoff
         ]
         for task in expired:
@@ -454,15 +464,27 @@ class TaskManager:
         task.verification = None
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
+        task.review_pending = False
+        task.review_rejections = 0
         task.touch()
         self._save_changed(task, old, "user")
         return task
 
-    def set_verification(self, task_id: str, success: bool) -> Task:
+    def set_verification(
+        self, task_id: str, success: bool, *, review_gate: bool = False
+    ) -> Task:
         """The tester's verdict: stamp the verification label and complete
         the task. Used by the tester's `set_verification` tool (which runs
         in a worker thread — see tool_runtime) so the transition goes
         through the same observer mechanism as every other status change.
+
+        With ``review_gate=True`` (the project defines an external review
+        in `.drcode/workflow.py`) a PASSED verdict does NOT complete the
+        task: "the tester is done" and "the task is finally accepted" are
+        split, and the task stays TESTING until the external review's
+        verdict arrives (accept → finalize_verified, reject →
+        requeue_review_rejection). A FAILED verdict behaves as without the
+        gate: the task completes with the failure label.
 
         A no-op when the task is no longer TESTING: while the tool call was
         in flight the user may have cancelled the task (Ctrl+X) or sent new
@@ -475,8 +497,59 @@ class TaskManager:
         task.verification = (
             VerificationStatus.PASSED if success else VerificationStatus.FAILED
         )
+        if success and review_gate:
+            # Passed, but the final completion waits for the external
+            # review: the TESTING status keeps the pipeline blocked (no new
+            # development starts while a verdict is outstanding), exactly
+            # like an in-flight tester round.
+            task.touch()
+            self.storage.save(task)
+            return task
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
+        task.touch()
+        self._save_changed(task, old, "system")
+        return task
+
+    def finalize_verified(self, task_id: str, origin: str = "system") -> Task:
+        """The external review accepted the task (accept verdict): finish
+        what set_verification(review_gate=True) held back — the task leaves
+        TESTING as COMPLETED with its PASSED label intact. The consecutive
+        review-rejection count resets: the loop is over."""
+        task = self.get(task_id)
+        if task.status is not TaskStatus.TESTING:
+            return task
+        old = task.status
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
+        task.unfinished = False
+        task.review_rejections = 0
+        task.touch()
+        self._save_changed(task, old, origin)
+        return task
+
+    def requeue_review_rejection(self, task_id: str, comment: str) -> Task:
+        """The external review rejected the task: send the reviewer's
+        comment to it as new user input and send it back to development —
+        the same path an ordinary user message to a TESTING/COMPLETED task
+        takes (send()'s re-queue branch), so the coding agent receives the
+        remarks in its existing transcript on the next promotion.
+
+        The consecutive rejection count grows (the pipeline parks the task
+        on hold after MAX_REVIEW_REJECTIONS in a row); a no-op when the
+        task is no longer TESTING/COMPLETED (the user got there first)."""
+        task = self.get(task_id)
+        if task.status not in (TaskStatus.TESTING, TaskStatus.COMPLETED):
+            return task
+        stripped = comment.strip()
+        if stripped:
+            task.pending_input.append(PendingInput(text=stripped))
+        old = task.status
+        task.status = TaskStatus.QUEUED
+        task.verification = None
+        task.completed_at = None
+        task.review_pending = False
+        task.review_rejections += 1
         task.touch()
         self._save_changed(task, old, "system")
         return task

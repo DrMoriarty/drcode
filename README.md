@@ -112,6 +112,15 @@ Tasks flow through a pipeline, mirrored by the sidebar: QUEUE → NEEDS CLARIFIC
 - **Hold / delete / cancel** — park a queued task out of the backlog (input keeps accumulating while held, and an unanswered clarification is preserved), delete a held task entirely, or cancel a task (queued or already in TESTING): pending input is dropped and it completes immediately, skipping the tester.
 - **Auto-cleanup** — completed tasks older than the retention period are deleted at startup. The setting (7/30/90 days or never) is per project, stored in `.drcode/settings.json`.
 
+## Custom team workflow
+
+A team can give the pipeline its own branching / merge / review process — including an **external code review** that can send a task back for rework — without changing the UI and without new task statuses. The workflow is enabled by the mere presence of the files (a solo developer without them keeps the default behaviour):
+
+- **`.drcode/git-workflow.md`** — the team's process rules in plain prose: injected into the coding agents' prompts (replacing the built-in "Never commit to git" sentence) and appended to the tester's, so commits/pushes/PRs follow the same rules.
+- **`.drcode/workflow.py`** — hard gates: optional Python hooks (`on_task_start`, `on_development_done`, `on_review`, `on_accepted`) run in an isolated subprocess with a JSON contract. `on_review` is the external review: a *reject* re-queues the task with the reviewer's comment (the agent reworks it in the same transcript), an *accept* completes it and runs `on_accepted` (merge the PR, delete the branch), a *pending* verdict releases the pipeline and the verdict is polled later; after 3 consecutive rejects the task is parked on hold for a human. A failing review is fail-closed — the task waits, nothing is waved through.
+
+`.drcode/git-workflow.md`, `.drcode/workflow.py` and `.drcode/drcode.json` are committable (drcode's `.gitignore` management covers only the private state: tasks, settings with secrets, sync bookkeeping). **Security:** `.drcode/workflow.py` is arbitrary code running with your user permissions — never trust it from a repository you did not author. Full format description: [docs/workflow.md](docs/workflow.md).
+
 ## GitHub Issues integration
 
 drcode can turn a repository's GitHub issues into local tasks automatically. Configure it in the TUI (Settings → "GitHub integration"): enable switch, personal access token (needs repo read access), repository name (a pasted URL is normalized to `owner/repo`), and the sync interval (1/2/4 hours). The first cycle runs shortly after startup, then on schedule.

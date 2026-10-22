@@ -123,15 +123,15 @@ def test_gitignore_appended_when_missing(project_root: Path) -> None:
     (project_root / ".gitignore").write_text("*.pyc\n")
     Storage(project_root)
     text = (project_root / ".gitignore").read_text()
-    assert ".drcode/" in text
+    assert ".drcode/tasks/" in text
 
 
 def test_gitignore_created_when_absent(project_root: Path) -> None:
-    # A git repo without a .gitignore gets one, with the entry inside.
+    # A git repo without a .gitignore gets one, with the entries inside.
     (project_root / ".git").mkdir()
     Storage(project_root)
     assert (project_root / ".gitignore").is_file()
-    assert ".drcode/" in (project_root / ".gitignore").read_text()
+    assert ".drcode/tasks/" in (project_root / ".gitignore").read_text()
 
 
 def test_no_git_repo_no_gitignore_created(project_root: Path) -> None:
@@ -142,14 +142,17 @@ def test_no_git_repo_no_gitignore_created(project_root: Path) -> None:
 
 def test_gitignore_not_duplicated(project_root: Path) -> None:
     (project_root / ".git").mkdir()
-    (project_root / ".gitignore").write_text(".drcode\n")
+    (project_root / ".gitignore").write_text(".drcode/tasks/\n")
     Storage(project_root)
-    assert (project_root / ".gitignore").read_text().count(".drcode") == 1
+    first = (project_root / ".gitignore").read_text()
+    Storage(project_root)  # second pass must change nothing
+    assert (project_root / ".gitignore").read_text() == first
+    assert first.count(".drcode/tasks/") == 1
 
 
 def test_gitignore_respects_comment_lines(project_root: Path) -> None:
     (project_root / ".git").mkdir()
     (project_root / ".gitignore").write_text("# .drcode\n")
     Storage(project_root)
-    # The commented mention doesn't count: the real entry is added.
-    assert ".drcode/" in (project_root / ".gitignore").read_text()
+    # The commented mention doesn't count: the real entries are added.
+    assert ".drcode/tasks/" in (project_root / ".gitignore").read_text()

@@ -41,6 +41,7 @@ from ..providers import (
 from ..providers import resolve as resolve_model_config
 from ..settings import ProjectSettings, ProjectSettingsStore
 from ..task_manager import TaskManager
+from ..workflow import load_hooks
 from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
 from .chat_view import ChatViewLayer
@@ -275,6 +276,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
+        # Custom team workflow (opt-in by file presence): .drcode/workflow.py
+        # hooks (branch checkout, dev-done, external review, accept) and
+        # .drcode/git-workflow.md rules (read at prompt-build time). None =
+        # the default single-developer workflow, the pipeline unchanged.
+        self.workflow = load_hooks(project_root)
+        # External-review bookkeeping (session-scoped): whether a review
+        # worker is in flight (set synchronously in _advance, like
+        # tester_running) and which task it verifies; per-task retry backoff
+        # and failure counts of the on_review hook; the monotonic time the
+        # async review poll may fire at next; the on_development_done notes
+        # waiting for the tester prompt; and the tasks whose dev-done hook
+        # ran in async review mode.
+        self._review_running = False
+        self._review_task_id: str | None = None
+        self._review_retry_at: dict[str, float] = {}
+        self._review_fail_count: dict[str, int] = {}
+        self._review_poll_at = 0.0
+        self._dev_done_notes: dict[str, str] = {}
         self.viewed_id: str | None = None
         self.agent_running = False
         self.tester_running = False
@@ -609,6 +628,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # GitHub Issues sync scheduler: every 30s, checks whether the
         # configured interval has elapsed (see _poll_github_sync).
         self.set_interval(30, self._poll_github_sync)
+        # Async external review poll (custom workflow without a synchronous
+        # on_review hook): asks the hook for the verdict of every completed
+        # task with an open PR (see _poll_workflow_review).
+        self.set_interval(30, self._poll_workflow_review)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is

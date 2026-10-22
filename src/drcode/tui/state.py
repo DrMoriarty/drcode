@@ -46,6 +46,7 @@ from ..settings import (
     TaskFinalization,
 )
 from ..task_manager import TaskManager
+from ..workflow import WorkflowHooks
 from .blocks import ToolCallBlock
 from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
@@ -290,6 +291,10 @@ class DrCodeState(App[None]):
 
     def action_change_stall_nudge(self) -> None: ...
 
+    def workflow_status_label(self) -> str: ...
+
+    def action_workflow_info(self) -> None: ...
+
     def action_change_github(self) -> None: ...
 
     def _github_settings_done(self, setup: GitHubSetup | None) -> None: ...
@@ -338,6 +343,23 @@ class DrCodeState(App[None]):
 
     def _schedule_tester_retry(self, task_id: str) -> None: ...
 
+    # -- external review / workflow hooks (implemented in PipelineLayer) ----
+
+    def _next_review(self) -> Task | None: ...
+
+    async def _run_task_start_hook(self, task: Task) -> str | None: ...
+
+    async def _run_development_done_hook(self, task: Task) -> None: ...
+
+    async def _run_accepted_hook(self, task: Task) -> None: ...
+
+    def _apply_review_accept(self, task: Task) -> None: ...
+
+    @work(exclusive=True, group="review")
+    async def run_external_review(self, task_id: str) -> None: ...
+
+    def _poll_workflow_review(self) -> None: ...
+
     # DrCodeApp.__init__ (see the region that builds self.manager, self.config,
     # the live-run bookkeeping dicts, the session stats, …). Declaring the
     # attributes here is what lets the chat/actions/pipeline mixins reference
@@ -349,6 +371,8 @@ class DrCodeState(App[None]):
     manager: TaskManager
     settings_store: ProjectSettingsStore
     settings: ProjectSettings
+    # Custom team workflow (.drcode/workflow.py hooks); None = absent.
+    workflow: WorkflowHooks | None
 
     # -- GitHub Issues sync bookkeeping -------------------------------------
     _github_state_store: GitHubSyncStateStore
@@ -391,6 +415,14 @@ class DrCodeState(App[None]):
     # monotonic time the next one may fire at.
     _failed_queue_rounds: int
     _failed_queue_retry_at: float
+
+    # -- external review (workflow hooks) bookkeeping ------------------------
+    _review_running: bool
+    _review_task_id: str | None
+    _review_retry_at: dict[str, float]
+    _review_fail_count: dict[str, int]
+    _review_poll_at: float
+    _dev_done_notes: dict[str, str]
 
     # -- session statistics (expanded header, session-scoped) ---------------
     _session_known_ids: set[str]

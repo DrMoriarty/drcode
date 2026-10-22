@@ -137,11 +137,17 @@ class AgentDeps:
 
 @dataclass
 class TesterDeps:
-    """Dependencies for the tester agent: project root, task manager, verified task."""
+    """Dependencies for the tester agent: project root, task manager, verified task.
+
+    `review_gate` mirrors the project's external-review hook
+    (`.drcode/workflow.py` defines on_review): a PASSED verdict then leaves
+    the task in TESTING awaiting the external review instead of completing
+    it (see TaskManager.set_verification)."""
 
     root: Path
     manager: TaskManager
     task_id: str
+    review_gate: bool = False
 
 
 def load_agents_md(root: Path) -> str:
@@ -335,7 +341,11 @@ def build_agent(
 
 
 def build_tester_agent(
-    config: Config, *, allow_commit: bool = True, root: Path | None = None
+    config: Config,
+    *,
+    allow_commit: bool = True,
+    root: Path | None = None,
+    review_gate: bool = False,
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
@@ -343,7 +353,10 @@ def build_tester_agent(
     selects the commit-free system prompt and does not register the
     git_commit tool, so verified changes are left uncommitted. When `root`
     is given, its actual path is substituted into the system prompt header
-    (the `{project_path}` placeholder).
+    (the `{project_path}` placeholder). With `review_gate=True` (an
+    external review is defined in `.drcode/workflow.py`) a successful
+    verdict only labels the task PASSED and leaves it TESTING — the
+    external review decides the final completion.
     """
     model = agent_model.build_model(config)
     agent = Agent(
@@ -463,11 +476,20 @@ def build_tester_agent(
     @agent.tool
     def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:
         """Set the verification label on the verified task (passed or failed)
-        and finish its testing: the task becomes completed."""
-        ctx.deps.manager.set_verification(ctx.deps.task_id, success)
+        and finish its testing: the task becomes completed. When the project
+        uses an external review, a passed task stays in testing until the
+        external review delivers its verdict."""
+        ctx.deps.manager.set_verification(
+            ctx.deps.task_id, success, review_gate=ctx.deps.review_gate
+        )
         # The label is stamped by the manager; formatting it from `success`
         # (not from the optional `task.verification`) keeps pyright happy.
         verdict = "passed" if success else "failed"
+        if success and ctx.deps.review_gate:
+            return (
+                f"Verification label set: {verdict}; the task now awaits "
+                "the external review, which decides the final completion."
+            )
         return f"Verification label set: {verdict}; task completed."
 
     return agent

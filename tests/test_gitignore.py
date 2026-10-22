@@ -1,10 +1,13 @@
-"""Tests for drcode.gitignore: `.drcode/` kept out of version control."""
+"""Tests for drcode.gitignore: drcode's private state kept out of version
+control, team-shared workflow files committable."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from drcode.gitignore import ensure_drcode_gitignored
+from drcode.gitignore import GITIGNORE_ENTRIES, ensure_drcode_gitignored
+
+ENTRIES = "\n".join(GITIGNORE_ENTRIES) + "\n"
 
 
 def make_git_repo(root: Path) -> None:
@@ -14,7 +17,7 @@ def make_git_repo(root: Path) -> None:
 def test_creates_gitignore_in_git_repo(project_root: Path) -> None:
     make_git_repo(project_root)
     ensure_drcode_gitignored(project_root)
-    assert (project_root / ".gitignore").read_text() == ".drcode/\n"
+    assert (project_root / ".gitignore").read_text() == ENTRIES
 
 
 def test_appends_to_existing_gitignore(project_root: Path) -> None:
@@ -23,35 +26,67 @@ def test_appends_to_existing_gitignore(project_root: Path) -> None:
     ensure_drcode_gitignored(project_root)
     text = (project_root / ".gitignore").read_text()
     assert text.startswith("*.pyc\nbuild/\n")
-    assert text.endswith("\n.drcode/\n")
+    assert text.endswith("\n" + ENTRIES)
 
 
 def test_no_trailing_blank_line_added(project_root: Path) -> None:
     make_git_repo(project_root)
     (project_root / ".gitignore").write_text("*.pyc")  # no trailing newline
     ensure_drcode_gitignored(project_root)
-    assert (project_root / ".gitignore").read_text() == "*.pyc\n.drcode/\n"
+    assert (project_root / ".gitignore").read_text() == "*.pyc\n" + ENTRIES
 
 
-def test_no_duplicate_entry(project_root: Path) -> None:
+def test_no_duplicate_entries(project_root: Path) -> None:
     make_git_repo(project_root)
-    (project_root / ".gitignore").write_text(".drcode/\n")
+    (project_root / ".gitignore").write_text(ENTRIES)
     ensure_drcode_gitignored(project_root)
-    assert (project_root / ".gitignore").read_text().count(".drcode") == 1
+    assert (project_root / ".gitignore").read_text() == ENTRIES
 
 
-def test_anchored_entry_counts(project_root: Path) -> None:
+def test_partial_entries_completed(project_root: Path) -> None:
+    make_git_repo(project_root)
+    (project_root / ".gitignore").write_text(".drcode/tasks/\n")
+    ensure_drcode_gitignored(project_root)
+    assert (project_root / ".gitignore").read_text() == ENTRIES
+
+
+def test_legacy_broad_entry_is_narrowed(project_root: Path) -> None:
+    """Older drcode builds appended a whole-directory entry; it must be
+    replaced so the team-shared workflow/model files can be committed."""
+    make_git_repo(project_root)
+    (project_root / ".gitignore").write_text("*.pyc\n.drcode/\n")
+    ensure_drcode_gitignored(project_root)
+    text = (project_root / ".gitignore").read_text()
+    assert ".drcode/\n" not in text.replace(".drcode/tasks/\n", "")
+    assert "*.pyc\n" in text
+    for entry in GITIGNORE_ENTRIES:
+        assert entry in text
+
+
+def test_legacy_anchored_broad_entry_is_narrowed(project_root: Path) -> None:
     make_git_repo(project_root)
     (project_root / ".gitignore").write_text("/.drcode\n")
     ensure_drcode_gitignored(project_root)
-    assert (project_root / ".gitignore").read_text().count(".drcode") == 1
+    assert (project_root / ".gitignore").read_text() == ENTRIES
 
 
-def test_comments_do_not_count(project_root: Path) -> None:
+def test_negated_entry_left_alone(project_root: Path) -> None:
+    """A custom negation means the user manages the entries by hand —
+    never rewrite those."""
     make_git_repo(project_root)
-    (project_root / ".gitignore").write_text("# .drcode\n")
+    (project_root / ".gitignore").write_text("!.drcode\n")
     ensure_drcode_gitignored(project_root)
-    assert ".drcode/" in (project_root / ".gitignore").read_text()
+    assert (project_root / ".gitignore").read_text() == "!.drcode\n" + ENTRIES
+
+
+def test_nested_drcode_mention_not_touched(project_root: Path) -> None:
+    make_git_repo(project_root)
+    (project_root / ".gitignore").write_text("sub/.drcode/\n")
+    ensure_drcode_gitignored(project_root)
+    text = (project_root / ".gitignore").read_text()
+    assert "sub/.drcode/\n" in text
+    for entry in GITIGNORE_ENTRIES:
+        assert entry in text
 
 
 def test_no_git_repo_untouched(project_root: Path) -> None:

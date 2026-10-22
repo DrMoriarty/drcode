@@ -52,13 +52,16 @@ from ..github import (
 from ..models import (
     PendingInput,
     Task,
+    TaskKind,
     TaskStatus,
+    VerificationStatus,
 )
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
 from ..settings import (
     TaskFinalization,
 )
+from ..workflow import MAX_REVIEW_REJECTIONS
 from .blocks import (
     AssistantBlock,
     ReasoningBlock,
@@ -161,14 +164,44 @@ class PipelineLayer(DrCodeState):
     def _next_testing(self) -> Task | None:
         """Oldest task in TESTING (crash/abort mid-test) whose retry backoff
         has expired. Tasks whose tester run failed recently are skipped
-        until their scheduled retry time."""
+        until their scheduled retry time. A TESTING task the tester already
+        PASSED is not "testing" — it awaits the external review verdict
+        (see _next_review) and is never re-tested."""
         now = time.monotonic()
         return next(
             (
                 t
                 for t in self.manager.all_tasks()
                 if t.status is TaskStatus.TESTING
+                and t.verification is not VerificationStatus.PASSED
                 and self._tester_retry_at.get(t.id, 0.0) <= now
+            ),
+            None,
+        )
+
+    # Review retry backoff (a failed/pending external review is retried
+    # like a failed tester round: capped exponential, from _REVIEW_RETRY_BASE).
+    _REVIEW_RETRY_BASE = 30.0
+    _REVIEW_RETRY_CAP = 600.0
+    # Poll interval for the async review mode: how often the completed
+    # tasks with an open PR (review_pending) ask the on_review hook again.
+    _REVIEW_PENDING_POLL = 60.0
+
+    def _next_review(self) -> Task | None:
+        """A task the tester passed (TESTING + PASSED) whose external
+        review may run now: the sync verdict call after a tester round, or
+        the retry of a failed/unfinished one. Only meaningful when the
+        project defines on_review in `.drcode/workflow.py`."""
+        if self.workflow is None or not self.workflow.has("on_review"):
+            return None
+        now = time.monotonic()
+        return next(
+            (
+                t
+                for t in self.manager.all_tasks()
+                if t.status is TaskStatus.TESTING
+                and t.verification is VerificationStatus.PASSED
+                and self._review_retry_at.get(t.id, 0.0) <= now
             ),
             None,
         )
@@ -179,7 +212,12 @@ class PipelineLayer(DrCodeState):
         Every path that used to promote the queue goes through here, so a
         new development run can never start while any task is awaiting
         verification. While a tester run is in flight this is a no-op —
-        the tester's own completion path advances the pipeline.
+        the tester's own completion path advances the pipeline. The same
+        holds for the external review (`.drcode/workflow.py` on_review):
+        a task the tester passed but the reviewer has not judged yet keeps
+        the pipeline in the "development finished, verdict outstanding"
+        state (it stays TESTING), and the review worker advances the
+        pipeline on its own completion.
         """
         if self.tester_running:
             return
@@ -193,6 +231,36 @@ class PipelineLayer(DrCodeState):
             for t in finalized:
                 self.manager.complete_without_verification(t.id)
             if finalized:
+                self.refresh_sidebar()
+        if self._review_running:
+            # A review worker is in flight; its completion path advances
+            # the pipeline (a second dispatch here would cancel it).
+            return
+        review = self._next_review()
+        if review is not None:
+            # Set synchronously: two _advance() calls within one tick must
+            # not start two review workers (mirrors the tester_running flag).
+            self._review_running = True
+            self._review_task_id = review.id
+            self.refresh_status()
+            self.run_external_review(review.id)
+            return
+        if not (self.workflow is not None and self.workflow.has("on_review")):
+            # No external review hook: a TESTING task the tester already
+            # passed (left over when the workflow file was removed
+            # mid-flight) would block the pipeline forever — finalize it
+            # the way the review's accept would have.
+            stale = next(
+                (
+                    t
+                    for t in self.manager.all_tasks()
+                    if t.status is TaskStatus.TESTING
+                    and t.verification is VerificationStatus.PASSED
+                ),
+                None,
+            )
+            if stale is not None:
+                self.manager.finalize_verified(stale.id)
                 self.refresh_sidebar()
         testing = self._next_testing()
         if testing is not None:
@@ -582,6 +650,10 @@ class PipelineLayer(DrCodeState):
             self._tps_samples.clear()
             self._touch_activity()
             self.refresh_status()
+            # Custom workflow (`.drcode/workflow.py`): the on_task_start
+            # hook runs before the first activation (branch checkout etc.);
+            # its instructions are prepended to the first consumed prompt.
+            workflow_instructions = await self._run_task_start_hook(task)
             agent = build_agent(
                 self.resolved_config(AgentRole.CODING),
                 kind=task.kind,
@@ -611,6 +683,12 @@ class PipelineLayer(DrCodeState):
                     consumed = list(task.pending_input)
                     task.pending_input.clear()
                     text = "\n\n".join(entry.text for entry in consumed)
+                    if workflow_instructions:
+                        text = (
+                            "# Project workflow instructions\n\n"
+                            f"{workflow_instructions}\n\n{text}"
+                        )
+                        workflow_instructions = None
                     if self.viewed_id == task_id:
                         for entry in consumed:
                             if entry.text in self._pending_rendered:
@@ -1129,6 +1207,12 @@ class PipelineLayer(DrCodeState):
                     # ACTIVE paused instead — the poller surfaces it as
                     # "active, nothing running" until the user acts or the
                     # app restarts (promotion then resumes the attempt).
+                    # Custom workflow: on_development_done (push / open a PR)
+                    # runs BEFORE mark_done — between the hook and the
+                    # TESTING transition there is no await point, so no
+                    # concurrent _advance() can start the tester round
+                    # without the hook's note.
+                    await self._run_development_done_hook(task)
                     self.manager.mark_done(task.id)
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:
@@ -1208,9 +1292,20 @@ class PipelineLayer(DrCodeState):
                     self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
                 ),
                 root=self.project_root,
+                # The external review (`.drcode/workflow.py` on_review)
+                # splits "the tester passed" from "the task is accepted":
+                # a PASSED verdict then leaves the task TESTING.
+                review_gate=(
+                    self.workflow is not None and self.workflow.has("on_review")
+                ),
             )
             deps = TesterDeps(
-                root=self.project_root, manager=self.manager, task_id=task_id
+                root=self.project_root,
+                manager=self.manager,
+                task_id=task_id,
+                review_gate=(
+                    self.workflow is not None and self.workflow.has("on_review")
+                ),
             )
             try:
                 prompt = f"Verify completed task #{task.id}: {task.title}"
@@ -1234,6 +1329,14 @@ class PipelineLayer(DrCodeState):
                 # originating issue ("Fixes #N" keyword in the message).
                 if task.github_issue is not None:
                     prompt += f"\n\n{issue_commit_hint(task.github_issue)}"
+                # Custom workflow: context returned by on_development_done
+                # (the opened PR, the pushed branch, CI links, …).
+                dev_note = self._dev_done_notes.pop(task_id, None)
+                if dev_note:
+                    prompt += (
+                        "\n\nProject workflow notes (from the on_development_done "
+                        f"step):\n{dev_note}"
+                    )
                 # Round continuation loop: a testing round is a single
                 # `tester.iter()` run, but it can make many model requests
                 # (each `read_file`/`run_bash` result grows the context).
@@ -1463,6 +1566,223 @@ class PipelineLayer(DrCodeState):
             # must not restart the pipeline.
             if not cancelled:
                 self._advance()
+
+    # -- external review (.drcode/workflow.py hooks) -----------------------------------
+
+    async def _run_task_start_hook(self, task: Task) -> str | None:
+        """`on_task_start` before the first activation: branch checkout and
+        friends. Returns the hook's "instructions" text (injected into the
+        coding agent's first prompt), None when there is nothing to inject.
+        Never fatal: a failing hook is logged and the run proceeds. Fires
+        only when the transcript is still empty — the hook must not run
+        again on every resume; it is the script's job to be idempotent
+        beyond that."""
+        workflow = self.workflow
+        if workflow is None or not workflow.has("on_task_start"):
+            return None
+        if task.messages:
+            return None  # not the first activation
+        result = await workflow.call("on_task_start", task)
+        if not result.ok:
+            self._show_event(
+                task,
+                f"Workflow on_task_start failed (continuing without it): "
+                f"{result.error}",
+                kind="workflow",
+            )
+            return None
+        instructions = str(result.output.get("instructions") or "").strip()
+        if instructions:
+            self._show_event(
+                task,
+                "Workflow on_task_start: project instructions injected "
+                "into the task prompt.",
+                kind="workflow",
+            )
+            return instructions
+        return None
+
+    async def _run_development_done_hook(self, task: Task) -> None:
+        """`on_development_done` when a development round finishes (push,
+        open a PR, …) and before the tester round starts. The returned text
+        is kept for the tester's prompt; without a synchronous on_review
+        hook this switches the task into the ASYNC review mode — it will
+        complete normally and await the verdict via the review poll."""
+        workflow = self.workflow
+        if workflow is None or not workflow.has("on_development_done"):
+            return
+        if task.kind is TaskKind.RESEARCH:
+            return  # research tasks never go through testing/finalization
+        result = await workflow.call("on_development_done", task)
+        if not result.ok:
+            self._show_event(
+                task,
+                f"Workflow on_development_done failed (continuing without "
+                f"it): {result.error}",
+                kind="workflow",
+            )
+            return
+        text = str(result.output.get("text") or "").strip()
+        if text:
+            self._dev_done_notes[task.id] = text
+
+    async def _run_accepted_hook(self, task: Task) -> None:
+        """`on_accepted` after an accept verdict (merge the PR, delete the
+        branch, …). Its text goes to the service-event log. Never fatal."""
+        workflow = self.workflow
+        if workflow is None or not workflow.has("on_accepted"):
+            return
+        result = await workflow.call("on_accepted", task)
+        if not result.ok:
+            self._show_event(
+                task,
+                f"Workflow on_accepted failed (non-fatal): {result.error}",
+                kind="workflow",
+            )
+            return
+        text = str(result.output.get("text") or "").strip()
+        if text:
+            self._show_event(task, f"on_accepted:\n{text}", kind="workflow")
+
+    def _apply_review_accept(self, task: Task) -> None:
+        """Finish the task after an accept verdict: a sync-mode task is
+        still TESTING (finalize_verified completes it with the PASSED
+        label); an async-mode task is already COMPLETED (just clear the
+        review-awaiting marker and the rejection count). A task the user
+        re-queued while the review ran (QUEUED/HOLD) is left alone."""
+        if task.status is TaskStatus.TESTING:
+            self.manager.finalize_verified(task.id)
+        elif task.status is TaskStatus.COMPLETED:
+            task.review_pending = False
+            task.review_rejections = 0
+            task.touch()
+            self.manager.storage.save(task)
+
+    @work(exclusive=True, group="review")
+    async def run_external_review(self, task_id: str) -> None:
+        """One external review attempt for a passed task (sync mode after
+        the tester round, or the retry/async poll). A reject re-queues the
+        task with the reviewer's comment as new input (the coding agent
+        reworks it in the same transcript); an accept completes it and
+        runs on_accepted; a failure or a pending verdict keeps the task
+        waiting (fail-closed) and schedules a retry."""
+        task = self.manager.get(task_id)
+        workflow = self.workflow
+        try:
+            if workflow is None:
+                return
+            result = await workflow.call("on_review", task)
+        finally:
+            self._review_running = False
+            self._review_task_id = None
+            self.refresh_status()
+        if not result.ok:
+            # Fail-closed: an unreachable reviewer must not wave the change
+            # through — the task stays TESTING+PASSED and is retried with
+            # backoff (like a failed tester round).
+            count = self._review_fail_count.get(task_id, 0) + 1
+            self._review_fail_count[task_id] = count
+            delay = min(
+                self._REVIEW_RETRY_BASE * 2 ** (count - 1), self._REVIEW_RETRY_CAP
+            )
+            self._review_retry_at[task_id] = time.monotonic() + delay
+            self._show_event(
+                task,
+                f"External review (on_review) failed — the task waits for "
+                f"the next attempt ({count}, in {int(delay)} s): {result.error}",
+                kind="workflow",
+            )
+            self.set_timer(delay, self._advance)
+            return
+        self._review_fail_count.pop(task_id, None)
+        verdict = str(result.output.get("verdict") or "").strip().lower()
+        if verdict == "accept":
+            self._show_event(task, "External review: accepted.", kind="workflow")
+            if task.status not in (TaskStatus.TESTING, TaskStatus.COMPLETED):
+                # The user took the task back into development (send()) or
+                # parked it while the review ran — no finalization.
+                self._advance()
+                return
+            self._apply_review_accept(task)
+            self.refresh_sidebar()
+            await self._run_accepted_hook(task)
+            self._advance()
+        elif verdict == "reject":
+            comment = (
+                str(result.output.get("comment") or "").strip()
+                or "The external review rejected the change — rework the "
+                "task according to the review notes."
+            )
+            self._show_event(
+                task,
+                f"External review: rejected — the task goes back to "
+                f"development.\n\n{comment}",
+                kind="workflow",
+            )
+            self.manager.requeue_review_rejection(task.id, comment)
+            self.refresh_sidebar()
+            if task.review_rejections >= MAX_REVIEW_REJECTIONS:
+                # Loop protection: park the task for a human instead of
+                # ping-ponging agent ⇄ reviewer forever (same idea as the
+                # tester backoff).
+                self.manager.set_hold(task.id, on=True)
+                self._show_event(
+                    task,
+                    f"Rejected {task.review_rejections} times in a row by "
+                    "the external review — the task is put on hold and "
+                    "requires human attention (Ctrl+P resumes it).",
+                    kind="workflow",
+                )
+            self._advance()
+        else:
+            # No final verdict yet (CI still running, a human review in
+            # progress): release the pipeline — the task completes (with
+            # its PASSED label) and the periodic poll re-asks on_review
+            # until a final verdict arrives. "Awaiting review" = COMPLETED
+            # with an open PR; such tasks are excluded from the startup
+            # auto-cleanup, so a verdict days later still finds them.
+            self._show_event(
+                task,
+                f"External review has no final verdict yet "
+                f"({verdict or 'none reported'}) — the task is released "
+                "and the review verdict will be polled.",
+                kind="workflow",
+            )
+            if task.status is TaskStatus.TESTING:
+                self.manager.finalize_verified(task.id)
+            if task.status is TaskStatus.COMPLETED:
+                task.review_pending = True
+                task.touch()
+                self.manager.storage.save(task)
+            self._review_poll_at = time.monotonic() + self._REVIEW_PENDING_POLL
+
+    def _poll_workflow_review(self) -> None:
+        """Async review poll (every 30s tick, rate-limited to one attempt
+        per _REVIEW_PENDING_POLL): ask on_review for the verdict of every
+        COMPLETED task awaiting its external review (review_pending — an
+        open PR). The script checks the PR state itself (merged/approved →
+        accept, "Changes requested" → reject, still open → pending)."""
+        if self.workflow is None or not self.workflow.has("on_review"):
+            return
+        if self._review_running:
+            return
+        if time.monotonic() < self._review_poll_at:
+            return
+        pending = next(
+            (
+                t
+                for t in self.manager.all_tasks()
+                if t.status is TaskStatus.COMPLETED and t.review_pending
+            ),
+            None,
+        )
+        if pending is None:
+            return
+        self._review_poll_at = time.monotonic() + self._REVIEW_PENDING_POLL
+        self._review_running = True
+        self._review_task_id = pending.id
+        self.refresh_status()
+        self.run_external_review(pending.id)
 
     # -- actions ---------------------------------------------------------------------
 

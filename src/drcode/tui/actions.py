@@ -43,6 +43,7 @@ from ..settings import (
     StallNudge,
     TaskFinalization,
 )
+from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
     FinalizationOptionsProvider,
@@ -816,6 +817,43 @@ class ActionsLayer(DrCodeState):
                 providers=[StallNudgeOptionsProvider],
                 placeholder="Search for options…",
             )
+        )
+
+    def workflow_status_label(self) -> str:
+        """One-line status of the custom team workflow for the Settings
+        entry: "default" without the workflow files, otherwise what is
+        active (from .drcode/git-workflow.md and .drcode/workflow.py)."""
+        return describe_project_workflow(self.project_root)
+
+    def action_workflow_info(self) -> None:
+        """Settings entry ("Workflow: …") — informational: explains which
+        workflow layers are active and where their files live. The workflow
+        is enabled by file presence alone; there is nothing to toggle."""
+        parts = [
+            (
+                "Git rules: .drcode/git-workflow.md — "
+                f"{'present' if load_git_workflow(self.project_root) else 'not present'}"
+            )
+        ]
+        hooks = self.workflow
+        if hooks is None:
+            parts.append("Hooks: .drcode/workflow.py — not present")
+        elif hooks.load_error:
+            parts.append(
+                f"Hooks: .drcode/workflow.py — unparseable ({hooks.load_error})"
+            )
+        else:
+            defined = ", ".join(hooks.defined_hooks()) or "no hook functions defined"
+            parts.append(f"Hooks: .drcode/workflow.py — {defined}")
+        parts.append(
+            "Security: .drcode/workflow.py is arbitrary code running with "
+            "your user permissions — never trust it from a repository you "
+            "did not author."
+        )
+        self.notify(
+            "\n".join(parts),
+            title="Custom workflow",
+            timeout=10,
         )
 
     def action_change_github(self) -> None:

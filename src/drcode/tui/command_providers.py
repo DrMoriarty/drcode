@@ -168,6 +168,7 @@ class SettingsPalette(CommandPalette):
         "Auto-delete completed tasks:",
         "Task finalization:",
         "Nudge stalled agent after:",
+        "Workflow:",
         "GitHub integration:",
         "Notifications:",
         "Maximize",
@@ -349,6 +350,16 @@ class ProjectSettingsCommandsProvider(Provider):
                     "activity for this long (project setting)"
                 ),
                 app.action_change_stall_nudge,
+            ),
+            (
+                f"Workflow: {app.workflow_status_label()}",
+                (
+                    "Custom branching/review rules: .drcode/git-workflow.md "
+                    "(prose rules for the agents) and .drcode/workflow.py "
+                    "(lifecycle hooks, incl. external code review) — press "
+                    "for details"
+                ),
+                app.action_workflow_info,
             ),
             (
                 (

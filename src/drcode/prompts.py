@@ -11,9 +11,11 @@ can ship as `package-data`.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .models import TaskKind
+from .workflow import load_git_workflow
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # System prompts for the coding/tester agents live here (one `.md` file each).
@@ -50,22 +52,59 @@ def _substitute_project_path(template: str, project_root: Path | None) -> str:
     return template.replace(PROJECT_PATH_PLACEHOLDER, replacement)
 
 
+# The "no commits" sentence of the bundled coding prompts (spelled across a
+# line break in feature.md). When the project ships its own git workflow,
+# this sentence is removed: the workflow file decides when committing is
+# allowed, and its text takes over entirely.
+_NEVER_COMMIT_RE = re.compile(r"\s*Never commit to\s+git unless explicitly asked\.?")
+
+# Header under which the project's `.drcode/git-workflow.md` rules are
+# appended to a system prompt.
+GIT_WORKFLOW_HEADER = "Git workflow (project rules)"
+
+
+def _project_prompt_override(project_root: Path | None, name: str) -> str | None:
+    """A project-local override of a bundled system prompt:
+    `<root>/.drcode/prompts/<name>.md`, or None when absent."""
+    if project_root is None:
+        return None
+    path = project_root / ".drcode" / "prompts" / name
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
     """Bundled system prompt for a coding task of the given kind.
 
     Each kind gets its own `.md` template in `prompts/system/` (feature tasks
     encourage refactoring, bug tasks demand minimal changes, research tasks
-    answer questions / update docs). The ``{project_path}`` placeholder in the
-    template header is replaced with the actual project directory; without a
-    root a neutral ``(unknown)`` marker is substituted.
+    answer questions / update docs). A project may override the template with
+    `<root>/.drcode/prompts/<name>.md`. The ``{project_path}`` placeholder in
+    the template header is replaced with the actual project directory; without
+    a root a neutral ``(unknown)`` marker is substituted.
+
+    When the project defines `.drcode/git-workflow.md` (team branching /
+    commit / review rules), the bundled "Never commit to git" sentence is
+    removed (the workflow file governs committing instead) and the workflow
+    text is appended under a dedicated header.
     """
     name = {
         TaskKind.FEATURE: "feature.md",
         TaskKind.BUG: "bug.md",
         TaskKind.RESEARCH: "research.md",
     }[kind]
-    template = (SYSTEM_PROMPTS_DIR / name).read_text(encoding="utf-8")
-    return _substitute_project_path(template, project_root)
+    template = _project_prompt_override(project_root, name) or (
+        SYSTEM_PROMPTS_DIR / name
+    ).read_text(encoding="utf-8")
+    git_workflow = load_git_workflow(project_root)
+    if git_workflow is not None:
+        template = _NEVER_COMMIT_RE.sub("", template)
+    prompt = _substitute_project_path(template, project_root)
+    if git_workflow is not None:
+        prompt = f"{prompt}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
+    return prompt
 
 
 def load_tester_prompt(
@@ -75,13 +114,25 @@ def load_tester_prompt(
 
     With ``allow_commit=False`` (project setting "Task finalization: Testing")
     the commit-free template is returned; otherwise the default one that
-    mentions ``git_commit``. The ``{project_path}`` placeholder in the template
-    header is replaced with the actual project directory; without a root a
-    neutral ``(unknown)`` marker is substituted.
+    mentions ``git_commit``. A project may override the template with
+    `<root>/.drcode/prompts/tester.md` (or `tester_no_commit.md`). The
+    ``{project_path}`` placeholder in the template header is replaced with the
+    actual project directory; without a root a neutral ``(unknown)`` marker is
+    substituted.
+
+    When the project defines `.drcode/git-workflow.md`, its rules are
+    appended: the tester must finalize the task according to the same team
+    process the coding agent follows.
     """
     name = "tester_no_commit.md" if not allow_commit else "tester.md"
-    template = (SYSTEM_PROMPTS_DIR / name).read_text(encoding="utf-8")
-    return _substitute_project_path(template, project_root)
+    template = _project_prompt_override(project_root, name) or (
+        SYSTEM_PROMPTS_DIR / name
+    ).read_text(encoding="utf-8")
+    prompt = _substitute_project_path(template, project_root)
+    git_workflow = load_git_workflow(project_root)
+    if git_workflow is not None:
+        prompt = f"{prompt}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
+    return prompt
 
 
 def load_compaction_prompts() -> tuple[str, str]:

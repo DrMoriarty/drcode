@@ -1603,6 +1603,19 @@ class PipelineLayer(DrCodeState):
                 self._tester_net_count.pop(task_id, None)
                 self._tester_resume_round.discard(task_id)
                 self._tester_retry_at.pop(task_id, None)
+            # Custom workflow: on_tester_passed after a PASSED finalization
+            # (no external review — with the review gate the task is still
+            # TESTING here and the hook fires from the review's accept path
+            # instead). State-checked, so it also fires when the run was
+            # aborted after set_verification had already finalized the task
+            # (the stall nudge), and never for FAILED labels, research
+            # tasks, cancels, or the "finalization: none" path (no label).
+            if (
+                task.status is TaskStatus.COMPLETED
+                and task.verification is VerificationStatus.PASSED
+                and not task.review_pending
+            ):
+                await self._run_tester_passed_hook(task)
             # A cancelled run (user abort, or a newer tester taking over)
             # must not restart the pipeline.
             if not cancelled:
@@ -1666,6 +1679,32 @@ class PipelineLayer(DrCodeState):
         text = str(result.output.get("text") or "").strip()
         if text:
             self._dev_done_notes[task.id] = text
+
+    async def _run_tester_passed_hook(self, task: Task) -> None:
+        """`on_tester_passed` right after the tester stamped the task PASSED
+        and the task is finalized (install, deploy, …). Fires on every path
+        to COMPLETED-after-PASSED: without an external review directly from
+        the tester round's completion, and on a review-mode task when the
+        review finally accepts it — an install step must run no matter
+        which path accepted the task. Fail-open like `on_accepted` (an
+        install step must not park the task the way the fail-closed
+        `on_review` does); its text goes to the service-event log."""
+        workflow = self.workflow
+        if workflow is None or not workflow.has("on_tester_passed"):
+            return
+        if task.kind is TaskKind.RESEARCH:
+            return  # research tasks never go through testing/finalization
+        result = await workflow.call("on_tester_passed", task)
+        if not result.ok:
+            self._show_event(
+                task,
+                f"Workflow on_tester_passed failed (non-fatal): {result.error}",
+                kind="workflow",
+            )
+            return
+        text = str(result.output.get("text") or "").strip()
+        if text:
+            self._show_event(task, f"on_tester_passed:\n{text}", kind="workflow")
 
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the
@@ -1746,6 +1785,10 @@ class PipelineLayer(DrCodeState):
                 return
             self._apply_review_accept(task)
             self.refresh_sidebar()
+            # on_tester_passed fires on every accept path too (a review-mode
+            # task reaches COMPLETED-after-PASSED only here), before
+            # on_accepted — lifecycle order.
+            await self._run_tester_passed_hook(task)
             await self._run_accepted_hook(task)
             self._advance()
         elif verdict == "reject":

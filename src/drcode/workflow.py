@@ -29,6 +29,14 @@ skips its step; `task` is the payload dict described below):
     def on_development_done(task) -> dict | None
         Development finished, before testing (push, `gh pr create`, …).
         Return {"text": "..."} to append context to the tester's prompt.
+    def on_tester_passed(task) -> dict | None
+        Called right after the tester stamped the task PASSED and the task
+        is finalized (also when a review-mode task is accepted later by the
+        external review — an install/deploy step must run on every path to
+        COMPLETED-after-PASSED). The unconditional post-verification hook:
+        it needs no on_review gate and never changes pipeline behaviour.
+        Research tasks never trigger it (they skip testing). Return
+        {"text": "..."} for the task's service-event log.
     def on_review(task) -> dict
         External code review after the tester passed the task. Return
         {"verdict": "accept"} or {"verdict": "reject", "comment": "..."}.
@@ -56,6 +64,11 @@ A typical script looks like:
         if ci.returncode != 0:
             return {"verdict": "pending"}
         return {"verdict": "accept"}
+
+    def on_tester_passed(task):
+        r = subprocess.run(["uv", "tool", "install", ".", "--force"],
+                           capture_output=True, text=True)
+        return {"text": r.stdout or r.stderr}
 
 A hook failure (non-zero exit, malformed output, timeout) is NEVER fatal:
 it is written into the task's service-event log and the pipeline moves on
@@ -106,6 +119,7 @@ GIT_WORKFLOW_FILE = "git-workflow.md"
 HOOK_NAMES: tuple[str, ...] = (
     "on_task_start",
     "on_development_done",
+    "on_tester_passed",
     "on_review",
     "on_accepted",
 )

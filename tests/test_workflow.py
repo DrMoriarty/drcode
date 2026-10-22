@@ -66,6 +66,27 @@ def on_review(task):
     return {"verdict": "accept"}
 """
 
+PASSED_HOOK_SCRIPT = """
+def on_tester_passed(task):
+    return {"text": "installed with uv tool install"}
+"""
+
+PASSED_HOOK_CRASH_SCRIPT = """
+def on_tester_passed(task):
+    raise RuntimeError("uv install exploded")
+"""
+
+REVIEW_ACCEPT_AND_PASSED_SCRIPT = """
+def on_review(task):
+    return {"verdict": "accept"}
+
+def on_tester_passed(task):
+    return {"text": "installed with uv tool install"}
+
+def on_accepted(task):
+    return {"text": "merged the PR"}
+"""
+
 ECHO_SCRIPT = """
 def on_task_start(task):
     return {"seen": task}
@@ -632,3 +653,168 @@ async def test_dev_done_note_reaches_tester_prompt(
     assert any("PR #7 opened" in call for call in scripted.calls[1:])
     # Without on_review the task simply completed — no review markers.
     assert task.review_pending is False
+
+
+# -- on_tester_passed: the unconditional post-verification hook -----------------------
+
+
+def passed_hook_events(task) -> str:
+    return "\n".join(
+        e.text
+        for e in task.events
+        if e.kind == "workflow" and "tester_passed" in e.text
+    )
+
+
+async def test_tester_passed_hook_fires_without_review(
+    review_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """No on_review defined: the tester passes the task, it completes with
+    the PASSED label and on_tester_passed runs — no fake review gate
+    needed."""
+    make_script(review_app.project_root, PASSED_HOOK_SCRIPT)
+    review_app.workflow = load_hooks(review_app.project_root)
+    task = review_app.manager.create("Add logging", "add logging everywhere")
+    scripted.steps = [
+        text_response("done"),
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+    async with review_app.run_test() as pilot:
+        await pilot.pause()
+        review_app._advance()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and "installed with uv tool install" in passed_hook_events(task)
+            ),
+            pilot,
+            what="on_tester_passed logged after the PASSED finalization",
+        )
+    assert task.verification is VerificationStatus.PASSED
+
+
+async def test_tester_passed_hook_failure_is_non_fatal(
+    review_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """Fail-open: a crashing install step is logged into the service events
+    and the task stays completed — it must not park the pipeline the way
+    the fail-closed on_review does."""
+    make_script(review_app.project_root, PASSED_HOOK_CRASH_SCRIPT)
+    review_app.workflow = load_hooks(review_app.project_root)
+    task = review_app.manager.create("Add logging", "add logging everywhere")
+    scripted.steps = [
+        text_response("done"),
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+    async with review_app.run_test() as pilot:
+        await pilot.pause()
+        review_app._advance()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and "on_tester_passed failed (non-fatal)" in passed_hook_events(task)
+            ),
+            pilot,
+            what="hook failure logged",
+        )
+    assert task.verification is VerificationStatus.PASSED
+    assert "uv install exploded" in passed_hook_events(task)
+
+
+async def test_tester_passed_hook_skipped_on_failed_verification(
+    review_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    make_script(review_app.project_root, PASSED_HOOK_SCRIPT)
+    review_app.workflow = load_hooks(review_app.project_root)
+    task = review_app.manager.create("Add logging", "add logging everywhere")
+    scripted.steps = [
+        text_response("done"),
+        tool_response("set_verification", {"success": False}),
+        text_response("tests fail"),
+    ]
+    async with review_app.run_test() as pilot:
+        await pilot.pause()
+        review_app._advance()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED and not review_app.tester_running
+            ),
+            pilot,
+            what="task completed with the FAILED label",
+        )
+    assert task.verification is VerificationStatus.FAILED
+    assert passed_hook_events(task) == ""
+
+
+async def test_tester_passed_hook_never_fires_for_research(
+    review_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """Research tasks skip testing entirely (mark_done completes them with
+    no verification label) — the hook must not run."""
+    make_script(review_app.project_root, PASSED_HOOK_SCRIPT)
+    review_app.workflow = load_hooks(review_app.project_root)
+    task = review_app.manager.create(
+        "Research options", "compare the options", kind=TaskKind.RESEARCH
+    )
+    scripted.steps = [text_response("research done")]
+    async with review_app.run_test() as pilot:
+        await pilot.pause()
+        review_app._advance()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED and not review_app.agent_running
+            ),
+            pilot,
+            what="research task completed",
+        )
+    assert passed_hook_events(task) == ""
+
+
+async def test_tester_passed_hook_fires_on_async_review_accept(
+    review_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """Review mode: a task completed while awaiting the async verdict gets
+    on_tester_passed when the poll finally accepts it (before on_accepted)
+    — an install step runs on every path to COMPLETED-after-PASSED."""
+    make_script(review_app.project_root, REVIEW_ACCEPT_AND_PASSED_SCRIPT)
+    review_app.workflow = load_hooks(review_app.project_root)
+    task = review_app.manager.create("Add logging", "add logging")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.review_pending = True
+    review_app.manager.storage.save(task)
+    review_app._review_poll_at = 0.0
+    async with review_app.run_test() as pilot:
+        await pilot.pause()
+        review_app._poll_workflow_review()
+        await wait_until(
+            lambda: (
+                task.review_pending is False
+                and "installed with uv tool install" in passed_hook_events(task)
+                and "on_accepted:" in "\n".join(e.text for e in task.events)
+            ),
+            pilot,
+            what="async review accept runs on_tester_passed",
+        )
+    assert task.status is TaskStatus.COMPLETED
+    events = "\n".join(e.text for e in task.events)
+    assert events.index("on_tester_passed:") < events.index("on_accepted:")
+
+
+def test_tester_passed_hook_in_lifecycle_order(project_root: Path) -> None:
+    from drcode.workflow import HOOK_NAMES
+
+    assert HOOK_NAMES == (
+        "on_task_start",
+        "on_development_done",
+        "on_tester_passed",
+        "on_review",
+        "on_accepted",
+    )
+    make_script(project_root, PASSED_HOOK_SCRIPT)
+    hooks = make_hooks(project_root)
+    assert hooks.has("on_tester_passed")
+    assert hooks.defined_hooks() == ["on_tester_passed"]
+    assert "on_tester_passed" in describe_project_workflow(project_root)

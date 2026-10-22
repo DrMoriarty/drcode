@@ -59,6 +59,15 @@ def on_development_done(task):
     url = subprocess.run(["gh", "pr", "create", "--fill"], capture_output=True, text=True).stdout
     return {"text": f"Pull request: {url}"}
 
+def on_tester_passed(task):
+    """Right after the tester stamped the task PASSED and the task is
+    finalized (install, deploy, ...). The unconditional post-verification
+    hook: no on_review gate needed, research tasks never trigger it. The
+    returned text goes to the task's service-event log."""
+    r = subprocess.run(["uv", "tool", "install", ".", "--force"],
+                       capture_output=True, text=True)
+    return {"text": r.stdout or r.stderr}
+
 def on_review(task):
     """External code review after the tester passed the task.
     accept  -> {"verdict": "accept"}
@@ -93,12 +102,21 @@ Behaviour per hook:
 - **`on_development_done`** — runs when a development round finishes and
   before the tester round. Its `{"text": ...}` reaches the tester's prompt.
   Research tasks skip it. A failure is logged and testing proceeds.
+- **`on_tester_passed`** — runs right after the tester stamps the task
+  PASSED and the task is finalized — with or without an external review
+  (on a review-mode task it fires when the review finally accepts it, just
+  before `on_accepted`). This is the place for a deterministic
+  post-verification step like `(re)installing the app`
+  (`uv tool install . --force`). A hook failure is **fail-open** (logged,
+  the pipeline moves on — an install step must not park tasks). Research
+  tasks never trigger it; neither do the cancellation paths or the
+  "Task finalization: None" setting (no PASSED label is stamped there).
 - **`on_review`** — the external review gate. After the tester stamps the
   task PASSED, the pipeline calls `on_review` (the task stays in TESTING —
   no new development starts while a verdict is outstanding, exactly like an
   in-flight tester round):
-  - `accept` → the task completes (with the "Verified successfully" label)
-    and `on_accepted` runs;
+  - `accept` → the task completes (with the "Verified successfully" label),
+    `on_tester_passed` and then `on_accepted` run;
   - `reject` → the reviewer's `comment` becomes the task's new user input
     and the task re-enters the queue — the coding agent reworks it **in the
     same transcript**, seeing the full history plus the review remarks;

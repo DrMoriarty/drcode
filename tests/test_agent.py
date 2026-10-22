@@ -557,6 +557,156 @@ async def test_git_push_success_with_bare_remote(tmp_path: Path) -> None:
     assert task.events == []
 
 
+# -- research agent: tracked-file commit (git_commit_docs) ---------------------------
+
+
+def _research_deps(root: Path) -> agent_mod.AgentDeps:
+    manager = TaskManager(root)
+    task = manager.create("docs", "write docs", kind=TaskKind.RESEARCH)
+    return agent_mod.AgentDeps(root=root, manager=manager, task_id=task.id)
+
+
+def _committed_files(repo: Path) -> list[str]:
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "show", "--name-only", "--format="],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.split()
+
+
+def _git_status(repo: Path, path: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "status", "--porcelain", path],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _git_log(repo: Path) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+async def test_git_commit_docs_commits_only_tracked_files(tmp_path: Path) -> None:
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    # A pre-existing tracked file the agent did NOT touch, left dirty, plus
+    # a committed baseline so the dirty state is real.
+    (tmp_path / "other.txt").write_text("original")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    (tmp_path / "other.txt").write_text("changed by someone else")
+    # The agent created a doc and edited another one.
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("guide")
+    (tmp_path / "README.md").write_text("# readme")
+    deps = _research_deps(tmp_path)
+    deps.manager.get(deps.task_id).edited_files[:] = [
+        "docs/guide.md",
+        "README.md",
+        "docs/guide.md",  # duplicate must collapse
+    ]
+    origin = tmp_path / "origin.git"
+    _git_init_repo(origin, bare=True)
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+
+    result = await agent_mod._commit_tracked_files(deps, tmp_path, "docs: add guide")
+
+    assert "Committed successfully" in result
+    assert "Pushed successfully" in result
+    assert sorted(_committed_files(tmp_path)) == ["README.md", "docs/guide.md"]
+    # The unrelated dirty change was NOT committed.
+    assert " M other.txt" in _git_status(tmp_path, "other.txt")
+    # Tracked list is cleared after a successful commit.
+    assert deps.manager.get(deps.task_id).edited_files == []
+
+
+async def test_git_commit_docs_without_tracked_files(tmp_path: Path) -> None:
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    deps = _research_deps(tmp_path)
+
+    result = await agent_mod._commit_tracked_files(deps, tmp_path, "docs")
+
+    assert "Nothing to commit" in result
+    assert "not created or edited" in result
+    # Nothing was committed.
+    assert _git_log(tmp_path).strip() == ""
+
+
+async def test_git_commit_docs_not_a_repo(tmp_path: Path) -> None:
+    deps = _research_deps(tmp_path)
+    deps.manager.get(deps.task_id).edited_files[:] = ["README.md"]
+    result = await agent_mod._commit_tracked_files(deps, tmp_path, "docs")
+    assert "Not a git repository" in result
+
+
+async def test_git_commit_docs_empty_message(tmp_path: Path) -> None:
+    deps = _research_deps(tmp_path)
+    deps.manager.get(deps.task_id).edited_files[:] = ["README.md"]
+    result = await agent_mod._commit_tracked_files(deps, tmp_path, "  ")
+    assert "Empty commit message" in result
+
+
+def test_track_edited_file(tmp_path: Path) -> None:
+    deps = _research_deps(tmp_path)
+    # Inside the project root: recorded project-relative, deduplicated.
+    agent_mod._track_edited_file(deps, tmp_path / "docs" / "guide.md")
+    agent_mod._track_edited_file(deps, tmp_path / "docs" / "guide.md")
+    assert deps.manager.get(deps.task_id).edited_files == ["docs/guide.md"]
+    # /tmp scratch file: never tracked.
+    agent_mod._track_edited_file(deps, Path("/tmp/scratch/x.md"))
+    assert deps.manager.get(deps.task_id).edited_files == ["docs/guide.md"]
+    # Persisted with the task.
+    reloaded = TaskManager(tmp_path).get(deps.task_id)
+    assert reloaded is not None
+    assert reloaded.edited_files == ["docs/guide.md"]
+
+
+def test_track_edited_file_ignores_non_research(tmp_path: Path) -> None:
+    manager = TaskManager(tmp_path)
+    task = manager.create("f", "x", kind=TaskKind.FEATURE)
+    deps = agent_mod.AgentDeps(root=tmp_path, manager=manager, task_id=task.id)
+    agent_mod._track_edited_file(deps, tmp_path / "README.md")
+    assert manager.get(task.id).edited_files == []
+
+
+def test_git_commit_docs_tool_only_for_research(fake_config: Config) -> None:
+    from drcode.agent import build_agent
+
+    research = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    assert "git_commit_docs" in _tool_names(research)
+    for kind in (TaskKind.FEATURE, TaskKind.BUG):
+        ag = build_agent(fake_config, kind=kind)
+        assert "git_commit_docs" not in _tool_names(ag)
+
+
+def test_research_prompt_documents_commit_flow() -> None:
+    from drcode.agent import RESEARCH_SYSTEM_PROMPT
+
+    assert "git_commit_docs" in RESEARCH_SYSTEM_PROMPT
+    assert "MUST finish the task by calling git_commit_docs" in RESEARCH_SYSTEM_PROMPT
+
+
 # -- agent construction (no network calls) ------------------------------------------
 
 

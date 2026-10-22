@@ -89,12 +89,14 @@ __all__ = [
     "ModelFetchError",
     "TaskManager",
     "TesterDeps",
+    "_commit_tracked_files",
     "_context_status",
     "_git_push",
     "_log_violation",
     "_run_bash_logged",
     "_run_tool",
     "_run_tool_logged",
+    "_track_edited_file",
     "all_user_prompts",
     "backdate_user_prompt",
     "build_agent",
@@ -234,9 +236,13 @@ def build_agent(
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
         """Create or overwrite a file. Only the project root (with all subdirectories)
         and /tmp (with all subdirectories) are writable; use /tmp to test hypotheses."""
-        return await _run_tool_logged(
+        result = await _run_tool_logged(
             ctx.deps, "write_file", tools.write_file, ctx.deps.root, path, content
         )
+        _track_edited_file(
+            ctx.deps, tools.resolve_edit_path(ctx.deps.root, path, "create/overwrite")
+        )
+        return result
 
     @agent.tool(sequential=True)
     async def edit_file(
@@ -245,7 +251,7 @@ def build_agent(
         """Replace an exact unique substring in a file. old_string must match exactly once.
         Only the project root (with all subdirectories) and /tmp (with all subdirectories)
         are writable; use /tmp to test hypotheses."""
-        return await _run_tool_logged(
+        result = await _run_tool_logged(
             ctx.deps,
             "edit_file",
             tools.edit_file,
@@ -254,6 +260,8 @@ def build_agent(
             old_string,
             new_string,
         )
+        _track_edited_file(ctx.deps, tools.resolve_edit_path(ctx.deps.root, path))
+        return result
 
     @agent.tool
     async def glob_files(ctx: RunContext[AgentDeps], pattern: str) -> list[str]:
@@ -315,6 +323,20 @@ def build_agent(
                 f"Feature request #{feature.id} '{feature.title}' created at "
                 "the tail of the queue."
             )
+
+        @agent.tool(sequential=True)
+        async def git_commit_docs(ctx: RunContext[AgentDeps], message: str) -> str:
+            """Commit and push the documentation changes you made in this task.
+            Stages EXACTLY the files you created or edited yourself (tracked
+            automatically by write_file/edit_file) — never any other change in
+            the working tree — commits them with the given message and pushes
+            the branch when a remote is configured. Call it once, when the
+            documentation assignment is complete; do NOT call it for pure
+            question-answering tasks where you changed no files. Skips
+            gracefully when the project root is not a git repository. A failed
+            push is NOT a failure: the commit stays safe locally, the error is
+            logged into the task's event log — mention it in your summary."""
+            return await _commit_tracked_files(ctx.deps, ctx.deps.root, message)
 
     @agent.tool
     def ask_clarifying_question(
@@ -495,12 +517,13 @@ def build_tester_agent(
     return agent
 
 
-async def _git_push(deps: TesterDeps, root: Path) -> str:
+async def _git_push(deps: AgentDeps | TesterDeps, root: Path) -> str:
     """Best-effort `git push` after a successful commit.
 
-    A push failure never fails verification: the error is written into the
-    task's service-event log and reported back to the model as a note, so the
-    tester still passes the task."""
+    A push failure never fails the caller's flow: the error is written into
+    the task's service-event log and reported back to the model as a note, so
+    the tester still passes the task and the research agent still finishes
+    its documentation assignment with the commit safe locally."""
     remotes = await tools.run_bash(root, "git remote")
     names = remotes.removeprefix("exit=0").strip()
     if not remotes.startswith("exit=0") or not names or names == "(no output)":
@@ -523,3 +546,71 @@ async def _git_push(deps: TesterDeps, root: Path) -> str:
         "set_verification(success=True) and mention the push problem "
         "in your summary."
     )
+
+
+def _track_edited_file(deps: AgentDeps, resolved: Path) -> None:
+    """Record a file the research agent created/edited on the task.
+
+    Only research tasks are tracked: the coding agent's feature/bug changes
+    are committed by the tester, not by the agent itself. Paths outside the
+    project root (/tmp scratch files) are ignored — they can never become
+    commit candidates. The list persists with the task, so tracking survives
+    restarts and the multi-turn loop of one run (a new AgentDeps is built per
+    `agent.iter`, the task field is the shared accumulator). Duplicates are
+    collapsed, keeping the first-seen order.
+    """
+    task = deps.manager.get(deps.task_id)
+    if task.kind is not TaskKind.RESEARCH:
+        return
+    try:
+        rel = resolved.relative_to(deps.root.resolve())
+    except ValueError:
+        return
+    rel_posix = rel.as_posix()
+    if rel_posix not in task.edited_files:
+        task.edited_files.append(rel_posix)
+        task.touch()
+        deps.manager.storage.save(task)
+
+
+async def _commit_tracked_files(deps: AgentDeps, root: Path, message: str) -> str:
+    """Commit EXACTLY the files the research agent created/edited itself.
+
+    The stage list comes from `task.edited_files` (see `_track_edited_file`)
+    — the model cannot widen it, so unrelated working-tree changes are never
+    committed. Pushes via `_git_push` when a remote is configured. The
+    tracked list is cleared after a successful commit so a later call does
+    not re-stage already-committed files.
+    """
+    message = message.strip().strip("'\"")
+    if not message:
+        return "Empty commit message — nothing committed."
+    task = deps.manager.get(deps.task_id)
+    files = list(dict.fromkeys(task.edited_files))
+    if not files:
+        return (
+            "Nothing to commit — you have not created or edited any files in "
+            "this task yourself. Only files you changed are ever committed; "
+            "other project changes are never staged."
+        )
+    inside = await tools.run_bash(root, "git rev-parse --is-inside-work-tree")
+    if not inside.startswith("exit=0") or "true" not in inside:
+        return "Not a git repository — nothing committed."
+    quoted = " ".join(shlex.quote(f) for f in files)
+    add = await tools.run_bash(root, f"git add -A -- {quoted}")
+    if not add.startswith("exit=0"):
+        return f"Staging failed:\n{add}"
+    staged = await tools.run_bash(root, "git diff --cached --name-only")
+    if staged.startswith("exit=0") and not staged.removeprefix("exit=0").strip():
+        return (
+            "Nothing to commit — the files you edited carry no changes "
+            "against HEAD (already committed or untouched)."
+        )
+    commit = await tools.run_bash(root, f"git commit -m {shlex.quote(message)}")
+    if not commit.startswith("exit=0"):
+        return f"Commit failed:\n{commit}"
+    head = await tools.run_bash(root, "git log -1 --oneline")
+    task.edited_files.clear()
+    task.touch()
+    deps.manager.storage.save(task)
+    return f"Committed successfully.\n{head}" + await _git_push(deps, root)

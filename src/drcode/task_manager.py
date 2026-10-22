@@ -157,7 +157,8 @@ class TaskManager:
                     continue
                 known.add(task.id)
                 new.append(task)
-            for t in sorted(new, key=lambda t: t.created_at):
+            ordered = sorted(new, key=lambda t: t.created_at)
+            for t in ordered:
                 changed = False
                 if t.queue_seq is None:
                     t.queue_seq = self._next_queue_seq()
@@ -168,7 +169,7 @@ class TaskManager:
                 self.tasks[t.id] = t
                 if changed:
                     self.storage.save(t)
-            return new
+            return ordered
 
     # -- mutations ------------------------------------------------------------
 

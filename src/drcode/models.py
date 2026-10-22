@@ -111,6 +111,12 @@ class Task(BaseModel):
     # User messages typed while the task is queued/not yet processed,
     # stamped with the moment they were typed (see PendingInput).
     pending_input: list[PendingInput] = Field(default_factory=list)
+    # Project-relative paths the RESEARCH agent created/edited itself via
+    # write_file/edit_file (tracked in agent._track_edited_file). The
+    # research-only git_commit_docs tool stages exactly these paths — never
+    # any other change in the working tree — and clears the list after a
+    # successful commit. /tmp scratch files are never recorded here.
+    edited_files: list[str] = Field(default_factory=list)
     # When the task reached COMPLETED (tester verdict, research done or
     # user cancel). Drives the startup auto-cleanup of old completed tasks
     # (see ProjectSettings.completed_retention); None while not completed.

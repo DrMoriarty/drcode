@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import queue
+import ssl
 import sys
 import threading
 import wave
@@ -154,17 +155,30 @@ class VoiceClient:
         if not model:
             raise VoiceError(f"Voice is not configured: no {what} model set")
 
+    def _verify(self) -> ssl.SSLContext | bool:
+        """Trust-store-backed TLS verification, falling back to httpx
+        defaults. Системное хранилище сертификатов: корпоративные CA
+        отсутствуют в certifi, из-за чего httpx даёт
+        CERTIFICATE_VERIFY_FAILED, который оборачивается в ConnectError
+        (тот же паттерн, что в ``agent_model._ssl_verify``)."""
+        try:
+            import truststore
+
+            return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except ImportError:
+            return True
+
     def _post(self, url: str, **kwargs: object) -> httpx.Response:
         if self._transport is not None:
             with httpx.Client(transport=self._transport) as client:
                 return client.post(url, **kwargs)  # type: ignore[arg-type]
-        return httpx.post(url, **kwargs)  # type: ignore[arg-type]
+        return httpx.post(url, verify=self._verify(), **kwargs)  # type: ignore[arg-type]
 
     def _get(self, url: str, **kwargs: object) -> httpx.Response:
         if self._transport is not None:
             with httpx.Client(transport=self._transport) as client:
                 return client.get(url, **kwargs)  # type: ignore[arg-type]
-        return httpx.get(url, **kwargs)  # type: ignore[arg-type]
+        return httpx.get(url, verify=self._verify(), **kwargs)  # type: ignore[arg-type]
 
     def transcribe(self, wav: bytes) -> str:
         """Speech → text (``POST /audio/transcriptions``): multipart WAV

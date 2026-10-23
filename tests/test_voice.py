@@ -232,6 +232,38 @@ def test_check_connection_error() -> None:
         _client(handler).check()
 
 
+def test_production_requests_use_truststore(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the test transport the client must verify against the system
+    trust store (corporate CAs are absent from certifi)."""
+    import ssl as ssl_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> httpx.Response:
+        seen["verify"] = kwargs.get("verify")
+        return httpx.Response(
+            200,
+            json={"text": "ok"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    VoiceClient(
+        VoiceConfig(
+            base_url="https://audio.local/v1",
+            api_key="key-1",
+            asr_model="x5-asr/x5-asr-large",
+        )
+    ).transcribe(_WAV_BYTES)
+    verify = seen["verify"]
+    try:
+        import truststore  # noqa: F401
+
+        assert isinstance(verify, ssl_mod.SSLContext)
+    except ImportError:
+        assert verify is True
+
+
 # -- TtsSpeaker -------------------------------------------------------------------
 
 

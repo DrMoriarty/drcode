@@ -329,7 +329,9 @@ def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
 # tools like `uv` print foreign paths into tool-returns and — worst case — let
 # `uv run --active` delete and recreate the foreign venv. They are stripped
 # from the environment of every subprocess the agent spawns. Everything else
-# (PATH, HOME, DRCODE_*, …) is passed through unchanged.
+# (PATH, HOME, …) is passed through unchanged, except DRCODE_TASK_ID /
+# DRCODE_WORKTREE: run_bash manages those itself (exported when a task id is
+# given, removed otherwise — a task-less child must never see a foreign id).
 STRIPPED_ENV_VARS = (
     "VIRTUAL_ENV",
     "PYTHONHOME",
@@ -462,6 +464,12 @@ async def run_bash(
         # root; a plain task still reports the project directory.
         env["DRCODE_TASK_ID"] = task_id
         env["DRCODE_WORKTREE"] = str(root)
+    else:
+        # Without a task id the variables stay unset (no empty-string noise):
+        # strip any inherited values so a task-less child never sees a
+        # foreign task's identity.
+        env.pop("DRCODE_TASK_ID", None)
+        env.pop("DRCODE_WORKTREE", None)
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,

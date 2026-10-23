@@ -42,6 +42,11 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         "DRCODE_MAX_CONTEXT_TOKENS",
         "DRCODE_MAX_TOKENS",
         "DRCODE_COMPACTION_THRESHOLD",
+        # Task-identity variables exported by run_bash(task_id=...) when drcode
+        # dogfoods itself (the agent runs `uv run pytest` via run_bash) — the
+        # child pytest must not inherit the parent task's id/worktree.
+        "DRCODE_TASK_ID",
+        "DRCODE_WORKTREE",
     ):
         monkeypatch.delenv(name, raising=False)
 

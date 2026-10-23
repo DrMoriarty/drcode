@@ -427,3 +427,23 @@ async def test_todo_panel_renders_items(project_root: Path) -> None:
         text = str(panel.render())
         assert "[ ] 1. first" in text
         assert "[x] 2. second" in text
+
+
+async def test_todo_panel_collapses_when_all_done(project_root: Path) -> None:
+    app = DrCodeApp(project_root)
+    task = app.manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    task.todos = [
+        TodoItem(text="first", done=True),
+        TodoItem(text="second", done=True),
+    ]
+    app.manager.storage.save(task)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        panel = app.query_one("#todo-panel", TodoPanel)
+        assert not panel.has_class("hidden")
+        text = str(panel.render())
+        assert "todos" in text and "2/2" in text
+        assert "first" not in text
+        assert "second" not in text

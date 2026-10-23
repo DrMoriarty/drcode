@@ -13,12 +13,17 @@ from pathlib import Path
 import pytest
 
 import drcode.config as config_module
+import drcode.tools as tools_module
 from drcode.config import Config
 
 
 @pytest.fixture(autouse=True)
 def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect the user config dir (computed at import time) to tmp."""
+    # Redirect the /tmp/drcode scratch base too: app-mounting tests run the
+    # startup orphan sweep, which must never touch real /tmp/drcode (another
+    # live drcode instance's active task may have its scratch there).
+    monkeypatch.setattr(tools_module, "SCRATCH_ROOT", tmp_path / "drcode-scratch")
     config_dir = tmp_path / "xdg" / "drcode"
     monkeypatch.setattr(config_module, "_USER_CONFIG_DIR", config_dir)
     monkeypatch.setattr(config_module, "USER_CONFIG_FILE", config_dir / "drcode.json")

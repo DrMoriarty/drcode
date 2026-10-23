@@ -48,6 +48,12 @@ DEFAULT_COMPACTION_THRESHOLD = 80
 # writable: a shared /tmp would let two tasks interfere through scratch
 # files, and closing that hole needs no OS-level sandbox — only a narrower
 # writable area.
+#
+# /tmp/drcode is GLOBAL while task ids are only unique per project, so every
+# scratch directory carries an owner marker (SCRATCH_OWNER_FILE below) with
+# the owning process's pid: the startup orphan sweep and the completion-time
+# cleanup must never touch a directory whose owner is another LIVE drcode
+# instance.
 SCRATCH_ROOT = Path("/tmp") / "drcode"
 
 
@@ -224,6 +230,7 @@ def write_file(root: Path, path: str, content: str, *, extra_writable: Path) -> 
     # Also creates the scratch directory lazily on the first write into it.
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
+    _stamp_owner_if_scratch(extra_writable, p)
     return f"written {len(content)} chars to {path}"
 
 
@@ -240,6 +247,7 @@ def edit_file(
             f"old_string matches {count} locations, provide more context to make it unique"
         )
     p.write_text(text.replace(old_string, new_string, 1))
+    _stamp_owner_if_scratch(extra_writable, p)
     return f"edited {path}"
 
 
@@ -423,6 +431,7 @@ async def run_bash(
         # directory too (created lazily here on the first run_bash call) —
         # third-party tools then cannot clash with another task's temps.
         extra_writable.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _stamp_scratch_owner(extra_writable)
         env["TMPDIR"] = str(extra_writable)
     proc = await asyncio.create_subprocess_shell(
         command,
@@ -458,28 +467,88 @@ async def run_bash(
 # -- scratch lifecycle ---------------------------------------------------------
 
 
+# Marker file inside every scratch directory recording the pid of the drcode
+# instance that owns it. Task ids are only unique per project (short 8-hex
+# ids), but /tmp/drcode is global — so both the startup orphan sweep and the
+# completion-time cleanup must not trust directory names alone: a directory
+# with a live foreign owner belongs to an active task of ANOTHER running
+# drcode instance and must be kept.
+SCRATCH_OWNER_FILE = ".owner"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
+def _stamp_scratch_owner(scratch: Path) -> None:
+    """Record this process's pid as the scratch directory's owner."""
+    try:
+        (scratch / SCRATCH_OWNER_FILE).write_text(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _stamp_owner_if_scratch(extra_writable: Path, p: Path) -> None:
+    """Stamp the owner marker when the just-resolved `p` lies inside the
+    task's scratch directory (write_file/edit_file create it lazily)."""
+    try:
+        resolved = extra_writable.resolve()
+    except OSError:
+        return
+    if resolved in p.parents:
+        _stamp_scratch_owner(resolved)
+
+
+def _foreign_live_owner(scratch: Path) -> bool:
+    """True when `scratch` carries an owner marker of another LIVE process."""
+    try:
+        pid = int((scratch / SCRATCH_OWNER_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pid != os.getpid() and _pid_alive(pid)
+
+
 def remove_scratch(task_id: str) -> None:
     """Best-effort removal of a task's scratch directory.
 
     Called when the task reaches COMPLETED or is deleted. It is NOT called
     on an interrupted/re-queued task: the next activation resumes the work
     and may still need the scratch files from the interrupted attempt.
+
+    A directory owned by another live drcode process is left alone: task
+    ids are per-project, so another instance's active task may share this
+    id (collision) — its owner removes the directory when its own task
+    completes or is deleted.
     """
-    shutil.rmtree(scratch_dir(task_id), ignore_errors=True)
+    scratch = scratch_dir(task_id)
+    if _foreign_live_owner(scratch):
+        return
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def cleanup_orphan_scratches(live_task_ids: set[str]) -> list[str]:
     """Remove scratch directories of tasks that no longer exist.
 
-    Runs once at app startup: directories under /tmp/drcode whose name does
-    not match a live task id are leftovers from a crashed previous session.
-    Returns the removed directory names.
+    Runs once at app startup. A directory whose name matches no live task id
+    of THIS project may still belong to an active task of ANOTHER running
+    drcode instance: such directories carry an owner marker (see
+    SCRATCH_OWNER_FILE) naming a live pid and are kept. Directories without
+    a marker, or with a dead owner, are leftovers from a crashed session
+    and removed. Returns the removed directory names.
     """
     if not SCRATCH_ROOT.is_dir():
         return []
     removed: list[str] = []
     for entry in SCRATCH_ROOT.iterdir():
         if not entry.is_dir() or entry.name in live_task_ids:
+            continue
+        if _foreign_live_owner(entry):
             continue
         shutil.rmtree(entry, ignore_errors=True)
         removed.append(entry.name)

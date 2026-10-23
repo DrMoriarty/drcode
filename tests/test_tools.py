@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -587,7 +589,80 @@ def test_cleanup_orphan_scratches_no_base(tmp_path: Path, monkeypatch) -> None:
 
 def test_remove_scratch_is_best_effort(scratch_root: Path) -> None:
     tools.remove_scratch("never-created")  # no error when absent
-    scratch = scratch_root / "gone"
-    scratch.mkdir(parents=True)
-    tools.remove_scratch("gone")
+
+
+# -- scratch owner marker (multi-instance safety) ------------------------------------
+
+
+def _dead_pid() -> int:
+    """A pid that is guaranteed not to exist anymore."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _live_foreign_process() -> subprocess.Popen[bytes]:
+    """A live process simulating another running drcode instance."""
+    return subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+
+
+def test_run_bash_stamps_owner_marker(project_root: Path, scratch_root: Path) -> None:
+    scratch = tools.scratch_dir("abc12345")
+    asyncio.run(run_bash(project_root, "true", extra_writable=scratch))
+    assert (scratch / tools.SCRATCH_OWNER_FILE).read_text() == str(os.getpid())
+
+
+def test_write_file_stamps_owner_marker(project_root: Path, scratch_root: Path) -> None:
+    scratch = tools.scratch_dir("abc12345")
+    write_file(
+        project_root, str(scratch / "sub" / "x.txt"), "hi", extra_writable=scratch
+    )
+    assert (scratch / tools.SCRATCH_OWNER_FILE).read_text() == str(os.getpid())
+    # A write into the project root does not restamp the marker.
+    (scratch / tools.SCRATCH_OWNER_FILE).write_text("42")
+    write_file(project_root, "root.txt", "hi", extra_writable=scratch)
+    assert (scratch / tools.SCRATCH_OWNER_FILE).read_text() == "42"
+
+
+def test_cleanup_keeps_live_foreign_scratch(scratch_root: Path) -> None:
+    # Active task of ANOTHER drcode instance (marker names a live foreign
+    # pid): the orphan sweep must keep it even though no local task matches.
+    foreign = scratch_root / "foreign"
+    foreign.mkdir(parents=True)
+    other = _live_foreign_process()
+    try:
+        (foreign / tools.SCRATCH_OWNER_FILE).write_text(str(other.pid))
+        assert tools.cleanup_orphan_scratches(set()) == []
+        assert foreign.is_dir()
+    finally:
+        other.kill()
+        other.wait()
+    # Now the owner is dead: the same sweep removes the leftover.
+    assert tools.cleanup_orphan_scratches(set()) == ["foreign"]
+    assert not foreign.exists()
+
+
+def test_cleanup_removes_dead_owner_scratch(scratch_root: Path) -> None:
+    # Marker of a dead process: crashed session's leftover → removed.
+    dead = scratch_root / "dead-owner"
+    dead.mkdir(parents=True)
+    (dead / tools.SCRATCH_OWNER_FILE).write_text(str(_dead_pid()))
+    assert tools.cleanup_orphan_scratches(set()) == ["dead-owner"]
+    assert not dead.exists()
+
+
+def test_remove_scratch_skips_live_foreign_owner(scratch_root: Path) -> None:
+    # Id collision across projects: this instance's task completes, but the
+    # directory is currently owned by another live process — keep it.
+    scratch = scratch_root / "abc12345"
+    other = _live_foreign_process()
+    try:
+        scratch.mkdir(parents=True)
+        (scratch / tools.SCRATCH_OWNER_FILE).write_text(str(other.pid))
+        tools.remove_scratch("abc12345")
+        assert scratch.is_dir()
+    finally:
+        other.kill()
+        other.wait()
+    tools.remove_scratch("abc12345")
     assert not scratch.exists()

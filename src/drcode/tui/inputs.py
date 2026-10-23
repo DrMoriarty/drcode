@@ -112,6 +112,12 @@ class NewTaskInput(WordNavTextArea):
         Binding("tab", "toggle_kind", "Toggle type", priority=True),
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
         Binding("ctrl+g", "focus_deps", "Depends on", priority=True),
+        # Push-to-talk (voice dictation): ctrl+b — ctrl+g is taken by
+        # "Depends on" here, and this is the only ctrl-letter free in BOTH
+        # this editor and ChatInput (TextArea owns ctrl+u/y/k/w, the app
+        # owns n/d/x/o/i/t/e/s/h/r/q). The binding lives on the widget
+        # because a focused TextArea stops unhandled keys.
+        Binding("ctrl+b", "push_to_talk", "Voice", priority=True),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
@@ -124,7 +130,14 @@ class NewTaskInput(WordNavTextArea):
         self._app().submit_new_task()
 
     def action_cancel_new_task(self) -> None:
+        # While a voice recording runs, ESC belongs to it (cancel the
+        # recording, keep the form); otherwise it cancels the form.
+        if self._app().voice_input.cancel():
+            return
         self._app().cancel_new_task()
+
+    def action_push_to_talk(self) -> None:
+        self._app().voice_input.toggle(self)
 
     def action_focus_deps(self) -> None:
         from textual.widgets import Input
@@ -179,6 +192,14 @@ class ChatInput(WordNavTextArea):
 
     BINDINGS: ClassVar = [
         Binding("enter", "submit", "Send", priority=True),
+        # Push-to-talk (voice dictation), same key as NewTaskInput
+        # (ctrl+g is free here but the shared muscle memory wins; ctrl+b
+        # is free in the stock TextArea bindings too).
+        Binding("ctrl+b", "push_to_talk", "Voice", priority=True),
+        # ESC during a recording cancels the recording (not the agent
+        # run): when nothing is recorded, SkipAction lets the key fall
+        # through to the app's abort binding.
+        Binding("escape", "voice_cancel", "Cancel recording", priority=True),
     ]
 
     def __init__(self, **kwargs: object) -> None:
@@ -190,6 +211,13 @@ class ChatInput(WordNavTextArea):
 
     def action_submit(self) -> None:
         self._app().submit_chat_input()
+
+    def action_push_to_talk(self) -> None:
+        self._app().voice_input.toggle(self)
+
+    def action_voice_cancel(self) -> None:
+        if not self._app().voice_input.cancel():
+            raise SkipAction()
 
     async def _on_key(self, event: events.Key) -> None:
         # A "vertical" Enter variant inserts a newline; plain Enter is

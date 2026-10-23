@@ -167,6 +167,7 @@ class Notifier:
         ntfy_base: str = NTFY_BASE,
         retry_interval: float = RETRY_INTERVAL,
         on_error: Callable[[str], None] | None = None,
+        speaker: Callable[[str], None] | None = None,
     ) -> None:
         self._settings_getter = settings_getter
         # Name of the project folder the app works in: prepended to every
@@ -176,6 +177,12 @@ class Notifier:
         self.ntfy_base = ntfy_base.rstrip("/")
         self._retry_interval = retry_interval
         self._on_error = on_error
+        # Voice channel (TTS announcements): a callback that synthesizes
+        # and plays a phrase (drcode.voice.TtsSpeaker.speak). Independent
+        # of ntfy: a broken/absent speaker never affects the pushes and
+        # vice versa. Each event decides by its own project-settings
+        # checkbox whether it is voiced at all.
+        self._speaker = speaker
         # Deferred-delivery queue: strict FIFO, guarded by _lock. Every
         # delivery attempt (immediate or retried) goes through it, which
         # guarantees both the original ordering and that nothing new is
@@ -424,6 +431,31 @@ class Notifier:
                 )
         print(f"drcode notifications: {text}", file=sys.stderr)
 
+    # -- voice announcements (TTS) ----------------------------------------------
+
+    def _speak(self, enabled: bool, text: str) -> None:
+        """Voice one event phrase through the speaker callback (when the
+        event's checkbox is on). Best-effort: a failed/broken speaker is
+        swallowed, exactly like a failed push."""
+        if not enabled or self._speaker is None:
+            return
+        try:
+            self._speaker(text)
+        except Exception as e:  # noqa: BLE001 - announcements never break anything
+            self._report_error(f"voice announcement failed: {e}")
+
+    def bug_report_created(self, task: Task, origin: str) -> None:
+        """A bug report task was created (TaskManager creation listener).
+        Voiced under the "tester failure" checkbox — together with the
+        re-queue phrase it covers both halves of the tester-failure event.
+        Only agent-created reports (origin "system") are voiced: a bug the
+        user typed by hand is something they just watched happen."""
+        if origin != "user" and task.kind.value == "bug":
+            self._speak(
+                self._settings_getter().voice_tts_tester_failed,
+                f"Заведён баг-репорт: {task.title}",
+            )
+
     # -- pipeline events --------------------------------------------------------
 
     def task_status(
@@ -438,6 +470,36 @@ class Notifier:
         change) are not reported — they already saw it happen."""
         if origin == "user" or old is new:
             return
+        # Voice announcements (each behind its own project-settings
+        # checkbox; they ride on the same system-origin transitions the
+        # pushes use, so no pipeline logic is duplicated here):
+        # - a completion; a FAILED verdict is voiced as a tester failure
+        #   instead (the bug report, when the tester created one, is
+        #   voiced separately through bug_report_created);
+        # - TESTING → QUEUED with system origin: the tester failed the
+        #   task and returned it for another development round
+        #   (requeue_failed_fix / requeue_review_rejection — the user
+        #   path re-queues with origin "user" via send()).
+        if new.value == "completed":
+            failed = task.verification is VerificationStatus.FAILED
+            self._speak(
+                (
+                    self._settings_getter().voice_tts_tester_failed
+                    if failed
+                    else self._settings_getter().voice_tts_completed
+                ),
+                (
+                    f"Задача «{task.title}» завершена с ошибкой"
+                    if failed
+                    else f"Задача «{task.title}» завершена"
+                ),
+            )
+        elif new.value == "queued" and old.value == "testing":
+            self._speak(
+                self._settings_getter().voice_tts_tester_failed,
+                f"Тестирование провалено — задача «{task.title}» "
+                "возвращена в разработку",
+            )
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
         # Текст уведомления: "задача <status>" / "#{id} «{title}» — <описание статуса>".
@@ -482,6 +544,9 @@ class Notifier:
             return
         self._settled_state = state
         if blocked:
+            # The "blocked" settled state means tasks remain that cannot
+            # run right now — a living backlog, not a finished queue: not
+            # voiced (only the genuinely-empty state is, by its checkbox).
             self.notify(
                 self._title("pipeline idle"),
                 f"No tasks can be taken into development. {detail}",
@@ -489,6 +554,10 @@ class Notifier:
                 priority=Priority.HIGH,
             )
         else:
+            self._speak(
+                self._settings_getter().voice_tts_queue_empty,
+                "Очередь пуста — все задачи обработаны",
+            )
             self.notify(
                 self._title("queue empty"),
                 "All tasks processed — no new tasks in the queue.",

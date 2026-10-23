@@ -23,7 +23,11 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
-uv sync --group build
+# The voice extra goes into the bundle too: sounddevice (PortAudio) — its
+# wheel carries the platform libportaudio binary inside _sounddevice_data,
+# which drcode.spec collects into the app; the TUI degrades gracefully
+# when the extra is missing, but a voice-capable binary needs it.
+uv sync --group build --extra voice
 .venv/bin/pyinstaller --noconfirm --clean drcode.spec
 
 mkdir -p dist

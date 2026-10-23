@@ -234,11 +234,7 @@ async def test_dynamic_instructions_reflect_state_within_activation(
             async for _node in run:
                 pass
 
-    model_requests = [
-        m
-        for m in messages
-        if isinstance(m, ModelRequest)
-    ]
+    model_requests = [m for m in messages if isinstance(m, ModelRequest)]
     assert len(model_requests) >= 2
     # Before todo_create: no live checklist block (the static prompt
     # section about todo_create / todo_update is always there).

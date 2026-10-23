@@ -21,7 +21,7 @@ Set DRCODE_ONEFILE=1 to build a legacy single-file executable instead.
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 ROOT = Path(SPECPATH).resolve()
 ONEFILE = os.environ.get("DRCODE_ONEFILE", "") not in ("", "0", "false")
@@ -41,10 +41,18 @@ a = Analysis(
         # does not bundle *.dist-info by default, so copy it in explicitly.
         *copy_metadata("genai_prices"),
         *copy_metadata("pydantic_ai_slim"),
+        # Voice extra (drcode.voice → sounddevice): the wheel ships the
+        # PortAudio binary library inside `_sounddevice_data` — without
+        # collecting it the frozen app imports sounddevice but fails at
+        # the first actual device call with "OSError: PortAudio library
+        # not found". The voice extra must be installed into the build
+        # venv (build-binary.sh does `uv sync --extra voice`).
+        *collect_data_files("sounddevice"),
     ],
     # anyio imports its backend dynamically — PyInstaller can't see it
-    # from static analysis alone.
-    hiddenimports=["anyio._backends._asyncio"],
+    # from static analysis alone; sounddevice/numpy are the optional
+    # voice extra (imported lazily by drcode.voice).
+    hiddenimports=["anyio._backends._asyncio", "sounddevice", "numpy"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

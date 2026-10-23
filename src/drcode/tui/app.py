@@ -52,6 +52,7 @@ from ..settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
+from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
@@ -70,6 +71,7 @@ from .sidebar import Sidebar, TaskItem  # noqa: F401
 from .state import LiveTailEntry
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
+from .voice_input import VoiceInputController
 
 
 class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
@@ -318,13 +320,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # ntfy.sh push notifications: the notifier reads the project
         # settings on every event, so a change made in the settings dialog
         # applies immediately. Delivery failures are surfaced as in-app
-        # toasts (the delivery itself runs in a daemon thread).
+        # toasts (the delivery itself runs in a daemon thread). The same
+        # notifier voices the configured events (TTS announcements via the
+        # audio gateway): the speaker serializes playback one phrase at a
+        # time in its own daemon thread and shares the settings getter.
+        self.voice_tts = TtsSpeaker(lambda: self.settings, on_error=self._notify_error)
         self.notifier = Notifier(
             lambda: self.settings,
             project=project_root.name,
             project_root=project_root,
             on_error=self._notify_error,
+            speaker=self.voice_tts.speak,
         )
+        # Push-to-talk voice dictation (Ctrl+B in the input fields).
+        self.voice_input = VoiceInputController(self)
         # The "queue empty" / "pipeline blocked" notifications are sent only
         # on state transitions; the very first pipeline evaluation after
         # startup only primes the state (a cold start on an empty queue
@@ -814,6 +823,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Status observers (notifications): wired on mount, so the startup
         # demotions in TaskManager.__init__ never produce events.
         self.manager.add_status_listener(self.notifier.task_status)
+        # TTS "bug report created" hook: the tester's create_bug_report
+        # tool calls manager.create directly (no status transition), so
+        # the voice path needs the creation listener. The startup reload
+        # (purge/demotion) does not re-create tasks — wiring on mount is
+        # quiet by construction.
+        self.manager.add_creation_listener(self.notifier.bug_report_created)
         if self._purged_tasks:
             # The startup cleanup removed something — say so, so deleted
             # history never "silently vanishes".

@@ -93,6 +93,9 @@ class TaskManager:
         # Observers of task removal (cancel/delete/purge): the optional
         # worktree environment cleans its per-task resources here.
         self._removal_listeners: list[RemovalListener] = []
+        # Observers of task creation (create()) — e.g. the voice
+        # announcements hook for tester-created bug reports.
+        self._creation_listeners: list[Callable[[Task, str], None]] = []
         # Serializes reload_new_tasks(): it runs both on the app thread
         # (the periodic disk poll) and on worker threads (promote_next in
         # the run's finally-blocks) — two concurrent scans must not load
@@ -136,6 +139,14 @@ class TaskManager:
         here. Same contract as the status listeners: sync, fast,
         non-raising."""
         self._removal_listeners.append(listener)
+
+    def add_creation_listener(self, listener: Callable[[Task, str], None]) -> None:
+        """Register an observer of task creation (create()): the listener
+        gets the new task and the origin ("user" — typed by the person at
+        the computer, "system" — created by an agent tool, e.g. the
+        tester's bug report). Same contract as the status listeners: sync,
+        fast, non-raising."""
+        self._creation_listeners.append(listener)
 
     def _fire_removed(self, task_id: str) -> None:
         for listener in list(self._removal_listeners):
@@ -280,6 +291,7 @@ class TaskManager:
         kind: TaskKind = TaskKind.FEATURE,
         *,
         hold: bool = False,
+        origin: str = "user",
     ) -> Task:
         first_line = (
             first_message.splitlines()[0][:60] if first_message.splitlines() else ""
@@ -300,6 +312,14 @@ class TaskManager:
             task.status = TaskStatus.HOLD
         self.tasks[task.id] = task
         self.storage.save(task)
+        for listener in list(self._creation_listeners):
+            try:
+                listener(task, origin)
+            except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
+                print(
+                    f"drcode: creation listener failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
         return task
 
     def editable_condition(self, task_id: str) -> str:

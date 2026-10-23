@@ -13,6 +13,16 @@ dependencies = [
     "textual>=8.2.8",
 ]
 
+[project.optional-dependencies]
+# Voice I/O (push-to-talk dictation + TTS announcements): sounddevice
+# needs the PortAudio library (bundled in its wheels; on Linux install
+# libportaudio2). Without the extra the app works fine — the voice
+# features are simply unavailable and the hotkey explains what to install.
+voice = [
+    "sounddevice>=0.5",
+    "numpy>=1.26",
+]
+
 [project.scripts]
 drcode = "drcode:main"
 drcode-models = "drcode.tui.model_setup_app:main"

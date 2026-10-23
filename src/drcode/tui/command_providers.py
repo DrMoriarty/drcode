@@ -178,6 +178,7 @@ class SettingsPalette(CommandPalette):
         "Workflow:",
         "GitHub integration:",
         "Notifications:",
+        "Voice:",
         "Maximize",
         "Minimize",
         "Quit",
@@ -513,6 +514,15 @@ class ProjectSettingsCommandsProvider(Provider):
                     "via ntfy.sh (project setting)"
                 ),
                 app.action_change_notifications,
+            ),
+            (
+                f"Voice: {app.voice_status_label()}",
+                (
+                    "Speech recognition (push-to-talk dictation into the "
+                    "input fields) and spoken announcements, via an "
+                    "OpenAI-compatible audio API (project setting)"
+                ),
+                app.action_change_voice,
             ),
         ]
 

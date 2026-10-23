@@ -505,7 +505,12 @@ def build_agent(
             via ask_clarifying_question whether a task should be filed.
             `title` is a short imperative summary; `description` carries the
             details: what is wrong, where (files/lines), and how it manifests."""
-            bug = ctx.deps.manager.create(title, description, kind=TaskKind.BUG)
+            # origin="system": the tool (not the user) created the task —
+            # creation listeners (e.g. the voice announcements) can tell
+            # agent-created bug reports from hand-typed ones.
+            bug = ctx.deps.manager.create(
+                title, description, kind=TaskKind.BUG, origin="system"
+            )
             return (
                 f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
             )
@@ -659,7 +664,10 @@ def build_tester_agent(
         ctx: RunContext[TesterDeps], title: str, description: str
     ) -> str:
         """Create a bug report task. It is placed at the head of the execution queue."""
-        bug = ctx.deps.manager.create(title, description, kind=TaskKind.BUG)
+        # origin="system" — see the research variant of this tool above.
+        bug = ctx.deps.manager.create(
+            title, description, kind=TaskKind.BUG, origin="system"
+        )
         return f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
 
     # The commit tool exists only when the project setting allows it: with

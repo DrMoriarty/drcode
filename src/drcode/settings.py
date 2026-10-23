@@ -239,6 +239,29 @@ class ProjectSettings(BaseModel):
     # Public ntfy.sh topic name to publish to (see https://ntfy.sh). Anyone
     # who knows the topic can read its messages — pick an unguessable one.
     ntfy_topic: str = ""
+    # -- Voice I/O (ASR dictation + TTS announcements) -----------------------
+    # OpenAI-compatible audio API endpoint (WITH the /v1 suffix; the audio
+    # routes are /audio/transcriptions and /audio/speech below it).
+    # Deliberately NOT the chat provider's base_url: gateways commonly serve
+    # audio on a different route than the chat models. Empty (the default)
+    # = every voice feature is off.
+    voice_api_url: str = ""
+    # Bearer token for the audio API. Empty = reuse the api_key of the
+    # user-catalog provider whose base_url host matches voice_api_url's
+    # host (no second token to manage for the common single-gateway case).
+    voice_api_key: str = ""
+    # Full ASR model id, e.g. "x5-asr/x5-asr-large". Model ids may contain
+    # "/" (unlike the agent-catalog ids), so they are stored here directly
+    # instead of the model catalog.
+    voice_asr_model: str = ""
+    # TTS model id (e.g. "x5-tts/tts-1") and the speaker voice (e.g.
+    # "alloy"); both required for the announcements.
+    voice_tts_model: str = ""
+    voice_tts_voice: str = ""
+    # Which events the TTS announces (each independent):
+    voice_tts_completed: bool = False
+    voice_tts_tester_failed: bool = False
+    voice_tts_queue_empty: bool = False
 
 
 class ProjectSettingsStore:

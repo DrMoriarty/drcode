@@ -70,6 +70,7 @@ from .notifications_dialog import NotificationsDialog, NotificationsSetup
 from .setup_dialog import ModelSetup, ModelSetupDialog
 from .sidebar import TaskItem
 from .state import DrCodeState
+from .voice_dialog import VoiceSettingsDialog, VoiceSetup
 
 
 class ActionsLayer(DrCodeState):
@@ -1284,6 +1285,73 @@ class ActionsLayer(DrCodeState):
                 "notification — the channel works.",
                 tags=["bell"],
             )
+
+    # -- voice (ASR dictation + TTS announcements) ------------------------------
+
+    def voice_status_label(self) -> str:
+        """Short status of the voice features for the Settings entry:
+        which halves are configured (dictation needs an ASR model,
+        announcements a TTS model; an empty base URL switches everything
+        off)."""
+        s = self.settings
+        if not s.voice_api_url.strip():
+            return "off"
+        parts: list[str] = []
+        if s.voice_asr_model.strip():
+            parts.append("dictation")
+        if s.voice_tts_model.strip():
+            parts.append("announcements")
+        return ", ".join(parts) if parts else "not configured"
+
+    def action_change_voice(self) -> None:
+        """Voice settings dialog, opened from the Settings entry
+        ("Voice…"). Collects the audio-API connection, the ASR/TTS models
+        and the announcement checkboxes; Save persists the values into the
+        project settings. The API key field is pre-filled from the
+        user-catalog provider whose host matches the audio URL."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        from ..voice import catalog_api_key_for_host
+
+        settings = self.settings
+        api_url = settings.voice_api_url
+        self.push_screen(
+            VoiceSettingsDialog(
+                api_url=api_url,
+                api_key=settings.voice_api_key,
+                # Prefill the key only while the user has not stored their
+                # own: after that the explicit value wins on every open.
+                catalog_api_key=(
+                    "" if settings.voice_api_key else catalog_api_key_for_host(api_url)
+                ),
+                asr_model=settings.voice_asr_model,
+                tts_model=settings.voice_tts_model,
+                tts_voice=settings.voice_tts_voice,
+                tts_completed=settings.voice_tts_completed,
+                tts_tester_failed=settings.voice_tts_tester_failed,
+                tts_queue_empty=settings.voice_tts_queue_empty,
+            ),
+            self._voice_settings_done,
+        )
+
+    def _voice_settings_done(self, setup: VoiceSetup | None) -> None:
+        if setup is None:
+            return
+        self.settings.voice_api_url = setup.api_url
+        self.settings.voice_api_key = setup.api_key
+        self.settings.voice_asr_model = setup.asr_model
+        self.settings.voice_tts_model = setup.tts_model
+        self.settings.voice_tts_voice = setup.tts_voice
+        self.settings.voice_tts_completed = setup.tts_completed
+        self.settings.voice_tts_tester_failed = setup.tts_tester_failed
+        self.settings.voice_tts_queue_empty = setup.tts_queue_empty
+        self.settings_store.save(self.settings)
+        enabled = bool(setup.api_url and (setup.asr_model or setup.tts_model))
+        self.notify(
+            f"Voice: {'on' if enabled else 'off'}",
+            title="Project settings",
+            timeout=4,
+        )
 
     # -- GitHub Issues sync ----------------------------------------------------
 

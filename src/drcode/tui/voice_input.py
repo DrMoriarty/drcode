@@ -10,7 +10,8 @@ Push-to-talk state machine, one instance per app:
   the recorder, uploads the WAV to the ASR endpoint and inserts the
   recognized text at the cursor of the field that started the recording —
   the user edits before sending.
-- recording → idle (ESC): the recording is discarded.
+- recording → idle (ESC): the recording is discarded (stream closed on a
+  worker thread, never on the UI thread).
 - any failure (no config, no sounddevice, microphone busy, network) is a
   readable toast; the state machine resets to idle.
 
@@ -90,14 +91,17 @@ class VoiceInputController:
 
     def cancel(self) -> bool:
         """ESC while a recording runs: drop it. True when something was
-        cancelled (the caller then swallows the ESC)."""
+        cancelled (the caller then swallows the ESC).
+
+        The stream close is offloaded to a worker thread — the UI thread
+        never touches PortAudio."""
         if self._state is not _State.RECORDING:
             return False
         recorder, self._recorder = self._recorder, None
         self._state = _State.IDLE
         self._target = None
         if recorder is not None:
-            recorder.discard()
+            _thread_start(_discard_recorder, recorder)
         self._notify("Запись отменена")
         return True
 
@@ -209,6 +213,12 @@ class VoiceInputController:
             self._app.call_from_thread(self._notify, message, error=True)
         except Exception:  # noqa: BLE001 - app may be shutting down
             self._notify(message, error=True)
+
+
+def _discard_recorder(recorder: MicrophoneRecorder) -> None:
+    """Worker body for the ESC path: close the PortAudio stream off the
+    UI thread (cancel never blocks the event loop on audio syscalls)."""
+    recorder.discard()
 
 
 def _thread_start(func: object, *args: object) -> None:

@@ -63,11 +63,22 @@ TTS_TIMEOUT = 60.0
 CHECK_TIMEOUT = 10.0
 
 try:  # pragma: no cover - exercised indirectly (availability flag)
+    import sounddevice as _sd  # noqa: F401 - the import itself is the probe
+
     SOUNDDEVICE_AVAILABLE = True
     _SOUNDDEVICE_ERROR: str | None = None
 except Exception as _e:  # noqa: BLE001 - ImportError, but also a missing PortAudio library
     SOUNDDEVICE_AVAILABLE = False
     _SOUNDDEVICE_ERROR = f"{type(_e).__name__}: {_e}"
+
+# python-sounddevice is not thread-safe at module level (global default
+# stream, cffi callback bookkeeping): every PortAudio lifecycle operation —
+# opening/starting/stopping/closing a stream, the sd.play()/sd.wait()
+# playback pair — must go through this one lock. Recording and TTS playback
+# run on independent threads, so without it their interleaved
+# open/close/stop calls corrupt the callback trampolines (observed as a
+# SIGSEGV on macOS's CoreAudio IOThread client).
+_PORTAUDIO_LOCK = threading.Lock()
 
 VOICE_EXTRA_HINT = "pip install drcode[voice]"
 
@@ -276,6 +287,11 @@ class MicrophoneRecorder:
         self._chunks: list[Any] = []
         self._stream: _AudioStream | None = None
         self._lock = threading.Lock()
+        # Strong reference to the bound callback for as long as the stream
+        # lives: sounddevice wraps it into a cffi trampoline, and letting the
+        # wrapper be garbage-collected while PortAudio still calls it is a
+        # crash (released only after the stream is fully closed).
+        self._cb: Callable[..., object] | None = None
 
     @property
     def recording(self) -> bool:
@@ -288,15 +304,18 @@ class MicrophoneRecorder:
             return
         import sounddevice as sd
 
+        self._cb = self._callback
         try:
-            stream: _AudioStream = sd.InputStream(
-                samplerate=self.SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                callback=self._callback,
-            )
-            stream.start()
+            with _PORTAUDIO_LOCK:
+                stream: _AudioStream = sd.InputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    channels=1,
+                    dtype="int16",
+                    callback=self._cb,
+                )
+                stream.start()
         except Exception as e:
+            self._cb = None
             raise VoiceError(f"Microphone unavailable: {e}") from e
         with self._lock:
             self._chunks = []
@@ -320,12 +339,8 @@ class MicrophoneRecorder:
             stream, self._stream = self._stream, None
             chunks = self._chunks
             self._chunks = []
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception as e:  # noqa: BLE001 - closing must never mask the result
-                print(f"drcode voice: stream close failed: {e}", file=sys.stderr)
+        _close_stream(stream)
+        self._cb = None
         if not chunks:
             pcm = np.zeros((0,), dtype=np.int16)
         else:
@@ -343,15 +358,25 @@ class MicrophoneRecorder:
         with self._lock:
             stream, self._stream = self._stream, None
             self._chunks = []
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception as e:  # noqa: BLE001 - cancel is best-effort
-                print(f"drcode voice: stream close failed: {e}", file=sys.stderr)
+        _close_stream(stream)
+        self._cb = None
 
 
 # -- playback ------------------------------------------------------------------
+
+
+def _close_stream(stream: _AudioStream | None) -> None:
+    """Stop and close a PortAudio stream under the module-level lock, from
+    whatever thread owns the recorder at that moment (never the UI thread —
+    the controller offloads cancel/stop to workers)."""
+    if stream is None:
+        return
+    try:
+        with _PORTAUDIO_LOCK:
+            stream.stop()
+            stream.close()
+    except Exception as e:  # noqa: BLE001 - closing must never mask the result
+        print(f"drcode voice: stream close failed: {e}", file=sys.stderr)
 
 
 def play_wav(data: bytes) -> None:
@@ -373,8 +398,12 @@ def play_wav(data: bytes) -> None:
     if channels > 1:
         pcm = pcm.reshape(-1, channels)
     if pcm.size:
-        sd.play(pcm, samplerate=rate)
-        sd.wait()
+        # sd.play()/sd.wait() drive sounddevice's global output stream —
+        # the whole playback (including the wait) stays under the lock so a
+        # concurrent recording open/close can never interleave with it.
+        with _PORTAUDIO_LOCK:
+            sd.play(pcm, samplerate=rate)
+            sd.wait()
 
 
 class _VoiceSynth(Protocol):

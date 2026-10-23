@@ -108,7 +108,8 @@ Tasks flow through a pipeline, mirrored by the sidebar: QUEUE → NEEDS CLARIFIC
 - **Stall watchdog** — a run that stops showing any sign of life (no stream deltas, no tool events) is aborted and restarted automatically after the configured stall limit (15/30 min, 1/2 hours, or never; 30 min by default, per project in `.drcode/settings.json`): the agent resumes via a continuation turn, the tester gets a fresh round. The same nudge is available manually with `ctrl+r` on an active or testing task. Every automatic nudge is logged into the task's service events.
 - **Restart-safe** — on startup, stale active tasks are re-queued, and tasks stuck in TESTING are re-tested first, before any queued task is taken into development.
 - **Failed-queue rescue** — a task whose run crashed (network outage, model error) is excluded from promotion for the rest of the session, so one broken task can't loop the queue. But when *every* queued task is failed and nothing is running, the exclusion is forcibly lifted and the backlog re-runs (with capped exponential backoff between rescue rounds, reset by any successful model call) — the queue keeps working instead of dead-ending until restart.
-- **Queue ordering** — bug reports always come first (newest at the head, so tester-created bugs are picked up immediately); answered clarifications follow, then creation order. The kind of a still-queued task can be changed: re-typing to bug moves it to the head, to feature — to the tail.
+- **Queue ordering** — bug reports always come first (newest at the head, so tester-created bugs are picked up immediately); answered clarifications follow, then creation order; tasks blocked by dependencies sink below every runnable one. The kind of a still-queued task can be changed: re-typing to bug moves it to the head, to feature — to the tail.
+- **Dependencies** — a task can wait for other tasks: in the new-task form press `ctrl+g` and enter comma-separated task ids (or use the Settings palette's "Add/Remove dependency" entries for the viewed queued/held task; removing a blocking dependency is the force-start). A dependency is satisfied only when it is **completed AND merged**: its task reached COMPLETED and — when per-task worktree isolation is on — its `drcode/<id>` branch is gone or fully merged into your base branch. The check is dynamic (fresh git state at every promotion attempt): merging a dependency by hand unblocks the dependents immediately, and a deleted dependency is judged by its surviving branch. Blocked tasks show a 🔒 marker in the sidebar; the task bar lists each dependency with its state. Without worktree isolation (the default) there is nothing to merge — the gate degenerates to "COMPLETED"; the merge guarantee only means something under isolation (or when your workflow hooks merge).
 - **Hold / delete / cancel** — park a queued task out of the backlog (input keeps accumulating while held, and an unanswered clarification is preserved), delete a held task entirely, or cancel a task (queued or already in TESTING): pending input is dropped and it completes immediately, skipping the tester.
 - **Auto-cleanup** — completed tasks older than the retention period are deleted at startup. The setting (7/30/90 days or never) is per project, stored in `.drcode/settings.json`.
 
@@ -120,6 +121,35 @@ A team can give the pipeline its own branching / merge / review process — incl
 - **`.drcode/workflow.py`** — hard gates: optional Python hooks (`on_task_start`, `on_development_done`, `on_tester_passed`, `on_review`, `on_accepted`) run in an isolated subprocess with a JSON contract. `on_tester_passed` is the unconditional post-verification hook (e.g. `uv tool install . --force` after every PASSED task). `on_review` is the external review: a *reject* re-queues the task with the reviewer's comment (the agent reworks it in the same transcript), an *accept* completes it and runs `on_accepted` (merge the PR, delete the branch), a *pending* verdict releases the pipeline and the verdict is polled later; after 3 consecutive rejects the task is parked on hold for a human. A failing review is fail-closed — the task waits, nothing is waved through.
 
 `.drcode/git-workflow.md`, `.drcode/workflow.py` and `.drcode/drcode.json` are committable (drcode's `.gitignore` management covers only the private state: tasks, settings with secrets, sync bookkeeping). **Security:** `.drcode/workflow.py` is arbitrary code running with your user permissions — never trust it from a repository you did not author. Full format description: [docs/workflow.md](docs/workflow.md).
+
+#### Example: automated dependency chains
+
+drcode itself never merges — but the `on_accepted` hook can. Combined with task dependencies this builds fully automated chains: each task of a chain waits for its predecessor to be **completed and merged**, then starts on a fresh base.
+
+```python
+# .drcode/workflow.py — merge each accepted task's branch into the base
+# branch (requires the project setting task_isolation: worktree, which
+# gives every task its own branch drcode/<task-id>).
+import subprocess
+from pathlib import Path
+
+
+def on_accepted(task) -> None:
+    branch = task["worktree"]["branch"]     # drcode/<task-id>
+    # With isolation on the hook's cwd IS the task's worktree
+    # (<project>/.drcode/worktrees/<id>): the main checkout is two
+    # levels up.
+    project = Path.cwd().parent.parent
+    subprocess.run(
+        ["git", "-C", str(project), "merge", "--no-ff", "-q", branch],
+        check=True,
+    )
+    # Optional housekeeping once the work is reachable from the base:
+    subprocess.run(["git", "-C", str(project), "branch", "-d", branch], check=True)
+    return {"text": f"merged {branch} into the base branch"}
+```
+
+With this hook, chaining tasks in the form (`ctrl+g`, e.g. `depends on: ab12cd34`) runs them strictly one after another, each merging before the next one is eligible — without the hook, drcode keeps the branches unmerged and reminds you, and you merge by hand whenever you decide the work is ready.
 
 ## GitHub Issues integration
 

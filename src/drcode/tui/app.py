@@ -57,12 +57,13 @@ from .actions import ActionsLayer
 from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
+    DependencyCommandsProvider,
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
 )
 from .header import ModelStatusHeader
-from .inputs import ChatInput, NewTaskInput
+from .inputs import ChatInput, DepsInput, NewTaskInput
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem  # noqa: F401
@@ -98,6 +99,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ModelSettingsCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
+        DependencyCommandsProvider,
     }
 
     CSS = """
@@ -191,6 +193,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #nt-input {
         width: 80%; height: 10;
         border: solid $primary;
+    }
+    #nt-deps {
+        width: 80%;
+        border: none;
+        background: $surface-lighten-1;
+    }
+    #nt-deps-note {
+        width: 80%;
+        color: $error;
     }
     # Labels must stay width: auto: a full-width (1fr) sibling disables
     # horizontal centering for the whole #new-task container, leaving the
@@ -376,6 +387,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # the next rescue may fire at. Reset when a model call succeeds.
         self._failed_queue_rounds = 0
         self._failed_queue_retry_at = 0.0
+        # Dependency gate (depends_on promotion condition): the last
+        # computed gate (task id -> unsatisfied dep id -> reason) for the
+        # sidebar/task-status rendering and the settled notification, plus
+        # the per-task dedup flags of its service events. Filled by
+        # PipelineLayer._promote_with_dependencies; session-only.
+        self._dep_gate: dict[str, dict[str, str]] = {}
+        self._dep_block_notified: set[str] = set()
         # Network-retry bookkeeping for agent runs, per task: consecutive
         # transient network failures this session (retry budget) and the
         # earliest monotonic time the delayed re-run fires at. Unlike a
@@ -539,6 +557,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                         id="nt-note",
                     )
                     yield NewTaskInput(placeholder="Describe the task…", id="nt-input")
+                    yield DepsInput(
+                        placeholder="Depends on — comma-separated task ids (Ctrl+G)",
+                        id="nt-deps",
+                    )
+                    yield Static("", id="nt-deps-note")
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
                         "tab — switch type   ctrl+enter — create   "

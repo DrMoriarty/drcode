@@ -173,6 +173,17 @@ class Task(BaseModel):
     # so a verdict arriving days later still finds its task; cleared when
     # the verdict is applied or the user re-queues/cancels the task.
     review_pending: bool = False
+    # Ids of tasks that must be COMPLETED *and* merged into the base branch
+    # before this task may be taken into development (the promotion gate is
+    # dynamic: git state is re-evaluated at every promotion attempt, so a
+    # manual `git merge drcode/<dep>` unblocks dependents without any
+    # drcode action). Mergedness is only checkable under per-task worktree
+    # isolation (drcode.task_env); without isolation — and for missing dep
+    # tasks with no branch left — the gate degenerates to "COMPLETED".
+    # Written only through TaskManager.set_dependencies (validated: no
+    # self-reference, existing ids, acyclic); a plain default keeps old
+    # task JSONs loading without migration.
+    depends_on: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

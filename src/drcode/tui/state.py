@@ -343,6 +343,17 @@ class DrCodeState(App[None]):
 
     def _advance(self) -> None: ...
 
+    def _promote_failed_queue(self, blocked: set[str] | None = None) -> Task | None: ...
+
+    @work(exclusive=True, group="promote")
+    async def _promote_with_dependencies(self) -> None: ...
+
+    def _dep_gate_sync(self, dep_ids: list[str]) -> tuple[set[str], str]: ...
+
+    def _announce_dependency_gate(
+        self, queued: list[Task], gate: dict[str, dict[str, str]], base: str
+    ) -> None: ...
+
     def _persist_task_messages(
         self, task: Task, run: AgentRun[AgentDeps, str] | None
     ) -> None: ...
@@ -451,6 +462,16 @@ class DrCodeState(App[None]):
     # monotonic time the next one may fire at.
     _failed_queue_rounds: int
     _failed_queue_retry_at: float
+
+    # -- dependency gate (depends_on promotion condition) ---------------------
+    # Last computed gate of the promote worker: viewed task id -> unsatisfied
+    # dependency id -> "not completed" | "unmerged". Drives the sidebar lock
+    # markers, the task-statusbar dependency list and the settled-pipeline
+    # notification. Session-only; empty until the first gated promotion.
+    _dep_gate: dict[str, dict[str, str]]
+    # Tasks that already received their "Task waits: …" service event and
+    # have not been announced as eligible again — dedups the gate's events.
+    _dep_block_notified: set[str]
 
     # -- external review (workflow hooks) bookkeeping ------------------------
     _review_running: bool

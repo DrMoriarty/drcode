@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from pathlib import Path
 
@@ -35,6 +35,52 @@ StatusListener = Callable[[Task, TaskStatus, TaskStatus, str], None]
 # (the optional worktree, see drcode.task_env) can be torn down. Sync,
 # like the status listeners: must be fast and non-raising.
 RemovalListener = Callable[[str], None]
+
+
+def validate_dependencies(
+    tasks: Mapping[str, Task], task_id: str | None, deps: Iterable[str]
+) -> list[str]:
+    """Normalize and validate a `depends_on` list for `task_id`.
+
+    Strips whitespace, drops empties and duplicates; every id must exist in
+    `tasks`, and the task must not depend on itself. When `task_id` is not
+    None (i.e. the task already exists — creation-time validation passes
+    None, self-reference is impossible then), the new edges are also
+    checked for cycles over the full depends_on graph.
+
+    Returns the cleaned id list; raises ValueError on any violation —
+    callers (the new-task form, the command palette) surface the message.
+    Deliberately tolerant at LOAD time: a bad id in a stored task file must
+    never break reading it, validation happens on write only.
+    """
+    cleaned: list[str] = []
+    for raw in deps:
+        dep = raw.strip()
+        if not dep:
+            continue
+        if dep == task_id:
+            raise ValueError("a task cannot depend on itself")
+        if dep not in tasks:
+            raise ValueError(f"unknown task id: {dep}")
+        if dep not in cleaned:
+            cleaned.append(dep)
+    if task_id is not None and cleaned:
+        graph = {tid: list(t.depends_on) for tid, t in tasks.items()}
+        graph[task_id] = cleaned
+        # A cycle can only involve the edge(s) just added (existing lists
+        # were validated the same way on write): the new dependency chain
+        # must not lead back to the task itself.
+        seen: set[str] = set()
+        stack = list(cleaned)
+        while stack:
+            node = stack.pop()
+            if node == task_id:
+                raise ValueError("dependency cycle detected")
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(graph.get(node, ()))
+    return cleaned
 
 
 class TaskManager:
@@ -146,13 +192,33 @@ class TaskManager:
         # queue stamp (creation order, bumped when a task is re-positioned,
         # e.g. by a kind change). A manual move (move_in_queue) re-stamps
         # the whole queue so this same key reproduces the user's order.
+        # Top tier: tasks blocked by dependencies (STATUS part only — a dep
+        # that exists and is not COMPLETED yet) sink below every runnable
+        # one; the git mergedness half of the gate is checked by the
+        # pipeline's promotion worker, not here (no git calls in a sort).
         def _queue_key(t: Task) -> tuple:
+            blocked = 1 if self._status_blocked(t) else 0
             if t.kind is TaskKind.BUG:
-                return (0, 0, -(t.queue_seq if t.queue_seq is not None else 0))
-            return (1, not t.queue_head, t.queue_seq if t.queue_seq is not None else 0)
+                return (blocked, 0, 0, -(t.queue_seq if t.queue_seq is not None else 0))
+            return (
+                blocked,
+                1,
+                not t.queue_head,
+                t.queue_seq if t.queue_seq is not None else 0,
+            )
 
         tasks.sort(key=_queue_key)
         return tasks
+
+    def _status_blocked(self, task: Task) -> bool:
+        """The STATUS half of the dependency gate: some dependency exists
+        and is not COMPLETED yet. Pure in-memory check (no git): the
+        mergedness half lives in drcode.task_env / the pipeline."""
+        return any(
+            (dep_task := self.tasks.get(dep)) is not None
+            and dep_task.status is not TaskStatus.COMPLETED
+            for dep in task.depends_on
+        )
 
     def reload_new_tasks(self) -> list[Task]:
         """Pick up task files that appeared on disk since the last check.
@@ -344,6 +410,34 @@ class TaskManager:
         self.storage.save(task)
         return task
 
+    def set_dependencies(self, task_id: str, deps: list[str]) -> Task:
+        """Replace the task's `depends_on` list (the promotion gate "all
+        dependencies COMPLETED and merged into the base branch").
+
+        Validation (see validate_dependencies): no self-reference, every id
+        must exist, no cycles — a violation raises ValueError for the
+        caller to show. Git-agnostic on purpose: mergedness is checked
+        dynamically by the pipeline (task_env.unmerged_ids) at every
+        promotion attempt, never stored."""
+        task = self.get(task_id)
+        task.depends_on = validate_dependencies(self.tasks, task_id, deps)
+        task.touch()
+        self.storage.save(task)
+        return task
+
+    def blocking_dependencies(self, task_id: str) -> list[str]:
+        """Dependency ids whose STATUS still blocks the task: the dep task
+        exists and is not COMPLETED yet. Missing dep ids (deleted task /
+        retention purge) are NOT reported here — their gate is the git
+        branch, checked by the pipeline via task_env.unmerged_ids."""
+        task = self.get(task_id)
+        return [
+            dep
+            for dep in task.depends_on
+            if (dep_task := self.tasks.get(dep)) is not None
+            and dep_task.status is not TaskStatus.COMPLETED
+        ]
+
     def _apply_manual_order(self, order: list[Task]) -> None:
         """Persist a manually adjusted queue order (index 0 = next to run)
         into the queue stamps, so the standard sort key in queued()
@@ -503,11 +597,18 @@ class TaskManager:
         self._save_changed(task, old, origin)
         return task
 
-    def promote_next(self, exclude: set[str] | None = None) -> Task | None:
+    def promote_next(
+        self, exclude: set[str] | None = None, blocked: set[str] | None = None
+    ) -> Task | None:
         """If no task is active, activate the first queued task that has
         pending input or an interrupted attempt to resume.
         `exclude` skips tasks that already failed this session (bounded
-        retries: a failing task must not stall the whole queue in a loop)."""
+        retries: a failing task must not stall the whole queue in a loop).
+        `blocked` skips tasks whose dependencies are not satisfied yet
+        (the pipeline's dynamic gate: not COMPLETED, or work not merged
+        into the base branch — re-evaluated by the caller at every
+        attempt, exactly like the hold skip: a manual merge unblocks the
+        dependents without any drcode action)."""
         # New tasks may have appeared on disk since the last look (created
         # by another process, e.g. drcode --feature-request): pick them up
         # before searching the queue, so the promotion acts on the full
@@ -516,8 +617,10 @@ class TaskManager:
         if self.active is not None:
             return None
         for t in self.queued():
-            if (t.pending_input or t.unfinished) and (
-                exclude is None or t.id not in exclude
+            if (
+                (t.pending_input or t.unfinished)
+                and (exclude is None or t.id not in exclude)
+                and (blocked is None or t.id not in blocked)
             ):
                 t.status = TaskStatus.ACTIVE
                 t.queue_head = False

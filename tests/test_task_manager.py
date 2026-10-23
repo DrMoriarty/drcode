@@ -1008,3 +1008,131 @@ def test_requeue_failed_fix_persists_across_restart(
     task2 = reloaded.get(task.id)
     assert task2.fix_rounds == 1
     assert [e.text for e in task2.pending_input] == ["broken"]
+
+
+# -- dependencies (depends_on promotion gate) -------------------------------------
+
+
+def _complete(manager: TaskManager, task_id: str) -> None:
+    """Drive a task to COMPLETED the way the pipeline does (tester
+    verdict path; the fix-loop caps are irrelevant here)."""
+    manager.mark_done(task_id)
+    manager.set_verification(task_id, True)
+
+
+def test_depends_on_defaults_empty(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    assert task.depends_on == []
+
+
+def test_set_dependencies_stores_and_persists(
+    manager: TaskManager, project_root: Path
+) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(b.id, [a.id, "  "])  # blank entries dropped
+    assert b.depends_on == [a.id]
+    reloaded = TaskManager(project_root)
+    assert reloaded.get(b.id).depends_on == [a.id]
+
+
+def test_set_dependencies_deduplicates(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(a.id, [b.id, b.id])
+    assert a.depends_on == [b.id]
+
+
+def test_set_dependencies_rejects_self(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    with pytest.raises(ValueError, match="itself"):
+        manager.set_dependencies(a.id, [a.id])
+
+
+def test_set_dependencies_rejects_unknown_id(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    with pytest.raises(ValueError, match="unknown task id"):
+        manager.set_dependencies(a.id, ["ffffffff"])
+
+
+def test_set_dependencies_rejects_cycle(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    c = manager.create("c", "x")
+    manager.set_dependencies(a.id, [b.id])  # a waits for b
+    manager.set_dependencies(b.id, [c.id])  # b waits for c
+    with pytest.raises(ValueError, match="cycle"):
+        manager.set_dependencies(c.id, [a.id])  # would close the ring
+    with pytest.raises(ValueError, match="cycle"):
+        manager.set_dependencies(b.id, [a.id])  # two-node ring
+    # Clearing the middle edge opens the graph again.
+    manager.set_dependencies(b.id, [])
+    manager.set_dependencies(c.id, [a.id])
+    assert c.depends_on == [a.id]
+
+
+def test_blocking_dependencies_status_only(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    r = manager.create("r", "x", kind=TaskKind.RESEARCH)
+    manager.set_dependencies(a.id, [b.id, r.id])
+    # A stale stored id (set_dependencies would reject it — load time must
+    # not): simulate a dep whose task file was deleted/purged.
+    a.depends_on.append("ghost")
+    manager.storage.save(a)
+    assert manager.blocking_dependencies(a.id) == [b.id, r.id]
+    _complete(manager, b.id)
+    _complete(manager, r.id)  # research: mark_done completes it directly
+    assert manager.blocking_dependencies(a.id) == []
+
+
+def test_promote_next_skips_blocked(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(b.id, [a.id])
+    assert manager.promote_next() is a
+    assert b.status is TaskStatus.QUEUED
+    _complete(manager, a.id)
+    assert manager.promote_next() is b
+    assert b.status is TaskStatus.ACTIVE
+
+
+def test_promote_next_skips_blocked_even_with_unfinished(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(b.id, [a.id])
+    b.unfinished = True  # would normally auto-resume
+    assert manager.promote_next() is a
+    assert b.status is TaskStatus.QUEUED
+
+
+def test_missing_dep_task_does_not_block_promotion(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(b.id, [a.id])
+    manager.delete(a.id)
+    assert manager.promote_next() is b
+
+
+def test_blocked_tasks_sink_below_runnable_in_queue(manager: TaskManager) -> None:
+    c = manager.create("c", "x")  # runnable, oldest
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(a.id, [c.id])
+    assert manager.queued() == [c, b, a]
+
+
+def test_requeued_dependency_reblocks(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    manager.set_dependencies(b.id, [a.id])
+    _complete(manager, a.id)
+    assert manager.blocking_dependencies(b.id) == []
+    # The user sends new input to the completed dependency: it re-enters
+    # the pipeline and its dependents are blocked again until its next
+    # completion (the gate is re-evaluated dynamically).
+    manager.send(a.id, "one more round")
+    assert a.status is TaskStatus.QUEUED
+    assert manager.blocking_dependencies(b.id) == [a.id]
+    assert manager.promote_next() is a
+    assert b.status is TaskStatus.QUEUED

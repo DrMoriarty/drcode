@@ -4,6 +4,7 @@ import time
 from functools import partial
 from typing import ClassVar
 
+from rich.markup import escape
 from textual.command import (
     CommandPalette,
 )
@@ -44,6 +45,7 @@ from ..settings import (
     TaskFinalization,
     TaskIsolation,
 )
+from ..task_manager import validate_dependencies
 from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
@@ -60,7 +62,7 @@ from .command_providers import (
     role_model_options_provider,
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
-from .inputs import NewTaskInput
+from .inputs import DepsInput, NewTaskInput
 from .model_setup_app import ModelCatalogScreen
 from .notifications_dialog import NotificationsDialog, NotificationsSetup
 from .setup_dialog import ModelSetup, ModelSetupDialog
@@ -188,6 +190,7 @@ class ActionsLayer(DrCodeState):
         # Every entry into the new-task screen starts from a clean editor.
         self._editing_task_id = None
         self.new_task_input.clear()
+        self._clear_deps_field()
         self._new_task_mode = True
         # The form is not tied to any task: drop the viewed highlight so the
         # sidebar doesn't single out a task while the user composes a new one.
@@ -218,8 +221,8 @@ class ActionsLayer(DrCodeState):
                 "are merged below; save it back on hold or into the queue."
             )
             hint.update(
-                "tab — switch type   ctrl+enter — save & queue   "
-                "ctrl+h — save on hold   esc — cancel"
+                "tab — switch type   ctrl+g — depends on   "
+                "ctrl+enter — save & queue   ctrl+h — save on hold   esc — cancel"
             )
         else:
             note.update(
@@ -227,7 +230,7 @@ class ActionsLayer(DrCodeState):
                 "you are composing a task to be executed later."
             )
             hint.update(
-                "tab — switch type   ctrl+enter — create   "
+                "tab — switch type   ctrl+g — depends on   ctrl+enter — create   "
                 "ctrl+h — create on hold   esc — cancel"
             )
 
@@ -242,6 +245,7 @@ class ActionsLayer(DrCodeState):
             return
         self._editing_task_id = task.id
         self.new_task_input.load_text(self.manager.editable_condition(task.id))
+        self._load_deps_field(task.depends_on)
         self.new_task_kind = task.kind
         self._new_task_mode = True
         self._new_task_prev_id = self.viewed_id
@@ -335,6 +339,40 @@ class ActionsLayer(DrCodeState):
         one) and put it into the queue."""
         self._submit_new_form(hold=False)
 
+    # -- the "Depends on" field of the new-task form ---------------------------
+
+    def _clear_deps_field(self) -> None:
+        self.query_one("#nt-deps", DepsInput).value = ""
+        self.query_one("#nt-deps-note", Static).update("")
+
+    def _load_deps_field(self, deps: list[str]) -> None:
+        self.query_one("#nt-deps", DepsInput).value = ", ".join(deps)
+        self.query_one("#nt-deps-note", Static).update("")
+
+    def _deps_from_form(self) -> list[str] | None:
+        """Parse + validate the form's Depends-on field.
+
+        Returns the cleaned id list, or None on a violation — the error is
+        shown in the form (#nt-deps-note) so the user can fix it without
+        losing the composed text. Validation mirrors
+        TaskManager.set_dependencies (existence, no self-reference, no
+        cycles); for a fresh creation the task id is still unknown (None —
+        self-reference and cycles are impossible then)."""
+        raw = self.query_one("#nt-deps", DepsInput).value
+        deps = [part for part in raw.replace(",", " ").split()]
+        if not deps:
+            self.query_one("#nt-deps-note", Static).update("")
+            return []
+        try:
+            cleaned = validate_dependencies(
+                self.manager.tasks, self._editing_task_id, deps
+            )
+        except ValueError as e:
+            self.query_one("#nt-deps-note", Static).update(escape(str(e)))
+            return None
+        self.query_one("#nt-deps-note", Static).update("")
+        return cleaned
+
     def action_submit_new_task_hold(self) -> None:
         """Ctrl+H in the form: create the task directly on hold — or, while
         editing a held task, save it back on hold (still out of the
@@ -353,7 +391,14 @@ class ActionsLayer(DrCodeState):
         text = self.new_task_input.text.strip()
         if not text:
             return
+        # Validate the dependencies BEFORE creating: an invalid list keeps
+        # the form open with the error shown, nothing is created.
+        deps = self._deps_from_form()
+        if deps is None:
+            return
         task = self.manager.create("", text, kind=self.new_task_kind, hold=hold)
+        if deps:
+            self.manager.set_dependencies(task.id, deps)
         self._leave_new_task_mode()
         self.refresh_sidebar()
         self.view_task(task.id)
@@ -377,7 +422,11 @@ class ActionsLayer(DrCodeState):
         text = self.new_task_input.text.strip()
         if not text:
             return
+        deps = self._deps_from_form()
+        if deps is None:
+            return
         self.manager.edit_task(task.id, text, kind=self.new_task_kind)
+        self.manager.set_dependencies(task.id, deps)
         self._editing_task_id = None
         self._leave_new_task_mode()
         if queue:
@@ -511,6 +560,61 @@ class ActionsLayer(DrCodeState):
         # The Move up/Move down footer buttons hide at the queue edges and
         # at the bug-block boundary — re-evaluate the visible bindings.
         self.refresh_bindings()
+
+    # -- dependencies (depends_on gate) ----------------------------------------
+
+    def _can_edit_dependencies(self, task: Task | None) -> bool:
+        """Dependencies only make sense before development starts: queued
+        and held tasks (the same statuses the kind cycle accepts)."""
+        return task is not None and task.status in (
+            TaskStatus.QUEUED,
+            TaskStatus.HOLD,
+        )
+
+    def action_add_dependency(self, dep_id: str) -> None:
+        """Command-palette entry: make the viewed task wait for `dep_id`
+        (COMPLETED + merged) before it can be taken into development."""
+        task = self.viewed
+        if not self._can_edit_dependencies(task) or task is None:
+            return
+        try:
+            self.manager.set_dependencies(task.id, [*task.depends_on, dep_id])
+        except ValueError as e:
+            self.notify(str(e), title="Dependencies", severity="warning", timeout=6)
+            return
+        self._show_event(task, f"Dependency #{dep_id} added — task waits for it.")
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+
+    def action_remove_dependency(self, dep_id: str) -> None:
+        """Command-palette entry: drop one dependency from the viewed task.
+
+        Doubles as the force-start: removing the blocking dependency makes
+        the task eligible immediately (the gate is dynamic — nothing else
+        to reset). The manual override is logged into the task's service
+        events."""
+        task = self.viewed
+        if not self._can_edit_dependencies(task) or task is None:
+            return
+        if dep_id not in task.depends_on:
+            return
+        self.manager.set_dependencies(
+            task.id, [d for d in task.depends_on if d != dep_id]
+        )
+        self._dep_block_notified.discard(task.id)
+        self._dep_gate.pop(task.id, None)
+        self._show_event(
+            task,
+            f"Manual override: dependency #{dep_id} removed — "
+            "task eligible for development.",
+        )
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        self._advance()
 
     def action_hold_task(self) -> None:
         """Park the viewed task out of the backlog (hold). Works for queued

@@ -554,3 +554,56 @@ def test_dormant_setting_survives_restart_without_git(
     assert loaded.task_isolation is TaskIsolation.WORKTREE
     env = TaskEnvironment(project_root, loaded)
     assert not env.active  # the startup warning path fires, mode dormant
+
+
+# -- unmerged_ids (dependency-gate mergedness) ------------------------------------
+
+
+def test_unmerged_ids_mixed(env: TaskEnvironment, git_root: Path) -> None:
+    # Merged: a branch sitting exactly at the base HEAD.
+    _git(git_root, "branch", "drcode/merged")
+    # Unmerged: a branch with one extra commit, main checkout left behind.
+    _git(git_root, "checkout", "-q", "-b", "drcode/work")
+    (git_root / "work.txt").write_text("work")
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "work")
+    _git(
+        git_root,
+        "checkout",
+        "-",
+    )
+    assert env.unmerged_ids(["merged", "work", "absent"]) == {"work"}
+
+
+def test_unmerged_ids_isolation_off_or_no_repo(git_root: Path) -> None:
+    # Setting off: there is nothing to merge — the gate degenerates to the
+    # dependency's status, the git half always reports "satisfied".
+    env = TaskEnvironment(git_root, ProjectSettings())
+    _git(git_root, "checkout", "-q", "-B", "drcode/x")
+    (git_root / "x.txt").write_text("x")
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "x")
+    _git(git_root, "checkout", "-")
+    assert env.unmerged_ids(["x"]) == set()
+
+
+def test_unmerged_ids_branch_outlives_task_file(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """RULE 2: a deleted dependency's branch survives when it holds
+    unmerged commits — and still blocks its dependents (the gate checks
+    git, not the task store)."""
+    _git(git_root, "checkout", "-q", "-b", "drcode/gone")
+    (git_root / "gone.txt").write_text("gone")
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "gone")
+    _git(git_root, "checkout", "-")
+    # No task with id "gone" exists anywhere — the branch alone decides.
+    assert env.unmerged_ids(["gone"]) == {"gone"}
+
+
+def test_unmerged_ids_empty_branch_not_blocking(env: TaskEnvironment) -> None:
+    # A branch that exists but adds nothing (created and never committed
+    # onto) counts as merged.
+    _git(env.project_root, "branch", "drcode/empty")
+    assert env.unmerged_ids(["empty"]) == set()

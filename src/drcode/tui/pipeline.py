@@ -288,6 +288,14 @@ class PipelineLayer(DrCodeState):
             # rule "no new development while any testing is incomplete"
             # holds even then — the retry timer will call _advance() again.
             return
+        if any(t.depends_on for t in self.manager.queued()):
+            # The dependency gate is active: mergedness of the depends_on
+            # branches must be checked with git OFF the event loop — hand
+            # the whole promotion tail to the worker (exclusive group: a
+            # re-entrant _advance() cancels the pending one instead of
+            # promoting twice).
+            self._promote_with_dependencies()
+            return
         promoted = self.manager.promote_next(exclude=self._agent_failed)
         if promoted is None:
             # Deadlock escape: the queue is not empty, but every task in it
@@ -308,7 +316,7 @@ class PipelineLayer(DrCodeState):
     _FAILED_QUEUE_RETRY_BASE = 60.0
     _FAILED_QUEUE_RETRY_CAP = 600.0
 
-    def _promote_failed_queue(self) -> Task | None:
+    def _promote_failed_queue(self, blocked: set[str] | None = None) -> Task | None:
         """Deadlock escape for a queue of session-failed tasks.
 
         A task whose run crashed (network outage, model error) is demoted
@@ -325,6 +333,11 @@ class PipelineLayer(DrCodeState):
         priority rules — the queue keeps working instead of stalling. A
         notification reports how many tasks were rescued this way.
 
+        `blocked` (the dependency gate's set, when the caller computed one)
+        counts as "cannot be rescued": dependency-blocked tasks are neither
+        lifted nor promoted, and they don't keep the rescue from firing for
+        the genuinely failed ones.
+
         Returns the promoted task, or None when the escape does not apply
         (an active task exists, the queue holds a non-failed task, or the
         next rescue round is still within its backoff window — a timer
@@ -333,7 +346,10 @@ class PipelineLayer(DrCodeState):
         if self.manager.active is not None:
             return None
         queued = self.manager.queued()
-        if not queued or any(t.id not in self._agent_failed for t in queued):
+        if not queued or any(
+            t.id not in self._agent_failed and (blocked is None or t.id not in blocked)
+            for t in queued
+        ):
             return None
         now = time.monotonic()
         if now < self._failed_queue_retry_at:
@@ -347,7 +363,8 @@ class PipelineLayer(DrCodeState):
         )
         self._failed_queue_retry_at = now + delay
         self.set_timer(delay, self._advance)
-        for t in queued:
+        rescued = [t for t in queued if blocked is None or t.id not in blocked]
+        for t in rescued:
             self._agent_failed.discard(t.id)
             self._show_event(
                 t,
@@ -355,8 +372,107 @@ class PipelineLayer(DrCodeState):
                 "for the rest of the session; no error-free tasks remain "
                 "in the queue — exclusion lifted, task back in development.",
             )
-        self.notifier.failed_tasks_requeued(len(queued))
-        return self.manager.promote_next()
+        self.notifier.failed_tasks_requeued(len(rescued))
+        return self.manager.promote_next(blocked=blocked)
+
+    # -- dependency gate (depends_on promotion condition) ---------------------
+
+    def _dep_gate_sync(self, dep_ids: list[str]) -> tuple[set[str], str]:
+        """The blocking part of the dependency gate, run in a worker thread
+        by _promote_with_dependencies: which dependency ids still hold
+        unmerged commits on their `drcode/<id>` branch, plus the base
+        branch name for the service-event texts (empty when isolation is
+        off — mergedness is not checkable then)."""
+        unmerged = self.task_env.unmerged_ids(dep_ids)
+        base = self.task_env.base_branch() if self.task_env.active else ""
+        return unmerged, base
+
+    @work(exclusive=True, group="promote")
+    async def _promote_with_dependencies(self) -> None:
+        """Promotion with the dependency gate active: the mirror of
+        _advance()'s tail, plus a git check of every queued task's
+        depends_on ids off the event loop.
+
+        A dependency is satisfied iff its task is COMPLETED and — under
+        per-task worktree isolation — its `drcode/<dep>` branch is gone or
+        fully merged into the base branch (a missing dep task is judged by
+        its branch alone). The set of unsatisfied tasks is passed to
+        promote_next as `blocked`, which skips them exactly like held
+        ones. Tasks without dependencies never enter this path —
+        _advance() keeps its synchronous zero-overhead route.
+        """
+        queued = [t for t in self.manager.queued() if t.depends_on]
+        dep_ids = sorted({d for t in queued for d in t.depends_on})
+        unmerged, base = await asyncio.to_thread(self._dep_gate_sync, dep_ids)
+        # The git calls ran in a thread — the pipeline may have moved on
+        # (a tester started, a review is in flight): re-check the gates
+        # _advance() enforces synchronously before dispatching here.
+        if self.tester_running or self._review_running:
+            return
+        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+            return
+        blocked: set[str] = set()
+        gate: dict[str, dict[str, str]] = {}
+        for t in queued:
+            reasons: dict[str, str] = {}
+            for dep in t.depends_on:
+                dep_task = self.manager.tasks.get(dep)
+                if dep_task is not None and dep_task.status is not TaskStatus.COMPLETED:
+                    reasons[dep] = "not completed"
+                elif dep in unmerged:
+                    reasons[dep] = "unmerged"
+            if reasons:
+                blocked.add(t.id)
+                gate[t.id] = reasons
+        self._dep_gate = gate
+        self._announce_dependency_gate(queued, gate, base)
+        promoted = self.manager.promote_next(
+            exclude=self._agent_failed, blocked=blocked
+        )
+        if promoted is None:
+            promoted = self._promote_failed_queue(blocked=blocked)
+        if promoted:
+            self.notifier.pipeline_busy()
+            self.run_agent(promoted.id)
+        else:
+            self._notify_pipeline_settled()
+        self.refresh_status()
+
+    def _announce_dependency_gate(
+        self,
+        queued: list[Task],
+        gate: dict[str, dict[str, str]],
+        base: str,
+    ) -> None:
+        """Service events of the dependency gate, deduplicated per task and
+        session: the first time a task enters the blocked set it gets one
+        "Task waits: …" line listing every unsatisfied dependency (with
+        title, or a note that the dep's task file is gone while its branch
+        still holds work); when it leaves the set — one "eligible" line.
+        Re-evaluations that don't change a task's blockedness stay silent."""
+        for t in queued:
+            reasons = gate.get(t.id)
+            if reasons:
+                if t.id in self._dep_block_notified:
+                    continue
+                self._dep_block_notified.add(t.id)
+                parts: list[str] = []
+                for dep, kind in reasons.items():
+                    dep_task = self.manager.tasks.get(dep)
+                    title = f" ({dep_task.title_display})" if dep_task else ""
+                    if kind == "unmerged":
+                        what = f"not merged into {base}" if base else "not merged"
+                        if dep_task is None:
+                            what += " (task file gone, branch survives)"
+                    else:
+                        what = "not completed"
+                    parts.append(f"#{dep}{title} — {what}")
+                self._show_event(t, "Task waits: dependency " + "; ".join(parts) + ".")
+            elif t.id in self._dep_block_notified:
+                self._dep_block_notified.discard(t.id)
+                self._show_event(
+                    t, "Dependencies satisfied — task eligible for development."
+                )
 
     def _notify_pipeline_settled(self) -> None:
         """Notifications: the gate settled without starting anything.
@@ -411,6 +527,17 @@ class PipelineLayer(DrCodeState):
         )
         if idle:
             reasons.append(f"queued without task text: {idle}")
+        # Tasks waiting on the dependency gate (last computed set — the
+        # git check runs only in the promote worker): reported separately
+        # from the "queue empty" idle state, so a backlog of chained tasks
+        # never reads as "everything processed".
+        dep_blocked = sum(
+            1
+            for t in remaining
+            if t.status is TaskStatus.QUEUED and t.id in self._dep_gate
+        )
+        if dep_blocked:
+            reasons.append(f"blocked by dependencies: {dep_blocked}")
         self.notifier.pipeline_idle(
             blocked=True,
             detail=("Reasons: " + ", ".join(reasons) + ".") if reasons else "",

@@ -7,7 +7,7 @@ from rich.cells import cell_len
 from textual import events
 from textual.actions import SkipAction
 from textual.binding import Binding
-from textual.widgets import TextArea
+from textual.widgets import Input, TextArea
 
 
 class WordNavTextArea(TextArea):
@@ -111,6 +111,7 @@ class NewTaskInput(WordNavTextArea):
     BINDINGS: ClassVar = [
         Binding("tab", "toggle_kind", "Toggle type", priority=True),
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
+        Binding("ctrl+g", "focus_deps", "Depends on", priority=True),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
@@ -124,6 +125,45 @@ class NewTaskInput(WordNavTextArea):
 
     def action_cancel_new_task(self) -> None:
         self._app().cancel_new_task()
+
+    def action_focus_deps(self) -> None:
+        from textual.widgets import Input
+
+        self._app().query_one("#nt-deps", Input).focus()
+
+
+class DepsInput(Input):
+    """Single-line "Depends on" field of the new-task form: comma-separated
+    task ids whose COMPLETED+merged state gates this task's promotion.
+
+    Ctrl+G from the description editor jumps here; Ctrl+G/Tab jumps back.
+    The value is validated on submit (existence, no self-reference, no
+    cycles — TaskManager.validate_dependencies) and the error is shown in
+    the form (#nt-deps-note) instead of closing it."""
+
+    BINDINGS: ClassVar = [
+        Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
+        Binding("ctrl+g,tab", "focus_editor", "Back to editor", priority=True),
+        Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
+        Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
+        Binding("escape", "cancel_new_task", "Cancel", priority=True),
+    ]
+
+    def _app(self):
+        from .app import DrCodeApp
+
+        app = self.app
+        assert isinstance(app, DrCodeApp)
+        return app
+
+    def action_submit_new_task(self) -> None:
+        self._app().submit_new_task()
+
+    def action_cancel_new_task(self) -> None:
+        self._app().cancel_new_task()
+
+    def action_focus_editor(self) -> None:
+        self._app().query_one("#nt-input", TextArea).focus()
 
 
 class ChatInput(WordNavTextArea):

@@ -253,10 +253,13 @@ class ChatViewLayer(DrCodeState):
                     suffix = " ❌"
                 else:
                     suffix = ""
+                # Dependency gate: a task whose depends_on is not satisfied
+                # yet gets the lock marker and the ids it waits for.
+                deps_suffix = self._dependency_marker(t)
                 viewed = " ●" if t.id == self.viewed_id else ""
                 item = TaskItem(
                     f"{marker} {kind_letter} #{t.id} "
-                    f"{escape(t.title_display)}{suffix}{viewed}",
+                    f"{escape(t.title_display)}{suffix}{deps_suffix}{viewed}",
                     t.id,
                 )
                 if t.id == self.viewed_id:
@@ -264,6 +267,25 @@ class ChatViewLayer(DrCodeState):
                 sidebar.append(item)
         sidebar.refresh()
         self._sidebar_snapshot = self._sidebar_fingerprint()
+
+    def _dependency_marker(self, task: Task) -> str:
+        """Sidebar suffix of the dependency gate: " 🔒 ⇢ <id1>,<id2>" for a
+        task whose dependencies are not satisfied yet, "" otherwise.
+
+        Status half from the manager (a dep exists and is not COMPLETED);
+        the mergedness half from the promote worker's last computed gate
+        (covers deps whose task file is gone but whose branch still holds
+        unmerged work)."""
+        if not task.depends_on:
+            return ""
+        gate = self._dep_gate.get(task.id)
+        if gate:
+            waiting = list(gate)
+        elif self.manager.blocking_dependencies(task.id):
+            waiting = list(task.depends_on)
+        else:
+            return ""
+        return f" [red]🔒[/] ⇢ {','.join(waiting)}"
 
     def toggle_sidebar_section(self, section: str) -> None:
         """Collapse/expand one sidebar category (its header row).
@@ -1054,12 +1076,44 @@ class ChatViewLayer(DrCodeState):
             f"[dim]{created}[/]",
             status,
         ]
+        deps_part = self._dependency_status_part(task)
+        if deps_part:
+            parts.append(deps_part)
         if task.verification is VerificationStatus.PASSED:
             parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:
             parts.append("[red]✗ testing[/]")
         left.update("   ".join(parts))
         self._update_ctx_counter(right, task)
+
+    def _dependency_status_part(self, task: Task) -> str:
+        """Task-statusbar fragment listing the task's dependencies with
+        their per-dependency gate state:
+
+        - `#id ✓` — the dependency is COMPLETED;
+        - `#id …` — the dependency task exists but is not completed yet;
+        - `#id ⇴` — the promote worker's last gate run found unmerged
+          commits on the dependency's `drcode/<id>` branch (also for a
+          dep whose task file is already gone — the branch outlives it);
+        - `#id ?` — an id that is not in the manager and has no branch
+          (a stale entry; the gate treats it as satisfied).
+
+        Empty string when the task has no dependencies."""
+        if not task.depends_on:
+            return ""
+        gate = self._dep_gate.get(task.id, {})
+        bits: list[str] = []
+        for dep in task.depends_on:
+            dep_task = self.manager.tasks.get(dep)
+            if gate.get(dep) == "unmerged":
+                bits.append(f"[red]#{escape(dep)}⇴[/]")
+            elif dep_task is not None and dep_task.status is TaskStatus.COMPLETED:
+                bits.append(f"[green]#{escape(dep)}✓[/]")
+            elif dep_task is not None:
+                bits.append(f"[yellow]#{escape(dep)}…[/]")
+            else:
+                bits.append(f"[dim]#{escape(dep)}?[/]")
+        return "deps: " + " ".join(bits)
 
     @staticmethod
     def _fmt_ctx_tokens(n: int) -> str:

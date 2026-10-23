@@ -438,6 +438,35 @@ class TaskEnvironment:
             return 0
         return self._unmerged_count(branch)
 
+    def unmerged_ids(self, task_ids: list[str]) -> set[str]:
+        """Which of `task_ids` still have unmerged work: their
+        `drcode/<id>` branch exists and holds commits not reachable from
+        the base branch — the mergedness half of the dependency promotion
+        gate (see drcode.task_manager / the pipeline's promote worker).
+
+        Semantics per id: isolation not active (setting off, no git repo)
+        → NOT in the set (nothing to merge — the gate degenerates to the
+        dependency's status); branch absent (cancelled/cleaned/never
+        isolated) → NOT in the set; branch present with unmerged commits →
+        in the set — including ids whose task file is already gone (RULE 2:
+        the branch outlives the task), so a deleted dependency with
+        unmerged work keeps its dependents blocked. Checks are dynamic:
+        the caller re-runs this at every promotion attempt, so a manual
+        `git merge drcode/<dep>` unblocks the dependents by itself.
+
+        Blocking (a couple of git calls per id): run via
+        `asyncio.to_thread` from the pipeline."""
+        if not self.active:
+            return set()
+        unmerged: set[str] = set()
+        for task_id in task_ids:
+            branch = self.branch(task_id)
+            if not self._branch_exists(branch):
+                continue
+            if self._unmerged_count(branch) > 0:
+                unmerged.add(task_id)
+        return unmerged
+
     def remove(self, task_id: str) -> None:
         """Remove the task's worktree; its `drcode/<task-id>` branch only
         when it holds no unmerged commits (RULE 2 — see the module

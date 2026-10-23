@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import statistics
 import time
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from ..agent import (
 )
 from ..providers import AgentRole
 from .blocks import (
+    TASK_MENTION_RE,
     AssistantBlock,
     ReasoningBlock,
     ToolCallBlock,
@@ -35,6 +37,26 @@ from .usage import NETWORK_RETRIES
 _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 _CHAT_MOUNT_CHUNK = 16
 _SCROLL_FOLLOW_THRESHOLD = 4
+
+
+def _mention_markup(text: str) -> str:
+    """Wrap task-id mentions (#69c8bd30) in click markup for markup-string
+    lines (tool output, tester/system/event lines, statusbar fragments).
+
+    *text* must already be ESCAPED (rich `escape`): the wrapper only touches
+    `#`+hex runs, which escaping never alters, and Textual's markup parser
+    fires the `@click` action on the span (same mechanism as the
+    clarification options' `[@click=…]` tags). Unknown ids are caught at
+    click time by the action's "not found" toast.
+    """
+
+    def _wrap(match: re.Match[str]) -> str:
+        task_id = match.group(1).lower()
+        return f"[@click=app.open_task('{task_id}')]#{task_id}[/]"
+
+    return TASK_MENTION_RE.sub(_wrap, text)
+
+
 from ..models import (
     Clarification,
     Task,
@@ -832,7 +854,7 @@ class ChatViewLayer(DrCodeState):
     @staticmethod
     def _format_event(event: TaskEvent) -> str:
         ts = event.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        return f"[dim]{ts}[/] {escape(event.text)}"
+        return f"[dim]{ts}[/] {_mention_markup(escape(event.text))}"
 
     def _show_event(self, task: Task, text: str, *, kind: str = "system") -> None:
         """Persist an event and, if the task is open, render it live."""
@@ -1109,9 +1131,14 @@ class ChatViewLayer(DrCodeState):
         elif role == "assistant":
             block = AssistantBlock(text)
         elif role == "tool":
-            self._write_chat(f"[dim]{escape(text)}[/]")
+            self._write_chat(f"[dim]{_mention_markup(escape(text))}[/]")
         elif role == "tester":
-            self._write_chat(f"[bold magenta]tester ›[/] {text}")
+            # tester output is raw model text: escape it before the markup
+            # parser sees it (a stray bracket would crash rendering), then
+            # wrap task-id mentions into click links.
+            self._write_chat(
+                f"[bold magenta]tester ›[/] {_mention_markup(escape(text))}"
+            )
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
             self._write_chat(f"[bold magenta]──── {label} ────[/]")
@@ -1124,13 +1151,15 @@ class ChatViewLayer(DrCodeState):
         elif role == "event":
             self._write_chat(f"[bold red]event ›[/] {text}")
         elif role == "system":
-            self._write_chat(f"[bold red]error ›[/] {text}")
+            self._write_chat(f"[bold red]error ›[/] {_mention_markup(escape(text))}")
         if block is not None:
             self._write_chat(block)
         return block
 
     def _write_clarification(self, clarification: Clarification) -> None:
-        lines = [f"[bold blue]drcode ❓[/] {escape(clarification.question)}"]
+        lines = [
+            f"[bold blue]drcode ❓[/] {_mention_markup(escape(clarification.question))}"
+        ]
         for i, option in enumerate(clarification.options):
             lines.append(
                 f"  ▸ [@click=app.pick_option({i})]"
@@ -1240,15 +1269,18 @@ class ChatViewLayer(DrCodeState):
         gate = self._dep_gate.get(task.id, {})
         bits: list[str] = []
         for dep in task.depends_on:
+            # Each #id marker is itself a link to the dependency task (ids
+            # are lowercase hex — no escaping needed inside the markup tag).
+            link = f"[@click=app.open_task('{dep.lower()}')]#{dep.lower()}[/]"
             dep_task = self.manager.tasks.get(dep)
             if gate.get(dep) == "unmerged":
-                bits.append(f"[red]#{escape(dep)}⇴[/]")
+                bits.append(f"[red]{link}⇴[/]")
             elif dep_task is not None and dep_task.status is TaskStatus.COMPLETED:
-                bits.append(f"[green]#{escape(dep)}✓[/]")
+                bits.append(f"[green]{link}✓[/]")
             elif dep_task is not None:
-                bits.append(f"[yellow]#{escape(dep)}…[/]")
+                bits.append(f"[yellow]{link}…[/]")
             else:
-                bits.append(f"[dim]#{escape(dep)}?[/]")
+                bits.append(f"[dim]{link}?[/]")
         return "deps: " + " ".join(bits)
 
     @staticmethod

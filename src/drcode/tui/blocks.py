@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from datetime import datetime
 from typing import Any
 
 from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.timer import Timer
@@ -18,6 +20,44 @@ from textual.widgets import Static
 # the tool is executing.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_INTERVAL = 0.12
+
+# Task-id mention: '#' + 8 hex chars (models._short_id() = uuid4().hex[:8]).
+# The lookarounds reject ids inside longer hex tokens: a 9+-char run
+# (#abcdef123 — the regex can't backtrack, 8 hex are mandatory), a 6- or
+# 12-digit CSS color (#aabbcc, #AABBCCDD) and an id glued to a preceding
+# hex char or another '#' (##69c8bd30). A non-hex word char before the '#'
+# (e.g. "x#69c8bd30") still matches — the mention is unambiguous there.
+TASK_MENTION_RE = re.compile(r"(?<![0-9A-Fa-f#])#([0-9A-Fa-f]{8})(?![0-9A-Fa-f])")
+
+
+def _mention_click_style(task_id: str) -> Style:
+    """Style for a clickable task-id mention.
+
+    The click action must ride in the style's META (a `Style` object): rich's
+    markup parser rejects `@click=…` as a style name, and Textual's
+    `App._broker_event` dispatches the action from `event.style.meta` — a
+    plain-colored span would render but never fire. Namespaced `app.` — the
+    default namespace would resolve against the widget, not the app.
+    """
+    return Style.parse("cyan underline") + Style.from_meta(
+        {"@click": f"app.open_task('{task_id}')"}
+    )
+
+
+def linkify(text: Text) -> Text:
+    """Stylize task-id mentions (#69c8bd30) in a rendered Text as clickable
+    links that open the mentioned task (app.open_task).
+
+    Applied to the RENDERED text (after markdown/escape), never to the raw
+    source. Membership in `manager.tasks` is deliberately not checked here:
+    the text may have been rendered (or streamed) before the mentioned task
+    existed (tester-created bug reports) and ids survive task deletion in
+    old transcripts — unknown ids are caught at click time with a toast.
+    """
+    for match in TASK_MENTION_RE.finditer(text.plain):
+        task_id = match.group(1).lower()
+        text.stylize(_mention_click_style(task_id), match.start(), match.end())
+    return text
 
 
 class UserBlock(Static):
@@ -35,7 +75,9 @@ class UserBlock(Static):
     """
 
     def __init__(self, text: str) -> None:
-        super().__init__(Text(text), expand=True)
+        # linkify on the plain Text (no markdown pass): user messages are
+        # rendered verbatim; task-id mentions become clickable.
+        super().__init__(linkify(Text(text)), expand=True)
 
 
 def _header_line_width(widget: Static) -> int:
@@ -360,6 +402,11 @@ class AssistantBlock(Static):
                 self._text = _streamable_markdown(self._content, width)
             else:
                 self._text = _markdown_text(self._content, width)
+            # Linkify the RENDERED Text (markdown may swallow a line-initial
+            # "#id" as an H1 — accepted), inside the width cache branch so
+            # the cache rules stay untouched: the per-repaint regex over
+            # text.plain is negligible.
+            linkify(self._text)
             self._width = width
         return self._text
 

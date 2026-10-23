@@ -1452,3 +1452,28 @@ class ActionsLayer(DrCodeState):
         if not 0 <= index < len(task.clarification.options):
             return
         self._submit_user_text(task, task.clarification.options[index])
+
+    def action_open_task(self, task_id: str) -> None:
+        """User clicked a task-id mention (#69c8bd30) in the chat or the
+        status surfaces: open the mentioned task."""
+        task_id = task_id.lower()
+        # A drag-selection that ends on a mention still dispatches the
+        # @click action (App._broker_event runs before any widget on_click
+        # and cannot be stopped by the block): an active selection means
+        # the user is copying text, not navigating.
+        if self.screen.selections:
+            return
+        if task_id not in self.manager.tasks:
+            self.notify(
+                f"Task #{task_id} not found",
+                title="Tasks",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        if task_id == self.viewed_id:
+            # Already on screen: skip the full chat wipe + scroll jump of
+            # view_task().
+            return
+        self.view_task(task_id)
+        self.chat_input.focus()

@@ -181,7 +181,8 @@ class ChatViewLayer(DrCodeState):
         """Re-render the todo panel from the viewed task's checklist.
 
         Visible (auto-sized) only when the task has a non-empty `todos`;
-        hidden otherwise. Done items render struck-through-dim (rich does
+        hidden otherwise. A fully completed checklist collapses to the
+        single `todos N/N` counter line. Done items render struck-through-dim (rich does
         not strike through reliably across terminals — dim is the portable
         equivalent); unchecked ones in the normal text color. Read-only:
         the agent owns the list."""
@@ -197,6 +198,12 @@ class ChatViewLayer(DrCodeState):
         lines = [
             f"[bold $accent]todos[/] [dim]{done}/{len(task.todos)}[/]",
         ]
+        if done == len(task.todos):
+            # Fully completed checklist: collapse to the single counter
+            # line — the items themselves carry no useful signal anymore.
+            panel.update("\n".join(lines))
+            panel.remove_class("hidden")
+            return
         for i, item in enumerate(task.todos, 1):
             text = escape(item.text)
             # The [x]/[ ] markers are escaped (\[) so rich keeps them

@@ -107,6 +107,31 @@ def test_enabled_without_git_stays_dormant(
     assert not (project_root / ".drcode" / "worktrees" / "t1").exists()
 
 
+# -- isolation off: no worktree, even in a git repo ----------------------------------
+
+
+def test_isolation_off_never_creates_or_reuses_worktree(git_root: Path) -> None:
+    """Default (off) in a git repo: every activation returns the project
+    root — the worktree path is neither created nor silently reused as the
+    task's root when a leftover worktree exists."""
+    env = TaskEnvironment(git_root, ProjectSettings())
+    assert not env.enabled
+    assert env.available  # a repo, but the setting says off
+    root, note = env.ensure_root("t1")
+    assert root == git_root
+    assert note == ""
+    assert not (git_root / ".drcode" / "worktrees" / "t1").exists()
+    assert not branch_exists(git_root, "drcode/t1")
+    # A worktree left over from a session where the setting was on stays
+    # out of the way: the task keeps working in the project directory.
+    leftover = git_root / ".drcode" / "worktrees" / "t1"
+    leftover.mkdir(parents=True)
+    (leftover / "README.md").write_text("stale")
+    root2, _ = env.ensure_root("t1")
+    assert root2 == git_root
+    assert (git_root / "README.md").read_text() == "hello"
+
+
 # -- creation and reuse -------------------------------------------------------------
 
 

@@ -40,7 +40,7 @@ from drcode.agent import (
     split_original_prompts,
 )
 from drcode.config import Config
-from drcode.models import TaskKind
+from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.task_manager import TaskManager
 from drcode.tools import PathViolation
 
@@ -567,6 +567,82 @@ async def test_git_push_success_with_bare_remote(tmp_path: Path) -> None:
     assert task.events == []
 
 
+# -- tester set_verification(retry_here=True): the fix loop --------------------------
+
+
+def _testing_deps(root: Path) -> agent_mod.TesterDeps:
+    deps = _tester_deps(root)
+    task = deps.manager.get(deps.task_id)
+    task.pending_input.clear()  # the original prompt was consumed by round 1
+    task.status = TaskStatus.TESTING
+    deps.manager.storage.save(task)
+    return deps
+
+
+async def test_retry_failed_here_requeues_task(tmp_path: Path) -> None:
+    deps = _testing_deps(tmp_path)
+    task = deps.manager.get(deps.task_id)
+
+    message = agent_mod._retry_failed_here(deps, "pytest fails: 1 broken")
+
+    assert task.status is TaskStatus.QUEUED
+    assert task.fix_rounds == 1
+    assert task.verification is None
+    assert task.completed_at is None
+    assert [e.text for e in task.pending_input] == ["pytest fails: 1 broken"]
+    assert "round 2/3" in message
+    assert "do NOT call create_bug_report" in message
+    # The re-queued task is promotable in its own (preserved) worktree.
+    assert deps.manager.promote_next() is task
+    # The event log carries the fix-loop note for the human.
+    assert any("returned for another development round" in e.text for e in task.events)
+
+
+async def test_retry_failed_here_caps_after_max_rounds(tmp_path: Path) -> None:
+    deps = _testing_deps(tmp_path)
+    task = deps.manager.get(deps.task_id)
+    task.fix_rounds = 2
+    deps.manager.storage.save(task)
+
+    message = agent_mod._retry_failed_here(deps, "still broken")
+
+    assert task.status is TaskStatus.COMPLETED
+    assert task.verification is VerificationStatus.FAILED
+    assert task.completed_at is not None
+    # The counter is not incremented on the capped completion; the tester
+    # must create the bug report now.
+    assert task.fix_rounds == 2
+    assert "create_bug_report" in message
+    assert any("fix-round cap" in e.text for e in task.events)
+
+
+async def test_retry_failed_here_respects_custom_cap(tmp_path: Path) -> None:
+    deps = _testing_deps(tmp_path)
+    deps.max_dev_rounds = 1
+    task = deps.manager.get(deps.task_id)
+
+    message = agent_mod._retry_failed_here(deps, "broken")
+
+    assert task.status is TaskStatus.COMPLETED
+    assert task.verification is VerificationStatus.FAILED
+    assert "create_bug_report" in message
+
+
+async def test_retry_failed_here_ignores_non_testing_task(tmp_path: Path) -> None:
+    deps = _tester_deps(tmp_path)
+    task = deps.manager.get(deps.task_id)
+    task.status = TaskStatus.ACTIVE
+    deps.manager.storage.save(task)
+    before = list(task.pending_input)
+
+    message = agent_mod._retry_failed_here(deps, "late verdict")
+
+    assert task.status is TaskStatus.ACTIVE
+    assert task.fix_rounds == 0
+    assert task.pending_input == before
+    assert "no longer being tested" in message
+
+
 # -- research agent: tracked-file commit (git_commit_docs) ---------------------------
 
 
@@ -807,6 +883,25 @@ def test_build_tester_agent_has_tester_tools(fake_config: Config) -> None:
     # Tester must not have write access: no write_file/edit_file tools.
     assert "write_file" not in tool_names
     assert "edit_file" not in tool_names
+
+
+def test_tester_prompt_teaches_retry_here() -> None:
+    """Both tester templates must teach the retry_here criterion: a failure
+    caused by the task's own changes returns the task to development
+    (retry_here=True, no bug report); a foreign/environmental failure
+    completes it with a bug report (retry_here=False)."""
+    from drcode.agent import (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+    )
+
+    for prompt in (TESTER_SYSTEM_PROMPT, TESTER_SYSTEM_PROMPT_NO_COMMIT):
+        assert "retry_here=True" in prompt
+        assert "retry_here=False" in prompt
+        assert "create_bug_report" in prompt
+        # The cap escape must be taught too: after max failed rounds the
+        # failure completes the task and the bug report is required again.
+        assert "fix-round cap" in prompt
 
 
 def test_build_tester_agent_substitutes_project_path(

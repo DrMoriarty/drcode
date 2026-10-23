@@ -777,7 +777,10 @@ async def test_tester_passed_hook_skipped_on_failed_verification(
     task = review_app.manager.create("Add logging", "add logging everywhere")
     scripted.steps = [
         text_response("done"),
-        tool_response("set_verification", {"success": False}),
+        # A foreign failure (retry_here=False): the task completes FAILED
+        # and the passed-hook must not fire. The default retry_here=True
+        # would requeue the task into another development round instead.
+        tool_response("set_verification", {"success": False, "retry_here": False}),
         text_response("tests fail"),
     ]
     async with review_app.run_test() as pilot:

@@ -1379,6 +1379,11 @@ class PipelineLayer(DrCodeState):
                 review_gate=(
                     self.workflow is not None and self.workflow.has("on_review")
                 ),
+                # The fix-loop cap: how many consecutive failed development
+                # rounds (retry_here verdicts) the task gets before its
+                # failure completes it as FAILED (and the tester creates
+                # the bug report).
+                max_dev_rounds=self.settings.max_dev_rounds,
             )
             try:
                 prompt = f"Verify completed task #{task.id}: {task.title}"

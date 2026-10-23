@@ -78,6 +78,16 @@ FINALIZATION_OPTIONS: tuple[TaskFinalization, ...] = (
 )
 
 
+# Options of the `max_dev_rounds` setting (the fix-loop cap), offered in the
+# Settings picker.
+DEV_ROUNDS_OPTIONS: tuple[int, ...] = (1, 2, 3, 5)
+
+
+def dev_rounds_label(rounds: int) -> str:
+    """Human-readable option label for the Settings UI."""
+    return "1 round" if rounds == 1 else f"{rounds} rounds"
+
+
 class TaskIsolation(str, enum.Enum):
     """Where a task's development happens.
 
@@ -181,6 +191,12 @@ GITHUB_SYNC_INTERVAL_OPTIONS: tuple[GitHubSyncInterval, ...] = (
 class ProjectSettings(BaseModel):
     completed_retention: CompletedRetention = CompletedRetention.DAYS_7
     task_finalization: TaskFinalization = TaskFinalization.TESTING_COMMIT
+    # Fix-loop cap: how many consecutive development rounds the tester may
+    # fail with a "the bug is this task's own change" verdict (retry_here)
+    # before the failure completes the task as FAILED and the bug report is
+    # created (branching from clean HEAD). Reset by a PASSED verdict or by
+    # the user taking the task back by hand.
+    max_dev_rounds: int = 3
     stall_nudge: StallNudge = StallNudge.MIN_30
     # Per-task worktree isolation (TaskIsolation docstring): a value that
     # the project cannot currently honour (worktree without a git repo) is

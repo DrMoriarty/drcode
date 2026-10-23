@@ -898,3 +898,113 @@ def test_delete_removes_scratch(manager: TaskManager, scratch_base: Path) -> Non
     scratch = _touch_scratch(scratch_base, task.id)
     manager.delete(task.id)
     assert not scratch.exists()
+
+
+# -- fix loop: requeue_failed_fix (tester retry_here) ---------------------------------
+
+
+def _to_testing(manager: TaskManager, task_id: str) -> Task:
+    task = manager.get(task_id)
+    task.status = TaskStatus.TESTING
+    task.touch()
+    manager.storage.save(task)
+    return task
+
+
+def test_requeue_failed_fix_returns_task_to_development(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    task.pending_input.clear()  # the original prompt was consumed by round 1
+    _to_testing(manager, task.id)
+    task.verification = VerificationStatus.FAILED
+    manager.storage.save(task)
+
+    manager.requeue_failed_fix(task.id, "your change broke pytest", max_rounds=3)
+
+    assert task.status is TaskStatus.QUEUED
+    assert task.verification is None
+    assert task.completed_at is None
+    assert task.fix_rounds == 1
+    assert [e.text for e in task.pending_input] == ["your change broke pytest"]
+    # The re-queued task is promotable: the coding agent receives the
+    # tester's report in the same transcript/worktree.
+    assert manager.promote_next() is task
+
+
+def test_requeue_failed_fix_rounds_accumulate(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    task.pending_input.clear()  # consumed by round 1
+    _to_testing(manager, task.id)
+    manager.requeue_failed_fix(task.id, "broken 1", max_rounds=3)
+    _to_testing(manager, task.id)
+    manager.requeue_failed_fix(task.id, "broken 2", max_rounds=3)
+    assert task.fix_rounds == 2
+    assert [e.text for e in task.pending_input] == ["broken 1", "broken 2"]
+
+
+def test_requeue_failed_fix_caps_at_max_rounds(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    task.pending_input.clear()
+    _to_testing(manager, task.id)
+    task.fix_rounds = 2
+    manager.storage.save(task)
+
+    manager.requeue_failed_fix(task.id, "still broken", max_rounds=3)
+
+    # Cap reached: ordinary FAILED completion (the bug report is created by
+    # the tester separately, from clean HEAD).
+    assert task.status is TaskStatus.COMPLETED
+    assert task.verification is VerificationStatus.FAILED
+    assert task.completed_at is not None
+    assert task.fix_rounds == 2
+    assert task.pending_input == []
+
+
+def test_requeue_failed_fix_ignores_non_testing_task(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    before = list(task.pending_input)
+    manager.requeue_failed_fix(task.id, "late", max_rounds=3)
+    assert task.status is TaskStatus.QUEUED  # unchanged (was QUEUED already)
+    assert task.fix_rounds == 0
+    assert task.pending_input == before
+
+
+def test_passed_verdict_resets_fix_rounds(manager: TaskManager) -> None:
+    task = _to_testing(manager, manager.create("t", "x").id)
+    task.fix_rounds = 2
+    manager.storage.save(task)
+    manager.set_verification(task.id, True)
+    assert task.status is TaskStatus.COMPLETED
+    assert task.fix_rounds == 0
+
+
+def test_user_input_to_testing_task_resets_fix_rounds(manager: TaskManager) -> None:
+    task = _to_testing(manager, manager.create("t", "x").id)
+    task.fix_rounds = 2
+    manager.storage.save(task)
+    manager.send(task.id, "try again differently")
+    assert task.status is TaskStatus.QUEUED
+    assert task.fix_rounds == 0
+
+
+def test_user_input_to_completed_task_resets_fix_rounds(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    task.status = TaskStatus.COMPLETED
+    task.fix_rounds = 2
+    task.completed_at = _now()
+    manager.storage.save(task)
+    manager.send(task.id, "one more round")
+    assert task.status is TaskStatus.QUEUED
+    assert task.fix_rounds == 0
+
+
+def test_requeue_failed_fix_persists_across_restart(
+    manager: TaskManager, project_root: Path
+) -> None:
+    task = manager.create("t", "x")
+    task.pending_input.clear()
+    _to_testing(manager, task.id)
+    manager.requeue_failed_fix(task.id, "broken", max_rounds=3)
+    reloaded = TaskManager(project_root)
+    task2 = reloaded.get(task.id)
+    assert task2.fix_rounds == 1
+    assert [e.text for e in task2.pending_input] == ["broken"]

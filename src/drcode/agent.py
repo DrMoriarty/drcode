@@ -152,13 +152,20 @@ class TesterDeps:
     `review_gate` mirrors the project's external-review hook
     (`.drcode/workflow.py` defines on_review): a PASSED verdict then leaves
     the task in TESTING awaiting the external review instead of completing
-    it (see TaskManager.set_verification)."""
+    it (see TaskManager.set_verification).
+
+    `max_dev_rounds` is the project setting capping the fix loop: how many
+    consecutive development rounds the tester may fail with a
+    "the bug is this task's own change" verdict (retry_here=True) before
+    the failure completes the task as FAILED (see
+    TaskManager.requeue_failed_fix)."""
 
     root: Path
     manager: TaskManager
     task_id: str
     scratch: Path
     review_gate: bool = False
+    max_dev_rounds: int = 3
 
 
 def load_agents_md(root: Path) -> str:
@@ -542,18 +549,44 @@ def build_tester_agent(
             return result + await _git_push(ctx.deps, root)
 
     @agent.tool
-    def set_verification(ctx: RunContext[TesterDeps], success: bool) -> str:
-        """Set the verification label on the verified task (passed or failed)
-        and finish its testing: the task becomes completed. When the project
-        uses an external review, a passed task stays in testing until the
-        external review delivers its verdict."""
-        ctx.deps.manager.set_verification(
-            ctx.deps.task_id, success, review_gate=ctx.deps.review_gate
+    def set_verification(
+        ctx: RunContext[TesterDeps],
+        success: bool,
+        retry_here: bool = True,
+        report: str = "",
+    ) -> str:
+        """Set the verification label on the verified task (passed or failed).
+
+        On failure, first decide who owns the bug:
+        - retry_here=True: the failure is caused by THIS task's own changes
+          (broken behaviour, tests this change should have kept green,
+          regressions of previously working functionality). The task returns
+          to development in its own worktree and `report` (what failed: the
+          exact command and the error output) becomes its next input — do
+          NOT call create_bug_report in this case.
+        - retry_here=False: the failure is unrelated to the task's changes
+          or environmental (pre-existing linter debt, CI/network issues, a
+          broken dependency). The task completes as failed — call
+          create_bug_report right after.
+
+        If the fix-round cap is reached (the task has already failed the
+        maximum number of consecutive development rounds), a retry_here=True
+        verdict completes the task as failed too — the tool result tells you,
+        and you must call create_bug_report then.
+
+        When the project uses an external review, a passed task stays in
+        testing until the external review delivers its verdict."""
+        deps = ctx.deps
+        task = deps.manager.get(deps.task_id)
+        if not success and retry_here and task.status is TaskStatus.TESTING:
+            return _retry_failed_here(deps, report)
+        deps.manager.set_verification(
+            deps.task_id, success, review_gate=deps.review_gate
         )
         # The label is stamped by the manager; formatting it from `success`
         # (not from the optional `task.verification`) keeps pyright happy.
         verdict = "passed" if success else "failed"
-        if success and ctx.deps.review_gate:
+        if success and deps.review_gate:
             return (
                 f"Verification label set: {verdict}; the task now awaits "
                 "the external review, which decides the final completion."
@@ -561,6 +594,40 @@ def build_tester_agent(
         return f"Verification label set: {verdict}; task completed."
 
     return agent
+
+
+def _retry_failed_here(deps: TesterDeps, report: str) -> str:
+    """Apply the tester's `retry_here` failure verdict (set_verification with
+    success=False, retry_here=True): requeue the task into development with
+    the failure report as its next input — unless the fix-round cap
+    (project setting `max_dev_rounds`) is reached, in which case the task
+    completes as FAILED and the tester must create the bug report. Both
+    outcomes are logged into the task's service-event history by the
+    manager (requeue_failed_fix); returns the tool-result text telling the
+    model which path was taken."""
+    task = deps.manager.get(deps.task_id)
+    rounds_done = task.fix_rounds + 1
+    max_rounds = max(1, deps.max_dev_rounds)
+    deps.manager.requeue_failed_fix(deps.task_id, report, max_rounds=max_rounds)
+    task = deps.manager.get(deps.task_id)
+    if task.status is TaskStatus.QUEUED and task.fix_rounds == rounds_done:
+        return (
+            "Verification label set: failed. The failure is caused by this "
+            "task's own changes: the task returns to development in its own "
+            f"worktree (round {task.fix_rounds + 1}/{max_rounds} of its fix "
+            "loop). The report was queued as the task's next input — do NOT "
+            "call create_bug_report."
+        )
+    if task.status is TaskStatus.COMPLETED:
+        return (
+            "Verification label set: failed; task completed. The bug "
+            f"survived {max_rounds} dedicated development rounds — call "
+            "create_bug_report now with a clear title and a description of "
+            "what still fails (the exact command and the error output)."
+        )
+    # The task left TESTING while the verdict was in flight (the user
+    # re-queued or cancelled it): the stale verdict changed nothing.
+    return "Verification label ignored: the task is no longer being tested."
 
 
 async def _git_push(deps: AgentDeps | TesterDeps, root: Path) -> str:

@@ -490,6 +490,10 @@ class ActionsLayer(DrCodeState):
             self.workers.cancel_group(self, "tester")
             self.tester_running = False
             self._current_tool[task.id] = None
+        # A queued comment (if any) leaves pending_input with the cancel:
+        # its rendered "user-pending" block must come off the screen, which
+        # only a full re-render does. Captured before cancel() clears it.
+        had_pending = bool(task.pending_input)
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
         # The task was possibly in TESTING: drop its tester pipeline state.
@@ -509,7 +513,10 @@ class ActionsLayer(DrCodeState):
         )
         self.refresh_sidebar()
         self.refresh_status()
-        if self.viewed_id == task.id:
+        # No full re-render when nothing but the event changed: the event
+        # line above is already on screen (one appended block), and a
+        # wipe-and-remount of the whole history here is the 1–2s flash.
+        if self.viewed_id == task.id and had_pending:
             self.view_task(task.id)
         # The pipeline continues: testing backlog first, then the queue.
         self._advance()
@@ -712,6 +719,7 @@ class ActionsLayer(DrCodeState):
         self._chat_epoch += 1
         self._chat_has_content = False
         self._pending_rendered = []
+        self._invalidate_chat_delta()
         remaining = self.manager.all_tasks()
         if remaining:
             self.view_task(remaining[0].id)

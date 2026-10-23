@@ -1578,8 +1578,12 @@ class PipelineLayer(DrCodeState):
                     self._todo_completion_warning(task)
                     self.manager.mark_done(task.id)
                     self.refresh_sidebar()
-                    if self.viewed_id == task_id:
-                        self.view_task(task.id)
+                    # No view_task() here: the transcript is fully on screen
+                    # already (streamed live, or re-rendered by the end-of-turn
+                    # dirty-check above) and mark_done changes only the status —
+                    # a full wipe-and-remount would flash the whole chat for
+                    # nothing (service events draw themselves, see
+                    # _task_env_event / _show_event).
                     if task.kind is TaskKind.RESEARCH:
                         # Research is complete (no tester): anchor the
                         # snapshot on the branch, then the research accept
@@ -1588,8 +1592,6 @@ class PipelineLayer(DrCodeState):
                         # PASSED-finalization steps the tester path runs.
                         await self._finalize_research_completion(task)
                         self.refresh_sidebar()
-                        if self.viewed_id == task_id:
-                            self.view_task(task.id)
                     # Testing (this task or an older one in the backlog)
                     # always goes before any new development.
                     self._advance()

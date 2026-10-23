@@ -107,6 +107,20 @@ def test_enabled_without_git_stays_dormant(
     assert not (project_root / ".drcode" / "worktrees" / "t1").exists()
 
 
+# -- isolation off: the project root, nothing created -----------------------------
+
+
+def test_isolation_off_returns_project_root(git_root: Path) -> None:
+    env = TaskEnvironment(git_root, ProjectSettings())  # task_isolation: off
+    assert not env.enabled
+    assert not env.active
+    root, note = env.ensure_root("t1")
+    assert root == git_root
+    assert note == ""
+    assert not (git_root / ".drcode" / "worktrees" / "t1").exists()
+    assert not branch_exists(git_root, "drcode/t1")
+
+
 # -- creation and reuse -------------------------------------------------------------
 
 

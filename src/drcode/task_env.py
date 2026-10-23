@@ -212,6 +212,10 @@ class TaskEnvironment:
                     "turned off)"
                 )
             return self.project_root, ""
+        if not self.enabled:
+            # Isolation is off (the default): no worktree is ever created —
+            # the task runs in the project directory, silently.
+            return self.project_root, ""
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
         # Stale registrations (directory removed by hand) make `add` fail:

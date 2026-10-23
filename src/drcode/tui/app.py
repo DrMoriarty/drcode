@@ -626,31 +626,37 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 title="Auto cleanup",
                 timeout=6,
             )
-        if self.settings.task_isolation is TaskIsolation.WORKTREE:
+        if (
+            self.settings.task_isolation is TaskIsolation.WORKTREE
+            and not self.task_env.available
+        ):
             # Worktree isolation is persisted even without a git repo (the
             # user's choice is never rewritten silently) — but then it is
             # dormant: warn at EVERY startup until the situation resolves
             # (git init, or the setting switched back to off).
-            if not self.task_env.available:
-                self.notify(
-                    "Task isolation is set to worktree, but this project "
-                    "has no git repository — the mode will not work and "
-                    "tasks run in the project directory. Run `git init` "
-                    "(and commit) or switch the setting to off in "
-                    "Settings (Ctrl+S).",
-                    title="Task isolation",
-                    severity="warning",
-                    timeout=12,
-                )
-            else:
-                # Sweep worktrees/branches of tasks that no longer exist
-                # (crashed session, retention cleanup) off the startup
-                # path: a few git calls in a worker thread.
-                self.run_worker(
-                    self._worktree_startup_cleanup,
-                    exclusive=True,
-                    group="worktree-cleanup",
-                )
+            self.notify(
+                "Task isolation is set to worktree, but this project "
+                "has no git repository — the mode will not work and "
+                "tasks run in the project directory. Run `git init` "
+                "(and commit) or switch the setting to off in "
+                "Settings (Ctrl+S).",
+                title="Task isolation",
+                severity="warning",
+                timeout=12,
+            )
+        elif self.task_env.available:
+            # Sweep worktrees/branches of tasks that no longer exist
+            # (crashed session, retention cleanup) off the startup
+            # path: a few git calls in a worker thread. Runs regardless
+            # of the setting: `cleanup_orphans` itself no-ops when the
+            # setting is off and there is nothing left to sweep, so
+            # leftovers of a session with isolation toggled on are still
+            # cleaned after the user switches it off.
+            self.run_worker(
+                self._worktree_startup_cleanup,
+                exclusive=True,
+                group="worktree-cleanup",
+            )
         self.refresh_project_info()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty

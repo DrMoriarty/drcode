@@ -400,6 +400,16 @@ class ActionsLayer(DrCodeState):
         self.manager.mark_done(task.id, origin="user")
         self.refresh_sidebar()
         self.view_task(task.id)
+        if task.kind is TaskKind.RESEARCH and task.status is TaskStatus.COMPLETED:
+            # Research done by hand (Ctrl+D): same post-completion steps as
+            # the automatic end-of-run completion — snapshot, then the
+            # on_research_accepted hook (or the unmerged-work reminder).
+            # A worker: the hook subprocess runs up to HOOK_TIMEOUT.
+            self.run_worker(
+                self._finalize_research_completion(task),
+                exclusive=True,
+                group="research-accept",
+            )
         # Testing backlog first (possibly an older TESTING task), then queue.
         self._advance()
 

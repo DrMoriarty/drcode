@@ -864,26 +864,31 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         `drcode/<task-id>` branch still holds commits the main checkout's
         current branch does not have (drcode never merges — the branch
         survives the retention cleanup and nothing nags about it, so a
-        PASSED task from a previous session can sit unmerged forever).
+        PASSED task from a previous session can sit unmerged forever —
+        and a finished research task's docs commit can too).
         One toast for the whole session, listing the branch names; each
         task's chat already carries the per-task reminder written at its
-        finalization. Skipped when the merge is automated by an
-        `on_accepted` hook."""
+        finalization. Skipped per task kind when the merge is automated
+        by the kind's accept hook (`on_accepted` /
+        `on_research_accepted`)."""
         env = self.task_env
         if not env.active:
             return
-        if self.workflow is not None and self.workflow.has("on_accepted"):
-            return  # the merge is the hook's job — no reminders
+        workflow = self.workflow
         stuck: list[str] = []
         for task in list(self.manager.tasks.values()):
-            if task.kind is TaskKind.RESEARCH:
-                continue  # research tasks never go through testing
             if task.status is not TaskStatus.COMPLETED:
                 continue
-            if task.verification is not VerificationStatus.PASSED:
-                continue
-            if task.review_pending:
-                continue  # the external review has not accepted it yet
+            if task.kind is TaskKind.RESEARCH:
+                if workflow is not None and workflow.has("on_research_accepted"):
+                    continue  # the merge is the research hook's job
+            else:
+                if workflow is not None and workflow.has("on_accepted"):
+                    continue  # the merge is the hook's job — no reminders
+                if task.verification is not VerificationStatus.PASSED:
+                    continue
+                if task.review_pending:
+                    continue  # the external review has not accepted it yet
             if await asyncio.to_thread(env.unmerged_commits, task.id) > 0:
                 stuck.append(env.branch(task.id))
         if not stuck:
@@ -892,8 +897,8 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         shown = ", ".join(stuck[:5]) + ("…" if len(stuck) > 5 else "")
         self.notify(
             f"Completed task work not merged into {base} yet: {shown}. "
-            "Merge it (git merge <branch>) or wire an on_accepted hook "
-            "in .drcode/workflow.py.",
+            "Merge it (git merge <branch>) or wire an on_accepted / "
+            "on_research_accepted hook in .drcode/workflow.py.",
             title="Unmerged work",
             severity="warning",
             timeout=12,

@@ -143,6 +143,7 @@ def test_examples_scaffolded_on_manager_init(project_root: Path) -> None:
         "on_tester_passed",
         "on_review",
         "on_accepted",
+        "on_research_accepted",
     ):
         assert hook in text
     assert "workflow.py" in text
@@ -861,6 +862,7 @@ def test_tester_passed_hook_in_lifecycle_order(project_root: Path) -> None:
         "on_tester_passed",
         "on_review",
         "on_accepted",
+        "on_research_accepted",
     )
     make_script(project_root, PASSED_HOOK_SCRIPT)
     hooks = make_hooks(project_root)

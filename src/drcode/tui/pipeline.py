@@ -1281,6 +1281,16 @@ class PipelineLayer(DrCodeState):
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:
                         self.view_task(task.id)
+                    if task.kind is TaskKind.RESEARCH:
+                        # Research is complete (no tester): anchor the
+                        # snapshot on the branch, then the research accept
+                        # hook (merge the docs branch) or the unmerged-work
+                        # reminder — the research counterpart of the
+                        # PASSED-finalization steps the tester path runs.
+                        await self._finalize_research_completion(task)
+                        self.refresh_sidebar()
+                        if self.viewed_id == task_id:
+                            self.view_task(task.id)
                     # Testing (this task or an older one in the backlog)
                     # always goes before any new development.
                     self._advance()
@@ -1777,8 +1787,71 @@ class PipelineLayer(DrCodeState):
         if text:
             self._show_event(task, f"on_accepted:\n{text}", kind="workflow")
 
+    async def _run_research_accepted_hook(self, task: Task) -> None:
+        """`on_research_accepted` right after a RESEARCH task completes —
+        the research counterpart of `on_accepted` (research skips testing,
+        so the review-accept path never runs for it): the team's script
+        merges the docs branch `drcode/<task-id>` back, pushes, opens a
+        PR, … Its text goes to the service-event log. Never fatal. The
+        payload carries `project` (the user's checkout path and base
+        branch) so a hook running inside the task's worktree can still
+        merge into the main tree (`git -C <project.path> merge <branch>`)."""
+        workflow = self.workflow
+        if workflow is None or not workflow.has("on_research_accepted"):
+            return
+        project: dict[str, Any] = {"path": str(self.project_root)}
+        if self.task_env.available:
+            project["base_branch"] = await asyncio.to_thread(self.task_env.base_branch)
+        cwd, wt = self._hook_env(task)
+        result = await workflow.call(
+            "on_research_accepted",
+            task,
+            cwd=cwd,
+            worktree=wt,
+            extra={"project": project},
+        )
+        if not result.ok:
+            self._show_event(
+                task,
+                f"Workflow on_research_accepted failed (non-fatal): {result.error}",
+                kind="workflow",
+            )
+            return
+        text = str(result.output.get("text") or "").strip()
+        if text:
+            self._show_event(task, f"on_research_accepted:\n{text}", kind="workflow")
+
+    async def _anchor_research_snapshot(self, task: Task) -> None:
+        """Make sure the completion snapshot has landed on the task's
+        branch before the research hook (or the reminder) looks at it:
+        `_snapshot_on_settled` commits the worktree in a background job —
+        a hook firing concurrently could merge a branch still being
+        written to. Waits for the pending snapshot jobs, then snapshots
+        once more synchronously (a no-op when the listener already
+        committed everything)."""
+        if not self.task_env.active:
+            return
+        if self._snapshot_jobs:
+            await asyncio.gather(*list(self._snapshot_jobs), return_exceptions=True)
+        msg = await asyncio.to_thread(
+            self.task_env.snapshot, task.id, "research completed"
+        )
+        if msg is not None and msg.startswith("snapshot committed"):
+            self._show_event(task, msg)
+
+    async def _finalize_research_completion(self, task: Task) -> None:
+        """Post-completion steps of a RESEARCH task (research skips
+        testing, so none of the PASSED-finalization steps run for it):
+        anchor the completion snapshot on the branch, then the
+        on_research_accepted hook (merge the docs branch) — or, without
+        the hook, the unmerged-work reminder. Every step is non-fatal."""
+        await self._anchor_research_snapshot(task)
+        await self._run_research_accepted_hook(task)
+        await self._remind_unmerged_work(task)
+
     async def _remind_unmerged_work(self, task: Task) -> None:
-        """After a PASSED finalization: with per-task worktree isolation
+        """After a finalization (PASSED for development tasks, plain
+        completion for research): with per-task worktree isolation
         the task's work lives on its own branch `drcode/<task-id>` —
         drcode deliberately never merges it back (merging is a team
         decision, see `drcode.task_env`); it is left to the project's
@@ -1786,15 +1859,15 @@ class PipelineLayer(DrCodeState):
         commits the main checkout's current branch does not have, say so
         explicitly — into the task's service-event log and as a toast —
         instead of leaving a PASSED label imply that the user's checkout
-        already has the fix (research tasks never finalize through
-        testing and are skipped; without isolation the work is in the
-        shared tree already).
+        already has the fix (for a research task, that its docs commit
+        reached the checkout; without isolation the work is in the shared
+        tree already).
 
-        With an `on_accepted` hook defined the merge is (supposed to be)
-        automated by that hook, so the toast is skipped there — the
-        service event above is kept either way, as the durable record."""
-        if task.kind is TaskKind.RESEARCH:
-            return  # research tasks never go through testing/finalization
+        With the task kind's accept hook defined (`on_accepted` for
+        development tasks, `on_research_accepted` for research) the merge
+        is (supposed to be) automated by that hook, so the toast is
+        skipped there — the service event above is kept either way, as
+        the durable record."""
         env = self.task_env
         if not env.active:
             return  # no isolation — nothing ever lives on a task branch
@@ -1804,13 +1877,23 @@ class PipelineLayer(DrCodeState):
         branch = branch_for(task.id)
         base = await asyncio.to_thread(env.base_branch)
         plural = "" if unmerged == 1 else "s"
-        text = (
-            f"Work finished on branch {branch} and not merged into "
-            f"{base} yet ({unmerged} commit{plural}). Merging is up to "
-            f"you (or the on_accepted hook): git merge {branch}"
-        )
+        research = task.kind is TaskKind.RESEARCH
+        if research:
+            text = (
+                f"Documentation committed on branch {branch} and not "
+                f"merged into {base} yet ({unmerged} commit{plural}). "
+                f"Merging is up to you (or the on_research_accepted "
+                f"hook): git merge {branch}"
+            )
+        else:
+            text = (
+                f"Work finished on branch {branch} and not merged into "
+                f"{base} yet ({unmerged} commit{plural}). Merging is up to "
+                f"you (or the on_accepted hook): git merge {branch}"
+            )
         self._show_event(task, text, kind="workflow")
-        if not (self.workflow is not None and self.workflow.has("on_accepted")):
+        hook = "on_research_accepted" if research else "on_accepted"
+        if not (self.workflow is not None and self.workflow.has(hook)):
             # The chat may be open on another task — also raise a toast.
             self.notify(text, title="Unmerged work", severity="warning", timeout=12)
 

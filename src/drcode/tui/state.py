@@ -17,6 +17,7 @@ raises ``AttributeError`` exactly as before).
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -370,6 +371,12 @@ class DrCodeState(App[None]):
 
     async def _run_accepted_hook(self, task: Task) -> None: ...
 
+    async def _run_research_accepted_hook(self, task: Task) -> None: ...
+
+    async def _anchor_research_snapshot(self, task: Task) -> None: ...
+
+    async def _finalize_research_completion(self, task: Task) -> None: ...
+
     def _apply_review_accept(self, task: Task) -> None: ...
 
     @work(exclusive=True, group="review")
@@ -391,6 +398,9 @@ class DrCodeState(App[None]):
     # Per-task worktree isolation (project setting `task_isolation`); the
     # optional root the agent/tester runs in comes from here.
     task_env: TaskEnvironment
+    # In-flight worktree snapshot jobs (see _snapshot_in_background) — the
+    # research finalization awaits them before running its hook.
+    _snapshot_jobs: set[asyncio.Task[None]]
     # Custom team workflow (.drcode/workflow.py hooks); None = absent.
     workflow: WorkflowHooks | None
 

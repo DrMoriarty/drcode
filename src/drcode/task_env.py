@@ -26,8 +26,9 @@ Lifecycle contract (enforced here and by the pipeline):
 - completion (tester PASSED, research done): the work and the worktree
   STAY on the branch `drcode/<task-id>`. drcode deliberately does NOT
   merge back into the user's base branch on its own: merging is a team
-  decision, so it is left to the project's `.drcode/workflow.py`
-  `on_accepted` hook (which receives the worktree path and branch in the
+  decision, so it is left to the project's `.drcode/workflow.py` accept
+  hook — `on_accepted` for development tasks, `on_research_accepted`
+  for research (each receives the worktree path and branch in the
   payload — see `drcode.workflow`). When the finalized task's branch
   still holds commits the main checkout does not have, the pipeline
   reminds the user explicitly (`unmerged_commits`) — a PASSED verdict
@@ -51,7 +52,8 @@ User-facing contract:
     worktree directory is disposable and can be removed at any time
     without loss. drcode never deletes a branch containing unmerged
     commits and never merges it into the user's base branch itself —
-    merging stays with `.drcode/workflow.py` `on_accepted` / the user.
+    merging stays with `.drcode/workflow.py` `on_accepted` (research:
+    `on_research_accepted`) / the user.
 
 Two rules enforce it (both active only under worktree isolation —
 without isolation everything lives in the shared main tree and nothing
@@ -82,7 +84,9 @@ Workflow hooks (`.drcode/workflow.py`): with isolation on, every hook
 runs INSIDE the task's worktree (cwd), and the payload carries the
 actual `worktree` path/branch — `on_task_start`'s branch checkout and
 friends operate on the task's branch, not the user's checkout (see
-`drcode.workflow`).
+`drcode.workflow`). `on_research_accepted` additionally receives the
+`project` entry (main checkout path + base branch) so it can merge the
+task's docs branch into the user's tree from inside the worktree.
 """
 
 from __future__ import annotations

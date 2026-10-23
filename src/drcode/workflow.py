@@ -47,12 +47,26 @@ skips its step; `task` is the payload dict described below):
     def on_accepted(task) -> dict | None
         After an accept (merge the PR, delete the branch). Return
         {"text": "..."} for the task's service-event log.
+    def on_research_accepted(task) -> dict | None
+        Right after a RESEARCH task completes (research skips testing —
+        this is the research counterpart of on_accepted: merge the docs
+        branch `drcode/<task-id>`, push, open a PR). The payload also
+        carries "project": {"path", "base_branch"} — with worktree
+        isolation the hook's cwd is the task's worktree, so merging into
+        the user's checkout means operating on project.path, e.g.
+        `git -C <project.path> merge drcode/<task-id>`. Return
+        {"text": "..."} for the task's service-event log.
 
 The `task` argument is one JSON object:
     {"hook": "<name>",
      "task": {"id", "title", "kind", "github_issue"},
      "git":  {"branch": "<current branch or null>", "dirty": <bool>},
-     "worktree": {"path": "...", "branch": "drcode/<task-id>"}}
+     "worktree": {"path": "...", "branch": "drcode/<task-id>"},
+     "project": {"path": "...", "base_branch": "<branch>"}}
+
+(`project` is present only for `on_research_accepted` — the base branch
+is resolved best-effort from the main checkout; outside a repository it
+is absent.)
 
 `worktree` is present only when per-task worktree isolation is on for the
 project (`.drcode/settings.json` `task_isolation: worktree`, see
@@ -65,7 +79,11 @@ the hooks run in the project directory as before and the key is absent.
 With isolation on, drcode itself never merges the task's branch back into
 the user's base branch: the commits stay on `drcode/<task-id>` and
 merging/PR-management is the team's decision — do it in `on_accepted`
-(merge the branch, delete it), which runs on every accept path.
+(merge the branch, delete it), which runs on every accept path. Research
+tasks never reach that path (they skip testing): their completed work is
+handed over by `on_research_accepted` instead — when the script does not
+define it, drcode reminds the user about the unmerged docs branch, same
+as for development tasks.
 
 A typical script looks like:
 
@@ -154,7 +172,8 @@ receives one JSON payload:
     {"hook": "<name>",
      "task": {"id", "title", "kind", "github_issue"},
      "git":  {"branch": "<current branch or null>", "dirty": <bool>},
-     "worktree": {"path", "branch"}   # only with task isolation on}
+     "worktree": {"path", "branch"}   # only with task isolation on,
+     "project": {"path", "base_branch"}}  # only on_research_accepted}
 
 Every hook is optional — an absent function simply skips its step. A hook
 failure (non-zero exit, timeout, malformed output) is NEVER fatal: it is
@@ -212,6 +231,22 @@ permissions. Only activate a workflow file you have read and trust.
 # def on_accepted(task):
 #     """After an accept (merge the PR, delete the branch). Return
 #     {"text": "..."} for the task's service-event log."""
+#
+#
+# def on_research_accepted(task):
+#     """Right after a RESEARCH task completes (research skips testing):
+#     merge the docs branch into the base branch — the payload carries
+#     "project": {"path", "base_branch"}; with worktree isolation the cwd
+#     is the task's worktree, so merge into the user's checkout with
+#     `git -C <project.path> merge <branch>`. Return {"text": "..."} for
+#     the task's service-event log."""
+#     branch = task.get("worktree", {}).get("branch") or (
+#         "drcode/" + task["task"]["id"]
+#     )
+#     subprocess.run(
+#         ["git", "-C", task["project"]["path"], "merge", branch], check=True
+#     )
+#     return {"text": f"merged {branch} into {task['project']['base_branch']}"}
 '''
 
 # The git-workflow.md template: prose rules replacing the built-in
@@ -272,6 +307,7 @@ HOOK_NAMES: tuple[str, ...] = (
     "on_tester_passed",
     "on_review",
     "on_accepted",
+    "on_research_accepted",
 )
 
 # Hard cap on a single hook invocation: a hook may push and wait for CI,
@@ -397,6 +433,7 @@ class WorkflowHooks:
         *,
         cwd: Path | None = None,
         worktree: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> HookResult:
         """Run one hook: `python -c <bootstrap> <script>` in a subprocess
         with cwd = project root (or the task's worktree — see below); the
@@ -410,7 +447,9 @@ class WorkflowHooks:
         runs and what `git.branch`/`git.dirty` in the payload describe.
         ``worktree`` ({"path", "branch"}, when the task is isolated) is
         copied into the payload as the `worktree` key so the script can
-        address the task's tree/branch explicitly.
+        address the task's tree/branch explicitly. ``extra`` (optional)
+        adds caller-provided top-level payload keys on top (e.g. the
+        `project` entry of `on_research_accepted`).
 
         Never raises (except cancellation — an aborted run must kill the
         child and unwind); every failure comes back as
@@ -430,6 +469,8 @@ class WorkflowHooks:
         }
         if worktree is not None:
             payload["worktree"] = worktree
+        if extra:
+            payload.update(extra)
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,

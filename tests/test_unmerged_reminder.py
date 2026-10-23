@@ -5,7 +5,9 @@ branch does not have, and reminds the user explicitly — merging is a
 team decision (drcode never merges), but it must not be a silent one.
 Covers `TaskEnvironment.unmerged_commits` / `base_branch`, the pipeline
 reminder on the finalization paths (toast + service event, softened by
-an `on_accepted` hook) and the startup sweep for old stuck fixes."""
+an `on_accepted` hook — research tasks are covered by the same reminder
+with `on_research_accepted` wording) and the startup sweep for old stuck
+fixes."""
 
 from __future__ import annotations
 
@@ -144,7 +146,8 @@ def finished_task(app: DrCodeApp, kind: TaskKind = TaskKind.FEATURE) -> Any:
     task = app.manager.create("Fix the bug", "fix the bug")
     task.kind = kind
     task.status = TaskStatus.COMPLETED
-    task.verification = VerificationStatus.PASSED
+    if kind is not TaskKind.RESEARCH:
+        task.verification = VerificationStatus.PASSED
     app.manager.storage.save(task)
     return task
 
@@ -203,9 +206,9 @@ async def test_reminder_silent_when_merged_or_absent(app_env: DrCodeApp) -> None
     assert not toasts
 
 
-async def test_reminder_skips_research_tasks(app_env: DrCodeApp) -> None:
-    """Research tasks never finalize through testing — no reminder even
-    when a branch with unmerged commits exists."""
+async def test_reminder_fires_for_research_task(app_env: DrCodeApp) -> None:
+    """Research tasks complete without the tester — the reminder covers
+    them too, with research wording (docs, on_research_accepted)."""
     app = app_env
     task = finished_task(app, kind=TaskKind.RESEARCH)
     commit_on_branch(app.task_env, task.id)
@@ -214,7 +217,36 @@ async def test_reminder_skips_research_tasks(app_env: DrCodeApp) -> None:
         await pilot.pause()
         await app._remind_unmerged_work(task)
         await pilot.pause()
-    assert event_texts(task) == []
+    base = current_branch(app.project_root)
+    events = "\n".join(event_texts(task))
+    assert "Documentation committed on branch" in events
+    assert f"not merged into {base}" in events
+    assert "on_research_accepted" in events
+    assert f"git merge drcode/{task.id}" in events
+    assert any(title == "Unmerged work" for title, _ in toasts)
+
+
+async def test_research_reminder_toast_softened_by_research_hook(
+    app_env: DrCodeApp,
+) -> None:
+    """With an on_research_accepted hook defined the docs merge is
+    automated — the service event stays, the toast is skipped (an
+    on_accepted hook alone does not suppress it)."""
+    app = app_env
+    drcode_dir = app.project_root / ".drcode"
+    drcode_dir.mkdir(exist_ok=True)
+    (drcode_dir / "workflow.py").write_text(
+        "def on_research_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app, kind=TaskKind.RESEARCH)
+    commit_on_branch(app.task_env, task.id)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    assert any("Documentation committed" in text for text in event_texts(task))
     assert not toasts
 
 

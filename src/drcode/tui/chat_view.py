@@ -874,6 +874,15 @@ class ChatViewLayer(DrCodeState):
         # sidebar item is an explicit "leave the form" from the user.
         if self._new_task_mode:
             self._leave_new_task_mode()
+        # Same task already on screen and the mounted blocks still mirror a
+        # rendered timeline prefix: append only the missing tail instead of
+        # the wipe-and-remount (mounting cost grows with the number of
+        # mounted blocks — a full rebuild of a fat history freezes the UI).
+        if task_id == self.viewed_id and self._try_delta_view(task_id):
+            self.refresh_todo_panel()
+            self.refresh_sidebar()
+            self.refresh_status()
+            return
         self.viewed_id = task_id
         task = self.manager.get(task_id)
         # Wipe marker for the streaming loop: any block created before this
@@ -881,6 +890,7 @@ class ChatViewLayer(DrCodeState):
         # delta (its accumulated content is carried over, so the live text
         # never loses the tail of an in-flight response).
         self._chat_epoch += 1
+        self._invalidate_chat_delta()
         self.chat_log.remove_children()
         # Drop any un-drained chunks of a previous view: their drain is
         # stale now (the epoch guard below would drop them anyway, but the
@@ -888,28 +898,99 @@ class ChatViewLayer(DrCodeState):
         self._chat_batch.clear()
         self._chat_batching = True
         try:
-            self._render_task_history(task, task_id)
+            timeline = self._render_task_history(task, task_id)
         finally:
             # Opening a task always lands on the latest entry (previously
             # this happened implicitly because every mount scrolled to the
             # end). The finally keeps a mid-render exception from leaving
             # batching on (later live writes would be swallowed).
             self._flush_chat_batch()
+        # The log now mirrors the rendered timeline: delta re-renders can
+        # append from here. A live write landing while the chunked drain is
+        # still going re-invalidates this via _write_chat.
+        self._rendered_count = len(timeline)
+        self._rendered_prefix = self._timeline_fingerprint(timeline)
         self.refresh_todo_panel()
         self.refresh_sidebar()
         self.refresh_status()
 
-    def _render_task_history(self, task: Task, task_id: str) -> None:
-        """Write the task's full history into the (batched) chat log."""
-        self._chat_has_content = False
-        self._pending_rendered = []
-        self._clear_stream_label()
-        # Rebuild the full history as ONE chronological timeline. Both the
-        # serialized transcripts (per-message timestamps) and the service
-        # events (TaskEvent.at) carry wall-clock stamps, so a stable sort
-        # by timestamp reproduces exactly the order in which the entries
-        # were rendered live — the same order on every (re)open, instead of
-        # clumping all events at the tail.
+    def _try_delta_view(self, task_id: str) -> bool:
+        """Delta re-render of the currently open task: mount only the
+        timeline entries that appeared since the last full render.
+
+        Falls back to False (caller does the full rebuild) whenever the
+        guarantee "mounted blocks == rendered timeline prefix" cannot be
+        trusted: a live block was mounted since (streaming, an event line,
+        a clarification, a consumed prompt), the drain of the last rebuild
+        is still running, queued comments are drawn, or the history prefix
+        changed underneath (compaction rewriting the transcript, an event
+        sorting INTO the middle of the timeline). Returns True also when
+        nothing new at all — the rebuild is skipped entirely.
+        """
+        count = self._rendered_count
+        if (
+            count is None
+            or self._chat_batching
+            or self._pending_rendered
+            or self._consumed_prompts.get(task_id) is not None
+        ):
+            return False
+        task = self.manager.get(task_id)
+        if task is None:
+            return False
+        if task.status is TaskStatus.AWAITING_CLARIFICATION and (
+            task.clarification is not self._rendered_clarification
+        ):
+            # A fresh clarifying question is on screen only via the full
+            # render (the dialog is rendered outside the timeline).
+            return False
+        timeline = self._build_task_timeline(task, task_id)
+        if len(timeline) < count:
+            return False
+        if self._timeline_fingerprint(timeline[:count]) != self._rendered_prefix:
+            return False
+        if len(timeline) == count:
+            return True
+        for at, _, role, text in timeline[count:]:
+            block = self._write_history_line(
+                role, text, None if at == _MIN_TIME else at
+            )
+            if role == "tool-call" and isinstance(block, ToolCallBlock):
+                self._reattach_tool_spinner(block, text, task_id)
+        self._rendered_count = len(timeline)
+        self._rendered_prefix = self._timeline_fingerprint(timeline)
+        return True
+
+    def _invalidate_chat_delta(self) -> None:
+        """Drop the delta re-render bookkeeping: the mounted blocks no
+        longer mirror a rendered timeline prefix (a live block arrived or
+        the log was wiped), so the next view_task of the same task must do
+        a full rebuild."""
+        self._rendered_count = None
+        self._rendered_prefix = ()
+
+    @staticmethod
+    def _timeline_fingerprint(
+        timeline: list[tuple[datetime, int, str, str]],
+    ) -> tuple[tuple[str, str], ...]:
+        """Compact identity of a rendered timeline prefix: (timestamp,
+        role) of every entry. Text is intentionally left out — a prefix
+        whose entries kept their positions but changed text means the
+        transcript was rewritten (compaction), which the length check and
+        the fingerprint both tend to catch anyway; timestamps+roles catch
+        the reordering case (an event sorted into the middle)."""
+        return tuple((at.isoformat(), role) for at, _, role, _ in timeline)
+
+    def _build_task_timeline(
+        self, task: Task, task_id: str
+    ) -> list[tuple[datetime, int, str, str]]:
+        """Build the task's full history as ONE chronological timeline of
+        (timestamp, sequence, role, text) entries. Both the serialized
+        transcripts (per-message timestamps) and the service events
+        (TaskEvent.at) carry wall-clock stamps, so a stable sort by
+        timestamp reproduces exactly the order in which the entries were
+        rendered live — the same order on every (re)open, instead of
+        clumping all events at the tail."""
         timeline: list[tuple[datetime, int, str, str]] = []
         seq = 0
 
@@ -961,6 +1042,18 @@ class ChatViewLayer(DrCodeState):
             for entry in in_flight[1]:
                 _add(entry.at, "user-pending", entry.text)
         timeline.sort(key=lambda item: item[:2])
+        return timeline
+
+    def _render_task_history(
+        self, task: Task, task_id: str
+    ) -> list[tuple[datetime, int, str, str]]:
+        """Write the task's full history into the (batched) chat log.
+        Returns the rendered timeline (for the delta re-render bookkeeping
+        in view_task)."""
+        self._chat_has_content = False
+        self._pending_rendered = []
+        self._clear_stream_label()
+        timeline = self._build_task_timeline(task, task_id)
         for at, _, role, text in timeline:
             block = self._write_history_line(
                 role, text, None if at == _MIN_TIME else at
@@ -972,6 +1065,7 @@ class ChatViewLayer(DrCodeState):
         if task.status is TaskStatus.AWAITING_CLARIFICATION and task.clarification:
             self._write_clarification(task.clarification)
             self._rendered_clarification = task.clarification
+        return timeline
 
     def _chat_at_bottom(self) -> bool:
         """True when the reader is tracking the chat tail (auto-scroll follows).
@@ -1062,6 +1156,12 @@ class ChatViewLayer(DrCodeState):
             content.add_class("chat-block")
         else:
             content = Static(content, expand=expand, classes="chat-block")
+        # Any live (non-timeline) mount — a streamed block, an event line, a
+        # clarification — breaks the "log == rendered timeline prefix"
+        # invariant the delta re-render relies on: the next view_task must
+        # rebuild fully. (During a batched rebuild this is a no-op: the
+        # counters are (re)set after the render.)
+        self._invalidate_chat_delta()
         if self._chat_batching:
             self._chat_batch.append(content)
             self._chat_has_content = True

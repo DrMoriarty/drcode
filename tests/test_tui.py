@@ -24,7 +24,7 @@ from textual.widgets._list_item import ListItem
 from textual.widgets.text_area import Selection
 
 from drcode.agent import serialize_messages
-from drcode.models import TaskKind, TaskStatus
+from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
@@ -300,6 +300,156 @@ async def test_service_event_persisted_and_shown(app: DrCodeApp) -> None:
             str(w.render()) for w in app.query_one("#chat-log").children
         )
         assert "something happened" in rendered
+
+
+async def test_task_env_event_from_worker_thread_draws_live(app: DrCodeApp) -> None:
+    """A worktree event logged from a worker thread (not the app thread)
+    must be drawn live — one appended line via call_from_thread — instead
+    of waiting for the next full view_task() rebuild (_on_app_thread bug:
+    _thread_id was never assigned, the live branch was dead)."""
+    import asyncio
+
+    task = app.manager.create("isolated", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        results: list[bool] = []
+
+        def _worker() -> None:
+            results.append(app._on_app_thread())
+            app._task_env_event(task.id, "worktree clean, nothing to snapshot")
+
+        # A plain thread.join() here would block the event loop and
+        # deadlock the worker's call_from_thread — await an executor
+        # thread instead so the loop keeps serving the hop.
+        await asyncio.get_running_loop().run_in_executor(None, _worker)
+        await pilot.pause()
+        assert results == [False]  # the worker really is off the app thread
+        assert app._on_app_thread()  # ...while the app thread is recognized
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "worktree clean, nothing to snapshot" in rendered
+
+
+async def test_on_app_thread_true_on_app_thread(app: DrCodeApp) -> None:
+    async with app.run_test():
+        assert app._on_app_thread()
+
+
+async def test_view_task_same_task_delta_appends_without_wipe(app: DrCodeApp) -> None:
+    """Re-opening the SAME task appends only the new timeline tail — the
+    already-mounted blocks keep their identity (no wipe-and-remount, no
+    multi-second flash on fat histories)."""
+    task = app.manager.create("delta task", "prompt")
+    task.status = TaskStatus.COMPLETED
+    task.pending_input.clear()
+    task.messages = _fat_transcript(3)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+        # A new service event lands in task.events without a live draw.
+        task.events.append(TaskEvent(text="snapshot committed"))
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after[: len(before)] == before  # prefix kept, not remounted
+        assert len(after) == len(before) + 1
+        assert "snapshot committed" in str(log.children[-1].render())
+
+
+async def test_view_task_delta_skips_rebuild_when_nothing_new(app: DrCodeApp) -> None:
+    task = app.manager.create("quiet task", "prompt")
+    task.status = TaskStatus.COMPLETED
+    task.pending_input.clear()
+    task.messages = _fat_transcript(3)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+        assert app.view_task(task.id) is None
+        assert [id(w) for w in log.children] == before
+
+
+async def test_view_task_delta_falls_back_to_full_rebuild(app: DrCodeApp) -> None:
+    """Delta state is fragile by design: a live mount (streaming block,
+    event line) or a rewritten (compacted) transcript must force the full
+    wipe-and-remount path again."""
+    task = app.manager.create("live task", "prompt")
+    task.status = TaskStatus.COMPLETED
+    task.pending_input.clear()
+    task.messages = _fat_transcript(3)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+
+        # A live block mounted outside the timeline invalidates the delta.
+        app._write_chat("[dim]live block[/]")
+        task.events.append(TaskEvent(text="later event"))
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after != before  # full rebuild: blocks were remounted
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "later event" in rendered
+
+        # A shrunken (compacted) transcript must rebuild too, never append
+        # onto a longer rendered prefix.
+        before = [id(w) for w in log.children]
+        task.messages = _fat_transcript(2)
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after != before
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "question 1" in rendered
+
+
+async def test_cancel_without_pending_skips_full_rebuild(app: DrCodeApp) -> None:
+    """Ctrl+X draws its event line live; without queued input no full
+    chat rebuild may follow (the mounted blocks keep their identity)."""
+    task = app.manager.create("cancelled", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()  # on_mount opened the task
+        task.pending_input.clear()  # no queued comment: rebuild must be skipped
+        app.view_task(task.id)
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+        app.action_cancel_task()
+        await pilot.pause()
+        assert task.status is TaskStatus.COMPLETED
+        after = [id(w) for w in log.children]
+        assert after[: len(before)] == before
+        assert len(after) == len(before) + 1  # only the event line appended
+        assert "cancelled by the user" in str(log.children[-1].render()).lower()
+
+
+async def test_cancel_with_pending_input_rebuilds(app: DrCodeApp) -> None:
+    """A queued comment leaves pending_input with the cancel: its rendered
+    "user-pending" block must come off the screen (full re-render)."""
+    task = app.manager.create("cancelled", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task.status = TaskStatus.HOLD
+        app.manager.send(task.id, "a queued comment")
+        app.view_task(task.id)
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        assert "a queued comment" in "\n".join(str(w.render()) for w in log.children)
+        before_count = len(log.children)
+        app.action_cancel_task()
+        await pilot.pause()
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "a queued comment" not in rendered
+        assert len(log.children) < before_count + 2
 
 
 # -- task actions ------------------------------------------------------------------

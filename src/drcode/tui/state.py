@@ -162,7 +162,13 @@ class DrCodeState(App[None]):
 
     def view_task(self, task_id: str) -> None: ...
 
-    def _render_task_history(self, task: Task, task_id: str) -> None: ...
+    def _try_delta_view(self, task_id: str) -> bool: ...
+
+    def _invalidate_chat_delta(self) -> None: ...
+
+    def _render_task_history(
+        self, task: Task, task_id: str
+    ) -> list[tuple[datetime, int, str, str]]: ...
 
     def _chat_at_bottom(self) -> bool: ...
 
@@ -560,6 +566,16 @@ class DrCodeState(App[None]):
     _chat_batch: list[Widget]
     _chat_drain_at: float
     _rendered_clarification: Clarification | None
+
+    # -- delta re-render bookkeeping ----------------------------------------
+    # When the open chat is a canonical history render (no live/streamed
+    # extras mounted since), _rendered_count is the number of timeline
+    # entries already mounted and _rendered_prefix their (timestamp, role)
+    # fingerprint — a view_task() of the SAME task then appends only the
+    # missing tail instead of wiping and remounting the whole history. Any
+    # live _write_chat() mount or log wipe invalidates both (None/()).
+    _rendered_count: int | None
+    _rendered_prefix: tuple[tuple[str, str], ...]
 
     # -- widget getters (defined in the DrCodeApp skeleton) -----------------
     @property

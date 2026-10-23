@@ -535,6 +535,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
         # chain died or starved (see chat_view._schedule_drain).
         self._chat_drain_at = 0.0
+        # Delta re-render bookkeeping (see _try_delta_view): None/() until
+        # the first full history render, invalidated by every live mount.
+        self._rendered_count: int | None = None
+        self._rendered_prefix: tuple[tuple[str, str], ...] = ()
         # Clarification object currently rendered in the open chat view.
         # Compared by identity: a newly asked question is a fresh instance,
         # so the agent run's end-of-run handler never re-draws a question
@@ -752,7 +756,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             if self._on_app_thread():
                 self._show_event(task, text)
             else:
-                self._log_event(task, text)
+                # A worker thread (e.g. the tester's set_verification tool
+                # snapshot): persisting alone would leave the line invisible
+                # until the next full re-render — hop into the app thread and
+                # draw it live, one appended line (never fatal).
+                try:
+                    self.call_from_thread(self._show_event, task, text)
+                except Exception:  # noqa: BLE001 - app not running/shutting down
+                    self._log_event(task, text)
             return
         self._announce_cleanup(text)
 
@@ -781,6 +792,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._set_terminal_title("")
 
     def on_mount(self) -> None:
+        # The app thread is the thread running the asyncio loop: recorded
+        # here so _on_app_thread() can tell live UI writes (safe) from
+        # worker-thread calls that must hop over via call_from_thread.
+        self._thread_id = threading.get_ident()
         self._update_terminal_title()
         # Keep the tab title's agent badge in sync with the pipeline: every
         # status transition (active/testing/queued/…) re-renders the title.

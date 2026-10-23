@@ -8,6 +8,7 @@ network anywhere) — same style as tests/network_mocks.py."""
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
 from drcode.workflow import (
     GIT_WORKFLOW_EXAMPLE_FILE,
+    HOOK_NAMES,
     HOOK_TIMEOUT,
     MAX_REVIEW_REJECTIONS,
     WORKFLOW_EXAMPLE_FILE,
@@ -168,6 +170,134 @@ def test_examples_do_not_activate_workflow(project_root: Path) -> None:
     assert load_hooks(project_root) is None
     assert load_git_workflow(project_root) is None
     assert describe_project_workflow(project_root) == "default"
+
+
+# -- the activated example: task isolation + degenerate auto-merge --------------------
+
+
+def _read_example(project_root: Path) -> str:
+    ensure_workflow_examples(project_root)
+    return (project_root / ".drcode" / WORKFLOW_EXAMPLE_FILE).read_text(
+        encoding="utf-8"
+    )
+
+
+def _activated_example(project_root: Path) -> str:
+    """The example as the user gets it by uncommenting the hooks: every
+    commented line of the template is exactly a `# ` prefix over real
+    code, so stripping the prefix from all of them is the uncomment."""
+    source = _read_example(project_root)
+    return "\n".join(line.removeprefix("# ") for line in source.splitlines()) + "\n"
+
+
+def _git_ok(*args: str, cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def test_example_as_shipped_is_valid_and_hookless(project_root: Path) -> None:
+    source = _read_example(project_root)
+    # No syntax rot in the shipped template itself...
+    compile(source, "workflow.py.example", "exec")
+    # ...and renaming it without editing defines no hooks (default behaviour).
+    make_script(project_root, source)
+    hooks = make_hooks(project_root)
+    assert hooks.defined_hooks() == []
+
+
+async def test_uncommented_example_merges_passed_tasks(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """The user flow the template promises: task isolation on, the example
+    copied over workflow.py, the degenerate hooks uncommented — a passed
+    task's branch `drcode/<id>` is merged into the checkout without any
+    external review, and research tasks merge their docs branch too."""
+    activated = _activated_example(project_root)
+    compile(activated, "workflow.py", "exec")
+    # A real repo shaped like a worktree-isolated project: main at the
+    # base commit, the task branches one commit ahead of it.
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    _git_ok("checkout", "-q", "-b", "drcode/t1", cwd=project_root)
+    (project_root / "feature.txt").write_text("feature\n")
+    _git_ok("add", "feature.txt", cwd=project_root)
+    _git_ok("commit", "-m", "feature", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    # The activated script (untracked, like a user who has not committed
+    # it yet) must not block anything.
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    assert set(hooks.defined_hooks()) == set(HOOK_NAMES)
+    task = manager.create("t", "")
+    worktree = {
+        "path": str(project_root / ".drcode" / "worktrees" / "t1"),
+        "branch": "drcode/t1",
+    }
+    review = await hooks.call("on_review", task, cwd=project_root, worktree=worktree)
+    assert review.ok and review.output == {"verdict": "accept"}
+    merged = await hooks.call("on_accepted", task, cwd=project_root, worktree=worktree)
+    assert merged.ok, merged.error
+    assert "merged drcode/t1" in merged.output["text"]
+    assert (project_root / "feature.txt").read_text(encoding="utf-8") == "feature\n"
+    # Research tasks: same degenerate accept for the docs branch.
+    _git_ok("checkout", "-q", "-b", "drcode/r1", cwd=project_root)
+    (project_root / "docs.md").write_text("docs\n")
+    _git_ok("add", "docs.md", cwd=project_root)
+    _git_ok("commit", "-m", "docs", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    research = await hooks.call(
+        "on_research_accepted",
+        task,
+        cwd=project_root,
+        worktree={
+            "path": str(project_root / ".drcode" / "worktrees" / "r1"),
+            "branch": "drcode/r1",
+        },
+        extra={"project": {"path": str(project_root), "base_branch": "main"}},
+    )
+    assert research.ok, research.error
+    assert "merged drcode/r1" in research.output["text"]
+    assert (project_root / "docs.md").read_text(encoding="utf-8") == "docs\n"
+
+
+async def test_uncommented_example_leaves_dirty_checkout_alone(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """The degenerate merge never fights the user's uncommitted work: a
+    checkout with modified tracked files gets the manual-merge hint (and
+    the branch stays for `git merge`), not a forced merge."""
+    activated = _activated_example(project_root)
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    _git_ok("checkout", "-q", "-b", "drcode/t1", cwd=project_root)
+    (project_root / "feature.txt").write_text("feature\n")
+    _git_ok("add", "feature.txt", cwd=project_root)
+    _git_ok("commit", "-m", "feature", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t", "")
+    (project_root / "base.txt").write_text("local edit\n")  # dirty tracked file
+    merged = await hooks.call(
+        "on_accepted",
+        task,
+        cwd=project_root,
+        worktree={
+            "path": str(project_root / ".drcode" / "worktrees" / "t1"),
+            "branch": "drcode/t1",
+        },
+    )
+    assert merged.ok, merged.error
+    assert "NOT merged" in merged.output["text"]
+    assert "git merge drcode/t1" in merged.output["text"]
+    assert not (project_root / "feature.txt").exists()
 
 
 def test_describe_lists_defined_hooks(project_root: Path) -> None:

@@ -558,6 +558,7 @@ class DrCodeState(App[None]):
     # -- chat batch drain ---------------------------------------------------
     _chat_batching: bool
     _chat_batch: list[Widget]
+    _chat_drain_at: float
     _rendered_clarification: Clarification | None
 
     # -- widget getters (defined in the DrCodeApp skeleton) -----------------

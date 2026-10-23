@@ -39,6 +39,9 @@ from .usage import NETWORK_RETRIES
 _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 _CHAT_MOUNT_CHUNK = 16
 _SCROLL_FOLLOW_THRESHOLD = 4
+# A history drain chunk that has not progressed for this long while blocks
+# are still pending is considered dead (see _poll_chat_drain).
+_CHAT_DRAIN_STUCK = 2.0
 
 
 def _mention_markup(text: str) -> str:
@@ -154,6 +157,7 @@ class ChatViewLayer(DrCodeState):
         if todo_fp != self._todo_snapshot:
             self._todo_snapshot = todo_fp
             self.refresh_todo_panel()
+        self._poll_chat_drain()
         if self._sidebar_fingerprint() != self._sidebar_snapshot:
             self.refresh_sidebar()
             # The task status header (and the bottom statusbar) have no
@@ -1081,15 +1085,31 @@ class ChatViewLayer(DrCodeState):
         """
         self._chat_batching = True
         self._chat_batch_epoch = self._chat_epoch
+        self._chat_drain_at = time.monotonic()
         self._drain_chat_batch()
 
-    def _drain_chat_batch(self) -> None:
-        """Mount one chunk of the pending batch, reschedule for the rest."""
-        if self._chat_batch_epoch != self._chat_epoch:
+    def _drain_chat_batch(self, epoch: int | None = None) -> None:
+        """Mount one chunk of the pending batch, reschedule for the rest.
+
+        *epoch* is the `_chat_epoch` value captured when THIS invocation was
+        scheduled: a view switch since then makes the chain stale, and the
+        guard below actually detects that (comparing the shared attributes
+        at run time never could — both always hold the current values).
+        A stale chain returns without touching `_chat_batching`/`_chat_batch`:
+        the newer view_task that bumped the epoch already re-flushed and owns
+        the shared state.
+        """
+        self._chat_drain_at = time.monotonic()
+        if epoch is None:
+            epoch = self._chat_batch_epoch
+        if epoch != self._chat_epoch:
             # The view switched mid-drain: the new view_task wiped the log
-            # and owns it now — drop the stale tail.
-            self._chat_batching = False
-            self._chat_batch.clear()
+            # and owns it now — drop the stale tail. (A watchdog re-kick
+            # under an orphaned drain — epoch bumped without a re-flush,
+            # e.g. action_delete — cleans the shared state up instead.)
+            if self._chat_batching and self._chat_batch_epoch == epoch:
+                self._chat_batching = False
+                self._chat_batch.clear()
             return
         chunk = self._chat_batch[:_CHAT_MOUNT_CHUNK]
         del self._chat_batch[:_CHAT_MOUNT_CHUNK]
@@ -1097,7 +1117,7 @@ class ChatViewLayer(DrCodeState):
             if chunk:
                 self.chat_log.mount(*chunk)
             if self._chat_batch:
-                self.call_after_refresh(self._drain_chat_batch)
+                self._schedule_drain(self._chat_epoch)
             else:
                 self._chat_batching = False
                 # Opening a task always lands on the latest entry (previously
@@ -1110,6 +1130,39 @@ class ChatViewLayer(DrCodeState):
             self._chat_batching = False
             self._chat_batch.clear()
             raise
+
+    def _schedule_drain(self, epoch: int) -> None:
+        """Schedule the next drain chunk. `call_after_refresh` may silently
+        NOT schedule its callback (it returns False when the message pump is
+        closed/closing) — its InvokeLater message also only ever runs on a
+        clean screen idle, so under a busy terminal (streaming deltas,
+        spinners, tickers keeping widgets dirty) the chain can starve.
+        The fallbacks here plus the _poll_chat_drain watchdog keep the drain
+        self-healing: a dropped or starved schedule must never leave a
+        permanently truncated history with batching stuck on."""
+        if self.call_after_refresh(self._drain_chat_batch, epoch):
+            return
+        # InvokeLater could not be queued — try a plain Callback message
+        # (processed in this pump's own queue, not gated on screen idle).
+        if not self.call_later(self._drain_chat_batch, epoch):
+            # Last resort while the app is still alive: a timer. If the app
+            # is really shutting down this never fires — nothing left to
+            # render into anyway.
+            self.set_timer(0.1, partial(self._drain_chat_batch, epoch))
+
+    def _poll_chat_drain(self) -> None:
+        """Watchdog for the chunked history drain (1 s poll): if a drain is
+        pending but no chunk has progressed for a while, the reschedule
+        chain died (a dropped `call_after_refresh` schedule, or InvokeLater
+        callbacks starved by a continuously dirty screen — both invisible
+        to headless run_test() repros). Re-kick it; _drain_chat_batch's
+        epoch guard drops the tail if the view moved on in the meantime."""
+        if (
+            self._chat_batching
+            and self._chat_batch
+            and time.monotonic() - self._chat_drain_at > _CHAT_DRAIN_STUCK
+        ):
+            self._drain_chat_batch()
 
     def _write_history_line(
         self, role: str, text: str, at: datetime | None = None

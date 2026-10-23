@@ -531,6 +531,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # mid-drain bumps the epoch and the remaining stale chunks are
         # dropped instead of mounting into the new view's log.
         self._chat_batch_epoch = 0
+        # monotonic() stamp of the last drain-chunk progress: the 1 s poll
+        # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
+        # chain died or starved (see chat_view._schedule_drain).
+        self._chat_drain_at = 0.0
         # Clarification object currently rendered in the open chat view.
         # Compared by identity: a newly asked question is a fresh instance,
         # so the agent run's end-of-run handler never re-draws a question

@@ -10,6 +10,7 @@ no network access happens.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import cast
 
@@ -18,7 +19,7 @@ from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
 from textual.command import Command, CommandList
 from textual.geometry import Offset
-from textual.widgets import ListView, TextArea
+from textual.widgets import ListView, Static, TextArea
 from textual.widgets._list_item import ListItem
 from textual.widgets.text_area import Selection
 
@@ -159,6 +160,106 @@ async def test_view_task_drains_fat_history_in_chunks(app: DrCodeApp) -> None:
         rendered = "\n".join(str(w.render()) for w in log.children)
         assert "question 0" in rendered
         assert "answer 79" in rendered
+
+
+async def test_drain_survives_dropped_call_after_refresh(app: DrCodeApp) -> None:
+    """Regression (task #79099479): a dropped `call_after_refresh` schedule
+    (it returns False when the message pump is closed/closing and never
+    queues the InvokeLater) used to kill the drain chain after the first
+    chunk — the history stayed truncated at the chunk boundary with
+    batching stuck on, swallowing every later live write (the whole tester
+    round). The fallback schedule must still drain everything."""
+    task = app.manager.create("fat task", "prompt")
+    task.messages = _fat_transcript(80)
+    task.status = TaskStatus.COMPLETED
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        calls = {"n": 0}
+        original = app.call_after_refresh
+
+        def drop_first_schedule(callback, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False  # pump "closed": InvokeLater never queued
+            return original(callback, *args, **kwargs)
+
+        app.call_after_refresh = drop_first_schedule  # type: ignore[method-assign]
+        app.view_task(task.id)
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert calls["n"] >= 1  # the drop actually happened
+        assert not app._chat_batching
+        assert app._chat_batch == []
+        log = app.query_one("#chat-log")
+        assert len(log.children) == 161
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "answer 79" in rendered
+
+
+async def test_watchdog_resumes_dead_drain(app: DrCodeApp) -> None:
+    """A drain chain that died outright (schedule dropped AND starved) is
+    resurrected by the 1 s poll watchdog: pending blocks still mount and
+    batching turns off."""
+    task = app.manager.create("fat task", "prompt")
+    task.messages = _fat_transcript(80)
+    task.status = TaskStatus.COMPLETED
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        for _ in range(30):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        # Simulate a new fat batch whose chain died right after the first
+        # chunk: batching on, chunks pending, no progress for ages.
+        app._chat_batching = True
+        app._chat_batch_epoch = app._chat_epoch
+        app._chat_batch = [
+            Static(f"late block {i}", classes="chat-block") for i in range(40)
+        ]
+        app._chat_drain_at = time.monotonic() - 10
+        app._poll_chat_drain()  # one 1 s poll tick
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert app._chat_batch == []
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "late block 39" in rendered
+
+
+async def test_stale_drain_chain_leaves_new_view_alone(app: DrCodeApp) -> None:
+    """A stale chain (scheduled under an older _chat_epoch, detected via
+    the epoch captured per callback) must neither mount its chunks into
+    the new view's log nor wipe the newer flush's state."""
+    fat = app.manager.create("fat task", "prompt")
+    fat.messages = _fat_transcript(80)
+    fat.status = TaskStatus.COMPLETED
+    other = app.manager.create("other task", "other prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(fat.id)
+        stale_epoch = app._chat_epoch
+        # Switch away before any drain chunk beyond the first could run:
+        # the fat view's chain is now stale, the other view owns the log.
+        app.view_task(other.id)
+        app._drain_chat_batch(stale_epoch)  # the stale chain's callback fires
+        await pilot.pause()  # let deferred DOM removal / queued callbacks settle
+        # The stale callback neither mounted fat-view chunks…
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "question 0" not in rendered
+        assert "other prompt" in rendered
+        # …nor touched the new view's (already settled) drain state.
+        assert not app._chat_batching
+        assert app._chat_batch == []
 
 
 async def test_view_switch_mid_drain_drops_stale_chunks(app: DrCodeApp) -> None:

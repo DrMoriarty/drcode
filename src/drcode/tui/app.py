@@ -31,7 +31,14 @@ from textual.widgets import (
 
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
-from ..models import Clarification, PendingInput, Task, TaskKind, TaskStatus
+from ..models import (
+    Clarification,
+    PendingInput,
+    Task,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+)
 from ..notifications import Notifier
 from ..providers import (
     AgentRole,
@@ -766,6 +773,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 exclusive=True,
                 group="worktree-cleanup",
             )
+        if self.task_env.active:
+            # Remind about completed tasks whose work never reached the
+            # current branch (old "stuck" fixes on drcode/* branches —
+            # see _unmerged_work_startup_scan).
+            self.run_worker(
+                self._unmerged_work_startup_scan,
+                exclusive=True,
+                group="unmerged-scan",
+            )
         self.refresh_project_info()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty
@@ -842,6 +858,46 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 title="Task isolation",
                 timeout=6,
             )
+
+    async def _unmerged_work_startup_scan(self) -> None:
+        """Startup reminder for old "stuck" fixes: completed tasks whose
+        `drcode/<task-id>` branch still holds commits the main checkout's
+        current branch does not have (drcode never merges — the branch
+        survives the retention cleanup and nothing nags about it, so a
+        PASSED task from a previous session can sit unmerged forever).
+        One toast for the whole session, listing the branch names; each
+        task's chat already carries the per-task reminder written at its
+        finalization. Skipped when the merge is automated by an
+        `on_accepted` hook."""
+        env = self.task_env
+        if not env.active:
+            return
+        if self.workflow is not None and self.workflow.has("on_accepted"):
+            return  # the merge is the hook's job — no reminders
+        stuck: list[str] = []
+        for task in list(self.manager.tasks.values()):
+            if task.kind is TaskKind.RESEARCH:
+                continue  # research tasks never go through testing
+            if task.status is not TaskStatus.COMPLETED:
+                continue
+            if task.verification is not VerificationStatus.PASSED:
+                continue
+            if task.review_pending:
+                continue  # the external review has not accepted it yet
+            if await asyncio.to_thread(env.unmerged_commits, task.id) > 0:
+                stuck.append(env.branch(task.id))
+        if not stuck:
+            return
+        base = await asyncio.to_thread(env.base_branch)
+        shown = ", ".join(stuck[:5]) + ("…" if len(stuck) > 5 else "")
+        self.notify(
+            f"Completed task work not merged into {base} yet: {shown}. "
+            "Merge it (git merge <branch>) or wire an on_accepted hook "
+            "in .drcode/workflow.py.",
+            title="Unmerged work",
+            severity="warning",
+            timeout=12,
+        )
 
     @property
     def sidebar(self) -> Sidebar:

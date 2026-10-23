@@ -1,0 +1,330 @@
+"""Tests for the unmerged-work reminder: after a tester PASSED finalizes
+a task (worktree isolation on), drcode checks whether the task's
+`drcode/<task-id>` branch holds commits the main checkout's current
+branch does not have, and reminds the user explicitly — merging is a
+team decision (drcode never merges), but it must not be a silent one.
+Covers `TaskEnvironment.unmerged_commits` / `base_branch`, the pipeline
+reminder on the finalization paths (toast + service event, softened by
+an `on_accepted` hook) and the startup sweep for old stuck fixes."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from drcode.models import TaskKind, TaskStatus, VerificationStatus
+from drcode.settings import (
+    ProjectSettings,
+    ProjectSettingsStore,
+    TaskIsolation,
+)
+from drcode.task_env import TaskEnvironment, branch_for
+from drcode.task_manager import TaskManager
+from drcode.tui.app import DrCodeApp
+from drcode.workflow import load_hooks
+from tests.network_mocks import event_texts, wait_until
+
+# -- shared fixtures (mirroring tests/test_task_env.py / test_workflow.py) --------
+
+
+@pytest.fixture
+def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured (but never contacted) model endpoint — suppresses the
+    first-start ModelSetupDialog so the app mounts straight into the
+    pipeline state under test."""
+    monkeypatch.setenv("DRCODE_MODEL", "mock-model")
+    monkeypatch.setenv("DRCODE_API_KEY", "mock-key")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://127.0.0.1:1/v1")
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def git_root(project_root: Path) -> Path:
+    """A project root that is a real git repository with one commit."""
+    _git(project_root, "init", "-q")
+    _git(project_root, "config", "user.email", "test@example.com")
+    _git(project_root, "config", "user.name", "Test")
+    (project_root / ".gitignore").write_text(".drcode/tasks/\n.drcode/worktrees/\n")
+    (project_root / "README.md").write_text("hello")
+    _git(project_root, "add", "-A")
+    _git(project_root, "commit", "-q", "-m", "init")
+    return project_root
+
+
+@pytest.fixture
+def isolated(git_root: Path) -> Path:
+    """The git repo with worktree isolation persisted (an app picks it up)."""
+    ProjectSettingsStore(git_root).save(
+        ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    return git_root
+
+
+@pytest.fixture
+def env(git_root: Path) -> TaskEnvironment:
+    return TaskEnvironment(
+        git_root, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+
+
+def commit_on_branch(env: TaskEnvironment, task_id: str, name: str = "fix.txt") -> None:
+    """Give the task's branch one commit the current branch lacks — via
+    the task's worktree, the way a real finished task leaves its work."""
+    wt, _ = env.ensure_root(task_id)
+    (wt / name).write_text(name)
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", f"fix for {task_id}")
+
+
+def current_branch(root: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+# -- TaskEnvironment.unmerged_commits ----------------------------------------------
+
+
+def test_unmerged_commits_counts_task_branch_work(env: TaskEnvironment) -> None:
+    root = env.project_root
+    env.ensure_root("t1")
+    commit_on_branch(env, "t1")
+    assert env.unmerged_commits("t1") == 1
+    assert env.base_branch() == current_branch(root)
+
+
+def test_unmerged_commits_zero_after_merge(env: TaskEnvironment) -> None:
+    root = env.project_root
+    env.ensure_root("t1")
+    commit_on_branch(env, "t1")
+    _git(root, "merge", "-q", "--no-ff", branch_for("t1"), "-m", "merge t1")
+    assert env.unmerged_commits("t1") == 0
+
+
+def test_unmerged_commits_zero_without_branch(env: TaskEnvironment) -> None:
+    env.ensure_root("t1")  # worktree exists, but nothing was committed
+    assert env.unmerged_commits("t1") == 0
+    # No worktree at all (task never activated / already cleaned up).
+    assert env.unmerged_commits("t2") == 0
+
+
+def test_unmerged_commits_zero_without_git_repo(project_root: Path) -> None:
+    env = TaskEnvironment(
+        project_root, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    assert not env.available
+    assert env.unmerged_commits("t1") == 0
+
+
+def test_unmerged_commits_zero_without_isolation(git_root: Path) -> None:
+    env = TaskEnvironment(git_root, ProjectSettings(task_isolation=TaskIsolation.OFF))
+    assert not env.active
+    assert env.unmerged_commits("t1") == 0
+
+
+# -- pipeline reminder on the PASSED finalization paths -----------------------------
+
+
+@pytest.fixture
+def app_env(isolated: Path, configured_env: None) -> DrCodeApp:
+    return DrCodeApp(isolated)
+
+
+def finished_task(app: DrCodeApp, kind: TaskKind = TaskKind.FEATURE) -> Any:
+    task = app.manager.create("Fix the bug", "fix the bug")
+    task.kind = kind
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    app.manager.storage.save(task)
+    return task
+
+
+def track_toasts(app: DrCodeApp) -> list[tuple[str, str]]:
+    toasts: list[tuple[str, str]] = []
+
+    def notify(message: str = "", *, title: str = "", **_: Any) -> None:
+        toasts.append((title, message))
+
+    app.notify = notify  # type: ignore[method-assign]
+    return toasts
+
+
+async def test_reminder_fires_for_unmerged_task(app_env: DrCodeApp) -> None:
+    """The task's branch holds work the current branch lacks: the
+    finalization reminder lands in the service-event log AND as a toast."""
+    app = app_env
+    task = finished_task(app)
+    commit_on_branch(app.task_env, task.id)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    base = current_branch(app.project_root)
+    events = "\n".join(event_texts(task))
+    assert f"drcode/{task.id}" in events
+    assert f"not merged into {base}" in events
+    assert f"git merge drcode/{task.id}" in events
+    assert any(title == "Unmerged work" for title, _ in toasts)
+
+
+async def test_reminder_silent_when_merged_or_absent(app_env: DrCodeApp) -> None:
+    app = app_env
+    task = finished_task(app)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # No task branch at all (isolation just turned on / cancelled task).
+        await app._remind_unmerged_work(task)
+        # A branch fully merged into the current one.
+        commit_on_branch(app.task_env, task.id)
+        _git(
+            app.project_root,
+            "merge",
+            "-q",
+            "--no-ff",
+            branch_for(task.id),
+            "-m",
+            "merge it",
+        )
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    assert event_texts(task) == []
+    assert not toasts
+
+
+async def test_reminder_skips_research_tasks(app_env: DrCodeApp) -> None:
+    """Research tasks never finalize through testing — no reminder even
+    when a branch with unmerged commits exists."""
+    app = app_env
+    task = finished_task(app, kind=TaskKind.RESEARCH)
+    commit_on_branch(app.task_env, task.id)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    assert event_texts(task) == []
+    assert not toasts
+
+
+async def test_reminder_toast_softened_by_on_accepted_hook(
+    app_env: DrCodeApp,
+) -> None:
+    """With an on_accepted hook defined the merge is automated — the
+    service event stays (the durable record), the toast is skipped."""
+    app = app_env
+    drcode_dir = app.project_root / ".drcode"
+    drcode_dir.mkdir(exist_ok=True)
+    (drcode_dir / "workflow.py").write_text(
+        "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    commit_on_branch(app.task_env, task.id)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    assert any(f"drcode/{task.id}" in text for text in event_texts(task))
+    assert not toasts
+
+
+# -- startup sweep: old stuck fixes are surfaced once per session --------------------
+
+
+async def test_startup_scan_toasts_stuck_fixes(
+    isolated: Path, configured_env: None
+) -> None:
+    """A completed task whose branch never got merged is announced at
+    startup; merged/absent branches are not."""
+    manager = TaskManager(isolated)
+    stuck = manager.create("Fix the bug", "fix the bug")
+    stuck.status = TaskStatus.COMPLETED
+    stuck.verification = VerificationStatus.PASSED
+    manager.storage.save(stuck)
+    merged = manager.create("Already merged", "merged work")
+    merged.status = TaskStatus.COMPLETED
+    merged.verification = VerificationStatus.PASSED
+    manager.storage.save(merged)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    commit_on_branch(env, stuck.id)
+
+    app = DrCodeApp(isolated)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: any(title == "Unmerged work" for title, _ in toasts),
+            pilot,
+            what="startup unmerged-work toast",
+        )
+    unmerged_toasts = [msg for title, msg in toasts if title == "Unmerged work"]
+    assert len(unmerged_toasts) == 1
+    assert f"drcode/{stuck.id}" in unmerged_toasts[0]
+    assert f"drcode/{merged.id}" not in unmerged_toasts[0]
+
+
+async def test_startup_scan_silent_without_isolation(
+    git_root: Path, configured_env: None
+) -> None:
+    """Without worktree isolation nothing ever lives on a task branch —
+    the startup scan does not run at all."""
+    manager = TaskManager(git_root)
+    task = manager.create("Fix the bug", "fix the bug")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        git_root, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    commit_on_branch(env, task.id)  # branch exists anyway
+
+    app = DrCodeApp(git_root)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._unmerged_work_startup_scan()
+        await pilot.pause()
+    assert not toasts
+
+
+async def test_startup_scan_silent_with_on_accepted_hook(
+    isolated: Path, configured_env: None
+) -> None:
+    manager = TaskManager(isolated)
+    task = manager.create("Fix the bug", "fix the bug")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    commit_on_branch(env, task.id)
+
+    drcode_dir = isolated / ".drcode"
+    drcode_dir.mkdir(exist_ok=True)
+    (drcode_dir / "workflow.py").write_text(
+        "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+
+    app = DrCodeApp(isolated)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._unmerged_work_startup_scan()
+        await pilot.pause()
+    assert not any(title == "Unmerged work" for title, _ in toasts)

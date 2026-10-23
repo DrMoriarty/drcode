@@ -28,9 +28,12 @@ Lifecycle contract (enforced here and by the pipeline):
   merge back into the user's base branch on its own: merging is a team
   decision, so it is left to the project's `.drcode/workflow.py`
   `on_accepted` hook (which receives the worktree path and branch in the
-  payload — see `drcode.workflow`). The worktree directory lives as long
-  as the task does; it is removed when the task is deleted (including
-  the retention auto-cleanup).
+  payload — see `drcode.workflow`). When the finalized task's branch
+  still holds commits the main checkout does not have, the pipeline
+  reminds the user explicitly (`unmerged_commits`) — a PASSED verdict
+  never silently assumes the fix reached their checkout. The worktree
+  directory lives as long as the task does; it is removed when the task
+  is deleted (including the retention auto-cleanup).
 - cancel (Ctrl+X) / delete (Ctrl+Delete): the worktree is removed; the
   branch `drcode/<task-id>` is deleted ONLY when it holds no unmerged
   commits (see the user-facing contract below). Before every removal a
@@ -391,7 +394,7 @@ class TaskEnvironment:
         except (OSError, subprocess.SubprocessError):
             return None
 
-    def _base_branch(self) -> str:
+    def base_branch(self) -> str:
         """The main checkout's current branch — the base the unmerged
         commits of a task branch are counted against. Falls back to HEAD
         (detached HEAD, unusual setups): counting against whatever HEAD
@@ -406,13 +409,30 @@ class TaskEnvironment:
         branch (RULE 2's delete-protection counter). 0 also on any git
         failure — when git cannot tell, the old delete behavior applies
         (the snapshot above is the real safety net)."""
-        code, out = self._git("rev-list", "--count", f"{self._base_branch()}..{branch}")
+        code, out = self._git("rev-list", "--count", f"{self.base_branch()}..{branch}")
         if code != 0:
             return 0
         try:
             return int(out or "0")
         except ValueError:
             return 0
+
+    def unmerged_commits(self, task_id: str) -> int:
+        """How many commits of the task's `drcode/<task-id>` branch are
+        NOT reachable from the main checkout's current branch
+        (`base_branch`) — the "is the task's work already merged?" check
+        the pipeline runs when a passed task is finalized, so an unmerged
+        fix is never left as a silent responsibility of the (absent)
+        `on_accepted` hook. 0 when the branch does not exist (no
+        isolation, a cancelled task, work already merged and the branch
+        cleaned up) or git cannot tell. Blocking (a few git calls): run
+        via `asyncio.to_thread` from the pipeline."""
+        if not self.available:
+            return 0
+        branch = self.branch(task_id)
+        if not self._branch_exists(branch):
+            return 0
+        return self._unmerged_count(branch)
 
     def remove(self, task_id: str) -> None:
         """Remove the task's worktree; its `drcode/<task-id>` branch only

@@ -75,6 +75,56 @@ def _project_prompt_override(project_root: Path | None, name: str) -> str | None
         return None
 
 
+def _join_components(base: str, git_workflow: str | None) -> str:
+    """Append the git-workflow rules to a base prompt (the single place the
+    two components of any system prompt are composed)."""
+    if git_workflow is None:
+        return base
+    return f"{base}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
+
+
+def load_system_prompt_components(
+    kind: TaskKind, project_root: Path | None = None
+) -> tuple[str, str | None]:
+    """(base prompt, git workflow or None) for a coding task of the given kind.
+
+    The base prompt is the (possibly project-overridden) template with the
+    ``{project_path}`` placeholder substituted and — when the project ships
+    `.drcode/git-workflow.md` — the bundled "Never commit to git" sentence
+    removed. The second element is the workflow text to append under
+    `GIT_WORKFLOW_HEADER` (None when there is none). Note the base prompt does
+    NOT include the project's AGENTS.md: that appendage is assembled by
+    `drcode.agent.build_agent` (see `load_agents_md`). `load_system_prompt`
+    joins the two components; consumers that must account for the parts
+    separately (the context-layout estimate in the TUI) use this directly.
+    """
+    name = {
+        TaskKind.FEATURE: "feature.md",
+        TaskKind.BUG: "bug.md",
+        TaskKind.RESEARCH: "research.md",
+    }[kind]
+    template = _project_prompt_override(project_root, name) or (
+        SYSTEM_PROMPTS_DIR / name
+    ).read_text(encoding="utf-8")
+    git_workflow = load_git_workflow(project_root)
+    if git_workflow is not None:
+        template = _NEVER_COMMIT_RE.sub("", template)
+    return _substitute_project_path(template, project_root), git_workflow
+
+
+def load_tester_prompt_components(
+    allow_commit: bool = True, project_root: Path | None = None
+) -> tuple[str, str | None]:
+    """(base prompt, git workflow or None) for the QA tester — the component
+    counterpart of `load_system_prompt_components`."""
+    name = "tester_no_commit.md" if not allow_commit else "tester.md"
+    template = _project_prompt_override(project_root, name) or (
+        SYSTEM_PROMPTS_DIR / name
+    ).read_text(encoding="utf-8")
+    git_workflow = load_git_workflow(project_root)
+    return _substitute_project_path(template, project_root), git_workflow
+
+
 def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
     """Bundled system prompt for a coding task of the given kind.
 
@@ -90,21 +140,8 @@ def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
     removed (the workflow file governs committing instead) and the workflow
     text is appended under a dedicated header.
     """
-    name = {
-        TaskKind.FEATURE: "feature.md",
-        TaskKind.BUG: "bug.md",
-        TaskKind.RESEARCH: "research.md",
-    }[kind]
-    template = _project_prompt_override(project_root, name) or (
-        SYSTEM_PROMPTS_DIR / name
-    ).read_text(encoding="utf-8")
-    git_workflow = load_git_workflow(project_root)
-    if git_workflow is not None:
-        template = _NEVER_COMMIT_RE.sub("", template)
-    prompt = _substitute_project_path(template, project_root)
-    if git_workflow is not None:
-        prompt = f"{prompt}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
-    return prompt
+    base, git_workflow = load_system_prompt_components(kind, project_root)
+    return _join_components(base, git_workflow)
 
 
 def load_tester_prompt(
@@ -124,15 +161,8 @@ def load_tester_prompt(
     appended: the tester must finalize the task according to the same team
     process the coding agent follows.
     """
-    name = "tester_no_commit.md" if not allow_commit else "tester.md"
-    template = _project_prompt_override(project_root, name) or (
-        SYSTEM_PROMPTS_DIR / name
-    ).read_text(encoding="utf-8")
-    prompt = _substitute_project_path(template, project_root)
-    git_workflow = load_git_workflow(project_root)
-    if git_workflow is not None:
-        prompt = f"{prompt}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
-    return prompt
+    base, git_workflow = load_tester_prompt_components(allow_commit, project_root)
+    return _join_components(base, git_workflow)
 
 
 def load_compaction_prompts() -> tuple[str, str]:

@@ -23,7 +23,9 @@ from ..agent import (
     is_pending_retry,
     last_context_tokens,
 )
+from ..context_layout import task_reports
 from ..providers import AgentRole
+from ..settings import TaskFinalization
 from .blocks import (
     TASK_MENTION_RE,
     AssistantBlock,
@@ -66,6 +68,7 @@ from ..models import (
     VerificationStatus,
 )
 from ..version import APP_VERSION
+from .ctx_dialog import ContextDialog
 from .header import HeaderConnInfo, HeaderSessionInfo, ModelStatusHeader
 from .state import DrCodeState
 
@@ -1298,6 +1301,10 @@ class ChatViewLayer(DrCodeState):
         — the value computed from the persisted transcript, i.e. the final
         value is saved in the task history together with the per-response
         usage and survives restarts.
+
+        The counter is clickable: it opens the modal context-layout dialog
+        (action_show_ctx_dialog) — the 🧠 figure itself is wrapped in the
+        same [@click] markup the task-id mention links use.
         """
         right.remove_class("ctx-warn", "ctx-crit")
         tokens = self._live_ctx_tokens.get(task.id)
@@ -1305,7 +1312,9 @@ class ChatViewLayer(DrCodeState):
             tokens = last_context_tokens(task.messages)
         if not tokens:
             right.update("")
+            right.tooltip = None
             return
+        right.tooltip = "Click: context layout (≈ breakdown + exact usage)"
         max_tokens = self.resolved_config(self._task_role(task)).max_context_tokens
         if max_tokens > 0:
             pct = round(tokens * 100 / max_tokens)
@@ -1328,6 +1337,33 @@ class ChatViewLayer(DrCodeState):
                 right.add_class("ctx-warn")
         else:
             text = f"🧠 {self._fmt_ctx_tokens(tokens)}"
-        right.update(text)
+        right.update(f"[@click=app.show_ctx_dialog]{text}[/]")
+
+    def action_show_ctx_dialog(self) -> None:
+        """Click on the context counter: open the modal dialog with the
+        ≈ context layout of the viewed task (development transcript on the
+        serving role's model, the latest testing round on the tester's,
+        plus the exact API figures and the whole-task cumulative usage)."""
+        task = self.viewed
+        if task is None or self._new_task_mode:
+            return
+        if not task.messages and not task.tester_messages:
+            self.notify("Task has no context yet — no model request was made.")
+            return
+        role = self._task_role(task)
+        dev, tester, usage, requests = task_reports(
+            task,
+            self.resolved_config(role),
+            self.resolved_config(AgentRole.TESTER),
+            role.value.upper(),
+            self.project_root,
+            live_tokens=self._live_ctx_tokens.get(task.id),
+            tester_allow_commit=(
+                self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
+            ),
+        )
+        self.push_screen(
+            ContextDialog([r for r in (dev, tester) if r is not None], usage, requests)
+        )
 
     # -- agent run -----------------------------------------------------------------

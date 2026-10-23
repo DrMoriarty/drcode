@@ -138,6 +138,8 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # twice the remaining headroom (threshold 80 → yellow from 60%).
     #task-status-right.ctx-warn { color: $warning; }
     #task-status-right.ctx-crit { color: $error; }
+    # The counter is a link (opens the context-layout dialog).
+    #task-status-right:hover { text-style: underline; }
     # 1-column empty gutter on both sides: no text sticks to the window edge.
     #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }

@@ -160,10 +160,14 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
 
 
 def build_compaction_prompt(
-    previous_summary: str | None, transcript: str, template: str
+    previous_summary: str | None,
+    transcript: str,
+    template: str,
+    checklist: str | None = None,
 ) -> str:
     """User prompt for the summarizer: the conversation, the anchored
-    previous summary (if any) and the required output structure."""
+    previous summary (if any), the task's current todo checklist (when it
+    has one) and the required output structure."""
     parts = [
         "Below is the conversation history of a coding session.",
         "",
@@ -174,11 +178,29 @@ def build_compaction_prompt(
         "<previous-summary>",
         previous_summary or "(none)",
         "</previous-summary>",
-        "",
-        "Produce the updated summary following exactly this structure:",
-        "",
-        template,
     ]
+    if checklist:
+        # The checklist lives in `task.todos`, outside the transcript — the
+        # summarizer cannot see it in the conversation text. Passed (and
+        # rendered) explicitly so the "## Task checklist" section of the
+        # output template carries the true current state into the summary
+        # (belt-and-suspenders alongside the structured task field).
+        parts.extend(
+            [
+                "",
+                "<task-checklist>",
+                checklist,
+                "</task-checklist>",
+            ]
+        )
+    parts.extend(
+        [
+            "",
+            "Produce the updated summary following exactly this structure:",
+            "",
+            template,
+        ]
+    )
     return "\n".join(parts)
 
 

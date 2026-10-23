@@ -73,6 +73,17 @@ class Clarification(BaseModel):
     options: list[str] = Field(default_factory=list)
 
 
+class TodoItem(BaseModel):
+    """One entry of a feature task's self-managed todo checklist.
+
+    Plain pydantic model with a plain default — old task JSONs (and task
+    JSONs written before this field existed) load without any migration,
+    same pattern as `depends_on`."""
+
+    text: str
+    done: bool = False
+
+
 class PendingInput(BaseModel):
     """A user message queued before the agent consumes it.
 
@@ -184,6 +195,21 @@ class Task(BaseModel):
     # self-reference, existing ids, acyclic); a plain default keeps old
     # task JSONs loading without migration.
     depends_on: list[str] = Field(default_factory=list)
+    # Self-managed todo checklist (feature tasks only — only those agents
+    # get the todo_create/todo_update tools). Persisted with the task like
+    # every other field, so the list survives restarts, compaction and
+    # interrupted attempts; it never lives only in the transcript. The
+    # agent owns the list (the TUI panel is read-only); its current state
+    # is re-injected into the model context on every activation and after
+    # every compaction (see tui/pipeline.py), so the agent cannot "forget"
+    # it. Rendered by render_todos below.
+    todos: list[TodoItem] = Field(default_factory=list)
+
+    @property
+    def unchecked_todos(self) -> list[TodoItem]:
+        """Checklist items not marked done yet (the completion soft gate
+        in the pipeline warns about these at mark_done time)."""
+        return [t for t in self.todos if not t.done]
 
     @model_validator(mode="before")
     @classmethod
@@ -222,3 +248,13 @@ class Task(BaseModel):
     @property
     def title_display(self) -> str:
         return self.title if len(self.title) <= 40 else self.title[:39] + "…"
+
+
+def render_todos(todos: list[TodoItem]) -> str:
+    """Plain-text rendering of a checklist ("1. [x] text"), numbered by its
+    1-based position — the same numbers todo_update accepts. Shared by the
+    agent context injection (tui/pipeline.py), the compaction prompt and
+    the TUI panel; the panel wraps the lines in rich markup itself."""
+    return "\n".join(
+        f"{i}. [{'x' if t.done else ' '}] {t.text}" for i, t in enumerate(todos, 1)
+    )

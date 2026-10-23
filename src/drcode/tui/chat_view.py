@@ -123,7 +123,12 @@ class ChatViewLayer(DrCodeState):
     def _poll_sidebar(self) -> None:
         """Redraw the sidebar only when the underlying task state changed
         since the last render (status transitions, new bug reports from the
-        tester, promote_next() activations, …)."""
+        tester, promote_next() activations, …). Also keeps the todo panel
+        in sync (fallback path — todo tool calls refresh it instantly)."""
+        todo_fp = self._todo_fingerprint()
+        if todo_fp != self._todo_snapshot:
+            self._todo_snapshot = todo_fp
+            self.refresh_todo_panel()
         if self._sidebar_fingerprint() != self._sidebar_snapshot:
             self.refresh_sidebar()
             # The task status header (and the bottom statusbar) have no
@@ -132,6 +137,47 @@ class ChatViewLayer(DrCodeState):
             # COMPLETED while its tester run is still finishing) would leave
             # them stale until the run ends — or a view switch.
             self.refresh_status()
+
+    def _todo_fingerprint(self) -> tuple:
+        """Everything the todo panel renders: new-task mode, the viewed
+        task's id and its checklist items (text + done flag)."""
+        if self._new_task_mode:
+            return ("new-task",)
+        task = self.viewed
+        if task is None:
+            return ()
+        return (task.id, tuple((t.text, t.done) for t in task.todos))
+
+    def refresh_todo_panel(self) -> None:
+        """Re-render the todo panel from the viewed task's checklist.
+
+        Visible (auto-sized) only when the task has a non-empty `todos`;
+        hidden otherwise. Done items render struck-through-dim (rich does
+        not strike through reliably across terminals — dim is the portable
+        equivalent); unchecked ones in the normal text color. Read-only:
+        the agent owns the list."""
+        try:
+            panel = self.todo_panel
+        except NoMatches:
+            return
+        task = self.viewed
+        if task is None or not task.todos:
+            panel.add_class("hidden")
+            return
+        done = len(task.todos) - len(task.unchecked_todos)
+        lines = [
+            f"[bold $accent]todos[/] [dim]{done}/{len(task.todos)}[/]",
+        ]
+        for i, item in enumerate(task.todos, 1):
+            text = escape(item.text)
+            # The [x]/[ ] markers are escaped (\[) so rich keeps them
+            # literal instead of eating [x] as a markup tag.
+            if item.done:
+                lines.append(f"[dim]  \\[x] {i}. {text}[/]")
+            else:
+                lines.append(f"  \\[ ] {i}. {text}")
+        panel.update("\n".join(lines))
+        panel.remove_class("hidden")
 
     def _poll_new_tasks(self) -> None:
         """Watch `<project>/.drcode/tasks/` for tasks created by other
@@ -820,6 +866,7 @@ class ChatViewLayer(DrCodeState):
             # end). The finally keeps a mid-render exception from leaving
             # batching on (later live writes would be swallowed).
             self._flush_chat_batch()
+        self.refresh_todo_panel()
         self.refresh_sidebar()
         self.refresh_status()
 

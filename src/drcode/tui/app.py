@@ -67,6 +67,7 @@ from .inputs import ChatInput, DepsInput, NewTaskInput
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem  # noqa: F401
+from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 
 
@@ -140,6 +141,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # 1-column empty gutter on both sides: no text sticks to the window edge.
     #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }
+    # Read-only todo checklist between the chat log and the input: hidden
+    # while the viewed task has no checklist, auto-sized to its items
+    # otherwise (capped, so a long list cannot crush the chat log).
+    #todo-panel {
+        height: auto;
+        max-height: 10;
+        border-top: solid $panel;
+        background: $surface;
+        padding: 0 1;
+    }
     # Multi-line chat editor: height is driven from Python (wrapped line
     # count, capped); auto here is just the pre-measure fallback.
     #chat-input {
@@ -449,6 +460,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
+        # Same idea for the todo panel: (new-task mode, viewed id, checklist
+        # items) of the last render — the 1s poll re-renders the panel only
+        # when this changes (todo tools refresh it instantly themselves).
+        self._todo_snapshot: tuple = ()
         # Sidebar sections currently collapsed (Enter/space/click on a
         # section header toggles it); session-only, not persisted.
         self._collapsed_sections: set[str] = set()
@@ -559,6 +574,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     yield Static("", id="task-status-left")
                     yield Static("", id="task-status-right")
                 yield VerticalScroll(id="chat-log")
+                yield TodoPanel("", id="todo-panel", classes="hidden")
                 yield ChatInput(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):
                     yield Static(
@@ -957,6 +973,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     @property
     def sidebar(self) -> Sidebar:
         return self.query_one("#sidebar", Sidebar)
+
+    @property
+    def todo_panel(self) -> TodoPanel:
+        return self.query_one("#todo-panel", TodoPanel)
 
     @property
     def project_info(self) -> Static:

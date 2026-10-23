@@ -56,6 +56,7 @@ from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
 from .setup_dialog import ModelSetup
 from .sidebar import Sidebar
+from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 
 
@@ -85,6 +86,15 @@ class DrCodeState(App[None]):
     def _sidebar_top_task(self) -> Task | None: ...
 
     def refresh_sidebar(self) -> None: ...
+
+    def _todo_fingerprint(self) -> tuple: ...
+
+    def refresh_todo_panel(self) -> None: ...
+
+    @staticmethod
+    def _todo_instructions(task: Task) -> str | None: ...
+
+    def _todo_completion_warning(self, task: Task) -> None: ...
 
     def toggle_sidebar_section(self, section: str) -> None: ...
 
@@ -521,6 +531,8 @@ class DrCodeState(App[None]):
 
     # -- sidebar / activity -------------------------------------------------
     _sidebar_snapshot: tuple
+    # Todo-panel snapshot of the last render (see _todo_fingerprint).
+    _todo_snapshot: tuple
     _collapsed_sections: set[str]
     # Per-run activity bookkeeping (parallel slots): last sign of life,
     # the tool each run is waiting on and the tok/s sample window.
@@ -556,6 +568,9 @@ class DrCodeState(App[None]):
 
     @property
     def sidebar(self) -> Sidebar: ...
+
+    @property
+    def todo_panel(self) -> TodoPanel: ...
 
     @property
     def project_info(self) -> Static: ...

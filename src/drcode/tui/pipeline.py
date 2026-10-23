@@ -57,6 +57,7 @@ from ..models import (
     TaskKind,
     TaskStatus,
     VerificationStatus,
+    render_todos,
 )
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
@@ -115,6 +116,55 @@ class PipelineLayer(DrCodeState):
         `providers.resolve_effective`), everything else on the coding role."""
         return (
             AgentRole.RESEARCH if task.kind is TaskKind.RESEARCH else AgentRole.CODING
+        )
+
+    @staticmethod
+    def _todo_instructions(task: Task) -> str | None:
+        """Per-run instructions carrying the task's current checklist state
+        (feature tasks with a non-empty list only — nothing else has todo
+        tools or a checklist).
+
+        This is the key anti-"forgot the list" measure: the state rides on
+        EVERY `agent.iter` call as run instructions — it is in front of the
+        model on every activation and on every turn after a compaction —
+        without being appended to the persisted transcript (a synthetic
+        user message would pile up one copy per activation). The list
+        itself lives in `task.todos`; if it were only prompt material, an
+        interrupted attempt or a compaction could drop it."""
+        if task.kind is not TaskKind.FEATURE or not task.todos:
+            return None
+        unchecked = len(task.unchecked_todos)
+        lines = [
+            "# Task checklist (current state)",
+            "",
+            "Your todo checklist for this task, as it stands right now:",
+            "",
+            render_todos(task.todos),
+            "",
+            (
+                f"{unchecked} of {len(task.todos)} items are unchecked. Keep the "
+                "list accurate with todo_update: check an item off immediately "
+                "after finishing it, before starting the next one. Do not finish "
+                "the task while items remain unchecked unless the user "
+                "explicitly dropped them."
+            ),
+        ]
+        return "\n".join(lines)
+
+    def _todo_completion_warning(self, task: Task) -> None:
+        """Completion soft gate: when a task leaves development with
+        unchecked checklist items, the human sees a service event listing
+        them (never fatal — the agent may have consciously skipped items,
+        or the user pressed Done by hand). The checklist state is also
+        re-injected on the next activation, so a re-queued task's agent
+        sees what is still open."""
+        unchecked = task.unchecked_todos
+        if not unchecked:
+            return
+        items = "; ".join(f"({i}) {t.text}" for i, t in enumerate(unchecked, 1))
+        self._show_event(
+            task,
+            f"Task completed with {len(unchecked)} unchecked todo item(s): {items}",
         )
 
     async def _check_model(self) -> None:
@@ -750,6 +800,11 @@ class PipelineLayer(DrCodeState):
                 extract_previous_summary(task.messages),
                 render_history_for_summary(task.messages),
                 load_compaction_prompts()[1],
+                checklist=(
+                    render_todos(task.todos)
+                    if task.kind is TaskKind.FEATURE and task.todos
+                    else None
+                ),
             )
             result = await agent.run(prompt)
         except asyncio.CancelledError:
@@ -1004,6 +1059,7 @@ class PipelineLayer(DrCodeState):
                     async with agent.iter(
                         text,
                         message_history=history,
+                        instructions=self._todo_instructions(task),
                         deps=AgentDeps(
                             root=root,
                             manager=self.manager,
@@ -1233,6 +1289,17 @@ class PipelineLayer(DrCodeState):
                                                 event.part.tool_call_id
                                             )
                                             self._touch_activity(task_id, done=True)
+                                            # A todo tool just mutated the
+                                            # checklist: refresh the panel of
+                                            # the open chat view (the 1s poll
+                                            # would catch it too — this is the
+                                            # instant path).
+                                            if (event.part.tool_name or "").startswith(
+                                                "todo_"
+                                            ):
+                                                self.call_after_refresh(
+                                                    self.refresh_todo_panel
+                                                )
                                         if self.viewed_id != task_id:
                                             # The tool-call block is skipped
                                             # (it will come from the next
@@ -1506,6 +1573,9 @@ class PipelineLayer(DrCodeState):
                     # concurrent _advance() can start the tester round
                     # without the hook's note.
                     await self._run_development_done_hook(task)
+                    # Completion soft gate: unchecked checklist items are
+                    # announced, not blocking (see _todo_completion_warning).
+                    self._todo_completion_warning(task)
                     self.manager.mark_done(task.id)
                     self.refresh_sidebar()
                     if self.viewed_id == task_id:

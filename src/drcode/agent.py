@@ -40,6 +40,8 @@ from .models import (
     Clarification,
     TaskKind,
     TaskStatus,
+    TodoItem,
+    render_todos,
 )
 from .prompts import (
     BUG_SYSTEM_PROMPT,
@@ -166,6 +168,75 @@ class TesterDeps:
     scratch: Path
     review_gate: bool = False
     max_dev_rounds: int = 3
+
+
+# Minimum checklist size: a shorter list is the degenerate anti-pattern
+# (OpenCode-style one-item todos on trivial work) — the guard rejects the
+# call and the ModelRetry corrects the model in-session.
+TODO_MIN_ITEMS = 3
+
+
+def _todo_create(deps: AgentDeps, items: list[str]) -> str:
+    """Create/replace the task's todo checklist (feature tasks only).
+
+    Raises ValueError (→ ModelRetry via _run_tool) for a degenerate list:
+    the agent must not maintain a checklist for single-step work."""
+    cleaned = [item.strip() for item in items if item and item.strip()]
+    if len(cleaned) < TODO_MIN_ITEMS:
+        raise ValueError(
+            f"todo_create needs at least {TODO_MIN_ITEMS} items, got "
+            f"{len(cleaned)}: for single-step work do not use the checklist, "
+            "just work."
+        )
+    task = deps.manager.get(deps.task_id)
+    replaced = bool(task.todos)
+    task.todos = [TodoItem(text=text) for text in cleaned]
+    task.touch()
+    deps.manager.storage.save(task)
+    head = "Checklist replaced" if replaced else "Checklist created"
+    return f"{head} with {len(cleaned)} items:\n{render_todos(task.todos)}"
+
+
+def _todo_update(deps: AgentDeps, targets: list[int | str], done: bool) -> str:
+    """Check/uncheck checklist items by 1-based index or text fragment.
+
+    Raises ValueError (→ ModelRetry via _run_tool) when a target matches
+    nothing — the model then corrects itself instead of silently losing an
+    item."""
+    task = deps.manager.get(deps.task_id)
+    if not task.todos:
+        raise ValueError("This task has no checklist — call todo_create first.")
+    matched: set[int] = set()
+    for target in targets:
+        if isinstance(target, int):
+            index = target
+        elif isinstance(target, str) and target.strip().isdigit():
+            index = int(target.strip())
+        else:
+            fragment = str(target).strip().lower()
+            hits = [
+                i for i, item in enumerate(task.todos) if fragment in item.text.lower()
+            ]
+            if not hits:
+                raise ValueError(
+                    f"No checklist item matches {target!r}; the current "
+                    f"items are:\n{render_todos(task.todos)}"
+                )
+            matched.update(hits)
+            continue
+        if not 1 <= index <= len(task.todos):
+            raise ValueError(
+                f"todo index {index} is out of range 1..{len(task.todos)}."
+            )
+        matched.add(index - 1)
+    for i in sorted(matched):
+        task.todos[i].done = done
+    task.touch()
+    deps.manager.storage.save(task)
+    return (
+        f"Checklist updated ({len(matched)} item(s) marked "
+        f"{'done' if done else 'not done'}):\n{render_todos(task.todos)}"
+    )
 
 
 def load_agents_md(root: Path) -> str:
@@ -322,6 +393,40 @@ def build_agent(
         rm/mv/cp are only allowed with paths inside the project root or your
         scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
+
+    # Self-managed todo checklist: registered for FEATURE agents only.
+    # Bug tasks (minimal-change mandate in the bug prompt), research tasks
+    # and the tester get NO todo tools — this structurally prevents the
+    # one-item-list-on-a-small-bugfix anti-pattern. The list lives on the
+    # task (`task.todos`, persisted by storage) and is re-injected into the
+    # model context on every activation and after every compaction by the
+    # pipeline (tui/pipeline.py), so an abandoned stale list cannot go
+    # unnoticed either. Both tools run through _run_tool so the fixable
+    # ValueErrors below become ModelRetry prompts for the model.
+    if kind is TaskKind.FEATURE:
+
+        @agent.tool(sequential=True)
+        async def todo_create(ctx: RunContext[AgentDeps], items: list[str]) -> str:
+            """Create (or replace) the todo checklist for THIS task: the plan
+            of the work you are about to do, shown to the user as a panel.
+            Pass the steps as short imperative strings, in execution order.
+            Call it once, at the start, when the work has 3 or more meaningful
+            steps; do NOT create a checklist for trivial work (fewer than 3
+            steps — just work instead). Replacing an existing list is allowed
+            when the plan genuinely changed; keep already-done items and mark
+            them done with todo_update afterwards."""
+            return await _run_tool(_todo_create, ctx.deps, items)
+
+        @agent.tool(sequential=True)
+        async def todo_update(
+            ctx: RunContext[AgentDeps], targets: list[int | str], done: bool
+        ) -> str:
+            """Check (done=True) or uncheck (done=False) checklist items of
+            this task. `targets` are 1-based item positions (as shown in the
+            checklist) or item-text fragments; update the checklist
+            IMMEDIATELY after finishing each item — before starting the next
+            one."""
+            return await _run_tool(_todo_update, ctx.deps, targets, done)
 
     # Task-creation tools exist only for the research agent: coding
     # agents (feature/bug) work on their own task and must not spawn more;

@@ -208,6 +208,7 @@ class ActionsLayer(DrCodeState):
         self._new_task_chrome()
         self._update_kind_label()
         self.refresh_task_status()
+        self.refresh_todo_panel()
         self.new_task_input.focus()
 
     # -- editing a held task ---------------------------------------------------
@@ -260,6 +261,7 @@ class ActionsLayer(DrCodeState):
         self._new_task_chrome()
         self._update_kind_label()
         self.refresh_task_status()
+        self.refresh_todo_panel()
         self.new_task_input.focus()
 
     def _leave_new_task_mode(self) -> None:
@@ -271,6 +273,7 @@ class ActionsLayer(DrCodeState):
         self._clear_stream_label()
         self.chat_input.remove_class("hidden")
         self.refresh_task_status()
+        self.refresh_todo_panel()
 
     def cancel_new_task(self) -> None:
         self._editing_task_id = None
@@ -452,6 +455,9 @@ class ActionsLayer(DrCodeState):
             self._current_tool[task.id] = None
         # The user pressed Done right here: the status observers
         # (notifications) must not report this transition.
+        # Completion soft gate (same as the pipeline's automatic path):
+        # unchecked checklist items are announced, not blocking.
+        self._todo_completion_warning(task)
         self.manager.mark_done(task.id, origin="user")
         self.refresh_sidebar()
         self.view_task(task.id)

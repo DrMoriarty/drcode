@@ -22,3 +22,7 @@
 
 ## Critical Context
 - [important technical details, file paths, identifiers, etc.]
+
+## Task checklist
+- [current state of the task's todo checklist: every item with its checked
+  [x] / unchecked [ ] marker, or "(none)"]

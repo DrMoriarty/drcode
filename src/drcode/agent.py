@@ -38,6 +38,7 @@ from .compaction import (
 from .config import Config
 from .models import (
     Clarification,
+    Task,
     TaskKind,
     TaskStatus,
     TodoItem,
@@ -127,6 +128,8 @@ __all__ = [
     "sanitized_messages",
     "serialize_messages",
     "split_original_prompts",
+    "todo_dynamic_instructions",
+    "todo_instructions",
 ]
 
 
@@ -194,7 +197,11 @@ def _todo_create(deps: AgentDeps, items: list[str]) -> str:
     task.touch()
     deps.manager.storage.save(task)
     head = "Checklist replaced" if replaced else "Checklist created"
-    return f"{head} with {len(cleaned)} items:\n{render_todos(task.todos)}"
+    return (
+        f"{head} with {len(cleaned)} items:\n{render_todos(task.todos)}\n\n"
+        "Keep the list accurate: call todo_update immediately after "
+        "finishing each item, before starting the next one."
+    )
 
 
 def _todo_update(deps: AgentDeps, targets: list[int | str], done: bool) -> str:
@@ -239,6 +246,51 @@ def _todo_update(deps: AgentDeps, targets: list[int | str], done: bool) -> str:
     )
 
 
+def todo_instructions(task: Task) -> str | None:
+    """The task's current checklist state as an instruction block (feature
+    tasks with a non-empty list only — nothing else has todo tools or a
+    checklist).
+
+    This is the key anti-"forgot the list" measure. It is injected as
+    DYNAMIC instructions (see `todo_dynamic_instructions`), so it is
+    recomputed for EVERY model request of every activation: the model sees
+    the live list state on the very first request after a `todo_create`
+    call within the same uninterrupted run, not only after a restart or a
+    compaction. A synthetic user message would pile up one stale copy per
+    activation in the persisted transcript; instructions never touch the
+    transcript. The list itself lives in `task.todos`; if it were only
+    prompt material, an interrupted attempt or a compaction could drop it."""
+    if task.kind is not TaskKind.FEATURE or not task.todos:
+        return None
+    unchecked = len(task.unchecked_todos)
+    lines = [
+        "# Task checklist (current state)",
+        "",
+        "Your todo checklist for this task, as it stands right now:",
+        "",
+        render_todos(task.todos),
+        "",
+        (
+            f"{unchecked} of {len(task.todos)} items are unchecked. Keep the "
+            "list accurate with todo_update: check an item off immediately "
+            "after finishing it, before starting the next one. Do not finish "
+            "the task while items remain unchecked unless the user "
+            "explicitly dropped them."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def todo_dynamic_instructions(ctx: RunContext[AgentDeps]) -> str | None:
+    """Dynamic instructions hook: recompute the checklist block from the
+    task's CURRENT state for every model request. Registered on the coding
+    agent in `build_agent` — pydantic-ai evaluates it per request, so a
+    checklist created (or updated) mid-activation is visible to the next
+    request of the same run, which run-level `instructions=` (frozen at
+    `agent.iter` start) could never achieve."""
+    return todo_instructions(ctx.deps.manager.get(ctx.deps.task_id))
+
+
 def load_agents_md(root: Path) -> str:
     """Return the project's AGENTS.md content, or an empty string if absent."""
     try:
@@ -274,6 +326,13 @@ def build_agent(
         },
         retries=10,
     )
+    # Dynamic instructions: the feature task's checklist state rides on
+    # EVERY model request (recomputed from `task.todos` at request time),
+    # so a list created or updated mid-activation is seen by the next
+    # request of the same run — run-level `instructions=` freezes at
+    # `agent.iter` start and would miss exactly that. For non-feature
+    # tasks and empty lists it yields None (excluded from the request).
+    agent.instructions(todo_dynamic_instructions)
 
     # All blocking tools run in a worker thread (or as asyncio subprocesses
     # for run_bash): called inline they would stall the event loop, which
@@ -398,11 +457,12 @@ def build_agent(
     # Bug tasks (minimal-change mandate in the bug prompt), research tasks
     # and the tester get NO todo tools — this structurally prevents the
     # one-item-list-on-a-small-bugfix anti-pattern. The list lives on the
-    # task (`task.todos`, persisted by storage) and is re-injected into the
-    # model context on every activation and after every compaction by the
-    # pipeline (tui/pipeline.py), so an abandoned stale list cannot go
-    # unnoticed either. Both tools run through _run_tool so the fixable
-    # ValueErrors below become ModelRetry prompts for the model.
+    # task (`task.todos`, persisted by storage) and is injected into the
+    # model context on every request by the dynamic instructions hook
+    # (`todo_dynamic_instructions`, registered above), so an abandoned
+    # stale list cannot go unnoticed either. Both tools run through
+    # _run_tool so the fixable ValueErrors below become ModelRetry
+    # prompts for the model.
     if kind is TaskKind.FEATURE:
 
         @agent.tool(sequential=True)

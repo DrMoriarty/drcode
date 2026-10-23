@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.messages import ModelRequest
+from pydantic_ai.models.test import TestModel
 
 from drcode import agent as agent_mod
 from drcode.agent import AgentDeps
@@ -189,6 +191,106 @@ def test_render_todos_numbered() -> None:
 
 
 # -- context injection ----------------------------------------------------------
+
+
+class _CreateThenFinishModel(TestModel):
+    """TestModel variant simulating the #fbb0d9fe scenario: the model
+    calls todo_create on the FIRST request of a run, then just answers —
+    all within ONE uninterrupted activation."""
+
+    def _get_tool_calls(self, model_request_parameters):  # type: ignore[no-untyped-def]
+        if not getattr(self, "_created", False):
+            self._created = True
+            defs = {t.name: t for t in model_request_parameters.function_tools}
+            return [("todo_create", defs["todo_create"])]
+        return []
+
+    def gen_tool_args(self, tool_def):  # type: ignore[no-untyped-def]
+        if tool_def.name == "todo_create":
+            return {"items": ["explore code", "implement", "run tests"]}
+        return super().gen_tool_args(tool_def)
+
+
+async def test_dynamic_instructions_reflect_state_within_activation(
+    manager, fake_config: Config
+) -> None:
+    """Regression (#fbb0d9fe): a checklist created at the start of an
+    activation must be visible in the instructions of the LATER model
+    requests of the SAME activation. Run-level `instructions=` froze the
+    (empty) state at `agent.iter` start, so the reminder never appeared;
+    dynamic instructions are recomputed per request."""
+    from pydantic_ai import capture_run_messages
+
+    from drcode.agent import build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    deps = _deps(manager, task, Path.cwd())
+
+    with capture_run_messages() as messages:
+        async with ag.iter(
+            "do the work", model=_CreateThenFinishModel(), deps=deps
+        ) as run:
+            async for _node in run:
+                pass
+
+    model_requests = [
+        m
+        for m in messages
+        if isinstance(m, ModelRequest)
+    ]
+    assert len(model_requests) >= 2
+    # Before todo_create: no live checklist block (the static prompt
+    # section about todo_create / todo_update is always there).
+    assert "# Task checklist (current state)" not in (
+        model_requests[0].instructions or ""
+    )
+    assert "explore code" not in (model_requests[0].instructions or "")
+    # After todo_create, same activation: the live state rides on the request.
+    final = model_requests[-1].instructions or ""
+    assert "# Task checklist (current state)" in final
+    assert "1. [ ] explore code" in final
+    assert "3 of 3 items are unchecked" in final
+    # The dynamic instructions never touch the persisted transcript.
+    stored = manager.get(task.id).messages
+    assert all("Task checklist (current state)" not in json.dumps(m) for m in stored)
+
+
+def test_dynamic_instructions_hook_direct(manager, fake_config: Config) -> None:
+    """The registered hook recomputes from the CURRENT task state: None
+    before todo_create, the live list after it."""
+    from pydantic_ai import RunContext
+    from pydantic_ai.usage import RunUsage
+
+    from drcode.agent import _todo_create, build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    deps = _deps(manager, task, Path.cwd())
+    ctx = RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+
+    # The hook IS registered as dynamic instructions on the built agent.
+    assert any(
+        part.instruction is agent_mod.todo_dynamic_instructions and part.dynamic
+        for part in ag._instructions
+    )
+    assert agent_mod.todo_dynamic_instructions(ctx) is None
+    _todo_create(deps, ["write tests", "add module", "run linters"])
+    text = agent_mod.todo_dynamic_instructions(ctx)
+    assert text is not None
+    assert "1. [ ] write tests" in text
+    assert "todo_update" in text
+
+
+def test_todo_create_result_reminds_to_update(manager, tmp_path) -> None:
+    """The tool result itself carries the discipline reminder — the model
+    sees it right when the list appears (its very first request already
+    happened, so instructions alone can't reach that turn)."""
+    from drcode.agent import _todo_create
+
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    result = _todo_create(_deps(manager, task, tmp_path), ["a", "b", "c"])
+    assert "todo_update immediately after" in result
 
 
 def test_todo_instructions_feature_with_items() -> None:

@@ -46,6 +46,7 @@ from ..agent import (
     sanitized_messages,
     serialize_messages,
     split_original_prompts,
+    todo_instructions,
 )
 from ..config import Config
 from ..github import (
@@ -120,36 +121,18 @@ class PipelineLayer(DrCodeState):
 
     @staticmethod
     def _todo_instructions(task: Task) -> str | None:
-        """Per-run instructions carrying the task's current checklist state
-        (feature tasks with a non-empty list only — nothing else has todo
-        tools or a checklist).
+        """Delegating alias for `agent.todo_instructions` — the checklist
+        block injected into the model context.
 
-        This is the key anti-"forgot the list" measure: the state rides on
-        EVERY `agent.iter` call as run instructions — it is in front of the
-        model on every activation and on every turn after a compaction —
-        without being appended to the persisted transcript (a synthetic
-        user message would pile up one copy per activation). The list
-        itself lives in `task.todos`; if it were only prompt material, an
-        interrupted attempt or a compaction could drop it."""
-        if task.kind is not TaskKind.FEATURE or not task.todos:
-            return None
-        unchecked = len(task.unchecked_todos)
-        lines = [
-            "# Task checklist (current state)",
-            "",
-            "Your todo checklist for this task, as it stands right now:",
-            "",
-            render_todos(task.todos),
-            "",
-            (
-                f"{unchecked} of {len(task.todos)} items are unchecked. Keep the "
-                "list accurate with todo_update: check an item off immediately "
-                "after finishing it, before starting the next one. Do not finish "
-                "the task while items remain unchecked unless the user "
-                "explicitly dropped them."
-            ),
-        ]
-        return "\n".join(lines)
+        The injection itself is DYNAMIC now: `build_agent` registers
+        `agent.todo_dynamic_instructions`, which pydantic-ai recomputes
+        from the task's current state for EVERY model request. That fixed
+        the #fbb0d9fe class of failures: run-level `instructions=` was
+        frozen at `agent.iter` start, so a checklist created (or updated)
+        mid-activation was invisible to the remaining requests of that
+        run. The alias stays for tests and the state protocol; the
+        pipeline itself no longer passes run-level instructions."""
+        return todo_instructions(task)
 
     def _todo_completion_warning(self, task: Task) -> None:
         """Completion soft gate: when a task leaves development with
@@ -1059,7 +1042,6 @@ class PipelineLayer(DrCodeState):
                     async with agent.iter(
                         text,
                         message_history=history,
-                        instructions=self._todo_instructions(task),
                         deps=AgentDeps(
                             root=root,
                             manager=self.manager,

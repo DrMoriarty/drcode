@@ -816,7 +816,11 @@ def _tool_names(ag) -> set[str]:
 
 
 def _instructions_text(ag) -> str:
-    return "\n".join(si.instruction for si in ag._instructions)
+    # Dynamic instruction hooks are functions recomputed per request —
+    # only the literal (static) parts carry prompt text.
+    return "\n".join(
+        si.instruction for si in ag._instructions if isinstance(si.instruction, str)
+    )
 
 
 def test_build_agent_instructions_by_kind(fake_config: Config) -> None:

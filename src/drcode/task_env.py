@@ -201,6 +201,12 @@ class TaskEnvironment:
         Blocking (git + the untracked-file copy): call via
         `asyncio.to_thread` from the pipeline.
         """
+        if not self.enabled:
+            # Isolation off: the task works in the project directory. An
+            # existing worktree of this task (left over from a session
+            # where the setting was on) is NOT reused silently — removing
+            # it is `remove`/`cleanup_orphans`' job.
+            return self.project_root, ""
         if not self.available:
             if self.enabled:
                 # The persisted-but-dormant mode (worktree without a git

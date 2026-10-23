@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -258,7 +259,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # setting in the dialog applies from the next activation. Removal
         # of a task (cancel/delete/purge) tears its worktree down here.
         self.task_env = TaskEnvironment(project_root, self.settings)
+        # Worktree service events (snapshot commits, kept-branch notices)
+        # surface through the task's event history — or a toast when the
+        # task is already gone (delete / retention purge).
+        self.task_env.event_log = self._task_env_event
         self.manager.add_removal_listener(self.task_env.remove)
+        # RULE 1 (see drcode.task_env): a verdict never leaves the task
+        # with a dirty tree — every transition out of active work
+        # (tester verdict, cancel) snapshots the worktree onto the task's
+        # branch before anything can tear it down.
+        self.manager.add_status_listener(self._snapshot_on_settled)
+        # Strong references to the in-flight background snapshot tasks
+        # (a bare create_task result can be garbage-collected mid-flight).
+        self._snapshot_jobs: set[asyncio.Task[None]] = set()
         # GitHub Issues sync: persisted bookkeeping (last sync, seen issue
         # numbers) and the monotonic time of the next scheduled cycle. The
         # first cycle runs shortly after startup.
@@ -603,6 +616,102 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             )
         except Exception as e:  # noqa: BLE001 - best-effort surface only
             print(f"drcode: notification error surfacing failed: {e}", file=sys.stderr)
+
+    # -- worktree snapshots (task-isolation bookkeeping) -------------------------
+
+    def _on_app_thread(self) -> bool:
+        return getattr(self, "_thread_id", None) == threading.get_ident()
+
+    def _snapshot_on_settled(
+        self, task: Task, old: TaskStatus, new: TaskStatus, origin: str
+    ) -> None:
+        """Status listener: RULE 1 of the worktree contract — a verdict
+        never leaves the task with a dirty tree. On every transition out
+        of active work into COMPLETED (the tester's PASSED/FAILED
+        verdict, Ctrl+X cancel, finalize without verification) the task's
+        worktree is committed onto its branch `drcode/<task-id>` in the
+        background; the result lands in the task's service-event history.
+        When the tester already committed via its git_commit tool, the
+        snapshot is a no-op. Without isolation this never fires: the work
+        lives in the shared main tree and nothing here may touch it."""
+        if new is not TaskStatus.COMPLETED or old not in (
+            TaskStatus.ACTIVE,
+            TaskStatus.TESTING,
+        ):
+            return
+        if not self.task_env.active:
+            return
+        if origin == "user":
+            note = "cancelled"
+        elif task.verification is not None:
+            note = f"tester verdict: {task.verification.value}"
+        else:
+            note = "completed without verification"
+        self._snapshot_in_background(task.id, note)
+
+    def _snapshot_in_background(self, task_id: str, note: str) -> None:
+        """Run task_env.snapshot off the UI thread (blocking git calls —
+        this is bookkeeping, not model work) and log the result into the
+        task's service-event history."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # A worker thread (e.g. the tester's set_verification tool):
+            # no loop here — a plain daemon thread does the job.
+
+            def _run() -> None:
+                msg = self.task_env.snapshot(task_id, note)
+                if msg is not None:
+                    self._task_env_event(task_id, msg)
+
+            threading.Thread(target=_run, name="drcode-snapshot", daemon=True).start()
+        else:
+
+            async def _job() -> None:
+                msg = await asyncio.to_thread(self.task_env.snapshot, task_id, note)
+                if msg is not None:
+                    self._task_env_event(task_id, msg)
+
+            # Hold a strong reference: a bare create_task result can be
+            # garbage-collected mid-flight.
+            job = loop.create_task(_job())
+            self._snapshot_jobs.add(job)
+            job.add_done_callback(self._snapshot_jobs.discard)
+
+    def _task_env_event(self, task_id: str, text: str) -> None:
+        """Service-event sink for the worktree environment
+        (TaskEnvironment.event_log): snapshot commits and kept-branch
+        notices. Logged into the task's service-event history when the
+        task still exists; otherwise (delete / retention purge / orphan
+        sweep — the task's chat is already gone) surfaced as a toast, so
+        the user still learns that a branch with its work was kept."""
+        task = self.manager.tasks.get(task_id)
+        if task is not None:
+            if self._on_app_thread():
+                self._show_event(task, text)
+            else:
+                self._log_event(task, text)
+            return
+        self._announce_cleanup(text)
+
+    def _announce_cleanup(self, text: str) -> None:
+        """Best-effort toast for worktree notices of tasks that no longer
+        exist (never fatal, also before the app is mounted / from worker
+        threads)."""
+        if not self.is_running:
+            return
+        try:
+            if self._on_app_thread():
+                self.notify(text, title="Worktree cleanup", timeout=8)
+            else:
+                self.call_from_thread(
+                    self.notify, text, title="Worktree cleanup", timeout=8
+                )
+        except Exception as e:  # noqa: BLE001 - the toast is best-effort
+            print(
+                f"drcode: worktree notice failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     def on_unmount(self) -> None:
         # Clear the tab title so "DrCode — <project>" doesn't stick around

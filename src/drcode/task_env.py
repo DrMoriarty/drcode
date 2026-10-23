@@ -31,12 +31,38 @@ Lifecycle contract (enforced here and by the pipeline):
   payload — see `drcode.workflow`). The worktree directory lives as long
   as the task does; it is removed when the task is deleted (including
   the retention auto-cleanup).
-- cancel (Ctrl+X) / delete (Ctrl+Delete): worktree removed, branch
-  `drcode/<task-id>` deleted (wired through TaskManager's removal
-  listeners).
+- cancel (Ctrl+X) / delete (Ctrl+Delete): the worktree is removed; the
+  branch `drcode/<task-id>` is deleted ONLY when it holds no unmerged
+  commits (see the user-facing contract below). Before every removal a
+  final snapshot commits a dirty tree onto the branch, so no verdict /
+  cancel / purge can strand uncommitted work in a directory that is
+  about to disappear (wired through TaskManager's removal listeners).
 - startup: worktree directories and `drcode/*` branches without a live
   task (crashed session, deleted task) are cleaned up
-  (`cleanup_orphans`).
+  (`cleanup_orphans`) — under the same two rules: a dirty tree is
+  snapshotted first, a branch with unmerged commits is kept.
+
+User-facing contract:
+
+    Every task leaves behind a committed branch `drcode/<task-id>`; the
+    worktree directory is disposable and can be removed at any time
+    without loss. drcode never deletes a branch containing unmerged
+    commits and never merges it into the user's base branch itself —
+    merging stays with `.drcode/workflow.py` `on_accepted` / the user.
+
+Two rules enforce it (both active only under worktree isolation —
+without isolation everything lives in the shared main tree and nothing
+here may change its behavior):
+
+1. A verdict never leaves the task with a dirty tree: `snapshot()`
+   commits the worktree's changes onto `drcode/<task-id>` whenever the
+   task transitions out of active work (tester verdict, cancel) and
+   before any removal.
+2. A branch with unique commits is never deleted automatically: before
+   every `branch -D`, the commits not reachable from the main checkout's
+   current branch are counted; if there are any, the branch survives
+   (the worktree directory is still removed — commits live in the repo
+   object store, the directory is disposable).
 
 Files git does not track are not part of a worktree checkout. To keep
 `.env`-style local configuration and ignored artifacts available to the
@@ -60,10 +86,18 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from .gitignore import _is_git_repo
 from .settings import ProjectSettings, TaskIsolation
+
+# Optional service-event sink wired by the app: `(task_id, text)`. The
+# worktree environment calls it when something happens the user must know
+# about (a snapshot commit, a branch kept against deletion) but cannot log
+# into the task's own event history itself — on the delete/retention paths
+# the task is already gone from the manager when the notice fires.
+EventLog = Callable[[str, str], None]
 
 # Where the per-task worktrees live (inside the already-gitignored private
 # state directory of the project).
@@ -121,6 +155,8 @@ class TaskEnvironment:
     def __init__(self, project_root: Path, settings: ProjectSettings) -> None:
         self.project_root = project_root
         self.settings = settings
+        # Service-event sink (EventLog): set by the app; best-effort.
+        self.event_log: EventLog | None = None
 
     # -- state ---------------------------------------------------------------
 
@@ -158,11 +194,12 @@ class TaskEnvironment:
 
     # -- git plumbing (sync subprocesses; callers wrap in to_thread) ----------
 
-    def _git(self, *args: str) -> tuple[int, str]:
-        """Run git in the project root; returns (returncode, combined output)."""
+    def _git(self, *args: str, cwd: Path | None = None) -> tuple[int, str]:
+        """Run git in the project root (or `cwd`, e.g. a task's worktree);
+        returns (returncode, combined output)."""
         proc = subprocess.run(
             ["git", *args],
-            cwd=self.project_root,
+            cwd=cwd if cwd is not None else self.project_root,
             capture_output=True,
             text=True,
             timeout=120,
@@ -304,12 +341,94 @@ class TaskEnvironment:
             )
         return ""
 
+    def snapshot(self, task_id: str, note: str = "") -> str | None:
+        """Commit every change in the task's worktree onto its branch
+        (RULE 1: a verdict never leaves the task with a dirty tree).
+
+        Runs `git add -A -- . ':(exclude).drcode'` + `git commit` inside
+        the task's worktree, so the work of a task that just left active
+        work (tester verdict, cancel, removal) is anchored on the branch
+        `drcode/<task-id>` — the worktree directory itself is disposable
+        afterwards. When the tester already committed through its
+        git_commit tool (or the tree is simply clean) the snapshot is a
+        no-op.
+
+        Returns a human-readable result for the service-event log —
+        either "snapshot committed on <branch> @ <sha>" or "worktree
+        clean, nothing to snapshot". None is a true no-op: isolation is
+        off / not a git repo / the worktree does not exist / git failed.
+
+        This is pipeline-level bookkeeping, NOT model work: blocking git
+        calls — run via asyncio.to_thread from the pipeline/listeners.
+        """
+        if not self.active:
+            return None
+        wt = self.worktree_path(task_id)
+        if not wt.is_dir():
+            return None
+        branch = self.branch(task_id)
+        try:
+            code, out = self._git(
+                "status", "--porcelain", "--", ".", ":(exclude).drcode", cwd=wt
+            )
+            if code != 0:
+                return None
+            if not out.strip():
+                return "worktree clean, nothing to snapshot"
+            code, _ = self._git("add", "-A", "--", ".", ":(exclude).drcode", cwd=wt)
+            if code != 0:
+                return None
+            message = (
+                f"drcode: snapshot of {task_id} ({note})"
+                if note
+                else f"drcode: snapshot of {task_id}"
+            )
+            code, _ = self._git("commit", "-m", message, cwd=wt)
+            if code != 0:
+                return None
+            code, sha = self._git("rev-parse", "--short", "HEAD", cwd=wt)
+            return f"snapshot committed on {branch} @ {sha if code == 0 else '?'}"
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _base_branch(self) -> str:
+        """The main checkout's current branch — the base the unmerged
+        commits of a task branch are counted against. Falls back to HEAD
+        (detached HEAD, unusual setups): counting against whatever HEAD
+        points at still protects the task's own commits."""
+        code, out = self._git("symbolic-ref", "--short", "HEAD")
+        if code == 0 and out:
+            return out
+        return "HEAD"
+
+    def _unmerged_count(self, branch: str) -> int:
+        """How many commits of `branch` are NOT reachable from the base
+        branch (RULE 2's delete-protection counter). 0 also on any git
+        failure — when git cannot tell, the old delete behavior applies
+        (the snapshot above is the real safety net)."""
+        code, out = self._git("rev-list", "--count", f"{self._base_branch()}..{branch}")
+        if code != 0:
+            return 0
+        try:
+            return int(out or "0")
+        except ValueError:
+            return 0
+
     def remove(self, task_id: str) -> None:
-        """Remove the task's worktree and its `drcode/<task-id>` branch.
+        """Remove the task's worktree; its `drcode/<task-id>` branch only
+        when it holds no unmerged commits (RULE 2 — see the module
+        docstring).
+
+        Belt-and-suspenders for RULE 1: a dirty tree is snapshotted first,
+        so a delete / retention purge that never passed through a verdict
+        transition (whose status listener already snapshots) cannot lose
+        uncommitted work either. The snapshot result and any kept-branch
+        notice go through `event_log` — the task is often already gone
+        from the manager here, so the app surfaces those as toasts.
 
         Called on cancel (Ctrl+X) and delete (Ctrl+Delete) through
         TaskManager's removal listeners — and therefore from sync context:
-        best-effort, never raises, fast (two git calls). A no-op when
+        best-effort, never raises (a handful of git calls). A no-op when
         nothing exists; works regardless of the current setting so
         leftovers of a session where isolation was toggled off are still
         cleaned.
@@ -317,6 +436,13 @@ class TaskEnvironment:
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
         try:
+            snap = self.snapshot(task_id, "before removal")
+            if (
+                snap is not None
+                and snap.startswith("snapshot committed")
+                and self.event_log is not None
+            ):
+                self.event_log(task_id, snap)
             self._git("worktree", "prune")
             if wt.is_dir():
                 code, _ = self._git("worktree", "remove", "--force", str(wt))
@@ -325,7 +451,17 @@ class TaskEnvironment:
             elif wt.exists():
                 wt.rmdir()  # empty leftover dir
             if self._branch_exists(branch):
-                self._git("branch", "-D", branch)
+                unmerged = self._unmerged_count(branch)
+                if unmerged > 0:
+                    # RULE 2: commits live in the object store — the
+                    # directory was disposable, the branch is not.
+                    if self.event_log is not None:
+                        self.event_log(
+                            task_id,
+                            f"branch {branch} kept ({unmerged} unmerged commits)",
+                        )
+                else:
+                    self._git("branch", "-D", branch)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -335,10 +471,13 @@ class TaskEnvironment:
         retention auto-cleanup). Returns the removed task ids.
 
         Worktrees/branches of LIVE tasks — including completed ones whose
-        work must stay inspectable — are never touched. Blocking (git
-        calls): run via `asyncio.to_thread` at app startup. Skipped
-        entirely when there is nothing to sweep (not a git repo, or the
-        setting is off and no worktree directory exists).
+        work must stay inspectable — are never touched. Both RULEs apply
+        here too: a dead task's dirty tree is snapshotted onto its branch
+        before the directory goes, and a branch with unmerged commits is
+        never deleted (a kept branch is reported through `event_log`).
+        Blocking (git calls): run via `asyncio.to_thread` at app startup.
+        Skipped entirely when there is nothing to sweep (not a git repo,
+        or the setting is off and no worktree directory exists).
         """
         if not self.available:
             return []
@@ -353,6 +492,13 @@ class TaskEnvironment:
                 for entry in wt_root.iterdir():
                     if entry.name in live_task_ids:
                         continue
+                    snap = self.snapshot(entry.name, "before orphan cleanup")
+                    if (
+                        snap is not None
+                        and snap.startswith("snapshot committed")
+                        and self.event_log is not None
+                    ):
+                        self.event_log(entry.name, snap)
                     code, _ = self._git("worktree", "remove", "--force", str(entry))
                     if code != 0:
                         shutil.rmtree(entry, ignore_errors=True)
@@ -361,8 +507,11 @@ class TaskEnvironment:
                 wt_root.rmdir()
             # Branch sweep: `drcode/<task-id>` without a live task — e.g.
             # the branch of a cancelled task whose worktree removal never
-            # ran — is deleted; a branch still checked out in a registered
-            # worktree is left alone (git refuses to delete it anyway).
+            # ran — is deleted, UNLESS it holds unmerged commits (RULE 2):
+            # those branches are the last home of the task's work and stay.
+            # A branch still checked out in some registered worktree makes
+            # -D fail — ignored, the worktree sweep above has already
+            # deregistered ours.
             code, out = self._git(
                 "for-each-ref", "--format=%(refname:short)", "refs/heads"
             )
@@ -374,9 +523,14 @@ class TaskEnvironment:
                     task_id = branch[len(BRANCH_PREFIX) :]
                     if task_id in live_task_ids:
                         continue
-                    # A branch still checked out in some worktree makes -D
-                    # fail — ignored, the worktree sweep above has already
-                    # deregistered ours.
+                    unmerged = self._unmerged_count(branch)
+                    if unmerged > 0:
+                        if self.event_log is not None:
+                            self.event_log(
+                                task_id,
+                                f"branch {branch} kept ({unmerged} unmerged commits)",
+                            )
+                        continue
                     self._git("branch", "-D", branch)
                     if task_id not in removed:
                         removed.append(task_id)

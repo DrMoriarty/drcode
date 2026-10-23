@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import timedelta
 from pathlib import Path
 
@@ -116,6 +117,18 @@ def test_save_is_atomic_no_tmp_leftovers(project_root: Path) -> None:
     storage.save(task)
     leftovers = list(storage.tasks_dir.glob("*.tmp"))
     assert leftovers == []
+
+
+def test_save_recreates_vanished_state_dir(project_root: Path) -> None:
+    # If .drcode/tasks is removed externally mid-session (e.g. by an `rm -rf`
+    # that predates the guard), save() must recreate the dir instead of
+    # raising FileNotFoundError and killing the pipeline worker.
+    storage = Storage(project_root)
+    task = make_task("survivor")
+    shutil.rmtree(project_root / ".drcode")
+    storage.save(task)
+    assert (storage.tasks_dir / f"{task.id}.json").is_file()
+    assert storage.load_all()[0].title == "survivor"
 
 
 def test_gitignore_appended_when_missing(project_root: Path) -> None:

@@ -26,6 +26,8 @@ import shlex
 import shutil
 from pathlib import Path
 
+from .config import PROJECT_STATE_DIRNAME
+
 MAX_TOOL_OUTPUT = 10_000
 BASH_TIMEOUT = 120
 # Hard cap for a run_bash call: the agent may request a longer timeout than
@@ -118,6 +120,16 @@ def _bash_violation(
     return PathViolation(
         f"Command refused: '{command}': {cmd}{target} would touch files outside "
         f"the allowed locations. {_writable_hint(root, extra_writable)}"
+    )
+
+
+def _state_dir_violation(command: str, cmd: str, path: str | None) -> PathViolation:
+    target = f" with path '{path}'" if path else ""
+    return PathViolation(
+        f"Command refused: '{command}': {cmd}{target} would touch the project "
+        f"state directory '{PROJECT_STATE_DIRNAME}/' — it holds drcode's task "
+        f"history, settings and worktrees, is not recoverable (it is gitignored), "
+        f"and must not be deleted, moved or overwritten."
     )
 
 
@@ -356,9 +368,13 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
     assignments (VAR=…) and common wrappers (sudo, nohup, …). For a
     destructive command every non-flag argument is treated as a path and
     checked against the writable area (project root + `extra_writable`).
-    Nested command substitution (`echo $(rm …)`) is not analysed; only
-    top-level invocations are.
+    The project state directory (`<root>/.drcode`) is protected even though
+    it sits inside the writable area: a path resolving into it — or into an
+    ancestor of it (`rm -rf .`, `rm -rf <root>`) — is refused, since deleting
+    it destroys all task history irrecoverably. Nested command substitution
+    (`echo $(rm …)`) is not analysed; only top-level invocations are.
     """
+    state_dir = (root / PROJECT_STATE_DIRNAME).resolve()
     for segment in _SEGMENT_SPLIT.split(command):
         segment = segment.strip()
         if not segment:
@@ -403,6 +419,8 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
             if not p.is_absolute():
                 p = root / p
             p = p.resolve()
+            if p == state_dir or state_dir in p.parents or p in state_dir.parents:
+                raise _state_dir_violation(command, base, raw)
             if not is_writable(root, p, extra_writable):
                 raise _bash_violation(root, command, base, raw, extra_writable)
 

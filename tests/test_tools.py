@@ -403,6 +403,30 @@ def test_check_command_scratch_boundaries(
         check_command(project_root, "rm -rf /tmp/loose")
 
 
+def test_check_command_protects_state_dir(project_root: Path) -> None:
+    # `.drcode` sits inside the writable area but holds all task history
+    # (gitignored, hence unrecoverable) — rm/mv/cp must refuse it and
+    # anything that would take it down with it.
+    with pytest.raises(PathViolation):
+        check_command(project_root, "rm -rf .drcode")
+    with pytest.raises(PathViolation):
+        check_command(project_root, "rm -rf .drcode/tasks")
+    with pytest.raises(PathViolation):
+        check_command(project_root, f"rm -rf {project_root}/.drcode")
+    with pytest.raises(PathViolation):
+        check_command(project_root, "mv .drcode /tmp/loose")
+    with pytest.raises(PathViolation):
+        check_command(project_root, "cp f.txt .drcode/tasks/x.json")
+    # Recursive parents that would swallow the state dir are refused too.
+    with pytest.raises(PathViolation):
+        check_command(project_root, "rm -rf .")
+    with pytest.raises(PathViolation):
+        check_command(project_root, f"rm -rf {project_root}")
+    # Siblings and unrelated paths inside the root stay allowed.
+    check_command(project_root, "rm -rf build")
+    check_command(project_root, "ls .drcode")
+
+
 def test_check_command_refuses_outside_paths(project_root: Path) -> None:
     with pytest.raises(PathViolation):
         check_command(project_root, "rm -rf /")

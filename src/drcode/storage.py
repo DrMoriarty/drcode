@@ -56,6 +56,10 @@ class Storage:
     def save(self, task: Task) -> None:
         path = self.tasks_dir / f"{task.id}.json"
         data = task.model_dump_json(indent=2)
+        # The state dir can vanish mid-session (deleted externally): recreate
+        # it instead of crashing the pipeline worker — already-lost task files
+        # cannot be restored, but every save from now on must keep working.
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.tasks_dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:

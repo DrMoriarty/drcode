@@ -37,9 +37,11 @@ from ..settings import (
     DEV_ROUNDS_OPTIONS,
     FINALIZATION_OPTIONS,
     ISOLATION_OPTIONS,
+    PARALLEL_TASKS_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
     dev_rounds_label,
+    parallel_tasks_label,
 )
 
 if TYPE_CHECKING:
@@ -172,6 +174,7 @@ class SettingsPalette(CommandPalette):
         "Max development rounds:",
         "Nudge stalled agent after:",
         "Task isolation:",
+        "Parallel tasks:",
         "Workflow:",
         "GitHub integration:",
         "Notifications:",
@@ -468,6 +471,16 @@ class ProjectSettingsCommandsProvider(Provider):
                 app.action_change_task_isolation,
             ),
             (
+                f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
+                (
+                    "How many tasks may develop in parallel, each in its "
+                    "own git worktree — needs Task isolation: worktree, "
+                    "otherwise tasks run one at a time (project setting; "
+                    "the tester stays single)"
+                ),
+                app.action_change_parallel_tasks,
+            ),
+            (
                 f"Workflow: {app.workflow_status_label()}",
                 (
                     "Custom branching/review rules: .drcode/git-workflow.md "
@@ -684,6 +697,38 @@ class IsolationOptionsProvider(Provider):
                 partial(app.action_set_task_isolation, option),
             )
             for option in ISOLATION_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class ParallelTasksOptionsProvider(Provider):
+    """Options of the "Parallel tasks" setting (the development-slot
+    limit, 1–4).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.parallel_tasks
+        return [
+            (
+                parallel_tasks_label(count)
+                + (" (current)" if count == current else ""),
+                partial(app.action_set_parallel_tasks, count),
+            )
+            for count in PARALLEL_TASKS_OPTIONS
         ]
 
     async def discover(self) -> Hits:

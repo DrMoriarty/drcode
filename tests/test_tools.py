@@ -483,6 +483,22 @@ def test_run_bash_output_and_exit_code(project_root: Path) -> None:
     assert "hello" in out
 
 
+def test_run_bash_exports_task_env(project_root: Path) -> None:
+    """Parallel development slots: the child process can tell its own task
+    (and its worktree) apart via the exported DRCODE_* variables."""
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            'echo "$DRCODE_TASK_ID|$DRCODE_WORKTREE"',
+            task_id="deadbeef",
+        )
+    )
+    assert f"deadbeef|{project_root}" in out
+    # Without a task id the variables stay unset (no empty-string noise).
+    out = asyncio.run(run_bash(project_root, 'echo "[$DRCODE_TASK_ID]"'))
+    assert "[]" in out
+
+
 def test_run_bash_cwd_is_root(project_root: Path) -> None:
     (project_root / "marker.txt").write_text("here")
     out = asyncio.run(run_bash(project_root, "ls"))

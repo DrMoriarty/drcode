@@ -182,6 +182,12 @@ class TaskManager:
                 return t
         return None
 
+    def active_tasks(self) -> list[Task]:
+        """ALL currently ACTIVE tasks (parallel development: under
+        worktree isolation with `parallel_tasks > 1` more than one task
+        can be in development at once). Creation order, like all_tasks."""
+        return [t for t in self.all_tasks() if t.status is TaskStatus.ACTIVE]
+
     def queued(self) -> list[Task]:
         tasks = [t for t in self.all_tasks() if t.status is TaskStatus.QUEUED]
 
@@ -598,10 +604,16 @@ class TaskManager:
         return task
 
     def promote_next(
-        self, exclude: set[str] | None = None, blocked: set[str] | None = None
+        self,
+        exclude: set[str] | None = None,
+        blocked: set[str] | None = None,
+        *,
+        max_active: int = 1,
     ) -> Task | None:
-        """If no task is active, activate the first queued task that has
-        pending input or an interrupted attempt to resume.
+        """If a development slot is free (fewer than `max_active` tasks
+        are ACTIVE — parallelism lives with the pipeline's promotion loop,
+        this check only keeps the count honest), activate the first queued
+        task that has pending input or an interrupted attempt to resume.
         `exclude` skips tasks that already failed this session (bounded
         retries: a failing task must not stall the whole queue in a loop).
         `blocked` skips tasks whose dependencies are not satisfied yet
@@ -614,7 +626,7 @@ class TaskManager:
         # before searching the queue, so the promotion acts on the full
         # backlog, not just on what this instance loaded earlier.
         self.reload_new_tasks()
-        if self.active is not None:
+        if len(self.active_tasks()) >= max_active:
             return None
         for t in self.queued():
             if (

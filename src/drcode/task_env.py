@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -164,6 +165,12 @@ class TaskEnvironment:
         self.settings = settings
         # Service-event sink (EventLog): set by the app; best-effort.
         self.event_log: EventLog | None = None
+        # Serializes activations (ensure_root): with parallel development
+        # slots several runs may activate concurrently, and their git
+        # worktree prune/add calls must not interleave (`worktree prune`
+        # racing `worktree add` can deregister a worktree another thread
+        # is just creating).
+        self._activation_lock = threading.Lock()
 
     # -- state ---------------------------------------------------------------
 
@@ -252,20 +259,24 @@ class TaskEnvironment:
             # it is `remove`/`cleanup_orphans`' job.
             return self.project_root, ""
         if not self.available:
-            if self.enabled:
-                # The persisted-but-dormant mode (worktree without a git
-                # repo): the app warns at startup; each activation says so
-                # too, once, into the task's service-event log.
-                return self.project_root, (
-                    "the project has no git repository — tasks run in the "
-                    "project directory until one exists (or the setting is "
-                    "turned off)"
-                )
-            return self.project_root, ""
-        if not self.enabled:
-            # Isolation is off (the default): no worktree is ever created —
-            # the task runs in the project directory, silently.
-            return self.project_root, ""
+            # The persisted-but-dormant mode (worktree without a git
+            # repo): the app warns at startup; each activation says so
+            # too, once, into the task's service-event log.
+            return self.project_root, (
+                "the project has no git repository — tasks run in the "
+                "project directory until one exists (or the setting is "
+                "turned off)"
+            )
+        # One activation at a time: the prune/add sequence below is not
+        # race-free against a concurrent activation of another task (the
+        # parallel development slots dispatch several ensure_root calls
+        # in flight at once).
+        with self._activation_lock:
+            return self._ensure_root_locked(task_id)
+
+    def _ensure_root_locked(self, task_id: str) -> tuple[Path, str]:
+        """The git-touching body of ensure_root, run under the activation
+        lock (see __init__)."""
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
         # Stale registrations (directory removed by hand) make `add` fail:

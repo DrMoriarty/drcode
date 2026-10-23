@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,7 @@ from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
 from ..settings import (
     TaskFinalization,
+    TaskIsolation,
 )
 from ..task_env import branch_for
 from ..tools import scratch_dir
@@ -79,6 +81,27 @@ from .usage import (
 
 
 class PipelineLayer(DrCodeState):
+    @property
+    def parallel_limit(self) -> int:
+        """Effective number of parallel development slots: the
+        `parallel_tasks` project setting, but only under worktree
+        isolation — each parallel task needs its own worktree, so
+        anything else behaves as 1 (the persisted value stays, warned
+        about at startup)."""
+        if (
+            self.settings.task_isolation is TaskIsolation.WORKTREE
+            and self.task_env.active
+        ):
+            return max(1, self.settings.parallel_tasks)
+        return 1
+
+    @property
+    def agent_running(self) -> bool:
+        """Whether ANY development agent run is in flight (parallel
+        slots: one flag over the per-task run registry — the tester
+        keeps its own singular `tester_running`)."""
+        return bool(self._agent_runs)
+
     def _coding_config(self) -> Config:
         """Effective model connection of the coding agent (resolved against
         the project's per-role selection and the user-level catalog)."""
@@ -143,36 +166,46 @@ class PipelineLayer(DrCodeState):
     _TPS_WINDOW = 6.0
     _TPS_MIN_SPAN = 1.5
 
-    def _record_stream_tokens(self, text: str) -> None:
-        """Record a streamed delta for the live tok/s estimate.
+    def _record_stream_tokens(self, task_id: str, text: str) -> None:
+        """Record a streamed delta of `task_id`'s run for the live tok/s
+        estimate.
 
         Streaming APIs emit deltas roughly token-sized, so the character
         count divided by the conventional ~4 chars/token is a good enough
         approximation — the point is the visual "is it producing" signal,
-        not billing-grade accounting.
+        not billing-grade accounting. With parallel slots the samples of
+        all running tasks are summed (one aggregate "is the model
+        producing" figure).
         """
         now = time.monotonic()
-        self._tps_samples.append((now, max(1, len(text) // 4)))
+        samples = self._tps_samples.setdefault(task_id, deque())
+        samples.append((now, max(1, len(text) // 4)))
         self._prune_tps_samples(now)
 
     def _prune_tps_samples(self, now: float) -> None:
         cutoff = now - self._TPS_WINDOW
-        samples = self._tps_samples
-        while samples and samples[0][0] < cutoff:
-            samples.popleft()
+        for task_id in list(self._tps_samples):
+            samples = self._tps_samples[task_id]
+            while samples and samples[0][0] < cutoff:
+                samples.popleft()
+            if not samples:
+                del self._tps_samples[task_id]
 
     def _tokens_per_second(self) -> float | None:
-        """Output rate over the sliding window (None = nothing measurable:
-        no recent stream output, or too little of it to average yet)."""
+        """Aggregate output rate over the sliding window across every
+        run's samples (None = nothing measurable: no recent stream
+        output, or too little of it to average yet)."""
         now = time.monotonic()
         self._prune_tps_samples(now)
-        samples = self._tps_samples
-        if not samples:
+        all_samples: list[tuple[float, int]] = []
+        for samples in self._tps_samples.values():
+            all_samples.extend(samples)
+        if not all_samples:
             return None
-        span = now - samples[0][0]
+        span = now - min(t for t, _ in all_samples)
         if span < self._TPS_MIN_SPAN:
             return None
-        return sum(n for _, n in samples) / span
+        return sum(n for _, n in all_samples) / span
 
     def _next_testing(self) -> Task | None:
         """Oldest task in TESTING (crash/abort mid-test) whose retry backoff
@@ -296,17 +329,43 @@ class PipelineLayer(DrCodeState):
             # promoting twice).
             self._promote_with_dependencies()
             return
-        promoted = self.manager.promote_next(exclude=self._agent_failed)
-        if promoted is None:
-            # Deadlock escape: the queue is not empty, but every task in it
-            # failed earlier this session (see _promote_failed_queue).
-            promoted = self._promote_failed_queue()
-        if promoted:
-            self.notifier.pipeline_busy()
-            self.run_agent(promoted.id)
+        if self._dispatch_promotions(blocked=None):
+            self.refresh_status()
         else:
             self._notify_pipeline_settled()
-        self.refresh_status()
+            self.refresh_status()
+
+    def _dispatch_promotions(self, blocked: set[str] | None) -> bool:
+        """Fill the free development slots from the queue: promote tasks
+        one by one (promote_next) while slots remain, dispatching each
+        promoted task's run_agent in its own worker group. `blocked` is
+        the dependency gate's set (None when there is no gate), computed
+        ONCE per pass by the caller — promotion itself never changes the
+        mergedness of a dependency branch.
+
+        The failed-queue deadlock escape (see _promote_failed_queue) runs
+        inside the loop: a queue where every remaining task failed this
+        session gets rescued into the free slots.
+
+        Returns True when at least one task was promoted (the caller
+        skips the settled notification then)."""
+        promoted_any = False
+        while len(self.manager.active_tasks()) < self.parallel_limit:
+            promoted = self.manager.promote_next(
+                exclude=self._agent_failed,
+                blocked=blocked,
+                max_active=self.parallel_limit,
+            )
+            if promoted is None:
+                # Deadlock escape: the queue is not empty, but every
+                # promotable task in it failed earlier this session.
+                promoted = self._promote_failed_queue(blocked=blocked)
+            if promoted is None:
+                break
+            self.notifier.pipeline_busy()
+            self.run_agent(promoted.id)
+            promoted_any = True
+        return promoted_any
 
     # Backoff schedule of the failed-queue deadlock escape (see
     # _promote_failed_queue): rescue rounds of a queue that keeps failing
@@ -327,11 +386,12 @@ class PipelineLayer(DrCodeState):
         can be promoted until the app is restarted (or the connection probe
         recovers and _recover_from_outage fires).
 
-        Now, when nothing is active, nothing is being tested and every
-        queued task carries the error flag, the flag is forcibly lifted
-        from all of them and the next task is promoted by the ordinary
-        priority rules — the queue keeps working instead of stalling. A
-        notification reports how many tasks were rescued this way.
+        Now, when no development slot is free (nothing is active under
+        parallelism 1; all slots taken otherwise) and every queued task
+        carries the error flag, the flag is forcibly lifted from all of
+        them and the next task is promoted by the ordinary priority rules
+        — the queue keeps working instead of stalling. A notification
+        reports how many tasks were rescued this way.
 
         `blocked` (the dependency gate's set, when the caller computed one)
         counts as "cannot be rescued": dependency-blocked tasks are neither
@@ -339,11 +399,11 @@ class PipelineLayer(DrCodeState):
         the genuinely failed ones.
 
         Returns the promoted task, or None when the escape does not apply
-        (an active task exists, the queue holds a non-failed task, or the
-        next rescue round is still within its backoff window — a timer
+        (no free slot, the queue holds a non-failed task, or the next
+        rescue round is still within its backoff window — a timer
         re-enters _advance() when the window expires).
         """
-        if self.manager.active is not None:
+        if len(self.manager.active_tasks()) >= self.parallel_limit:
             return None
         queued = self.manager.queued()
         if not queued or any(
@@ -373,7 +433,9 @@ class PipelineLayer(DrCodeState):
                 "in the queue — exclusion lifted, task back in development.",
             )
         self.notifier.failed_tasks_requeued(len(rescued))
-        return self.manager.promote_next(blocked=blocked)
+        return self.manager.promote_next(
+            blocked=blocked, max_active=self.parallel_limit
+        )
 
     # -- dependency gate (depends_on promotion condition) ---------------------
 
@@ -398,8 +460,11 @@ class PipelineLayer(DrCodeState):
         fully merged into the base branch (a missing dep task is judged by
         its branch alone). The set of unsatisfied tasks is passed to
         promote_next as `blocked`, which skips them exactly like held
-        ones. Tasks without dependencies never enter this path —
-        _advance() keeps its synchronous zero-overhead route.
+        ones. The gate is computed ONCE per pass (promotion never changes
+        the mergedness of a dependency branch) and then the free
+        development slots are filled in a loop (parallel slots — see
+        _dispatch_promotions). Tasks without dependencies never enter
+        this path — _advance() keeps its synchronous zero-overhead route.
         """
         queued = [t for t in self.manager.queued() if t.depends_on]
         dep_ids = sorted({d for t in queued for d in t.depends_on})
@@ -425,18 +490,35 @@ class PipelineLayer(DrCodeState):
                 blocked.add(t.id)
                 gate[t.id] = reasons
         self._dep_gate = gate
+        # Fill the slots first (the git state cannot change mid-loop:
+        # promotion never merges anything), then announce the gate and
+        # refresh the UI once for the whole pass.
+        promoted_any = self._dispatch_promotions(blocked=blocked)
         self._announce_dependency_gate(queued, gate, base)
-        promoted = self.manager.promote_next(
-            exclude=self._agent_failed, blocked=blocked
-        )
-        if promoted is None:
-            promoted = self._promote_failed_queue(blocked=blocked)
-        if promoted:
-            self.notifier.pipeline_busy()
-            self.run_agent(promoted.id)
-        else:
+        if not promoted_any:
             self._notify_pipeline_settled()
         self.refresh_status()
+        self.refresh_sidebar()
+
+    def _poll_dependency_unblock(self) -> None:
+        """The 30s unblock tick (registered in on_mount): the dependency
+        gate's mergedness half is dynamic, but it is only re-evaluated
+        when something calls _advance() — a manual `git merge
+        drcode/<dep>` (or a foreign merge) would otherwise sit unnoticed
+        while the pipeline idles. When there are queued tasks with
+        dependencies, free development slots and no run in flight, this
+        re-fires the gate so a hand-merge unblocks the dependents by
+        itself. Works for parallelism 1 too (it fixes the pre-existing
+        "manual merge not noticed while idle" gap)."""
+        if self.tester_running or self.agent_running or self._review_running:
+            return
+        if len(self.manager.active_tasks()) >= self.parallel_limit:
+            return
+        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+            return
+        if not any(t.depends_on for t in self.manager.queued()):
+            return
+        self._advance()
 
     def _announce_dependency_gate(
         self,
@@ -488,7 +570,7 @@ class PipelineLayer(DrCodeState):
         """
         if self.tester_running or self.agent_running:
             return
-        if self.manager.active is not None:
+        if self.manager.active_tasks():
             return
         if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
             return
@@ -767,13 +849,27 @@ class PipelineLayer(DrCodeState):
             self.view_task(task.id)
         return True
 
-    @work(exclusive=True, group="agent")
-    async def run_agent(self, task_id: str) -> None:
-        self._agent_generation += 1
-        generation = self._agent_generation
+    def run_agent(self, task_id: str) -> None:
+        """(Re)start the development agent for one task, in that task's
+        own exclusive worker group (`agent-<task-id>`): a newer run of
+        the SAME task (a mid-flight comment, a nudge, a network-retry
+        timer) supersedes the in-flight one exactly as the single global
+        group always did — while every other task's run is untouched.
+        This per-task independence is the base of the parallel
+        development slots (see `parallel_limit`)."""
+        self.run_worker(
+            partial(self._run_agent_worker, task_id),
+            name=f"agent run {task_id}",
+            group=f"agent-{task_id}",
+            exclusive=True,
+        )
+
+    async def _run_agent_worker(self, task_id: str) -> None:
+        generation = self._agent_generations.get(task_id, 0) + 1
+        self._agent_generations[task_id] = generation
         # Key for the tool-spinner registry: superseded runs clean up only
         # their own entries.
-        run_key: tuple[str, int] = ("agent", generation)
+        run_key: tuple[str, str, int] = ("agent", task_id, generation)
         task = self.manager.get(task_id)
         # Bound only once `async with agent.iter(...)` is entered; the
         # except handlers below must not touch a run that never started.
@@ -796,12 +892,12 @@ class PipelineLayer(DrCodeState):
                     "available.",
                 )
                 return
-            self.agent_running = True
+            self._agent_runs[task_id] = generation
             self._agent_failed.discard(task_id)
             self._agent_net_retry_at.pop(task_id, None)
-            self._current_tool = None
-            self._tps_samples.clear()
-            self._touch_activity()
+            self._current_tool[task_id] = None
+            self._tps_samples.pop(task_id, None)
+            self._touch_activity(task_id)
             self.refresh_status()
             # Per-task worktree isolation (project setting
             # `task_isolation: worktree`, see drcode.task_env): the whole
@@ -932,7 +1028,7 @@ class PipelineLayer(DrCodeState):
                                 assistant_block: AssistantBlock | None = None
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
-                                        self._touch_activity()
+                                        self._touch_activity(task_id)
                                         if isinstance(event, PartStartEvent):
                                             # The first chunk of a new text/thinking
                                             # part arrives as PartStartEvent carrying
@@ -965,7 +1061,7 @@ class PipelineLayer(DrCodeState):
                                             continue
                                         if delta.content_delta:
                                             self._record_stream_tokens(
-                                                delta.content_delta
+                                                task_id, delta.content_delta
                                             )
                                         if (
                                             isinstance(delta, ThinkingPartDelta)
@@ -1127,14 +1223,16 @@ class PipelineLayer(DrCodeState):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
                                         if isinstance(event, FunctionToolCallEvent):
-                                            self._touch_activity(event.part.tool_name)
+                                            self._touch_activity(
+                                                task_id, event.part.tool_name
+                                            )
                                         elif isinstance(event, FunctionToolResultEvent):
                                             # Result stops the spinner even
                                             # when the task is off-screen.
                                             self._tool_call_finished(
                                                 event.part.tool_call_id
                                             )
-                                            self._touch_activity(done=True)
+                                            self._touch_activity(task_id, done=True)
                                         if self.viewed_id != task_id:
                                             # The tool-call block is skipped
                                             # (it will come from the next
@@ -1242,7 +1340,7 @@ class PipelineLayer(DrCodeState):
                     # task.unfinished marks the possibly-undone attempt and
                     # the next activation resumes it without re-sending text.
                     cancelled = True
-                    if generation == self._agent_generation and (
+                    if self._agent_generations.get(task_id) == generation and (
                         task.status is TaskStatus.ACTIVE
                     ):
                         # Persist whatever the interrupted turn managed to
@@ -1269,7 +1367,7 @@ class PipelineLayer(DrCodeState):
                         self.manager.storage.save(task)
                     # Drop our streaming preview; a newer run (if any) owns
                     # the label now and must not be touched.
-                    self._drop_stream_preview(generation)
+                    self._drop_stream_preview(task_id, generation)
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
                     # A transient network error (transport failure like a
@@ -1292,8 +1390,8 @@ class PipelineLayer(DrCodeState):
                             f"Network error ({type(e).__name__}): retry {attempt}/"
                             f"{NETWORK_RETRIES} in {int(delay)} s",
                         )
-                        if generation == self._agent_generation:
-                            self._drop_stream_preview(generation)
+                        if self._agent_generations.get(task_id) == generation:
+                            self._drop_stream_preview(task_id, generation)
                         self._persist_task_messages(task, run)
                         task.messages = sanitized_messages(task.messages)
                         if run is None and consumed:
@@ -1327,12 +1425,12 @@ class PipelineLayer(DrCodeState):
                     # Persist the failure even for a superseded run: it
                     # happened, and the human must be able to see it.
                     self._show_event(task, f"{type(e).__name__}: {e}")
-                    if generation == self._agent_generation:
+                    if self._agent_generations.get(task_id) == generation:
                         # A mid-stream failure leaves a half-streamed orange
                         # preview above the input: clear it, otherwise the
                         # stale fragments hang in the dialog (and would be
                         # shown for whatever the user does next).
-                        self._drop_stream_preview(generation)
+                        self._drop_stream_preview(task_id, generation)
                     self._persist_task_messages(task, run)
                     task.messages = sanitized_messages(task.messages)
                     # Not lost: unfinished marks the attempt; promotion
@@ -1354,8 +1452,12 @@ class PipelineLayer(DrCodeState):
             # Stop any spinner whose result event was lost to an abort or a
             # run error (normally all of them are already stopped).
             self._stop_run_tools(run_key)
-            if generation == self._agent_generation:
-                self.agent_running = False
+            if self._agent_generations.get(task_id) == generation:
+                # This is still the task's newest run: release its slot.
+                # (Guarded: a superseded run must not steal a newer run's
+                # entry — parallel slots make the other tasks' runs
+                # untouchable by definition.)
+                self._agent_runs.pop(task_id, None)
                 self.refresh_status()
                 # The run is over: the consumed prompt is either persisted in
                 # the transcript or back in pending_input — the in-flight
@@ -1365,7 +1467,7 @@ class PipelineLayer(DrCodeState):
             # A cancelled run (user abort, or a newer run taking over) must
             # not restart the pipeline: the abort stops everything until the
             # user acts, and the newer run advances on its own completion.
-            if not cancelled and generation == self._agent_generation:
+            if not cancelled and self._agent_generations.get(task_id) == generation:
                 if task.status is TaskStatus.AWAITING_CLARIFICATION:
                     # The user may have answered while the run was still
                     # finishing (the answer sits in pending_input and send()'s
@@ -1445,7 +1547,7 @@ class PipelineLayer(DrCodeState):
         """After any task completes, verify the project and label the task."""
         self._tester_task_id = task_id
         self._tester_generation += 1
-        run_key: tuple[str, int] = ("tester", self._tester_generation)
+        run_key: tuple[str, str, int] = ("tester", task_id, self._tester_generation)
         task = self.manager.get(task_id)
         # A network-retry continues the current testing round in place
         # instead of starting a new one (the flag is set by the network
@@ -1476,9 +1578,9 @@ class PipelineLayer(DrCodeState):
             # Idempotent: _advance() sets this before starting the worker so
             # two _advance() calls in one tick cannot double-start the tester.
             self.tester_running = True
-            self._current_tool = None
-            self._tps_samples.clear()
-            self._touch_activity()
+            self._current_tool[task_id] = None
+            self._tps_samples.pop(task_id, None)
+            self._touch_activity(task_id)
             self.refresh_status()
             # New testing round: created up front, filled by
             # _persist_tester_messages as the run progresses. An empty round
@@ -1614,7 +1716,7 @@ class PipelineLayer(DrCodeState):
                                 # aborts a perfectly healthy run.
                                 async with node.stream(run.ctx) as stream:
                                     async for _event in stream:
-                                        self._touch_activity()
+                                        self._touch_activity(task_id)
                                 live_tokens = run_context_tokens(run)
                                 # Exact per-request usage of the completed
                                 # model call, into the session totals.
@@ -1629,14 +1731,16 @@ class PipelineLayer(DrCodeState):
                                 async with node.stream(run.ctx) as stream:
                                     async for event in stream:
                                         if isinstance(event, FunctionToolCallEvent):
-                                            self._touch_activity(event.part.tool_name)
+                                            self._touch_activity(
+                                                task_id, event.part.tool_name
+                                            )
                                         elif isinstance(event, FunctionToolResultEvent):
                                             # Result stops the spinner even when
                                             # the task is off-screen.
                                             self._tool_call_finished(
                                                 event.part.tool_call_id
                                             )
-                                            self._touch_activity(done=True)
+                                            self._touch_activity(task_id, done=True)
                                         if self.viewed_id == task_id and isinstance(
                                             event, FunctionToolCallEvent
                                         ):
@@ -1897,22 +2001,29 @@ class PipelineLayer(DrCodeState):
 
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the
-        branch, …). Its text goes to the service-event log. Never fatal."""
+        branch, …). Its text goes to the service-event log. Never fatal.
+
+        Serialized through `_accept_hook_lock`: with parallel slots two
+        tasks can be accepted around the same moment, and both hooks
+        (typically `git merge` into the shared main checkout) must not
+        interleave — git's index.lock and conflicting merges would break
+        one of them. Fail-open semantics unchanged."""
         workflow = self.workflow
         if workflow is None or not workflow.has("on_accepted"):
             return
-        cwd, wt = self._hook_env(task)
-        result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
-        if not result.ok:
-            self._show_event(
-                task,
-                f"Workflow on_accepted failed (non-fatal): {result.error}",
-                kind="workflow",
-            )
-            return
-        text = str(result.output.get("text") or "").strip()
-        if text:
-            self._show_event(task, f"on_accepted:\n{text}", kind="workflow")
+        async with self._accept_hook_lock:
+            cwd, wt = self._hook_env(task)
+            result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
+            if not result.ok:
+                self._show_event(
+                    task,
+                    f"Workflow on_accepted failed (non-fatal): {result.error}",
+                    kind="workflow",
+                )
+                return
+            text = str(result.output.get("text") or "").strip()
+            if text:
+                self._show_event(task, f"on_accepted:\n{text}", kind="workflow")
 
     async def _run_research_accepted_hook(self, task: Task) -> None:
         """`on_research_accepted` right after a RESEARCH task completes —
@@ -1922,31 +2033,39 @@ class PipelineLayer(DrCodeState):
         PR, … Its text goes to the service-event log. Never fatal. The
         payload carries `project` (the user's checkout path and base
         branch) so a hook running inside the task's worktree can still
-        merge into the main tree (`git -C <project.path> merge <branch>`)."""
+        merge into the main tree (`git -C <project.path> merge <branch>`).
+
+        Serialized through `_accept_hook_lock`, like `on_accepted` (see
+        there): parallel finalizations merge one at a time."""
         workflow = self.workflow
         if workflow is None or not workflow.has("on_research_accepted"):
             return
-        project: dict[str, Any] = {"path": str(self.project_root)}
-        if self.task_env.available:
-            project["base_branch"] = await asyncio.to_thread(self.task_env.base_branch)
-        cwd, wt = self._hook_env(task)
-        result = await workflow.call(
-            "on_research_accepted",
-            task,
-            cwd=cwd,
-            worktree=wt,
-            extra={"project": project},
-        )
-        if not result.ok:
-            self._show_event(
+        async with self._accept_hook_lock:
+            project: dict[str, Any] = {"path": str(self.project_root)}
+            if self.task_env.available:
+                project["base_branch"] = await asyncio.to_thread(
+                    self.task_env.base_branch
+                )
+            cwd, wt = self._hook_env(task)
+            result = await workflow.call(
+                "on_research_accepted",
                 task,
-                f"Workflow on_research_accepted failed (non-fatal): {result.error}",
-                kind="workflow",
+                cwd=cwd,
+                worktree=wt,
+                extra={"project": project},
             )
-            return
-        text = str(result.output.get("text") or "").strip()
-        if text:
-            self._show_event(task, f"on_research_accepted:\n{text}", kind="workflow")
+            if not result.ok:
+                self._show_event(
+                    task,
+                    f"Workflow on_research_accepted failed (non-fatal): {result.error}",
+                    kind="workflow",
+                )
+                return
+            text = str(result.output.get("text") or "").strip()
+            if text:
+                self._show_event(
+                    task, f"on_research_accepted:\n{text}", kind="workflow"
+                )
 
     async def _anchor_research_snapshot(self, task: Task) -> None:
         """Make sure the completion snapshot has landed on the task's

@@ -60,8 +60,15 @@ from .usage import SessionTokenUsage
 
 
 class DrCodeState(App[None]):
-    @work(exclusive=True, group="agent")
-    async def run_agent(self, task_id: str) -> None: ...
+    def run_agent(self, task_id: str) -> None: ...
+
+    async def _run_agent_worker(self, task_id: str) -> None: ...
+
+    @property
+    def agent_running(self) -> bool: ...
+
+    @property
+    def parallel_limit(self) -> int: ...
 
     async def _check_model(self) -> None: ...
     def _git_branch(self) -> str | None: ...
@@ -120,7 +127,7 @@ class DrCodeState(App[None]):
     ) -> None: ...
 
     def _touch_activity(
-        self, tool: str | None = None, *, done: bool = False
+        self, task_id: str, tool: str | None = None, *, done: bool = False
     ) -> None: ...
 
     @staticmethod
@@ -153,7 +160,7 @@ class DrCodeState(App[None]):
 
     def _tool_call_started(
         self,
-        run_key: tuple[str, int],
+        run_key: tuple[str, str, int],
         task_id: str,
         call_id: str,
         call_text: str,
@@ -162,7 +169,7 @@ class DrCodeState(App[None]):
 
     def _tool_call_finished(self, call_id: str) -> None: ...
 
-    def _stop_run_tools(self, run_key: tuple[str, int]) -> None: ...
+    def _stop_run_tools(self, run_key: tuple[str, str, int]) -> None: ...
 
     def _reattach_tool_spinner(
         self, block: ToolCallBlock, call_text: str, task_id: str
@@ -231,7 +238,7 @@ class DrCodeState(App[None]):
 
     def _clear_stream_label(self) -> None: ...
 
-    def _drop_stream_preview(self, generation: int) -> None: ...
+    def _drop_stream_preview(self, task_id: str, generation: int) -> None: ...
 
     def action_new_task(self) -> None: ...
 
@@ -307,6 +314,10 @@ class DrCodeState(App[None]):
 
     def action_change_task_isolation(self) -> None: ...
 
+    def action_set_parallel_tasks(self, count: int) -> None: ...
+
+    def action_change_parallel_tasks(self) -> None: ...
+
     def _task_isolation_label(self) -> str: ...
 
     def workflow_status_label(self) -> str: ...
@@ -333,7 +344,7 @@ class DrCodeState(App[None]):
 
     def action_pick_option(self, index: int) -> None: ...
 
-    def _record_stream_tokens(self, text: str) -> None: ...
+    def _record_stream_tokens(self, task_id: str, text: str) -> None: ...
 
     def _prune_tps_samples(self, now: float) -> None: ...
 
@@ -344,6 +355,10 @@ class DrCodeState(App[None]):
     def _advance(self) -> None: ...
 
     def _promote_failed_queue(self, blocked: set[str] | None = None) -> Task | None: ...
+
+    def _poll_dependency_unblock(self) -> None: ...
+
+    def _dispatch_promotions(self, blocked: set[str] | None) -> bool: ...
 
     @work(exclusive=True, group="promote")
     async def _promote_with_dependencies(self) -> None: ...
@@ -429,11 +444,17 @@ class DrCodeState(App[None]):
 
     # -- run state ----------------------------------------------------------
     viewed_id: str | None
-    agent_running: bool
+    # Counted run state (parallel development slots): task id -> the
+    # generation of its in-flight agent run. `agent_running` above is a
+    # property over `_agent_runs`; the tester stays single (a plain flag).
+    _agent_runs: dict[str, int]
     tester_running: bool
     _tester_task_id: str | None
     new_task_kind: TaskKind
-    _agent_generation: int
+    # Per-task run generation (superseded-run bookkeeping): a run's
+    # teardown may only touch shared state while it is still the task's
+    # newest run.
+    _agent_generations: dict[str, int]
     _pending_rendered: list[str]
     # Prompts a run has already consumed (popped from pending_input) but
     # that are not persisted into the transcript yet: the first node
@@ -480,6 +501,10 @@ class DrCodeState(App[None]):
     _review_fail_count: dict[str, int]
     _review_poll_at: float
     _dev_done_notes: dict[str, str]
+    # Serializes the accept hooks (on_accepted / on_research_accepted):
+    # two tasks finalizing in parallel must not run concurrent git merges
+    # into the shared main checkout.
+    _accept_hook_lock: asyncio.Lock
 
     # -- session statistics (expanded header, session-scoped) ---------------
     _session_known_ids: set[str]
@@ -497,15 +522,17 @@ class DrCodeState(App[None]):
     # -- sidebar / activity -------------------------------------------------
     _sidebar_snapshot: tuple
     _collapsed_sections: set[str]
-    _last_activity: float
-    _current_tool: str | None
+    # Per-run activity bookkeeping (parallel slots): last sign of life,
+    # the tool each run is waiting on and the tok/s sample window.
+    _last_activity: dict[str, float]
+    _current_tool: dict[str, str | None]
 
     # -- live stream / connection -------------------------------------------
-    _tps_samples: deque[tuple[float, int]]
+    _tps_samples: dict[str, deque[tuple[float, int]]]
     _conn_label: str
     _last_probe_ms: int | None
     _probe_fail_streak: int
-    _active_tools: dict[tuple[str, int], dict[str, tuple[str, str, ToolCallBlock]]]
+    _active_tools: dict[tuple[str, str, int], dict[str, tuple[str, str, ToolCallBlock]]]
     _tester_generation: int
 
     # -- context fill / compaction ------------------------------------------

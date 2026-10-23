@@ -222,7 +222,13 @@ class ChatViewLayer(DrCodeState):
         return None
 
     def refresh_sidebar(self) -> None:
-        sidebar = self.sidebar
+        # Called from worker finally-blocks too — it can fire while the
+        # app is shutting down and the screen (with the sidebar) is
+        # already gone; a NoMatches there would panic the whole app.
+        try:
+            sidebar = self.sidebar
+        except NoMatches:
+            return
         sidebar.clear()
         for name, tasks in self._sidebar_sections():
             # A collapsed section keeps only its header line: the "+" shows
@@ -530,15 +536,18 @@ class ChatViewLayer(DrCodeState):
 
     # -- run activity indicator ----------------------------------------------
 
-    def _touch_activity(self, tool: str | None = None, *, done: bool = False) -> None:
-        """Record a sign of life from the agent/tester run. `tool` marks a
-        tool call start; `done` clears the current-tool marker (result
-        arrived)."""
-        self._last_activity = time.monotonic()
+    def _touch_activity(
+        self, task_id: str, tool: str | None = None, *, done: bool = False
+    ) -> None:
+        """Record a sign of life from the run of `task_id` (parallel
+        slots: every running run keeps its own activity stamp). `tool`
+        marks a tool call start; `done` clears the current-tool marker
+        (result arrived)."""
+        self._last_activity[task_id] = time.monotonic()
         if done:
-            self._current_tool = None
+            self._current_tool[task_id] = None
         elif tool is not None:
-            self._current_tool = tool
+            self._current_tool[task_id] = tool
 
     @staticmethod
     def _fmt_age(seconds: int) -> str:
@@ -547,8 +556,10 @@ class ChatViewLayer(DrCodeState):
         return f"{seconds // 60}m{seconds % 60:02d}s"
 
     def _poll_activity(self) -> None:
-        """Every second, show in the sidebar whether the run makes progress
-        or has gone silent (hung model request, long tool, deadlock)."""
+        """Every second, show in the sidebar whether the run(s) make
+        progress or have gone silent (hung model request, long tool,
+        deadlock). One live run keeps the detailed rendering; several
+        (parallel development slots) collapse into a compact summary."""
         try:
             self._render_model_status()
             # Expanded header: fold task-tree changes into the session
@@ -563,11 +574,12 @@ class ChatViewLayer(DrCodeState):
             # Teardown race: the 1s timer can tick while the app is being
             # dismantled and its status widgets are already gone.
             return
-        if not (self.agent_running or self.tester_running):
-            active = self.manager.active
-            if active is not None:
-                # Network-retried run waiting for its delayed retry: the task
-                # is fine, the re-run timer just has not fired yet.
+        agent_ids = list(self._agent_runs)
+        tester_id = self._tester_task_id if self.tester_running else None
+        if not (agent_ids or tester_id):
+            for active in self.manager.active_tasks():
+                # Network-retried run waiting for its delayed retry: the
+                # task is fine, the re-run timer just has not fired yet.
                 retry_at = self._agent_net_retry_at.get(active.id)
                 if retry_at is not None and retry_at > time.monotonic():
                     left = max(1, int(retry_at - time.monotonic()))
@@ -577,22 +589,75 @@ class ChatViewLayer(DrCodeState):
                         f"#{active.id} attempt {attempt}/{NETWORK_RETRIES} in {left}s",
                     )
                     return
-                # Task claims to be active but no worker owns it (e.g. the
-                # user aborted the run, or an older build stranded it):
-                # surface the inconsistency instead of showing a fake idle.
+            active_tasks = self.manager.active_tasks()
+            if active_tasks:
+                # A task claims to be active but no worker owns it (e.g.
+                # the user aborted the run, or an older build stranded it):
+                # surface the inconsistency instead of a fake idle.
+                first = active_tasks[0]
+                more = (
+                    f" (+{len(active_tasks) - 1} more)" if len(active_tasks) > 1 else ""
+                )
                 self._render_activity(
                     "⚠ agent: idle",
-                    f"#{active.id} active, nothing running — "
+                    f"#{first.id}{more} active, nothing running — "
                     "send a message or ctrl+r to (re)start",
                     "stale",
                 )
                 return
             self._render_activity("○ idle", "")
             return
-        who = "agent" if self.agent_running else "tester"
-        age = int(time.monotonic() - self._last_activity)
-        if self._current_tool:
-            detail = f"tool {self._current_tool} running {self._fmt_age(age)}"
+        if len(agent_ids) + (1 if tester_id else 0) == 1:
+            # Single live run: the detailed rendering as before.
+            if agent_ids:
+                task_id, who = agent_ids[0], "agent"
+            else:
+                task_id, who = tester_id or "", "tester"
+            self._render_single_run_activity(task_id, who)
+            return
+        # Several runs at once (parallel slots): a compact summary line —
+        # the count plus the age of the most silent run, so a hung one
+        # still surfaces without a per-run detail wall.
+        n_agents = len(agent_ids)
+        parts = [f"{n_agents} agent" + ("s" if n_agents != 1 else "")]
+        if tester_id is not None:
+            parts.append("1 tester")
+        all_running = agent_ids + ([tester_id] if tester_id else [])
+        oldest = min(
+            (self._last_activity.get(t, time.monotonic()) for t in all_running),
+            default=time.monotonic(),
+        )
+        age = int(time.monotonic() - oldest)
+        detail = " + ".join(parts) + " working"
+        if age < 30:
+            self._render_activity(
+                f"▶ {len(all_running)} runs: working",
+                f"{detail} · oldest event {self._fmt_age(age)} ago",
+                "fresh",
+            )
+        else:
+            limit = self.settings.stall_nudge.minutes
+            if limit is not None:
+                left = max(1, limit * 60 - age)
+                detail += f" · auto-nudge in {self._fmt_age(int(left))}"
+            else:
+                detail += " (ctrl+r nudges the viewed task)"
+            self._render_activity(
+                f"⚠ {len(all_running)} runs: stalled",
+                f"{detail} · oldest event {self._fmt_age(age)} ago",
+                "stale",
+            )
+
+    def _render_single_run_activity(self, task_id: str, who: str) -> None:
+        """Detailed single-run rendering of the activity line (the
+        historical one-run view): current tool, age, stall countdown."""
+        stamped = self._last_activity.get(task_id)
+        if stamped is None:
+            stamped = time.monotonic()
+        age = int(time.monotonic() - stamped)
+        tool = self._current_tool.get(task_id)
+        if tool:
+            detail = f"tool {tool} running {self._fmt_age(age)}"
         else:
             detail = f"last event {self._fmt_age(age)} ago"
         if age < 30:
@@ -636,47 +701,53 @@ class ChatViewLayer(DrCodeState):
     _NUDGE_RESTART_DELAY = 1.0
 
     def _poll_stall(self) -> None:
-        """Watchdog: when the running agent/tester has emitted nothing (no
-        stream deltas, no tool events) for the configured stall limit, abort
-        the hung run and restart it. A stalled run blocks its own task — and
-        through the pipeline gate, the whole backlog — so this keeps an
-        overnight run going without human intervention."""
+        """Watchdog: when a running agent/tester has emitted nothing (no
+        stream deltas, no tool events) for the configured stall limit,
+        abort the hung run and restart it — ONLY that run: with parallel
+        development slots every run gets its own stall deadline and its
+        own nudge, and the healthy siblings keep running. A stalled run
+        blocks its own task — and through the pipeline gate, the whole
+        backlog — so this keeps an overnight run going without human
+        intervention."""
         limit = self.settings.stall_nudge.minutes
         if limit is None:
             return
-        if not (self.agent_running or self.tester_running):
-            return
-        stalled_for = time.monotonic() - self._last_activity
-        if stalled_for < limit * 60:
-            return
-        if self.agent_running:
-            task = self.manager.active
-        else:
-            task = (
-                self.manager.get(self._tester_task_id) if self._tester_task_id else None
+        now = time.monotonic()
+        running: list[tuple[str, str]] = [
+            (task_id, "agent") for task_id in list(self._agent_runs)
+        ]
+        if self.tester_running and self._tester_task_id:
+            running.append((self._tester_task_id, "tester"))
+        for task_id, who in running:
+            stamped = self._last_activity.get(task_id)
+            if stamped is None:
+                continue  # the run has not started emitting yet
+            stalled_for = now - stamped
+            if stalled_for < limit * 60:
+                continue
+            task = self.manager.tasks.get(task_id)
+            if task is None:
+                continue
+            self._show_event(
+                task,
+                f"{who} stalled for {self._fmt_age(int(stalled_for))} without any "
+                f"activity — aborting the run (stall limit: "
+                f"{self.settings.stall_nudge.label})",
             )
-        if task is None:
-            return
-        who = "agent" if self.agent_running else "tester"
-        self._show_event(
-            task,
-            f"{who} stalled for {self._fmt_age(int(stalled_for))} without any "
-            f"activity — aborting the run (stall limit: "
-            f"{self.settings.stall_nudge.label})",
-        )
-        self._nudge_run(task)
+            self._nudge_run(task)
 
     def _nudge_run(self, task: Task) -> None:
         """Abort the hung/stalled run for `task` (if one is in flight) and
         schedule its restart: the agent resumes via a continuation turn (no
         text is re-sent — `task.unfinished` marks the interrupted attempt),
         the tester gets a fresh verification round via the pipeline gate
-        (`_advance` re-tests the still-TESTING task)."""
+        (`_advance` re-tests the still-TESTING task). Only this task's run
+        is touched — parallel slots keep the other tasks' runs alive."""
         if task.status is TaskStatus.ACTIVE:
-            if self.agent_running:
-                self.workers.cancel_group(self, "agent")
-                self.agent_running = False
-                self._current_tool = None
+            if task.id in self._agent_runs:
+                self.workers.cancel_group(self, f"agent-{task.id}")
+                self._agent_runs.pop(task.id, None)
+                self._current_tool[task.id] = None
                 self._clear_stream_label()
                 self.refresh_status()
             self.set_timer(self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id))
@@ -684,7 +755,7 @@ class ChatViewLayer(DrCodeState):
             if self.tester_running:
                 self.workers.cancel_group(self, "tester")
                 self.tester_running = False
-                self._current_tool = None
+                self._current_tool[task.id] = None
                 self.refresh_status()
             self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
         elif self.tester_running and self._tester_task_id == task.id:
@@ -695,7 +766,7 @@ class ChatViewLayer(DrCodeState):
             # so it must be aborted and the pipeline re-advanced.
             self.workers.cancel_group(self, "tester")
             self.tester_running = False
-            self._current_tool = None
+            self._current_tool[task.id] = None
             self.refresh_status()
             self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
 
@@ -857,7 +928,7 @@ class ChatViewLayer(DrCodeState):
 
     def _tool_call_started(
         self,
-        run_key: tuple[str, int],
+        run_key: tuple[str, str, int],
         task_id: str,
         call_id: str,
         call_text: str,
@@ -879,7 +950,7 @@ class ChatViewLayer(DrCodeState):
             if entry is not None:
                 entry[2].stop_spinner()
 
-    def _stop_run_tools(self, run_key: tuple[str, int]) -> None:
+    def _stop_run_tools(self, run_key: tuple[str, str, int]) -> None:
         """End-of-run cleanup: anything still marked running for this run
         (a result event lost to an abort/error) loses its spinner."""
         for _task_id, _text, block in self._active_tools.pop(run_key, {}).values():
@@ -1022,18 +1093,31 @@ class ChatViewLayer(DrCodeState):
         self._write_chat("\n".join(lines))
 
     def refresh_status(self) -> None:
-        active = self.manager.active
+        # Called from worker finally-blocks too — it can fire while the
+        # app is shutting down and the screen (with the statusbar) is
+        # already gone; a NoMatches there would panic the whole app.
+        try:
+            statusbar = self.query_one("#statusbar", Static)
+        except NoMatches:
+            return
+        active = self.manager.active_tasks()
         queue_len = len(self.manager.queued())
         testing_len = len(
             [t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING]
         )
         state = "running" if self.agent_running else "idle"
         tester = "running" if self.tester_running else "idle"
-        who = f"#{active.id} {active.title_display}" if active else "none"
+        if active:
+            who = f"#{active[0].id} {active[0].title_display}"
+            if len(active) > 1:
+                # Parallel slots: several tasks in development at once.
+                who += f" (+{len(active) - 1})"
+        else:
+            who = "none"
         model = self.resolved_config(AgentRole.CODING).model or (
             "(model not configured)"
         )
-        self.query_one("#statusbar", Static).update(
+        statusbar.update(
             f" active: {who}   queue: {queue_len}   testing: {testing_len}   "
             f"agent: {state}   tester: {tester}   model: {model} "
         )
@@ -1042,9 +1126,14 @@ class ChatViewLayer(DrCodeState):
     def refresh_task_status(self) -> None:
         # The footer mirrors the state check_action() gates on (viewed task,
         # its status, running flags): re-evaluate the visible bindings.
+        # Guarded like refresh_status: worker finally-blocks can call this
+        # while the screen is already dismantled.
         self.refresh_bindings()
-        left = self.query_one("#task-status-left", Static)
-        right = self.query_one("#task-status-right", Static)
+        try:
+            left = self.query_one("#task-status-left", Static)
+            right = self.query_one("#task-status-right", Static)
+        except NoMatches:
+            return
         # The new-task form is not tied to any task: keep the bar empty so
         # the previously viewed task doesn't keep updating behind the form.
         if self._new_task_mode:

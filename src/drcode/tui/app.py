@@ -341,15 +341,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._review_fail_count: dict[str, int] = {}
         self._review_poll_at = 0.0
         self._dev_done_notes: dict[str, str] = {}
+        # Serializes the accept hooks (on_accepted / on_research_accepted):
+        # with parallel slots two tasks can finalize at once, and their
+        # merges into the shared main checkout must not interleave (git
+        # index.lock, conflicting merges).
+        self._accept_hook_lock = asyncio.Lock()
         self.viewed_id: str | None = None
-        self.agent_running = False
+        # Counted run state (parallel development slots): the in-flight
+        # agent runs (task id -> generation) and the per-task run
+        # generation counter. The tester stays single (plain flag).
+        self._agent_runs: dict[str, int] = {}
         self.tester_running = False
         # Task id the tester worker is currently verifying (for Ctrl+X).
         self._tester_task_id: str | None = None
         self.new_task_kind: TaskKind = TaskKind.FEATURE
-        # Incremented on every run_agent() start; the finally block of a
-        # superseded (cancelled) run must not touch shared state.
-        self._agent_generation = 0
+        # Per task: incremented on every run_agent() start; the finally
+        # block of a superseded (cancelled) run must not touch shared
+        # state.
+        self._agent_generations: dict[str, int] = {}
         # Pending messages already drawn in the current chat view, so the
         # agent run doesn't re-render them when it consumes them.
         self._pending_rendered: list[str] = []
@@ -443,18 +452,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Sidebar sections currently collapsed (Enter/space/click on a
         # section header toggles it); session-only, not persisted.
         self._collapsed_sections: set[str] = set()
-        # Last moment an agent/tester event (stream delta, tool call/result)
-        # was seen; the activity label compares it against now. Zero means
-        # the current run has not emitted anything yet.
-        self._last_activity = 0.0
-        # Tool the run is currently waiting on (name at call start, cleared
-        # on the result event) — lets the label distinguish "tool busy" from
-        # "total silence".
-        self._current_tool: str | None = None
-        # Sliding window of streamed output ((monotonic stamp, approximated
-        # token count) samples) — feeds the live tok/s figure in the header
-        # connection status. See _record_stream_tokens/_tokens_per_second.
-        self._tps_samples: deque[tuple[float, int]] = deque()
+        # Per-run activity bookkeeping (parallel slots): the last moment a
+        # run emitted an event (stream delta, tool call/result) — the
+        # activity label and the stall watchdog compare it against now.
+        self._last_activity: dict[str, float] = {}
+        # Tool each run is currently waiting on (name at call start,
+        # cleared on the result event) — lets the label distinguish "tool
+        # busy" from "total silence".
+        self._current_tool: dict[str, str | None] = {}
+        # Sliding window of streamed output per run ((monotonic stamp,
+        # approximated token count) samples) — feeds the live tok/s
+        # figure in the header connection status. See
+        # _record_stream_tokens/_tokens_per_second.
+        self._tps_samples: dict[str, deque[tuple[float, int]]] = {}
         # Base text of the header connection label ("● model" / "✗ …"),
         # written by _check_model; _render_model_status appends the live
         # activity suffix (tok/s / waiting / testing) on top of it.
@@ -465,12 +475,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._last_probe_ms: int | None = None
         self._probe_fail_streak = 0
         # Tool calls currently executing, per run (the run key is
-        # ("agent"|"tester", generation)): tool_call_id ->
+        # ("agent"|"tester", task_id, generation)): tool_call_id ->
         # (task_id, rendered call text, live block with the spinner). The
         # text lets a mid-run view re-render (view_task wipes the chat log)
         # re-attach the running spinner to the freshly rendered block.
         self._active_tools: dict[
-            tuple[str, int], dict[str, tuple[str, str, ToolCallBlock]]
+            tuple[str, str, int], dict[str, tuple[str, str, ToolCallBlock]]
         ] = {}
         # Monotonic stamp distinguishing successive tester runs.
         self._tester_generation = 0
@@ -783,7 +793,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 severity="warning",
                 timeout=12,
             )
-        elif self.task_env.available:
+        if self.settings.parallel_tasks > 1 and not self.task_env.active:
+            # Parallel development needs per-task worktrees: without a
+            # usable isolation the persisted value is dormant and the
+            # pipeline behaves as 1 (warned once per startup).
+            self.notify(
+                f"Parallel tasks: {self.settings.parallel_tasks} is saved, "
+                "but needs Task isolation: worktree (a git repository) — "
+                "tasks run one at a time until it is on.",
+                title="Parallel tasks",
+                severity="warning",
+                timeout=12,
+            )
+        if self.task_env.available:
             # Sweep worktrees/branches of tasks that no longer exist
             # (crashed session, retention cleanup) off the startup
             # path: a few git calls in a worker thread. Runs regardless
@@ -837,6 +859,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # on_review hook): asks the hook for the verdict of every completed
         # task with an open PR (see _poll_workflow_review).
         self.set_interval(30, self._poll_workflow_review)
+        # Dependency-gate unblock tick: a manual `git merge drcode/<dep>`
+        # (or a foreign merge) must unblock waiting dependents even when
+        # the pipeline is otherwise idle and nothing re-fires _advance()
+        # (see _poll_dependency_unblock).
+        self.set_interval(30, self._poll_dependency_unblock)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is

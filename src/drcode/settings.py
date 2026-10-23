@@ -88,6 +88,17 @@ def dev_rounds_label(rounds: int) -> str:
     return "1 round" if rounds == 1 else f"{rounds} rounds"
 
 
+# Options of the `parallel_tasks` setting (the development-slot limit),
+# offered in the Settings picker. Parallelism is only meaningful with
+# worktree isolation: without it the effective limit stays 1.
+PARALLEL_TASKS_OPTIONS: tuple[int, ...] = (1, 2, 3, 4)
+
+
+def parallel_tasks_label(count: int) -> str:
+    """Human-readable option label for the Settings UI."""
+    return "1 task" if count == 1 else f"{count} tasks"
+
+
 class TaskIsolation(str, enum.Enum):
     """Where a task's development happens.
 
@@ -203,6 +214,13 @@ class ProjectSettings(BaseModel):
     # still persisted — the app warns about the dormant mode at every
     # startup instead of silently rewriting the user's choice.
     task_isolation: TaskIsolation = TaskIsolation.OFF
+    # How many tasks may develop in parallel (development slots). Only
+    # effective under worktree isolation — each parallel task needs its
+    # own worktree, so without it the effective limit is 1 (the value is
+    # still persisted; the app warns and behaves as 1). The tester stays
+    # single: testing never occupies a development slot and never runs
+    # concurrently with another tester round.
+    parallel_tasks: int = 1
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
     # connection check fails): the sync simply logs an error each cycle

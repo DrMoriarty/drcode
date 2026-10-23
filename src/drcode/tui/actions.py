@@ -44,6 +44,7 @@ from ..settings import (
     StallNudge,
     TaskFinalization,
     TaskIsolation,
+    parallel_tasks_label,
 )
 from ..task_manager import validate_dependencies
 from ..workflow import describe_project_workflow, load_git_workflow
@@ -54,6 +55,7 @@ from .command_providers import (
     IsolationOptionsProvider,
     ModelCatalogCommandProvider,
     ModelSettingsPalette,
+    ParallelTasksOptionsProvider,
     RetentionOptionsProvider,
     RoleModelsCommandsProvider,
     SettingsPalette,
@@ -180,10 +182,10 @@ class ActionsLayer(DrCodeState):
         clear — kept as a no-op so abort/new-task paths stay simple.
         """
 
-    def _drop_stream_preview(self, generation: int) -> None:
+    def _drop_stream_preview(self, task_id: str, generation: int) -> None:
         """Clear the streaming preview after an agent run ends, but only if
-        no newer run has (already) taken over the label."""
-        if generation == self._agent_generation:
+        no newer run of the SAME task has (already) taken over the label."""
+        if self._agent_generations.get(task_id) == generation:
             self._clear_stream_label()
 
     def action_new_task(self) -> None:
@@ -442,8 +444,12 @@ class ActionsLayer(DrCodeState):
         task = self.viewed
         if task is None or task.status is TaskStatus.COMPLETED:
             return
-        self.workers.cancel_group(self, "agent")
-        self.agent_running = False
+        # Stop only the VIEWED task's agent run (parallel slots: other
+        # tasks' runs must keep going).
+        if task.id in self._agent_runs:
+            self.workers.cancel_group(self, f"agent-{task.id}")
+            self._agent_runs.pop(task.id, None)
+            self._current_tool[task.id] = None
         # The user pressed Done right here: the status observers
         # (notifications) must not report this transition.
         self.manager.mark_done(task.id, origin="user")
@@ -468,15 +474,16 @@ class ActionsLayer(DrCodeState):
         task = self.viewed
         if task is None or task.status is TaskStatus.COMPLETED:
             return
-        active = self.manager.active
-        if self.agent_running and active is not None and active.id == task.id:
-            self.workers.cancel_group(self, "agent")
-            self.agent_running = False
-            self._current_tool = None
+        # Stop only the target task's runs (parallel slots: other tasks'
+        # agent runs are independent and keep running).
+        if task.id in self._agent_runs:
+            self.workers.cancel_group(self, f"agent-{task.id}")
+            self._agent_runs.pop(task.id, None)
+            self._current_tool[task.id] = None
         if self.tester_running and self._tester_task_id == task.id:
             self.workers.cancel_group(self, "tester")
             self.tester_running = False
-            self._current_tool = None
+            self._current_tool[task.id] = None
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
         # The task was possibly in TESTING: drop its tester pipeline state.
@@ -502,16 +509,51 @@ class ActionsLayer(DrCodeState):
         self._advance()
 
     def action_abort_run(self) -> None:
-        if self.agent_running or self.tester_running:
-            self.workers.cancel_group(self, "agent")
+        """ESC: stop the running agent/tester.
+
+        With a single development slot (the default, or parallelism
+        without worktree isolation) this is the historical global stop:
+        ESC halts whatever run is alive. With parallel slots (>= 2) ESC
+        stops ONLY the currently viewed task's run — the other tasks'
+        runs are independent work the user did not ask to stop; ESC on a
+        task with nothing running does nothing but say so."""
+        if self.parallel_limit <= 1:
+            if self.agent_running or self.tester_running:
+                for group in [f"agent-{tid}" for tid in list(self._agent_runs)]:
+                    self.workers.cancel_group(self, group)
+                if self.tester_running:
+                    self.workers.cancel_group(self, "tester")
+                self._agent_runs.clear()
+                self.tester_running = False
+                self._current_tool.clear()
+                # Hide AND empty: the aborted run's partial text must not be
+                # resurrected by a later add_class("visible").
+                self._clear_stream_label()
+                self.refresh_status()
+            return
+        task = self.viewed
+        if task is None:
+            return
+        stopped = False
+        if task.id in self._agent_runs:
+            self.workers.cancel_group(self, f"agent-{task.id}")
+            self._agent_runs.pop(task.id, None)
+            self._current_tool[task.id] = None
+            stopped = True
+        if self.tester_running and self._tester_task_id == task.id:
             self.workers.cancel_group(self, "tester")
-            self.agent_running = False
             self.tester_running = False
-            self._current_tool = None
-            # Hide AND empty: the aborted run's partial text must not be
-            # resurrected by a later add_class("visible").
+            self._current_tool[task.id] = None
+            stopped = True
+        if stopped:
             self._clear_stream_label()
             self.refresh_status()
+        else:
+            self.notify(
+                "Task is not running — open an active task to stop one",
+                title="Stop run",
+                timeout=5,
+            )
 
     def action_nudge_run(self) -> None:
         """Ctrl+R on the viewed ACTIVE/TESTING task: abort its hung or
@@ -1004,13 +1046,16 @@ class ActionsLayer(DrCodeState):
     def _task_isolation_label(self) -> str:
         """The Settings-entry label of the task-isolation setting: the
         option's own label, plus the dormant marker when worktree is
-        selected but the project has no git repository."""
+        selected but the project has no git repository, plus the
+        parallel-slot count when more than one is configured."""
         label = self.settings.task_isolation.label
         if (
             self.settings.task_isolation is TaskIsolation.WORKTREE
             and not self.task_env.available
         ):
             label += " — no git repo, inactive"
+        if self.settings.parallel_tasks > 1:
+            label += f" — parallel: {self.settings.parallel_tasks}"
         return label
 
     def action_set_task_isolation(self, isolation: TaskIsolation) -> None:
@@ -1056,6 +1101,52 @@ class ActionsLayer(DrCodeState):
             SettingsPalette(
                 id="--task-isolation-palette",
                 providers=[IsolationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_parallel_tasks(self, count: int) -> None:
+        """Settings command: how many tasks may develop in parallel
+        (development slots). Persisted per project (.drcode/
+        settings.json); applies from the next promotion on. Only
+        meaningful under worktree isolation — every parallel task needs
+        its own worktree, so without a usable isolation the picker
+        refuses values above 1 (the persisted value stays; the effective
+        limit is 1 and the app warns at startup)."""
+        count = max(1, count)
+        if count > 1 and not self.task_env.active:
+            self.notify(
+                "Parallel tasks needs Task isolation: worktree — each "
+                "parallel task runs in its own git worktree, and this "
+                "project has none. Set Task isolation first; the limit "
+                "stays 1.",
+                title="Project settings",
+                severity="warning",
+                timeout=10,
+            )
+            return
+        self.settings.parallel_tasks = count
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Parallel tasks: {parallel_tasks_label(count)}",
+            title="Project settings",
+            timeout=4,
+        )
+        # A raised limit can start waiting tasks right away.
+        self._advance()
+
+    def action_change_parallel_tasks(self) -> None:
+        """Parallel-tasks picker, opened from the Settings entry
+        ("Parallel tasks: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the options; picking one applies
+        it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--parallel-tasks-palette",
+                providers=[ParallelTasksOptionsProvider],
                 placeholder="Search for options…",
             )
         )

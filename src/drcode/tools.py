@@ -7,8 +7,10 @@ Permission model:
   /tmp/drcode/<task-id> — /tmp outside that directory is NOT writable, so two
   tasks cannot interfere through shared scratch files;
 - run_bash inspects the command and refuses rm/mv/cp whose path arguments
-  escape that writable area, and points the child process's TMPDIR at the
-  task's scratch directory.
+  escape that writable area, points the child process's TMPDIR at the
+  task's scratch directory, and exports DRCODE_TASK_ID / DRCODE_WORKTREE
+  so a parallel task's child processes can pick per-task resources
+  (ports, caches) — see the parallel development slots.
 
 Every refusal raises PathViolation with a model-friendly message; the agent
 layer logs it into the task's service-event history before returning it to
@@ -422,6 +424,7 @@ async def run_bash(
     timeout: float | None = None,
     *,
     extra_writable: Path | None = None,
+    task_id: str | None = None,
 ) -> str:
     check_command(root, command, extra_writable)
     effective = clamp_bash_timeout(timeout)
@@ -433,6 +436,14 @@ async def run_bash(
         extra_writable.mkdir(parents=True, exist_ok=True, mode=0o700)
         _stamp_scratch_owner(extra_writable)
         env["TMPDIR"] = str(extra_writable)
+    if task_id is not None:
+        # Parallel development slots run several tasks at once: the child
+        # process can tell its own task apart (pick per-task ports, write
+        # per-task caches). Under worktree isolation the cwd IS the task's
+        # worktree, so DRCODE_WORKTREE distinguishes it from the project
+        # root; a plain task still reports the project directory.
+        env["DRCODE_TASK_ID"] = task_id
+        env["DRCODE_WORKTREE"] = str(root)
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,

@@ -1134,7 +1134,22 @@ class PipelineLayer(DrCodeState):
                                                     )
                                                 reasoning_block.begin()
                                                 if self.viewed_id == task_id:
-                                                    self._write_chat(reasoning_block)
+                                                    # Noted: the block mirrors
+                                                    # the timeline "reasoning"
+                                                    # entry the persisted
+                                                    # transcript gains at the
+                                                    # node boundary — the
+                                                    # end-of-turn view_task
+                                                    # then appends instead of
+                                                    # wiping.
+                                                    self._write_chat(
+                                                        reasoning_block,
+                                                        note=(
+                                                            "reasoning",
+                                                            "",
+                                                            reasoning_block,
+                                                        ),
+                                                    )
                                                 else:
                                                     view_dirty = True
                                                 reasoning_block.append(
@@ -1197,7 +1212,18 @@ class PipelineLayer(DrCodeState):
                                                         old._content
                                                     )
                                                 if self.viewed_id == task_id:
-                                                    self._write_chat(assistant_block)
+                                                    # Noted: mirrors the
+                                                    # timeline "assistant"
+                                                    # entry (see the reasoning
+                                                    # branch above).
+                                                    self._write_chat(
+                                                        assistant_block,
+                                                        note=(
+                                                            "assistant",
+                                                            "",
+                                                            assistant_block,
+                                                        ),
+                                                    )
                                                 else:
                                                     view_dirty = True
                                                 assistant_block.append(
@@ -1310,7 +1336,10 @@ class PipelineLayer(DrCodeState):
                                                 block,
                                             )
                                             block.start_spinner()
-                                            self._write_chat(block)
+                                            self._write_chat(
+                                                block,
+                                                note=("tool-call", call_text, None),
+                                            )
                                 # Mid-run compaction gate: a single turn can
                                 # run for many model requests, and the
                                 # turn-boundary gate above would only fire
@@ -1371,7 +1400,10 @@ class PipelineLayer(DrCodeState):
                         # the task was off-screen (view_dirty), or the user
                         # switched views mid-node — the switch-back render
                         # covered only the transcript persisted at the
-                        # previous node boundary.
+                        # previous node boundary. The rebuild itself goes
+                        # through the delta path: the streamed blocks are
+                        # reconciled against the (now persisted) timeline and
+                        # only the missing tail is appended.
                         self.view_task(task_id)
                         view_dirty = False
                         synced_epoch = self._chat_epoch
@@ -1760,17 +1792,133 @@ class PipelineLayer(DrCodeState):
                     ) as run:  # noqa: F811 - rebinding per attempt is intended
                         async for node in run:
                             if Agent.is_model_request_node(node):
-                                # Drain the stream (nothing to render — the
-                                # answer comes from the end-of-round
-                                # re-render) and take the round's freshest
-                                # context reading once the request is final.
+                                # Stream the round's reasoning/answer into
+                                # the open chat view (mirrors run_agent's
+                                # streaming branch): everything the tester
+                                # produces must already be on screen when
+                                # the end-of-round re-render runs, so that
+                                # re-render can go through the delta path
+                                # (append the missing tail) instead of
+                                # wiping and remounting the whole history.
                                 # Every event is a sign of life: without the
                                 # touch a long (minutes) report generation
                                 # reads as "stalled" — and the stall watchdog
                                 # aborts a perfectly healthy run.
+                                reasoning_block: ReasoningBlock | None = None
+                                assistant_block: AssistantBlock | None = None
                                 async with node.stream(run.ctx) as stream:
-                                    async for _event in stream:
+                                    async for event in stream:
                                         self._touch_activity(task_id)
+                                        if isinstance(event, PartStartEvent):
+                                            part = event.part
+                                            if isinstance(part, ThinkingPart):
+                                                delta: (
+                                                    ThinkingPartDelta | TextPartDelta
+                                                ) = ThinkingPartDelta(
+                                                    content_delta=part.content
+                                                )
+                                            elif isinstance(part, TextPart):
+                                                delta = TextPartDelta(
+                                                    content_delta=part.content
+                                                )
+                                            else:
+                                                continue
+                                        elif isinstance(event, PartDeltaEvent):
+                                            if isinstance(
+                                                event.delta,
+                                                ThinkingPartDelta | TextPartDelta,
+                                            ):
+                                                delta = event.delta
+                                            else:
+                                                continue
+                                        else:
+                                            continue
+                                        if not delta.content_delta:
+                                            continue
+                                        if isinstance(delta, ThinkingPartDelta):
+                                            if (
+                                                reasoning_block is None
+                                                or reasoning_block.stream_epoch
+                                                != self._chat_epoch
+                                            ):
+                                                old, reasoning_block = (
+                                                    reasoning_block,
+                                                    ReasoningBlock(
+                                                        reasoning_block.at
+                                                        if reasoning_block
+                                                        else None
+                                                    ),
+                                                )
+                                                reasoning_block.stream_epoch = (
+                                                    self._chat_epoch
+                                                )
+                                                if old is not None:
+                                                    # A mid-node view_task()
+                                                    # re-render orphaned the
+                                                    # old block: carry the
+                                                    # already-streamed text
+                                                    # over (see run_agent).
+                                                    reasoning_block.set_content(
+                                                        old._content
+                                                    )
+                                                reasoning_block.begin()
+                                                if self.viewed_id == task_id:
+                                                    self._write_chat(
+                                                        reasoning_block,
+                                                        note=(
+                                                            "reasoning",
+                                                            "",
+                                                            reasoning_block,
+                                                        ),
+                                                    )
+                                                reasoning_block.append(
+                                                    delta.content_delta
+                                                )
+                                            else:
+                                                reasoning_block.thinking(True)
+                                                reasoning_block.append(
+                                                    delta.content_delta
+                                                )
+                                        else:
+                                            if reasoning_block is not None:
+                                                reasoning_block.thinking(False)
+                                            if (
+                                                assistant_block is None
+                                                or assistant_block.stream_epoch
+                                                != self._chat_epoch
+                                            ):
+                                                old, assistant_block = (
+                                                    assistant_block,
+                                                    AssistantBlock(),
+                                                )
+                                                assistant_block.stream_epoch = (
+                                                    self._chat_epoch
+                                                )
+                                                if old is not None:
+                                                    # See the reasoning branch.
+                                                    assistant_block.set_content(
+                                                        old._content
+                                                    )
+                                                if self.viewed_id == task_id:
+                                                    self._write_chat(
+                                                        assistant_block,
+                                                        note=(
+                                                            "assistant",
+                                                            "",
+                                                            assistant_block,
+                                                        ),
+                                                    )
+                                                assistant_block.append(
+                                                    delta.content_delta
+                                                )
+                                            else:
+                                                assistant_block.append(
+                                                    delta.content_delta
+                                                )
+                                if reasoning_block is not None:
+                                    reasoning_block.finish()
+                                if assistant_block is not None:
+                                    assistant_block.finish()
                                 live_tokens = run_context_tokens(run)
                                 # Exact per-request usage of the completed
                                 # model call, into the session totals.
@@ -1819,7 +1967,10 @@ class PipelineLayer(DrCodeState):
                                                 block,
                                             )
                                             block.start_spinner()
-                                            self._write_chat(block)
+                                            self._write_chat(
+                                                block,
+                                                note=("tool-call", call_text, None),
+                                            )
                                 # Mid-round compaction gate: a tool boundary
                                 # is the only safe stopping point (same as
                                 # the agent's mid-run gate). Skipped when a
@@ -1868,9 +2019,12 @@ class PipelineLayer(DrCodeState):
                         text = None
                         continue
                     if run.result is not None and self.viewed_id == task_id:
-                        # Re-render from the persisted transcript: the streamed
-                        # tool-call blocks above are replaced by the full history
-                        # view (separator + reasoning + tool calls + answer).
+                        # Re-render from the persisted transcript: everything
+                        # the round streamed live (separator, tool calls,
+                        # reasoning, answer) is on screen and mirrored by the
+                        # delta ledger, so this appends only the entries the
+                        # live view is missing (usually nothing) instead of
+                        # wiping and remounting the whole history.
                         self.view_task(task_id)
                     break
             except asyncio.CancelledError:

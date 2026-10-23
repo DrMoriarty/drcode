@@ -67,6 +67,7 @@ from .inputs import ChatInput, DepsInput, NewTaskInput
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem  # noqa: F401
+from .state import LiveTailEntry
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 
@@ -536,9 +537,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # chain died or starved (see chat_view._schedule_drain).
         self._chat_drain_at = 0.0
         # Delta re-render bookkeeping (see _try_delta_view): None/() until
-        # the first full history render, invalidated by every live mount.
+        # the first full history render; live writes that mirror the next
+        # timeline entries are recorded in _live_tail instead of
+        # invalidating, so a subsequent view_task can append just the tail.
         self._rendered_count: int | None = None
-        self._rendered_prefix: tuple[tuple[str, str], ...] = ()
+        self._rendered_prefix: tuple[tuple[str, ...], ...] = ()
+        # Live-tail ledger: (role, text, block) of every chat write mounted
+        # since the last delta-consistent point that _try_delta_view has not
+        # reconciled against the timeline yet. `block` (a ReasoningBlock /
+        # AssistantBlock) is set when the entry's final text lives in the
+        # widget's own `_content` (streamed blocks whose text was still
+        # partial at mount time); otherwise `text` is the exact timeline-
+        # comparable string. Cleared by full renders and invalidation.
+        self._live_tail: list[LiveTailEntry] = []
         # Clarification object currently rendered in the open chat view.
         # Compared by identity: a newly asked question is a fresh instance,
         # so the agent run's end-of-run handler never re-draws a question

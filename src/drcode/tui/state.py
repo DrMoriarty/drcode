@@ -50,7 +50,7 @@ from ..settings import (
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..workflow import WorkflowHooks
-from .blocks import ToolCallBlock
+from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock
 from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
@@ -58,6 +58,13 @@ from .setup_dialog import ModelSetup
 from .sidebar import Sidebar
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
+
+# A live-tail ledger entry (see chat_view._write_chat's `note`): (role,
+# text, block). `block` is set only for streamed ReasoningBlock/
+# AssistantBlock mounts — their final text lives in the widget's `_content`
+# (still partial at mount time); every other entry is compared by the exact
+# `text` written.
+LiveTailEntry = tuple[str, str, ReasoningBlock | AssistantBlock | None]
 
 
 class DrCodeState(App[None]):
@@ -192,7 +199,11 @@ class DrCodeState(App[None]):
     ) -> None: ...
 
     def _write_chat(
-        self, content: RenderableType | Widget, *, expand: bool = False
+        self,
+        content: RenderableType | Widget,
+        *,
+        expand: bool = False,
+        note: LiveTailEntry | None = None,
     ) -> None: ...
 
     def _flush_chat_batch(self) -> None: ...
@@ -572,10 +583,13 @@ class DrCodeState(App[None]):
     # extras mounted since), _rendered_count is the number of timeline
     # entries already mounted and _rendered_prefix their (timestamp, role)
     # fingerprint — a view_task() of the SAME task then appends only the
-    # missing tail instead of wiping and remounting the whole history. Any
+    # missing tail instead of wiping and remounting the whole history. Live
+    # writes that mirror the next timeline entries are tracked in the
+    # live-tail ledger and reconciled by _try_delta_view; a non-timeline
     # live _write_chat() mount or log wipe invalidates both (None/()).
     _rendered_count: int | None
-    _rendered_prefix: tuple[tuple[str, str], ...]
+    _rendered_prefix: tuple[tuple[str, ...], ...]
+    _live_tail: list[LiveTailEntry]
 
     # -- widget getters (defined in the DrCodeApp skeleton) -----------------
     @property

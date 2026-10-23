@@ -9,31 +9,42 @@ no network access happens.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from textual.command import Command, CommandList
 from textual.geometry import Offset
 from textual.widgets import ListView, Static, TextArea
 from textual.widgets._list_item import ListItem
 from textual.widgets.text_area import Selection
 
+from drcode import agent_model
 from drcode.agent import serialize_messages
 from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
+from drcode.tui.blocks import AssistantBlock
 from drcode.tui.command_providers import (
     SettingsPalette,
     role_model_options_provider,
 )
 from drcode.tui.setup_dialog import ModelSetupDialog
 from drcode.tui.sidebar import TaskItem
+from tests.network_mocks import (
+    ScriptedState,
+    text_response,
+    tool_response,
+    wait_until,
+)
 
 
 @pytest.fixture
@@ -184,6 +195,9 @@ async def test_drain_survives_dropped_call_after_refresh(app: DrCodeApp) -> None
             return original(callback, *args, **kwargs)
 
         app.call_after_refresh = drop_first_schedule  # type: ignore[method-assign]
+        # The queued prompt left the pending input (the delta re-render
+        # would otherwise be a no-op): the view_task below must rebuild.
+        task.pending_input.clear()
         app.view_task(task.id)
         for _ in range(60):
             await pilot.pause()
@@ -193,7 +207,9 @@ async def test_drain_survives_dropped_call_after_refresh(app: DrCodeApp) -> None
         assert not app._chat_batching
         assert app._chat_batch == []
         log = app.query_one("#chat-log")
-        assert len(log.children) == 161
+        # 2 blocks per turn (the rebuild no longer counts the drained
+        # pending prompt — its input was cleared above).
+        assert len(log.children) == 160
         rendered = "\n".join(str(w.render()) for w in log.children)
         assert "answer 79" in rendered
 
@@ -410,6 +426,273 @@ async def test_view_task_delta_falls_back_to_full_rebuild(app: DrCodeApp) -> Non
         assert after != before
         rendered = "\n".join(str(w.render()) for w in log.children)
         assert "question 1" in rendered
+
+
+async def test_view_task_delta_reconciles_streamed_tail(app: DrCodeApp) -> None:
+    """Live writes that mirror the next timeline entries (noted into the
+    live-tail ledger by _write_chat) keep the delta path alive: the
+    following view_task appends only what the live view is missing instead
+    of wiping the log (the end-of-turn / end-of-round rebuilds)."""
+    task = app.manager.create("streamed task", "prompt")
+    task.status = TaskStatus.COMPLETED
+    task.pending_input.clear()
+    base = _fat_transcript(3)
+    task.messages = base
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        for _ in range(30):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+
+        # Simulate the run's live tail: the consumed prompt drawn as a user
+        # block and the streamed answer block (mounted empty, content grows
+        # in place) — both mirrored by the timeline entries the transcript
+        # gains at the node boundary.
+        app._write_history_line("user", "question 3")
+        block = AssistantBlock()
+        app._write_chat(block, note=("assistant", "", block))
+        block.append("answer 3")
+        # Now the transcript catches up (the node-boundary persist): the
+        # first three turns keep their identity (same timestamps), the new
+        # turn appends.
+        task.messages = base + serialize_messages(
+            [
+                ModelRequest(parts=[UserPromptPart(content="question 3")]),
+                ModelResponse(parts=[TextPart(content="answer 3")]),
+            ]
+        )
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after[: len(before)] == before  # nothing remounted
+        # The two live writes (user prompt + streamed answer) are the only
+        # additions — the view_task re-render appended nothing.
+        assert len(after) == len(before) + 2
+        assert "question 3" in str(log.children[-2].render())
+        assert "answer 3" in str(log.children[-1].render())
+        assert app._rendered_count is not None  # delta bookkeeping alive
+        assert app._live_tail == []
+
+
+async def test_view_task_delta_streamed_mismatch_rebuilds(app: DrCodeApp) -> None:
+    """A live block whose content does NOT match the timeline (still
+    streaming, or a text the transcript disagrees with) must fall back to
+    the full rebuild."""
+    task = app.manager.create("mismatch task", "prompt")
+    task.status = TaskStatus.COMPLETED
+    task.pending_input.clear()
+    task.messages = _fat_transcript(3)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        for _ in range(30):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+
+        block = AssistantBlock()
+        app._write_chat(block, note=("assistant", "", block))
+        block.append("still streaming…")  # transcript has no such entry
+        after = [id(w) for w in log.children]
+        assert after[: len(before)] == before  # nothing happened yet
+        task.messages = _fat_transcript(4)
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after != before  # full rebuild: the ledger did not reconcile
+        assert app._live_tail == []
+
+
+async def test_view_task_delta_survives_prompt_consumption(app: DrCodeApp) -> None:
+    """A queued prompt rendered as a pending bubble becomes a regular user
+    entry once the run consumes it into the transcript (same timestamp —
+    the request is backdated, same block look): the transition must keep
+    the delta path instead of forcing a rebuild."""
+    task = app.manager.create("pending task", "the queued brief")
+    task.status = TaskStatus.ACTIVE
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        for _ in range(30):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        log = app.query_one("#chat-log")
+        before = [id(w) for w in log.children]
+        assert len(before) == 1  # the pending bubble
+
+        # The run consumed the prompt into the transcript (backdated to the
+        # typing time) and streamed the answer live.
+        typed_at = task.pending_input[0].at
+        task.pending_input.clear()
+        block = AssistantBlock()
+        app._write_chat(block, note=("assistant", "", block))
+        block.append("the answer")
+        app._pending_rendered.clear()
+        part = UserPromptPart(content="the queued brief")
+        part.timestamp = typed_at
+        req = ModelRequest(parts=[part])
+        req.timestamp = typed_at
+        task.messages = serialize_messages(
+            [req, ModelResponse(parts=[TextPart(content="the answer")])]
+        )
+        app.view_task(task.id)
+        await pilot.pause()
+        after = [id(w) for w in log.children]
+        assert after[: len(before)] == before  # the bubble stayed (no wipe)
+        assert len(after) == len(before) + 1
+        assert "the answer" in str(log.children[-1].render())
+
+
+# -- full-pipeline delta runs (FunctionModel stub) ---------------------------------
+
+
+@pytest.fixture
+def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DRCODE_MODEL", "mock-model")
+    monkeypatch.setenv("DRCODE_API_KEY", "mock-key")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://127.0.0.1:1/v1")
+
+
+@pytest.fixture
+def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
+    state = ScriptedState()
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    return state
+
+
+def _spy_wipes(app: DrCodeApp) -> list[int]:
+    """Record every chat-log wipe (the full rebuild's remove_children)."""
+    log = app.query_one("#chat-log")
+    wipes: list[int] = []
+    orig = log.remove_children
+
+    def spy() -> None:
+        wipes.append(len(log.children))
+        orig()
+
+    log.remove_children = spy  # type: ignore[method-assign]
+    return wipes
+
+
+async def test_pipeline_final_answer_never_wipes_chat(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+) -> None:
+    """The task watched live through a whole pipeline run (agent answer →
+    mark_done → tester round) must not wipe-and-remount the chat: the
+    streamed blocks are reconciled against the timeline by the ledger and
+    every end-of-turn / end-of-round view_task appends only the tail."""
+    app = DrCodeApp(project_root)
+    task = app.manager.create("delta pipeline", "do the thing")
+    scripted.steps = [
+        text_response("work done"),  # dev round
+        tool_response("set_verification", {"success": True}),  # tester
+        text_response("all good"),
+    ]
+    # Emulate the production loop (see test_tui_consumed_prompt).
+    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        wipes = _spy_wipes(app)
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not app.agent_running
+                and not app.tester_running
+            ),
+            pilot,
+            what="pipeline settled",
+            timeout=30.0,
+        )
+        await pilot.pause()
+        assert wipes == [], "the chat was wiped around the final answer"
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "do the thing" in rendered
+        assert "work done" in rendered
+        assert "testing" in rendered
+        assert "all good" in rendered
+        # The delta bookkeeping survived the run (nothing invalidated it).
+        assert app._rendered_count is not None
+        assert app._live_tail == []
+
+
+async def test_pipeline_switch_back_mid_run_appends_without_wipe(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance scenario: the user is on another task, switches to this
+    one when the answer appears, and watches it finish (then the tester
+    round) — no full wipe-and-remount may follow the switch-back."""
+    app = DrCodeApp(project_root)
+    task = app.manager.create("watched task", "do the thing")
+    other = app.manager.create("other task", "other brief")
+    release = asyncio.Event()
+    orig_stream = scripted.stream_fn
+
+    async def gated_stream(
+        messages: list[Any], info: AgentInfo
+    ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
+        for m in messages:
+            if hasattr(m, "parts"):
+                for p in m.parts:
+                    if "do the thing" in str(getattr(p, "content", "")):
+                        await release.wait()
+        async for chunk in orig_stream(messages, info):
+            yield chunk
+
+    monkeypatch.setattr(
+        scripted,
+        "model",
+        lambda: FunctionModel(scripted.fn, stream_function=gated_stream),
+    )
+    scripted.steps = [
+        text_response("work done"),
+        tool_response("set_verification", {"success": True}),
+        text_response("all good"),
+    ]
+    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(lambda: app.agent_running, pilot, what="agent running")
+        # Switch away and back while the run holds at its first request.
+        app.view_task(other.id)
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        wipes = _spy_wipes(app)
+        # The answer appears: the run resumes and the pipeline settles.
+        release.set()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not app.agent_running
+                and not app.tester_running
+            ),
+            pilot,
+            what="pipeline settled",
+            timeout=30.0,
+        )
+        await pilot.pause()
+        assert wipes == [], "full rebuild after the switch-back"
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "work done" in rendered
+        assert "all good" in rendered
+        assert app._rendered_count is not None
+        assert app._live_tail == []
 
 
 async def test_cancel_without_pending_skips_full_rebuild(app: DrCodeApp) -> None:

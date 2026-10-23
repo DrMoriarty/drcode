@@ -73,7 +73,7 @@ from ..models import (
 from ..version import APP_VERSION
 from .ctx_dialog import ContextDialog
 from .header import HeaderConnInfo, HeaderSessionInfo, ModelStatusHeader
-from .state import DrCodeState
+from .state import DrCodeState, LiveTailEntry
 
 
 class ChatViewLayer(DrCodeState):
@@ -914,7 +914,9 @@ class ChatViewLayer(DrCodeState):
             self._flush_chat_batch()
         # The log now mirrors the rendered timeline: delta re-renders can
         # append from here. A live write landing while the chunked drain is
-        # still going re-invalidates this via _write_chat.
+        # still going keeps the ledger (its note rides along); noted writes
+        # made by THIS render (the notes above) are dropped.
+        self._live_tail.clear()
         self._rendered_count = len(timeline)
         self._rendered_prefix = self._timeline_fingerprint(timeline)
         self.refresh_todo_panel()
@@ -926,21 +928,23 @@ class ChatViewLayer(DrCodeState):
         timeline entries that appeared since the last full render.
 
         Falls back to False (caller does the full rebuild) whenever the
-        guarantee "mounted blocks == rendered timeline prefix" cannot be
-        trusted: a live block was mounted since (streaming, an event line,
-        a clarification, a consumed prompt), the drain of the last rebuild
-        is still running, queued comments are drawn, or the history prefix
-        changed underneath (compaction rewriting the transcript, an event
-        sorting INTO the middle of the timeline). Returns True also when
-        nothing new at all — the rebuild is skipped entirely.
+        guarantee "mounted blocks == rendered timeline prefix (+ reconciled
+        live tail)" cannot be trusted: a live write that does not mirror
+        the next timeline entries (a clarification, a still-growing partial
+        stream, merged prompts, an event sorting INTO the middle), the
+        drain of the last rebuild still running, or the history prefix
+        changed underneath (compaction rewriting the transcript). Queued
+        comments and consumed-but-unpersisted prompts ARE timeline entries
+        ("user-pending", canonicalized to "user" with the prompt text in
+        the fingerprint — see _timeline_fingerprint), so they don't block
+        the delta. Writes that DO mirror the timeline (streamed blocks,
+        tool-call lines, event lines) are tracked in the live-tail ledger
+        (_write_chat's note) and reconciled here — the rebuild then appends
+        only the missing tail. Returns True also when nothing new at all —
+        the rebuild is skipped entirely.
         """
         count = self._rendered_count
-        if (
-            count is None
-            or self._chat_batching
-            or self._pending_rendered
-            or self._consumed_prompts.get(task_id) is not None
-        ):
+        if count is None or self._chat_batching:
             return False
         task = self.manager.get(task_id)
         if task is None:
@@ -952,18 +956,45 @@ class ChatViewLayer(DrCodeState):
             # render (the dialog is rendered outside the timeline).
             return False
         timeline = self._build_task_timeline(task, task_id)
-        if len(timeline) < count:
+        # Reconcile the live-tail ledger: every live write since the last
+        # delta-consistent point must mirror the timeline entries that
+        # follow the rendered prefix, in order. Streamed blocks are
+        # compared by their final `_content` (the stream has ended by the
+        # time a view_task re-render happens); everything else by the exact
+        # text that was written. A mismatch (a partial stream still
+        # growing, merged prompts, reordered entries) falls back to the
+        # full rebuild.
+        tail = self._live_tail
+        end = count + len(tail)
+        if len(timeline) < end:
             return False
+        for offset, (tail_role, tail_text, tail_block) in enumerate(tail):
+            entry = timeline[count + offset]
+            if self._fingerprint_role(entry[2]) != self._fingerprint_role(tail_role):
+                return False
+            if tail_block is not None:
+                if tail_block._content != entry[3]:
+                    return False
+            elif tail_text != entry[3]:
+                return False
         if self._timeline_fingerprint(timeline[:count]) != self._rendered_prefix:
             return False
-        if len(timeline) == count:
+        if len(timeline) == end:
+            # Nothing to mount: the live tail IS the timeline tail — fold
+            # it into the rendered prefix so later deltas build on it.
+            self._live_tail.clear()
+            self._rendered_count = end
+            self._rendered_prefix = self._timeline_fingerprint(timeline)
             return True
-        for at, _, role, text in timeline[count:]:
+        for at, _, role, text in timeline[end:]:
             block = self._write_history_line(
                 role, text, None if at == _MIN_TIME else at
             )
             if role == "tool-call" and isinstance(block, ToolCallBlock):
                 self._reattach_tool_spinner(block, text, task_id)
+        # The mounted tail is now part of the rendered prefix; the writes
+        # above noted themselves into the ledger — drop the whole record.
+        self._live_tail.clear()
         self._rendered_count = len(timeline)
         self._rendered_prefix = self._timeline_fingerprint(timeline)
         return True
@@ -975,18 +1006,43 @@ class ChatViewLayer(DrCodeState):
         a full rebuild."""
         self._rendered_count = None
         self._rendered_prefix = ()
+        self._live_tail.clear()
 
     @staticmethod
     def _timeline_fingerprint(
         timeline: list[tuple[datetime, int, str, str]],
-    ) -> tuple[tuple[str, str], ...]:
+    ) -> tuple[tuple[str, ...], ...]:
         """Compact identity of a rendered timeline prefix: (timestamp,
-        role) of every entry. Text is intentionally left out — a prefix
-        whose entries kept their positions but changed text means the
-        transcript was rewritten (compaction), which the length check and
-        the fingerprint both tend to catch anyway; timestamps+roles catch
-        the reordering case (an event sorted into the middle)."""
-        return tuple((at.isoformat(), role) for at, _, role, _ in timeline)
+        role) of every entry — plus the text for user prompts. Text is
+        intentionally left out for everything else: a prefix whose entries
+        kept their positions but changed text means the transcript was
+        rewritten (compaction), which the length check and the fingerprint
+        both tend to catch anyway; timestamps+roles catch the reordering
+        case (an event sorted into the middle).
+
+        "user-pending" canonicalizes to "user" (see _fingerprint_role): a
+        queued prompt rendered as a pending bubble becomes a regular user
+        entry (same timestamp — the request is backdated to the typing
+        time) once the run consumes it into the transcript; the mounted
+        UserBlock is identical, so the transition must not force a rebuild.
+        The user-prompt TEXT is part of the fingerprint precisely for this
+        transition: a consumed batch (comments merged into one prompt,
+        workflow instructions prepended) changes it, and only a rebuild
+        replaces the stale bubble(s)."""
+        out: list[tuple[str, ...]] = []
+        for at, _, role, text in timeline:
+            if role in ("user", "user-pending"):
+                out.append((at.isoformat(), "user", text))
+            else:
+                out.append((at.isoformat(), role))
+        return tuple(out)
+
+    @staticmethod
+    def _fingerprint_role(role: str) -> str:
+        """Canonical timeline role: "user-pending" and "user" render the
+        same UserBlock and may swap underneath a mounted one (the run
+        consuming the queued prompt into the transcript)."""
+        return "user" if role == "user-pending" else role
 
     def _build_task_timeline(
         self, task: Task, task_id: str
@@ -1147,7 +1203,11 @@ class ChatViewLayer(DrCodeState):
                     return
 
     def _write_chat(
-        self, content: RenderableType | Widget, *, expand: bool = False
+        self,
+        content: RenderableType | Widget,
+        *,
+        expand: bool = False,
+        note: LiveTailEntry | None = None,
     ) -> None:
         """Mount one block to the chat log.
 
@@ -1158,17 +1218,35 @@ class ChatViewLayer(DrCodeState):
         While batching (view_task's history rebuild and its chunked drain),
         the block is only collected — _flush_chat_batch() mounts the
         timeline in chunks afterwards.
+
+        *note* marks the write as one that mirrors the NEXT timeline entry
+        of the open task: (role, text, block) — `text` is the exact
+        timeline-comparable string (for markup lines and tool calls), or
+        `block` is a ReasoningBlock/AssistantBlock whose `_content` holds
+        the final text once the stream ends. Noted writes extend the delta
+        bookkeeping (the live-tail ledger) instead of invalidating it:
+        _try_delta_view reconciles the ledger against the timeline and
+        appends only the missing tail. A write without a note (a
+        clarification dialog, an error line, anything outside the
+        timeline) invalidates as before.
         """
         if isinstance(content, Widget):
             content.add_class("chat-block")
         else:
             content = Static(content, expand=expand, classes="chat-block")
-        # Any live (non-timeline) mount — a streamed block, an event line, a
-        # clarification — breaks the "log == rendered timeline prefix"
-        # invariant the delta re-render relies on: the next view_task must
-        # rebuild fully. (During a batched rebuild this is a no-op: the
-        # counters are (re)set after the render.)
-        self._invalidate_chat_delta()
+        if note is not None and self._rendered_count is not None:
+            # Live write whose timeline counterpart is known: keep the
+            # "mounted log == rendered timeline (+ reconciled live tail)"
+            # invariant instead of dropping it. (During a batched rebuild
+            # the counters are stale/None — view_task resets both the
+            # counters and the ledger after the render.)
+            self._live_tail.append(note)
+        elif note is None:
+            # Any live (non-timeline) mount — a streamed block, an event
+            # line, a clarification — breaks the "log == rendered timeline
+            # prefix" invariant the delta re-render relies on: the next
+            # view_task must rebuild fully.
+            self._invalidate_chat_delta()
         if self._chat_batching:
             self._chat_batch.append(content)
             self._chat_has_content = True
@@ -1281,6 +1359,14 @@ class ChatViewLayer(DrCodeState):
         spinner to tool-call blocks this way.
         """
         block: Widget | None = None
+        # Live-tail note: (role, timeline-text, streamed-block-or-None).
+        # Timeline roles note themselves (the ledger reconciles them
+        # against the next timeline entry); "system" and the summary's
+        # separator line are outside the timeline and keep invalidating.
+        # For streamed blocks (reasoning/assistant) the note carries the
+        # widget — its `_content` holds the final text once the stream
+        # ends; for everything else the exact text compares.
+        note: LiveTailEntry | None = (role, text, None)
         if role == "user":
             block = UserBlock(text)
         elif role == "user-pending":
@@ -1294,17 +1380,18 @@ class ChatViewLayer(DrCodeState):
         elif role == "assistant":
             block = AssistantBlock(text)
         elif role == "tool":
-            self._write_chat(f"[dim]{_mention_markup(escape(text))}[/]")
+            self._write_chat(f"[dim]{_mention_markup(escape(text))}[/]", note=note)
         elif role == "tester":
             # tester output is raw model text: escape it before the markup
             # parser sees it (a stray bracket would crash rendering), then
             # wrap task-id mentions into click links.
             self._write_chat(
-                f"[bold magenta]tester ›[/] {_mention_markup(escape(text))}"
+                f"[bold magenta]tester ›[/] {_mention_markup(escape(text))}",
+                note=note,
             )
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
-            self._write_chat(f"[bold magenta]──── {label} ────[/]")
+            self._write_chat(f"[bold magenta]──── {label} ────[/]", note=note)
         elif role == "summary":
             # Compaction summary: a marker separator, then the summary
             # itself rendered as markdown (it is the model's output the
@@ -1312,11 +1399,17 @@ class ChatViewLayer(DrCodeState):
             self._write_chat("[bold magenta]──── context compacted ────[/]")
             block = AssistantBlock(text)
         elif role == "event":
-            self._write_chat(f"[bold red]event ›[/] {text}")
+            self._write_chat(f"[bold red]event ›[/] {text}", note=note)
         elif role == "system":
+            note = None
             self._write_chat(f"[bold red]error ›[/] {_mention_markup(escape(text))}")
         if block is not None:
-            self._write_chat(block)
+            if isinstance(block, ReasoningBlock | AssistantBlock):
+                self._write_chat(block, note=(role, text, block))
+            elif note is not None:
+                self._write_chat(block, note=(role, text, None))
+            else:
+                self._write_chat(block)
         return block
 
     def _write_clarification(self, clarification: Clarification) -> None:

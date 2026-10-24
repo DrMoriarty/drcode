@@ -586,6 +586,10 @@ class DrCodeState(App[None]):
     # the tool each run is waiting on and the tok/s sample window.
     _last_activity: dict[str, float]
     _current_tool: dict[str, str | None]
+    # Per-task mergedness of COMPLETED tasks' drcode/<id> branches
+    # ("none"/"unmerged"/"merged") — refreshes off the event loop in
+    # _unmerged_completed_ids; the sidebar colors the ✓ marker by it.
+    _merge_state: dict[str, str]
 
     # -- live stream / connection -------------------------------------------
     _tps_samples: dict[str, deque[tuple[float, int]]]

@@ -659,3 +659,117 @@ async def test_stale_hook_merge_failed_cleared_after_manual_merge(
         reloaded = TaskManager(app.project_root).get(task.id)
         assert not reloaded.hook_merge_failed
         await pilot.pause()
+
+
+# -- sidebar merge-state colors (the ✓ marker of COMPLETED tasks) --------------------
+
+
+async def test_merge_state_tracks_branch_lifecycle(app_env: DrCodeApp) -> None:
+    """_unmerged_completed_ids (the 10 s poll's worker) refreshes
+    `_merge_state` from one batched snapshot: no branch → "none", unmerged
+    commits → "unmerged", merged branch → "merged", branch deleted after
+    the merge → back to "none" (the accepted cleanup limitation)."""
+    app = app_env
+    task = finished_task(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # No worktree/branch yet: white.
+        assert app._unmerged_completed_ids() == []
+        assert app._merge_state == {task.id: "none"}
+        commit_on_branch(app.task_env, task.id)
+        assert app._unmerged_completed_ids() == [task.id]
+        assert app._merge_state == {task.id: "unmerged"}
+        _git(
+            app.project_root,
+            "merge",
+            "-q",
+            "--no-ff",
+            branch_for(task.id),
+            "-m",
+            "merge it",
+        )
+        assert app._unmerged_completed_ids() == []
+        assert app._merge_state == {task.id: "merged"}
+        # Worktree removal / retention cleanup deletes the merged branch
+        # (TaskEnvironment.remove: worktree first, then `branch -D`).
+        app.task_env.remove(task.id)
+        assert app._unmerged_completed_ids() == []
+        assert app._merge_state == {task.id: "none"}
+        await pilot.pause()
+
+
+async def test_merge_state_hook_merge_failed_is_unmerged(app_env: DrCodeApp) -> None:
+    """A failed hook-merge renders orange: the task is re-admitted to the
+    unmerged-work tracking, and its branch holds the unmerged commits."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    task.hook_merge_failed = True
+    app.manager.storage.save(task)
+    commit_on_branch(app.task_env, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._unmerged_completed_ids() == [task.id]
+        assert app._merge_state == {task.id: "unmerged"}
+        await pilot.pause()
+
+
+async def test_merge_state_research_task_colored_by_branch(
+    app_env: DrCodeApp,
+) -> None:
+    """Research tasks have no verification — the same git criteria apply:
+    an unmerged research branch colors its ✓ orange."""
+    app = app_env
+    task = finished_task(app, kind=TaskKind.RESEARCH)
+    commit_on_branch(app.task_env, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._merge_state == {task.id: "unmerged"}
+        await pilot.pause()
+
+
+def test_merge_state_empty_without_isolation(git_root: Path) -> None:
+    """Isolation off: no branch ever exists — no colored markers, the
+    state dict stays empty (white ✓ for every completed task)."""
+    manager = TaskManager(git_root)
+    task = manager.create("Fix the bug", "fix the bug")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    manager.storage.save(task)
+    app = DrCodeApp(git_root)
+    assert app._unmerged_completed_ids() == []
+    assert app._merge_state == {}
+
+
+async def test_sidebar_row_marker_follows_merge_state(app_env: DrCodeApp) -> None:
+    """The rendered ✓ marker: plain (white) without a branch, orange
+    while unmerged, green once merged — and the sidebar fingerprint
+    changes with the color, so the incremental refresh actually redraws
+    a row whose only change is the marker color."""
+    app = app_env
+    task = finished_task(app)
+    commit_on_branch(app.task_env, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._unmerged_completed_ids()
+        assert "[orange]✓[/]" in app._task_row_text(task)
+        fp_unmerged = app._sidebar_fingerprint()
+        _git(
+            app.project_root,
+            "merge",
+            "-q",
+            "--no-ff",
+            branch_for(task.id),
+            "-m",
+            "merge it",
+        )
+        app._unmerged_completed_ids()
+        assert "[green]✓[/]" in app._task_row_text(task)
+        assert app._sidebar_fingerprint() != fp_unmerged
+        app.task_env.remove(task.id)
+        app._unmerged_completed_ids()
+        plain = app._task_row_text(task)
+        assert "✓" in plain
+        assert "[orange]" not in plain and "[green]✓" not in plain
+        await pilot.pause()

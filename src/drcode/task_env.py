@@ -529,15 +529,20 @@ class TaskEnvironment:
                 task_id for task_id in ids if cache.get(self.branch(task_id), False)
             }
 
-    def unmerged_drcode_branches(self) -> set[str]:
-        """ALL `drcode/<task-id>` branch names (full short names, prefix
-        included) whose tip holds commits the base branch does not have —
-        the wholesale answer behind the header's unmerged-work indicator
-        and the accept-hook merge audit. Unlike `unmerged_ids` this does
-        not need the caller to know WHICH ids to ask: one `for-each-ref
-        --no-merged <base>` over the `refs/heads/drcode/` glob answers
-        every task branch at once — the cost is O(1) git processes, not
-        per branch and not per completed task.
+    def drcode_branch_state(self) -> tuple[set[str], set[str]]:
+        """`(existing, unmerged)` for EVERY `drcode/<task-id>` branch in
+        one snapshot — the wholesale answer behind the header's
+        unmerged-work indicator, the accept-hook merge audit and the
+        sidebar's ✓ marker color. `existing` is the set of drcode branch
+        names the snapshot saw (the white-vs-colored discriminator: a
+        missing branch means isolation is off, there is no git repo, or
+        the merged branch was already cleaned up); `unmerged` is the
+        subset whose tip holds commits the base branch does not have.
+        Unlike `unmerged_ids` this does not need the caller to know
+        WHICH ids to ask: one `show-ref --head` plus one `for-each-ref
+        --no-merged <base>` glob over `refs/heads/drcode/` answer every
+        task branch at once — O(1) git processes, not per branch and not
+        per completed task.
 
         Shares the `_unmerged_cache_fingerprint` mechanism with
         `unmerged_ids` (identical per-branch mergedness semantics, one
@@ -548,19 +553,20 @@ class TaskEnvironment:
         result is only trusted for branches existing under THAT
         fingerprint.
 
-        Degradation: isolation off / no git repo → empty set; the
-        snapshot unavailable (broken repository) → the plain glob
-        without caching; the glob itself failing → empty set ("merged" —
-        the same degradation as the rev-list path). Blocking (2–3 cheap
-        git calls cold, 1 warm): run via `asyncio.to_thread`."""
+        Degradation: isolation off / no git repo → both sets empty; the
+        snapshot unavailable (broken repository) → empty `existing` and
+        the plain glob without caching for `unmerged`; the glob itself
+        failing → empty `unmerged` ("merged" — the same degradation as
+        the rev-list path). Blocking (2–3 cheap git calls cold, 1 warm):
+        run via `asyncio.to_thread`."""
         if not self.active:
-            return set()
+            return set(), set()
         fingerprint, existing = self._branch_snapshot()
         if fingerprint is None:
             # The wholesale snapshot could not be taken (broken/empty
             # repository): answer without caching — the glob degrades to
             # empty exactly like the rev-list path on git failure.
-            return self._unmerged_branches_glob()
+            return set(), self._unmerged_branches_glob()
         with self._unmerged_cache_lock:
             if fingerprint != self._unmerged_cache_fingerprint:
                 # Anything moved (a commit on a drcode branch, a merge
@@ -576,7 +582,17 @@ class TaskEnvironment:
                 # for every branch the snapshot vouches for.
                 batch = self._unmerged_branches_glob()
                 cache.update((b, b in batch) for b in unknown)
-            return {b for b in existing if cache.get(b, False)}
+            unmerged = {b for b in existing if cache.get(b, False)}
+        return existing, unmerged
+
+    def unmerged_drcode_branches(self) -> set[str]:
+        """ALL `drcode/<task-id>` branch names whose tip holds commits
+        the base branch does not have — the unmerged half of
+        `drcode_branch_state()` (same batching, same cache, same
+        degradation), kept as the shorthand for callers that only ask
+        about mergedness. Blocking (2–3 cheap git calls cold, 1 warm):
+        run via `asyncio.to_thread`."""
+        return self.drcode_branch_state()[1]
 
     def _unmerged_branches_glob(self) -> set[str]:
         """Which `drcode/*` branches hold commits the base branch does

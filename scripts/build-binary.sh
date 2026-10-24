@@ -25,8 +25,9 @@ esac
 
 # The voice extra goes into the bundle too: sounddevice (PortAudio) — its
 # wheel carries the platform libportaudio binary inside _sounddevice_data,
-# which drcode.spec collects into the app; the TUI degrades gracefully
-# when the extra is missing, but a voice-capable binary needs it.
+# which drcode.spec collects into the app (numpy-free: the voice PCM path
+# runs on stdlib array via sounddevice's raw streams); the TUI degrades
+# gracefully when the extra is missing, but a voice-capable binary needs it.
 uv sync --group build --extra voice
 .venv/bin/pyinstaller --noconfirm --clean drcode.spec
 

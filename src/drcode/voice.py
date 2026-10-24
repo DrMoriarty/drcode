@@ -38,9 +38,10 @@ import ssl
 import sys
 import threading
 import wave
+from array import array
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 
@@ -73,8 +74,9 @@ except Exception as _e:  # noqa: BLE001 - ImportError, but also a missing PortAu
 
 # python-sounddevice is not thread-safe at module level (global default
 # stream, cffi callback bookkeeping): every PortAudio lifecycle operation —
-# opening/starting/stopping/closing a stream, the sd.play()/sd.wait()
-# playback pair — must go through this one lock. Recording and TTS playback
+# opening/starting/stopping/closing a stream, the RawOutputStream
+# playback (write + stop-drain) — must go through this one lock. Recording
+# and TTS playback
 # run on independent threads, so without it their interleaved
 # open/close/stop calls corrupt the callback trampolines (observed as a
 # SIGSEGV on macOS's CoreAudio IOThread client).
@@ -284,7 +286,7 @@ class MicrophoneRecorder:
     SAMPLE_RATE = 16_000
 
     def __init__(self) -> None:
-        self._chunks: list[Any] = []
+        self._chunks: list[array[int]] = []
         self._stream: _AudioStream | None = None
         self._lock = threading.Lock()
         # Strong reference to the bound callback for as long as the stream
@@ -307,7 +309,11 @@ class MicrophoneRecorder:
         self._cb = self._callback
         try:
             with _PORTAUDIO_LOCK:
-                stream: _AudioStream = sd.InputStream(
+                # RawInputStream (not InputStream): its callback hands over
+                # a plain cffi buffer, so the audio path needs no numpy —
+                # the regular InputStream hard-requires numpy to wrap the
+                # callback data into ndarrays.
+                stream: _AudioStream = sd.RawInputStream(
                     samplerate=self.SAMPLE_RATE,
                     channels=1,
                     dtype="int16",
@@ -324,27 +330,26 @@ class MicrophoneRecorder:
     def _callback(
         self, indata: object, frames: int, time: object, status: object
     ) -> None:
-        # Audio-thread callback: a plain append of a numpy copy; the import
-        # guard above guarantees numpy exists whenever a stream is running.
+        # Audio-thread callback: a plain append of a copy (RawInputStream
+        # hands over a cffi buffer; array.array("h", buffer) copies it into
+        # int16 samples). Cheap and non-blocking under the GIL — all
+        # assembly happens later, on the caller's thread in stop().
         with self._lock:
             if self._stream is not None:
-                self._chunks.append(indata.copy())  # type: ignore[attr-defined]
+                self._chunks.append(array("h", indata))  # type: ignore[call-overload]
 
     def stop(self) -> bytes:
         """Close the stream and return the recording as WAV bytes (empty
         recording still yields a valid, silent WAV header)."""
-        import numpy as np
-
         with self._lock:
             stream, self._stream = self._stream, None
             chunks = self._chunks
             self._chunks = []
         _close_stream(stream)
         self._cb = None
-        if not chunks:
-            pcm = np.zeros((0,), dtype=np.int16)
-        else:
-            pcm = np.concatenate(chunks).reshape(-1)
+        pcm = array("h")
+        for chunk in chunks:
+            pcm.extend(chunk)
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
             wav.setnchannels(1)
@@ -391,19 +396,32 @@ def play_wav(data: bytes) -> None:
             frames = wav.readframes(wav.getnframes())
     except (wave.Error, EOFError) as e:
         raise VoiceError(f"TTS answer is not a valid WAV: {e}") from e
-    import numpy as np
     import sounddevice as sd
 
-    pcm = np.frombuffer(frames, dtype=np.int16)
-    if channels > 1:
-        pcm = pcm.reshape(-1, channels)
-    if pcm.size:
-        # sd.play()/sd.wait() drive sounddevice's global output stream —
-        # the whole playback (including the wait) stays under the lock so a
-        # concurrent recording open/close can never interleave with it.
+    # int16 framing: building array.array("h") from the raw frames doubles
+    # as the odd-byte guard — a truncated final sample raises ValueError
+    # (surfaced as a readable VoiceError) instead of corrupting playback.
+    # This replaces np.frombuffer; sd.play()/sd.wait() hard-require numpy,
+    # which the voice extra deliberately avoids.
+    try:
+        pcm = array("h", frames)
+    except ValueError as e:
+        raise VoiceError(f"TTS answer has a truncated PCM frame: {e}") from e
+    if pcm:
+        # RawOutputStream blocking write + Pa_StopStream drain replaces the
+        # sd.play()/sd.wait() pair. The whole playback (including the drain
+        # in stop()) stays under the lock so a concurrent recording
+        # open/close can never interleave with it.
         with _PORTAUDIO_LOCK:
-            sd.play(pcm, samplerate=rate)
-            sd.wait()
+            stream = sd.RawOutputStream(
+                samplerate=rate, channels=channels, dtype="int16"
+            )
+            stream.start()
+            try:
+                stream.write(pcm)  # blocks until all frames are consumed
+            finally:
+                stream.stop()  # drains the pending audio, like sd.wait()
+                stream.close()
 
 
 class _VoiceSynth(Protocol):

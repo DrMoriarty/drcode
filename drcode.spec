@@ -50,9 +50,9 @@ a = Analysis(
         *collect_data_files("sounddevice"),
     ],
     # anyio imports its backend dynamically — PyInstaller can't see it
-    # from static analysis alone; sounddevice/numpy are the optional
-    # voice extra (imported lazily by drcode.voice).
-    hiddenimports=["anyio._backends._asyncio", "sounddevice", "numpy"],
+    # from static analysis alone; sounddevice is the optional voice extra
+    # (imported lazily by drcode.voice; numpy-free via raw streams).
+    hiddenimports=["anyio._backends._asyncio", "sounddevice"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

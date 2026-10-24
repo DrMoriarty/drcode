@@ -598,7 +598,7 @@ def test_creation_listener_failure_not_fatal(manager: Any) -> None:
 
 
 class _FakeStream:
-    """Just enough of sounddevice.InputStream for the recorder's stop/close."""
+    """Just enough of sounddevice.RawInputStream for the recorder's stop/close."""
 
     def start(self) -> None: ...
 
@@ -608,14 +608,16 @@ class _FakeStream:
 
 
 def test_recorder_wav_assembly() -> None:
-    import numpy as np
+    from array import array
 
     recorder = MicrophoneRecorder()
     # Pretend the PortAudio stream is open and feed the audio-thread
-    # callback by hand (the real InputStream needs a microphone).
+    # callback by hand (the real RawInputStream needs a microphone).
+    # The callback receives a flat interleaved int16 buffer (cffi buffer
+    # in production; array.array here) — mono, so one sample per frame.
     recorder._stream = _FakeStream()
-    recorder._callback(np.array([[100], [-200]], dtype=np.int16), 2, None, None)
-    recorder._callback(np.array([[300]], dtype=np.int16), 1, None, None)
+    recorder._callback(array("h", [100, -200]), 2, None, None)
+    recorder._callback(array("h", [300]), 1, None, None)
     assert recorder.recording
 
     wav = recorder.stop()
@@ -625,19 +627,19 @@ def test_recorder_wav_assembly() -> None:
         assert handle.getsampwidth() == 2
         assert handle.getframerate() == MicrophoneRecorder.SAMPLE_RATE
         frames = handle.readframes(handle.getnframes())
-    samples = np.frombuffer(frames, dtype=np.int16)
+    samples = array("h", frames)
     assert samples.tolist() == [100, -200, 300]
     assert not recorder.recording
 
 
 def test_recorder_callback_after_stop_is_ignored() -> None:
-    import numpy as np
+    from array import array
 
     recorder = MicrophoneRecorder()
     recorder._stream = _FakeStream()
-    recorder._callback(np.array([[1]], dtype=np.int16), 1, None, None)
+    recorder._callback(array("h", [1]), 1, None, None)
     recorder.stop()
-    recorder._callback(np.array([[2]], dtype=np.int16), 1, None, None)
+    recorder._callback(array("h", [2]), 1, None, None)
     # A late audio-thread chunk after the stop must not resurrect the
     # recording (stop() already returned; a new session calls start()).
     with wave.open(io.BytesIO(recorder.stop())) as handle:
@@ -645,11 +647,11 @@ def test_recorder_callback_after_stop_is_ignored() -> None:
 
 
 def test_recorder_discard_drops_audio() -> None:
-    import numpy as np
+    from array import array
 
     recorder = MicrophoneRecorder()
     recorder._stream = _FakeStream()
-    recorder._callback(np.array([[7]], dtype=np.int16), 1, None, None)
+    recorder._callback(array("h", [7]), 1, None, None)
     recorder.discard()
     assert not recorder.recording
     # A discard leaves nothing to stop() — an empty valid WAV comes back.

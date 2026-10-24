@@ -80,6 +80,25 @@ worktree with your package manager — and the copy stops at
 activation for minutes); both are reported into the task's service-event
 log by the pipeline when they bite.
 
+When the worktree DIRECTORY goes (project setting `worktree_removal`,
+`drcode.settings`): `on_delete` (the default) — with the task, i.e. on
+cancel (Ctrl+X), delete (Ctrl+Delete) and the retention purge, via
+TaskManager's removal listeners; `on_completion` — as soon as the task
+reaches COMPLETED (research right in `TaskManager.mark_done`, dev tasks
+at the tester's `set_verification` verdict, the no-tester and
+review-accept completions alike — every COMPLETED transition funnels
+through the completion listeners the app wires to
+`TaskEnvironment.on_completed`); `never` — never automatically, and
+`remove()` then only anchors a dirty tree on the branch. In every mode
+the branch itself is governed by RULE 2 alone: a completion never
+touches it, and a removal deletes it only when it holds no unmerged
+commits. Under `on_completion` a re-activated completed task (the user
+sent new input) simply gets its worktree recreated from the surviving
+branch by `ensure_root` — nothing is lost. `cleanup_orphans` IGNORES
+the setting: directories of tasks that no longer exist are garbage from
+deleted tasks (a crashed session, a manual delete under `never`), and
+`never` would otherwise grow `.drcode/worktrees/` without bound.
+
 Workflow hooks (`.drcode/workflow.py`): with isolation on, every hook
 runs INSIDE the task's worktree (cwd), and the payload carries the
 actual `worktree` path/branch — `on_task_start`'s branch checkout and
@@ -99,7 +118,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .gitignore import _is_git_repo
-from .settings import ProjectSettings, TaskIsolation
+from .models import Task, TaskStatus
+from .settings import ProjectSettings, TaskIsolation, WorktreeRemoval
 
 # Optional service-event sink wired by the app: `(task_id, text)`. The
 # worktree environment calls it when something happens the user must know
@@ -690,6 +710,13 @@ class TaskEnvironment:
         nothing exists; works regardless of the current setting so
         leftovers of a session where isolation was toggled off are still
         cleaned.
+
+        Project setting `worktree_removal` (`drcode.settings`): under
+        `never` the directory is NOT removed — the snapshot above still
+        runs (RULE 1), and the branch stays too (it is checked out in the
+        surviving worktree; git would refuse to delete it anyway). The
+        other modes behave identically here: with the task means with the
+        task, whether it was cancelled or had just completed.
         """
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
@@ -702,6 +729,10 @@ class TaskEnvironment:
                 and self.event_log is not None
             ):
                 self.event_log(task_id, snap)
+            if self.settings.worktree_removal is WorktreeRemoval.NEVER:
+                # The user keeps the directory — snapshot (above) is the
+                # only thing this call does.
+                return
             self._git("worktree", "prune")
             if wt.is_dir():
                 code, _ = self._git("worktree", "remove", "--force", str(wt))
@@ -724,6 +755,27 @@ class TaskEnvironment:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def on_completed(self, task: Task, old: TaskStatus, origin: str) -> None:
+        """Completion-transition hook for `worktree_removal:
+        on_completion`: the task's worktree directory is removed as soon
+        as the task reaches COMPLETED (research done, the tester's
+        verdict, a no-tester or review-accept finalization — the app
+        registers this method as a TaskManager completion listener, so
+        every COMPLETED transition funnels through here; the signature
+        matches `drcode.task_manager.CompletionListener`).
+
+        A no-op under the other modes (`remove` itself honours `never`).
+        Synchronous by contract — like the removal listeners, and on
+        purpose: it must not run as a background job, or a fast re-queue
+        of the completed task (new input) would have `ensure_root`
+        recreate the worktree under the removal's feet. `remove()`
+        snapshots the dirty tree first (RULE 1) and is idempotent, so the
+        removal listeners (cancel/delete) firing before or after this do
+        no harm."""
+        if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
+            return
+        self.remove(task.id)
+
     def cleanup_orphans(self, live_task_ids: set[str]) -> list[str]:
         """Startup cleanup: worktree directories and `drcode/*` branches
         whose task no longer exists (crashed session, deleted task, the
@@ -734,6 +786,10 @@ class TaskEnvironment:
         here too: a dead task's dirty tree is snapshotted onto its branch
         before the directory goes, and a branch with unmerged commits is
         never deleted (a kept branch is reported through `event_log`).
+        The `worktree_removal` setting is IGNORED here: dead tasks'
+        directories are leftovers of deleted tasks, not live state —
+        under `never` they would otherwise accumulate without bound (see
+        the module docstring).
         Blocking (git calls): run via `asyncio.to_thread` at app startup.
         Skipped entirely when there is nothing to sweep (not a git repo,
         or the setting is off and no worktree directory exists).

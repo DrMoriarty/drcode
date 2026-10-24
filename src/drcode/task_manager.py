@@ -36,6 +36,13 @@ StatusListener = Callable[[Task, TaskStatus, TaskStatus, str], None]
 # like the status listeners: must be fast and non-raising.
 RemovalListener = Callable[[str], None]
 
+# Completion observer: (task, old status, origin) — fired on every
+# transition INTO COMPLETED (research done, the tester's verdict, a
+# no-tester or review-accept finalization; a cancel completes too and may
+# fire both a removal and a completion observer). Sync, like the other
+# observers: must be fast and non-raising.
+CompletionListener = Callable[[Task, TaskStatus, str], None]
+
 
 def validate_dependencies(
     tasks: Mapping[str, Task], task_id: str | None, deps: Iterable[str]
@@ -93,6 +100,11 @@ class TaskManager:
         # Observers of task removal (cancel/delete/purge): the optional
         # worktree environment cleans its per-task resources here.
         self._removal_listeners: list[RemovalListener] = []
+        # Observers of the transition into COMPLETED (see
+        # CompletionListener): the optional worktree environment removes
+        # the task's worktree directory here under `worktree_removal:
+        # on_completion`.
+        self._completion_listeners: list[CompletionListener] = []
         # Observers of task creation (create()) — e.g. the voice
         # announcements hook for tester-created bug reports.
         self._creation_listeners: list[Callable[[Task, str], None]] = []
@@ -140,6 +152,12 @@ class TaskManager:
         non-raising."""
         self._removal_listeners.append(listener)
 
+    def add_completion_listener(self, listener: CompletionListener) -> None:
+        """Register an observer of the transition into COMPLETED
+        (CompletionListener docstring). Same contract as the status
+        listeners: sync, fast, non-raising."""
+        self._completion_listeners.append(listener)
+
     def add_creation_listener(self, listener: Callable[[Task, str], None]) -> None:
         """Register an observer of task creation (create()): the listener
         gets the new task and the origin ("user" — typed by the person at
@@ -155,6 +173,16 @@ class TaskManager:
             except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
                 print(
                     f"drcode: removal listener failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
+    def _fire_completed(self, task: Task, old: TaskStatus, origin: str) -> None:
+        for listener in list(self._completion_listeners):
+            try:
+                listener(task, old, origin)
+            except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
+                print(
+                    f"drcode: completion listener failed: {type(e).__name__}: {e}",
                     file=sys.stderr,
                 )
 
@@ -179,6 +207,13 @@ class TaskManager:
                     f"drcode: status listener failed: {type(e).__name__}: {e}",
                     file=sys.stderr,
                 )
+        # Every path into COMPLETED (mark_done for research, the tester's
+        # set_verification, complete_without_verification,
+        # finalize_verified, cancel) funnels here — the single hook point
+        # for completion-side side effects (worktree_removal:
+        # on_completion).
+        if task.status is TaskStatus.COMPLETED and old is not TaskStatus.COMPLETED:
+            self._fire_completed(task, old, origin)
 
     def _save_changed(self, task: Task, old: TaskStatus, origin: str) -> None:
         """Persist a status mutation and notify the observers. fire first:

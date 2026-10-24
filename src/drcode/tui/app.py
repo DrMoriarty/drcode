@@ -49,7 +49,12 @@ from ..providers import (
     project_has_model_selection,
 )
 from ..providers import resolve_effective as resolve_model_config
-from ..settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
+from ..settings import (
+    ProjectSettings,
+    ProjectSettingsStore,
+    TaskIsolation,
+    WorktreeRemoval,
+)
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
@@ -325,6 +330,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # task is already gone (delete / retention purge).
         self.task_env.event_log = self._task_env_event
         self.manager.add_removal_listener(self.task_env.remove)
+        # worktree_removal: on_completion — the worktree directory goes as
+        # soon as the task reaches COMPLETED (research done, the tester's
+        # verdict, a no-tester / review-accept finalization). Synchronous
+        # on purpose (see TaskEnvironment.on_completed): a background job
+        # would race a re-queue of the same task, whose ensure_root
+        # recreates the worktree.
+        self.manager.add_completion_listener(self.task_env.on_completed)
         # RULE 1 (see drcode.task_env): a verdict never leaves the task
         # with a dirty tree — every transition out of active work
         # (tester verdict, cancel) snapshots the worktree onto the task's
@@ -802,6 +814,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ):
             return
         if not self.task_env.active:
+            return
+        if self.settings.worktree_removal is WorktreeRemoval.ON_COMPLETION:
+            # The completion removal (task_env.on_completed, a completion
+            # listener) snapshots the tree itself before tearing the
+            # worktree down — a parallel snapshot job would race its git
+            # calls in the same worktree.
             return
         if origin == "user":
             note = "cancelled"

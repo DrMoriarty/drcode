@@ -41,6 +41,7 @@ from ..settings import (
     PARALLEL_TASKS_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    WORKTREE_REMOVAL_OPTIONS,
     dev_rounds_label,
     parallel_tasks_label,
 )
@@ -258,19 +259,21 @@ class TaskSettingsPalette(SettingsPalette):
     """Sub-menu of the Settings palette with the task-management entries.
 
     Opened from the single "Task settings…" entry of the main Settings
-    menu: the six project preferences that govern how tasks behave
-    (retention, finalization, dev rounds, stall nudge, isolation,
-    parallelism). Same narrowed layout and spaced list as the parent; the
-    entry order is its own (task entries only), so the shared prefix-sort
-    in `SettingsPalette._entry_rank` orders this menu independently.
+    menu: the seven project preferences that govern how tasks behave
+    (retention, finalization, worktree removal, dev rounds, stall nudge,
+    isolation, parallelism). Same narrowed layout and spaced list as the
+    parent; the entry order is its own (task entries only), so the shared
+    prefix-sort in `SettingsPalette._entry_rank` orders this menu
+    independently.
     """
 
     # Same prefix-matching contract as SettingsPalette.ENTRY_ORDER, but
-    # scoped to this sub-menu: the six task-management preferences in
+    # scoped to this sub-menu: the seven task-management preferences in
     # their fixed logical order.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Auto-delete completed tasks:",
         "Task finalization:",
+        "Worktree removal:",
         "Max development rounds:",
         "Nudge stalled agent after:",
         "Task isolation:",
@@ -385,9 +388,9 @@ class ModelSettingsCommandProvider(Provider):
 class TaskSettingsCommandProvider(Provider):
     """The single "Task settings…" entry in the main Settings palette.
 
-    Opens the TaskSettingsPalette sub-menu with the six project
+    Opens the TaskSettingsPalette sub-menu with the seven project
     preferences that govern task behavior (retention, finalization,
-    dev rounds, stall nudge, isolation, parallelism).
+    worktree removal, dev rounds, stall nudge, isolation, parallelism).
     """
 
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
@@ -397,8 +400,8 @@ class TaskSettingsCommandProvider(Provider):
                 "Task settings…",
                 (
                     "Task-management preferences: auto-delete, "
-                    "finalization, dev rounds, stall nudge, isolation, "
-                    "parallelism"
+                    "finalization, worktree removal, dev rounds, stall "
+                    "nudge, isolation, parallelism"
                 ),
                 app.action_open_task_settings,
             ),
@@ -618,7 +621,7 @@ class DependencyCommandsProvider(Provider):
 
 
 class TaskSettingsEntriesProvider(Provider):
-    """The six task-management entries of the "Task settings…" sub-menu.
+    """The seven task-management entries of the "Task settings…" sub-menu.
 
     One entry per project preference; its current value is shown after the
     ":". Picking an entry opens the option-selection palette (same UX as the
@@ -646,6 +649,17 @@ class TaskSettingsEntriesProvider(Provider):
                     "without commit, or nothing (project setting)"
                 ),
                 app.action_change_task_finalization,
+            ),
+            (
+                f"Worktree removal: {app.settings.worktree_removal.label}",
+                (
+                    "When the per-task worktree directory (.drcode/"
+                    "worktrees/<id>) is deleted automatically: with the "
+                    "task, on task completion, or never — the branch "
+                    "drcode/<id> with the committed work always survives "
+                    "(project setting)"
+                ),
+                app.action_change_worktree_removal,
             ),
             (
                 f"Max development rounds: {app.settings.max_dev_rounds}",
@@ -839,6 +853,37 @@ class ParallelTasksOptionsProvider(Provider):
                 partial(app.action_set_parallel_tasks, count),
             )
             for count in PARALLEL_TASKS_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class WorktreeRemovalOptionsProvider(Provider):
+    """Options of the "Worktree removal" setting (with the task / on
+    completion / never).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.worktree_removal
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_worktree_removal, option),
+            )
+            for option in WORKTREE_REMOVAL_OPTIONS
         ]
 
     async def discover(self) -> Hits:

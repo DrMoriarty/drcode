@@ -45,6 +45,7 @@ from ..settings import (
     StallNudge,
     TaskFinalization,
     TaskIsolation,
+    WorktreeRemoval,
     parallel_tasks_label,
 )
 from ..task_manager import validate_dependencies
@@ -65,6 +66,7 @@ from .command_providers import (
     TaskSettingsEntriesProvider,
     TaskSettingsPalette,
     ThemeOptionsProvider,
+    WorktreeRemovalOptionsProvider,
     role_model_options_provider,
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
@@ -1187,6 +1189,42 @@ class ActionsLayer(DrCodeState):
             SettingsPalette(
                 id="--finalization-palette",
                 providers=[FinalizationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_worktree_removal(self, removal: WorktreeRemoval) -> None:
+        """Settings command: when the per-task worktree directory
+        (.drcode/worktrees/<id>) is removed automatically — with the task
+        (cancel / delete / retention purge), as soon as the task reaches
+        COMPLETED, or never. Persisted per project
+        (.drcode/settings.json); applies to transitions from now on.
+
+        Only the DIRECTORY is governed: the branch `drcode/<id>` with its
+        committed work survives every completion, a branch holding
+        unmerged commits is never deleted (see `drcode.task_env`), and a
+        re-activated completed task gets its worktree recreated from the
+        branch."""
+        self.settings.worktree_removal = removal
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Worktree removal: {removal.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_worktree_removal(self) -> None:
+        """Worktree-removal picker, opened from the Settings entry
+        ("Worktree removal: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the three options; picking one
+        applies it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--worktree-removal-palette",
+                providers=[WorktreeRemovalOptionsProvider],
                 placeholder="Search for options…",
             )
         )

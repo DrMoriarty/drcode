@@ -310,6 +310,13 @@ class PipelineLayer(DrCodeState):
         TESTING), and the review worker advances the pipeline on its own
         completion.
         """
+        if self._exit or not self.is_running:
+            # Teardown race: deferred set_timer callbacks (retry backoffs,
+            # the failed-queue rescue, the dependency poll tick) can fire
+            # while the app is being dismantled — the DOM is already gone,
+            # so anything below (chat_log access via refresh paths) would
+            # raise NoMatches. Skip the tick (same pattern as _poll_activity).
+            return
         if not self.tester_running:
             # Tester-side duties — any of them firing returns: while a
             # test can start right now, no development is promoted.
@@ -948,6 +955,13 @@ class PipelineLayer(DrCodeState):
         group always did — while every other task's run is untouched.
         This per-task independence is the base of the parallel
         development slots (see `parallel_limit`)."""
+        if self._exit or not self.is_running:
+            # Teardown race: a network-retry set_timer fired while the app
+            # was being dismantled — starting a worker now would only have
+            # its body trip over the already-removed DOM. The task stays
+            # ACTIVE with pending retry state; nothing is lost (the next
+            # start resumes it).
+            return
         self.run_worker(
             partial(self._run_agent_worker, task_id),
             name=f"agent run {task_id}",

@@ -894,9 +894,9 @@ def test_bundled_portaudio_ignored_outside_frozen_linux(
 def test_availability_hint_frozen_vs_source(monkeypatch: pytest.MonkeyPatch) -> None:
     import sys as _sys
 
-    from drcode.voice import VOICE_EXTRA_HINT, availability_hint
+    from drcode.voice import VOICE_UNAVAILABLE_HINT, availability_hint
 
     monkeypatch.delattr(_sys, "frozen", raising=False)
-    assert availability_hint() == VOICE_EXTRA_HINT
+    assert availability_hint() == VOICE_UNAVAILABLE_HINT
     monkeypatch.setattr(_sys, "frozen", True, raising=False)
     assert "libportaudio2" in availability_hint()

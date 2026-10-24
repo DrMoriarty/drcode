@@ -43,7 +43,6 @@ from ..voice import (
     MicrophoneRecorder,
     VoiceClient,
     VoiceError,
-    availability_hint,
     config_from_settings,
 )
 

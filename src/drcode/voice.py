@@ -43,7 +43,7 @@ from array import array
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 
@@ -129,11 +129,11 @@ VOICE_UNAVAILABLE_HINT = (
 
 def availability_hint() -> str:
     """Actionable advice for the unavailable-sounddevice toast/error: the
-    pip extra in a normal installation, the system PortAudio package in a
-    frozen bundle (where pip advice makes no sense)."""
+    generic backend hint in a normal installation, the system PortAudio
+    package in a frozen bundle (where pip advice makes no sense)."""
     if getattr(sys, "frozen", False):
         return "install the system libportaudio2 package (Linux)"
-    return VOICE_EXTRA_HINT
+    return VOICE_UNAVAILABLE_HINT
 
 
 class VoiceError(Exception):

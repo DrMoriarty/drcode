@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from collections import deque
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -268,6 +269,21 @@ class PipelineLayer(DrCodeState):
     # tasks with an open PR (review_pending) ask the on_review hook again.
     _REVIEW_PENDING_POLL = 60.0
 
+    def _schedule_pipeline_timer(
+        self, delay: float, callback: Callable[[], Any]
+    ) -> None:
+        """Schedule a deferred pipeline tick (retry backoffs, the
+        failed-queue rescue, the nudge restart) — unless the app is being
+        dismantled. Every deferred tick eventually re-enters the pipeline
+        (`_advance` / `run_agent`): scheduling one into a closing event
+        loop either raises outright (`create_task` → `call_soon` on a
+        closed loop) or fires the callback into a dead DOM — the same
+        teardown race the `_advance`/`run_agent` entry guards (see
+        32abee3) catch one step later, at the source here."""
+        if self._exit or not self.is_running:
+            return
+        self.set_timer(delay, callback)
+
     def _next_review(self) -> Task | None:
         """A task the tester passed (TESTING + PASSED) whose external
         review may run now: the sync verdict call after a tester round, or
@@ -412,6 +428,11 @@ class PipelineLayer(DrCodeState):
 
         Returns True when at least one task was promoted (the caller
         skips the settled notification then)."""
+        if self._exit or not self.is_running:
+            # Teardown race: the dependency-gate worker calls this directly
+            # (not through _advance's guard) after its off-loop git check —
+            # the app can be dismantled while that check runs.
+            return False
         promoted_any = False
         while len(self.manager.active_tasks()) < self.parallel_limit:
             promoted = self.manager.promote_next(
@@ -485,7 +506,7 @@ class PipelineLayer(DrCodeState):
             self._FAILED_QUEUE_RETRY_CAP,
         )
         self._failed_queue_retry_at = now + delay
-        self.set_timer(delay, self._advance)
+        self._schedule_pipeline_timer(delay, self._advance)
         rescued = [t for t in queued if blocked is None or t.id not in blocked]
         for t in rescued:
             self._agent_failed.discard(t.id)
@@ -532,6 +553,11 @@ class PipelineLayer(DrCodeState):
         queued = [t for t in self.manager.queued() if t.depends_on]
         dep_ids = sorted({d for t in queued for d in t.depends_on})
         unmerged, base = await asyncio.to_thread(self._dep_gate_sync, dep_ids)
+        if self._exit or not self.is_running:
+            # The git check ran off the loop; the app may have been
+            # dismantled in the meantime — nothing below may touch the
+            # DOM (service events, refreshes) or the pipeline.
+            return
         # The git calls ran in a thread — the pipeline may have moved on
         # (a tester round started/ended, a review is in flight): re-check
         # the gates _advance() enforces synchronously before dispatching
@@ -1568,7 +1594,9 @@ class PipelineLayer(DrCodeState):
                         # The task stays ACTIVE — no requeue, no pipeline
                         # advance; the delayed re-run below picks it up.
                         self.manager.storage.save(task)
-                        self.set_timer(delay, partial(self.run_agent, task_id))
+                        self._schedule_pipeline_timer(
+                            delay, partial(self.run_agent, task_id)
+                        )
                         return
                     # Persist the failure even for a superseded run: it
                     # happened, and the human must be able to see it.
@@ -1596,6 +1624,22 @@ class PipelineLayer(DrCodeState):
                     # to the status observers (notifications) explicitly.
                     self.manager.fire_status_change(task, TaskStatus.ACTIVE, "system")
                     break
+        except asyncio.CancelledError:
+            # Cancelled BEFORE the turn loop's own handler (worktree setup,
+            # the task-start hook, the pre-turn compaction gate): the
+            # pending prompt was never consumed. Mark the interrupted
+            # attempt exactly like a mid-stream abort does — otherwise the
+            # ESC stop leaves the task "active, nothing running" with no
+            # resume marker (Ctrl+R / the restart-time auto-resume both key
+            # off task.unfinished), and an abort racing the run's slow
+            # setup window looks like the run silently ignores it.
+            cancelled = True
+            if self._agent_generations.get(task_id) == generation and (
+                task.status is TaskStatus.ACTIVE
+            ):
+                task.unfinished = True
+                self.manager.storage.save(task)
+            raise
         finally:
             # Stop any spinner whose result event was lost to an abort or a
             # run error (normally all of them are already stopped).
@@ -1696,7 +1740,7 @@ class PipelineLayer(DrCodeState):
         count = self._tester_fail_count.get(task_id, 1)
         delay = min(5 * 2 ** (count - 1), 300)
         self._tester_retry_at[task_id] = time.monotonic() + delay
-        self.set_timer(delay, self._advance)
+        self._schedule_pipeline_timer(delay, self._advance)
 
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
@@ -2136,7 +2180,7 @@ class PipelineLayer(DrCodeState):
                     self._persist_tester_messages(task, run)
                     self._tester_resume_round.add(task_id)
                     self._tester_retry_at[task_id] = time.monotonic() + delay
-                    self.set_timer(delay, self._advance)
+                    self._schedule_pipeline_timer(delay, self._advance)
                     return
                 self._persist_tester_messages(task, run)
                 self._tester_resume_round.discard(task_id)
@@ -2470,7 +2514,7 @@ class PipelineLayer(DrCodeState):
                 f"the next attempt ({count}, in {int(delay)} s): {result.error}",
                 kind="workflow",
             )
-            self.set_timer(delay, self._advance)
+            self._schedule_pipeline_timer(delay, self._advance)
             return
         self._review_fail_count.pop(task_id, None)
         verdict = str(result.output.get("verdict") or "").strip().lower()
@@ -2546,6 +2590,8 @@ class PipelineLayer(DrCodeState):
         open PR). The script checks the PR state itself (merged/approved →
         accept, "Changes requested" → reject, still open → pending)."""
         if self.workflow is None or not self.workflow.has("on_review"):
+            return
+        if self._exit or not self.is_running:
             return
         if self._review_running:
             return

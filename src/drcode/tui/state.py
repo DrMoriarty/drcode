@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,10 @@ class DrCodeState(App[None]):
     def _poll_stall(self) -> None: ...
 
     def _nudge_run(self, task: Task) -> None: ...
+
+    def _schedule_pipeline_timer(
+        self, delay: float, callback: Callable[[], Any]
+    ) -> None: ...
 
     def _log_event(self, task: Task, text: str, *, kind: str = "system") -> None: ...
 

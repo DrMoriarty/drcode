@@ -405,17 +405,23 @@ class ChatViewLayer(DrCodeState):
                 live.remove(item)
             if following is not None:
                 if item in tracked:
-                    sidebar.move_child(item, before=following)
+                    if item in sidebar._nodes:
+                        sidebar.move_child(item, before=following)
+                    # else: the row's mount (or its position among the
+                    # desired rows) is still an in-flight async round-trip
+                    # — moving it now would raise WidgetError (not a child
+                    # YET); the next refresh reconciles its position.
                 else:
                     # A row created by THIS refresh (never mounted yet).
                     sidebar.mount(item, before=following)
                 live.insert(i, item)
             else:
                 if item in tracked:
-                    if live:
+                    if live and item in sidebar._nodes:
                         sidebar.move_child(item, after=live[-1])
-                    # else: no tracked row left to anchor against — its
-                    # position among the pending-prune rows is irrelevant.
+                    # else: no tracked row left to anchor against, or the
+                    # row's mount is still in flight — its position among
+                    # the pending-prune rows is irrelevant either way.
                 else:
                     sidebar.mount(item)
                 live.append(item)
@@ -1042,14 +1048,16 @@ class ChatViewLayer(DrCodeState):
                 self._current_tool[task.id] = None
                 self._clear_stream_label()
                 self.refresh_status()
-            self.set_timer(self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id))
+            self._schedule_pipeline_timer(
+                self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
+            )
         elif task.status is TaskStatus.TESTING:
             if self.tester_running:
                 self.workers.cancel_group(self, "tester")
                 self.tester_running = False
                 self._current_tool[task.id] = None
                 self.refresh_status()
-            self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
+            self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
         elif self.tester_running and self._tester_task_id == task.id:
             # The run hung AFTER its useful work: set_verification already
             # flipped the task to COMPLETED mid-run. Nothing to restart —
@@ -1060,7 +1068,7 @@ class ChatViewLayer(DrCodeState):
             self.tester_running = False
             self._current_tool[task.id] = None
             self.refresh_status()
-            self.set_timer(self._NUDGE_RESTART_DELAY, self._advance)
+            self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
 
     # -- chat pane ---------------------------------------------------------------
 

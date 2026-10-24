@@ -736,6 +736,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         Called from the delivery's daemon thread: hop into the app thread
         (a broken ntfy.sh must never crash anything, hence the blanket
         except — the failure is already on stderr at that point)."""
+        if self._exit or not self.is_running:
+            # The delivery thread outlives the app (daemon): hopping into a
+            # closed event loop would raise "Event loop is closed" from
+            # call_soon_threadsafe. The send failure is already on stderr.
+            return
         try:
             self.call_from_thread(
                 self.notify,

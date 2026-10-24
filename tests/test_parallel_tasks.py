@@ -789,6 +789,12 @@ async def test_esc_fast_double_press_is_debounced(
     double-keystroke — exactly the inertia scenario the arming guards
     against) is ignored; a deliberate press after the debounce gap still
     confirms the arming."""
+    # pilot.press runs a full screen-idle sync per keystroke — under a
+    # loaded suite two back-to-back presses can take longer than the real
+    # 250ms window, flipping the test into the "deliberate repeat" branch.
+    # Widen the window: the mechanism under test is the debounce, not the
+    # concrete default.
+    monkeypatch.setattr(ActionsLayer, "_ESC_DEBOUNCE_SECONDS", 30.0)
     app = DrCodeApp(project_root)
     toasts: list[str] = []
     monkeypatch.setattr(
@@ -813,10 +819,11 @@ async def test_esc_fast_double_press_is_debounced(
         assert app._agent_runs == {task.id: 1}, "the debounced press must be ignored"
         assert app._esc_armed_signature is not None, "arming must survive the debounce"
         # A deliberate press after the debounce gap confirms the stop.
-        # (Re-stamp the arming time first: under a loaded suite the two
-        # pauses above can eat into the 2s window, and the point here is
-        # the debounce gap, not the window expiry.)
-        await asyncio.sleep(0.3)
+        # (Emulate the gap instead of sleeping it out: re-stamp the arming
+        # time and age out the last accepted press, so the press reads as
+        # "after the window" without a real 30s wait — and without the
+        # arming window expiring under a loaded suite first.)
+        app._esc_last_press = 0.0
         app._esc_armed_at = time.monotonic()
         await pilot.press("escape")
         await pilot.pause()

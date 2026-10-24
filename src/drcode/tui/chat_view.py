@@ -432,8 +432,15 @@ class ChatViewLayer(DrCodeState):
         # Incremental reconcile instead of clear()+append-everything: the
         # typical update (a status flip, a new bug report at the queue
         # head) touches a handful of rows instead of recreating them all.
-        highlighted = sidebar.highlighted_child
-        keep_cursor = isinstance(highlighted, TaskItem)
+        # The highlighted row is detected via the ListItem.highlighted
+        # reactive, not highlighted_child: the latter is index-based and
+        # desyncs when an async prune has already shrunk the node list
+        # under an unchanged index (see the tail of this method).
+        highlighted = next(
+            (w for w in sidebar._nodes if isinstance(w, TaskItem) and w.highlighted),
+            None,
+        )
+        keep_cursor = highlighted is not None
         items: list[TaskItem] = []
         keys: set[tuple[str, str]] = set()
         for name, tasks in self._sidebar_sections():
@@ -486,6 +493,19 @@ class ChatViewLayer(DrCodeState):
         else:
             assert highlighted is not None
             sidebar.index = sidebar._nodes.index(highlighted)
+        # ListView.watch_index clears the old highlight by *position*
+        # (_nodes[old_index]), not by widget. When rows moved under the
+        # reconcile or an async prune shrank the node list between two
+        # refreshes, the widget at the old index is not the one that was
+        # painted — the painted row keeps its -highlight class forever,
+        # and every such mismatch adds another stuck highlighted row
+        # (several rows lit in the cursor colour, none of them the viewed
+        # task). Clear the stale highlight reactives directly; only the
+        # widget the index actually points at may stay lit.
+        cursor = sidebar.highlighted_child
+        for item in sidebar._nodes:
+            if isinstance(item, TaskItem) and item.highlighted and item is not cursor:
+                item.highlighted = False
         self._sidebar_snapshot = self._sidebar_fingerprint()
 
     def _dependency_marker(self, task: Task) -> str:

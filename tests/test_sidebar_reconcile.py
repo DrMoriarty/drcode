@@ -261,6 +261,82 @@ async def test_refocus_sidebar_task_contract(app: DrCodeApp, two_tasks) -> None:
         assert sidebar.highlighted_child is row_of(app, a.id)
 
 
+async def test_stale_highlight_cleared_after_prune_shifts_rows(
+    app: DrCodeApp, two_tasks
+) -> None:
+    """An async prune must not leave the painted highlight stuck on a row.
+
+    ListView clears the old highlight by *position* (_nodes[old_index]),
+    not by widget. When a removed row's prune lands between two refreshes,
+    the node list shrinks under the unchanged index and the widget the
+    ListView un-highlights is not the one that was painted — the painted
+    row keeps its -highlight class forever (a second, stuck highlight that
+    matches neither the cursor nor the viewed task)."""
+    a, b = two_tasks
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        sidebar = app.sidebar
+        sidebar.focus()
+        await pilot.pause()
+        row_a = row_of(app, a.id)
+        sidebar.index = sidebar._nodes.index(row_a)
+        await pilot.pause()
+        assert row_a.highlighted
+
+        # Deleting b pops its row from the tracking dict and issues an
+        # async remove(): the prune completes after this refresh, shifting
+        # row_a's position under the unchanged index.
+        app.manager.set_hold(b.id, on=True)
+        app.manager.delete(b.id)
+        app.refresh_sidebar()
+        await pilot.pause()
+
+        # Desynced state (pre-fix): row_a is still painted highlighted
+        # while the index points past the end of the node list.
+        assert row_a.highlighted
+
+        # The next refresh must repair the cursor instead of leaving the
+        # stale -highlight in place.
+        app.refresh_sidebar()
+        await pilot.pause()
+
+        assert sidebar.highlighted_child is row_a
+        assert row_a.highlighted
+        painted = [
+            w for w in sidebar.children if isinstance(w, TaskItem) and w.highlighted
+        ]
+        assert painted == [row_a]
+
+
+async def test_extra_highlight_reactives_are_cleared_on_refresh(
+    app: DrCodeApp, two_tasks
+) -> None:
+    """refresh_sidebar syncs the highlight reactives to the cursor: only
+    the row the ListView index points at may stay lit."""
+    a, b = two_tasks
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        sidebar = app.sidebar
+        sidebar.focus()
+        await pilot.pause()
+        row_a, row_b = row_of(app, a.id), row_of(app, b.id)
+        # Simulate the stuck state: painted highlights on rows the index
+        # does not point at (what the prune/move desync used to produce).
+        row_a.highlighted = True
+        row_b.highlighted = True
+        await pilot.pause()
+
+        app.refresh_sidebar()
+        await pilot.pause()
+
+        cursor = sidebar.highlighted_child
+        assert cursor is not None
+        painted = [
+            w for w in sidebar.children if isinstance(w, TaskItem) and w.highlighted
+        ]
+        assert painted == [cursor]
+
+
 async def test_poll_sidebar_uses_reconcile_and_updates_snapshot(
     app: DrCodeApp, two_tasks
 ) -> None:

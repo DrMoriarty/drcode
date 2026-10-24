@@ -12,7 +12,7 @@ Three independent pieces live here:
   complete WAV file. Importing this module never fails when sounddevice is
   missing (it is an optional ``voice`` extra) — :data:`SOUNDDEVICE_AVAILABLE`
   says whether the recording/playback half is usable, and the callers show
-  the "pip install drcode[voice]" hint instead.
+  an install hint (:func:`availability_hint`) instead.
 - :class:`TtsSpeaker` — fire-and-forget announcer used by the notifier: a
   single daemon worker thread synthesizes and plays the queued phrases one
   at a time (at most :data:`TtsSpeaker.MAX_PENDING` phrases wait in the
@@ -40,6 +40,7 @@ import threading
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -62,7 +63,42 @@ ASR_TIMEOUT = 60.0
 TTS_TIMEOUT = 60.0
 CHECK_TIMEOUT = 10.0
 
+
+def _bundled_portaudio() -> str | None:
+    """Absolute path of the ``libportaudio.so.2`` shipped inside the frozen
+    Linux bundle (see drcode.spec and scripts/fetch-portaudio.sh), or None.
+
+    sounddevice's POSIX code path locates PortAudio exclusively through
+    ``ctypes.util.find_library`` (ldconfig / compiler default dirs) — its
+    bundled ``_sounddevice_data`` fallback exists for macOS/Windows only.
+    The Linux bundle therefore carries the library next to the executable,
+    and the import guard below points the lookup at it before sounddevice
+    is imported."""
+    if not sys.platform.startswith("linux") or not getattr(sys, "frozen", False):
+        return None
+    base = getattr(sys, "_MEIPASS", None) or str(Path(sys.executable).parent)
+    candidate = Path(base) / "libportaudio.so.2"
+    return str(candidate) if candidate.is_file() else None
+
+
+_BUNDLED_PORTAUDIO = _bundled_portaudio()
+
 try:  # pragma: no cover - exercised indirectly (availability flag)
+    if _BUNDLED_PORTAUDIO is not None:
+        import ctypes.util
+
+        _system_find_library = ctypes.util.find_library
+
+        def _find_library(name: str) -> str | None:
+            """sounddevice shim: resolve 'portaudio' to the copy bundled
+            next to the frozen executable (the system search cannot see
+            it), everything else to the system lookup."""
+            if name == "portaudio":
+                return _BUNDLED_PORTAUDIO
+            return _system_find_library(name)
+
+        ctypes.util.find_library = _find_library
+
     import sounddevice as _sd  # noqa: F401 - the import itself is the probe
 
     SOUNDDEVICE_AVAILABLE = True
@@ -81,6 +117,15 @@ except Exception as _e:  # noqa: BLE001 - ImportError, but also a missing PortAu
 _PORTAUDIO_LOCK = threading.Lock()
 
 VOICE_EXTRA_HINT = "pip install drcode[voice]"
+
+
+def availability_hint() -> str:
+    """Actionable advice for the unavailable-sounddevice toast/error: the
+    pip extra in a normal installation, the system PortAudio package in a
+    frozen bundle (where pip advice makes no sense)."""
+    if getattr(sys, "frozen", False):
+        return "install the system libportaudio2 package (Linux)"
+    return VOICE_EXTRA_HINT
 
 
 class VoiceError(Exception):
@@ -383,7 +428,7 @@ def play_wav(data: bytes) -> None:
     """Decode PCM WAV bytes and play them synchronously (blocks until the
     sound finishes). Worker threads only."""
     if not SOUNDDEVICE_AVAILABLE:
-        raise VoiceError(f"sounddevice is not installed ({VOICE_EXTRA_HINT})")
+        raise VoiceError(f"sounddevice is not available ({availability_hint()})")
     try:
         with wave.open(io.BytesIO(data)) as wav:
             rate = wav.getframerate()

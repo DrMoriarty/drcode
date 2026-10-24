@@ -39,9 +39,10 @@ The TUI operates on the **current directory** (`Path.cwd()`).
 Voice I/O (push-to-talk dictation and spoken announcements, see below) needs
 the optional `voice` extra — `uv tool install '.[voice]'` / `pipx install '.[voice]'` /
 `pip install 'drcode[voice]'`, or `uv sync --extra voice` from source. The
-`sounddevice` wheels bundle PortAudio (on Linux install `libportaudio2`).
-Without the extra the app works fine — the voice features are simply
-unavailable and the hotkey explains what to install.
+`sounddevice` wheels bundle the PortAudio library on macOS and Windows; on
+Linux install the system `libportaudio2` (the standalone binary bundles its
+own PortAudio on every platform). Without the extra the app works fine — the
+voice features are simply unavailable and the hotkey explains what to install.
 
 ## Standalone binary
 
@@ -73,7 +74,12 @@ the payload is written once at unpack time and subsequent starts are fast
 anyway.
 
 PyInstaller is provisioned automatically via the `build` dependency group
-(`uv sync --group build`). The binary reads the same configuration (env vars,
+(`uv sync --group build --extra voice`). The bundle carries the voice
+features on every platform: macOS/Windows via the PortAudio binary shipped
+in the `sounddevice` wheel, Linux via an ALSA-only `libportaudio.so.2`
+built from source during the build (`scripts/fetch-portaudio.sh`; needs the
+ALSA headers — Debian/Ubuntu `libasound2-dev`). The binary reads the same
+configuration (env vars,
 `~/.config/drcode/drcode.json`, per-project `.env` / `.drcode/drcode.json`) as the
 installed package.
 

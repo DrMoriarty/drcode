@@ -61,8 +61,20 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies (incl. PyInstaller)
-        run: uv sync --group build
+      - name: Install dependencies (incl. PyInstaller and the voice extra)
+        run: uv sync --group build --extra voice
+
+      # Linux only: the sounddevice wheel is pure-Python there (no manylinux
+      # wheel), so the bundle carries an ALSA-only libportaudio built from
+      # source (see scripts/fetch-portaudio.sh); macOS/Windows wheels ship
+      # their own PortAudio.
+      - name: Install ALSA headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build bundled PortAudio (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/fetch-portaudio.sh
 
       - name: Build binary
         run: uv run pyinstaller --noconfirm --clean drcode.spec

@@ -15,6 +15,11 @@ Push-to-talk state machine, one instance per app:
 - any failure (no config, no sounddevice, microphone busy, network) is a
   readable toast; the state machine resets to idle.
 
+While a recording runs the persistent indicator lives in the header status
+line (``_render_model_status`` re-renders it on every state change and on
+the 1 s poll) — the status toast auto-dismisses after a few seconds and
+must not be the only visible sign that dictation is still active.
+
 Everything audio/network runs in short-lived daemon worker threads (the
 tool_runtime pattern); the only UI-thread work is inserting the text and
 showing toasts (via call_from_thread).
@@ -24,6 +29,8 @@ from __future__ import annotations
 
 import enum
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING
 
 from textual.widgets import TextArea
@@ -48,6 +55,16 @@ class _State(enum.Enum):
     TRANSCRIBING = "transcribing"
 
 
+# Terminal auto-repeat sends a burst of synthetic presses while Ctrl+B is
+# held (a natural push-to-talk reflex); Textual's Key event carries no
+# repeat marker, so the toggle is guarded in time instead. Auto-repeat
+# intervals (~15–90 ms) are far below the debounce window, and the first
+# repeat — arriving after the initial delay, which can exceed it — is
+# caught by the minimum-recording guard.
+_TOGGLE_DEBOUNCE = 0.3  # s between distinct toggle presses
+_MIN_RECORDING = 0.7  # a stop sooner than this cannot be real speech
+
+
 class VoiceInputController:
     """Toggle-style push-to-talk: first press starts, second stops and
     inserts; ESC cancels. Created by DrCodeApp (``app.voice_input``)."""
@@ -58,12 +75,26 @@ class VoiceInputController:
         self._recorder: MicrophoneRecorder | None = None
         # The field whose cursor receives the recognized text.
         self._target: TextArea | None = None
+        self._last_toggle = 0.0  # auto-repeat guard stamp (monotonic)
+        self._recording_since = 0.0
 
     @property
     def active(self) -> bool:
         """A recording or transcription is in flight (drives the ESC
         handling of the input fields)."""
         return self._state is not _State.IDLE
+
+    @property
+    def indicator(self) -> str | None:
+        """Persistent status text for the header line while busy (None
+        when idle) — the auto-dismissing toast alone left any utterance
+        longer than a few seconds with no visible sign that dictation
+        was still running."""
+        if self._state is _State.RECORDING:
+            return "● запись…"
+        if self._state is _State.TRANSCRIBING:
+            return "● распознаю…"
+        return None
 
     def _notify(self, message: str, *, error: bool = False) -> None:
         try:
@@ -78,16 +109,45 @@ class VoiceInputController:
 
     def toggle(self, target: TextArea) -> None:
         """The hotkey action: start recording, or stop it and insert the
-        text (called on the UI thread)."""
+        text (called on the UI thread).
+
+        Guarded against terminal auto-repeat: holding Ctrl+B produces
+        synthetic presses indistinguishable from real ones, and without
+        the guard the first repeat would stop the recording it just
+        started (a tiny fragment, flickering toasts). Every call —
+        accepted or swallowed — refreshes the stamp, so a held key can
+        never flip the state machine no matter how long it is held."""
+        now = time.monotonic()
+        repeated = now - self._last_toggle < _TOGGLE_DEBOUNCE
+        self._last_toggle = now
+        if repeated:
+            return
         if self._state is _State.TRANSCRIBING:
             self._notify("Still recognizing the previous utterance…")
             return
         if self._state is _State.RECORDING:
+            if now - self._recording_since < _MIN_RECORDING:
+                # A stop within the first beat slipped past the debounce
+                # (initial auto-repeat delay can exceed it) — it is not
+                # intent, and must not cut the recording to a fragment.
+                return
             self._state = _State.TRANSCRIBING
             self._notify("● распознаю…")
+            self._sync_indicator()
             self._transcribe()
             return
         self._start(target)
+
+    def _sync_indicator(self) -> None:
+        """Re-render the persistent header indicator right away (the 1 s
+        activity poll would refresh it anyway). Safe from any thread."""
+        try:
+            if threading.get_ident() == self._app._thread_id:
+                self._app._render_model_status()
+            else:
+                self._app.call_from_thread(self._app._render_model_status)
+        except Exception as e:  # noqa: BLE001 - the indicator is cosmetic
+            print(f"drcode voice: indicator failed: {e}", file=sys.stderr)
 
     def cancel(self) -> bool:
         """ESC while a recording runs: drop it. True when something was
@@ -102,6 +162,7 @@ class VoiceInputController:
         self._target = None
         if recorder is not None:
             _thread_start(_discard_recorder, recorder)
+        self._sync_indicator()
         self._notify("Запись отменена")
         return True
 
@@ -136,6 +197,8 @@ class VoiceInputController:
         self._recorder = recorder
         self._target = target
         self._state = _State.RECORDING
+        self._recording_since = time.monotonic()
+        self._sync_indicator()
         _thread_start(self._open_microphone, recorder)
 
     def _open_microphone(self, recorder: MicrophoneRecorder) -> None:
@@ -188,6 +251,7 @@ class VoiceInputController:
         """Insert the recognized text at the cursor of the field that
         started the recording (never sends it)."""
         self._state = _State.IDLE
+        self._sync_indicator()
         if target is None:
             return
         prefix = ""
@@ -209,6 +273,7 @@ class VoiceInputController:
         self._recorder = None
         self._target = None
         self._state = _State.IDLE
+        self._sync_indicator()
         try:
             self._app.call_from_thread(self._notify, message, error=True)
         except Exception:  # noqa: BLE001 - app may be shutting down

@@ -58,6 +58,7 @@ from .setup_dialog import ModelSetup
 from .sidebar import Sidebar
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
+from .voice_input import VoiceInputController
 
 # A live-tail ledger entry (see chat_view._write_chat's `note`): (role,
 # text, block). `block` is set only for streamed ReasoningBlock/
@@ -470,6 +471,9 @@ class DrCodeState(App[None]):
     # -- ntfy.sh notifications ------------------------------------------------
     notifier: Notifier
     _notifications_primed: bool
+
+    # -- push-to-talk voice dictation ---------------------------------------
+    voice_input: VoiceInputController
 
     # -- run state ----------------------------------------------------------
     viewed_id: str | None

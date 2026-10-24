@@ -524,6 +524,79 @@ async def test_push_to_talk_binding_and_controller(project_root: Any) -> None:
         assert not app.voice_input.active
 
 
+async def test_toggle_debounces_auto_repeat(project_root: Any) -> None:
+    """Holding Ctrl+B sends a burst of synthetic presses (no repeat marker
+    in Textual's Key event); the debounce must keep them from flipping the
+    state machine — the first repeat used to stop the recording it just
+    started."""
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        controller = app.voice_input
+        started: list[Any] = []
+        controller._start = started.append  # type: ignore[method-assign]
+        target = app.new_task_input
+        controller.toggle(target)
+        assert len(started) == 1
+        for _ in range(10):
+            controller.toggle(target)
+        assert len(started) == 1
+        assert controller._state is _State.IDLE
+
+
+async def test_toggle_min_recording_guard(project_root: Any) -> None:
+    """A stop arriving within the first beat of a recording (an initial
+    auto-repeat delay longer than the debounce window) must not cut it to
+    a fragment; a stop after a real recording transcribes."""
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _MIN_RECORDING, _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        controller = app.voice_input
+        target = app.new_task_input
+        stopped: list[bool] = []
+        controller._transcribe = lambda: stopped.append(True)  # type: ignore[method-assign]
+        controller._state = _State.RECORDING
+        controller._recording_since = time.monotonic()
+        controller._last_toggle = 0.0
+        controller.toggle(target)
+        assert not stopped
+        assert controller._state is _State.RECORDING
+        controller._recording_since = time.monotonic() - (_MIN_RECORDING + 0.1)
+        controller._last_toggle = 0.0
+        controller.toggle(target)
+        assert stopped == [True]
+        assert controller._state is _State.TRANSCRIBING
+
+
+async def test_header_shows_persistent_recording_indicator(project_root: Any) -> None:
+    """The recording indicator lives in the header status line exactly as
+    long as the dictation is busy — the toast auto-dismisses after a few
+    seconds and must not be the only visible sign."""
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        label = app.model_status
+        controller = app.voice_input
+        controller._state = _State.RECORDING
+        app._render_model_status()
+        assert "● запись…" in str(label.render())
+        controller._state = _State.TRANSCRIBING
+        app._render_model_status()
+        assert "● распознаю…" in str(label.render())
+        controller._state = _State.IDLE
+        app._render_model_status()
+        assert "● запись…" not in str(label.render())
+
+
 async def test_voice_settings_dialog_saves(project_root: Any) -> None:
     from textual.widgets import Button, Input, Switch
 

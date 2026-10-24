@@ -428,9 +428,17 @@ class ChatViewLayer(DrCodeState):
         the chat), "waiting" while a run is alive but the model is silent
         (a tool executing, a non-streamed request in flight), "testing"
         while the tester works, and just the plain connection label when
-        nothing runs.
+        nothing runs. A voice dictation in flight outranks all of that:
+        its recording indicator must stay visible for the whole utterance.
         """
         label = self.model_status
+        voice = self.voice_input.indicator
+        if voice is not None:
+            # The dictation indicator outranks the model-activity suffix:
+            # a recording that loses its only persistent cue looks broken
+            # to the user (the toast auto-dismisses after a few seconds).
+            label.update(f"{self._conn_label} · {voice}")
+            return
         tps = self._tokens_per_second()
         if tps is not None:
             label.update(f"{self._conn_label} · {tps:.0f} tok/s")

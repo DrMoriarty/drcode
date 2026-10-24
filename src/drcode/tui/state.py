@@ -472,6 +472,9 @@ class DrCodeState(App[None]):
     notifier: Notifier
     _notifications_primed: bool
 
+    # -- push-to-talk voice dictation ---------------------------------------
+    voice_input: VoiceInputController
+
     # -- run state ----------------------------------------------------------
     viewed_id: str | None
     # Counted run state (parallel development slots): task id -> the

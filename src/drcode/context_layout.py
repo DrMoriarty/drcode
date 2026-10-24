@@ -39,24 +39,22 @@ from .prompts import (
     load_system_prompt_components,
     load_tester_prompt_components,
 )
-from .transcript import COMPACTION_SUMMARY_PREFIX, last_context_tokens
+from .transcript import (  # noqa: F401 - CHARS_PER_TOKEN is re-exported
+    CHARS_PER_TOKEN,
+    COMPACTION_SUMMARY_PREFIX,
+    estimate_tokens,
+    last_context_tokens,
+)
 
-# Conventional token-size assumption of the estimate: ~4 characters per
-# token. The dialog labels every figure built from it with "≈".
-CHARS_PER_TOKEN = 4
+# `estimate_tokens` and `CHARS_PER_TOKEN` live in `transcript` now (shared
+# with the compaction module) and are re-exported here — the existing
+# `from context_layout import estimate_tokens` consumers keep working.
 
 # How many of the heaviest tool results the report lists in detail.
 TOP_TOOL_RESULTS = 5
 
 # Cap of one tool-result label in the top-list (chars).
 _TOOL_LABEL_CAP = 60
-
-
-def estimate_tokens(text: str) -> int:
-    """≈ tokens of `text` by the chars/4 heuristic (0 for empty text)."""
-    if not text:
-        return 0
-    return max(1, len(text) // CHARS_PER_TOKEN)
 
 
 def format_tokens(n: int) -> str:

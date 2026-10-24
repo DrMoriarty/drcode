@@ -27,11 +27,14 @@ from .agent_model import (
     probe_model,
 )
 from .compaction import (
+    MECHANICAL_HEADROOM_TOKENS,
     build_compaction_agent,
     build_compaction_prompt,
     compacted_messages,
     extract_previous_summary,
     is_summary_message,
+    mechanical_compaction_messages,
+    prompt_fits_context,
     render_history_for_summary,
     split_original_prompts,
 )
@@ -84,6 +87,7 @@ __all__ = [
     "BUG_SYSTEM_PROMPT",
     "COMPACTION_SUMMARY_PREFIX",
     "FEATURE_SYSTEM_PROMPT",
+    "MECHANICAL_HEADROOM_TOKENS",
     "RESEARCH_SYSTEM_PROMPT",
     "TESTER_SYSTEM_PROMPT",
     "TESTER_SYSTEM_PROMPT_NO_COMMIT",
@@ -121,7 +125,9 @@ __all__ = [
     "load_system_prompt",
     "load_tester_prompt",
     "log_service_event",
+    "mechanical_compaction_messages",
     "probe_model",
+    "prompt_fits_context",
     "render_history_for_summary",
     "resumable_history",
     "run_context_tokens",

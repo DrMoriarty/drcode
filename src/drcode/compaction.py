@@ -20,12 +20,23 @@ from . import agent_model
 from .agent_model import EXTRA_HEADERS
 from .config import Config
 from .prompts import load_compaction_prompts
-from .transcript import COMPACTION_SUMMARY_PREFIX, serialize_messages
+from .transcript import (
+    COMPACTION_SUMMARY_PREFIX,
+    estimate_tokens,
+    sanitized_messages,
+    serialize_messages,
+)
 
 # Tool results carry most of the working context (file reads, command
 # output), but a single pathological result must not blow up the
 # summarizer's own request — everything above the cap is cut.
 _COMPACTION_TOOL_RESULT_CAP = 20_000
+
+# Headroom (tokens) the mechanical compaction floor reserves in the serving
+# model's window for everything the transcript does not carry: the system
+# prompt, the tool schemas and the next turn's output. Capped at a quarter
+# of the window so small local models keep a usable budget.
+MECHANICAL_HEADROOM_TOKENS = 32_000
 
 
 def build_compaction_agent(config: Config) -> Agent[None, str]:
@@ -264,3 +275,99 @@ def compacted_messages(
         ]
     )
     return preserved + serialize_messages([request])
+
+
+# -- mechanical compaction floor (no LLM call) --------------------------------
+
+
+def prompt_fits_context(prompt: str, system_prompt: str, config: Config) -> bool:
+    """Whether the summarizer request plausibly fits the compaction model's
+    context window: the chars/4 estimate of the rendered prompt plus the
+    system prompt plus the configured output reserve (`max_tokens`).
+
+    A window ≤ 0 (unknown) counts as fitting — the LLM path is simply tried,
+    and a deterministic rejection is handled by the caller."""
+    if config.max_context_tokens <= 0:
+        return True
+    needed = (
+        estimate_tokens(prompt)
+        + estimate_tokens(system_prompt)
+        + max(config.max_tokens, 0)
+    )
+    return needed <= config.max_context_tokens
+
+
+_MECHANICAL_NOTE = (
+    "The middle of the conversation history was dropped mechanically to fit "
+    "the context window: the summarizer model could not process the full "
+    "transcript, so everything between the original task prompt(s) at the "
+    "top and the recent messages right above this note was removed without "
+    "summarization."
+)
+
+
+def _message_tokens(msg: dict[str, Any]) -> int:
+    """≈ wire size of one serialized message in tokens (json + chars/4 —
+    json escaping makes this deliberately conservative: overestimating only
+    trims more)."""
+    return estimate_tokens(json.dumps(msg, ensure_ascii=False))
+
+
+def _has_tool_returns(msg: dict[str, Any]) -> bool:
+    return any(
+        isinstance(part, dict) and part.get("part_kind") == "tool-return"
+        for part in msg.get("parts", [])
+    )
+
+
+def mechanical_compaction_messages(
+    messages: list[dict[str, Any]], token_budget: int
+) -> list[dict[str, Any]]:
+    """LLM-free compaction floor: the original user prompts verbatim, the
+    previous summary verbatim (embedded in the note), and as many of the
+    LAST messages as fit `token_budget`.
+
+    Used when the summarizer itself cannot be run — the rendered prompt does
+    not fit the compaction model's window, or the gateway rejected the
+    summary request with a deterministic context-overflow error — because a
+    summary call would be guaranteed to fail. The transcript is trimmed at
+    message boundaries instead.
+
+    The note rides in a COMPACTION_SUMMARY_PREFIX request, so the next
+    compaction (LLM or mechanical) extracts it as the previous summary; the
+    last real summary is embedded in it, so the anchored chain never loses
+    the condensed history.
+
+    An orphan tool-return request whose tool-call response was trimmed is
+    dropped (a tool call is never separated from its result), and the result
+    goes through `sanitized_messages` — the transcript stays API-valid no
+    matter where the cut lands. Note that `preserved` cannot be trimmed (it
+    IS the task assignment): when the original prompts alone exceed the
+    budget, the result keeps them anyway."""
+    preserved, rest = split_original_prompts(messages)
+    previous = extract_previous_summary(messages)
+    note = _MECHANICAL_NOTE
+    if previous:
+        note = f"{note}\n\n<previous-summary>\n{previous}\n</previous-summary>"
+    stub = serialize_messages(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content=f"{COMPACTION_SUMMARY_PREFIX}\n\n{note}")]
+            )
+        ]
+    )
+    used = sum(_message_tokens(m) for m in preserved)
+    used += sum(_message_tokens(m) for m in stub)
+    cut = len(rest)
+    while cut > 0:
+        tokens = _message_tokens(rest[cut - 1])
+        if used + tokens > token_budget:
+            break
+        cut -= 1
+        used += tokens
+    # Never separate a tool call from its result: when the cut lands right
+    # before a request carrying tool returns (their calls were trimmed),
+    # drop the orphan results too.
+    while cut < len(rest) and _has_tool_returns(rest[cut]):
+        cut += 1
+    return sanitized_messages(preserved + rest[cut:] + stub)

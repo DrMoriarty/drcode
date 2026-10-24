@@ -27,6 +27,7 @@ from pydantic_ai.usage import UsageLimits
 from textual import work
 
 from ..agent import (
+    MECHANICAL_HEADROOM_TOKENS,
     AgentDeps,
     TesterDeps,
     all_user_prompts,
@@ -42,7 +43,9 @@ from ..agent import (
     is_summary_message,
     last_context_tokens,
     last_response_usage,
+    mechanical_compaction_messages,
     probe_model,
+    prompt_fits_context,
     render_history_for_summary,
     resumable_history,
     run_context_tokens,
@@ -866,18 +869,120 @@ class PipelineLayer(DrCodeState):
             self._live_ctx_tokens.get(task.id), task.messages, self._task_role(task)
         )
 
+    def _mechanical_token_budget(self, role: AgentRole) -> int:
+        """Token budget of the mechanical compaction floor for `role`: the
+        serving model's window under its compaction threshold, minus a
+        headroom reserve (system prompt, tool schemas, the next turn's
+        output — MECHANICAL_HEADROOM_TOKENS, capped at a quarter of the
+        window). An unknown serving window falls back to the compaction
+        model's (smaller) one; both unknown → 0 (only the original prompts
+        and the note survive)."""
+        cfg = self.resolved_config(role)
+        window = cfg.max_context_tokens
+        if window <= 0:
+            window = self.resolved_config(AgentRole.COMPACTION).max_context_tokens
+        if window <= 0:
+            return 0
+        threshold = min(max(cfg.compaction_threshold, 1), 100)
+        headroom = min(MECHANICAL_HEADROOM_TOKENS, window // 4)
+        return max(window * threshold // 100 - headroom, 0)
+
+    def _mechanical_compact(
+        self, messages: list[dict[str, Any]], summary_role: AgentRole, what: str
+    ) -> tuple[list[dict[str, Any]], str]:
+        """The LLM-free floor: trim `messages` at message boundaries into a
+        transcript that fits `summary_role`'s window, plus the success event
+        text announcing it."""
+        trimmed = mechanical_compaction_messages(
+            messages, self._mechanical_token_budget(summary_role)
+        )
+        event = (
+            "Context compacted mechanically: the transcript did not fit the "
+            f"summarizer model's context window, {what} was trimmed at "
+            "message boundaries without a summarizer call (original task "
+            "prompt(s), the previous summary and the most recent messages "
+            "kept)."
+        )
+        return trimmed, event
+
+    async def _compact_transcript(
+        self,
+        messages: list[dict[str, Any]],
+        summary_role: AgentRole,
+        task: Task,
+        what: str,
+        checklist: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Summarize `messages` into a compacted transcript; returns it
+        together with the success event text.
+
+        LLM path first — but only after a pre-flight size check: when the
+        rendered prompt plausibly does not fit the COMPACTION role's context
+        window (chars/4 estimate), the summarizer request would be rejected
+        deterministically (HTTP 400) and compaction would fail with the run
+        continuing uncompressed past the hard limit. In that case the LLM is
+        skipped and the transcript is trimmed mechanically
+        (`mechanical_compaction_messages`) — a guaranteed floor that never
+        calls the model. The same floor engages as a fallback when the
+        gateway rejects the summary request anyway with a deterministic
+        context-overflow error (see `_is_context_overflow_error`) — the
+        chars/4 estimate can under-shoot. Any OTHER summarizer failure is
+        re-raised: a transient outage should retry later, not throw away
+        history.
+        """
+        compaction_config = self.resolved_config(AgentRole.COMPACTION)
+        system_prompt, template = load_compaction_prompts()
+        prompt = build_compaction_prompt(
+            extract_previous_summary(messages),
+            render_history_for_summary(messages),
+            template,
+            checklist=checklist,
+        )
+        if not prompt_fits_context(prompt, system_prompt, compaction_config):
+            return self._mechanical_compact(messages, summary_role, what)
+        agent = build_compaction_agent(compaction_config)
+        try:
+            result = await agent.run(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not _is_context_overflow_error(e):
+                raise
+            # The estimate under-shot and the gateway rejected the summary
+            # request: fall back to the mechanical floor instead of failing
+            # the whole compaction.
+            self._show_event(
+                task,
+                "The summarizer model rejected the transcript "
+                f"({type(e).__name__}: context overflow) — trimming "
+                "mechanically instead.",
+            )
+            return self._mechanical_compact(messages, summary_role, what)
+        # The summarizer's model calls count toward the session usage too.
+        self._record_session_usage(result.usage)
+        event = (
+            f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
+        )
+        return compacted_messages(messages, result.output), event
+
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
         boundary is the only safe point: the transcript never ends with
         unanswered tool calls there).
 
         When the context fill reaches the configured threshold (percent of
-        max_context_tokens), the main agent's work is paused, a tool-less
-        summarizer agent rewrites the transcript into a structured summary
-        (anchored to the previous one, if any), and the transcript is
-        replaced by the original user prompt(s) plus that summary. A
-        compaction failure is never fatal: it is logged into the service
-        events and the run continues with the uncompressed history.
+        max_context_tokens), the main agent's work is paused and the
+        transcript is compacted: a tool-less summarizer agent rewrites it
+        into a structured summary (anchored to the previous one, if any) —
+        or, when the summarizer itself cannot be run (the rendered prompt
+        does not fit the compaction model's window, or the gateway rejects
+        the summary request with a deterministic context-overflow error),
+        the transcript is trimmed mechanically without any LLM call. Either
+        way the transcript is replaced by the original user prompt(s) plus
+        the summary/note, so compaction always terminates with a history
+        that fits the serving model's context. A compaction failure is
+        never fatal: it is logged into the service events and the run
+        continues with the uncompressed history.
         """
         tokens = self._compaction_due(task)
         if tokens is None:
@@ -894,18 +999,17 @@ class PipelineLayer(DrCodeState):
             f"Context fill {pct}% — pausing the agent and compacting history…",
         )
         try:
-            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
-            prompt = build_compaction_prompt(
-                extract_previous_summary(task.messages),
-                render_history_for_summary(task.messages),
-                load_compaction_prompts()[1],
+            new_messages, event = await self._compact_transcript(
+                task.messages,
+                summary_role=self._task_role(task),
+                task=task,
+                what="history",
                 checklist=(
                     render_todos(task.todos)
                     if task.kind is TaskKind.FEATURE and task.todos
                     else None
                 ),
             )
-            result = await agent.run(prompt)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the run
@@ -913,20 +1017,14 @@ class PipelineLayer(DrCodeState):
             self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return
         self._compaction_failed.discard(task.id)
-        # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
-        task.messages = compacted_messages(task.messages, result.output)
+        task.messages = new_messages
         task.touch()
         self.manager.storage.save(task)
         # The live token reading is stale now (it belongs to the old
         # transcript); drop it so the counter falls back to the compacted
         # transcript until the next model request reports real usage.
         self._live_ctx_tokens.pop(task.id, None)
-        self._show_event(
-            task,
-            "Context compacted: history summarized, original task "
-            "prompt(s) kept verbatim.",
-        )
+        self._show_event(task, event)
         if self.viewed_id == task.id:
             self.view_task(task.id)
 
@@ -941,18 +1039,21 @@ class PipelineLayer(DrCodeState):
         (`task.tester_messages[-1]`) in place — `task.messages` (the
         developer transcript) is never touched, the two histories must not
         mix (tester rounds are persisted separately precisely so they never
-        leak into the coding agent's model history).
+        leak into the coding agent's model history). The same pre-flight /
+        mechanical-floor guarantees apply: when the summarizer cannot be
+        run, the round is trimmed mechanically instead of looping through a
+        guaranteed failure.
 
         Returns True when the round was compacted: run_tester must resume
         it as a continuation turn from the compacted transcript (and drop
         the stale live token reading). Returns False when compaction was
         not possible — the threshold is not reached, there is nothing to
-        summarize (a no-op), or the summarizer failed — in which case the
-        round is resumed uncompressed and the caller adds the task to
-        `_compaction_failed`, so the mid-round gate stays off (a
-        persistently broken summarizer must not loop pause→resume
-        forever); turn-boundary compaction of the main agent still retries
-        on later turns.
+        summarize (a no-op), or the summarizer failed with a non-overflow
+        error — in which case the round is resumed uncompressed and the
+        caller adds the task to `_compaction_failed`, so the mid-round gate
+        stays off (a persistently broken summarizer must not loop
+        pause→resume forever); turn-boundary compaction of the main agent
+        still retries on later turns.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
         tokens = self._fill_over_threshold(
@@ -975,13 +1076,12 @@ class PipelineLayer(DrCodeState):
             f"Context fill {pct}% — compacting the testing round…",
         )
         try:
-            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
-            prompt = build_compaction_prompt(
-                extract_previous_summary(round_messages),
-                render_history_for_summary(round_messages),
-                load_compaction_prompts()[1],
+            new_messages, event = await self._compact_transcript(
+                round_messages,
+                summary_role=AgentRole.TESTER,
+                task=task,
+                what="testing round",
             )
-            result = await agent.run(prompt)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the round
@@ -989,16 +1089,10 @@ class PipelineLayer(DrCodeState):
             self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return False
         self._compaction_failed.discard(task.id)
-        # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
-        task.tester_messages[-1] = compacted_messages(round_messages, result.output)
+        task.tester_messages[-1] = new_messages
         task.touch()
         self.manager.storage.save(task)
-        self._show_event(
-            task,
-            "Context compacted: testing round summarized, original "
-            "prompt kept verbatim.",
-        )
+        self._show_event(task, event)
         if self.viewed_id == task.id:
             self.view_task(task.id)
         return True

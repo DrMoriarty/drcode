@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from textual import on
 from textual.app import ComposeResult
+from textual.containers import Horizontal
 from textual.events import Click
 from textual.message import Message
 from textual.widgets import Static
@@ -130,6 +131,22 @@ class ModelStatusHeader(Header):
     ModelStatusHeader HeaderIcon {
         display: none;
     }
+    /* The git indicator and the clock must sit side by side at the right
+    edge (indicator LEFT of the clock). Docking them individually does not
+    work on current Textual: every right-docked widget pins to the right
+    edge and later widgets paint OVER earlier ones (no push-away). So both
+    live in a single right-docked Horizontal and are laid out by flow
+    inside it — `dock: none` strips their own right-dock, which would
+    otherwise pin each of them to the container's right edge and overlap. */
+    ModelStatusHeader #header-right {
+        dock: right;
+        width: auto;
+        height: 100%;
+    }
+    ModelStatusHeader #header-right > HeaderClockSpace,
+    ModelStatusHeader #header-right > HeaderGitIndicator {
+        dock: none;
+    }
     /* The extra tall-only lines are hidden in the collapsed state; the
     display rules live here (not in HeaderTallInfo's own stylesheet) so
     the -tall override reliably wins the cascade. */
@@ -167,14 +184,17 @@ class ModelStatusHeader(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderModelStatus(id="model-status")
-        yield (
-            HeaderClock().data_bind(Header.time_format)
-            if self._show_clock
-            else HeaderClockSpace()
-        )
-        # Docked right AFTER the clock: right-docks stack away from the
-        # edge in compose order, so the indicator lands just left of it.
-        yield HeaderGitIndicator(id="header-git")
+        # One right-docked container holding the git indicator and the
+        # clock: individual right-docks overlap on current Textual (see
+        # the #header-right CSS note), the container's flow layout puts
+        # the indicator just left of the clock.
+        with Horizontal(id="header-right"):
+            yield HeaderGitIndicator(id="header-git")
+            yield (
+                HeaderClock().data_bind(Header.time_format)
+                if self._show_clock
+                else HeaderClockSpace()
+            )
         # The tall-only lines dock around the icon/clock columns (they are
         # composed after those docks, see HeaderTallInfo).
         yield HeaderConnInfo(id="header-conn")

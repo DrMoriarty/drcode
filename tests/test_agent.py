@@ -404,6 +404,119 @@ def test_build_compaction_prompt_no_previous() -> None:
     assert "<previous-summary>\n(none)\n</previous-summary>" in prompt
 
 
+# -- map-reduce chunking --------------------------------------------------------
+
+
+def _long_transcript(turns: int, filler: str = "x" * 200) -> list[dict]:
+    """A rendered-past-the-window transcript: each turn is a user prompt, a
+    tool call and its (oversized) result plus an assistant remark."""
+    messages: list[ModelRequest | ModelResponse] = []
+    for i in range(turns):
+        messages.append(user_msg(f"task {i}: {filler}"))
+        messages.append(tool_call_response(call_id=f"c{i}"))
+        messages.append(
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="run_bash", content=filler, tool_call_id=f"c{i}"
+                    )
+                ]
+            )
+        )
+        messages.append(text_response(f"did {i}"))
+    return serialize_messages(messages)
+
+
+def test_chunk_history_respects_budget() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    data = _long_transcript(turns=12)
+    slices = chunk_history_for_summary(data, budget_tokens=600)
+    assert len(slices) > 1
+    for s in slices:
+        assert len(s) <= 600 * 4
+
+
+def test_chunk_history_never_separates_tool_call_from_result() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    data = _long_transcript(turns=10)
+    for s in chunk_history_for_summary(data, budget_tokens=1_000):
+        calls = s.count("[tool call]")
+        results = s.count("[tool result for")
+        assert calls == results
+
+
+def test_chunk_history_never_splits_user_from_answer() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    data = _long_transcript(turns=8)
+    for s in chunk_history_for_summary(data, budget_tokens=1_500):
+        # A slice starting with a user prompt always carries at least one
+        # following non-user block (its answer's beginning)...
+        if s.startswith("[user]"):
+            assert "\n[assistant]\n" in s or "[tool call]" in s
+
+
+def test_chunk_history_prefers_turn_boundaries() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    filler = "x" * 200
+    data = _long_transcript(turns=6, filler=filler)
+    # One turn ≈ (8 + 200) + 40 + (17 + 200) + (9 + 6) chars — a budget of
+    # two turns must make every interior slice start at a [user] block.
+    slices = chunk_history_for_summary(data, budget_tokens=1_200)
+    for s in slices[1:-1]:
+        assert s.startswith("[user]")
+
+
+def test_chunk_history_oversized_single_block_hard_split() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    data = serialize_messages([user_msg("huge " * 40_000)])
+    slices = chunk_history_for_summary(data, budget_tokens=2_000)
+    assert len(slices) > 1
+    assert "".join(slc.replace("\n\n", " ") for slc in slices).startswith("[user]")
+
+
+def test_chunk_history_empty_transcript() -> None:
+    from drcode.agent import chunk_history_for_summary
+
+    assert chunk_history_for_summary([], 1_000) == []
+
+
+def test_build_reduce_prompt_structure() -> None:
+    from drcode.agent import build_reduce_prompt
+
+    prompt = build_reduce_prompt(["partial one", "partial two"], "TEMPLATE")
+    assert "<partial index=1>\npartial one\n</partial>" in prompt
+    assert "<partial index=2>\npartial two\n</partial>" in prompt
+    assert prompt.rstrip().endswith("TEMPLATE")
+
+
+def test_build_reduce_prompt_with_checklist() -> None:
+    from drcode.agent import build_reduce_prompt
+
+    prompt = build_reduce_prompt(["p"], "T", checklist="- [x] item")
+    assert "<task-checklist>\n- [x] item\n</task-checklist>" in prompt
+
+
+def test_slice_budget_tokens_leaves_headroom() -> None:
+    from drcode.agent import slice_budget_tokens
+
+    cfg = Config(max_context_tokens=100_000, max_tokens=8_192)
+    budget = slice_budget_tokens(cfg, anchor="a" * 400, checklist=None)
+    assert 0 < budget < 100_000
+    # A bigger anchor eats into the budget.
+    bigger = slice_budget_tokens(cfg, anchor="a" * 40_000, checklist=None)
+    assert bigger < budget
+    # A tiny window still yields the floor budget (chunker stays usable).
+    tiny = slice_budget_tokens(
+        Config(max_context_tokens=1_000, max_tokens=8_192), None, None
+    )
+    assert tiny >= 2_000
+
+
 def test_compacted_messages_preserves_originals() -> None:
     data = serialize_messages(
         [

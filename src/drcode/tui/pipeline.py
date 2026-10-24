@@ -34,7 +34,9 @@ from ..agent import (
     build_agent,
     build_compaction_agent,
     build_compaction_prompt,
+    build_reduce_prompt,
     build_tester_agent,
+    chunk_history_for_summary,
     compacted_messages,
     ends_with_open_request,
     extract_previous_summary,
@@ -43,14 +45,17 @@ from ..agent import (
     last_context_tokens,
     last_response_usage,
     probe_model,
+    prompt_fits_window,
     render_history_for_summary,
     resumable_history,
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
+    slice_budget_tokens,
     split_original_prompts,
     todo_instructions,
 )
+from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
 from ..github import (
     issue_commit_hint,
@@ -836,6 +841,159 @@ class PipelineLayer(DrCodeState):
             self._live_ctx_tokens.get(task.id), task.messages, self._task_role(task)
         )
 
+    async def _run_summarizer(self, prompt: str) -> str:
+        """One compaction model call: run the tool-less summarizer and
+        record its usage into the session totals like every other model
+        call. Raises on failure — the callers turn that into a non-fatal
+        compaction-failed event."""
+        agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
+        result = await agent.run(prompt)
+        # The summarizer's model calls count toward the session usage too.
+        self._record_session_usage(result.usage)
+        return result.output
+
+    async def _reduce_partials(
+        self,
+        partials: list[str],
+        template: str,
+        checklist: str | None,
+        depth: int = 0,
+    ) -> str:
+        """Merge the map step's partial summaries into the final structured
+        summary. When the accumulated partials overflow the merge call, the
+        partials are grouped into fitting batches and each batch is reduced
+        first (hierarchical reduce, depth-capped); past the cap the payload
+        is mechanically trimmed per partial so the merge call always
+        happens (the guaranteed floor — a bounded summary beats none)."""
+        prompt = build_reduce_prompt(partials, template, checklist)
+        compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
+        if prompt_fits_window(prompt, compaction_cfg) or not partials:
+            return await self._run_summarizer(prompt)
+        if depth >= _MAX_REDUCE_DEPTH:
+            trimmed = self._mechanically_trim_partials(
+                partials, compaction_cfg, checklist
+            )
+            return await self._run_summarizer(
+                build_reduce_prompt(trimmed, template, checklist)
+            )
+        # Hierarchical reduce: batch the partials so each batch's prompt
+        # fits, reduce every batch, then merge the intermediates.
+        batch_budget = slice_budget_tokens(compaction_cfg, checklist=checklist)
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_tokens = 0
+        for p in partials:
+            size = len(p) // CHARS_PER_TOKEN + 1
+            if current and current_tokens + size > batch_budget:
+                batches.append(current)
+                current, current_tokens = [], 0
+            current.append(p)
+            current_tokens += size
+        if current:
+            batches.append(current)
+        if len(batches) == 1 and len(batches[0]) == len(partials):
+            # Single batch covering everything and still overflowing (one
+            # gigantic partial): trim mechanically instead of recursing on
+            # an unchanged payload.
+            trimmed = self._mechanically_trim_partials(
+                partials, compaction_cfg, checklist
+            )
+            return await self._run_summarizer(
+                build_reduce_prompt(trimmed, template, checklist)
+            )
+        intermediates = [
+            await self._reduce_partials(batch, template, checklist, depth + 1)
+            for batch in batches
+        ]
+        return await self._reduce_partials(
+            intermediates, template, checklist, depth + 1
+        )
+
+    @staticmethod
+    def _mechanically_trim_partials(
+        partials: list[str],
+        compaction_cfg: Config,
+        checklist: str | None,
+    ) -> list[str]:
+        """Guaranteed-floor fallback: trim each partial to an equal char
+        share of the reduce budget so the merge call always happens (a
+        bounded, degraded summary beats no compaction at all)."""
+        budget_chars = (
+            max(slice_budget_tokens(compaction_cfg, checklist=checklist), 1)
+            * CHARS_PER_TOKEN
+        )
+        per_partial = max(budget_chars // max(len(partials), 1), 200)
+        return [
+            p[:per_partial] + ("\n…[truncated]" if len(p) > per_partial else "")
+            for p in partials
+        ]
+
+    async def _summarize_history(
+        self,
+        task: Task,
+        messages: list[dict[str, Any]],
+        *,
+        checklist: str | None = None,
+    ) -> str | None:
+        """LLM summarization of `messages` for compaction, shared by the
+        main-agent and tester-round gates.
+
+        Single-shot when the rendered history fits the COMPACTION role's
+        window; otherwise a map-reduce: the history is chunked at
+        conversation boundaries into slices that fit (with headroom for the
+        system prompt, output template, anchors and the reduce step), the
+        slices are summarized sequentially — each map call sees the running
+        partial summaries as its <previous-summary> anchor, mirroring the
+        previous-summary anchoring of the single-shot path — and a final
+        reduce call merges the partials into the structured summary
+        (hierarchical reduce, then a mechanical per-partial trim, when the
+        partials themselves overflow the merge call).
+
+        Every model call's usage is recorded via _record_session_usage, so
+        total extra calls stay visible exactly like the single-shot path.
+        Returns the summary text, or None when a summarizer call failed
+        (compaction must not kill the run) — the callers decide the
+        failure's side effects (_compaction_failed etc.)."""
+        _system_prompt, template = load_compaction_prompts()
+        anchor = extract_previous_summary(messages)
+        try:
+            prompt = build_compaction_prompt(
+                anchor,
+                render_history_for_summary(messages),
+                template,
+                checklist=checklist,
+            )
+            compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
+            if prompt_fits_window(prompt, compaction_cfg):
+                return await self._run_summarizer(prompt)
+            slices = chunk_history_for_summary(
+                messages,
+                slice_budget_tokens(compaction_cfg, anchor, checklist),
+            )
+            if not slices:
+                return None
+            self._show_event(
+                task,
+                f"History too large for one summarizer call — map-reduce "
+                f"over {len(slices)} slice(s)…",
+            )
+            partials: list[str] = []
+            for chunk in slices:
+                running = "\n\n".join(partials) if partials else anchor
+                partials.append(
+                    await self._run_summarizer(
+                        build_compaction_prompt(
+                            running, chunk, template, checklist=checklist
+                        )
+                    )
+                )
+            return await self._reduce_partials(partials, template, checklist)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+            return None
+
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
         boundary is the only safe point: the transcript never ends with
@@ -844,10 +1002,12 @@ class PipelineLayer(DrCodeState):
         When the context fill reaches the configured threshold (percent of
         max_context_tokens), the main agent's work is paused, a tool-less
         summarizer agent rewrites the transcript into a structured summary
-        (anchored to the previous one, if any), and the transcript is
-        replaced by the original user prompt(s) plus that summary. A
-        compaction failure is never fatal: it is logged into the service
-        events and the run continues with the uncompressed history.
+        (anchored to the previous one, if any; map-reduce over
+        conversation-boundary slices when the rendered history overflows the
+        summarizer's window), and the transcript is replaced by the original
+        user prompt(s) plus that summary. A compaction failure is never
+        fatal: it is logged into the service events and the run continues
+        with the uncompressed history.
         """
         tokens = self._compaction_due(task)
         if tokens is None:
@@ -863,29 +1023,20 @@ class PipelineLayer(DrCodeState):
             task,
             f"Context fill {pct}% — pausing the agent and compacting history…",
         )
-        try:
-            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
-            prompt = build_compaction_prompt(
-                extract_previous_summary(task.messages),
-                render_history_for_summary(task.messages),
-                load_compaction_prompts()[1],
-                checklist=(
-                    render_todos(task.todos)
-                    if task.kind is TaskKind.FEATURE and task.todos
-                    else None
-                ),
-            )
-            result = await agent.run(prompt)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+        summary = await self._summarize_history(
+            task,
+            task.messages,
+            checklist=(
+                render_todos(task.todos)
+                if task.kind is TaskKind.FEATURE and task.todos
+                else None
+            ),
+        )
+        if summary is None:
             self._compaction_failed.add(task.id)
-            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return
         self._compaction_failed.discard(task.id)
-        # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
-        task.messages = compacted_messages(task.messages, result.output)
+        task.messages = compacted_messages(task.messages, summary)
         task.touch()
         self.manager.storage.save(task)
         # The live token reading is stale now (it belongs to the old
@@ -944,24 +1095,12 @@ class PipelineLayer(DrCodeState):
             task,
             f"Context fill {pct}% — compacting the testing round…",
         )
-        try:
-            agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
-            prompt = build_compaction_prompt(
-                extract_previous_summary(round_messages),
-                render_history_for_summary(round_messages),
-                load_compaction_prompts()[1],
-            )
-            result = await agent.run(prompt)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - compaction must not kill the round
+        summary = await self._summarize_history(task, round_messages)
+        if summary is None:
             self._compaction_failed.add(task.id)
-            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
             return False
         self._compaction_failed.discard(task.id)
-        # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
-        task.tester_messages[-1] = compacted_messages(round_messages, result.output)
+        task.tester_messages[-1] = compacted_messages(round_messages, summary)
         task.touch()
         self.manager.storage.save(task)
         self._show_event(

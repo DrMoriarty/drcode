@@ -453,6 +453,139 @@ async def test_compaction_success_replaces_history(
     assert not state.steps  # exactly one summarizer request happened
 
 
+# -- map-reduce compaction (history larger than the summarizer's window) ----
+
+
+def _routing_summarizer(
+    map_prompts: list[str], calls: dict[str, Any]
+) -> Callable[[list, Any], Any]:
+    """A FunctionModel routing map vs reduce compaction calls: map prompts
+    (carrying a <conversation>) answer with a numbered partial, reduce
+    prompts (carrying <partial-summaries>) with the merged final summary."""
+    from tests.network_mocks import last_user_text
+
+    def fn(messages: list, info: Any) -> Any:
+        prompt = last_user_text(messages)
+        if "<partial-summaries>" in prompt:
+            calls["reduce"] += 1
+            calls["last_reduce_prompt"] = prompt
+            return text_response("FINAL MERGED SUMMARY")
+        calls["map"] += 1
+        map_prompts.append(prompt)
+        return text_response(f"PARTIAL {calls['map']}")
+
+    return fn
+
+
+async def test_map_reduce_compaction_over_window(
+    project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript whose rendered history is several times the compaction
+    role's window is still compacted into a proper structured summary: the
+    history is chunked at conversation boundaries, each slice is summarized
+    sequentially (each map call seeing the running partials as anchor), and
+    a final reduce call merges the partials — with every extra model call
+    recorded via _record_session_usage like the single-shot path."""
+    monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
+    from pydantic_ai.models.function import FunctionModel
+
+    map_prompts: list[str] = []
+    calls: dict[str, Any] = {"map": 0, "reduce": 0}
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: FunctionModel(_routing_summarizer(map_prompts, calls)),
+    )
+
+    recorded: list[Any] = []
+    orig_record = DrCodeApp._record_session_usage
+    monkeypatch.setattr(
+        DrCodeApp,
+        "_record_session_usage",
+        lambda self, usage: (recorded.append(usage), orig_record(self, usage)),
+    )
+
+    app = DrCodeApp(project_root)
+    # Rendered history ~25k chars (~6k estimated tokens) vs a 2k-token
+    # window: several times over, and past the compaction threshold (the
+    # seeded response reports a 2k-token fill).
+    task = _seed_transcript(app, "word " * 5_000)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("map-reduce" in t for t in event_texts(task))
+    assert any("Context compacted" in t for t in event_texts(task))
+    assert len(task.messages) == 2
+    assert is_summary_message(task.messages[1])
+    assert "FINAL MERGED SUMMARY" in task.messages[1]["parts"][0]["content"]
+    # The map step really chunked: several slices, each well below the
+    # rendered history, and the reduce call merged them.
+    assert calls["map"] >= 2
+    assert calls["reduce"] == 1
+    rendered_len = len("word " * 5_000)
+    assert all(len(p) < rendered_len for p in map_prompts)
+    # Each map call sees the running partial summaries as its anchor
+    # (mirroring the previous-summary anchoring).
+    assert "PARTIAL 1" in map_prompts[1]
+    # Total extra calls bounded and all recorded into the session usage.
+    assert len(recorded) == calls["map"] + calls["reduce"]
+    assert "<partial-summaries>" in calls["last_reduce_prompt"]
+
+
+async def test_reduce_partials_hierarchical_on_overflow(
+    project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partials whose accumulated prompt overflows the reduce call are
+    batched and reduced hierarchically, then merged: bounded extra calls,
+    still a structured summary."""
+    monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
+    from pydantic_ai.models.function import FunctionModel
+
+    calls: dict[str, Any] = {"map": 0, "reduce": 0}
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: FunctionModel(_routing_summarizer([], calls)),
+    )
+    app = DrCodeApp(project_root)
+    partials = ["p" * 60_000 for _ in range(3)]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        result = await app._reduce_partials(partials, "TEMPLATE", None)
+    assert result == "FINAL MERGED SUMMARY"
+    # 3 batch reduces (one gigantic partial per batch) + 1 final merge.
+    assert calls["reduce"] == 4
+
+
+async def test_reduce_partials_mechanical_trim_at_depth_cap(
+    project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the hierarchical-reduce depth cap the payload is mechanically
+    trimmed per partial so the merge call always happens (the guaranteed
+    floor)."""
+    monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
+    from pydantic_ai.models.function import FunctionModel
+
+    calls: dict[str, Any] = {"map": 0, "reduce": 0}
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: FunctionModel(_routing_summarizer([], calls)),
+    )
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        result = await app._reduce_partials(
+            ["p" * 60_000 for _ in range(2)], "TEMPLATE", None, depth=3
+        )
+    assert result == "FINAL MERGED SUMMARY"
+    assert calls["reduce"] == 1
+    assert "…[truncated]" in calls["last_reduce_prompt"]
+
+
 # -- mid-run context compaction ------------------------------------------------------------
 
 

@@ -676,6 +676,18 @@ class ActionsLayer(DrCodeState):
         # Mitigation: make the stop explicit and show the way back
         # (Ctrl+R re-runs the interrupted attempt — action_nudge_run).
         for stopped in stopped_tasks:
+            if stopped.status is TaskStatus.ACTIVE and not stopped.unfinished:
+                # Mark the interrupted attempt HERE, not only in the run's
+                # CancelledError handler: the worker may be cancelled
+                # before its first step (a just-dispatched run under load)
+                # or inside its setup window (worktree git, the task-start
+                # hook) — the handler then never runs, the marker is lost,
+                # and the stopped task looks like a run that silently
+                # ignored the stop (or auto-restarts itself out of the
+                # queue). Idempotent with the handler's own marking.
+                stopped.unfinished = True
+                stopped.touch()
+                self.manager.storage.save(stopped)
             self._show_event(
                 stopped,
                 "Run aborted by user (ESC) — press Ctrl+R to resume.",

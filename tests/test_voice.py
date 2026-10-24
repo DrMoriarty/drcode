@@ -1128,6 +1128,19 @@ def test_recorder_stop_raises_when_silent_after_long_recording(
         assert handle.getnframes() == 0
 
 
+def test_recorder_stop_raises_on_all_zero_samples() -> None:
+    """A device that delivers frames but captures no sound (wrong input
+    selected, muted input) yields an all-zero WAV: raise a distinct,
+    actionable VoiceError from stop() instead of shipping digital
+    silence to the ASR endpoint and surfacing the misleading
+    "ASR returned no text"."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._callback(_cffi_int16_buffer([0, 0, 0]), 3, None, None)
+    with pytest.raises(VoiceError, match="silence"):
+        recorder.stop()
+
+
 def test_recorder_brief_tap_still_yields_silent_wav() -> None:
     """A stop immediately after a start (a quick tap) is not an error."""
     recorder = MicrophoneRecorder()

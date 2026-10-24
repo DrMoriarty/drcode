@@ -417,7 +417,10 @@ class MicrophoneRecorder:
         having been open longer than a moment (or whose callback failed)
         raises a distinct VoiceError instead — shipping a silent WAV to
         the ASR endpoint only surfaces later as the misleading
-        "ASR returned no text". A genuinely brief tap still yields a
+        "ASR returned no text". Same for a non-empty recording made of
+        nothing but digital zeros: the device delivers frames but
+        captures no sound (wrong input device selected, muted input) —
+        that too is caught here. A genuinely brief tap still yields a
         valid, silent WAV."""
         with self._lock:
             stream, self._stream = self._stream, None
@@ -441,6 +444,13 @@ class MicrophoneRecorder:
                 raise VoiceError(
                     f"Microphone returned no audio in {duration:.1f} s of recording"
                 )
+        elif not any(pcm):
+            duration = time.monotonic() - self._opened_at
+            raise VoiceError(
+                f"Microphone recorded only silence in {duration:.1f} s "
+                f"(digital zeros) — check that the right input device is "
+                f"selected and not muted"
+            )
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
             wav.setnchannels(1)

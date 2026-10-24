@@ -194,6 +194,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         border: solid $success;
         color: $text;
     }
+    # Persistent dictation indicator, bottom-right corner (on the toast
+    # layer so it paints over the statusbar/footer row). Shown for the
+    # whole RECORDING/TRANSCRIBING session — the auto-dismissing toasts
+    # left a long utterance with no visible sign that dictation is still
+    # running. Background stays transparent: the strip only draws its
+    # right-aligned text, never a full-width panel.
+    #voice-indicator {
+        layer: toast;
+        dock: bottom;
+        width: 100%;
+        height: 1;
+        text-align: right;
+        padding: 0 1 0 0;
+        background: transparent;
+        color: $warning;
+        text-style: bold;
+    }
     .hidden { display: none; }
     #new-task {
         height: 1fr; width: 1fr;
@@ -640,6 +657,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     yield Static("", id="nt-kinds")
         yield Static("", id="statusbar")
         yield Static("", id="copy-toast", classes="hidden")
+        yield Static("", id="voice-indicator", classes="hidden")
         yield Footer()
 
     def _set_terminal_title(self, title: str) -> None:

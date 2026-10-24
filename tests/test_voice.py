@@ -631,6 +631,43 @@ async def test_header_shows_persistent_recording_indicator(project_root: Any) ->
         assert "● запись…" not in str(label.render())
 
 
+async def test_corner_indicator_persists_while_busy(project_root: Any) -> None:
+    """The bottom-right corner widget shows the dictation status for the
+    whole busy session — recording (with the Ctrl+B/ESC hint), then
+    transcribing — and disappears only on return to IDLE (insert /
+    cancel / error). No timeout: the auto-dismissing toasts left a long
+    utterance with no visible sign in the corner."""
+    from textual.widgets import Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        widget = app.query_one("#voice-indicator", Static)
+        controller = app.voice_input
+        assert widget.has_class("hidden")
+
+        controller._state = _State.RECORDING
+        app._render_model_status()
+        assert not widget.has_class("hidden")
+        text = str(widget.render())
+        assert "● запись…" in text
+        assert "Ctrl+B — готово, ESC — отмена" in text
+
+        controller._state = _State.TRANSCRIBING
+        app._render_model_status()
+        assert not widget.has_class("hidden")
+        text = str(widget.render())
+        assert "● распознаю…" in text
+        assert "Ctrl+B" not in text  # no stream left to stop
+
+        controller._state = _State.IDLE
+        app._render_model_status()
+        assert widget.has_class("hidden")
+
+
 async def test_voice_settings_dialog_saves(project_root: Any) -> None:
     from textual.widgets import Button, Input, Switch
 

@@ -246,6 +246,87 @@ def test_read_file_missing_raises(project_root: Path) -> None:
         read_file(project_root, "nope.txt")
 
 
+def test_read_file_oversized_chunk_truncated_not_refused(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read above the per-result cap is truncated (head+tail), never refused:
+    the model keeps a usable slice plus the offset/limit guidance."""
+    monkeypatch.setattr(tools, "MAX_READ_RESULT_BYTES", 500)
+    n = 200
+    (project_root / "big.txt").write_text(
+        "\n".join(f"line{i:04d} " + "x" * 20 for i in range(1, n + 1))
+    )
+    out = read_file(project_root, "big.txt")
+    assert "output truncated" in out
+    assert "adjusting `offset` and `limit`" in out
+    # Head keeps the file's start, tail its end — original line numbers intact.
+    assert "1: line0001" in out
+    assert f"{n}: line{n:04d}" in out
+    # The middle is gone.
+    assert "line0100" not in out
+    assert "Refusing to read" not in out
+
+
+def test_read_file_truncation_respects_cap(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No single read result — slices AND the note — exceeds the cap."""
+    monkeypatch.setattr(tools, "MAX_READ_RESULT_BYTES", 500)
+    (project_root / "big.txt").write_text(
+        "\n".join(f"line{i:04d} " + "y" * 30 for i in range(1, 301))
+    )
+    out = read_file(project_root, "big.txt")
+    assert len(out.encode("utf-8")) <= tools.MAX_READ_RESULT_BYTES
+
+
+def test_read_file_truncation_honors_offset(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Truncation of a mid-file chunk keeps the chunk's own numbering: the head
+    starts at the requested offset, not at line 1."""
+    monkeypatch.setattr(tools, "MAX_READ_RESULT_BYTES", 400)
+    (project_root / "big.txt").write_text(
+        "\n".join(f"line{i:04d} " + "z" * 20 for i in range(1, 401))
+    )
+    out = read_file(project_root, "big.txt", offset=100)
+    assert out.startswith("100: line0100")
+    assert "output truncated" in out
+
+
+def test_read_file_truncation_single_giant_line_fallback(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single line longer than the whole budget defeats line-based slicing —
+    fall back to a raw character head+tail so the slice is still usable."""
+    monkeypatch.setattr(tools, "MAX_READ_RESULT_BYTES", 500)
+    (project_root / "one.txt").write_text("A" * 2000 + "\n" + "B" * 2000)
+    out = read_file(project_root, "one.txt")
+    assert "output truncated" in out
+    assert out.startswith("1: AAAA")
+    assert out.rstrip().endswith("BBBB")
+    assert len(out.encode("utf-8")) <= tools.MAX_READ_RESULT_BYTES
+
+
+def test_read_file_budget_refusal_still_gates_after_truncation(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Truncation shrinks the piece, but the context-budget gate still refuses
+    when even the truncated result would push the fill past the threshold."""
+    monkeypatch.setattr(tools, "MAX_READ_RESULT_BYTES", 500)
+    (project_root / "big.txt").write_text(
+        "\n".join(f"line{i:04d} " + "w" * 30 for i in range(1, 301))
+    )
+    out = read_file(
+        project_root,
+        "big.txt",
+        current_usage=790,
+        max_context_tokens=1000,
+        compaction_threshold=80,
+    )
+    assert "Refusing to read" in out
+    assert "context budget" in out
+
+
 # -- write_file ------------------------------------------------------------------
 
 

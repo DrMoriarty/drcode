@@ -875,6 +875,24 @@ def test_git_commit_docs_tool_only_for_research(fake_config: Config) -> None:
         assert "git_commit_docs" not in _tool_names(ag)
 
 
+def test_search_task_history_tool_only_for_research(fake_config: Config) -> None:
+    from drcode.agent import build_agent, build_tester_agent
+
+    research = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    assert "search_task_history" in _tool_names(research)
+    for kind in (TaskKind.FEATURE, TaskKind.BUG):
+        ag = build_agent(fake_config, kind=kind)
+        assert "search_task_history" not in _tool_names(ag)
+    tester = build_tester_agent(fake_config)
+    assert "search_task_history" not in _tool_names(tester)
+
+
+def test_research_prompt_documents_task_search() -> None:
+    from drcode.agent import RESEARCH_SYSTEM_PROMPT
+
+    assert "search_task_history" in RESEARCH_SYSTEM_PROMPT
+
+
 def test_research_prompt_documents_commit_flow() -> None:
     from drcode.agent import RESEARCH_SYSTEM_PROMPT
 

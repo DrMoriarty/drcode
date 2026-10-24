@@ -172,6 +172,51 @@ ISOLATION_OPTIONS: tuple[TaskIsolation, ...] = (
 )
 
 
+class WorktreeRemoval(str, enum.Enum):
+    """When a task's worktree directory `.drcode/worktrees/<task-id>`
+    (see `drcode.task_env`) is removed automatically (project setting).
+
+    ON_DELETE (the default, the historical behaviour): the directory
+    lives as long as the task — it is torn down on cancel (Ctrl+X),
+    delete (Ctrl+Delete) and the retention cleanup. ON_COMPLETION: the
+    directory is removed as soon as the task reaches COMPLETED
+    (research right in `mark_done`, dev tasks at the tester's
+    `set_verification` verdict — and the no-tester / review-accept
+    completions alike); the branch `drcode/<task-id>` with its
+    committed work always survives (RULE 2), and re-activating a
+    completed task (new input) recreates the worktree from the branch.
+    NEVER: the directory is never removed automatically — `remove()`
+    then only snapshots a dirty tree onto the branch (RULE 1); dead
+    tasks' leftover directories are still swept at startup
+    (`cleanup_orphans` ignores this setting), otherwise the mode would
+    grow the worktrees directory without bound.
+
+    The setting governs ONLY the worktree directory — never the branch:
+    a branch holding unmerged commits is never deleted automatically
+    (see the `drcode.task_env` module docstring).
+    """
+
+    ON_DELETE = "on_delete"
+    ON_COMPLETION = "on_completion"
+    NEVER = "never"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is WorktreeRemoval.ON_DELETE:
+            return "on task deletion"
+        if self is WorktreeRemoval.ON_COMPLETION:
+            return "on task completion"
+        return "never"
+
+
+WORKTREE_REMOVAL_OPTIONS: tuple[WorktreeRemoval, ...] = (
+    WorktreeRemoval.ON_DELETE,
+    WorktreeRemoval.ON_COMPLETION,
+    WorktreeRemoval.NEVER,
+)
+
+
 class StallNudge(str, enum.Enum):
     """How long an agent/tester run may stay without any sign of life
     (no stream deltas, no tool events) before it is automatically aborted
@@ -259,6 +304,11 @@ class ProjectSettings(BaseModel):
     # single: testing never occupies a development slot and never runs
     # concurrently with another tester round.
     parallel_tasks: int = 1
+    # When the per-task worktree directory (.drcode/worktrees/<id>) is
+    # removed automatically (WorktreeRemoval docstring). Only the
+    # directory is governed: the branch `drcode/<id>` lives by RULE 2,
+    # whatever this says.
+    worktree_removal: WorktreeRemoval = WorktreeRemoval.ON_DELETE
     # How ESC stops a running agent/tester (EscAbort docstring): the safe
     # double-press default guards the "closed a dialog with ESC, pressed
     # ESC once more by inertia" accident; "instant" restores the

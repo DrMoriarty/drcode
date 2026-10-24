@@ -47,6 +47,7 @@ from ..settings import (
     StallNudge,
     TaskFinalization,
     TaskIsolation,
+    WorktreeRemoval,
 )
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
@@ -340,6 +341,10 @@ class DrCodeState(App[None]):
     def action_set_task_finalization(self, finalization: TaskFinalization) -> None: ...
 
     def action_change_task_finalization(self) -> None: ...
+
+    def action_set_worktree_removal(self, removal: WorktreeRemoval) -> None: ...
+
+    def action_change_worktree_removal(self) -> None: ...
 
     def action_set_max_dev_rounds(self, rounds: int) -> None: ...
 

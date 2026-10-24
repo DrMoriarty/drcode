@@ -8,10 +8,12 @@ from pathlib import Path
 from drcode.settings import (
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    WORKTREE_REMOVAL_OPTIONS,
     CompletedRetention,
     ProjectSettings,
     ProjectSettingsStore,
     StallNudge,
+    WorktreeRemoval,
 )
 
 # -- CompletedRetention -------------------------------------------------------
@@ -80,6 +82,43 @@ def test_stall_nudge_options_order() -> None:
         StallNudge.HOUR_2,
         StallNudge.NEVER,
     )
+
+
+# -- WorktreeRemoval ------------------------------------------------------------
+
+
+def test_worktree_removal_default() -> None:
+    # The historical behaviour: the worktree lives as long as the task.
+    assert ProjectSettings().worktree_removal is WorktreeRemoval.ON_DELETE
+
+
+def test_worktree_removal_labels() -> None:
+    assert WorktreeRemoval.ON_DELETE.label == "on task deletion"
+    assert WorktreeRemoval.ON_COMPLETION.label == "on task completion"
+    assert WorktreeRemoval.NEVER.label == "never"
+
+
+def test_worktree_removal_values_stable() -> None:
+    # Persisted in settings.json — must not change silently.
+    assert WorktreeRemoval.ON_DELETE.value == "on_delete"
+    assert WorktreeRemoval.ON_COMPLETION.value == "on_completion"
+    assert WorktreeRemoval.NEVER.value == "never"
+
+
+def test_worktree_removal_options_order() -> None:
+    assert WORKTREE_REMOVAL_OPTIONS == (
+        WorktreeRemoval.ON_DELETE,
+        WorktreeRemoval.ON_COMPLETION,
+        WorktreeRemoval.NEVER,
+    )
+
+
+def test_store_worktree_removal_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(worktree_removal=WorktreeRemoval.ON_COMPLETION))
+    assert store.load().worktree_removal is WorktreeRemoval.ON_COMPLETION
+    store.save(ProjectSettings(worktree_removal=WorktreeRemoval.NEVER))
+    assert store.load().worktree_removal is WorktreeRemoval.NEVER
 
 
 # -- ProjectSettings ------------------------------------------------------------

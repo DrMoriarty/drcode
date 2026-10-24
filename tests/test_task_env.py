@@ -17,12 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from drcode.models import TaskStatus
+from drcode.models import TaskKind, TaskStatus
 from drcode.settings import (
     ISOLATION_OPTIONS,
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
+    WorktreeRemoval,
 )
 from drcode.task_env import TaskEnvironment
 from drcode.task_manager import TaskManager
@@ -765,3 +766,142 @@ def test_drcode_branch_state_repeated_calls_reuse_cache(
         {"drcode/work"},
     )
     assert calls == [("show-ref", "--head")]
+
+# -- worktree_removal: on_completion / never ---------------------------------------
+
+
+def _removal_env(git_root: Path, removal: WorktreeRemoval) -> TaskEnvironment:
+    return TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_removal=removal,
+        ),
+    )
+
+
+def test_completion_removal_research_tears_worktree_down(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """worktree_removal: on_completion — a research task is completed
+    right in mark_done, and its worktree directory goes with it. The
+    branch of a commit-less task is deleted (nothing unmerged)."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    manager.add_completion_listener(env.on_completed)
+    manager.add_removal_listener(env.remove)
+    task = manager.create("research", "x", kind=TaskKind.RESEARCH)
+    env.ensure_root(task.id)
+    assert env.worktree_path(task.id).is_dir()
+    manager.mark_done(task.id)
+    assert task.status is TaskStatus.COMPLETED
+    assert not env.worktree_path(task.id).exists()
+    assert not branch_exists(git_root, f"drcode/{task.id}")
+
+
+def test_completion_removal_dev_tears_worktree_down_on_verdict(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """worktree_removal: on_completion — a dev task's directory goes at
+    the tester's verdict. RULE 1: the dirty tree is snapshotted first;
+    RULE 2: the branch with the work survives."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    manager.add_completion_listener(env.on_completed)
+    manager.add_removal_listener(env.remove)
+    task = manager.create("dev", "x")
+    root, _ = env.ensure_root(task.id)
+    (root / "feature.txt").write_text("the work")
+    manager.mark_done(task.id)  # → TESTING, no removal yet
+    assert env.worktree_path(task.id).is_dir()
+    manager.set_verification(task.id, True)
+    assert task.status is TaskStatus.COMPLETED
+    assert not env.worktree_path(task.id).exists()
+    assert branch_exists(git_root, f"drcode/{task.id}")
+    assert unmerged_count(git_root, f"drcode/{task.id}") >= 1
+    assert last_commit_subject(git_root, f"drcode/{task.id}") == (
+        f"drcode: snapshot of {task.id} (before removal)"
+    )
+
+
+def test_completion_removal_then_requeue_recreates_worktree(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """Sending input to a COMPLETED task re-queues it — ensure_root
+    recreates the removed worktree from the surviving branch, so the
+    earlier committed work is back on disk."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    manager.add_completion_listener(env.on_completed)
+    task = manager.create("research", "x", kind=TaskKind.RESEARCH)
+    root, _ = env.ensure_root(task.id)
+    (root / "docs.md").write_text("the research result")
+    manager.mark_done(task.id)
+    assert not env.worktree_path(task.id).exists()
+    # Re-queue: the user sent new input to the completed task.
+    root2, _ = env.ensure_root(task.id)
+    assert env.worktree_path(task.id).is_dir()
+    assert (root2 / "docs.md").read_text() == "the research result"
+
+
+def test_completion_removal_off_by_default(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """The default (on_delete): a completion never touches the worktree —
+    the historical lifecycle is untouched."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_DELETE)
+    manager.add_completion_listener(env.on_completed)
+    task = manager.create("research", "x", kind=TaskKind.RESEARCH)
+    env.ensure_root(task.id)
+    manager.mark_done(task.id)
+    assert env.worktree_path(task.id).is_dir()
+    assert branch_exists(git_root, f"drcode/{task.id}")
+
+
+def test_removal_never_keeps_worktree_directory(git_root: Path) -> None:
+    """worktree_removal: never — remove() only anchors the dirty tree on
+    the branch (RULE 1) and keeps the directory AND the branch."""
+    notices: list[tuple[str, str]] = []
+    env = _removal_env(git_root, WorktreeRemoval.NEVER)
+    env.event_log = lambda task_id, text: notices.append((task_id, text))
+    env.ensure_root("t1")
+    (env.worktree_path("t1") / "keep.txt").write_text("still wanted")
+    env.remove("t1")
+    assert env.worktree_path("t1").is_dir()
+    assert branch_exists(git_root, "drcode/t1")
+    assert last_commit_subject(git_root, "drcode/t1") == (
+        "drcode: snapshot of t1 (before removal)"
+    )
+
+
+def test_removal_never_cancel_keeps_worktree(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """worktree_removal: never — even a cancel (Ctrl+X) leaves the
+    directory in place; the dirty work is still committed to the branch."""
+    env = _removal_env(git_root, WorktreeRemoval.NEVER)
+    manager.add_removal_listener(env.remove)
+    task = manager.create("t", "x")
+    root, _ = env.ensure_root(task.id)
+    (root / "wip.txt").write_text("cancelled, but kept")
+    manager.cancel(task.id)
+    assert env.worktree_path(task.id).is_dir()
+    assert unmerged_count(git_root, f"drcode/{task.id}") >= 1
+
+
+def test_cleanup_orphans_ignores_removal_never(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """The startup sweep ignores worktree_removal: a dead task's
+    directory is garbage from a deleted task, not state to preserve —
+    otherwise `never` would grow .drcode/worktrees/ without bound. Live
+    tasks (including their dirty trees) are never touched."""
+    env = _removal_env(git_root, WorktreeRemoval.NEVER)
+    live = manager.create("live", "x")
+    dead = manager.create("dead", "x")
+    env.ensure_root(live.id)
+    env.ensure_root(dead.id)
+    manager.tasks.pop(dead.id)
+    manager.storage.delete(dead.id)
+    removed = env.cleanup_orphans(set(manager.tasks))
+    assert dead.id in removed
+    assert not env.worktree_path(dead.id).exists()
+    assert env.worktree_path(live.id).is_dir()
+

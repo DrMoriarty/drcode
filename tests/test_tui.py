@@ -1772,9 +1772,9 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
 
 
 async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
-    """The main Settings menu collapses the six task-management entries
+    """The main Settings menu collapses the seven task-management entries
     into one "Task settings…" item, which opens the sub-menu with exactly
-    those six preference entries."""
+    those seven preference entries."""
     from drcode.tui.command_providers import (
         ProjectSettingsCommandsProvider,
         TaskSettingsCommandProvider,
@@ -1787,6 +1787,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     for prefix in (
         "Auto-delete completed tasks:",
         "Task finalization:",
+        "Worktree removal:",
         "Max development rounds:",
         "Nudge stalled agent after:",
         "Task isolation:",
@@ -1819,6 +1820,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         assert names == [
             f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
             f"Task finalization: {app.settings.task_finalization.label}",
+            f"Worktree removal: {app.settings.worktree_removal.label}",
             f"Max development rounds: {app.settings.max_dev_rounds}",
             f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
             f"Task isolation: {app._task_isolation_label()}",
@@ -1834,9 +1836,41 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
         ]
-        # Sub-menu providers: the six task entries, nothing else.
+        # Sub-menu providers: the seven task entries, nothing else.
         entries = TaskSettingsEntriesProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [name for name, _help, _cb in entries] == names
+
+
+async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
+    """The "Worktree removal" setting: the option palette lists the three
+    modes with the current one marked, and picking one persists it into
+    the project settings."""
+    from drcode.settings import ProjectSettingsStore, WorktreeRemoval
+    from drcode.tui.command_providers import WorktreeRemovalOptionsProvider
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        commands = WorktreeRemovalOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _cb in commands] == [
+            "on task deletion (current)",
+            "on task completion",
+            "never",
+        ]
+        commands[1][1]()  # pick "on task completion"
+        await pilot.pause()
+        assert app.settings.worktree_removal is WorktreeRemoval.ON_COMPLETION
+        assert (
+            ProjectSettingsStore(app.project_root).load().worktree_removal
+            is WorktreeRemoval.ON_COMPLETION
+        )
+        app.action_set_worktree_removal(WorktreeRemoval.NEVER)
+        await pilot.pause()
+        assert app.settings.worktree_removal is WorktreeRemoval.NEVER
+        assert (
+            ProjectSettingsStore(app.project_root).load().worktree_removal
+            is WorktreeRemoval.NEVER
+        )
 
 
 async def test_custom_role_model_dialog_prefills_and_saves(

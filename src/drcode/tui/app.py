@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from rich.markup import escape
 from textual import events
@@ -589,6 +589,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         """Drop the cached per-role resolutions (after any change to the
         flat config, the project model slots or the user catalog)."""
         self._resolved_configs.clear()
+
+    def push_screen(self, *args: Any, **kwargs: Any) -> Any:
+        """A modal screen is a context change: any in-flight dictation
+        belongs to the screen it was started on and must not outlive it
+        (its insert-time validation would drop the text anyway — this
+        just releases the microphone immediately)."""
+        self.voice_input.cancel(silent=True)
+        return super().push_screen(*args, **kwargs)
 
     # -- layout -------------------------------------------------------------
 

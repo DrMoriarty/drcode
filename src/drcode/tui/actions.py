@@ -191,6 +191,10 @@ class ActionsLayer(DrCodeState):
 
     def action_new_task(self) -> None:
         # Every entry into the new-task screen starts from a clean editor.
+        if not self._new_task_mode:
+            # Entering the form is a context change: a dictation started
+            # in the chat input must not outlive it.
+            self.voice_input.cancel(silent=True)
         self._editing_task_id = None
         self.new_task_input.clear()
         self._clear_deps_field()
@@ -247,6 +251,9 @@ class ActionsLayer(DrCodeState):
         task = self.viewed
         if task is None or task.status is not TaskStatus.HOLD:
             return
+        # Opening the editor is a context change: drop any dictation
+        # started in the chat input (the editor reuses the new-task form).
+        self.voice_input.cancel(silent=True)
         self._editing_task_id = task.id
         self.new_task_input.load_text(self.manager.editable_condition(task.id))
         self._load_deps_field(task.depends_on)
@@ -266,6 +273,9 @@ class ActionsLayer(DrCodeState):
         self.new_task_input.focus()
 
     def _leave_new_task_mode(self) -> None:
+        # Leaving the form (cancel, submit, sidebar click) is a context
+        # change: a dictation started in the form's editors is discarded.
+        self.voice_input.cancel(silent=True)
         self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
         self.chat_log.remove_class("hidden")

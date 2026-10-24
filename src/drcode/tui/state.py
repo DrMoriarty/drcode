@@ -58,6 +58,7 @@ from .setup_dialog import ModelSetup
 from .sidebar import Sidebar
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
+from .voice_input import VoiceInputController
 
 # A live-tail ledger entry (see chat_view._write_chat's `note`): (role,
 # text, block). `block` is set only for streamed ReasoningBlock/
@@ -547,6 +548,9 @@ class DrCodeState(App[None]):
     _new_task_mode: bool
     _new_task_prev_id: str | None
     _editing_task_id: str | None
+
+    # -- push-to-talk dictation (Ctrl+B; created in DrCodeApp.__init__) ------
+    voice_input: VoiceInputController
 
     # -- sidebar / activity -------------------------------------------------
     _sidebar_snapshot: tuple

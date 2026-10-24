@@ -26,6 +26,7 @@ import enum
 import sys
 from typing import TYPE_CHECKING
 
+from textual.dom import DOMNode
 from textual.widgets import TextArea
 
 from .. import voice
@@ -58,6 +59,11 @@ class VoiceInputController:
         self._recorder: MicrophoneRecorder | None = None
         # The field whose cursor receives the recognized text.
         self._target: TextArea | None = None
+        # Context snapshot taken together with the target (see
+        # _snapshot_context): the recognized text is only ever inserted
+        # while the app is still in the same context the dictation was
+        # started in (same screen, same viewed task / same new-task form).
+        self._context: tuple[str, object] | None = None
 
     @property
     def active(self) -> bool:
@@ -89,20 +95,28 @@ class VoiceInputController:
             return
         self._start(target)
 
-    def cancel(self) -> bool:
+    def cancel(self, *, silent: bool = False) -> bool:
         """ESC while a recording runs: drop it. True when something was
         cancelled (the caller then swallows the ESC).
 
+        ``silent=True`` is for the automatic navigation hooks (task
+        switch, new-task form leave, modal push): the discard is part of
+        the navigation the user just performed, no extra toast.
+
         The stream close is offloaded to a worker thread — the UI thread
-        never touches PortAudio."""
+        never touches PortAudio. A TRANSCRIBING phase cannot be cancelled
+        this way (no stream left); the insert-time context validation
+        drops its text instead."""
         if self._state is not _State.RECORDING:
             return False
         recorder, self._recorder = self._recorder, None
         self._state = _State.IDLE
         self._target = None
+        self._context = None
         if recorder is not None:
             _thread_start(_discard_recorder, recorder)
-        self._notify("Запись отменена")
+        if not silent:
+            self._notify("Запись отменена")
         return True
 
     # -- phases ------------------------------------------------------------------
@@ -135,8 +149,48 @@ class VoiceInputController:
         recorder = MicrophoneRecorder()
         self._recorder = recorder
         self._target = target
+        self._context = self._snapshot_context(target)
         self._state = _State.RECORDING
         _thread_start(self._open_microphone, recorder)
+
+    def _snapshot_context(self, target: TextArea) -> tuple[str, object]:
+        """Freeze the UI context the dictation belongs to: which screen,
+        and for the shared inputs which logical view (the ChatInput is one
+        widget reused by every task view; the new-task editor serves both
+        creation and held-task editing)."""
+        from .inputs import ChatInput, DepsInput, NewTaskInput
+
+        if isinstance(target, ChatInput):
+            return ("chat", self._app.viewed_id)
+        if isinstance(target, (NewTaskInput, DepsInput)):
+            return ("new-task", self._app._editing_task_id)
+        return ("other", None)
+
+    def _context_valid(self, target: TextArea) -> bool:
+        """Re-validate at insert time (runs on the UI thread): the target
+        is still mounted, visible (no ``hidden`` class on it or an
+        ancestor), shown by the app's active screen, and the context
+        snapshot still matches the current state."""
+        if not target.is_mounted:
+            return False
+        try:
+            if target.screen is not self._app.screen:
+                return False
+        except Exception:  # noqa: BLE001 - not mounted / no screen stack
+            return False
+        node: DOMNode | None = target
+        while node is not None:
+            if node.has_class("hidden"):
+                return False
+            node = node.parent
+        if self._context is None:
+            return True
+        kind, token = self._context
+        if kind == "chat":
+            return self._app.viewed_id == token
+        if kind == "new-task":
+            return self._app._new_task_mode and self._app._editing_task_id == token
+        return True
 
     def _open_microphone(self, recorder: MicrophoneRecorder) -> None:
         """Worker thread: open the PortAudio stream (a slow syscall — the
@@ -157,11 +211,15 @@ class VoiceInputController:
 
     def _transcribe(self) -> None:
         """Stop the recorder, upload the WAV, insert the text at the
-        cursor — all in a worker thread; only the insertion is UI work."""
+        cursor — all in a worker thread; only the insertion is UI work.
+
+        The target and the context snapshot stay on the controller until
+        the insert: ``_insert`` re-validates them against the CURRENT app
+        state (they are not stale-cleared here), so a context change
+        while ASR runs drops the text instead of inserting it."""
         recorder = self._recorder
         target = self._target
         self._recorder = None
-        self._target = None
         _thread_start(self._recognize, recorder, target)
 
     def _recognize(self, recorder: MicrophoneRecorder, target: TextArea | None) -> None:
@@ -186,9 +244,22 @@ class VoiceInputController:
 
     def _insert(self, target: TextArea | None, text: str) -> None:
         """Insert the recognized text at the cursor of the field that
-        started the recording (never sends it)."""
+        started the recording (never sends it).
+
+        The dictation belongs to the context it was started in: if the
+        user navigated away while ASR was in flight (another task, the
+        new-task form, a modal dialog, a hidden target), the text is
+        dropped with a toast instead of landing in a stale field."""
         self._state = _State.IDLE
         if target is None:
+            self._target = None
+            self._context = None
+            return
+        valid = self._context_valid(target)
+        self._target = None
+        self._context = None
+        if not valid:
+            self._notify("Dictation discarded — context changed")
             return
         prefix = ""
         try:
@@ -208,6 +279,7 @@ class VoiceInputController:
         thread)."""
         self._recorder = None
         self._target = None
+        self._context = None
         self._state = _State.IDLE
         try:
             self._app.call_from_thread(self._notify, message, error=True)

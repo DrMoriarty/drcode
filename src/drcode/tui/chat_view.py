@@ -881,6 +881,11 @@ class ChatViewLayer(DrCodeState):
         # sidebar item is an explicit "leave the form" from the user.
         if self._new_task_mode:
             self._leave_new_task_mode()
+        elif task_id != self.viewed_id:
+            # A task switch is a context change: the shared ChatInput is
+            # about to show another task's view, so an in-flight dictation
+            # must not land there. Re-viewing the SAME task keeps it.
+            self.voice_input.cancel(silent=True)
         # Same task already on screen and the mounted blocks still mirror a
         # rendered timeline prefix: append only the missing tail instead of
         # the wipe-and-remount (mounting cost grows with the number of

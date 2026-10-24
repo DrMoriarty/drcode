@@ -475,6 +475,36 @@ def _close_stream(stream: _AudioStream | None) -> None:
         print(f"drcode voice: stream close failed: {e}", file=sys.stderr)
 
 
+# Click-suppression constants for play_wav: short linear ramps at the
+# audible edges of the phrase plus a tail of appended silence.
+_PLAYBACK_FADE_IN_S = 0.008
+_PLAYBACK_FADE_OUT_S = 0.030
+_PLAYBACK_TAIL_S = 0.120
+
+
+def _fade_edges(pcm: array[int], rate: int, channels: int) -> None:
+    """Linear fade-in/out on an interleaved int16 PCM ``array`` (in place).
+
+    Gain is computed per frame and applied to every channel of the frame,
+    so an interleaved stereo phrase keeps its image. Both ramps start and
+    end at zero gain: the phrase no longer jumps out of silence at the
+    start nor into the zero padding of the final block at the end — either
+    jump within one sample is an audible click."""
+    ch = max(channels, 1)
+    total_frames = len(pcm) // ch
+    fade_in = min(total_frames, int(rate * _PLAYBACK_FADE_IN_S))
+    fade_out = min(total_frames, int(rate * _PLAYBACK_FADE_OUT_S))
+    for i in range(fade_in):
+        gain = i / fade_in
+        for c in range(ch):
+            pcm[i * ch + c] = int(pcm[i * ch + c] * gain)
+    for i in range(fade_out):
+        gain = (fade_out - 1 - i) / fade_out
+        base = (total_frames - fade_out + i) * ch
+        for c in range(ch):
+            pcm[base + c] = int(pcm[base + c] * gain)
+
+
 def play_wav(data: bytes) -> None:
     """Decode PCM WAV bytes and play them synchronously (blocks until the
     sound finishes). Worker threads only."""
@@ -509,9 +539,19 @@ def play_wav(data: bytes) -> None:
         raise VoiceError(f"TTS answer has a truncated PCM frame: {e}") from e
     if not pcm:
         return
+
+    # Click suppression, applied to the decoded PCM before playback:
+    # TTS answers rarely end at (or start from) zero amplitude, so first
+    # fade the audible edges in-place ...
+    _fade_edges(pcm, rate, channels)
+    # ... then append tail silence AFTER the fade-out — any stop()/close
+    # transient now happens once the audible content has already decayed
+    # (many TTS backends also ship an unzeroed tail; the fade covers it).
+    pcm.frombytes(bytes(2 * channels * int(rate * _PLAYBACK_TAIL_S)))
+
     raw = pcm.tobytes()
     total = len(raw)
-    state = {"pos": 0, "underflowed": False}
+    state = {"pos": 0, "underflowed": False, "filled": False}
     done = threading.Event()
 
     # Callback mode, not the blocking RawOutputStream.write() pair: with
@@ -537,7 +577,16 @@ def play_wav(data: bytes) -> None:
                 view[block:] = bytes(len(view) - block)
             state["pos"] = end
             if end >= total:
-                done.set()
+                # Race guard: `done` must NOT be raised by the callback that
+                # fills the last block — the main thread would call
+                # stream.stop() while this callback is still running, and on
+                # ALSA / partially CoreAudio that truncates the final block
+                # (the phrase tail ends in a click). Raise it one callback
+                # LATER, when the last block is already in the device.
+                if state["filled"]:
+                    done.set()
+                else:
+                    state["filled"] = True
         except Exception as e:  # noqa: BLE001 - a dead callback would hang play_wav
             print(f"drcode voice: playback callback failed: {e}", file=sys.stderr)
             done.set()
@@ -554,7 +603,13 @@ def play_wav(data: bytes) -> None:
         )
         try:
             stream.start()
-            done.wait()
+            # `done` fires one callback after the last block (see the race
+            # guard above), so the wait normally ends ~one block late —
+            # before stop() touches anything. The timeout is only a hang
+            # guard for a device that stops calling the callback.
+            duration = len(pcm) / max(channels, 1) / rate
+            if not done.wait(timeout=duration + 30.0):
+                print("drcode voice: playback timed out", file=sys.stderr)
         finally:
             stream.stop()  # drains the pending audio, like sd.wait()
             stream.close()

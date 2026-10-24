@@ -397,6 +397,127 @@ def test_play_wav_rejects_non_16bit_pcm() -> None:
         play_wav(buffer.getvalue())
 
 
+class _FakeOutStream:
+    """Just enough of sounddevice.RawOutputStream for play_wav: start()
+    pretends to be the audio device, pulling blocks from the callback in a
+    loop (recording every delivered block) until stop() ends the pull."""
+
+    BLOCK_FRAMES = 256
+
+    def __init__(self, callback: Any) -> None:
+        self._callback = callback
+        self._stop_evt = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.delivered = bytearray()  # every block the "device" received
+        self.frames_at_stop = -1
+
+    def start(self) -> None:
+        def run() -> None:
+            block = bytearray(self.BLOCK_FRAMES * 2)  # mono int16
+            while not self._stop_evt.is_set():
+                self._callback(block, self.BLOCK_FRAMES, None, None)
+                self.delivered.extend(block)
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        # Snapshot how much audio reached the "device" before the main
+        # thread got around to stopping the stream.
+        self.frames_at_stop = len(self.delivered) // 2
+        self._stop_evt.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+
+    def close(self) -> None: ...
+
+
+def _play_wav_with_fake_device(
+    samples: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    rate: int = 24_000,
+) -> _FakeOutStream:
+    """Run play_wav against a faked sounddevice module and return the fake
+    stream with everything it delivered."""
+    import sys
+    from array import array
+
+    import drcode.voice as voice_mod
+
+    created: list[_FakeOutStream] = []
+
+    class _FakeSdModule:
+        @staticmethod
+        def RawOutputStream(**kwargs: Any) -> _FakeOutStream:
+            stream = _FakeOutStream(kwargs["callback"])
+            created.append(stream)
+            return stream
+
+    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSdModule())
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(array("h", samples).tobytes())
+    play_wav(buffer.getvalue())
+    assert created, "play_wav never opened a stream"
+    return created[0]
+
+
+def test_play_wav_fades_edges_and_appends_tail_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from array import array
+
+    from drcode.voice import _PLAYBACK_FADE_IN_S, _PLAYBACK_FADE_OUT_S, _PLAYBACK_TAIL_S
+
+    rate = 24_000
+    n = 2_000  # 83 ms of a loud constant — the click-prone shape
+    stream = _play_wav_with_fake_device([16_000] * n, monkeypatch, rate=rate)
+
+    played = array("h", bytes(stream.delivered))
+    # The audible phrase + appended tail silence, then block zero-padding.
+    tail_frames = int(rate * _PLAYBACK_TAIL_S)
+    assert len(played) >= n + tail_frames
+    # Fade-in: the phrase starts from silence, no sample jumps to full gain.
+    fade_in_frames = int(rate * _PLAYBACK_FADE_IN_S)
+    fade_out_frames = int(rate * _PLAYBACK_FADE_OUT_S)
+    assert played[0] == 0
+    assert 0 < played[1] < 16_000
+    assert all(0 < played[i] < 16_000 for i in range(1, fade_in_frames))
+    assert played[fade_in_frames] == 16_000
+    # The middle keeps full amplitude, then the fade-out decays it to
+    # exactly zero — no signal→0 jump within one sample.
+    assert all(played[i] == 16_000 for i in range(fade_in_frames, n - fade_out_frames))
+    assert all(0 < played[i] < 16_000 for i in range(n - fade_out_frames, n - 1))
+    assert played[n - 1] == 0
+    # Tail silence AFTER the fade-out (any stop() transient lands here).
+    assert all(s == 0 for s in played[n : n + tail_frames])
+
+
+def test_play_wav_done_fires_only_after_last_block_reaches_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from array import array
+
+    from drcode.voice import _PLAYBACK_TAIL_S
+
+    rate = 24_000
+    n = 1_000
+    tail_frames = int(rate * _PLAYBACK_TAIL_S)
+    stream = _play_wav_with_fake_device([-12_345] * n, monkeypatch, rate=rate)
+
+    # play_wav returned => done fired. It must have fired on the callback
+    # AFTER the one that filled the last block, so by the time stop() ran
+    # the whole phrase (including the appended tail) was already delivered.
+    assert stream.frames_at_stop >= n + tail_frames
+    played = array("h", bytes(stream.delivered))
+    assert played[n - 1] == 0  # last audible sample is the faded zero
+
+
 # -- Notifier voice hooks ------------------------------------------------------------
 
 

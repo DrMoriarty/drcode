@@ -401,8 +401,10 @@ async def test_model_not_configured_keeps_prompt_pending(project_root: Path) -> 
 
 
 def _seed_transcript(app: DrCodeApp, prompt: str) -> Any:
-    """A persisted transcript whose last response reports a big context
-    fill (2k tokens) — past the compaction threshold of the small-ctx app."""
+    """A persisted transcript whose last response reports a context fill of
+    900 tokens — past the 80% compaction threshold of the small-ctx app but
+    below its 97% hard limit (tests that exercise the hard limit script
+    their own fills)."""
     from pydantic_ai.messages import (
         ModelRequest,
         ModelResponse,
@@ -414,7 +416,7 @@ def _seed_transcript(app: DrCodeApp, prompt: str) -> Any:
     task = app.manager.create("docs", "", kind=TaskKind.RESEARCH)
     response = ModelResponse(
         parts=[TextPart("partial work")],
-        usage=RequestUsage(input_tokens=2000, output_tokens=8),
+        usage=RequestUsage(input_tokens=900, output_tokens=8),
     )
     task.messages = serialize_messages(
         [ModelRequest(parts=[UserPromptPart(prompt)]), response]
@@ -444,7 +446,7 @@ async def test_compaction_failure_is_not_fatal(
     )
     # Uncompressed history: the run continues with what it has.
     assert not any(is_summary_message(m) for m in task.messages)
-    assert last_context_tokens(task.messages) == 2008  # 2000 input + 8 output
+    assert last_context_tokens(task.messages) == 908  # 900 input + 8 output
 
 
 async def test_compaction_success_replaces_history(
@@ -528,6 +530,36 @@ async def test_compaction_overflow_fallback_trims_mechanically(
     assert any("Context compacted mechanically" in t for t in texts)
     assert not any("compaction failed" in t for t in texts)
     assert "dropped mechanically" in (extract_previous_summary(task.messages) or "")
+
+
+async def test_hard_limit_noop_marks_exhausted(
+    net_app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """A transcript consisting only of the verbatim original prompt(s) and
+    the previous summary cannot be shrunk by either compaction path (the
+    mechanical floor keeps the prompts verbatim too): at the hard-limit
+    level the task lands in `_hard_limit_exhausted`, so the gate bypass
+    stops firing instead of looping pause→resume forever."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    task = _seed_transcript(net_app_small_ctx, "only prompts")
+    task.messages = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart("only prompts")]),
+            ModelRequest(parts=[UserPromptPart("[context summary]\n\nprevious body")]),
+        ]
+    )
+    net_app_small_ctx.manager.storage.save(task)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        net_app_small_ctx._live_ctx_tokens[task.id] = 980  # past 97% of 1000
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert task.id in net_app_small_ctx._hard_limit_exhausted
+    assert not any("compaction failed" in t for t in event_texts(task))
+    assert scripted.calls == []  # nothing was attempted: a no-op either way
 
 
 async def test_tester_round_compaction_mechanical_floor(
@@ -705,6 +737,69 @@ async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
     assert not task.unfinished
 
 
+async def test_mid_run_hard_limit_escalates_to_mechanical(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """With a permanently broken summarizer the threshold-level gate goes
+    quiet after one failure — but growth past the HARD limit (97% of the
+    window) must never be allowed: the gate fires anyway and the failed
+    compaction escalates to the mechanical trim instead of the run dying
+    with a deterministic context-overflow 400."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
+    scripted_fills([100, 900, 970])
+    scripted.steps = [
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        # 900 of 1000 — past the 80% threshold: the mid-run gate pauses…
+        tool_response("read_file", {"path": "README.md"}, "c2"),
+        api_error("Connection error."),  # …but the summarizer dies
+        # The continuation runs on; 970 of 1000 is past the hard limit —
+        # the gate must fire despite `_compaction_failed`.
+        tool_response("read_file", {"path": "README.md"}, "c3"),
+        api_error("Connection error."),  # the escalated attempt dies too…
+        # …and the mechanical floor takes over; the run finishes.
+        text_response("carried on"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed after hard-limit mechanical escalation",
+        )
+
+    texts = event_texts(task)
+    # The gate fired twice: once at the threshold, once at the hard limit.
+    assert len([t for t in texts if "pausing the run to compact history" in t]) == 2
+    # Exactly one plain threshold-level failure; the hard-level one is
+    # reported as an escalation to the mechanical floor.
+    assert len([t for t in texts if t.startswith("compaction failed: ")]) == 1
+    assert any("with the fill at the hard limit" in t for t in texts)
+    assert any("Context compacted mechanically" in t for t in texts)
+    # The transcript carries the mechanical note: it was trimmed, not left
+    # to grow uncompressed into a deterministic 400.
+    assert any(is_summary_message(m) for m in task.messages)
+    assert any(
+        "dropped mechanically" in p["content"]
+        for m in task.messages
+        if is_summary_message(m)
+        for p in m["parts"]
+        if isinstance(p, dict) and "content" in p
+    )
+    # Six round-trips: three development requests, two dead summarizer
+    # attempts, the final continuation.
+    assert len(scripted.calls) == 6
+    assert not task.unfinished
+
+
 async def test_no_mid_run_pause_below_threshold(
     net_app_small_ctx: DrCodeApp,
     scripted: ScriptedState,
@@ -849,6 +944,60 @@ async def test_tester_round_compaction_failure_is_not_fatal(
     assert not any(is_summary_message(m) for m in task.messages)
     assert not any(is_summary_message(m) for rnd in task.tester_messages for m in rnd)
     assert len(scripted.calls) == 5
+
+
+async def test_tester_round_hard_limit_escalates_to_mechanical(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """Same escalation for the testing round: with a broken summarizer the
+    mid-round gate stays off at the threshold level, but a round that grows
+    past the hard limit is paused anyway and trimmed mechanically — the
+    verification still lands instead of the round dying with a 400."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted_fills([100, 900, 970])
+    scripted.steps = [
+        text_response("work done"),
+        # 900 of 1000 — past the threshold: the round pauses, the
+        # summarizer dies, the round resumes uncompressed.
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        api_error("Connection error."),
+        # 970 of 1000 — past the hard limit: the gate fires despite the
+        # failed summarizer, the escalated attempt dies too, the mechanical
+        # floor trims the round.
+        tool_response("read_file", {"path": "README.md"}, "c2"),
+        api_error("Connection error."),
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.tester_running
+            ),
+            pilot,
+            what="tester round completed after hard-limit mechanical escalation",
+        )
+
+    texts = event_texts(task)
+    assert len([t for t in texts if "pausing the tester round" in t]) == 2
+    assert len([t for t in texts if t.startswith("compaction failed: ")]) == 1
+    assert any("with the fill at the hard limit" in t for t in texts)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert task.verification is VerificationStatus.PASSED
+    # The round transcript carries the mechanical note (it was trimmed,
+    # never left to grow past the limit); the agent transcript is untouched.
+    final_round = task.tester_messages[-1]
+    assert any(is_summary_message(m) for m in final_round)
+    assert not any(is_summary_message(m) for m in task.messages)
+    assert len(scripted.calls) == 7
 
 
 async def test_tester_round_compaction_never_touches_agent_transcript(

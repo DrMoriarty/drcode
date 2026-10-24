@@ -33,10 +33,19 @@ BASH_TIMEOUT = 120
 # Hard cap for a run_bash call: the agent may request a longer timeout than
 # the default, but never more than an hour — values above are clamped to it.
 BASH_MAX_TIMEOUT = 60 * 60
-# Hard cap on a single read_file result: a read larger than this (200 KiB) is
-# refused outright. The model must read the file in smaller pieces via
-# `offset`/`limit` instead — a single chunk must stay under the cap.
-MAX_READ_CHUNK_BYTES = 200 * 1024
+# Per-result cap for a read_file result: a read chunk larger than this is not
+# refused but returned truncated (head + tail) with a note. The cap keeps one
+# tool result well inside a single turn's growth budget relative to the
+# compaction threshold — ~25k chars ≈ ~6k tokens, so one or two big reads can
+# no longer push the context from below the threshold past 100% before the
+# turn-boundary compaction gate fires. The model always gets a usable slice
+# plus instructions on how to read the rest via `offset`/`limit`.
+MAX_READ_RESULT_BYTES = 25_000
+# Shares of the truncation budget given to the head and the tail slices.
+_READ_HEAD_SHARE = 0.75
+# Bytes reserved for the truncation note, so the WHOLE result (slices + note)
+# stays within MAX_READ_RESULT_BYTES.
+_READ_NOTE_RESERVE = 256
 # Defaults for the context-budget check (overridden per run by the caller):
 # a fresh agent starts with empty context, and the default compaction threshold
 # matches Config.compaction_threshold (80).
@@ -200,6 +209,66 @@ def _token_estimate(text_bytes: int) -> int:
     return max(1, text_bytes // 4)
 
 
+def _truncate_read(numbered: list[str]) -> str:
+    """Cut an oversized read chunk to a head+tail slice within
+    MAX_READ_RESULT_BYTES, keeping the original line numbers intact.
+
+    The head gets `_READ_HEAD_SHARE` of the budget (the file's start is what
+    the model usually navigates from), the tail the rest (the end often holds
+    the current state). The middle is replaced by a note carrying the omitted
+    span and the `offset`/`limit` guidance from the old refusal message."""
+    total_bytes = sum(len(line.encode("utf-8")) + 1 for line in numbered)
+    content_budget = MAX_READ_RESULT_BYTES - _READ_NOTE_RESERVE
+    head_budget = int(content_budget * _READ_HEAD_SHARE)
+    tail_budget = content_budget - head_budget
+
+    head: list[str] = []
+    taken = 0
+    cut = len(numbered)
+    for i, line in enumerate(numbered):
+        size = len(line.encode("utf-8")) + 1
+        if taken + size > head_budget:
+            cut = i
+            break
+        head.append(line)
+        taken += size
+
+    tail: list[str] = []
+    taken = 0
+    tail_start = len(numbered)
+    for i in range(len(numbered) - 1, cut - 1, -1):
+        size = len(numbered[i].encode("utf-8")) + 1
+        if taken + size > tail_budget:
+            tail_start = i + 1
+            break
+        tail.append(numbered[i])
+        taken += size
+    tail.reverse()
+
+    if not head and not tail:
+        # Pathological chunk (single line(s) bigger than the budgets): line
+        # slicing yields nothing, so fall back to a raw character head+tail —
+        # the model still gets a usable slice, just without line numbers.
+        enc = "\n".join(numbered).encode("utf-8")
+        head_text = enc[:head_budget].decode("utf-8", errors="ignore")
+        tail_text = enc[-tail_budget:].decode("utf-8", errors="ignore")
+        note = (
+            f"[output truncated: raw head+tail of {_fmt_bytes(len(enc))} — "
+            f"read the file in smaller pieces by adjusting `offset` and `limit`]"
+        )
+        return f"{head_text}\n{note}\n{tail_text}"
+
+    # total_bytes > MAX_READ_RESULT_BYTES >= head+tail, so something is always
+    # omitted — the note is never a lie.
+    omitted = tail_start - cut
+    note = (
+        f"\n[output truncated: {omitted} of {len(numbered)} lines omitted "
+        f"({_fmt_bytes(total_bytes)} total) — read the file in smaller pieces "
+        f"by adjusting `offset` and `limit`]"
+    )
+    return "\n".join(head + tail) + note
+
+
 def read_file(
     root: Path,
     path: str,
@@ -214,11 +283,12 @@ def read_file(
     against the project root). Lines are numbered, starting from `offset`
     (1-based), up to `limit` lines.
 
-    Refuses a read that risks blowing up the model context: a single result
-    larger than the hard cap (200 KiB) is refused outright (read the file in
-    smaller pieces via `offset`/`limit`), and a read that would push the
-    context fill past the compaction threshold is also refused — the token
-    estimate of the piece is checked against the current context usage and the
+    A read that risks blowing up the model context is truncated, never refused:
+    a single result larger than MAX_READ_RESULT_BYTES is cut to a head+tail
+    slice with an explicit note (read the file in smaller pieces via
+    `offset`/`limit`), and a read that would still push the context fill past
+    the compaction threshold is refused — the token estimate of the (possibly
+    truncated) piece is checked against the current context usage and the
     current compaction threshold (default 80% of the context window)."""
     p = resolve_read_path(root, path)
     lines = p.read_text(errors="replace").splitlines()
@@ -227,14 +297,12 @@ def read_file(
     numbered = [f"{start + i + 1}: {line}" for i, line in enumerate(chunk)]
     text = "\n".join(numbered)
     chunk_bytes = len(text.encode("utf-8"))
-    # Hard cap: a single read result larger than 200 KiB is refused outright;
-    # read the file in smaller pieces via `offset`/`limit`.
-    if chunk_bytes > MAX_READ_CHUNK_BYTES:
-        return (
-            f"Refusing to read '{path}': this read would return about "
-            f"{_fmt_bytes(chunk_bytes)} — more than the {_fmt_bytes(MAX_READ_CHUNK_BYTES)} "
-            f"read cap. Read the file in smaller pieces by adjusting `offset` and `limit`."
-        )
+    # Hard cap: a single read result larger than MAX_READ_RESULT_BYTES is
+    # truncated to a head+tail slice — the model keeps a usable piece of the
+    # file plus instructions on how to read the rest.
+    if chunk_bytes > MAX_READ_RESULT_BYTES:
+        text = _truncate_read(numbered)
+        chunk_bytes = len(text.encode("utf-8"))
     # Context-budget check: does this read risk exceeding the compaction
     # threshold? `current_usage` is the tokens the model already holds.
     threshold = min(max(compaction_threshold, 1), 100)

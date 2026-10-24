@@ -73,6 +73,19 @@ class WordNavTextArea(TextArea):
         # a wrap that pushes the cursor down).
         self.call_after_refresh(self.scroll_cursor_visible)
 
+    async def _on_mouse_up(self, event: events.MouseUp) -> None:
+        # Copy-on-select: terminals with mouse reporting leave selection to
+        # the widget, and Cmd-C never reaches the app (Terminal.app/iTerm2
+        # swallow it), so the mouse-up that finalizes a selection is the
+        # only reliable hook. super() ends the selection (the endpoints are
+        # already tracked on mouse-move), so selected_text is final here.
+        await super()._on_mouse_up(event)
+        text = self.selected_text
+        if text:
+            app = self._app()
+            app._copy_with_fallback(text)
+            app._show_copy_toast(text)
+
     def action_copy(self) -> None:
         """Copy the selection via the app's clipboard fallback.
 

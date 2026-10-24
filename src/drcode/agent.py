@@ -553,16 +553,28 @@ def build_agent(
         ) -> str:
             """Search the project's task archive (ALL statuses: queued, hold,
             active, testing, completed, clarification) by keywords. Case-
-            insensitive substring match over each task's title and user
-            prompts; several keywords are combined with AND. Optional filters:
-            `status` and `kind` (bug/feature/research). Output is one compact
-            line per task — id, status/kind, date, title, a short snippet
-            around the match — capped at 50 results (a longer hit list is
-            truncated with a "refine the query" tail). Use it to assess the
-            state of development around a topic or find past decisions/bug
-            reports without reading raw task JSONs; for a specific task's
-            details, read_file its file <project>/.drcode/tasks/<id>.json.
-            Your own task is excluded from the results."""
+            insensitive substring match over each task's title, user prompts,
+            pending input, edited file paths, the agent's final summary
+            response and its service events; a common trailing ending of a
+            keyword is also stripped heuristically ("смерженных" matches
+            "смерженный"), so prefer full natural wordforms. Several keywords
+            are combined with AND; when nothing matches the AND, an OR pass
+            runs and its results come back under an explicit "no exact AND
+            match" preamble. Results are ranked by keyword occurrences
+            (ties: newest first). Optional filters: `status` and `kind`
+            (bug/feature/research). Output is one compact line per task —
+            id, status/kind, verification label, an "unmerged" marker when
+            the task's drcode/<id> branch still holds unmerged commits (only
+            computed for short result lists), date, title and a short
+            snippet around the most informative match — capped at 50
+            results (a longer hit list is truncated with a "refine the
+            query" tail). Use it to assess the state of development around
+            a topic — including "was it done AND merged?" — or find past
+            decisions/bug reports without reading raw task JSONs; for a
+            specific task's details, read_file its file
+            <project>/.drcode/tasks/<id>.json. Your own task is excluded
+            from the results, but the output tells you when it matches too
+            — its transcript is often exactly what you are looking for."""
             # The archive lives in the MAIN checkout's .drcode/tasks/ — under
             # worktree isolation ctx.deps.root is the task's worktree, whose
             # .drcode/ has no task files. The manager's storage root always

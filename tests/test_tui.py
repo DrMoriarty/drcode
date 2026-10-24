@@ -2005,3 +2005,60 @@ async def test_copy_on_select_matches_visual_selection(
             "```"
         )
     ]
+
+
+async def test_copy_on_select_in_multi_line_inputs(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mouse-selecting text inside the multi-line inputs (NewTaskInput,
+    ChatInput) copies it on mouse-up: the terminal has no own selection
+    under mouse reporting and Cmd-C never reaches the app, so the widget
+    itself must copy. A plain click without a drag selects nothing and
+    must not copy or show the toast."""
+    copied: list[str] = []
+    monkeypatch.setattr(app, "_copy_with_fallback", copied.append)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.text = "hello selectable world"
+        await pilot.pause()
+        region = nt_input.content_region
+        toast = app.query_one("#copy-toast", Static)
+
+        # Plain click (down and up at the same spot): no selection —
+        # nothing copied, toast stays hidden.
+        await pilot.mouse_down(offset=(region.x, region.y))
+        await pilot.mouse_up(offset=(region.x, region.y))
+        await pilot.pause()
+        assert copied == []
+        assert toast.has_class("hidden")
+
+        # Drag-select "hello": mouse_up posts a final MouseMove, which
+        # extends the selection before the MouseUp finalizes it.
+        await pilot.mouse_down(offset=(region.x, region.y))
+        await pilot.mouse_up(offset=(region.x + 5, region.y))
+        await pilot.pause()
+        assert copied == ["hello"]
+        assert not toast.has_class("hidden")
+        assert "✓ copied: hello" in str(toast.render())
+
+        # Ctrl+C with a selection still works (binding → action_copy).
+        copied.clear()
+        nt_input.selection = Selection((0, 6), (0, 16))
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert copied == ["selectable"]
+
+        # Same behavior in the chat editor.
+        copied.clear()
+        await pilot.press("escape")  # cancel the new-task form
+        await pilot.pause()
+        chat_input = app.query_one("#chat-input", TextArea)
+        chat_input.text = "chat draft text"
+        await pilot.pause()
+        region = chat_input.content_region
+        await pilot.mouse_down(offset=(region.x, region.y))
+        await pilot.mouse_up(offset=(region.x + 4, region.y))
+        await pilot.pause()
+        assert copied == ["chat"]

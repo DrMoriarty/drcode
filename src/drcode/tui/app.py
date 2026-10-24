@@ -1084,13 +1084,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         audited (see _hook_merge_still_owns) and a failed hook-merge is
         back-stamped, re-admitting the task no matter which process
         finalized it. Conversely a stale flag whose branch has since been
-        merged by hand is cleared here. Blocking git calls — run in a
-        worker thread."""
+        merged by hand is cleared here. The whole audit reads one
+        batched mergedness snapshot (`unmerged_drcode_branches` — a
+        single `for-each-ref` glob, cached per fingerprint), so the cost
+        does not grow with the number of completed tasks. Blocking git
+        calls — run in a worker thread."""
         env = self.task_env
         if not env.active:
             return []
         workflow = self.workflow
-        candidates: list[str] = []
+        # Candidates come from task statuses alone — no git here.
+        candidates: list[Task] = []
         for task in list(self.manager.tasks.values()):
             if task.status is not TaskStatus.COMPLETED:
                 continue
@@ -1100,23 +1104,30 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     continue
                 if task.review_pending:
                     continue  # the external review has not accepted it yet
+            candidates.append(task)
+        if not candidates:
+            return []
+        # ONE wholesale mergedness answer for every candidate branch (a
+        # glob over refs/heads/drcode/, cached per the fingerprint
+        # snapshot shared with unmerged_ids): the existence/mergedness
+        # check below AND the hook-merge audit both read from it — zero
+        # git processes per task, so a project with hundreds of
+        # completed tasks polls in well under a second.
+        unmerged_branches = env.unmerged_drcode_branches()
+        result: list[str] = []
+        for task in candidates:
+            research = task.kind is TaskKind.RESEARCH
             hook = "on_research_accepted" if research else "on_accepted"
             if (
                 workflow is not None
                 and workflow.has(hook)
                 and not task.hook_merge_failed
-                and self._hook_merge_still_owns(task, hook)
+                and self._hook_merge_still_owns(task, hook, unmerged_branches)
             ):
                 continue  # the merge is the hook's job (and it worked)
-            candidates.append(task.id)
-        if not candidates:
-            return []
-        unmerged = env.unmerged_ids(candidates)
-        for task_id in candidates:
-            if task_id in unmerged:
-                continue
-            task = self.manager.get(task_id)
-            if task.hook_merge_failed:
+            if env.branch(task.id) in unmerged_branches:
+                result.append(task.id)
+            elif task.hook_merge_failed:
                 # A manual `git merge drcode/<id>` (or a successful hook
                 # re-run on another path) merged the branch since the
                 # failure — drop the stale flag instead of keeping it
@@ -1125,21 +1136,25 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 task.hook_merge_failed = False
                 task.touch()
                 self.manager.storage.save(task)
-        return [task_id for task_id in candidates if task_id in unmerged]
+        return result
 
-    def _hook_merge_still_owns(self, task: Task, hook: str) -> bool:
+    def _hook_merge_still_owns(
+        self, task: Task, hook: str, unmerged_branches: set[str]
+    ) -> bool:
         """Whether the kind's accept hook can still be trusted with a
         COMPLETED task's merge (`task.hook_merge_failed` unset): True
         keeps the task hidden from the unmerged-work tracking, False
         re-admits it. The optimistic answer stands while the hook may
         still be running (within HOOK_MERGE_AUDIT_GRACE of completed_at);
-        after that the branch is audited directly: work still unmerged
+        after that the branch is audited against the caller's batched
+        mergedness snapshot (`unmerged_drcode_branches`, already taken
+        once for the whole poll — no git call here): work still unmerged
         means the hook-merge failed without anyone stamping the flag
         (a session on older code, a crash mid-stamp) — the failure is
         back-stamped and persisted, so `_remind_unmerged_work` and the
         header tooltip see it too. Audited-merged tasks are cached per
-        (id, completed_at) so the 10 s poll does not re-run git on them
-        forever. Blocking (a couple of git calls) — worker thread."""
+        (id, completed_at) so the 10 s poll does not re-audit them
+        forever."""
         audited = self._hook_merge_audit_ok.get(task.id)
         if audited is not None and audited == task.completed_at:
             return True
@@ -1147,7 +1162,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             self.HOOK_MERGE_AUDIT_GRACE
         ):
             return True  # too fresh — the hook may still be merging
-        if self.task_env.unmerged_commits(task.id) <= 0:
+        if self.task_env.branch(task.id) not in unmerged_branches:
             self._hook_merge_audit_ok[task.id] = task.completed_at or datetime.now(UTC)
             return True  # merged — the hook (or a hand) did its job
         if not task.hook_merge_failed:

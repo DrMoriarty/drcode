@@ -5,9 +5,9 @@
 ```bash
 uv sync                                    # install deps into .venv (Python 3.12, src layout)
 uv run drcode                              # run the TUI — operates on the CURRENT directory (Path.cwd())
-uv run pytest                              # whole suite (testpaths=tests, asyncio_mode=auto)
-uv run pytest -n auto                      # whole suite in parallel (pytest-xdist) — ~2.5–3 min vs 5–9 serial
-uv run pytest tests/test_task_manager.py -k hold   # focused run
+uv run pytest                              # whole suite — parallel by default (pytest-xdist, -n auto via addopts), ~2.5–3 min
+uv run pytest tests/test_task_manager.py -k hold   # focused run (also parallel)
+uv run pytest -n 0                         # serial run — for debugging (-s/--pdb; -p no:xdist needs -o addopts="" too)
 uv run ruff check src                      # lint (no config; ruff defaults)
 uv run ruff format src
 uv run pyright                             # typecheck (dev dep; no config)
@@ -79,4 +79,4 @@ Task-centric coding agent (pydantic-ai + textual), inspired by opencode. Single 
 
 `tests/conftest.py` has an autouse fixture that sandboxes every test: the user config dir (`config._USER_CONFIG_DIR` and friends) is monkeypatched into a tmp path, the dotenv source is disabled (the repo's own `.env` must not leak), and all `DRCODE_*` variables are stripped — keep this in mind when adding config-layering tests. Common fixtures: `project_root` (fresh tmp dir, the agent's writable root), `manager` (TaskManager over it), `user_config_dir`. The `test_network_*` suite exercises model/network failures (outages, retries, recovery) exclusively through the stubs in `tests/network_mocks.py` — no real API access is needed anywhere.
 
-Parallel runs: pytest-xdist is a dev dependency, so `uv run pytest -n auto` works — every test gets its own process and `tmp_path`, no known cross-test conflicts. This is a LOCAL option only (no CI runs tests); prefer it over the serial run when iterating on the whole suite. On a slow/loaded machine the async helper `wait_until` (`tests/network_mocks.py`) takes its default deadline from `DRCODE_TEST_WAIT_TIMEOUT` (float seconds, default 30, read via `os.environ` directly so the conftest sandbox doesn't strip it) — raise it there instead of editing timeouts per test.
+Parallel runs: pytest-xdist is a dev dependency and enabled by default via `addopts = "-n auto"` in `[tool.pytest.ini_options]` — every `uv run pytest` (whole suite, focused `-k`/file picks alike) gets its own worker processes and per-test `tmp_path`, no known cross-test conflicts. Serial runs (debugging, `-s`/`--pdb`) go with `uv run pytest -n 0`; a bare `-p no:xdist` alone errors out (unrecognized `-n` from addopts) — combine it with `-o addopts=""` if you really need the plugin unloaded. This is a LOCAL option only (no CI runs tests). On a slow/loaded machine the async helper `wait_until` (`tests/network_mocks.py`) takes its default deadline from `DRCODE_TEST_WAIT_TIMEOUT` (float seconds, default 30, read via `os.environ` directly so the conftest sandbox doesn't strip it) — raise it there instead of editing timeouts per test.

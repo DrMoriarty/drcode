@@ -4,8 +4,9 @@ fields).
 Push-to-talk state machine, one instance per app:
 
 - idle → recording: a worker thread opens the microphone
-  (:class:`drcode.voice.MicrophoneRecorder`); the status toast appears via
-  call_from_thread — the event loop never touches PortAudio.
+  (:class:`drcode.voice.MicrophoneRecorder`); the persistent corner
+  indicator appears via call_from_thread — the event loop never touches
+  PortAudio.
 - recording → idle (second press): the same (exclusive) worker thread stops
   the recorder, uploads the WAV to the ASR endpoint and inserts the
   recognized text at the cursor of the field that started the recording —
@@ -15,10 +16,14 @@ Push-to-talk state machine, one instance per app:
 - any failure (no config, no sounddevice, microphone busy, network) is a
   readable toast; the state machine resets to idle.
 
-While a recording runs the persistent indicator lives in the header status
-line (``_render_model_status`` re-renders it on every state change and on
-the 1 s poll) — the status toast auto-dismisses after a few seconds and
-must not be the only visible sign that dictation is still active.
+While a recording runs the persistent indicator lives in two places,
+re-rendered by ``_render_model_status`` on every state change and on the
+1 s poll: the header status line and a dedicated corner widget docked to
+the bottom-right of the window (``#voice-indicator`` — the corner the
+user watches while dictating). The status toasts are gone: they
+auto-dismissed after a few seconds and left a long utterance with no
+visible sign that dictation is still active. Only error toasts remain
+transient.
 
 Everything audio/network runs in short-lived daemon worker threads (the
 tool_runtime pattern); the only UI-thread work is inserting the text and
@@ -102,6 +107,20 @@ class VoiceInputController:
             return "● распознаю…"
         return None
 
+    @property
+    def corner_indicator(self) -> str | None:
+        """Status text for the persistent bottom-right corner widget
+        (None when idle): the base status from ``indicator`` plus the
+        push-to-talk hint while recording — the corner is where the user
+        watches while dictating, so the stop/cancel keys must be right
+        there for the whole session, not just the first four seconds."""
+        base = self.indicator
+        if base is None:
+            return None
+        if self._state is _State.RECORDING:
+            return f"{base}  Ctrl+B — готово, ESC — отмена"
+        return base
+
     def _notify(self, message: str, *, error: bool = False) -> None:
         try:
             self._app.notify(
@@ -138,7 +157,6 @@ class VoiceInputController:
                 # intent, and must not cut the recording to a fragment.
                 return
             self._state = _State.TRANSCRIBING
-            self._notify("● распознаю…")
             self._sync_indicator()
             self._transcribe()
             return
@@ -256,7 +274,10 @@ class VoiceInputController:
 
     def _open_microphone(self, recorder: MicrophoneRecorder) -> None:
         """Worker thread: open the PortAudio stream (a slow syscall — the
-        event loop never waits for it), confirm the recording afterwards."""
+        event loop never waits for it). The persistent corner indicator
+        (with the Ctrl+B/ESC hint) is already up from ``_start`` — the
+        old confirming status toast here auto-dismissed after a few
+        seconds, which is exactly the feedback gap it claimed to fill."""
         try:
             recorder.start()
         except VoiceError as e:
@@ -264,12 +285,9 @@ class VoiceInputController:
             return
         if self._state is not _State.RECORDING:
             return
-        try:
-            self._app.call_from_thread(
-                self._notify, "● запись…  Ctrl+B — готово, ESC — отмена"
-            )
-        except Exception as e:  # noqa: BLE001 - app may be shutting down
-            print(f"drcode voice: status toast failed: {e}", file=sys.stderr)
+        # The microphone is confirmed open: re-render the corner once so
+        # a state flip racing the slow open is caught up immediately.
+        self._sync_indicator()
 
     def _transcribe(self) -> None:
         """Stop the recorder, upload the WAV, insert the text at the

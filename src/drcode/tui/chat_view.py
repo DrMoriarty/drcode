@@ -546,9 +546,13 @@ class ChatViewLayer(DrCodeState):
         while the tester works, and just the plain connection label when
         nothing runs. A voice dictation in flight outranks all of that:
         its recording indicator must stay visible for the whole utterance.
-        """
+
+        Also re-renders the persistent bottom-right dictation indicator —
+        both render paths (the immediate _sync_indicator and the 1 s
+        poll) go through here, so the corner never goes stale."""
         label = self.model_status
         voice = self.voice_input.indicator
+        self._render_voice_indicator()
         if voice is not None:
             # The dictation indicator outranks the model-activity suffix:
             # a recording that loses its only persistent cue looks broken
@@ -566,6 +570,26 @@ class ChatViewLayer(DrCodeState):
             label.update(self._conn_label)
 
     # -- expanded (tall) header: connection details + session statistics ----
+
+    def _render_voice_indicator(self) -> None:
+        """Persistent bottom-right dictation indicator (#voice-indicator).
+
+        Visible for the whole RECORDING/TRANSCRIBING session (the corner
+        never times out, unlike the toasts it replaces); it disappears
+        only when the controller returns to IDLE — insert, cancel or
+        error. Text comes from the controller's ``corner_indicator`` so
+        the header and the corner can never disagree."""
+        try:
+            widget = self.query_one("#voice-indicator", Static)
+        except NoMatches:
+            return  # teardown race: the widget is already gone
+        text = self.voice_input.corner_indicator
+        if text is None:
+            widget.add_class("hidden")
+            widget.update("")
+        else:
+            widget.remove_class("hidden")
+            widget.update(text)
 
     @property
     def header_conn_info(self) -> Static:

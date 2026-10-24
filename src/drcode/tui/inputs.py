@@ -216,6 +216,14 @@ class ChatInput(WordNavTextArea):
     def action_submit(self) -> None:
         self._app().submit_chat_input()
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # "Cancel recording" only makes sense while a dictation is in
+        # flight — hidden from the footer (and disabled) otherwise, so
+        # ESC falls through to the app's abort binding as before.
+        if action == "voice_cancel":
+            return self._app().voice_input.active
+        return True
+
     def action_push_to_talk(self) -> None:
         self._app().voice_input.toggle(self)
 

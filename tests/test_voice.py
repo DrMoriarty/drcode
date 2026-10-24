@@ -631,6 +631,40 @@ async def test_header_shows_persistent_recording_indicator(project_root: Any) ->
         assert "● запись…" not in str(label.render())
 
 
+async def test_footer_shows_cancel_recording_only_while_busy(
+    project_root: Any,
+) -> None:
+    """The footer's "Cancel recording" entry exists only while a dictation
+    is in flight: idle it must be hidden (ESC then belongs to the app's
+    abort binding), busy it must be back."""
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    app.manager.create("task", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # dismiss the first-start dialog
+        await pilot.pause()
+        app.chat_input.focus()
+        await pilot.pause()
+
+        def esc_action() -> str | None:
+            active = app.screen.active_bindings
+            entry = active.get("escape")
+            return entry.binding.action if entry else None
+
+        assert esc_action() != "voice_cancel"
+
+        controller = app.voice_input
+        controller._state = _State.RECORDING
+        app.refresh_bindings()
+        assert esc_action() == "voice_cancel"
+
+        controller._state = _State.IDLE
+        app.refresh_bindings()
+        assert esc_action() != "voice_cancel"
+
+
 async def test_corner_indicator_persists_while_busy(project_root: Any) -> None:
     """The bottom-right corner widget shows the dictation status for the
     whole busy session — recording (with the Ctrl+B/ESC hint), then

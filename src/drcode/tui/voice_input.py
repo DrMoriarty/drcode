@@ -164,12 +164,20 @@ class VoiceInputController:
 
     def _sync_indicator(self) -> None:
         """Re-render the persistent header indicator right away (the 1 s
-        activity poll would refresh it anyway). Safe from any thread."""
+        activity poll would refresh it anyway). Also refreshes the
+        bindings, so the footer's "Cancel recording" entry appears and
+        disappears together with the state. Safe from any thread."""
         try:
             if threading.get_ident() == self._app._thread_id:
                 self._app._render_model_status()
+                self._app.refresh_bindings()
             else:
-                self._app.call_from_thread(self._app._render_model_status)
+
+                def _sync() -> None:
+                    self._app._render_model_status()
+                    self._app.refresh_bindings()
+
+                self._app.call_from_thread(_sync)
         except Exception as e:  # noqa: BLE001 - the indicator is cosmetic
             print(f"drcode voice: indicator failed: {e}", file=sys.stderr)
 

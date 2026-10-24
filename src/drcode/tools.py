@@ -123,6 +123,19 @@ def _bash_violation(
     )
 
 
+def _stash_violation(command: str) -> PathViolation:
+    return PathViolation(
+        f"Command refused: '{command}': 'git stash' (any subcommand except list) "
+        f"touches the shared stash stack (refs/stash), which is common to ALL "
+        f"worktrees of the repository — parallel drcode tasks would push and pop "
+        f"each other's stashed changes. To run a check on a clean tree, create a "
+        f"throwaway worktree instead: `git worktree add <tmp-dir> HEAD && "
+        f"cd <tmp-dir> && <check>` — a worktree has its own tree/index, so there "
+        f"is no shared state to race on. Place <tmp-dir> inside your scratch "
+        f"directory."
+    )
+
+
 def _state_dir_violation(command: str, cmd: str, path: str | None) -> PathViolation:
     target = f" with path '{path}'" if path else ""
     return PathViolation(
@@ -364,6 +377,43 @@ COMMAND_WRAPPERS = {"sudo", "nohup", "nice", "env", "command", "time"}
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n&]")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _DESTRUCTIVE_WORD = re.compile(r"(?:^|[\s;&|(])(sudo\s+)?(rm|mv|cp)\b")
+# Conservative fallback for unparsable segments: any `git … stash …` in there.
+_GIT_STASH_WORD = re.compile(r"\bgit\b[^;&|]*\bstash\b")
+
+# `git stash` subcommands allowed through the guard (read-only over the stack).
+_ALLOWED_STASH_SUBCOMMANDS = {"list"}
+
+
+def _git_leading_words(words: list[str], i: int, n: int = 2) -> list[str]:
+    """Return up to `n` non-flag words following the `git` at index `i`,
+    skipping git's global flags (including their values, e.g. `-C <path>`,
+    `-c <key>=<value>`)."""
+    out: list[str] = []
+    j = i + 1
+    while j < len(words) and len(out) < n:
+        w = words[j]
+        if w == "--":
+            break
+        if w.startswith("-"):
+            if w in ("-C", "-c") and j + 1 < len(words):
+                j += 1  # these flags take a value
+            j += 1
+            continue
+        out.append(w)
+        j += 1
+    return out
+
+
+def _is_forbidden_git_stash(words: list[str], i: int) -> bool:
+    """True if the `git` invocation at index `i` mutates the shared stash stack.
+
+    `git stash` with no subcommand defaults to `stash push`, so only the
+    read-only `list` is permitted.
+    """
+    sub = _git_leading_words(words, i)
+    if not sub or sub[0] != "stash":
+        return False
+    return len(sub) < 2 or sub[1] not in _ALLOWED_STASH_SUBCOMMANDS
 
 
 def check_command(root: Path, command: str, extra_writable: Path | None = None) -> None:
@@ -379,6 +429,12 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
     ancestor of it (`rm -rf .`, `rm -rf <root>`) — is refused, since deleting
     it destroys all task history irrecoverably. Nested command substitution
     (`echo $(rm …)`) is not analysed; only top-level invocations are.
+
+    Additionally, any `git stash` invocation that mutates the stash stack
+    (`push`/`pop`/`apply`/`drop`/`clear`/bare `stash`) is refused outright:
+    `refs/stash` is shared between all worktrees of the repository, so
+    parallel task agents would otherwise push and pop each other's stashed
+    changes. `git stash list` (read-only) stays allowed.
     """
     state_dir = (root / PROJECT_STATE_DIRNAME).resolve()
     for segment in _SEGMENT_SPLIT.split(command):
@@ -394,6 +450,8 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
                 raise _bash_violation(
                     root, command, "rm/mv/cp", None, extra_writable
                 ) from None
+            if _GIT_STASH_WORD.search(segment):
+                raise _stash_violation(command) from None
             continue
         i = 0
         # Strip leading env assignments and wrappers in any order
@@ -411,6 +469,8 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
         if i >= len(words):
             continue
         base = Path(words[i]).name  # tolerate /bin/rm, /usr/bin/mv, …
+        if base == "git" and _is_forbidden_git_stash(words, i):
+            raise _stash_violation(command)
         if base not in DESTRUCTIVE_COMMANDS:
             continue
         paths: list[str] = []

@@ -558,6 +558,60 @@ def test_check_command_tilde_expansion(project_root: Path) -> None:
         check_command(project_root, "rm ~/.bashrc")
 
 
+# -- check_command: git stash guard --------------------------------------------------
+
+
+def test_check_command_refuses_git_stash(project_root: Path) -> None:
+    # refs/stash is shared between all worktrees of the repository — parallel
+    # task agents would push and pop each other's stashed changes.
+    for cmd in (
+        "git stash",
+        "git stash pop",
+        "git stash push -m wip",
+        "git stash apply stash@{1}",
+        "git stash drop",
+        "git stash clear",
+        "git -C . stash clear",
+        "/usr/bin/git stash pop",
+        "env -i git stash",
+        "VAR=1 time nice git stash pop",
+        "git stash -q && pytest -k test_foo",
+        "echo hi; git stash drop",
+        "echo hi || git stash",
+    ):
+        with pytest.raises(PathViolation):
+            check_command(project_root, cmd)
+
+
+def test_check_command_stash_refusal_suggests_worktree(project_root: Path) -> None:
+    with pytest.raises(PathViolation, match=r"git worktree add"):
+        check_command(project_root, "git stash pop")
+
+
+def test_check_command_allows_git_stash_list_and_safe_git(project_root: Path) -> None:
+    check_command(project_root, "git stash list")
+    check_command(project_root, "git status")
+    check_command(project_root, "git diff")
+    check_command(project_root, "git -C . stash list")
+    check_command(project_root, "git worktree add /tmp/clean HEAD")
+
+
+def test_check_command_git_stash_unparsable_quoting_conservative(
+    project_root: Path,
+) -> None:
+    # Unbalanced quotes with `git stash` inside → refuse rather than run blind.
+    with pytest.raises(PathViolation, match=r"git worktree add"):
+        check_command(project_root, "git stash 'unbalanced")
+    # Unparsable but no stash in there → allowed.
+    check_command(project_root, "git 'unbalanced")
+
+
+def test_run_bash_refuses_git_stash(project_root: Path) -> None:
+    # PathViolation (not a crash): tool_runtime converts it to a ModelRetry.
+    with pytest.raises(PathViolation, match=r"git worktree add"):
+        asyncio.run(run_bash(project_root, "git stash pop"))
+
+
 # -- run_bash (async) ----------------------------------------------------------------
 
 

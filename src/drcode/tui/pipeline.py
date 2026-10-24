@@ -2277,6 +2277,31 @@ class PipelineLayer(DrCodeState):
         if text:
             self._show_event(task, f"on_tester_passed:\n{text}", kind="workflow")
 
+    # Hook-merge failure markers: the workflow template's hooks report a
+    # failed `git merge` as free text ("merge of drcode/<id> into main
+    # FAILED — CONFLICT …", "NOT merged — the checkout has uncommitted
+    # changes"). A crashed/nonzero-exit hook arrives as `not result.ok`
+    # instead — covered separately in _record_hook_merge_outcome.
+    _HOOK_MERGE_FAILURE_MARKERS = ("FAILED", "NOT merged")
+
+    def _record_hook_merge_outcome(self, task: Task, result: Any) -> None:
+        """Stamp `task.hook_merge_failed` with the accept hook's merge
+        outcome and persist it. The accept hooks are fail-open (the task
+        stays COMPLETED), but a FAILED/NOT merged merge must not vanish:
+        the flag re-admits the task into the unmerged-work tracking (the
+        header's `⎇ N` counter and the startup reminder) so a human
+        resolves it — see DrCodeApp._unmerged_completed_ids. A successful
+        merge (or a later successful re-run) clears the flag again."""
+        failed = not result.ok or any(
+            marker in str(result.output.get("text") or "")
+            for marker in self._HOOK_MERGE_FAILURE_MARKERS
+        )
+        if task.hook_merge_failed is failed:
+            return
+        task.hook_merge_failed = failed
+        task.touch()
+        self.manager.storage.save(task)
+
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the
         branch, …). Its text goes to the service-event log. Never fatal.
@@ -2285,13 +2310,16 @@ class PipelineLayer(DrCodeState):
         tasks can be accepted around the same moment, and both hooks
         (typically `git merge` into the shared main checkout) must not
         interleave — git's index.lock and conflicting merges would break
-        one of them. Fail-open semantics unchanged."""
+        one of them. Fail-open semantics unchanged: a failed hook-merge
+        only stamps `task.hook_merge_failed` (unmerged-work tracking picks
+        the task up), the task itself stays COMPLETED."""
         workflow = self.workflow
         if workflow is None or not workflow.has("on_accepted"):
             return
         async with self._accept_hook_lock:
             cwd, wt = self._hook_env(task)
             result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
+            self._record_hook_merge_outcome(task, result)
             if not result.ok:
                 self._show_event(
                     task,
@@ -2314,7 +2342,9 @@ class PipelineLayer(DrCodeState):
         merge into the main tree (`git -C <project.path> merge <branch>`).
 
         Serialized through `_accept_hook_lock`, like `on_accepted` (see
-        there): parallel finalizations merge one at a time."""
+        there): parallel finalizations merge one at a time. A failed
+        hook-merge stamps `task.hook_merge_failed` (unmerged-work tracking
+        picks the task up) — fail-open, the task stays COMPLETED."""
         workflow = self.workflow
         if workflow is None or not workflow.has("on_research_accepted"):
             return
@@ -2332,6 +2362,7 @@ class PipelineLayer(DrCodeState):
                 worktree=wt,
                 extra={"project": project},
             )
+            self._record_hook_merge_outcome(task, result)
             if not result.ok:
                 self._show_event(
                     task,
@@ -2390,8 +2421,10 @@ class PipelineLayer(DrCodeState):
         With the task kind's accept hook defined (`on_accepted` for
         development tasks, `on_research_accepted` for research) the merge
         is (supposed to be) automated by that hook, so the toast is
-        skipped there — the service event above is kept either way, as
-        the durable record."""
+        skipped there — unless the hook-merge itself failed
+        (`task.hook_merge_failed`): then the branch is stuck on a conflict
+        and the user must hear about it. The service event above is kept
+        either way, as the durable record."""
         env = self.task_env
         if not env.active:
             return  # no isolation — nothing ever lives on a task branch
@@ -2417,7 +2450,11 @@ class PipelineLayer(DrCodeState):
             )
         self._show_event(task, text, kind="workflow")
         hook = "on_research_accepted" if research else "on_accepted"
-        if not (self.workflow is not None and self.workflow.has(hook)):
+        if not (
+            self.workflow is not None
+            and self.workflow.has(hook)
+            and not task.hook_merge_failed
+        ):
             # The chat may be open on another task — also raise a toast.
             self.notify(text, title="Unmerged work", severity="warning", timeout=12)
 

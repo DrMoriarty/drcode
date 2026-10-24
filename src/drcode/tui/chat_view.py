@@ -947,18 +947,29 @@ class ChatViewLayer(DrCodeState):
         work is merged. A manual `git merge drcode/<id>` clears it on the
         next tick, no restart needed. The git calls are blocking — run
         them in a worker thread so a slow repo never stalls the UI."""
-        count = len(await asyncio.to_thread(self._unmerged_completed_ids))
+        ids = await asyncio.to_thread(self._unmerged_completed_ids)
+        count = len(ids)
         try:
             widget = self.query_one("#header-git", HeaderGitIndicator)
         except NoMatches:
             return  # teardown race: the app is being dismantled
         if count > 0:
             plural = "" if count == 1 else "s"
+            failed = sum(
+                1 for task_id in ids if self.manager.get(task_id).hook_merge_failed
+            )
             widget.update(f"⎇ {count}")
-            widget.tooltip = (
+            tooltip = (
                 f"{count} completed task{plural} not merged into the "
                 "base branch yet (git merge drcode/<id>)"
             )
+            if failed:
+                failed_plural = "" if failed == 1 else "es"
+                tooltip += (
+                    f" — {failed} hook merge{failed_plural} failed "
+                    "(conflict: resolve it in the checkout)"
+                )
+            widget.tooltip = tooltip
             widget.add_class("-unmerged")
         else:
             widget.remove_class("-unmerged")

@@ -360,3 +360,161 @@ async def test_startup_scan_silent_with_on_accepted_hook(
         await app._unmerged_work_startup_scan()
         await pilot.pause()
     assert not any(title == "Unmerged work" for title, _ in toasts)
+
+
+# -- failed hook merges re-enter the unmerged-work tracking --------------------------
+
+
+def _workflow_file(isolated: Path, source: str) -> None:
+    drcode_dir = isolated / ".drcode"
+    drcode_dir.mkdir(exist_ok=True)
+    (drcode_dir / "workflow.py").write_text(source)
+
+
+async def test_crashed_hook_merge_sets_hook_merge_failed(app_env: DrCodeApp) -> None:
+    """A crashed (nonzero-exit) on_accepted hook — typically a failed
+    `git merge` — stamps `task.hook_merge_failed` and persists it."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    raise RuntimeError\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    commit_on_branch(app.task_env, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+    assert task.hook_merge_failed
+    reloaded = TaskManager(app.project_root).get(task.id)
+    assert reloaded.hook_merge_failed
+
+
+async def test_failed_hook_merge_text_sets_hook_merge_failed(
+    app_env: DrCodeApp,
+) -> None:
+    """The workflow template reports a conflicted merge as free text
+    ("… FAILED — CONFLICT", "NOT merged …") with a zero exit — the text
+    marks the flag too."""
+    app = app_env
+    _workflow_file(
+        app.project_root,
+        "def on_accepted(task):\n"
+        "    return {'text': 'merge of drcode/<id> into main "
+        "FAILED — CONFLICT (content)'}\n",
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+    assert task.hook_merge_failed
+
+
+async def test_successful_hook_merge_clears_hook_merge_failed(
+    app_env: DrCodeApp,
+) -> None:
+    """A successful hook-merge clears the flag (a later successful re-run
+    after a manual fix does too)."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    task.hook_merge_failed = True
+    app.manager.storage.save(task)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+    assert not task.hook_merge_failed
+    reloaded = TaskManager(app.project_root).get(task.id)
+    assert not reloaded.hook_merge_failed
+
+
+async def test_failed_hook_merge_counts_in_unmerged_completed_ids(
+    app_env: DrCodeApp,
+) -> None:
+    """With an on_accepted hook defined, a completed task is normally
+    invisible to the unmerged-work tracking — unless its hook-merge
+    failed (the flag re-admits it; research tasks get the same treatment
+    under their own hook)."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    research = finished_task(app, kind=TaskKind.RESEARCH)
+    commit_on_branch(app.task_env, task.id)
+    commit_on_branch(app.task_env, research.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Successful hook-merges (no flag): the development task is hidden
+        # (on_accepted owns its merge); the research task counts anyway —
+        # on_accepted does not automate research merges.
+        assert app._unmerged_completed_ids() == [research.id]
+        # A failed hook-merge — the development task counts again too.
+        task.hook_merge_failed = True
+        assert sorted(app._unmerged_completed_ids()) == sorted([task.id, research.id])
+        # The research counterpart: on_research_accepted defined instead —
+        # it hides the research task until ITS hook-merge fails.
+        (app.project_root / ".drcode" / "workflow.py").write_text(
+            "def on_research_accepted(task):\n    return None\n"
+        )
+        app.workflow = load_hooks(app.project_root)
+        assert app._unmerged_completed_ids() == [task.id]
+        research.hook_merge_failed = True
+        assert sorted(app._unmerged_completed_ids()) == sorted([task.id, research.id])
+        await pilot.pause()
+
+
+async def test_startup_scan_toasts_failed_hook_merge(
+    isolated: Path, configured_env: None
+) -> None:
+    """The counterpart of the suppressed case: with an on_accepted hook
+    defined, a completed task whose hook-merge FAILED still produces the
+    startup toast (a stuck conflict must not vanish silently)."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix the bug", "fix the bug")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.hook_merge_failed = True
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    commit_on_branch(env, task.id)
+
+    _workflow_file(isolated, "def on_accepted(task):\n    return None\n")
+    app = DrCodeApp(isolated)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: any(title == "Unmerged work" for title, _ in toasts),
+            pilot,
+            what="startup unmerged-work toast",
+        )
+    unmerged = [msg for title, msg in toasts if title == "Unmerged work"]
+    assert len(unmerged) == 1
+    assert f"drcode/{task.id}" in unmerged[0]
+
+
+async def test_reminder_toast_not_softened_after_hook_merge_failure(
+    app_env: DrCodeApp,
+) -> None:
+    """The finalization reminder's toast is suppressed while the accept
+    hook owns the merge — but after a failed hook-merge the user must
+    hear about the stuck branch again."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    task.hook_merge_failed = True
+    commit_on_branch(app.task_env, task.id)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._remind_unmerged_work(task)
+        await pilot.pause()
+    assert any(f"drcode/{task.id}" in text for text in event_texts(task))
+    assert any(title == "Unmerged work" for title, _ in toasts)

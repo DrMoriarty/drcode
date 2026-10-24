@@ -1036,8 +1036,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         "stuck" fixes the startup scan reminds about and the header's
         unmerged-work indicator counts. Skipped per task kind when the
         merge is automated by the kind's accept hook (`on_accepted` /
-        `on_research_accepted`). Blocking git calls — run in a worker
-        thread."""
+        `on_research_accepted`) — but only while that hook-merge has not
+        FAILED (`task.hook_merge_failed`): a stuck/conflicted merge needs
+        a human, so the task counts again exactly as if no hook existed
+        (a manual `git merge drcode/<id>` clears it dynamically, and a
+        later successful hook re-run clears the flag). Blocking git
+        calls — run in a worker thread."""
         env = self.task_env
         if not env.active:
             return []
@@ -1047,10 +1051,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             if task.status is not TaskStatus.COMPLETED:
                 continue
             if task.kind is TaskKind.RESEARCH:
-                if workflow is not None and workflow.has("on_research_accepted"):
-                    continue  # the merge is the research hook's job
+                if (
+                    workflow is not None
+                    and workflow.has("on_research_accepted")
+                    and not task.hook_merge_failed
+                ):
+                    continue  # the merge is the research hook's job (and it worked)
             else:
-                if workflow is not None and workflow.has("on_accepted"):
+                if (
+                    workflow is not None
+                    and workflow.has("on_accepted")
+                    and not task.hook_merge_failed
+                ):
                     continue  # the merge is the hook's job — no reminders
                 if task.verification is not VerificationStatus.PASSED:
                     continue

@@ -184,6 +184,18 @@ class Task(BaseModel):
     # so a verdict arriving days later still finds its task; cleared when
     # the verdict is applied or the user re-queues/cancels the task.
     review_pending: bool = False
+    # The task kind's accept hook (on_accepted for development tasks,
+    # on_research_accepted for research) normally owns the merge of the
+    # task's `drcode/<id>` branch back into the base branch — and while it
+    # does, the unmerged-work indicator/startup reminder stay silent (the
+    # merge is automated). Set when that hook-merge FAILED: a git conflict,
+    # a dirty checkout ("NOT merged …") or a crashed hook. A failed merge
+    # needs a human, so the task re-enters the unmerged-work tracking (the
+    # header's `⎇ N` counter and the startup reminder) exactly as if no
+    # hook existed — a manual `git merge drcode/<id>` (or a later
+    # successful hook re-run) clears the signal again. Persisted like every
+    # other Task field; False for old task files (plain default).
+    hook_merge_failed: bool = False
     # Ids of tasks that must be COMPLETED *and* merged into the base branch
     # before this task may be taken into development (the promotion gate is
     # dynamic: git state is re-evaluated at every promotion attempt, so a

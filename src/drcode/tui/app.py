@@ -62,6 +62,7 @@ from .command_providers import (
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
+    TaskSettingsCommandProvider,
 )
 from .header import ModelStatusHeader
 from .inputs import ChatInput, DepsInput, NewTaskInput
@@ -96,11 +97,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends). The model
     # entries (provider catalog, per-role picks) live in the "Model
-    # settings…" sub-menu, whose providers are passed explicitly by
-    # action_open_model_settings.
+    # settings…" sub-menu and the task-management preferences in the
+    # "Task settings…" sub-menu; both sub-palettes' providers are passed
+    # explicitly by their open actions.
     COMMANDS: ClassVar = {
         get_system_commands_provider,
         ModelSettingsCommandProvider,
+        TaskSettingsCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,
@@ -288,6 +291,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     def __init__(self, project_root: Path) -> None:
         super().__init__()
+        # Resolve once: a relative or symlinked root would leak into storage,
+        # git and the tool sandbox (tools compare resolved paths against it).
+        project_root = Path(project_root).resolve()
         self.project_root = project_root
         # One-time migrations BEFORE the config is built: legacy flat model
         # keys in the user-level / project drcode.json move into the user

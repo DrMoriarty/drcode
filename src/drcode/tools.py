@@ -143,8 +143,12 @@ def resolve_read_path(root: Path, path: str) -> Path:
 
 
 def is_writable(root: Path, p: Path, extra_writable: Path | None = None) -> bool:
-    if p == root or root in p.parents:
-        return True
+    # `p` is always resolved (resolve_edit_path / the command guard resolve
+    # first), but `root` may arrive relative or through a symlink — accept
+    # both the literal and the resolved location.
+    for r in {root, root.resolve()}:
+        if p == r or r in p.parents:
+            return True
     if extra_writable is not None:
         # /tmp may be a symlink (macOS: /tmp -> /private/tmp) — accept both
         # the literal and the resolved location.

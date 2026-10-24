@@ -140,6 +140,66 @@ def test_resolve_edit_path_macos_tmp_symlink(
     assert is_writable(project_root, scratch.resolve(), scratch)
 
 
+def test_resolve_edit_path_relative_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scratch_root: Path
+) -> None:
+    # An embedder may pass a relative project root (e.g. run_dir / "workspace");
+    # the tool sandbox compares resolved paths against the root, so it must
+    # accept both the literal and the resolved root.
+    monkeypatch.chdir(tmp_path)
+    root = Path("workspace")
+    (tmp_path / "workspace" / "sub").mkdir(parents=True)
+    p = resolve_edit_path(
+        root, "sub/f.txt", extra_writable=tools.scratch_dir("abc12345")
+    )
+    assert p == (tmp_path / "workspace" / "sub" / "f.txt").resolve()
+
+
+def test_resolve_edit_path_relative_root_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scratch_root: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(PathViolation) as exc:
+        resolve_edit_path(
+            Path("workspace"),
+            "/etc/evil",
+            extra_writable=tools.scratch_dir("abc12345"),
+        )
+    # The hint interpolates the root as it was given (relative stays readable).
+    assert "'workspace'" in str(exc.value)
+    assert "/etc/evil" in str(exc.value)
+
+
+def test_resolve_edit_path_symlinked_root(tmp_path: Path, scratch_root: Path) -> None:
+    # A symlinked absolute root (e.g. /tmp on macOS) must be accepted for
+    # files under its resolved location — mirror of the scratch-dir case.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    scratch = tools.scratch_dir("abc12345")
+    p = resolve_edit_path(link, "f.txt", extra_writable=scratch)
+    assert p == (real / "f.txt").resolve()
+    assert is_writable(link, p, scratch)
+    with pytest.raises(PathViolation):
+        resolve_edit_path(
+            link, str(tmp_path / "elsewhere" / "f.txt"), extra_writable=scratch
+        )
+
+
+def test_check_command_relative_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scratch_root: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    root = Path("workspace")
+    (tmp_path / "workspace").mkdir()
+    # In-project destructive commands pass; escapes still refused.
+    check_command(root, "rm -rf build")
+    check_command(root, "mv a.txt b.txt")
+    with pytest.raises(PathViolation):
+        check_command(root, "rm /etc/passwd")
+
+
 def test_resolve_edit_path_foreign_scratch_raises(
     project_root: Path, scratch_root: Path
 ) -> None:

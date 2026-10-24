@@ -524,6 +524,9 @@ class DrCodeState(App[None]):
 
     # -- agent failure / network-retry bookkeeping --------------------------
     _agent_failed: set[str]
+    # Deterministically-failed subset of _agent_failed (transcript over the
+    # model's context window): the rescue escape never lifts it.
+    _agent_dead: set[str]
     _agent_net_count: dict[str, int]
     _agent_net_retry_at: dict[str, float]
     _net_retries_total: int

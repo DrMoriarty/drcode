@@ -453,6 +453,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # promote_next for the rest of the session, so one broken task (or a
         # dead gateway) doesn't loop the whole queue through the error.
         self._agent_failed: set[str] = set()
+        # Subset of _agent_failed whose failure is DETERMINISTIC (currently:
+        # the transcript exceeds the model's context window — HTTP 400
+        # context-overflow, see _is_context_overflow_error): requeueing and
+        # rescuing such a task would only loop it through the same error,
+        # so the failed-queue deadlock escape never lifts _agent_dead — the
+        # task needs manual intervention (delete, or a smaller transcript
+        # once mechanical compaction lands). Session-only.
+        self._agent_dead: set[str] = set()
         # Deadlock escape for a queue where every task failed this session
         # (see PipelineLayer._promote_failed_queue): the rescue-round counter
         # (backoff base 60s doubling, capped) and the earliest monotonic time

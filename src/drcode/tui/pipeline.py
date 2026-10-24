@@ -80,6 +80,7 @@ from .blocks import (
 from .state import DrCodeState
 from .usage import (
     NETWORK_RETRIES,
+    _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
 )
@@ -477,6 +478,14 @@ class PipelineLayer(DrCodeState):
         — the queue keeps working instead of stalling. A notification
         reports how many tasks were rescued this way.
 
+        The lift applies only to plausibly-transient failures: tasks whose
+        failure is deterministic (`_agent_dead` — e.g. a transcript over
+        the model's context window, rejected with the same 400 on every
+        attempt) are never lifted, otherwise they would loop
+        error → rescue → error forever. When every failed task is dead,
+        the escape does not fire — the settled-pipeline notification
+        reports those tasks as needing manual intervention.
+
         `blocked` (the dependency gate's set, when the caller computed one)
         counts as "cannot be rescued": dependency-blocked tasks are neither
         lifted nor promoted, and they don't keep the rescue from firing for
@@ -490,7 +499,18 @@ class PipelineLayer(DrCodeState):
         if len(self.manager.active_tasks()) >= self.parallel_limit:
             return None
         queued = self.manager.queued()
-        if not queued or any(
+        # Only plausibly-transient failures are rescuable: a deterministically
+        # dead task (_agent_dead — e.g. a transcript over the model's context
+        # window) keeps its exclusion forever, lifting it would just re-run
+        # the same guaranteed error.
+        rescuable = [
+            t
+            for t in queued
+            if t.id in self._agent_failed
+            and t.id not in self._agent_dead
+            and (blocked is None or t.id not in blocked)
+        ]
+        if not rescuable or any(
             t.id not in self._agent_failed and (blocked is None or t.id not in blocked)
             for t in queued
         ):
@@ -507,7 +527,7 @@ class PipelineLayer(DrCodeState):
         )
         self._failed_queue_retry_at = now + delay
         self._schedule_pipeline_timer(delay, self._advance)
-        rescued = [t for t in queued if blocked is None or t.id not in blocked]
+        rescued = rescuable
         for t in rescued:
             self._agent_failed.discard(t.id)
             self._show_event(
@@ -694,7 +714,17 @@ class PipelineLayer(DrCodeState):
         )
         if awaiting:
             reasons.append(f"awaiting a clarifying question: {awaiting}")
-        failed = sum(1 for t in remaining if t.id in self._agent_failed)
+        dead = sum(1 for t in remaining if t.id in self._agent_dead)
+        if dead:
+            reasons.append(
+                f"transcript over the model's context window "
+                f"(needs manual intervention): {dead}"
+            )
+        failed = sum(
+            1
+            for t in remaining
+            if t.id in self._agent_failed and t.id not in self._agent_dead
+        )
         if failed:
             reasons.append(f"failed this session: {failed}")
         idle = sum(
@@ -1025,6 +1055,7 @@ class PipelineLayer(DrCodeState):
                 return
             self._agent_runs[task_id] = generation
             self._agent_failed.discard(task_id)
+            self._agent_dead.discard(task_id)
             self._agent_net_retry_at.pop(task_id, None)
             self._current_tool[task_id] = None
             self._tps_samples.pop(task_id, None)
@@ -1619,6 +1650,24 @@ class PipelineLayer(DrCodeState):
                     # queue continues with the next task.
                     task.status = TaskStatus.QUEUED
                     self._agent_failed.add(task_id)
+                    if _is_context_overflow_error(e):
+                        # Deterministic failure: the transcript itself is
+                        # over the model's context window, so every retry
+                        # of the same history is guaranteed the same 400.
+                        # Mark the task dead — the failed-queue rescue must
+                        # never lift it back into development — and tell
+                        # the user what manual fix is needed.
+                        self._agent_dead.add(task_id)
+                        self._show_event(
+                            task,
+                            "The transcript exceeds the model's context "
+                            "window: the model rejects it deterministically "
+                            "on every attempt, retrying cannot help. The "
+                            "task needs manual intervention — delete it, or "
+                            "shrink its transcript (e.g. mechanical "
+                            "compaction).",
+                        )
+                        self.notifier.task_context_overflow(task.title)
                     self.manager.storage.save(task)
                     # The transition happened outside the manager — report it
                     # to the status observers (notifications) explicitly.

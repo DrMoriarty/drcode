@@ -767,6 +767,7 @@ def test_drcode_branch_state_repeated_calls_reuse_cache(
     )
     assert calls == [("show-ref", "--head")]
 
+
 # -- worktree_removal: on_completion / never ---------------------------------------
 
 
@@ -841,6 +842,36 @@ def test_completion_removal_then_requeue_recreates_worktree(
     assert (root2 / "docs.md").read_text() == "the research result"
 
 
+def test_worktree_info_branch_only_after_completion_removal(
+    git_root: Path,
+) -> None:
+    """worktree_removal: on_completion — after the completion removal the
+    hook payload entry degrades to the branch (no `path`): the accept
+    hooks run AFTER the removal and only need `worktree.branch` to merge
+    the surviving branch into the main checkout."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    env.ensure_root("t1")
+    (env.worktree_path("t1") / "docs.md").write_text("docs")
+    env.snapshot("t1", "test")
+    env.remove("t1")
+    assert not env.worktree_path("t1").exists()
+    assert unmerged_count(git_root, "drcode/t1") >= 1
+    assert env.worktree_info("t1") == {"branch": "drcode/t1"}
+
+
+def test_worktree_info_none_when_completion_removal_deletes_branch(
+    git_root: Path,
+) -> None:
+    """worktree_removal: on_completion — a task with nothing unmerged has
+    its branch deleted along with the worktree; without a branch there is
+    nothing to merge and the payload entry is absent (as before)."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    env.ensure_root("t1")
+    env.remove("t1")
+    assert not branch_exists(git_root, "drcode/t1")
+    assert env.worktree_info("t1") is None
+
+
 def test_completion_removal_off_by_default(
     manager: TaskManager, git_root: Path
 ) -> None:
@@ -904,4 +935,3 @@ def test_cleanup_orphans_ignores_removal_never(
     assert dead.id in removed
     assert not env.worktree_path(dead.id).exists()
     assert env.worktree_path(live.id).is_dir()
-

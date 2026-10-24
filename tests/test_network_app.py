@@ -759,6 +759,123 @@ async def test_tester_round_compaction_never_touches_agent_transcript(
     assert not any(is_summary_message(m) for m in task.messages)
 
 
+async def test_second_mid_run_compaction_does_not_grow_summary(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """Regression: pydantic-ai merges the synthetic summary request into the
+    adjacent original-prompt request on resume, so the next compaction saw
+    the whole merged request as an "original prompt" and re-appended another
+    summary — the transcript grew by one summary per pause→resume cycle and
+    a long run could never compact its way below the threshold. Two
+    consecutive compactions must leave exactly ONE summary part, holding
+    the LATEST summary."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
+    # The pause sanitizes away the trailing unanswered tool call, so the
+    # second compaction must find fresh committed activity in `rest`: the
+    # continuation runs one below-threshold round (fill 500) before the
+    # fill crosses again.
+    scripted_fills([100, 900, 500, 900])
+    scripted.steps = [
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        tool_response("read_file", {"path": "README.md"}, "c2"),  # 900 → compact
+        text_response("SUMMARY ONE"),
+        tool_response("read_file", {"path": "README.md"}, "c3"),  # 500 → carry on
+        tool_response("read_file", {"path": "README.md"}, "c4"),  # 900 → compact again
+        text_response("SUMMARY TWO"),
+        text_response("final answer"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed after two mid-run compactions",
+        )
+
+    texts = event_texts(task)
+    assert len([t for t in texts if "Context compacted" in t]) == 2
+    assert len(scripted.calls) == 7
+    prompt_contents = [
+        p["content"]
+        for m in task.messages
+        for p in m["parts"]
+        if p["part_kind"] == "user-prompt" and isinstance(p["content"], str)
+    ]
+    summaries = [c for c in prompt_contents if c.startswith("[context summary]")]
+    assert len(summaries) == 1
+    assert "SUMMARY TWO" in summaries[0]
+    assert "SUMMARY ONE" not in summaries[0]
+    # The stale summary reaches the summarizer only as <previous-summary>
+    # (the anchored chain), never as [user] conversation content.
+    second_summary_prompt = scripted.calls[5]
+    assert (
+        "<previous-summary>\nSUMMARY ONE\n</previous-summary>" in second_summary_prompt
+    )
+    assert "[user]\nSUMMARY ONE" not in second_summary_prompt
+
+
+async def test_second_tester_round_compaction_does_not_grow_summary(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """Regression mirror for the tester: two consecutive mid-round
+    compactions of the SAME round must leave the round transcript with a
+    single (latest) summary part, not an ever-growing chain — otherwise the
+    round oscillates pause → compact → resume forever without a verdict."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted_fills([100, 900, 900])
+    scripted.steps = [
+        text_response("work done"),
+        tool_response("read_file", {"path": "README.md"}),  # 900 → compact
+        text_response("SUMMARY ONE"),
+        tool_response("read_file", {"path": "README.md"}),  # 900 → compact again
+        text_response("SUMMARY TWO"),
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.tester_running
+            ),
+            pilot,
+            what="tester round completed after two mid-round compactions",
+        )
+
+    texts = event_texts(task)
+    assert len([t for t in texts if "Context compacted: testing round" in t]) == 2
+    assert task.verification is VerificationStatus.PASSED
+    assert len(scripted.calls) == 7
+    final_round = task.tester_messages[-1]
+    prompt_contents = [
+        p["content"]
+        for m in final_round
+        for p in m["parts"]
+        if p["part_kind"] == "user-prompt" and isinstance(p["content"], str)
+    ]
+    summaries = [c for c in prompt_contents if c.startswith("[context summary]")]
+    assert len(summaries) == 1
+    assert "SUMMARY TWO" in summaries[0]
+    assert "SUMMARY ONE" not in summaries[0]
+    # Stale summary as <previous-summary> only, never as [user] content.
+    assert "<previous-summary>\nSUMMARY ONE\n</previous-summary>" in scripted.calls[4]
+    assert "[user]\nSUMMARY ONE" not in scripted.calls[4]
+
+
 # -- connection probe (_check_model) ------------------------------------------------------
 
 

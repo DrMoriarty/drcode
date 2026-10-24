@@ -421,6 +421,85 @@ def test_compacted_messages_preserves_originals() -> None:
     assert "new summary" in content
 
 
+# -- compaction of a merged request (pydantic-ai folds the summary into the
+#    original-prompt request on resume, via _merge_consecutive_messages) ------
+
+
+def merged_request() -> dict:
+    """What the transcript looks like after a compaction + resume: one
+    request whose user-prompt parts are [original, summary]."""
+    return serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="long task"),
+                    UserPromptPart(content=f"{COMPACTION_SUMMARY_PREFIX}\nold summary"),
+                ]
+            )
+        ]
+    )[0]
+
+
+def test_is_summary_message_merged_request() -> None:
+    assert is_summary_message(merged_request())
+
+
+def test_split_original_prompts_merged_request_keeps_original_only() -> None:
+    merged = merged_request()
+    preserved, rest = split_original_prompts([merged])
+    assert len(preserved) == 1
+    contents = [
+        p["content"] for p in preserved[0]["parts"] if p["part_kind"] == "user-prompt"
+    ]
+    assert contents == ["long task"]
+    assert not any(
+        isinstance(p, dict) and "[context summary]" in str(p.get("content", ""))
+        for p in preserved[0]["parts"]
+    )
+    # The merged request stays in rest (for the nothing-to-summarize guard),
+    # but its summary must not survive into the next compaction.
+    assert rest == [merged]
+
+
+def test_extract_previous_summary_merged_request() -> None:
+    assert extract_previous_summary([merged_request()]) == "old summary"
+
+
+def test_render_history_skips_summary_part_of_merged_request() -> None:
+    text = render_history_for_summary([merged_request()])
+    assert "[user]\nlong task" in text
+    assert "old summary" not in text
+
+
+def test_compacted_messages_drops_stale_summary_of_merged_request() -> None:
+    """Second compaction of the same transcript: the summary must be
+    REPLACED, not accumulated (the compaction livelock regression)."""
+    result = compacted_messages([merged_request()], "new summary")
+    prompt_contents = [
+        p["content"]
+        for m in result
+        for p in m["parts"]
+        if p["part_kind"] == "user-prompt"
+    ]
+    assert prompt_contents[0] == "long task"
+    summaries = [c for c in prompt_contents if c.startswith(COMPACTION_SUMMARY_PREFIX)]
+    assert len(summaries) == 1
+    assert "new summary" in summaries[0]
+    assert "old summary" not in summaries[0]
+    assert extract_previous_summary(result) == "new summary"
+
+
+def test_compacted_messages_drops_request_reduced_to_summary() -> None:
+    """A request holding nothing but summary parts vanishes instead of
+    leaving an empty husk in the compacted transcript."""
+    pure_summary = serialize_messages(
+        [user_msg(f"{COMPACTION_SUMMARY_PREFIX}\nold summary")]
+    )
+    result = compacted_messages(pure_summary, "new summary")
+    assert [is_summary_message(m) for m in result] == [True]
+    assert "new summary" in result[0]["parts"][0]["content"]
+
+
 # -- AGENTS.md loading ------------------------------------------------------------
 
 

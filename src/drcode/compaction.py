@@ -51,24 +51,57 @@ def _is_request(msg: dict[str, Any]) -> bool:
     return msg.get("kind") == "request" or msg.get("role") == "request"
 
 
+def _user_prompt_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """String user-prompt parts of a serialized request, in order."""
+    return [
+        part
+        for part in msg.get("parts", [])
+        if isinstance(part, dict)
+        and part.get("part_kind") == "user-prompt"
+        and isinstance(part.get("content"), str)
+        and part["content"]
+    ]
+
+
+def _is_summary_part(part: dict[str, Any]) -> bool:
+    content = part.get("content")
+    return isinstance(content, str) and content.startswith(COMPACTION_SUMMARY_PREFIX)
+
+
 def _user_prompt_content(msg: dict[str, Any]) -> str | None:
     """First string user-prompt content of a serialized request, if any."""
-    for part in msg.get("parts", []):
-        if not isinstance(part, dict):
-            continue
-        if part.get("part_kind") == "user-prompt":
-            content = part.get("content")
-            if isinstance(content, str) and content:
-                return content
-    return None
+    parts = _user_prompt_parts(msg)
+    return parts[0]["content"] if parts else None
 
 
 def is_summary_message(msg: dict[str, Any]) -> bool:
-    """True for the synthetic user message carrying the compaction summary."""
+    """True for a request carrying the compaction summary.
+
+    pydantic-ai merges the synthetic summary request with the adjacent
+    original-prompt request on resume (_merge_consecutive_messages), so a
+    merged request holds the original prompt AND the summary as adjacent
+    user-prompt parts — any summary part makes it a summary carrier.
+    """
     if not _is_request(msg):
         return False
-    content = _user_prompt_content(msg)
-    return content is not None and content.startswith(COMPACTION_SUMMARY_PREFIX)
+    return any(_is_summary_part(p) for p in _user_prompt_parts(msg))
+
+
+def _without_summary_parts(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy of a serialized request with its summary user-prompt parts
+    dropped; None when nothing but summary parts remains."""
+    parts = [
+        p
+        for p in msg.get("parts", [])
+        if not (
+            isinstance(p, dict)
+            and p.get("part_kind") == "user-prompt"
+            and _is_summary_part(p)
+        )
+    ]
+    if len(parts) == len(msg.get("parts", [])):
+        return msg
+    return {**msg, "parts": parts} if parts else None
 
 
 def split_original_prompts(
@@ -80,15 +113,27 @@ def split_original_prompts(
     assignment(s) — they are kept verbatim across compactions (the summary
     message, if a previous compaction left one, ends this prefix: it lives
     in `rest` so the summarizer sees it as <previous-summary>).
+
+    Part-aware: a leading request that pydantic-ai merged with a summary
+    (adjacent user-prompt parts after a resume) contributes only its
+    non-summary parts to `preserved` — stale summaries must not survive
+    into the next compaction, or the transcript grows on every cycle.
     """
     i = 0
+    preserved: list[dict[str, Any]] = []
     while i < len(messages):
         msg = messages[i]
-        content = _user_prompt_content(msg) if _is_request(msg) else None
-        if content is None or content.startswith(COMPACTION_SUMMARY_PREFIX):
+        parts = _user_prompt_parts(msg) if _is_request(msg) else []
+        if not parts:
             break
+        if any(_is_summary_part(p) for p in parts):
+            trimmed = _without_summary_parts(msg)
+            if trimmed is not None:
+                preserved.append(trimmed)
+            break
+        preserved.append(msg)
         i += 1
-    return messages[:i], messages[i:]
+    return preserved, messages[i:]
 
 
 def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
@@ -98,9 +143,9 @@ def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
     for msg in messages:
         if not _is_request(msg):
             continue
-        content = _user_prompt_content(msg)
-        if content is not None and content.startswith(COMPACTION_SUMMARY_PREFIX):
-            found = content[len(COMPACTION_SUMMARY_PREFIX) :].strip()
+        for part in _user_prompt_parts(msg):
+            if _is_summary_part(part):
+                found = part["content"][len(COMPACTION_SUMMARY_PREFIX) :].strip()
     return found
 
 
@@ -110,13 +155,12 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
     User prompts, assistant text, tool calls and tool results are kept
     (tool results are the bulk of the working context — file contents and
     command output the summary must capture); thinking parts are dropped;
-    an existing compaction summary is skipped (it is passed separately as
-    <previous-summary>).
+    compaction-summary user-prompt parts are skipped (they are passed
+    separately as <previous-summary>) — including the merged ones pydantic-ai
+    folds into the original-prompt request after a resume.
     """
     lines: list[str] = []
     for msg in messages:
-        if is_summary_message(msg):
-            continue
         is_request = _is_request(msg)
         for part in msg.get("parts", []):
             if not isinstance(part, dict):
@@ -124,7 +168,11 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
             kind = part.get("part_kind")
             if kind == "user-prompt":
                 content = part.get("content")
-                if isinstance(content, str) and content:
+                if (
+                    isinstance(content, str)
+                    and content
+                    and not content.startswith(COMPACTION_SUMMARY_PREFIX)
+                ):
                     lines.append(f"[user]\n{content}")
             elif kind == "tool-return":
                 # Tool returns live in request messages (ModelRequest with a

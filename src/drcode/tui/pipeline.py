@@ -288,73 +288,94 @@ class PipelineLayer(DrCodeState):
         )
 
     def _advance(self) -> None:
-        """The single pipeline gate: testing always has absolute priority.
+        """The single pipeline gate: a test that can start right now has
+        absolute priority over development.
 
-        Every path that used to promote the queue goes through here, so a
-        new development run can never start while any task is awaiting
-        verification. While a tester run is in flight this is a no-op —
-        the tester's own completion path advances the pipeline. The same
-        holds for the external review (`.drcode/workflow.py` on_review):
-        a task the tester passed but the reviewer has not judged yet keeps
-        the pipeline in the "development finished, verdict outstanding"
-        state (it stays TESTING), and the review worker advances the
-        pipeline on its own completion.
+        Every path that used to promote the queue goes through here. The
+        historical rule "a new development run can never start while any
+        task is awaiting verification" holds in full for a single
+        development slot (parallel_limit == 1). With parallel slots the
+        block is narrowed: development is held back only while the tester
+        is FREE and a TESTING task is ready to be tested right now (that
+        test is dispatched first and the gate returns). A tester run
+        already in flight — or a TESTING task waiting for the busy
+        tester's single slot or sitting in its retry backoff — does not
+        stop free development slots from being filled; the tester reaches
+        the queued TESTING tasks as each of its rounds ends (bug reports
+        land at the queue head, so `_dispatch_promotions` picks them up
+        first). The same holds for the external review
+        (`.drcode/workflow.py` on_review): a task the tester passed but
+        the reviewer has not judged yet keeps the pipeline in the
+        "development finished, verdict outstanding" state (it stays
+        TESTING), and the review worker advances the pipeline on its own
+        completion.
         """
-        if self.tester_running:
-            return
-        if self.settings.task_finalization is TaskFinalization.NONE:
-            # No tester at all: every task that reached TESTING (this tick or
-            # left over from a run started under another setting) is completed
-            # straight away, and the queue continues below.
-            finalized = [
-                t for t in self.manager.all_tasks() if t.status is TaskStatus.TESTING
-            ]
-            for t in finalized:
-                self.manager.complete_without_verification(t.id)
-            if finalized:
-                self.refresh_sidebar()
-        if self._review_running:
-            # A review worker is in flight; its completion path advances
-            # the pipeline (a second dispatch here would cancel it).
-            return
-        review = self._next_review()
-        if review is not None:
-            # Set synchronously: two _advance() calls within one tick must
-            # not start two review workers (mirrors the tester_running flag).
-            self._review_running = True
-            self._review_task_id = review.id
-            self.refresh_status()
-            self.run_external_review(review.id)
-            return
-        if not (self.workflow is not None and self.workflow.has("on_review")):
-            # No external review hook: a TESTING task the tester already
-            # passed (left over when the workflow file was removed
-            # mid-flight) would block the pipeline forever — finalize it
-            # the way the review's accept would have.
-            stale = next(
-                (
+        if not self.tester_running:
+            # Tester-side duties — any of them firing returns: while a
+            # test can start right now, no development is promoted.
+            if self.settings.task_finalization is TaskFinalization.NONE:
+                # No tester at all: every task that reached TESTING (this
+                # tick or left over from a run started under another
+                # setting) is completed straight away, and the queue
+                # continues below.
+                finalized = [
                     t
                     for t in self.manager.all_tasks()
                     if t.status is TaskStatus.TESTING
-                    and t.verification is VerificationStatus.PASSED
-                ),
-                None,
-            )
-            if stale is not None:
-                self.manager.finalize_verified(stale.id)
-                self.refresh_sidebar()
-        testing = self._next_testing()
-        if testing is not None:
-            # Set synchronously: two _advance() calls within one event-loop
-            # tick must not start two tester workers (the exclusive group
-            # would cancel the first before it does anything).
-            self.tester_running = True
-            self.run_tester(testing.id)
-            return
-        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
-            # Every TESTING task is within its retry backoff window: the
-            # rule "no new development while any testing is incomplete"
-            # holds even then — the retry timer will call _advance() again.
+                ]
+                for t in finalized:
+                    self.manager.complete_without_verification(t.id)
+                if finalized:
+                    self.refresh_sidebar()
+            if self._review_running:
+                # A review worker is in flight; its completion path advances
+                # the pipeline (a second dispatch here would cancel it).
+                return
+            review = self._next_review()
+            if review is not None:
+                # Set synchronously: two _advance() calls within one tick must
+                # not start two review workers (mirrors the tester_running flag).
+                self._review_running = True
+                self._review_task_id = review.id
+                self.refresh_status()
+                self.run_external_review(review.id)
+                return
+            if not (self.workflow is not None and self.workflow.has("on_review")):
+                # No external review hook: a TESTING task the tester already
+                # passed (left over when the workflow file was removed
+                # mid-flight) would block the pipeline forever — finalize it
+                # the way the review's accept would have.
+                stale = next(
+                    (
+                        t
+                        for t in self.manager.all_tasks()
+                        if t.status is TaskStatus.TESTING
+                        and t.verification is VerificationStatus.PASSED
+                    ),
+                    None,
+                )
+                if stale is not None:
+                    self.manager.finalize_verified(stale.id)
+                    self.refresh_sidebar()
+            testing = self._next_testing()
+            if testing is not None:
+                # Set synchronously: two _advance() calls within one event-loop
+                # tick must not start two tester workers (the exclusive group
+                # would cancel the first before it does anything).
+                self.tester_running = True
+                self.run_tester(testing.id)
+                return
+        # -- promotion tail (reached with the tester busy, too) ------------
+        if self.parallel_limit == 1 and (
+            self.tester_running
+            or any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks())
+        ):
+            # Single development slot: testing keeps its absolute priority —
+            # no development starts while a tester run is in flight or any
+            # task awaits verification (also covers a TESTING task inside
+            # its retry backoff window — the retry timer will call
+            # _advance() again — and the window where a comment re-queued
+            # the tested task while its tester round is still running).
             return
         if any(t.depends_on for t in self.manager.queued()):
             # The dependency gate is active: mergedness of the depends_on
@@ -505,11 +526,20 @@ class PipelineLayer(DrCodeState):
         dep_ids = sorted({d for t in queued for d in t.depends_on})
         unmerged, base = await asyncio.to_thread(self._dep_gate_sync, dep_ids)
         # The git calls ran in a thread — the pipeline may have moved on
-        # (a tester started, a review is in flight): re-check the gates
-        # _advance() enforces synchronously before dispatching here.
-        if self.tester_running or self._review_running:
+        # (a tester round started/ended, a review is in flight): re-check
+        # the gates _advance() enforces synchronously before dispatching
+        # here. A test that can start right now (the tester is free and a
+        # TESTING task is ready) outranks promotion; a tester run already
+        # in flight does not — under parallel slots the free development
+        # slots are filled anyway (mirrors _advance()'s narrowed block).
+        if self._review_running:
             return
-        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
+        if not self.tester_running and self._next_testing() is not None:
+            return
+        if self.parallel_limit == 1 and (
+            self.tester_running
+            or any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks())
+        ):
             return
         blocked: set[str] = set()
         gate: dict[str, dict[str, str]] = {}
@@ -541,15 +571,15 @@ class PipelineLayer(DrCodeState):
         when something calls _advance() — a manual `git merge
         drcode/<dep>` (or a foreign merge) would otherwise sit unnoticed
         while the pipeline idles. When there are queued tasks with
-        dependencies, free development slots and no run in flight, this
-        re-fires the gate so a hand-merge unblocks the dependents by
-        itself. Works for parallelism 1 too (it fixes the pre-existing
+        dependencies, free development slots and no development/review
+        run in flight, this re-fires the gate so a hand-merge unblocks
+        the dependents by itself. A busy tester does not suppress the
+        tick — _advance() applies its own (narrowed) promotion gates.
+        Works for parallelism 1 too (it fixes the pre-existing
         "manual merge not noticed while idle" gap)."""
-        if self.tester_running or self.agent_running or self._review_running:
+        if self.agent_running or self._review_running:
             return
         if len(self.manager.active_tasks()) >= self.parallel_limit:
-            return
-        if any(t.status is TaskStatus.TESTING for t in self.manager.all_tasks()):
             return
         if not any(t.depends_on for t in self.manager.queued()):
             return
@@ -1629,8 +1659,10 @@ class PipelineLayer(DrCodeState):
                         # PASSED-finalization steps the tester path runs.
                         await self._finalize_research_completion(task)
                         self.refresh_sidebar()
-                    # Testing (this task or an older one in the backlog)
-                    # always goes before any new development.
+                    # A test that can start right now (this task or an
+                    # older one in the backlog) always goes before any
+                    # new development; under parallel slots the rest of
+                    # the queue flows while the tester is busy.
                     self._advance()
                 elif task.status is TaskStatus.QUEUED:
                     # The run failed and demoted the task back to the queue:
@@ -1643,9 +1675,10 @@ class PipelineLayer(DrCodeState):
     def _schedule_tester_retry(self, task_id: str) -> None:
         """Backoff before the next tester attempt for a failed task.
 
-        TESTING tasks block the whole pipeline, so a failed tester run is
-        retried (with capped exponential backoff) instead of being dropped
-        from the backlog until restart."""
+        A TESTING task must not be dropped from the backlog until restart,
+        so a failed tester run is retried with capped exponential backoff
+        (the timer re-fires _advance(); under parallel slots the queue
+        keeps flowing while the task waits out its window)."""
         count = self._tester_fail_count.get(task_id, 1)
         delay = min(5 * 2 ** (count - 1), 300)
         self._tester_retry_at[task_id] = time.monotonic() + delay

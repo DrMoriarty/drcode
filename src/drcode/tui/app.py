@@ -400,6 +400,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # the completed_at the audit passed against — re-completing a task
         # (re-queue → finalize again) re-arms the audit.
         self._hook_merge_audit_ok: dict[str, datetime] = {}
+        # Per-task mergedness of COMPLETED tasks' `drcode/<id>` branches
+        # (the sidebar colors their ✓ marker by it): "none" (no branch —
+        # isolation off, no repo, or the merged branch was cleaned up),
+        # "unmerged", "merged". Refreshed off the event loop by
+        # _unmerged_completed_ids (the same 10 s poll as the header's ⎇
+        # counter); tasks absent from the dict render the plain marker.
+        # Replaced wholesale by the worker thread — never mutated in
+        # place — so a read on the event loop is always consistent.
+        self._merge_state: dict[str, str] = {}
         self.viewed_id: str | None = None
         # Counted run state (parallel development slots): the in-flight
         # agent runs (task id -> generation) and the per-task run
@@ -1085,12 +1094,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         back-stamped, re-admitting the task no matter which process
         finalized it. Conversely a stale flag whose branch has since been
         merged by hand is cleared here. The whole audit reads one
-        batched mergedness snapshot (`unmerged_drcode_branches` — a
-        single `for-each-ref` glob, cached per fingerprint), so the cost
-        does not grow with the number of completed tasks. Blocking git
-        calls — run in a worker thread."""
+        batched mergedness snapshot (`drcode_branch_state` — one
+        `show-ref` plus a single `for-each-ref` glob, cached per
+        fingerprint), so the cost does not grow with the number of
+        completed tasks. Side effect: the same snapshot refreshes
+        `_merge_state` (per-task none/unmerged/merged), which the
+        sidebar's ✓ marker colors read — the state covers exactly the
+        candidate set of this method. Blocking git calls — run in a
+        worker thread."""
         env = self.task_env
         if not env.active:
+            self._merge_state = {}
             return []
         workflow = self.workflow
         # Candidates come from task statuses alone — no git here.
@@ -1106,14 +1120,28 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     continue  # the external review has not accepted it yet
             candidates.append(task)
         if not candidates:
+            self._merge_state = {}
             return []
         # ONE wholesale mergedness answer for every candidate branch (a
-        # glob over refs/heads/drcode/, cached per the fingerprint
-        # snapshot shared with unmerged_ids): the existence/mergedness
+        # snapshot + glob over refs/heads/drcode/, cached per the
+        # fingerprint shared with unmerged_ids): the existence/mergedness
         # check below AND the hook-merge audit both read from it — zero
         # git processes per task, so a project with hundreds of
-        # completed tasks polls in well under a second.
-        unmerged_branches = env.unmerged_drcode_branches()
+        # completed tasks polls in well under a second. The per-task
+        # state doubles as the sidebar's ✓ color source (none/unmerged/
+        # merged — the batched answer yields branch existence for free,
+        # which is the white-vs-colored discriminator).
+        existing, unmerged_branches = env.drcode_branch_state()
+        self._merge_state = {
+            task.id: (
+                "unmerged"
+                if env.branch(task.id) in unmerged_branches
+                else "merged"
+                if env.branch(task.id) in existing
+                else "none"
+            )
+            for task in candidates
+        }
         result: list[str] = []
         for task in candidates:
             research = task.kind is TaskKind.RESEARCH

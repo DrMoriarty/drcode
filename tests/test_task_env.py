@@ -696,3 +696,72 @@ def test_unmerged_ids_new_branch_appears_dynamically(
     assert env.unmerged_ids(["work"]) == set()
     _commit_on_branch(git_root, "drcode/work", "work")
     assert env.unmerged_ids(["work"]) == {"work"}
+
+
+# -- drcode_branch_state (existence + mergedness, one snapshot) --------------------
+
+
+def test_drcode_branch_state_batches_existence_and_mergedness(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    _commit_on_branch(git_root, "drcode/a", "a")
+    _commit_on_branch(git_root, "drcode/b", "b")
+    _git(git_root, "branch", "drcode/merged")
+    existing, unmerged = env.drcode_branch_state()
+    assert existing == {"drcode/a", "drcode/b", "drcode/merged"}
+    assert unmerged == {"drcode/a", "drcode/b"}
+    # The shorthand is exactly the unmerged half of the same snapshot.
+    assert env.unmerged_drcode_branches() == unmerged
+
+
+def test_drcode_branch_state_isolation_off(git_root: Path) -> None:
+    env = TaskEnvironment(git_root, ProjectSettings())
+    assert not env.active
+    assert env.drcode_branch_state() == (set(), set())
+
+
+def test_drcode_branch_state_reflects_merge_and_removal_dynamically(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """Same fingerprint cache as unmerged_ids: a manual merge and a
+    later branch cleanup must both flip the answer on the next call."""
+    _commit_on_branch(git_root, "drcode/work", "work")
+    _git(git_root, "branch", "drcode/idle")
+    existing, unmerged = env.drcode_branch_state()
+    assert unmerged == {"drcode/work"}
+    _git(git_root, "merge", "-q", "--no-ff", "drcode/work", "-m", "merge work")
+    existing, unmerged = env.drcode_branch_state()
+    assert existing == {"drcode/work", "drcode/idle"}
+    assert unmerged == set()
+    # The accepted-worktree-removal path deletes a merged branch — the
+    # task must fall back to "no branch" (white ✓), not stay green.
+    _git(git_root, "branch", "-D", "drcode/work")
+    existing, unmerged = env.drcode_branch_state()
+    assert "drcode/work" not in existing
+    assert unmerged == set()
+
+
+def test_drcode_branch_state_repeated_calls_reuse_cache(
+    env: TaskEnvironment, git_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Steady state (refs unchanged): a poll is one cheap `show-ref`
+    snapshot — the warm cache answers both halves, no extra glob."""
+    _commit_on_branch(git_root, "drcode/work", "work")
+    _git(git_root, "branch", "drcode/merged")
+    assert env.drcode_branch_state() == (
+        {"drcode/work", "drcode/merged"},
+        {"drcode/work"},
+    )
+    calls: list[tuple[str, ...]] = []
+    original = env._git
+
+    def spy(*args: str, **kwargs: object) -> tuple[int, str]:
+        calls.append(args)
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(env, "_git", spy)
+    assert env.drcode_branch_state() == (
+        {"drcode/work", "drcode/merged"},
+        {"drcode/work"},
+    )
+    assert calls == [("show-ref", "--head")]

@@ -140,8 +140,13 @@ class ChatViewLayer(DrCodeState):
 
     def _sidebar_fingerprint(self) -> tuple:
         """Lightweight snapshot of everything the sidebar renders: status,
-        verification label, title, the viewed-marker and the queue stamp
-        (the QUEUE section is order-sensitive) per task."""
+        verification label, title, the viewed-marker, the queue stamp
+        (the QUEUE section is order-sensitive) and the mergedness color
+        of the ✓ marker per task. The merge state lives outside the task
+        objects (updated off the event loop by the 10 s git poll), so
+        without it here a color-only change would not redraw — the same
+        staleness trap _poll_sidebar's fingerprint guards against."""
+        merge_state = self._merge_state
         return tuple(
             (
                 t.id,
@@ -152,6 +157,7 @@ class ChatViewLayer(DrCodeState):
                 t.id == self.viewed_id,
                 t.queue_seq,
                 t.queue_head,
+                merge_state.get(t.id, ""),
             )
             for t in self.manager.all_tasks()
         )
@@ -314,14 +320,28 @@ class ChatViewLayer(DrCodeState):
     def _task_row_text(self, t: Task) -> str:
         """Rendered label of a task row (the incremental refresh compares
         it against the mounted row to skip unchanged labels)."""
-        marker = {
-            "queued": "⏳",
-            "hold": "⏸",
-            "active": "▶",
-            "testing": "🧪",
-            "completed": "✓",
-            "clarification": "❓",
-        }.get(t.status.value, "⏳")
+        if t.status.value == "completed":
+            # The ✓ color tracks the mergedness of the task's
+            # `drcode/<id>` branch (refreshed by the 10 s git poll):
+            # orange while the work sits unmerged, green once merged,
+            # plain when no branch exists (isolation off, no repo, or
+            # the merged branch was cleaned up) — the accepted
+            # "temporary green" limitation: the cleanup deletes a merged
+            # branch, turning the task white again.
+            color = {
+                "unmerged": "orange",
+                "merged": "green",
+            }.get(self._merge_state.get(t.id, "none"))
+            marker = f"[{color}]✓[/]" if color else "✓"
+        else:
+            marker = {
+                "queued": "⏳",
+                "hold": "⏸",
+                "active": "▶",
+                "testing": "🧪",
+                "completed": "✓",
+                "clarification": "❓",
+            }.get(t.status.value, "⏳")
         kind_letter = {
             TaskKind.BUG: "[red]B[/]",
             TaskKind.RESEARCH: "[yellow]R[/]",

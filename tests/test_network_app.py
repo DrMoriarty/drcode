@@ -31,6 +31,7 @@ from drcode.agent import (
     serialize_messages,
 )
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
+from drcode.providers import AgentRole
 from drcode.tui import pipeline as pipeline_module
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (
@@ -77,6 +78,24 @@ def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     state = ScriptedState()
     monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
     return state
+
+
+@pytest.fixture
+def wide_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The COMPACTION role resolves with a huge window: the rendered prompt
+    fits, so these tests exercise the LLM summarizer path. (With the
+    small-ctx fixture's 1000-token window everywhere, the pre-flight check
+    of the mechanical compaction floor would route every compaction through
+    the LLM-free trim instead.)"""
+    real = DrCodeApp.resolved_config
+
+    def resolved(self: DrCodeApp, role: AgentRole):  # type: ignore[no-untyped-def]
+        cfg = real(self, role)
+        if role is AgentRole.COMPACTION:
+            return cfg.model_copy(update={"max_context_tokens": 200_000})
+        return cfg
+
+    monkeypatch.setattr(DrCodeApp, "resolved_config", resolved)
 
 
 @pytest.fixture
@@ -405,7 +424,7 @@ def _seed_transcript(app: DrCodeApp, prompt: str) -> Any:
 
 
 async def test_compaction_failure_is_not_fatal(
-    net_app_small_ctx: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from pydantic_ai.models.function import FunctionModel
 
@@ -429,7 +448,7 @@ async def test_compaction_failure_is_not_fatal(
 
 
 async def test_compaction_success_replaces_history(
-    net_app_small_ctx: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from pydantic_ai.models.function import FunctionModel
 
@@ -451,6 +470,117 @@ async def test_compaction_success_replaces_history(
     assert is_summary_message(task.messages[1])
     assert "THE SUMMARY BODY" in task.messages[1]["parts"][0]["content"]
     assert not state.steps  # exactly one summarizer request happened
+
+
+async def test_compaction_preflight_skips_llm_and_trims_mechanically(
+    net_app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The rendered prompt does not fit the compaction model's window (the
+    chars/4 pre-flight estimate says the summarizer request would be
+    rejected deterministically): the summarizer is never called and the
+    transcript is trimmed mechanically — the guaranteed floor that cannot
+    fail with a 400."""
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert scripted.calls == []  # the summarizer was never invoked
+    # Original prompt verbatim + the mechanical note request (nothing of the
+    # tail fit the tiny budget); the note is the next previous summary and
+    # the transcript stays resumable.
+    assert [m["kind"] for m in task.messages] == ["request", "request"]
+    assert not is_summary_message(task.messages[0])
+    assert is_summary_message(task.messages[1])
+    note = task.messages[1]["parts"][0]["content"]
+    assert "dropped mechanically" in note
+    assert ends_with_open_request(task.messages)
+
+
+async def test_compaction_overflow_fallback_trims_mechanically(
+    net_app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    wide_compaction: None,
+) -> None:
+    """The estimate said the prompt fits, but the gateway rejected the
+    summary request anyway with a deterministic context-overflow 400
+    (the _is_context_overflow_error classification): compaction falls back
+    to the mechanical floor instead of failing."""
+    from drcode.compaction import extract_previous_summary
+
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+    scripted.steps = [
+        http_error(400, "This model's maximum context length is 262144 tokens")
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("trimming mechanically" in t for t in texts)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert "dropped mechanically" in (extract_previous_summary(task.messages) or "")
+
+
+async def test_tester_round_compaction_mechanical_floor(
+    net_app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The tester round gate carries the same guarantee: when the
+    summarizer cannot run, the round is trimmed mechanically and reported
+    as compacted (the caller resumes it and drops the stale live tokens)
+    instead of looping uncompressed through a guaranteed 400."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    # Hold the task so the pipeline does not promote it while the gate is
+    # exercised directly (the round transcript below is seeded by hand).
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    # A testing round whose fill (2k tokens) is past the 1000-token window's
+    # 80% threshold — same shape as _seed_transcript, for the round.
+    task.tester_messages = [
+        serialize_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content="Verify completed task #1")]
+                ),
+                ModelResponse(
+                    parts=[TextPart("working")],
+                    usage=RequestUsage(input_tokens=2000, output_tokens=8),
+                ),
+            ]
+        )
+    ]
+    net_app_small_ctx.manager.storage.save(task)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        assert await net_app_small_ctx._maybe_compact_tester_round(task, 900) is True
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert scripted.calls == []
+    final_round = task.tester_messages[-1]
+    # The round's tail fits the budget: prompt verbatim, response kept, the
+    # mechanical note request last.
+    assert [m["kind"] for m in final_round] == ["request", "response", "request"]
+    assert not is_summary_message(final_round[0])
+    assert is_summary_message(final_round[-1])
+    # The developer transcript is untouched, as with the LLM path.
+    assert not any(is_summary_message(m) for m in task.messages)
 
 
 # -- mid-run context compaction ------------------------------------------------------------
@@ -476,6 +606,7 @@ def scripted_fills(monkeypatch: pytest.MonkeyPatch):
 
 async def test_mid_run_compaction_pauses_and_resumes(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -532,6 +663,7 @@ async def test_mid_run_compaction_pauses_and_resumes(
 
 async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -612,6 +744,7 @@ async def test_no_mid_run_pause_below_threshold(
 
 async def test_tester_round_compaction_replaces_round_transcript(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -677,6 +810,7 @@ async def test_tester_round_compaction_replaces_round_transcript(
 
 async def test_tester_round_compaction_failure_is_not_fatal(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -719,6 +853,7 @@ async def test_tester_round_compaction_failure_is_not_fatal(
 
 async def test_tester_round_compaction_never_touches_agent_transcript(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -761,6 +896,7 @@ async def test_tester_round_compaction_never_touches_agent_transcript(
 
 async def test_second_mid_run_compaction_does_not_grow_summary(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,
@@ -824,6 +960,7 @@ async def test_second_mid_run_compaction_does_not_grow_summary(
 
 async def test_second_tester_round_compaction_does_not_grow_summary(
     net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
     scripted: ScriptedState,
     scripted_fills: Any,
     project_root: Path,

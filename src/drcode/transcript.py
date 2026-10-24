@@ -34,6 +34,22 @@ from pydantic_ai.usage import RunUsage
 # regular user message.
 COMPACTION_SUMMARY_PREFIX = "[context summary]"
 
+# Conventional token-size assumption of the chars/4 estimate: ~4 characters
+# per token. Used by `estimate_tokens` here and re-exported by
+# `context_layout` (which labels every figure built from it with "≈").
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str) -> int:
+    """≈ tokens of `text` by the chars/4 heuristic (0 for empty text).
+
+    Lives here (not in `context_layout`) because the compaction module needs
+    it too and must not import `context_layout` — which pulls in `agent` and
+    would close a circular import."""
+    if not text:
+        return 0
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
 
 def serialize_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
     return ModelMessagesTypeAdapter.dump_python(messages, mode="json")  # type: ignore[return-value]

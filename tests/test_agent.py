@@ -33,6 +33,8 @@ from drcode.agent import (
     last_context_tokens,
     load_agents_md,
     load_messages,
+    mechanical_compaction_messages,
+    prompt_fits_context,
     render_history_for_summary,
     resumable_history,
     sanitized_messages,
@@ -498,6 +500,152 @@ def test_compacted_messages_drops_request_reduced_to_summary() -> None:
     result = compacted_messages(pure_summary, "new summary")
     assert [is_summary_message(m) for m in result] == [True]
     assert "new summary" in result[0]["parts"][0]["content"]
+
+
+# -- mechanical compaction floor (no LLM call) ---------------------------------
+
+
+def _msg_tokens(msg: dict) -> int:
+    """The same conservative wire-size estimate the mechanical floor uses."""
+    return len(json.dumps(msg, ensure_ascii=False)) // 4
+
+
+def _has_returns(msg: dict) -> bool:
+    return any(
+        isinstance(p, dict) and p.get("part_kind") == "tool-return"
+        for p in msg.get("parts", [])
+    )
+
+
+def _has_calls(msg: dict) -> bool:
+    return any(
+        isinstance(p, dict) and p.get("part_kind") == "tool-call"
+        for p in msg.get("parts", [])
+    )
+
+
+def test_prompt_fits_context() -> None:
+    cfg = Config(project_root=None, max_context_tokens=1000, max_tokens=100)
+    # 250 (prompt) + 1 (system) + 100 (output reserve) ≤ 1000.
+    assert prompt_fits_context("x" * 1000, "s", cfg)
+    assert not prompt_fits_context("x" * 100_000, "s", cfg)
+    # An unknown window (≤ 0) counts as fitting — the LLM path is tried.
+    unknown = Config(project_root=None, max_context_tokens=0)
+    assert prompt_fits_context("x" * 10_000_000, "s", unknown)
+
+
+def test_mechanical_compaction_noop_when_everything_fits() -> None:
+    data = serialize_messages(
+        [user_msg("task"), text_response("early work"), text_response("recent work")]
+    )
+    result = mechanical_compaction_messages(data, token_budget=10**9)
+    assert [m["kind"] for m in result] == [
+        "request",
+        "response",
+        "response",
+        "request",
+    ]
+    assert result[0] == data[0]
+    assert is_summary_message(result[-1])
+    note = result[-1]["parts"][0]["content"]
+    assert "dropped mechanically" in note
+    # The note request closes the transcript: resumable as a continuation.
+    assert ends_with_open_request(result)
+
+
+def test_mechanical_compaction_trims_middle_within_budget() -> None:
+    big = "x" * 40_000  # ≈10k tokens
+    data = serialize_messages(
+        [user_msg("task"), text_response(big), text_response("recent work")]
+    )
+    result = mechanical_compaction_messages(data, token_budget=6_000)
+    # The original prompt and the LAST messages are kept, the heavy middle
+    # response is gone, the note rides last.
+    assert [m["kind"] for m in result] == ["request", "response", "request"]
+    recent = [p["content"] for p in result[1]["parts"] if p["part_kind"] == "text"]
+    assert recent == ["recent work"]
+    note = result[-1]["parts"][0]["content"]
+    assert big not in json.dumps(result)
+    assert "dropped mechanically" in note
+
+
+def test_mechanical_compaction_never_orphans_tool_returns() -> None:
+    big_args = {"command": "q" * 4000}  # ≈1000 tokens as a call response
+    big_result = "z" * 800  # ≈200 tokens as a return
+    data = serialize_messages(
+        [
+            user_msg("task"),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="run_bash", args=big_args, tool_call_id="c1")
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="run_bash",
+                        content=big_result,
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+        ]
+    )
+    preserved, rest = split_original_prompts(data)
+    # Budget that fits exactly the last (return) request plus the stub, but
+    # NOT the big call response before it.
+    stub_tokens = _msg_tokens(mechanical_compaction_messages(data, 10**9)[-1])
+    budget = (
+        sum(_msg_tokens(m) for m in preserved)
+        + stub_tokens
+        + _msg_tokens(rest[-1])
+        + 10
+    )
+    result = mechanical_compaction_messages(data, budget)
+    # The orphan return (its call response was trimmed) is dropped with the
+    # cut: no tool return ever appears without its call right before it.
+    for i, m in enumerate(result):
+        if _has_returns(m):
+            assert i > 0 and _has_calls(result[i - 1])
+    assert not any(_has_calls(m) or _has_returns(m) for m in result)
+    assert [m["kind"] for m in result] == ["request", "request"]
+
+
+def test_mechanical_compaction_keeps_intact_tool_pair() -> None:
+    data = serialize_messages(
+        [
+            user_msg("task"),
+            text_response("middle work"),
+            tool_call_response("c1"),
+            tool_return_msg("c1"),
+        ]
+    )
+    result = mechanical_compaction_messages(data, token_budget=10**9)
+    for i, m in enumerate(result):
+        if _has_returns(m):
+            assert i > 0 and _has_calls(result[i - 1])
+    # The call→return pair survived the cut, the stub closes the transcript.
+    assert _has_returns(result[-2]) and _has_calls(result[-3])
+    assert is_summary_message(result[-1])
+
+
+def test_mechanical_compaction_embeds_previous_summary() -> None:
+    """The previous summary must survive verbatim: it is embedded in the
+    note (the next compaction's previous summary), so the anchored chain
+    never loses the condensed history."""
+    data = serialize_messages(
+        [
+            user_msg(f"{COMPACTION_SUMMARY_PREFIX}\nold summary"),
+            text_response("w"),
+        ]
+    )
+    result = mechanical_compaction_messages(data, token_budget=10**9)
+    note = result[-1]["parts"][0]["content"]
+    assert "<previous-summary>\nold summary\n</previous-summary>" in note
+    extracted = extract_previous_summary(result)
+    assert extracted is not None
+    assert extracted == note.split("\n", 1)[1].strip()
+    assert "old summary" in extracted
 
 
 # -- AGENTS.md loading ------------------------------------------------------------

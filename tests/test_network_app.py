@@ -614,6 +614,7 @@ async def test_tester_round_compaction_mechanical_floor(
     # The developer transcript is untouched, as with the LLM path.
     assert not any(is_summary_message(m) for m in task.messages)
 
+
 # -- map-reduce compaction (history larger than the summarizer's window) ----
 
 
@@ -668,9 +669,11 @@ async def test_map_reduce_compaction_over_window(
 
     app = DrCodeApp(project_root)
     # Rendered history ~25k chars (~6k estimated tokens) vs a 2k-token
-    # window: several times over, and past the compaction threshold (the
-    # seeded response reports a 2k-token fill).
+    # window: several times over. The seeded response reports a 900-token
+    # fill (the shared seeding helper), so script a live fill past the 80%
+    # threshold (1600 of 2000) but below the 97% hard limit to fire the gate.
     task = _seed_transcript(app, "word " * 5_000)
+    app._live_ctx_tokens[task.id] = 1700
 
     async with app.run_test() as pilot:
         await pilot.pause()

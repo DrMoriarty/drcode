@@ -104,6 +104,14 @@ from .usage import (
 _HARD_LIMIT_PCT = 97
 
 
+class _ChunkingImpossible(Exception):
+    """The history cannot be chunked into map-reduce slices that fit the
+    COMPACTION role's context window (a tiny window the slice budget's
+    floor exceeds, or no summarizable slices at all): every map call would
+    deterministically overflow — the deterministic signal for the caller
+    to apply the mechanical floor instead of calling the model."""
+
+
 class PipelineLayer(DrCodeState):
     @property
     def parallel_limit(self) -> int:
@@ -979,14 +987,14 @@ class PipelineLayer(DrCodeState):
         tasks, meaning "the summarizer is unavailable", and clear it when
         the summarizer ran fine).
 
-        LLM path first — but only after a pre-flight size check: when the
-        rendered prompt plausibly does not fit the COMPACTION role's context
-        window (chars/4 estimate), the summarizer request would be rejected
-        deterministically (HTTP 400) and compaction would fail with the run
-        continuing uncompressed past the hard limit. In that case the LLM is
-        skipped and the transcript is trimmed mechanically
-        (`mechanical_compaction_messages`) — a guaranteed floor that never
-        calls the model. The same floor engages as a fallback when the
+        The LLM path goes through `_summarize_history`, which owns the
+        single-shot pre-flight (the rendered prompt must fit the COMPACTION
+        role's context window) and falls back to a chunked map-reduce
+        summarization when the history does not fit — so an oversized
+        history is still summarized, never skipped. Two deterministic
+        outcomes bypass the LLM and land on the mechanical floor
+        (`mechanical_compaction_messages`): the window is too small for
+        even one minimal map-reduce slice (`_ChunkingImpossible`), or the
         gateway rejects the summary request anyway with a deterministic
         context-overflow error (see `_is_context_overflow_error`) — the
         chars/4 estimate can under-shoot.
@@ -999,22 +1007,15 @@ class PipelineLayer(DrCodeState):
         words `_compaction_failed` may mean "the summarizer is
         unavailable", never "growth past the limit is allowed".
         """
-        compaction_config = self.resolved_config(AgentRole.COMPACTION)
-        system_prompt, template = load_compaction_prompts()
-        prompt = build_compaction_prompt(
-            extract_previous_summary(messages),
-            render_history_for_summary(messages),
-            template,
-            checklist=checklist,
-        )
-        if not prompt_fits_context(prompt, system_prompt, compaction_config):
-            trimmed, event = self._mechanical_compact(messages, summary_role, what)
-            return trimmed, event, False
-        agent = build_compaction_agent(compaction_config)
         try:
-            result = await agent.run(prompt)
+            summary = await self._summarize_history(task, messages, checklist=checklist)
         except asyncio.CancelledError:
             raise
+        except _ChunkingImpossible:
+            # Chunking cannot produce a slice that fits the window: the
+            # mechanical floor is the only path that never overflows.
+            trimmed, event = self._mechanical_compact(messages, summary_role, what)
+            return trimmed, event, False
         except Exception as e:
             if _is_context_overflow_error(e):
                 # The estimate under-shot and the gateway rejected the
@@ -1040,12 +1041,10 @@ class PipelineLayer(DrCodeState):
             )
             trimmed, event = self._mechanical_compact(messages, summary_role, what)
             return trimmed, event, True
-        # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
         event = (
             f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
         )
-        return compacted_messages(messages, result.output), event, False
+        return compacted_messages(messages, summary), event, False
 
     async def _run_summarizer(self, prompt: str) -> str:
         """One compaction model call: run the tool-less summarizer and
@@ -1140,65 +1139,67 @@ class PipelineLayer(DrCodeState):
         messages: list[dict[str, Any]],
         *,
         checklist: str | None = None,
-    ) -> str | None:
+    ) -> str:
         """LLM summarization of `messages` for compaction, shared by the
-        main-agent and tester-round gates.
+        main-agent and tester-round gates (both via _compact_transcript).
 
         Single-shot when the rendered history fits the COMPACTION role's
-        window; otherwise a map-reduce: the history is chunked at
-        conversation boundaries into slices that fit (with headroom for the
-        system prompt, output template, anchors and the reduce step), the
-        slices are summarized sequentially — each map call sees the running
-        partial summaries as its <previous-summary> anchor, mirroring the
-        previous-summary anchoring of the single-shot path — and a final
-        reduce call merges the partials into the structured summary
-        (hierarchical reduce, then a mechanical per-partial trim, when the
-        partials themselves overflow the merge call).
+        window (the chars/4 pre-flight, `prompt_fits_context`); otherwise a
+        map-reduce: the history is chunked at conversation boundaries into
+        slices that fit (with headroom for the system prompt, output
+        template, anchors and the reduce step), the slices are summarized
+        sequentially — each map call sees the running partial summaries as
+        its <previous-summary> anchor, mirroring the previous-summary
+        anchoring of the single-shot path — and a final reduce call merges
+        the partials into the structured summary (hierarchical reduce, then
+        a mechanical per-partial trim, when the partials themselves
+        overflow the merge call). When even one minimal slice cannot fit
+        the window (a tiny window the slice budget's floor exceeds), raises
+        `_ChunkingImpossible` — the deterministic signal for the caller to
+        apply the mechanical floor instead of calling the model.
 
         Every model call's usage is recorded via _record_session_usage, so
         total extra calls stay visible exactly like the single-shot path.
-        Returns the summary text, or None when a summarizer call failed
-        (compaction must not kill the run) — the callers decide the
-        failure's side effects (_compaction_failed etc.)."""
-        _system_prompt, template = load_compaction_prompts()
+        Returns the summary text; a summarizer failure propagates to the
+        caller (_compact_transcript), which keeps the mechanical-floor /
+        retry-later / hard-limit-escalation semantics (compaction must not
+        kill the run)."""
+        system_prompt, template = load_compaction_prompts()
         anchor = extract_previous_summary(messages)
-        try:
-            prompt = build_compaction_prompt(
-                anchor,
-                render_history_for_summary(messages),
-                template,
-                checklist=checklist,
+        prompt = build_compaction_prompt(
+            anchor,
+            render_history_for_summary(messages),
+            template,
+            checklist=checklist,
+        )
+        compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
+        if prompt_fits_context(prompt, system_prompt, compaction_cfg):
+            return await self._run_summarizer(prompt)
+        budget = slice_budget_tokens(compaction_cfg, anchor, checklist)
+        if budget > compaction_cfg.max_context_tokens:
+            raise _ChunkingImpossible(
+                f"the {compaction_cfg.max_context_tokens}-token window is "
+                f"smaller than one minimal {budget}-token slice"
             )
-            compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
-            if prompt_fits_window(prompt, compaction_cfg):
-                return await self._run_summarizer(prompt)
-            slices = chunk_history_for_summary(
-                messages,
-                slice_budget_tokens(compaction_cfg, anchor, checklist),
-            )
-            if not slices:
-                return None
-            self._show_event(
-                task,
-                f"History too large for one summarizer call — map-reduce "
-                f"over {len(slices)} slice(s)…",
-            )
-            partials: list[str] = []
-            for chunk in slices:
-                running = "\n\n".join(partials) if partials else anchor
-                partials.append(
-                    await self._run_summarizer(
-                        build_compaction_prompt(
-                            running, chunk, template, checklist=checklist
-                        )
+        slices = chunk_history_for_summary(messages, budget)
+        if not slices:
+            raise _ChunkingImpossible("no summarizable slices")
+        self._show_event(
+            task,
+            f"History too large for one summarizer call — map-reduce "
+            f"over {len(slices)} slice(s)…",
+        )
+        partials: list[str] = []
+        for chunk in slices:
+            running = "\n\n".join(partials) if partials else anchor
+            partials.append(
+                await self._run_summarizer(
+                    build_compaction_prompt(
+                        running, chunk, template, checklist=checklist
                     )
                 )
-            return await self._reduce_partials(partials, template, checklist)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
-            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
-            return None
+            )
+        return await self._reduce_partials(partials, template, checklist)
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -1209,10 +1210,11 @@ class PipelineLayer(DrCodeState):
         max_context_tokens), the main agent's work is paused and the
         transcript is compacted: a tool-less summarizer agent rewrites it
         into a structured summary (anchored to the previous one, if any) —
-        or, when the summarizer itself cannot be run (the rendered prompt
-        does not fit the compaction model's window, or the gateway rejects
-        the summary request with a deterministic context-overflow error),
-        the transcript is trimmed mechanically without any LLM call. Either
+        single-shot when it fits the compaction model's window, else a
+        chunked map-reduce — or, when the summarizer itself cannot be run
+        (the gateway rejects the summary request with a deterministic
+        context-overflow error), the transcript is trimmed mechanically
+        without any LLM call. Either
         way the transcript is replaced by the original user prompt(s) plus
         the summary/note, so compaction always terminates with a history
         that fits the serving model's context. A compaction failure is
@@ -1309,7 +1311,7 @@ class PipelineLayer(DrCodeState):
         (`task.tester_messages[-1]`) in place — `task.messages` (the
         developer transcript) is never touched, the two histories must not
         mix (tester rounds are persisted separately precisely so they never
-        leak into the coding agent's model history). The same pre-flight /
+        leak into the coding agent's model history). The same summarizer /
         mechanical-floor guarantees apply: when the summarizer cannot be
         run, the round is trimmed mechanically instead of looping through a
         guaranteed failure.

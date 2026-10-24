@@ -62,6 +62,7 @@ from .command_providers import (
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
+    TaskSettingsCommandProvider,
 )
 from .header import ModelStatusHeader
 from .inputs import ChatInput, DepsInput, NewTaskInput
@@ -96,11 +97,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends). The model
     # entries (provider catalog, per-role picks) live in the "Model
-    # settings…" sub-menu, whose providers are passed explicitly by
-    # action_open_model_settings.
+    # settings…" sub-menu and the task-management preferences in the
+    # "Task settings…" sub-menu; both sub-palettes' providers are passed
+    # explicitly by their open actions.
     COMMANDS: ClassVar = {
         get_system_commands_provider,
         ModelSettingsCommandProvider,
+        TaskSettingsCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,

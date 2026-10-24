@@ -30,6 +30,7 @@ from drcode import agent_model
 from drcode.agent import serialize_messages
 from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
+from drcode.settings import parallel_tasks_label
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
@@ -1768,6 +1769,74 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         )
         catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [name for name, _help, _cb in catalog] == ["Provider catalog…"]
+
+
+async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
+    """The main Settings menu collapses the six task-management entries
+    into one "Task settings…" item, which opens the sub-menu with exactly
+    those six preference entries."""
+    from drcode.tui.command_providers import (
+        ProjectSettingsCommandsProvider,
+        TaskSettingsCommandProvider,
+        TaskSettingsEntriesProvider,
+        TaskSettingsPalette,
+    )
+
+    # The main menu has no direct task entries anymore.
+    assert "Task settings" in SettingsPalette.ENTRY_ORDER
+    for prefix in (
+        "Auto-delete completed tasks:",
+        "Task finalization:",
+        "Max development rounds:",
+        "Nudge stalled agent after:",
+        "Task isolation:",
+        "Parallel tasks:",
+    ):
+        assert prefix not in SettingsPalette.ENTRY_ORDER
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        provider = TaskSettingsCommandProvider(app.screen)
+        commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [(name, cb) for name, _help, cb in commands] == [
+            ("Task settings…", app.action_open_task_settings)
+        ]
+        app.action_open_task_settings()
+        await pilot.pause()
+        palette = app.screen
+        assert isinstance(palette, TaskSettingsPalette)
+        # Wait for the palette's gather worker to finish.
+        command_list = palette.query_one(CommandList)
+        for _ in range(100):
+            if "-ready" in palette.classes and command_list.option_count:
+                break
+            await pilot.pause()
+        await pilot.pause()
+        names = [
+            cast(Command, command).hit.text or "" for command in command_list._options
+        ]
+        assert names == [
+            f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
+            f"Task finalization: {app.settings.task_finalization.label}",
+            f"Max development rounds: {app.settings.max_dev_rounds}",
+            f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
+            f"Task isolation: {app._task_isolation_label()}",
+            f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
+        ]
+        # The main-menu provider no longer carries the task entries: it
+        # keeps only the workflow/github/notifications/voice preferences.
+        main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        main_names = [name for name, _help, _cb in main]
+        assert main_names == [
+            f"Workflow: {app.workflow_status_label()}",
+            (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
+            (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
+            f"Voice: {app.voice_status_label()}",
+        ]
+        # Sub-menu providers: the six task entries, nothing else.
+        entries = TaskSettingsEntriesProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _help, _cb in entries] == names
 
 
 async def test_custom_role_model_dialog_prefills_and_saves(

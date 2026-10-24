@@ -62,6 +62,8 @@ from .command_providers import (
     RoleModelsCommandsProvider,
     SettingsPalette,
     StallNudgeOptionsProvider,
+    TaskSettingsEntriesProvider,
+    TaskSettingsPalette,
     ThemeOptionsProvider,
     role_model_options_provider,
 )
@@ -923,6 +925,21 @@ class ActionsLayer(DrCodeState):
                 id="--model-settings-palette",
                 providers=[ModelCatalogCommandProvider, RoleModelsCommandsProvider],
                 placeholder="Model settings…",
+            )
+        )
+
+    def action_open_task_settings(self) -> None:
+        """Open the "Task settings…" sub-menu: the six task-management
+        project preferences in one palette. Runs as the callback of a
+        palette entry — the palette has already dismissed itself by the
+        time this executes, so pushing the sub-palette is safe."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            TaskSettingsPalette(
+                id="--task-settings-palette",
+                providers=[TaskSettingsEntriesProvider],
+                placeholder="Task settings…",
             )
         )
 

@@ -1654,6 +1654,9 @@ class ChatViewLayer(DrCodeState):
         )
         state = "running" if self.agent_running else "idle"
         tester = "running" if self.tester_running else "idle"
+        # Armed-ESC confirmation (esc_abort: double_press): show that the
+        # next ESC within the window will stop the run(s).
+        esc = " (esc armed)" if self._esc_armed_signature else ""
         if active:
             who = f"#{active[0].id} {active[0].title_display}"
             if len(active) > 1:
@@ -1666,7 +1669,7 @@ class ChatViewLayer(DrCodeState):
         )
         statusbar.update(
             f" active: {who}   queue: {queue_len}   testing: {testing_len}   "
-            f"agent: {state}   tester: {tester}   model: {model} "
+            f"agent: {state}   tester: {tester}{esc}   model: {model} "
         )
         self.refresh_task_status()
 

@@ -6,7 +6,8 @@ waits), interaction with the depends_on gate (blocked tasks never
 promoted even with free slots; siblings unblocked together after the
 dependency is completed AND merged), the ESC semantics matrix
 (parallelism 1 = the historical global stop; parallelism 2 = only the
-viewed task's run), the worktree activation race (serialized
+viewed task's run) under the double-press arming (first ESC arms, second
+confirms; debounced fast repeats and expired windows re-arm), the worktree activation race (serialized
 ensure_root), the settings gating (parallel > 1 without isolation
 behaves as 1, with a warning) and the startup recovery (stale ACTIVE
 tasks demoted, slots refilled). The narrowed promotion gate (variant A)
@@ -31,6 +32,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from drcode import agent_model
 from drcode.models import Task, TaskStatus
 from drcode.settings import (
+    EscAbort,
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
@@ -38,6 +40,7 @@ from drcode.settings import (
 )
 from drcode.task_env import TaskEnvironment
 from drcode.task_manager import TaskManager
+from drcode.tui.actions import ActionsLayer
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import ScriptedState, text_response, wait_until
 
@@ -91,6 +94,23 @@ def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     state = ScriptedState()
     monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
     return state
+
+
+@pytest.fixture
+def esc_timing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shorten the armed-ESC timings: pilot presses land within a few
+    milliseconds of each other, so the real 250ms debounce would swallow
+    every deliberate second press; a short arm window keeps the expiry
+    test fast."""
+    monkeypatch.setattr(ActionsLayer, "_ESC_DEBOUNCE_SECONDS", 0.0)
+    monkeypatch.setattr(ActionsLayer, "_ESC_ARM_SECONDS", 2.0)
+
+
+def _disarm_window(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Shorten only the armed window (the debounce stays 0): for the
+    expiry test the window must pass while the test waits."""
+    monkeypatch.setattr(ActionsLayer, "_ESC_DEBOUNCE_SECONDS", 0.0)
+    monkeypatch.setattr(ActionsLayer, "_ESC_ARM_SECONDS", seconds)
 
 
 def _gate_on(
@@ -298,6 +318,7 @@ async def test_esc_parallel_one_stops_everything(
     configured_env: None,
     scripted: ScriptedState,
     monkeypatch: pytest.MonkeyPatch,
+    esc_timing: None,
 ) -> None:
     _save_settings(git_root, isolation=TaskIsolation.WORKTREE, parallel=1)
     app = DrCodeApp(git_root)
@@ -309,6 +330,10 @@ async def test_esc_parallel_one_stops_everything(
         await pilot.pause()
         await _dismiss_startup_dialog(pilot)
         await wait_until(lambda: app.agent_running, pilot, what="agent running")
+        # esc_abort: double_press — the first ESC only arms the stop.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.agent_running, "the first ESC must only arm the stop"
         await pilot.press("escape")
         await pilot.pause()
         await pilot.pause()
@@ -325,6 +350,7 @@ async def test_esc_parallel_two_stops_only_viewed_task(
     configured_env: None,
     scripted: ScriptedState,
     monkeypatch: pytest.MonkeyPatch,
+    esc_timing: None,
 ) -> None:
     _save_settings(git_root, isolation=TaskIsolation.WORKTREE, parallel=2)
     app = DrCodeApp(git_root)
@@ -352,6 +378,10 @@ async def test_esc_parallel_two_stops_only_viewed_task(
         )
         assert branch_exists(app.project_root, f"drcode/{a.id}")
         assert branch_exists(app.project_root, f"drcode/{b.id}")
+        # esc_abort: double_press — arm, then confirm.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert a.id in app._agent_runs, "the first ESC must only arm the stop"
         await pilot.press("escape")
         await pilot.pause()
         await pilot.pause()
@@ -678,3 +708,231 @@ async def test_dependency_gate_still_blocks_while_tester_busy(
             what="dependency gate records the unsatisfied dependency",
         )
         assert x.status is TaskStatus.QUEUED
+
+
+# -- armed ESC (esc_abort: double_press) -------------------------------------------------
+
+
+def _save_esc_mode(root: Path, mode: EscAbort) -> None:
+    store = ProjectSettingsStore(root)
+    settings = store.load()
+    settings.esc_abort = mode
+    store.save(settings)
+
+
+async def test_esc_single_press_arms_and_toasts(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch, esc_timing: None
+) -> None:
+    """First ESC with a live run: nothing stops, the arming is announced
+    and the statusbar shows it."""
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        task = app.manager.create("busy", "do it")
+        app._advance()
+        await pilot.pause()
+        # Simulate a live run without a model.
+        app._agent_runs[task.id] = 1
+        # The new-task input binds ESC with priority (cancels the form):
+        # move focus to the chat input, or the press never reaches the
+        # app-level stop action.
+        app.chat_input.focus()
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {task.id: 1}, "single ESC must not stop"
+        assert app._esc_armed_signature is not None, "the run must be armed"
+        assert any("Press ESC again" in t for t in toasts)
+
+
+async def test_esc_double_press_stops_with_mitigation(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch, esc_timing: None
+) -> None:
+    """Second ESC within the window: the run stops, and both the toast
+    and the task's service event point at Ctrl+R as the way back."""
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        task = app.manager.create("busy", "do it")
+        app._advance()
+        await pilot.pause()
+        app._agent_runs[task.id] = 1
+        # The new-task input binds ESC with priority (cancels the form):
+        # move focus to the chat input, or the press never reaches the
+        # app-level stop action.
+        app.chat_input.focus()
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {}, "the confirmed ESC must stop the run"
+        assert app._esc_armed_signature is None, "firing must disarm"
+        assert any("Run stopped" in t for t in toasts)
+        events = [e.text for e in app.manager.get(task.id).events]
+        assert any("Run aborted by user (ESC)" in e for e in events)
+
+
+async def test_esc_fast_double_press_is_debounced(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ESC repeat faster than the debounce interval (the accidental
+    double-keystroke — exactly the inertia scenario the arming guards
+    against) is ignored; a deliberate press after the debounce gap still
+    confirms the arming."""
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        task = app.manager.create("busy", "do it")
+        app._advance()
+        await pilot.pause()
+        app._agent_runs[task.id] = 1
+        # The new-task input binds ESC with priority (cancels the form):
+        # move focus to the chat input, or the press never reaches the
+        # app-level stop action.
+        app.chat_input.focus()
+        await pilot.pause()
+        # Two pilot presses land within the default 250ms debounce window.
+        await pilot.press("escape")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {task.id: 1}, "the debounced press must be ignored"
+        assert app._esc_armed_signature is not None, "arming must survive the debounce"
+        # A deliberate press after the debounce gap confirms the stop.
+        # (Re-stamp the arming time first: under a loaded suite the two
+        # pauses above can eat into the 2s window, and the point here is
+        # the debounce gap, not the window expiry.)
+        await asyncio.sleep(0.3)
+        app._esc_armed_at = time.monotonic()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {}
+
+
+async def test_esc_after_window_expiry_rearms(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ESC after the armed window expired re-arms instead of firing;
+    the next press within the fresh window stops the run."""
+    _disarm_window(monkeypatch, 0.1)
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        task = app.manager.create("busy", "do it")
+        app._advance()
+        await pilot.pause()
+        app._agent_runs[task.id] = 1
+        # The new-task input binds ESC with priority (cancels the form):
+        # move focus to the chat input, or the press never reaches the
+        # app-level stop action.
+        app.chat_input.focus()
+        await pilot.pause()
+        # Arm with the short window (direct call: the 0.1s expiry timer
+        # would race a pilot press + pause).
+        app.action_abort_run()
+        assert app._esc_armed_signature is not None
+        # Outlive the (shortened) window: the expiry timer disarms.
+        await asyncio.sleep(0.3)
+        await pilot.pause()
+        assert app._esc_armed_signature is None, "the window must expire"
+        # Restore a comfortable window for the re-arm phase: the fresh
+        # confirming press must land INSIDE the new window.
+        monkeypatch.setattr(ActionsLayer, "_ESC_ARM_SECONDS", 2.0)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {task.id: 1}, "a fresh ESC must re-arm"
+        assert app._esc_armed_signature is not None
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {}
+
+
+async def test_esc_instant_mode_stops_on_single_press(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """esc_abort: instant — the historical single-press stop, with the
+    same mitigation toast and service event."""
+    _save_esc_mode(project_root, EscAbort.INSTANT)
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        task = app.manager.create("busy", "do it")
+        app._advance()
+        await pilot.pause()
+        app._agent_runs[task.id] = 1
+        # The new-task input binds ESC with priority (cancels the form):
+        # move focus to the chat input, or the press never reaches the
+        # app-level stop action.
+        app.chat_input.focus()
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._agent_runs == {}, "instant mode: one ESC stops the run"
+        assert app._esc_armed_signature is None
+        assert any("Run stopped" in t for t in toasts)
+        events = [e.text for e in app.manager.get(task.id).events]
+        assert any("Run aborted by user (ESC)" in e for e in events)
+
+
+async def test_esc_parallel_two_arms_only_viewed_task(
+    parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch, esc_timing: None
+) -> None:
+    """Parallel slots: arming and the stop both concern only the viewed
+    task's run; the sibling keeps working."""
+    app = parallel_app
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _dismiss_startup_dialog(pilot)
+        a = app.manager.create("viewed", "do a")
+        b = app.manager.create("sibling", "do b")
+        app._advance()
+        await pilot.pause()
+        app.view_task(a.id)
+        # Simulate two live runs without models. The new-task input binds
+        # ESC with priority (cancels the form): move focus to the chat
+        # input, or the press never reaches the app-level stop action.
+        app._agent_runs[a.id] = 1
+        app._agent_runs[b.id] = 2
+        app.chat_input.focus()
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._esc_armed_signature is not None
+        assert {a.id, b.id} <= set(app._agent_runs)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert a.id not in app._agent_runs, "only the viewed task stops"
+        assert b.id in app._agent_runs, "the sibling keeps working"
+        assert any("Run stopped" in t for t in toasts)
+        events = [e.text for e in app.manager.get(a.id).events]
+        assert any("Run aborted by user (ESC)" in e for e in events)
+        sibling_events = [e.text for e in app.manager.get(b.id).events]
+        assert not any("Run aborted" in e for e in sibling_events)

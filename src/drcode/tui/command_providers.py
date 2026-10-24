@@ -35,6 +35,7 @@ from ..providers import (
 )
 from ..settings import (
     DEV_ROUNDS_OPTIONS,
+    ESC_ABORT_OPTIONS,
     FINALIZATION_OPTIONS,
     ISOLATION_OPTIONS,
     PARALLEL_TASKS_OPTIONS,
@@ -175,6 +176,7 @@ class SettingsPalette(CommandPalette):
         "Nudge stalled agent after:",
         "Task isolation:",
         "Parallel tasks:",
+        "ESC stop behavior:",
         "Workflow:",
         "GitHub integration:",
         "Notifications:",
@@ -482,6 +484,16 @@ class ProjectSettingsCommandsProvider(Provider):
                 app.action_change_parallel_tasks,
             ),
             (
+                f"ESC stop behavior: {app.settings.esc_abort.label}",
+                (
+                    "How ESC stops a running agent/tester: double-press "
+                    "(the first ESC only arms the stop, the second "
+                    "confirms) or instant — the historical single-press "
+                    "stop (project setting)"
+                ),
+                app.action_change_esc_abort,
+            ),
+            (
                 f"Workflow: {app.workflow_status_label()}",
                 (
                     "Custom branching/review rules: .drcode/git-workflow.md "
@@ -739,6 +751,37 @@ class ParallelTasksOptionsProvider(Provider):
                 partial(app.action_set_parallel_tasks, count),
             )
             for count in PARALLEL_TASKS_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class EscAbortOptionsProvider(Provider):
+    """Options of the "ESC stop behavior" setting (double-press confirm /
+    instant stop).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.esc_abort
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_esc_abort, option),
+            )
+            for option in ESC_ABORT_OPTIONS
         ]
 
     async def discover(self) -> Hits:

@@ -41,6 +41,7 @@ from ..providers import (
 )
 from ..settings import (
     CompletedRetention,
+    EscAbort,
     StallNudge,
     TaskFinalization,
     TaskIsolation,
@@ -51,6 +52,7 @@ from ..workflow import describe_project_workflow, load_git_workflow
 from .agents_dialog import AgentsMdDialog
 from .command_providers import (
     DevRoundsOptionsProvider,
+    EscAbortOptionsProvider,
     FinalizationOptionsProvider,
     IsolationOptionsProvider,
     ModelCatalogCommandProvider,
@@ -74,6 +76,13 @@ from .voice_dialog import VoiceSettingsDialog, VoiceSetup
 
 
 class ActionsLayer(DrCodeState):
+    # Armed-ESC confirmation (project setting `esc_abort: double_press`):
+    # how long the armed state waits for the confirming second press, and
+    # the minimum gap between two ESC presses for the second one to count
+    # as deliberate (a faster repeat is an accidental double-keystroke).
+    _ESC_ARM_SECONDS: ClassVar[float] = 2.0
+    _ESC_DEBOUNCE_SECONDS: ClassVar[float] = 0.25
+
     @staticmethod
     def _custom_entry_from_setup(setup: ModelSetup) -> CustomModelEntry:
         """The dialog result as a per-role custom model entry (a None cap
@@ -539,52 +548,189 @@ class ActionsLayer(DrCodeState):
         # The pipeline continues: testing backlog first, then the queue.
         self._advance()
 
-    def action_abort_run(self) -> None:
-        """ESC: stop the running agent/tester.
+    def _run_alive_signature(
+        self,
+    ) -> tuple[frozenset[str], bool, str | None, str | None]:
+        """Everything about the current run state that the armed-ESC
+        confirmation cares about: which agent runs are live, whether the
+        tester runs (and on what), and which task is viewed. A change in
+        any of these between the arming and the confirming ESC invalidates
+        the arming — a stale "armed" state must never fire against runs
+        the user has not just seen."""
+        return (
+            frozenset(self._agent_runs),
+            self.tester_running,
+            self._tester_task_id,
+            self.viewed_id,
+        )
+
+    def _esc_targets_running(self) -> bool:
+        """Whether the task(s) THIS ESC press would stop are actually
+        running: with a single slot it is the historical global check,
+        with parallel slots only the viewed task's runs count."""
+        if self.parallel_limit <= 1:
+            return self.agent_running or self.tester_running
+        task = self.viewed
+        if task is None:
+            return False
+        return task.id in self._agent_runs or (
+            self.tester_running and self._tester_task_id == task.id
+        )
+
+    def _esc_disarm(self) -> None:
+        """Drop the armed-ESC confirmation state (window expired, runs
+        changed, or the stop actually fired)."""
+        self._esc_armed_signature = None
+        if self._esc_disarm_timer is not None:
+            self._esc_disarm_timer.stop()
+            self._esc_disarm_timer = None
+
+    def _esc_arm_expired(self) -> None:
+        """The confirmation window closed without a second ESC: disarm
+        quietly, so the NEXT ESC arms afresh."""
+        self._esc_disarm_timer = None
+        self._esc_armed_signature = None
+        self.refresh_status()
+
+    def _esc_arm(self) -> None:
+        """Arm the stop: announce it and start the confirmation window.
+        The actual abort still requires a second ESC within the window."""
+        self._esc_armed_signature = self._run_alive_signature()
+        self._esc_armed_at = time.monotonic()
+        if self._esc_disarm_timer is not None:
+            self._esc_disarm_timer.stop()
+        self._esc_disarm_timer = self.set_timer(
+            self._ESC_ARM_SECONDS, self._esc_arm_expired
+        )
+        self.notify(
+            "Press ESC again to stop the run (2s)",
+            title="Stop run",
+            timeout=self._ESC_ARM_SECONDS + 0.5,
+        )
+        self.refresh_status()
+
+    def _abort_active_runs(self) -> None:
+        """The actual stop, shared by both ESC modes.
 
         With a single development slot (the default, or parallelism
         without worktree isolation) this is the historical global stop:
-        ESC halts whatever run is alive. With parallel slots (>= 2) ESC
+        it halts whatever run is alive. With parallel slots (>= 2) it
         stops ONLY the currently viewed task's run — the other tasks'
-        runs are independent work the user did not ask to stop; ESC on a
-        task with nothing running does nothing but say so."""
+        runs are independent work the user did not ask to stop. Every
+        aborted run leaves a service event in its task's chat ("press
+        Ctrl+R to resume") and a toast, so the stop is never silent."""
+        stopped_tasks: list[Task] = []
         if self.parallel_limit <= 1:
-            if self.agent_running or self.tester_running:
-                for group in [f"agent-{tid}" for tid in list(self._agent_runs)]:
-                    self.workers.cancel_group(self, group)
-                if self.tester_running:
-                    self.workers.cancel_group(self, "tester")
-                self._agent_runs.clear()
-                self.tester_running = False
-                self._current_tool.clear()
-                # Hide AND empty: the aborted run's partial text must not be
-                # resurrected by a later add_class("visible").
-                self._clear_stream_label()
-                self.refresh_status()
-            return
-        task = self.viewed
-        if task is None:
-            return
-        stopped = False
-        if task.id in self._agent_runs:
-            self.workers.cancel_group(self, f"agent-{task.id}")
-            self._agent_runs.pop(task.id, None)
-            self._current_tool[task.id] = None
-            stopped = True
-        if self.tester_running and self._tester_task_id == task.id:
-            self.workers.cancel_group(self, "tester")
+            if not (self.agent_running or self.tester_running):
+                return
+            stopped_tasks = [
+                self.manager.get(tid)
+                for tid in list(self._agent_runs)
+                if tid in self.manager.tasks
+            ]
+            for group in [f"agent-{tid}" for tid in list(self._agent_runs)]:
+                self.workers.cancel_group(self, group)
+            if self.tester_running:
+                self.workers.cancel_group(self, "tester")
+                if (
+                    self._tester_task_id is not None
+                    and self._tester_task_id in self.manager.tasks
+                ):
+                    stopped_tasks.append(self.manager.get(self._tester_task_id))
+            self._agent_runs.clear()
             self.tester_running = False
-            self._current_tool[task.id] = None
-            stopped = True
-        if stopped:
+            self._current_tool.clear()
+            # Hide AND empty: the aborted run's partial text must not be
+            # resurrected by a later add_class("visible").
             self._clear_stream_label()
             self.refresh_status()
         else:
-            self.notify(
-                "Task is not running — open an active task to stop one",
-                title="Stop run",
-                timeout=5,
+            task = self.viewed
+            if task is None:
+                return
+            stopped = False
+            if task.id in self._agent_runs:
+                self.workers.cancel_group(self, f"agent-{task.id}")
+                self._agent_runs.pop(task.id, None)
+                self._current_tool[task.id] = None
+                stopped = True
+                stopped_tasks.append(task)
+            if self.tester_running and self._tester_task_id == task.id:
+                self.workers.cancel_group(self, "tester")
+                self.tester_running = False
+                self._current_tool[task.id] = None
+                stopped = True
+                stopped_tasks.append(task)
+            if stopped:
+                self._clear_stream_label()
+                self.refresh_status()
+            else:
+                self.notify(
+                    "Task is not running — open an active task to stop one",
+                    title="Stop run",
+                    timeout=5,
+                )
+                return
+        # Mitigation: make the stop explicit and show the way back
+        # (Ctrl+R re-runs the interrupted attempt — action_nudge_run).
+        for stopped in stopped_tasks:
+            self._show_event(
+                stopped,
+                "Run aborted by user (ESC) — press Ctrl+R to resume.",
             )
+        self.notify(
+            "Run stopped · Ctrl+R to resume",
+            title="Stop run",
+            timeout=5,
+        )
+
+    def action_abort_run(self) -> None:
+        """ESC: stop the running agent/tester.
+
+        Two modes (project setting `esc_abort`). DOUBLE_PRESS (the
+        default): the first ESC only ARMS the stop — a toast asks for a
+        confirmation press — and a second ESC within the window performs
+        the stop. A press faster than the debounce interval (an
+        accidental double-keystroke, exactly the inertia scenario this
+        guards against) is ignored; an ESC after the window expired
+        re-arms instead of firing. INSTANT: the historical single-press
+        stop. In both modes the footer binding stays "Stop agent"."""
+        if self.settings.esc_abort is EscAbort.INSTANT:
+            self._abort_active_runs()
+            return
+        now = time.monotonic()
+        # Debounce: a second ESC within the debounce interval of the last
+        # ACCEPTED press is an accidental fast repeat — ignore it without
+        # consuming the armed window (and without re-stamping the press
+        # time, so a deliberate third press still confirms).
+        if now - self._esc_last_press < self._ESC_DEBOUNCE_SECONDS:
+            return
+        self._esc_last_press = now
+        if not self._esc_targets_running():
+            # Nothing to stop: the historical no-op / toast. Any stale
+            # arming is dropped — it must not wait for runs that are gone.
+            self._esc_disarm()
+            if self.parallel_limit > 1:
+                self.notify(
+                    "Task is not running — open an active task to stop one",
+                    title="Stop run",
+                    timeout=5,
+                )
+            return
+        signature = self._run_alive_signature()
+        armed = self._esc_armed_signature is not None and (
+            now - self._esc_armed_at <= self._ESC_ARM_SECONDS
+        )
+        if armed and self._esc_armed_signature == signature:
+            # Second press within the window and the runs are the same
+            # ones the user saw when arming: fire the actual stop.
+            self._esc_disarm()
+            self._abort_active_runs()
+            return
+        # First press, re-arm after an expired window, or the run state
+        # changed since arming (a run finished/started on its own, the
+        # viewed task switched): (re-)arm against the CURRENT state.
+        self._esc_arm()
 
     def action_nudge_run(self) -> None:
         """Ctrl+R on the viewed ACTIVE/TESTING task: abort its hung or
@@ -1179,6 +1325,35 @@ class ActionsLayer(DrCodeState):
             SettingsPalette(
                 id="--parallel-tasks-palette",
                 providers=[ParallelTasksOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_esc_abort(self, mode: EscAbort) -> None:
+        """Settings command: how ESC stops a running agent/tester
+        (double-press confirmation vs the historical instant stop).
+        Persisted per project (.drcode/settings.json); applies to the
+        very next ESC press."""
+        self.settings.esc_abort = mode
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"ESC stop behavior: {mode.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_esc_abort(self) -> None:
+        """ESC-stop-behavior picker, opened from the Settings entry
+        ("ESC stop behavior: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the options; picking one applies
+        it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--esc-abort-palette",
+                providers=[EscAbortOptionsProvider],
                 placeholder="Search for options…",
             )
         )

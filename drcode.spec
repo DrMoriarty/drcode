@@ -19,6 +19,7 @@ subsequent starts load them straight from disk: ~0.4s cold binary start.
 Set DRCODE_ONEFILE=1 to build a legacy single-file executable instead.
 """
 import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
@@ -26,10 +27,28 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 ROOT = Path(SPECPATH).resolve()
 ONEFILE = os.environ.get("DRCODE_ONEFILE", "") not in ("", "0", "false")
 
+# Linux: the sounddevice wheel is pure-Python (no manylinux wheel — the
+# PortAudio binary inside _sounddevice_data exists for macOS/Windows only),
+# so the ALSA-only libportaudio.so.2 built by scripts/fetch-portaudio.sh is
+# shipped next to the executable; drcode.voice points sounddevice's library
+# lookup at it at runtime. Without it a Linux bundle would depend on the
+# user's system libportaudio2.
+binaries = []
+portaudio = ROOT / "build" / "portaudio" / "libportaudio.so.2"
+if portaudio.exists():
+    binaries.append((str(portaudio), "."))
+elif sys.platform.startswith("linux"):
+    print(
+        "WARNING: build/portaudio/libportaudio.so.2 not found — run "
+        "scripts/fetch-portaudio.sh first; the Linux bundle will need the "
+        "system libportaudio2 for voice features",
+        file=sys.stderr,
+    )
+
 a = Analysis(
     [str(ROOT / "drcode_entry.py")],
     pathex=[str(ROOT / "src")],
-    binaries=[],
+    binaries=binaries,
     datas=[
         # Bundled prompt templates: read via `Path(__file__).parent / "prompts"`,
         # which inside a frozen app resolves to <_MEIPASS>/drcode/prompts.
@@ -41,12 +60,14 @@ a = Analysis(
         # does not bundle *.dist-info by default, so copy it in explicitly.
         *copy_metadata("genai_prices"),
         *copy_metadata("pydantic_ai_slim"),
-        # Voice extra (drcode.voice → sounddevice): the wheel ships the
-        # PortAudio binary library inside `_sounddevice_data` — without
-        # collecting it the frozen app imports sounddevice but fails at
-        # the first actual device call with "OSError: PortAudio library
-        # not found". The voice extra must be installed into the build
-        # venv (build-binary.sh does `uv sync --extra voice`).
+        # Voice extra (drcode.voice → sounddevice): the macOS/Windows
+        # wheels ship the PortAudio binary library inside the top-level
+        # `_sounddevice_data` package — without collecting it the frozen
+        # app imports sounddevice but fails at the first actual device
+        # call with "OSError: PortAudio library not found". (The Linux
+        # wheel is pure-Python; its PortAudio comes via `binaries`
+        # above.) The voice extra must be installed into the build venv
+        # (build-binary.sh / the CI workflow do `uv sync --extra voice`).
         *collect_data_files("sounddevice"),
     ],
     # anyio imports its backend dynamically — PyInstaller can't see it

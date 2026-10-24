@@ -657,3 +657,49 @@ def test_recorder_discard_drops_audio() -> None:
     # A discard leaves nothing to stop() — an empty valid WAV comes back.
     with wave.open(io.BytesIO(recorder.stop())) as handle:
         assert handle.getnframes() == 0
+
+
+# -- bundled PortAudio shim (frozen Linux bundle) ---------------------------------
+
+
+def test_bundled_portaudio_found_in_frozen_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import sys as _sys
+
+    from drcode import voice
+
+    monkeypatch.setattr(_sys, "platform", "linux")
+    monkeypatch.setattr(_sys, "frozen", True, raising=False)
+    monkeypatch.setattr(_sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert voice._bundled_portaudio() is None  # nothing staged yet
+    lib = tmp_path / "libportaudio.so.2"
+    lib.write_bytes(b"ELF")
+    assert voice._bundled_portaudio() == str(lib)
+
+
+def test_bundled_portaudio_ignored_outside_frozen_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import sys as _sys
+
+    from drcode import voice
+
+    (tmp_path / "libportaudio.so.2").write_bytes(b"ELF")
+    monkeypatch.setattr(_sys, "platform", "linux")
+    monkeypatch.setattr(_sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert voice._bundled_portaudio() is None  # not frozen
+    monkeypatch.setattr(_sys, "frozen", True, raising=False)
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    assert voice._bundled_portaudio() is None  # not Linux
+
+
+def test_availability_hint_frozen_vs_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys as _sys
+
+    from drcode.voice import VOICE_EXTRA_HINT, availability_hint
+
+    monkeypatch.delattr(_sys, "frozen", raising=False)
+    assert availability_hint() == VOICE_EXTRA_HINT
+    monkeypatch.setattr(_sys, "frozen", True, raising=False)
+    assert "libportaudio2" in availability_hint()

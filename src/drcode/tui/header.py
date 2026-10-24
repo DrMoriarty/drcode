@@ -44,6 +44,31 @@ class HeaderModelStatus(Static):
     """
 
 
+class HeaderGitIndicator(Static):
+    """Unmerged-completed-tasks counter, docked right, left of the clock.
+
+    Shows `⎇ N` when N completed tasks still sit unmerged on their
+    `drcode/<id>` branches (see DrCodeState._poll_git_indicator); hidden
+    entirely (display:none) when every task's work is merged. The amber
+    bold styling is deliberate — the indicator must stand out from the
+    muted header furniture so an unmerged fix is hard to miss.
+    """
+
+    DEFAULT_CSS = """
+    HeaderGitIndicator {
+        dock: right;
+        width: auto;
+        padding: 0 1;
+        color: $warning;
+        text-style: bold;
+        display: none;
+    }
+    HeaderGitIndicator.-unmerged {
+        display: block;
+    }
+    """
+
+
 class HeaderTallInfo(Static):
     """Base for the extra lines shown only in the expanded (tall) header.
 
@@ -147,6 +172,9 @@ class ModelStatusHeader(Header):
             if self._show_clock
             else HeaderClockSpace()
         )
+        # Docked right AFTER the clock: right-docks stack away from the
+        # edge in compose order, so the indicator lands just left of it.
+        yield HeaderGitIndicator(id="header-git")
         # The tall-only lines dock around the icon/clock columns (they are
         # composed after those docks, see HeaderTallInfo).
         yield HeaderConnInfo(id="header-conn")

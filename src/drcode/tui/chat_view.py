@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import statistics
 import time
@@ -73,7 +74,12 @@ from ..models import (
 )
 from ..version import APP_VERSION
 from .ctx_dialog import ContextDialog
-from .header import HeaderConnInfo, HeaderSessionInfo, ModelStatusHeader
+from .header import (
+    HeaderConnInfo,
+    HeaderGitIndicator,
+    HeaderSessionInfo,
+    ModelStatusHeader,
+)
 from .state import DrCodeState, LiveTailEntry
 
 
@@ -876,6 +882,32 @@ class ChatViewLayer(DrCodeState):
             else:
                 detail += " (esc to stop, ctrl+r to nudge)"
             self._render_activity(f"⚠ {who}: stalled", detail, "stale")
+
+    # -- unmerged-work header indicator -----------------------------------
+
+    async def _poll_git_indicator(self) -> None:
+        """Refresh the header's unmerged-work counter: `⎇ N` next to the
+        clock while N completed tasks still sit unmerged on their
+        `drcode/<id>` branches (same criteria as the startup reminder —
+        see _unmerged_completed_ids), hidden entirely once every task's
+        work is merged. A manual `git merge drcode/<id>` clears it on the
+        next tick, no restart needed. The git calls are blocking — run
+        them in a worker thread so a slow repo never stalls the UI."""
+        count = len(await asyncio.to_thread(self._unmerged_completed_ids))
+        try:
+            widget = self.query_one("#header-git", HeaderGitIndicator)
+        except NoMatches:
+            return  # teardown race: the app is being dismantled
+        if count > 0:
+            plural = "" if count == 1 else "s"
+            widget.update(f"⎇ {count}")
+            widget.tooltip = (
+                f"{count} completed task{plural} not merged into the "
+                "base branch yet (git merge drcode/<id>)"
+            )
+            widget.add_class("-unmerged")
+        else:
+            widget.remove_class("-unmerged")
 
     def _render_activity(
         self, status: str, detail: str, state: str | None = None

@@ -903,6 +903,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 exclusive=True,
                 group="unmerged-scan",
             )
+            # Header's unmerged-work counter (`⎇ N` left of the clock):
+            # an immediate first fill plus a 10 s poll — a manual
+            # `git merge drcode/<id>` clears it without a restart (see
+            # _poll_git_indicator / _unmerged_completed_ids).
+            self.run_worker(
+                self._poll_git_indicator,
+                exclusive=True,
+                group="git-indicator",
+            )
+            self.set_interval(10, self._poll_git_indicator)
         self.refresh_project_info()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty
@@ -985,23 +995,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 timeout=6,
             )
 
-    async def _unmerged_work_startup_scan(self) -> None:
-        """Startup reminder for old "stuck" fixes: completed tasks whose
-        `drcode/<task-id>` branch still holds commits the main checkout's
-        current branch does not have (drcode never merges — the branch
-        survives the retention cleanup and nothing nags about it, so a
-        PASSED task from a previous session can sit unmerged forever —
-        and a finished research task's docs commit can too).
-        One toast for the whole session, listing the branch names; each
-        task's chat already carries the per-task reminder written at its
-        finalization. Skipped per task kind when the merge is automated
-        by the kind's accept hook (`on_accepted` /
-        `on_research_accepted`)."""
+    def _unmerged_completed_ids(self) -> list[str]:
+        """Synchronous half of the unmerged-work tracking: ids of
+        completed tasks whose `drcode/<task-id>` branch still holds
+        commits the main checkout's current branch does not have — the
+        "stuck" fixes the startup scan reminds about and the header's
+        unmerged-work indicator counts. Skipped per task kind when the
+        merge is automated by the kind's accept hook (`on_accepted` /
+        `on_research_accepted`). Blocking git calls — run in a worker
+        thread."""
         env = self.task_env
         if not env.active:
-            return
+            return []
         workflow = self.workflow
-        stuck: list[str] = []
+        candidates: list[str] = []
         for task in list(self.manager.tasks.values()):
             if task.status is not TaskStatus.COMPLETED:
                 continue
@@ -1015,10 +1022,28 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     continue
                 if task.review_pending:
                     continue  # the external review has not accepted it yet
-            if await asyncio.to_thread(env.unmerged_commits, task.id) > 0:
-                stuck.append(env.branch(task.id))
-        if not stuck:
+            candidates.append(task.id)
+        if not candidates:
+            return []
+        unmerged = env.unmerged_ids(candidates)
+        return [task_id for task_id in candidates if task_id in unmerged]
+
+    async def _unmerged_work_startup_scan(self) -> None:
+        """Startup reminder for old "stuck" fixes: completed tasks whose
+        `drcode/<task-id>` branch still holds commits the main checkout's
+        current branch does not have (drcode never merges — the branch
+        survives the retention cleanup and nothing nags about it, so a
+        PASSED task from a previous session can sit unmerged forever —
+        and a finished research task's docs commit can too).
+        One toast for the whole session, listing the branch names; each
+        task's chat already carries the per-task reminder written at its
+        finalization. Same criteria as the header's unmerged-work
+        indicator (see _unmerged_completed_ids)."""
+        env = self.task_env
+        stuck_ids = await asyncio.to_thread(self._unmerged_completed_ids)
+        if not stuck_ids:
             return
+        stuck = [env.branch(task_id) for task_id in stuck_ids]
         base = await asyncio.to_thread(env.base_branch)
         shown = ", ".join(stuck[:5]) + ("…" if len(stuck) > 5 else "")
         self.notify(

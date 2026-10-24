@@ -484,9 +484,18 @@ def play_wav(data: bytes) -> None:
         with wave.open(io.BytesIO(data)) as wav:
             rate = wav.getframerate()
             channels = wav.getnchannels()
+            sampwidth = wav.getsampwidth()
             frames = wav.readframes(wav.getnframes())
     except (wave.Error, EOFError) as e:
         raise VoiceError(f"TTS answer is not a valid WAV: {e}") from e
+    if sampwidth != 2:
+        # play_wav interprets the frames as native int16 (array("h")); a
+        # 24-bit or float32 answer from the gateway would be played as
+        # shifted garbage (crackle over the whole phrase) — fail readable
+        # instead.
+        raise VoiceError(
+            f"TTS answer is {sampwidth * 8}-bit PCM; only 16-bit is supported"
+        )
     import sounddevice as sd
 
     # int16 framing: building array.array("h") from the raw frames doubles
@@ -498,21 +507,59 @@ def play_wav(data: bytes) -> None:
         pcm = array("h", frames)
     except ValueError as e:
         raise VoiceError(f"TTS answer has a truncated PCM frame: {e}") from e
-    if pcm:
-        # RawOutputStream blocking write + Pa_StopStream drain replaces the
-        # sd.play()/sd.wait() pair. The whole playback (including the drain
-        # in stop()) stays under the lock so a concurrent recording
-        # open/close can never interleave with it.
-        with _PORTAUDIO_LOCK:
-            stream = sd.RawOutputStream(
-                samplerate=rate, channels=channels, dtype="int16"
-            )
+    if not pcm:
+        return
+    raw = pcm.tobytes()
+    total = len(raw)
+    state = {"pos": 0, "underflowed": False}
+    done = threading.Event()
+
+    # Callback mode, not the blocking RawOutputStream.write() pair: with
+    # blocking writes the ring buffer is empty when the stream starts, so
+    # the first frames go out as zeros (an audible click at the head of
+    # every phrase) and any writer-thread hiccup mid-phrase drops out.
+    # (Priming via Pa_WriteStream before start() is NOT an option — on
+    # current PortAudio it fails with paStreamIsStopped.) The callback
+    # fills each block straight from memory on demand — nothing can run
+    # dry. Replaces sd.play()/sd.wait(), which hard-require numpy.
+
+    def _callback(outdata: object, frames: int, time: object, status: object) -> None:
+        try:
+            if status:
+                state["underflowed"] = True
+            view = memoryview(outdata).cast("B")  # type: ignore[arg-type]
+            end = min(state["pos"] + len(view), total)
+            block = end - state["pos"]
+            view[:block] = raw[state["pos"] : end]
+            if block < len(view):
+                # The final partial block is padded with silence — the
+                # phrase's natural tail.
+                view[block:] = bytes(len(view) - block)
+            state["pos"] = end
+            if end >= total:
+                done.set()
+        except Exception as e:  # noqa: BLE001 - a dead callback would hang play_wav
+            print(f"drcode voice: playback callback failed: {e}", file=sys.stderr)
+            done.set()
+
+    # The whole playback (including the drain in stop()) stays under the
+    # lock so a concurrent recording open/close can never interleave with it.
+    with _PORTAUDIO_LOCK:
+        stream = sd.RawOutputStream(
+            samplerate=rate,
+            channels=channels,
+            dtype="int16",
+            latency="high",  # extra headroom against mid-phrase dropouts
+            callback=_callback,
+        )
+        try:
             stream.start()
-            try:
-                stream.write(pcm)  # blocks until all frames are consumed
-            finally:
-                stream.stop()  # drains the pending audio, like sd.wait()
-                stream.close()
+            done.wait()
+        finally:
+            stream.stop()  # drains the pending audio, like sd.wait()
+            stream.close()
+    if state["underflowed"]:
+        print("drcode voice: playback buffer underflowed", file=sys.stderr)
 
 
 class _VoiceSynth(Protocol):
@@ -525,6 +572,11 @@ class _VoiceSynth(Protocol):
 class TtsSpeaker:
     """Fire-and-forget TTS announcer: one daemon worker thread synthesizes
     and plays the queued phrases strictly one at a time.
+
+    The phrase following the one being played is synthesized in parallel on
+    a short-lived helper thread, so consecutive announcements follow each
+    other without a network-synthesis gap between them (the playback itself
+    stays strictly serialized).
 
     ``speak`` never raises and never touches the network on the caller's
     thread; when more than MAX_PENDING phrases are already waiting, new ones
@@ -553,6 +605,10 @@ class TtsSpeaker:
         self._queue: queue.Queue[tuple[str, VoiceConfig]] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Phrases currently held out of the queue by the prefetch helper
+        # (0 or 1): they are already being synthesized but sit in no queue,
+        # so speak()'s cap must count them on top of qsize.
+        self._prefetching = 0
 
     def speak(self, text: str) -> None:
         """Queue a phrase for synthesis+playback. Safe from any thread;
@@ -575,17 +631,78 @@ class TtsSpeaker:
                     target=self._worker, daemon=True, name="drcode-tts"
                 )
                 self._thread.start()
-            if self._queue.qsize() >= self.MAX_PENDING:
+            if self._queue.qsize() + self._prefetching >= self.MAX_PENDING:
                 return
         self._queue.put((text, config))
 
     def _worker(self) -> None:
+        # ready = the next phrase, already synthesized by the prefetch
+        # helper while the previous one was playing.
+        ready: tuple[bytes | None, str | None] | None = None
         while True:
-            text, config = self._queue.get()
+            if ready is None:
+                text, config = self._queue.get()
+                wav, error = self._synthesize(text, config)
+            else:
+                wav, error = ready
+                ready = None
+            if wav is None:
+                self._report_error(error or "TTS synthesis failed")
+                continue
+            finish = self._start_prefetch()
             try:
-                self._play(self._client_factory(config).speech(text))
+                self._play(wav)
             except Exception as e:  # noqa: BLE001 - announcements never break anything
                 self._report_error(str(e))
+            finally:
+                if finish is not None:
+                    ready = finish()
+
+    def _synthesize(
+        self, text: str, config: VoiceConfig
+    ) -> tuple[bytes | None, str | None]:
+        """Network synthesis, never raising: (wav, None) on success,
+        (None, readable message) on failure."""
+        try:
+            return self._client_factory(config).speech(text), None
+        except Exception as e:  # noqa: BLE001 - announcements never break anything
+            return None, str(e)
+
+    def _synthesize_into(
+        self,
+        text: str,
+        config: VoiceConfig,
+        out: list[tuple[bytes | None, str | None]],
+    ) -> None:
+        """Helper-thread body: synthesize one phrase into ``out``."""
+        out.append(self._synthesize(text, config))
+
+    def _start_prefetch(self) -> Callable[[], tuple[bytes | None, str | None]] | None:
+        """Pop the next queued phrase and start synthesizing it on a helper
+        thread while the current one plays. Returns a callable that joins
+        the helper and yields its result (None when the queue was empty)."""
+        try:
+            text, config = self._queue.get_nowait()
+        except queue.Empty:
+            return None
+        with self._lock:
+            self._prefetching += 1
+        box: list[tuple[bytes | None, str | None]] = []
+        thread = threading.Thread(
+            target=self._synthesize_into,
+            args=(text, config, box),
+            daemon=True,
+            name="drcode-tts-prefetch",
+        )
+        thread.start()
+
+        def finish() -> tuple[bytes | None, str | None]:
+            thread.join()
+            with self._lock:
+                self._prefetching -= 1
+            return box[0]
+
+        return finish
 
     def _report_error(self, message: str) -> None:
         if self._on_error is not None:

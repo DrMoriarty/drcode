@@ -725,6 +725,7 @@ async def test_merge_state_research_task_colored_by_branch(
     commit_on_branch(app.task_env, task.id)
     async with app.run_test() as pilot:
         await pilot.pause()
+        assert app._unmerged_completed_ids() == [task.id]
         assert app._merge_state == {task.id: "unmerged"}
         await pilot.pause()
 

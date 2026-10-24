@@ -13,12 +13,14 @@ from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelRequest,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
     TextPartDelta,
     ThinkingPart,
     ThinkingPartDelta,
+    UserPromptPart,
 )
 from pydantic_ai.usage import UsageLimits
 from textual import work
@@ -691,6 +693,27 @@ class PipelineLayer(DrCodeState):
             return
         task.messages = serialize_messages(messages)
         self.manager.storage.save(task)
+
+    def _flush_in_flight_prompt(self, task: Task) -> None:
+        """Persist a consumed-but-not-yet-transcribed prompt of `task`.
+
+        run_agent pops the queued prompts from pending_input as soon as the
+        run starts and records them in `_consumed_prompts`; the transcript
+        picks them up only at the first node boundary. A cancel arriving in
+        between drops the pending_input copy AND skips the run's own persist
+        (its CancelledError handler only acts on an ACTIVE task) — without
+        this flush the user's brief would vanish from the chat history and
+        only the "cancelled" service event would remain.
+        """
+        in_flight = self._consumed_prompts.pop(task.id, None)
+        if in_flight is None or in_flight[0] in all_user_prompts(task.messages):
+            return
+        request = ModelRequest(parts=[UserPromptPart(content=in_flight[0])])
+        # The prompt was typed when it was queued, not when this run
+        # consumed it — keep the chat thread chronological (same backdating
+        # the node-boundary persist path does).
+        backdate_user_prompt([request], in_flight[0], in_flight[1][0].at)
+        task.messages.extend(serialize_messages([request]))
 
     def _persist_tester_messages(
         self, task: Task, run: AgentRun[TesterDeps, str] | None

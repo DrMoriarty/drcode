@@ -505,6 +505,13 @@ class ActionsLayer(DrCodeState):
         # its rendered "user-pending" block must come off the screen, which
         # only a full re-render does. Captured before cancel() clears it.
         had_pending = bool(task.pending_input)
+        # A running agent may have already consumed the queued prompts
+        # (popped from pending_input, not yet persisted into the transcript):
+        # cancel() is about to clear pending_input and complete the task,
+        # and the cancelled run's own persist skips a no-longer-ACTIVE task —
+        # flush the in-flight copy into the transcript, or the user's brief
+        # would disappear from the chat history.
+        self._flush_in_flight_prompt(task)
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
         # The task was possibly in TESTING: drop its tester pipeline state.

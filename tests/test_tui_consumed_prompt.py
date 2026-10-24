@@ -23,8 +23,9 @@ import pytest
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from drcode import agent_model
-from drcode.models import TaskKind
+from drcode.models import TaskKind, TaskStatus
 from drcode.task_manager import TaskManager
+from drcode.transcript import all_user_prompts
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (
     ScriptedState,
@@ -127,3 +128,74 @@ async def test_reopen_during_consumption_window_keeps_prompt(
             if "исходное условие" in str(w.render())
         )
         assert hits == 1
+
+
+async def test_cancel_during_consumption_window_keeps_prompt(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (task #0c519559): Ctrl+X during the consumption window must
+    not swallow the brief.
+
+    The run has already popped the prompt from pending_input but has not
+    persisted it into the transcript yet; cancel() clears pending_input and
+    completes the task, and the cancelled run's own persist skips a
+    no-longer-ACTIVE task. The flush into the transcript is what keeps the
+    user's input visible in the chat history."""
+    task = TaskManager(project_root).create(
+        "bug title", "исходное условие задачи", kind=TaskKind.BUG
+    )
+    app = DrCodeApp(project_root)
+    # Hold the first model call: consumption happens, the persist doesn't.
+    release = asyncio.Event()
+    orig_stream = scripted.stream_fn
+
+    async def gated_stream(
+        messages: list[Any], info: AgentInfo
+    ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
+        for m in messages:
+            if hasattr(m, "parts"):
+                for p in m.parts:
+                    if "исходное условие" in str(getattr(p, "content", "")):
+                        await release.wait()
+        async for chunk in orig_stream(messages, info):
+            yield chunk
+
+    monkeypatch.setattr(
+        scripted,
+        "model",
+        lambda: FunctionModel(scripted.fn, stream_function=gated_stream),
+    )
+    scripted.steps = [text_response("готово")]
+    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
+    async with app.run_test() as pilot:
+        task = app.manager.get(task.id)
+        await wait_until(
+            lambda: app.agent_running and not task.pending_input,
+            pilot,
+            what="brief consumed",
+        )
+        assert task.messages == []
+
+        app.action_cancel_task()
+        await pilot.pause()
+
+        assert task.status is TaskStatus.COMPLETED
+        # The brief survived the cancel: it is in the transcript now.
+        assert "исходное условие" in "\n".join(all_user_prompts(task.messages))
+        # The in-flight record is consumed (no stale duplicate rendering).
+        assert task.id not in app._consumed_prompts
+        # Re-opening the cancelled task shows the brief from the transcript.
+        app.view_task(task.id)
+        for _ in range(20):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "исходное условие" in rendered
+        assert "cancelled by the user" in rendered.lower()
+    release.set()

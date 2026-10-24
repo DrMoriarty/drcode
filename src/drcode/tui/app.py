@@ -201,15 +201,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # layer so it paints over the statusbar/footer row). Shown for the
     # whole RECORDING/TRANSCRIBING session — the auto-dismissing toasts
     # left a long utterance with no visible sign that dictation is still
-    # running. Background stays transparent: the strip only draws its
-    # right-aligned text, never a full-width panel.
+    # running. The strip is exactly as wide as its content: Textual does
+    # not blend overlay layers, so a full-width strip wipes the row
+    # beneath it (the sidebar's agent-status line) even with a
+    # transparent background. Docking pins a widget to x=0, so the right
+    # edge is set from Python (offset-x in _render_voice_indicator).
     #voice-indicator {
         layer: toast;
         dock: bottom;
-        width: 100%;
+        width: auto;
         height: 1;
         margin-bottom: 1;
-        text-align: right;
         padding: 0 1 0 0;
         background: transparent;
         color: $warning;

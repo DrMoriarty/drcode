@@ -632,6 +632,16 @@ class ChatViewLayer(DrCodeState):
         else:
             widget.remove_class("hidden")
             widget.update(text)
+            # Pin the shrink-to-fit strip to the right edge: a docked
+            # widget always lands at x=0, and the offset must track the
+            # current text length (it differs between recording and
+            # transcribing) and the terminal width. Re-evaluated on every
+            # render — state changes plus the 1 s activity poll cover
+            # terminal resizes within a second.
+            widget.styles.offset = (
+                max(0, self.size.width - cell_len(text) - 1),  # 1: right padding
+                0,
+            )
 
     @property
     def header_conn_info(self) -> Static:

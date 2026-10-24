@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from pydantic_ai import capture_run_messages
+from pydantic_ai.models.test import TestModel
 from textual.widgets import Static, TextArea
 
 from drcode.models import Task, TaskStatus
@@ -291,3 +293,127 @@ async def test_mergedness_gate_with_real_git(project_root: Path) -> None:
         assert await _settle(pilot, app, lambda: b.status is TaskStatus.ACTIVE), (
             "manual merge must unblock the dependent"
         )
+
+
+# -- research agent: task creation / dependency tools --------------------------------
+
+
+class _CreateChainedModel(TestModel):
+    """TestModel variant simulating the research agent: ONE
+    create_feature_request call with depends_on, then a final answer."""
+
+    def __init__(self, dep_id: str) -> None:
+        super().__init__()
+        self.dep_id = dep_id
+
+    def _get_tool_calls(self, model_request_parameters):  # type: ignore[no-untyped-def]
+        if not getattr(self, "_created", False):
+            self._created = True
+            defs = {t.name: t for t in model_request_parameters.function_tools}
+            return [("create_feature_request", defs["create_feature_request"])]
+        return []
+
+    def gen_tool_args(self, tool_def):  # type: ignore[no-untyped-def]
+        if tool_def.name == "create_feature_request":
+            return {
+                "title": "chained follow-up",
+                "description": "do b",
+                "depends_on": [self.dep_id],
+            }
+        return super().gen_tool_args(tool_def)
+
+
+async def test_agent_created_task_with_depends_on_stays_blocked(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The research agent's create_feature_request(depends_on=…) path: the
+    created task carries the dependency and is promoted only after the
+    dependency completes."""
+    from drcode.agent import AgentDeps, build_agent
+    from drcode.config import Config
+    from drcode.models import TaskKind
+    from drcode.tools import scratch_dir
+
+    config = Config(project_root=project_root, model="test-model", api_key="sk-test")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        a = app.manager.create("first", "do a")
+        research_task = app.manager.create(
+            "research", "file the follow-up", kind=TaskKind.RESEARCH
+        )
+        agent = build_agent(config, kind=TaskKind.RESEARCH, root=project_root)
+        deps = AgentDeps(
+            root=project_root,
+            manager=app.manager,
+            task_id=research_task.id,
+            scratch=scratch_dir(research_task.id),
+        )
+        with capture_run_messages():
+            async with agent.iter(
+                "file the follow-up", model=_CreateChainedModel(a.id), deps=deps
+            ) as run:
+                async for _node in run:
+                    pass
+
+        created = [
+            t for t in app.manager.all_tasks() if t.id not in {a.id, research_task.id}
+        ]
+        assert len(created) == 1, "the tool must have created exactly one task"
+        b = created[0]
+        assert b.depends_on == [a.id]
+
+        # The research run was driven directly (not through the pipeline):
+        # park its task so it does not compete with b for the free slot.
+        app.manager.set_hold(research_task.id, on=True)
+
+        app._advance()
+        assert await _settle(pilot, app, lambda: a.status is TaskStatus.ACTIVE), (
+            "runnable dependency must be promoted"
+        )
+        assert b.status is TaskStatus.QUEUED
+        assert b.id in app._dep_gate, "the gate must record why b waits"
+
+        _complete(app, a)
+        app._advance()
+        assert await _settle(pilot, app, lambda: b.status is TaskStatus.ACTIVE), (
+            "completing the dependency must unblock the agent-created task"
+        )
+
+
+def test_set_task_dependencies_replaces_and_restricts(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The set_task_dependencies helper (research tool backend): replaces
+    the whole list on a queued task; refuses tasks under way and unknown
+    ids with ValueError (→ ModelRetry via _run_tool)."""
+    from drcode.agent import AgentDeps, _set_task_dependencies
+    from drcode.models import TaskKind
+    from drcode.tools import scratch_dir
+
+    a = app.manager.create("a", "x")
+    b = app.manager.create("b", "x")
+    c = app.manager.create("c", "x")
+    agent_task = app.manager.create("research", "x", kind=TaskKind.RESEARCH)
+    deps = AgentDeps(
+        root=project_root,
+        manager=app.manager,
+        task_id=agent_task.id,
+        scratch=scratch_dir(agent_task.id),
+    )
+
+    result = _set_task_dependencies(deps, b.id, [a.id])
+    assert app.manager.get(b.id).depends_on == [a.id]
+    assert a.id in result
+
+    # Replaces, not merges: a second call with a new list drops the old edge.
+    _set_task_dependencies(deps, b.id, [c.id])
+    assert app.manager.get(b.id).depends_on == [c.id]
+
+    # The agent's own (active) task and completed tasks are not editable.
+    app.manager.mark_done(a.id)
+    with pytest.raises(ValueError, match="queued or held"):
+        _set_task_dependencies(deps, a.id, [b.id])
+    assert app.manager.get(a.id).depends_on == []
+
+    with pytest.raises(ValueError, match="unknown task id"):
+        _set_task_dependencies(deps, "ffffffff", [])

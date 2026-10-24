@@ -292,7 +292,14 @@ class TaskManager:
         *,
         hold: bool = False,
         origin: str = "user",
+        depends_on: list[str] | None = None,
     ) -> Task:
+        # Creation-time validation passes task_id=None (self-reference is
+        # impossible — the id does not exist yet, so a dep naming it comes
+        # back as "unknown task id"), only the existence of the ids needs
+        # checking. Raises ValueError BEFORE anything is stored or any
+        # listener fires — the caller surfaces the message.
+        cleaned_deps = validate_dependencies(self.tasks, None, depends_on or [])
         first_line = (
             first_message.splitlines()[0][:60] if first_message.splitlines() else ""
         )
@@ -301,6 +308,7 @@ class TaskManager:
             kind=kind,
             queue_seq=self._next_queue_seq(),
         )
+        task.depends_on = cleaned_deps
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
         if hold:

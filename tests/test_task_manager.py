@@ -1055,6 +1055,33 @@ def test_set_dependencies_rejects_unknown_id(manager: TaskManager) -> None:
         manager.set_dependencies(a.id, ["ffffffff"])
 
 
+def test_create_with_depends_on(manager: TaskManager, project_root: Path) -> None:
+    """depends_on at creation: cleaned (stripped/deduped), stored on the
+    task before the first save and persisted."""
+    a = manager.create("a", "x")
+    b = manager.create("b", "x", depends_on=[f" {a.id} ", a.id, "  "])
+    assert b.depends_on == [a.id]
+    assert b.status is TaskStatus.QUEUED  # created normally, just gated
+    reloaded = TaskManager(project_root)
+    assert reloaded.get(b.id).depends_on == [a.id]
+
+
+def test_create_rejects_unknown_dependency(manager: TaskManager) -> None:
+    """A nonexistent dep id fails validation before anything is stored."""
+    with pytest.raises(ValueError, match="unknown task id"):
+        manager.create("b", "x", depends_on=["ffffffff"])
+    assert manager.all_tasks() == []
+
+
+def test_create_rejects_dep_naming_the_task_itself(manager: TaskManager) -> None:
+    """A self-reference is impossible at creation (the id does not exist
+    yet) — it surfaces as an unknown-id error, not a cycle error."""
+    with pytest.raises(ValueError, match="unknown task id"):
+        # The id is generated internally, so the agent can only hit this
+        # by passing a placeholder; any absent id must fail the same way.
+        manager.create("b", "x", depends_on=["b"])
+
+
 def test_set_dependencies_rejects_cycle(manager: TaskManager) -> None:
     a = manager.create("a", "x")
     b = manager.create("b", "x")

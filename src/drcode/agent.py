@@ -246,6 +246,43 @@ def _todo_update(deps: AgentDeps, targets: list[int | str], done: bool) -> str:
     )
 
 
+def _set_task_dependencies(deps: AgentDeps, task_id: str, dep_ids: list[str]) -> str:
+    """Replace a task's depends_on list (research agent only).
+
+    Raises ValueError (→ ModelRetry via _run_tool) when the task does not
+    exist, is already under way (only QUEUED/HOLD tasks are editable —
+    the same rule as the command palette) or a dependency id is unknown /
+    would form a cycle."""
+    if task_id not in deps.manager.tasks:
+        raise ValueError(f"unknown task id: {task_id}")
+    task = deps.manager.get(task_id)
+    if task.status not in (TaskStatus.QUEUED, TaskStatus.HOLD):
+        raise ValueError(
+            f"task #{task_id} is {task.status.value} — dependencies can only "
+            "be set on queued or held tasks (before development starts)."
+        )
+    deps.manager.set_dependencies(task_id, dep_ids)
+    if task.depends_on:
+        return (
+            f"Task #{task_id} now waits for: "
+            + ", ".join(f"#{d}" for d in task.depends_on)
+            + " — it is not promoted until every listed task is COMPLETED "
+            "and (under worktree isolation) merged."
+        )
+    return f"Task #{task_id} has no dependencies — it is freely promotable."
+
+
+def _deps_suffix(task: Task) -> str:
+    """The dependency note appended to a create_* tool result."""
+    if not task.depends_on:
+        return ""
+    return (
+        " It waits for: "
+        + ", ".join(f"#{d}" for d in task.depends_on)
+        + " (not promoted until all are COMPLETED and merged)."
+    )
+
+
 def todo_instructions(task: Task) -> str | None:
     """The task's current checklist state as an instruction block (feature
     tasks with a non-empty list only — nothing else has todo tools or a
@@ -498,37 +535,76 @@ def build_agent(
 
         @agent.tool
         def create_bug_report(
-            ctx: RunContext[AgentDeps], title: str, description: str
+            ctx: RunContext[AgentDeps],
+            title: str,
+            description: str,
+            depends_on: list[str] | None = None,
         ) -> str:
             """Create a bug report task in the backlog. Use ONLY when the user
             explicitly asked for it — if you found a problem on your own, ask
             via ask_clarifying_question whether a task should be filed.
             `title` is a short imperative summary; `description` carries the
-            details: what is wrong, where (files/lines), and how it manifests."""
+            details: what is wrong, where (files/lines), and how it manifests.
+            Optional `depends_on`: short task ids (as shown in the TUI and in
+            search_task_history output) the new task must wait for — it is not
+            promoted until every listed task is COMPLETED and, under worktree
+            isolation, its drcode/<id> branch is merged into the base branch.
+            The returned id lets you chain subsequent creations on it."""
             # origin="system": the tool (not the user) created the task —
             # creation listeners (e.g. the voice announcements) can tell
             # agent-created bug reports from hand-typed ones.
             bug = ctx.deps.manager.create(
-                title, description, kind=TaskKind.BUG, origin="system"
+                title,
+                description,
+                kind=TaskKind.BUG,
+                origin="system",
+                depends_on=depends_on,
             )
             return (
                 f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
+                + _deps_suffix(bug)
             )
 
         @agent.tool
         def create_feature_request(
-            ctx: RunContext[AgentDeps], title: str, description: str
+            ctx: RunContext[AgentDeps],
+            title: str,
+            description: str,
+            depends_on: list[str] | None = None,
         ) -> str:
             """Create a feature request task in the backlog. Use ONLY when the
             user explicitly asked for it — if you spotted an improvement on
             your own, ask via ask_clarifying_question whether a task should be
             filed. `title` is a short summary of the desired change;
-            `description` details what should be done and why."""
-            feature = ctx.deps.manager.create(title, description, kind=TaskKind.FEATURE)
+            `description` details what should be done and why.
+            Optional `depends_on`: short task ids (as shown in the TUI and in
+            search_task_history output) the new task must wait for — it is not
+            promoted until every listed task is COMPLETED and, under worktree
+            isolation, its drcode/<id> branch is merged into the base branch.
+            The returned id lets you chain subsequent creations on it."""
+            feature = ctx.deps.manager.create(
+                title, description, kind=TaskKind.FEATURE, depends_on=depends_on
+            )
             return (
                 f"Feature request #{feature.id} '{feature.title}' created at "
-                "the tail of the queue."
+                "the tail of the queue." + _deps_suffix(feature)
             )
+
+        @agent.tool(sequential=True)
+        async def set_task_dependencies(
+            ctx: RunContext[AgentDeps], task_id: str, deps: list[str]
+        ) -> str:
+            """Replace the dependency list of an existing QUEUED or HOLD task
+            (only those can still be edited — a task under way or finished
+            cannot). `task_id` is the short task id; `deps` is the FULL new
+            list of short task ids it must wait for (pass [] to clear —
+            dependencies are replaced, not merged). The task is not promoted
+            until every listed task is COMPLETED and, under worktree
+            isolation, its drcode/<id> branch is merged into the base branch.
+            Use it to link a task to an older one that existed before this
+            run; for a task you create yourself, prefer the depends_on
+            parameter of create_bug_report/create_feature_request."""
+            return await _run_tool(_set_task_dependencies, ctx.deps, task_id, deps)
 
         @agent.tool(sequential=True)
         async def git_commit_docs(ctx: RunContext[AgentDeps], message: str) -> str:

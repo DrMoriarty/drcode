@@ -36,6 +36,13 @@ Uninstall: `uv tool uninstall drcode`.
 
 The TUI operates on the **current directory** (`Path.cwd()`).
 
+Voice I/O (push-to-talk dictation and spoken announcements, see below) needs
+the optional `voice` extra — `uv tool install '.[voice]'` / `pipx install '.[voice]'` /
+`pip install 'drcode[voice]'`, or `uv sync --extra voice` from source. The
+`sounddevice` wheels bundle PortAudio (on Linux install `libportaudio2`).
+Without the extra the app works fine — the voice features are simply
+unavailable and the hotkey explains what to install.
+
 ## Standalone binary
 
 A self-contained bundle that ships its own Python interpreter and all
@@ -178,6 +185,15 @@ Reported events:
 
 Delivery is fire-and-forget and can never stall the UI or an agent run: it happens in a short-lived daemon thread and every failure is swallowed (surfaced as an in-app toast). A notification that couldn't be sent (network down, timeout) is **not lost**: it is persisted in `.drcode/pending_notifications.json` and re-delivered in strict FIFO order, retrying every 15 minutes; a re-sent notification says so, with the moment it originally arose.
 
+## Voice I/O
+
+Optional speech features over an OpenAI-compatible audio API (`POST /audio/transcriptions` for ASR, `POST /audio/speech` for TTS), configured per project via Settings → **"Voice: …"**:
+
+- **Push-to-talk dictation** — `ctrl+b` in a chat input or the new-task form starts the microphone; a second press uploads the recording and inserts the recognized text at the cursor (you edit before sending), `escape` discards it. Everything audio/network runs in worker threads, so the UI never freezes; any failure (no config, no microphone, network) is a readable toast.
+- **TTS announcements** — the same events that drive push notifications can be spoken aloud (per-event checkboxes in the dialog: task completed, tester failed, queue became empty). Phrases are synthesized and played one at a time by a background worker with a bounded queue, so a burst of events never stacks up minutes of speech; user-caused events (typing, pressing Done) are never voiced.
+
+Configuration: audio API base URL (the dialog is prefilled with the default gateway), API key — leave it empty to reuse the token of the user-catalog provider whose host matches the audio URL's host —, the ASR and TTS model ids, the speaker voice (`alloy` by default) and the announcement checkboxes. Everything empty = the features are off. The models are stored in `.drcode/settings.json` (`voice_*` fields), not in the model catalog — their ids contain `/`, which would collide with the `<provider>/<model-id>` reference format.
+
 ## Headless CLI
 
 One-shot commands without the TUI (the pipeline itself is left to the next interactive start):
@@ -208,7 +224,7 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 - Working-agent badge in the terminal tab title (`F`/`B`/`R`/`T` for feature/bug/research/tester) — visible at a glance when drcode sits in a background tab.
 - Copy on select: selecting text in the chat copies it to the clipboard (with a toast; `pbcopy` fallback on macOS).
 - Multi-line chat input (Enter sends, Shift/Alt+Enter inserts a newline) that grows with the draft; the new-task form (Tab toggles the type, Ctrl+Enter creates). Between the chat log and the input sits the todo checklist panel of the viewed task (hidden while empty).
-- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled research task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" / "Nudge stalled agent after" / "Task isolation" / "Parallel tasks" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit + push" (default — the tester verifies, commits the verified changes and pushes them), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed). "Parallel tasks" (1–4) sets how many tasks develop at once — effective only with "Task isolation: worktree" (the picker refuses a value above 1 otherwise). The palette also holds the "Model settings…" sub-palette (the provider catalog and a model picker per agent role), the "GitHub integration: on/off" entry (token, repository, sync interval) and "Notifications: on/off" (ntfy.sh topic).
+- Settings palette (`ctrl+s`): system commands, themes, "Update/create AGENTS.md" service task (a pre-filled research task that writes or refreshes AGENTS.md), and the "Auto-delete completed tasks" / "Task finalization" / "Nudge stalled agent after" / "Task isolation" / "Parallel tasks" entries (current value shown after the colon; picking one opens the option-selection palette, Escape dismisses). "Task finalization" controls what happens after development: "Testing + Git commit + push" (default — the tester verifies, commits the verified changes and pushes them), "Testing" (the tester verifies but the `git_commit` tool is not registered, changes stay uncommitted) or "None" (no tester run — tasks go straight to Completed). "Parallel tasks" (1–4) sets how many tasks develop at once — effective only with "Task isolation: worktree" (the picker refuses a value above 1 otherwise). The palette also holds the "Model settings…" sub-palette (the provider catalog and a model picker per agent role), the "GitHub integration: on/off" entry (token, repository, sync interval), "Notifications: on/off" (ntfy.sh topic) and the "Voice: …" entry (dictation and announcements).
 - Chat history is one chronological timeline: agent messages, tester rounds behind a "testing" separator, and service events (failures, skips, permission violations) with timestamps. None of the service lines ever reach the model context.
 
 ## Keys
@@ -222,10 +238,12 @@ The agent has filesystem and shell tools: `read_file`, `write_file`, `edit_file`
 | `ctrl+up` | Move a queued task one step up the backlog (away from execution) |
 | `ctrl+down` | Move a queued task one step down the backlog (closer to execution) |
 | `ctrl+h` | Hold / resume viewed task |
+| `ctrl+e` | Edit a held task (reopen the task form with its text and queued comments merged; on save it stays on hold or re-enters the queue) |
 | `ctrl+delete` | Delete viewed held task (from the sidebar and disk) |
-| `ctrl+s` | Settings palette (themes, AGENTS.md refresh, auto-cleanup, GitHub integration, notifications) |
+| `ctrl+s` | Settings palette (themes, AGENTS.md refresh, auto-cleanup, GitHub integration, notifications, voice) |
 | `ctrl+o` | Focus task sidebar (↑/↓ + Enter to switch tasks) |
 | `ctrl+i` | Focus chat input |
+| `ctrl+b` | Push-to-talk voice dictation in the focused input (press again to insert the recognized text, `escape` cancels) |
 | `escape` | Abort the running agent/tester — with parallel slots (≥ 2, worktree isolation): only the viewed task's run; otherwise every running task |
 | `ctrl+r` | Nudge viewed task: abort its hung run and restart it (agent continues, tester re-verifies) |
 | `ctrl+q` | Quit |
@@ -238,6 +256,6 @@ moved to `.json.bak`, not deleted). Tester runs are persisted separately from
 the coding agent's transcript, so they never leak into its model history.
 `.drcode/` is gitignored. Alongside the tasks it holds the per-project
 `settings.json` (retention, finalization, stall nudge, GitHub integration,
-notifications), `github_state.json` (sync bookkeeping: last cycle, seen
+notifications, voice), `github_state.json` (sync bookkeeping: last cycle, seen
 issues — imported issues are never reconsidered) and
 `pending_notifications.json` (deferred ntfy.sh deliveries).

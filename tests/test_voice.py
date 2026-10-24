@@ -38,6 +38,7 @@ from drcode.voice import (
     play_wav,
     resolve_api_key,
 )
+from tests.network_mocks import wait_until
 
 # A minimal valid PCM16 WAV file (one sample) for the request-shape tests.
 _WAV_BYTES = (
@@ -864,6 +865,143 @@ async def test_voice_dialog_cancel_keeps_settings(project_root: Any) -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert app.settings.voice_api_url == ""
+
+
+# -- Check-passed spoken confirmation ---------------------------------------------
+
+
+class _FakeAudioClient:
+    """Stands in for VoiceClient: records `speech` calls, serves `check`."""
+
+    def __init__(self, config: Any, spoken: list[str], error: Exception | None) -> None:
+        self.config = config
+        self._spoken = spoken
+        self._error = error
+
+    def check(self) -> str:
+        return "OK — 3 models available"
+
+    def speech(self, text: str) -> bytes:
+        self._spoken.append(text)
+        if self._error is not None:
+            raise self._error
+        return b"RIFF-fake-wav"
+
+
+def _open_voice_dialog(app: Any, pilot: Any) -> Any:
+    app.action_change_voice()
+    return pilot.app.screen
+
+
+async def test_voice_check_success_voices_confirmation(
+    project_root: Any, monkeypatch: Any
+) -> None:
+    """A successful Check with a TTS model set speaks the confirmation
+    phrase (synth + playback in a background thread)."""
+    from textual.widgets import Button, Input, Static
+
+    from drcode.tui import voice_dialog as vd
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_dialog import CHECK_PASSED_PHRASE, VoiceSettingsDialog
+
+    spoken: list[str] = []
+    played: list[bytes] = []
+    monkeypatch.setattr(
+        vd,
+        "VoiceClient",
+        lambda config: _FakeAudioClient(config, spoken, None),
+    )
+    monkeypatch.setattr(vd, "play_wav", played.append)
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+        dialog.query_one("#voice-tts-model", Input).value = "x5-tts/tts-1"
+        dialog.query_one("#voice-check", Button).press()
+        await wait_until(
+            lambda: played == [b"RIFF-fake-wav"], pilot=pilot, what="playback"
+        )
+        assert spoken == [CHECK_PASSED_PHRASE]
+        status_text = str(dialog.query_one("#voice-status", Static).content)
+        assert status_text.startswith("✓")
+
+
+async def test_voice_check_without_tts_model_stays_silent(
+    project_root: Any, monkeypatch: Any
+) -> None:
+    """No TTS model — the check still succeeds but nothing is spoken."""
+    from textual.widgets import Button, Static
+
+    from drcode.tui import voice_dialog as vd
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_dialog import VoiceSettingsDialog
+
+    spoken: list[str] = []
+    monkeypatch.setattr(
+        vd, "VoiceClient", lambda config: _FakeAudioClient(config, spoken, None)
+    )
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+        dialog.query_one("#voice-check", Button).press()
+        await pilot.pause()
+        await pilot.pause()
+        assert spoken == []
+        status_text = str(dialog.query_one("#voice-status", Static).content)
+        assert status_text.startswith("✓")
+
+
+async def test_voice_check_playback_failure_shows_note(
+    project_root: Any, monkeypatch: Any
+) -> None:
+    """A synthesis/playback failure never masks the check result — it is
+    appended to the status line as a note."""
+    from textual.widgets import Button, Input, Static
+
+    from drcode.tui import voice_dialog as vd
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_dialog import VoiceSettingsDialog
+    from drcode.voice import VoiceError
+    from tests.network_mocks import wait_until
+
+    spoken: list[str] = []
+    monkeypatch.setattr(
+        vd,
+        "VoiceClient",
+        lambda config: _FakeAudioClient(
+            config, spoken, VoiceError("TTS failed: HTTP 500")
+        ),
+    )
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+        dialog.query_one("#voice-tts-model", Input).value = "x5-tts/tts-1"
+        dialog.query_one("#voice-check", Button).press()
+        await wait_until(
+            lambda: (
+                "озвучка не удалась"
+                in str(dialog.query_one("#voice-status", Static).content)
+            ),
+            pilot=pilot,
+            what="failure note",
+        )
+        status_text = str(dialog.query_one("#voice-status", Static).content)
+        assert status_text.startswith("✓")
+        assert "TTS failed: HTTP 500" in status_text
 
 
 # -- Dictation context safety ---------------------------------------------------------

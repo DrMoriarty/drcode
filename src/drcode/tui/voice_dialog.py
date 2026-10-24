@@ -12,7 +12,9 @@ Opened from the Settings palette ("Voice…"). The form collects:
 - three checkboxes: which events to voice-announce (task completed,
   tester failure, empty queue).
 
-"Check" probes ``GET /models`` in a worker thread. Save persists everything
+"Check" probes ``GET /models`` in a worker thread; when it succeeds and a
+TTS model is set, the confirmation phrase (:data:`CHECK_PASSED_PHRASE`) is
+synthesized and played in a background thread. Save persists everything
 into the project settings (``<project>/.drcode/settings.json``); ESC — close
 without saving. Everything empty = the voice features are off.
 """
@@ -20,6 +22,8 @@ without saving. Everything empty = the voice features are off.
 from __future__ import annotations
 
 import asyncio
+import sys
+import threading
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -30,12 +34,23 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static, Switch
 
-from ..voice import DEFAULT_TTS_VOICE, DEFAULT_VOICE_API_URL, VoiceClient, VoiceConfig
+from ..voice import (
+    DEFAULT_TTS_VOICE,
+    DEFAULT_VOICE_API_URL,
+    VoiceClient,
+    VoiceConfig,
+    play_wav,
+)
 
 _VOICE_URLS = {
     "transcriptions": "/audio/transcriptions",
     "speech": "/audio/speech",
 }
+
+# Spoken on a successful connection check when a TTS model is present:
+# the same phrase the pipeline announcements use (Russian), so the user
+# hears the familiar announcer voice confirming the setup.
+CHECK_PASSED_PHRASE = "Проверка голосового соединения пройдена, всё хорошо"
 
 
 @dataclass
@@ -268,6 +283,49 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         status.add_class("ok" if ok else "error")
         hint = "" if ok else f" (endpoints: {', '.join(_VOICE_URLS.values())})"
         status.update(f"{'✓' if ok else '✗'} {detail}{hint}")
+        if ok and config.tts_model:
+            self._announce_check(config)
+
+    # -- check-passed confirmation ---------------------------------------------
+
+    def _announce_check(self, config: VoiceConfig) -> None:
+        """Voice the check-passed confirmation when a TTS model is set.
+
+        Fire-and-forget daemon thread: both the network synthesis and the
+        blocking playback must never touch the UI event loop (the module
+        PortAudio lock in voice.py serializes it with any concurrent
+        dictation recording)."""
+        threading.Thread(
+            target=self._announce_run,
+            args=(config,),
+            daemon=True,
+            name="drcode-voice-check",
+        ).start()
+
+    def _announce_run(self, config: VoiceConfig) -> None:
+        try:
+            wav = VoiceClient(config).speech(CHECK_PASSED_PHRASE)
+            play_wav(wav)
+        except Exception as e:  # noqa: BLE001 - a failed confirmation never
+            # masks the check result: it is only appended to the status line
+            self._report_announce_error(str(e))
+
+    def _report_announce_error(self, message: str) -> None:
+        """Show the playback/synthesis failure as a note in the status line
+        (thread-safe: hops back onto the UI loop)."""
+        if not self.is_running:
+            print(
+                f"drcode voice: check confirmation failed: {message}",
+                file=sys.stderr,
+            )
+            return
+        self.app.call_from_thread(self._show_announce_note, message)
+
+    def _show_announce_note(self, message: str) -> None:
+        if not self.is_running:
+            return
+        status = self.query_one("#voice-status", Static)
+        status.update(f"{status.content} — озвучка не удалась: {message}")
 
     @staticmethod
     def _probe(config: VoiceConfig) -> tuple[bool, str]:

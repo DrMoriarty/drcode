@@ -9,10 +9,11 @@ Three independent pieces live here:
   meant to be called from worker threads, never from the UI event loop.
 - :class:`MicrophoneRecorder` — push-to-talk recording via ``sounddevice``
   (PortAudio): 16 kHz mono PCM16 into an in-memory buffer, returned as a
-  complete WAV file. Importing this module never fails when sounddevice is
-  missing (it is an optional ``voice`` extra) — :data:`SOUNDDEVICE_AVAILABLE`
-  says whether the recording/playback half is usable, and the callers show
-  the "pip install drcode[voice]" hint instead.
+  complete WAV file. sounddevice is a core dependency, but the import is
+  still guarded (a missing system PortAudio library raises the same
+  ImportError from inside the wheel) — :data:`SOUNDDEVICE_AVAILABLE`
+  says whether the recording/playback half is usable, and the callers
+  show a readable toast instead of crashing.
 - :class:`TtsSpeaker` — fire-and-forget announcer used by the notifier: a
   single daemon worker thread synthesizes and plays the queued phrases one
   at a time (at most :data:`TtsSpeaker.MAX_PENDING` phrases wait in the
@@ -82,7 +83,12 @@ except Exception as _e:  # noqa: BLE001 - ImportError, but also a missing PortAu
 # SIGSEGV on macOS's CoreAudio IOThread client).
 _PORTAUDIO_LOCK = threading.Lock()
 
-VOICE_EXTRA_HINT = "pip install drcode[voice]"
+# Shown when the guarded import above failed despite sounddevice being a
+# core dependency (normally a missing system PortAudio library on Linux).
+VOICE_UNAVAILABLE_HINT = (
+    "the sounddevice/PortAudio audio backend is unavailable "
+    "(on Linux install the libportaudio2 system package)"
+)
 
 
 class VoiceError(Exception):
@@ -388,7 +394,7 @@ def play_wav(data: bytes) -> None:
     """Decode PCM WAV bytes and play them synchronously (blocks until the
     sound finishes). Worker threads only."""
     if not SOUNDDEVICE_AVAILABLE:
-        raise VoiceError(f"sounddevice is not installed ({VOICE_EXTRA_HINT})")
+        raise VoiceError(f"sounddevice is not available ({VOICE_UNAVAILABLE_HINT})")
     try:
         with wave.open(io.BytesIO(data)) as wav:
             rate = wav.getframerate()

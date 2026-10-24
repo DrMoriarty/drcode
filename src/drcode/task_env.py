@@ -529,6 +529,81 @@ class TaskEnvironment:
                 task_id for task_id in ids if cache.get(self.branch(task_id), False)
             }
 
+    def unmerged_drcode_branches(self) -> set[str]:
+        """ALL `drcode/<task-id>` branch names (full short names, prefix
+        included) whose tip holds commits the base branch does not have —
+        the wholesale answer behind the header's unmerged-work indicator
+        and the accept-hook merge audit. Unlike `unmerged_ids` this does
+        not need the caller to know WHICH ids to ask: one `for-each-ref
+        --no-merged <base>` over the `refs/heads/drcode/` glob answers
+        every task branch at once — the cost is O(1) git processes, not
+        per branch and not per completed task.
+
+        Shares the `_unmerged_cache_fingerprint` mechanism with
+        `unmerged_ids` (identical per-branch mergedness semantics, one
+        `show-ref --head` snapshot per poll): whichever of the two timers
+        (10 s indicator, 30 s dependency tick) runs first pays for the
+        snapshot+glob, the other hits the warm cache. Answers for
+        branches the snapshot did not see are never cached — a glob
+        result is only trusted for branches existing under THAT
+        fingerprint.
+
+        Degradation: isolation off / no git repo → empty set; the
+        snapshot unavailable (broken repository) → the plain glob
+        without caching; the glob itself failing → empty set ("merged" —
+        the same degradation as the rev-list path). Blocking (2–3 cheap
+        git calls cold, 1 warm): run via `asyncio.to_thread`."""
+        if not self.active:
+            return set()
+        fingerprint, existing = self._branch_snapshot()
+        if fingerprint is None:
+            # The wholesale snapshot could not be taken (broken/empty
+            # repository): answer without caching — the glob degrades to
+            # empty exactly like the rev-list path on git failure.
+            return self._unmerged_branches_glob()
+        with self._unmerged_cache_lock:
+            if fingerprint != self._unmerged_cache_fingerprint:
+                # Anything moved (a commit on a drcode branch, a merge
+                # into the base, a branch added/removed): every cached
+                # answer is stale — recompute from scratch below.
+                self._unmerged_cache_fingerprint = fingerprint
+                self._unmerged_cache = {}
+            cache = self._unmerged_cache
+            unknown = [b for b in existing if b not in cache]
+            if unknown:
+                # The glob answers ALL drcode branches at once (unmerged
+                # ones come back, merged ones do not) — fill the cache
+                # for every branch the snapshot vouches for.
+                batch = self._unmerged_branches_glob()
+                cache.update((b, b in batch) for b in unknown)
+            return {b for b in existing if cache.get(b, False)}
+
+    def _unmerged_branches_glob(self) -> set[str]:
+        """Which `drcode/*` branches hold commits the base branch does
+        not have — ONE `for-each-ref --no-merged <base>` over the
+        prefix glob (no refspec per branch, so the cost does not grow
+        with the branch count). Full short branch names, prefix
+        included. Empty set on any git failure — when git cannot tell,
+        the answer is "merged" (same as the rev-list path)."""
+        try:
+            code, out = self._git(
+                "for-each-ref",
+                "--format=%(refname)",
+                "--no-merged",
+                self.base_branch(),
+                f"refs/heads/{BRANCH_PREFIX}",
+            )
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        if code != 0:
+            return set()
+        prefix = "refs/heads/"
+        return {
+            line.strip()[len(prefix) :]
+            for line in out.splitlines()
+            if line.strip().startswith(prefix)
+        }
+
     def _unmerged_ids_slow(self, ids: list[str]) -> set[str]:
         """The pre-optimization per-id loop: rev-parse + rev-list per
         branch, base resolved per call. Fallback only — for environments

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -42,6 +43,37 @@ RemovalListener = Callable[[str], None]
 # fire both a removal and a completion observer). Sync, like the other
 # observers: must be fast and non-raising.
 CompletionListener = Callable[[Task, TaskStatus, str], None]
+
+
+def _remove_scratch_background(task: Task) -> None:
+    """remove_scratch off the UI thread when one is under us: the
+    completion paths run on the Textual event loop, and deleting a large
+    /tmp/drcode/<id> tree synchronously froze the whole UI for the
+    deletion's duration. Called without a running loop (plain sync
+    callers, worker threads like the tester's set_verification tool) the
+    removal runs inline — it is off the UI thread there already.
+
+    Re-queue race guard: a task that was re-queued (new input on the
+    completed task) while the deletion was pending may already use a
+    freshly created scratch directory — a non-COMPLETED status skips the
+    removal (the task's own completion/cleanup removes it later)."""
+
+    def _run() -> None:
+        try:
+            if task.status is not TaskStatus.COMPLETED:
+                return
+            remove_scratch(task.id)
+        except Exception:  # noqa: BLE001, S110 - a cleanup job must never crash anything
+            pass
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _run()
+        return
+    threading.Thread(
+        target=_run, name=f"drcode-scratch-remove-{task.id}", daemon=True
+    ).start()
 
 
 def validate_dependencies(
@@ -673,7 +705,7 @@ class TaskManager:
         )
         if task.status is TaskStatus.COMPLETED:
             task.completed_at = _now()
-            remove_scratch(task_id)
+            _remove_scratch_background(task)
         task.touch()
         self._save_changed(task, old, origin)
         return task
@@ -728,7 +760,7 @@ class TaskManager:
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.unfinished = False
-        remove_scratch(task_id)
+        _remove_scratch_background(task)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -755,7 +787,7 @@ class TaskManager:
         task.completed_at = _now()
         task.review_pending = False
         task.review_rejections = 0
-        remove_scratch(task_id)
+        _remove_scratch_background(task)
         self._fire_removed(task_id)
         task.touch()
         self._save_changed(task, old, "user")
@@ -802,7 +834,7 @@ class TaskManager:
             return task
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
-        remove_scratch(task_id)
+        _remove_scratch_background(task)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -821,7 +853,7 @@ class TaskManager:
         task.unfinished = False
         task.review_rejections = 0
         task.fix_rounds = 0
-        remove_scratch(task_id)
+        _remove_scratch_background(task)
         task.touch()
         self._save_changed(task, old, origin)
         return task

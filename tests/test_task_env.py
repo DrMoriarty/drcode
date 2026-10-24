@@ -12,6 +12,8 @@ still saved, the mode stays dormant). Plus the two no-loss rules:
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -483,6 +485,126 @@ def test_retention_purge_keeps_unmerged_branch(
     assert not env.worktree_path(task.id).exists()
     assert branch_exists(git_root, f"drcode/{task.id}")
     assert any("kept" in t for _, t in notices)
+
+
+# -- background removal (the completion path) ----------------------------------------
+#
+# The worktree teardown moved off the UI thread: a real-world worktree
+# (venvs, caches) takes tens of seconds to snapshot and delete, and a
+# synchronous remove on the completion path froze the whole Textual UI.
+# These tests pin the two race guards that replaced the old "synchronous
+# by contract" rule: the per-task lock (ensure_root waits out an in-flight
+# removal) and the re-check (a re-queued task keeps its worktree).
+
+
+def test_scheduled_removal_does_not_block_the_caller(git_root: Path) -> None:
+    """schedule_removal returns while the removal is still running;
+    wait_removal joins it (the pipeline's await point before the accept
+    hooks)."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    env.ensure_root("t1")
+    (env.worktree_path("t1") / "docs.md").write_text("docs")
+    env.snapshot("t1", "test")
+    started = threading.Event()
+    release = threading.Event()
+    original = env._remove_locked
+
+    def slow(task_id: str) -> None:
+        started.set()
+        release.wait(10)
+        original(task_id)
+
+    env._remove_locked = slow  # type: ignore[method-assign]
+    env.schedule_removal("t1")
+    assert started.wait(10)
+    # The caller is back while the removal is still parked in its body…
+    assert env.worktree_path("t1").is_dir()
+    release.set()
+    env.wait_removal("t1")
+    # …and wait_removal returns only when it has really finished.
+    assert not env.worktree_path("t1").exists()
+
+
+def test_ensure_root_waits_for_in_flight_removal(git_root: Path) -> None:
+    """A re-activation during a background removal does not race it:
+    ensure_root blocks until the removal has finished, then recreates the
+    worktree from the surviving branch."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    root, _ = env.ensure_root("t1")
+    (root / "docs.md").write_text("the work")
+    env.snapshot("t1", "test")
+    started = threading.Event()
+    release = threading.Event()
+    original = env._remove_locked
+
+    def slow(task_id: str) -> None:
+        started.set()
+        release.wait(10)
+        original(task_id)
+
+    env._remove_locked = slow  # type: ignore[method-assign]
+    env.schedule_removal("t1")
+    assert started.wait(10)
+    results: list[tuple[Path, str]] = []
+
+    def activate() -> None:
+        results.append(env.ensure_root("t1"))
+
+    activator = threading.Thread(target=activate)
+    activator.start()
+    time.sleep(0.1)
+    assert activator.is_alive()  # still waiting for the removal
+    release.set()
+    activator.join(10)
+    new_root, note = results[0]
+    assert note == ""
+    assert new_root == env.worktree_path("t1")
+    assert (new_root / "docs.md").read_text() == "the work"
+
+
+def test_scheduled_removal_skips_requeued_task(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """A task re-queued while its removal job was pending keeps its
+    worktree: the job's re-check (under the per-task lock, i.e. ordered
+    against ensure_root) sees the non-COMPLETED status and skips."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    task = manager.create("research", "x", kind=TaskKind.RESEARCH)
+    root, _ = env.ensure_root(task.id)
+    (root / "docs.md").write_text("the research result")
+    env.snapshot(task.id, "test")
+    # Hold the per-task lock: the scheduled job must park in front of it,
+    # so the re-check happens only after the re-queue below.
+    lock = env._task_lock(task.id)
+    acquired = threading.Event()
+    release_hold = threading.Event()
+
+    def hold() -> None:
+        with lock:
+            acquired.set()
+            release_hold.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert acquired.wait(10)
+    env.schedule_removal(task.id, task)
+    # The user re-queues the completed task while the job is pending…
+    task.status = TaskStatus.QUEUED
+    release_hold.set()
+    holder.join(10)
+    env.wait_removal(task.id)
+    # …so the worktree survives (the work is still on disk).
+    assert env.worktree_path(task.id).is_dir()
+    assert (env.worktree_path(task.id) / "docs.md").read_text() == (
+        "the research result"
+    )
+    assert branch_exists(git_root, f"drcode/{task.id}")
+
+
+def test_wait_removal_without_scheduled_job_is_instant(git_root: Path) -> None:
+    """No removal scheduled: wait_removal is a cheap no-op."""
+    env = _removal_env(git_root, WorktreeRemoval.ON_COMPLETION)
+    env.wait_removal("never-scheduled")
 
 
 # -- startup orphan sweep --------------------------------------------------------------

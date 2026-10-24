@@ -207,6 +207,17 @@ class TaskEnvironment:
         self._unmerged_cache_fingerprint: str | None = None
         self._unmerged_cache: dict[str, bool] = {}
         self._unmerged_cache_lock = threading.Lock()
+        # Per-task removal coordination (see schedule_removal / wait_removal):
+        # `_removal_locks` serializes the git-touching body of `remove`
+        # against `ensure_root` of the same task (a background removal must
+        # never race a re-activation's worktree creation), and
+        # `_removal_pending` lets the pipeline wait until a scheduled
+        # background removal has finished (or skipped) before the accept
+        # hooks read the worktree state.
+        self._removal_locks: dict[str, threading.RLock] = {}
+        self._removal_locks_guard = threading.Lock()
+        self._removal_cond = threading.Condition()
+        self._removal_pending: set[str] = set()
 
     # -- state ---------------------------------------------------------------
 
@@ -228,6 +239,18 @@ class TaskEnvironment:
     def worktree_path(self, task_id: str) -> Path:
         """Where this task's worktree lives (exists or not)."""
         return self.project_root / WORKTREES_SUBDIR / task_id
+
+    def _task_lock(self, task_id: str) -> threading.RLock:
+        """The per-task serialization lock shared by `ensure_root`,
+        `remove` and `snapshot` (lazily created; one small RLock per task
+        id — reentrant because remove/cleanup_orphans snapshot from
+        inside the lock)."""
+        with self._removal_locks_guard:
+            lock = self._removal_locks.get(task_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._removal_locks[task_id] = lock
+            return lock
 
     def branch(self, task_id: str) -> str:
         return branch_for(task_id)
@@ -319,8 +342,12 @@ class TaskEnvironment:
         # One activation at a time: the prune/add sequence below is not
         # race-free against a concurrent activation of another task (the
         # parallel development slots dispatch several ensure_root calls
-        # in flight at once).
-        with self._activation_lock:
+        # in flight at once). The per-task lock additionally keeps this
+        # off the toes of a background removal of the SAME task
+        # (schedule_removal): the removal finishes before a worktree is
+        # (re-)created here — or, when this activation got here first,
+        # the removal's re-check sees the task alive again and skips.
+        with self._task_lock(task_id), self._activation_lock:
             return self._ensure_root_locked(task_id)
 
     def _ensure_root_locked(self, task_id: str) -> tuple[Path, str]:
@@ -433,6 +460,14 @@ class TaskEnvironment:
         wt = self.worktree_path(task_id)
         if not wt.is_dir():
             return None
+        # Serialized per task against remove/ensure_root (a background
+        # completion removal must not delete the tree mid-commit); the
+        # RLock makes the nested snapshot from remove/cleanup_orphans a
+        # no-op re-entry.
+        with self._task_lock(task_id):
+            return self._snapshot_locked(task_id, wt, note)
+
+    def _snapshot_locked(self, task_id: str, wt: Path, note: str) -> str | None:
         branch = self.branch(task_id)
         try:
             code, out = self._git(
@@ -740,6 +775,12 @@ class TaskEnvironment:
         leftovers of a session where isolation was toggled off are still
         cleaned.
 
+        Serialized per task against `ensure_root` and any concurrent
+        background removal (`schedule_removal`) through the per-task lock —
+        the hot completion path runs this in a daemon thread (see
+        `on_completed`), and a re-activation's worktree creation must
+        never interleave with the deletion.
+
         Project setting `worktree_removal` (`drcode.settings`): under
         `never` the directory is NOT removed — the snapshot above still
         runs (RULE 1), and the branch stays too (it is checked out in the
@@ -747,6 +788,12 @@ class TaskEnvironment:
         other modes behave identically here: with the task means with the
         task, whether it was cancelled or had just completed.
         """
+        with self._task_lock(task_id):
+            self._remove_locked(task_id)
+
+    def _remove_locked(self, task_id: str) -> None:
+        """The git-touching body of remove, run under the per-task lock
+        (see remove)."""
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
         try:
@@ -784,23 +831,90 @@ class TaskEnvironment:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def schedule_removal(self, task_id: str, task: Task | None = None) -> None:
+        """Run `remove` in a daemon thread and return immediately.
+
+        The hot path for worktree teardown: agents leave huge trees behind
+        (.venv, node_modules, build artifacts — the snapshot's `git add -A`
+        and the per-file deletion each take tens of seconds on such a
+        worktree), and a synchronous remove on the caller's thread froze
+        the Textual event loop for the whole duration (the Header clock
+        stopped ticking — every completion looked like a hang).
+
+        Race safety (the reason removal used to be synchronous): a fast
+        re-queue of the completed task (new input → re-activation →
+        `ensure_root` recreates the worktree) must not interleave with the
+        deletion. Two mechanisms, covering both orderings:
+
+        - `ensure_root` serializes against an in-flight removal through
+          the same per-task lock — a re-activation WAITS for the removal
+          to finish, then recreates the worktree from the surviving
+          branch (nothing is lost);
+        - the captured `task` (the completion path passes it) is
+          re-checked under that lock just before removing: a task that
+          got re-queued while the job was pending is left alone (its next
+          completion schedules a fresh removal).
+
+        When `task` is None (delete/purge paths — the task is already
+        gone from the manager, no re-activation is possible) the removal
+        always runs. Best-effort: never raises."""
+        with self._removal_cond:
+            self._removal_pending.add(task_id)
+        thread = threading.Thread(
+            target=self._remove_in_background,
+            args=(task_id, task),
+            name=f"drcode-wt-remove-{task_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _remove_in_background(self, task_id: str, task: Task | None) -> None:
+        """The daemon-thread body of schedule_removal: re-check the task
+        under the per-task lock (so the answer cannot be overtaken by a
+        re-activation's ensure_root, which holds the same lock while it
+        recreates the worktree), remove, then release the waiters
+        (pipeline accept hooks)."""
+        try:
+            with self._task_lock(task_id):
+                if task is not None and task.status is not TaskStatus.COMPLETED:
+                    return  # re-queued / re-activated while the job was pending
+                self.remove(task_id)  # RLock re-entry: the lock is held
+        except Exception:  # noqa: BLE001, S110 - a removal job must never crash anything
+            pass
+        finally:
+            with self._removal_cond:
+                self._removal_pending.discard(task_id)
+                self._removal_cond.notify_all()
+
+    def wait_removal(self, task_id: str) -> None:
+        """Block until a scheduled background removal of the task has
+        finished (or skipped). Cheap no-op when none is pending; the
+        pipeline awaits this via `asyncio.to_thread` before the accept
+        hooks — they must observe the post-removal state (branch-only
+        `worktree` payload, the directory really gone) exactly like the
+        synchronous contract used to guarantee."""
+        with self._removal_cond:
+            self._removal_cond.wait_for(lambda: task_id not in self._removal_pending)
+
     def on_completed(self, task: Task, old: TaskStatus, origin: str) -> None:
         """Completion-transition hook for `worktree_removal:
         on_completion`: the task's worktree directory is removed as soon
         as the task reaches COMPLETED (research done, the tester's
-        verdict, a no-tester or review-accept finalization — the app
-        registers this method as a TaskManager completion listener, so
-        every COMPLETED transition funnels through here; the signature
+        verdict, a no-tester or review-accept finalization — the signature
         matches `drcode.task_manager.CompletionListener`).
 
         A no-op under the other modes (`remove` itself honours `never`).
-        Synchronous by contract — like the removal listeners, and on
-        purpose: it must not run as a background job, or a fast re-queue
-        of the completed task (new input) would have `ensure_root`
-        recreate the worktree under the removal's feet. `remove()`
-        snapshots the dirty tree first (RULE 1) and is idempotent, so the
-        removal listeners (cancel/delete) firing before or after this do
-        no harm."""
+        Synchronous, and safe to run as a background job too (see
+        `schedule_removal`): the re-queue race that used to demand the
+        synchronous contract — a fast re-queue of the completed task
+        (new input) having `ensure_root` recreate the worktree under the
+        removal's feet — is now handled by the per-task removal lock
+        (ensure_root waits out an in-flight removal) plus the job's
+        re-check of the captured task. The app wires the background
+        variant; this direct form stays for tests and simple embeddings.
+        `remove()` snapshots the dirty tree first (RULE 1) and is
+        idempotent, so the removal listeners (cancel/delete) firing
+        before or after this do no harm."""
         if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
             return
         self.remove(task.id)
@@ -837,16 +951,22 @@ class TaskEnvironment:
                 for entry in wt_root.iterdir():
                     if entry.name in live_task_ids:
                         continue
-                    snap = self.snapshot(entry.name, "before orphan cleanup")
-                    if (
-                        snap is not None
-                        and snap.startswith("snapshot committed")
-                        and self.event_log is not None
-                    ):
-                        self.event_log(entry.name, snap)
-                    code, _ = self._git("worktree", "remove", "--force", str(entry))
-                    if code != 0:
-                        shutil.rmtree(entry, ignore_errors=True)
+                    # Same per-task lock as remove/ensure_root: a startup
+                    # sweep can overlap a background removal scheduled
+                    # just before shutdown of the previous session's
+                    # pattern — serialize instead of racing two
+                    # snapshot+delete sequences over one directory.
+                    with self._task_lock(entry.name):
+                        snap = self.snapshot(entry.name, "before orphan cleanup")
+                        if (
+                            snap is not None
+                            and snap.startswith("snapshot committed")
+                            and self.event_log is not None
+                        ):
+                            self.event_log(entry.name, snap)
+                        code, _ = self._git("worktree", "remove", "--force", str(entry))
+                        if code != 0:
+                            shutil.rmtree(entry, ignore_errors=True)
                     removed.append(entry.name)
             elif wt_root.exists():
                 wt_root.rmdir()

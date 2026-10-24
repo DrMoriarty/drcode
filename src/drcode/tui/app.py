@@ -329,14 +329,22 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # surface through the task's event history — or a toast when the
         # task is already gone (delete / retention purge).
         self.task_env.event_log = self._task_env_event
-        self.manager.add_removal_listener(self.task_env.remove)
+        # Removal teardown (cancel / delete / retention purge) in a
+        # daemon thread: a giant worktree takes tens of seconds to
+        # snapshot and delete — synchronously that froze the event loop.
+        # The task object (when the task still exists) is re-checked on
+        # the thread: a task re-queued in the meantime keeps its worktree.
+        self.manager.add_removal_listener(self._remove_worktree_background)
         # worktree_removal: on_completion — the worktree directory goes as
         # soon as the task reaches COMPLETED (research done, the tester's
-        # verdict, a no-tester / review-accept finalization). Synchronous
-        # on purpose (see TaskEnvironment.on_completed): a background job
-        # would race a re-queue of the same task, whose ensure_root
-        # recreates the worktree.
-        self.manager.add_completion_listener(self.task_env.on_completed)
+        # verdict, a no-tester / review-accept finalization). The removal
+        # runs in a daemon thread (schedule_removal): a real-world
+        # worktree takes tens of seconds to snapshot and delete, far too
+        # long for the UI thread. The old re-queue race is handled by the
+        # per-task removal lock + re-check in TaskEnvironment, and the
+        # pipeline waits the removal out (wait_removal) before the accept
+        # hooks.
+        self.manager.add_completion_listener(self._completion_removal_background)
         # RULE 1 (see drcode.task_env): a verdict never leaves the task
         # with a dirty tree — every transition out of active work
         # (tester verdict, cancel) snapshots the worktree onto the task's
@@ -801,6 +809,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             print(f"drcode: notification error surfacing failed: {e}", file=sys.stderr)
 
     # -- worktree snapshots (task-isolation bookkeeping) -------------------------
+
+    def _remove_worktree_background(self, task_id: str) -> None:
+        """Removal-listener adapter: hand the worktree teardown to
+        TaskEnvironment's background scheduler, passing the task (when it
+        still exists — delete/purge have already popped it) so the
+        scheduler can skip a re-queued task."""
+        self.task_env.schedule_removal(task_id, self.manager.tasks.get(task_id))
+
+    def _completion_removal_background(
+        self, task: Task, old: TaskStatus, origin: str
+    ) -> None:
+        """Completion-listener adapter for `worktree_removal:
+        on_completion` — like TaskEnvironment.on_completed, but the
+        removal is scheduled in a daemon thread (see
+        _remove_worktree_background)."""
+        if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
+            return
+        self.task_env.schedule_removal(task.id, task)
 
     def _on_app_thread(self) -> bool:
         return getattr(self, "_thread_id", None) == threading.get_ident()

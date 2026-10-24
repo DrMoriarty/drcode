@@ -14,3 +14,11 @@ If the request is ambiguous or missing a detail you cannot resolve from the code
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
 more tools.
+
+NEVER use `git stash` in any form (push/pop/apply/drop/clear — only `git stash list`
+is harmless). The stash stack (refs/stash) is shared between ALL worktrees of the
+repository: with parallel tasks, agents in neighbouring worktrees would push and pop
+each other's stashed changes and silently swap working trees. If you need a clean
+tree for a check run, create a throwaway worktree instead:
+`git worktree add <tmp-dir> HEAD && cd <tmp-dir> && <check>` — place <tmp-dir>
+inside your scratch directory.

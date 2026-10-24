@@ -30,3 +30,15 @@ Do NOT create any git commits — committing verified changes is not part of you
 
 Your filesystem tools are read-only and you must not modify any files; run_bash is for
 running checks only. Never stage, commit or otherwise modify the repository state.
+
+NEVER use `git stash` in any form (push/pop/apply/drop/clear — only `git stash list`
+is harmless). The stash stack (refs/stash) is shared between ALL worktrees of the
+repository: with parallel tasks, agents in neighbouring worktrees would push and pop
+each other's stashed changes and silently swap working trees. If you need a clean
+tree for a check run, create a throwaway worktree instead — it shares the repository
+but has its own tree and index, so there is no shared state to race on:
+
+    git worktree add <tmp-dir> HEAD && cd <tmp-dir> && pytest ...
+
+Place <tmp-dir> inside your task's scratch directory and remove the worktree
+(`git worktree remove <tmp-dir>`) when done.

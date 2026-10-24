@@ -35,6 +35,7 @@ from drcode.voice import (
     VoiceError,
     catalog_api_key_for_host,
     config_from_settings,
+    play_wav,
     resolve_api_key,
 )
 
@@ -361,6 +362,39 @@ def test_speaker_error_is_reported_not_raised() -> None:
     while not errors and time.monotonic() < deadline:
         time.sleep(0.01)
     assert errors == ["TTS failed: HTTP 500"]
+
+
+def test_speaker_plays_queued_phrases_in_order() -> None:
+    # The second phrase goes through the prefetch path (synthesized on a
+    # helper thread while the first one plays) — order must survive it.
+    synth, player = _FakeSynth(), _FakePlayer()
+    speaker = TtsSpeaker(
+        lambda: _voice_settings(),
+        client_factory=lambda c: synth,
+        play=player,
+    )
+    speaker.speak("первая")
+    speaker.speak("вторая")
+    deadline = time.monotonic() + 5
+    while len(player.played) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert player.played == [
+        b"WAV:" + "первая".encode(),
+        b"WAV:" + "вторая".encode(),
+    ]
+
+
+def test_play_wav_rejects_non_16bit_pcm() -> None:
+    # A 24-bit answer from the TTS gateway must fail with a readable error,
+    # not play as int16-shifted crackle.
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(3)
+        wav.setframerate(24_000)
+        wav.writeframes(b"\x00" * 60)
+    with pytest.raises(VoiceError, match="24-bit"):
+        play_wav(buffer.getvalue())
 
 
 # -- Notifier voice hooks ------------------------------------------------------------

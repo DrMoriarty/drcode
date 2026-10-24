@@ -67,7 +67,7 @@ from .header import ModelStatusHeader
 from .inputs import ChatInput, DepsInput, NewTaskInput
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
-from .sidebar import Sidebar, TaskItem  # noqa: F401
+from .sidebar import Sidebar, TaskItem
 from .state import LiveTailEntry
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
@@ -472,6 +472,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
+        # Mounted sidebar rows by key (("header", section) / ("task", id)):
+        # refresh_sidebar() reuses these widgets instead of rebuilding the
+        # whole list every time (a full rebuild of a few hundred tasks
+        # costs over a second of mounting + layout).
+        self._sidebar_items: dict[tuple[str, str], TaskItem] = {}
         # Same idea for the todo panel: (new-task mode, viewed id, checklist
         # items) of the last render — the 1s poll re-renders the panel only
         # when this changes (todo tools refresh it instantly themselves).

@@ -55,7 +55,7 @@ from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
 from .setup_dialog import ModelSetup
-from .sidebar import Sidebar
+from .sidebar import Sidebar, TaskItem
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
@@ -556,6 +556,9 @@ class DrCodeState(App[None]):
 
     # -- sidebar / activity -------------------------------------------------
     _sidebar_snapshot: tuple
+    # Mounted sidebar rows by key ("header", section) / ("task", id) —
+    # reused by the incremental refresh instead of a full rebuild.
+    _sidebar_items: dict[tuple[str, str], TaskItem]
     # Todo-panel snapshot of the last render (see _todo_fingerprint).
     _todo_snapshot: tuple
     _collapsed_sections: set[str]

@@ -17,14 +17,23 @@ class TaskItem(ListItem):
         header: bool = False,
         section: str | None = None,
     ) -> None:
-        super().__init__(
-            Label(text, classes="section-header" if header else "task-item")
-        )
+        label = Label(text, classes="section-header" if header else "task-item")
+        super().__init__(label)
         self.task_id = task_id
         self.text = text
+        self._label = label
         # For section headers: the collapsible category they belong to
         # (None on task rows). Enter/space/click on a header toggles it.
         self.section = section
+
+    def set_text(self, text: str) -> None:
+        """Update the row's label in place.
+
+        The incremental sidebar refresh (chat_view.refresh_sidebar) reuses
+        mounted rows and rewrites only the changed labels — a full
+        clear-and-remount of a few hundred rows costs a visible freeze."""
+        self.text = text
+        self._label.update(text)
 
 
 class Sidebar(ListView):

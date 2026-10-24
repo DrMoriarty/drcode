@@ -14,6 +14,7 @@ from rich.markup import escape
 from textual.css.query import NoMatches
 from textual.widget import Widget
 from textual.widgets import (
+    ListView,
     Static,
 )
 
@@ -303,6 +304,106 @@ class ChatViewLayer(DrCodeState):
             return tasks[0]
         return None
 
+    def _task_row_text(self, t: Task) -> str:
+        """Rendered label of a task row (the incremental refresh compares
+        it against the mounted row to skip unchanged labels)."""
+        marker = {
+            "queued": "⏳",
+            "hold": "⏸",
+            "active": "▶",
+            "testing": "🧪",
+            "completed": "✓",
+            "clarification": "❓",
+        }.get(t.status.value, "⏳")
+        kind_letter = {
+            TaskKind.BUG: "[red]B[/]",
+            TaskKind.RESEARCH: "[yellow]R[/]",
+        }.get(t.kind, "[green]F[/]")
+        if t.verification is VerificationStatus.PASSED:
+            suffix = " ✅"
+        elif t.verification is VerificationStatus.FAILED:
+            suffix = " ❌"
+        else:
+            suffix = ""
+        # Dependency gate: a task whose depends_on is not satisfied yet
+        # gets the lock marker and the ids it waits for.
+        deps_suffix = self._dependency_marker(t)
+        viewed = " ●" if t.id == self.viewed_id else ""
+        return (
+            f"{marker} {kind_letter} #{t.id} "
+            f"{escape(t.title_display)}{suffix}{deps_suffix}{viewed}"
+        )
+
+    def _sidebar_row(
+        self,
+        key: tuple[str, str],
+        text: str,
+        *,
+        task_id: str | None = None,
+        header: bool = False,
+        section: str | None = None,
+        viewed: bool = False,
+    ) -> TaskItem:
+        """Reuse (or create) the mounted row for *key* and sync it to the
+        desired *text*/`viewed` class.
+
+        Rows are tracked in `_sidebar_items` so a refresh only creates the
+        rows that appeared and rewrites the labels that changed — the
+        full rebuild of ~2 widgets per row (ListItem + Label) with mount
+        messages and layout passes is what made the sidebar redraw take
+        over a second at a few hundred completed tasks."""
+        item = self._sidebar_items.get(key)
+        if item is None:
+            item = TaskItem(text, task_id, header=header, section=section)
+            if viewed:
+                item.add_class("viewed")
+            self._sidebar_items[key] = item
+            return item
+        if item.text != text:
+            item.set_text(text)
+        if viewed != item.has_class("viewed"):
+            if viewed:
+                item.add_class("viewed")
+            else:
+                item.remove_class("viewed")
+        return item
+
+    def _reconcile_sidebar(
+        self, sidebar: ListView, desired: list[TaskItem], tracked: set[TaskItem]
+    ) -> None:
+        """Bring the sidebar's row order to *desired*, reusing widgets.
+
+        Rows already mounted keep their place while they match the desired
+        order; new rows are mounted (before the first following row that
+        is already in place, or appended at the end); tracked rows sitting
+        at a wrong position are moved with `move_child` — an in-place
+        reorder of the node list, since textual has no mount-time
+        reparenting and re-creating a row would defeat the reuse. Rows
+        that were removed from the tracking dict (pending their async
+        prune) are invisible to this: they never match a desired row and
+        are skipped as placement anchors.
+        """
+        live = [child for child in sidebar._nodes if child in tracked]
+        next_live = 0
+        for i, item in enumerate(desired):
+            if next_live < len(live) and live[next_live] is item:
+                next_live += 1
+                continue
+            following = live[next_live:]
+            anchor = next(
+                (later for later in desired[i + 1 :] if later in following), None
+            )
+            if item not in tracked:
+                # A row created by THIS refresh (never mounted yet).
+                if anchor is not None:
+                    sidebar.mount(item, before=anchor)
+                else:
+                    sidebar.mount(item)
+            elif anchor is not None:
+                sidebar.move_child(item, before=anchor)
+            # else: every kept row is already before it and everything
+            # after it will be pruned — its position is already correct.
+
     def refresh_sidebar(self) -> None:
         # Called from worker finally-blocks too — it can fire while the
         # app is shutting down and the screen (with the sidebar) is
@@ -311,49 +412,64 @@ class ChatViewLayer(DrCodeState):
             sidebar = self.sidebar
         except NoMatches:
             return
-        sidebar.clear()
+        mounted_before = set(self._sidebar_items.values())
+        # Incremental reconcile instead of clear()+append-everything: the
+        # typical update (a status flip, a new bug report at the queue
+        # head) touches a handful of rows instead of recreating them all.
+        highlighted = sidebar.highlighted_child
+        keep_cursor = isinstance(highlighted, TaskItem)
+        items: list[TaskItem] = []
+        keys: set[tuple[str, str]] = set()
         for name, tasks in self._sidebar_sections():
+            keys.add(("header", name))
             # A collapsed section keeps only its header line: the "+" shows
             # there is content hidden underneath, "-" means fully expanded.
             collapsed = name in self._collapsed_sections
             marker = "+" if collapsed else "-"
-            sidebar.append(
-                TaskItem(f"{marker} {name} ({len(tasks)})", header=True, section=name)
+            items.append(
+                self._sidebar_row(
+                    ("header", name),
+                    f"{marker} {name} ({len(tasks)})",
+                    header=True,
+                    section=name,
+                )
             )
             if collapsed:
                 continue
             for t in tasks:
-                marker = {
-                    "queued": "⏳",
-                    "hold": "⏸",
-                    "active": "▶",
-                    "testing": "🧪",
-                    "completed": "✓",
-                    "clarification": "❓",
-                }.get(t.status.value, "⏳")
-                kind_letter = {
-                    TaskKind.BUG: "[red]B[/]",
-                    TaskKind.RESEARCH: "[yellow]R[/]",
-                }.get(t.kind, "[green]F[/]")
-                if t.verification is VerificationStatus.PASSED:
-                    suffix = " ✅"
-                elif t.verification is VerificationStatus.FAILED:
-                    suffix = " ❌"
-                else:
-                    suffix = ""
-                # Dependency gate: a task whose depends_on is not satisfied
-                # yet gets the lock marker and the ids it waits for.
-                deps_suffix = self._dependency_marker(t)
-                viewed = " ●" if t.id == self.viewed_id else ""
-                item = TaskItem(
-                    f"{marker} {kind_letter} #{t.id} "
-                    f"{escape(t.title_display)}{suffix}{deps_suffix}{viewed}",
-                    t.id,
+                keys.add(("task", t.id))
+                items.append(
+                    self._sidebar_row(
+                        ("task", t.id),
+                        self._task_row_text(t),
+                        task_id=t.id,
+                        viewed=t.id == self.viewed_id,
+                    )
                 )
-                if t.id == self.viewed_id:
-                    item.add_class("viewed")
-                sidebar.append(item)
-        sidebar.refresh()
+        # Rows whose key disappeared: drop from the tracking dict and
+        # remove. The removal is async (a Prune round-trip), so a row can
+        # linger in the DOM for a moment — the sidebar's click handler
+        # already ignores items that are no longer ListView children, and
+        # the reconcile below treats only tracked rows as anchors.
+        for key in [*self._sidebar_items]:
+            if key not in keys:
+                item = self._sidebar_items.pop(key)
+                mounted_before.discard(item)
+                if item is highlighted:
+                    keep_cursor = False
+                item.remove()
+        self._reconcile_sidebar(sidebar, items, mounted_before)
+        # The reconcile is position-based and mount/move do not shift the
+        # reactive index: put the cursor back onto the row it was on (a
+        # full rebuild used to drop it entirely; callers restore it via
+        # _refocus_sidebar_task / toggle_sidebar_section when they need a
+        # specific row highlighted).
+        if not keep_cursor:
+            if highlighted is not None:
+                sidebar.index = None
+        else:
+            assert highlighted is not None
+            sidebar.index = sidebar._nodes.index(highlighted)
         self._sidebar_snapshot = self._sidebar_fingerprint()
 
     def _dependency_marker(self, task: Task) -> str:
@@ -378,8 +494,8 @@ class ChatViewLayer(DrCodeState):
     def toggle_sidebar_section(self, section: str) -> None:
         """Collapse/expand one sidebar category (its header row).
 
-        The rebuild resets the ListView cursor, so it is put back onto the
-        toggled header — the next space/enter keeps working on it.
+        The cursor is put back onto the toggled header — the next
+        space/enter keeps working on it.
         """
         if section in self._collapsed_sections:
             self._collapsed_sections.discard(section)
@@ -393,9 +509,9 @@ class ChatViewLayer(DrCodeState):
                 break
 
     def _refocus_sidebar_task(self, task_id: str) -> None:
-        """Put the ListView cursor back onto a task's row after a sidebar
-        rebuild (the rebuild resets it), so a series of reorder/hold keys
-        keeps working on the same task without re-selecting it."""
+        """Put the ListView cursor onto a task's row, so a series of
+        reorder/hold keys keeps working on the same task without
+        re-selecting it."""
         sidebar = self.sidebar
         for index, item in enumerate(sidebar.children):
             if isinstance(item, TaskItem) and item.task_id == task_id:

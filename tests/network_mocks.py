@@ -252,13 +252,27 @@ def sse_body(*chunks: dict[str, Any]) -> str:
 async def wait_until(
     pred: Callable[[], bool],
     pilot: Any = None,
-    timeout: float = 10.0,
+    timeout: float | None = None,
     what: str = "condition",
 ) -> None:
     """Poll `pred` (yielding to the event loop, and to the textual app when
-    a pilot is given) until it holds or the deadline passes."""
+    a pilot is given) until it holds or the deadline passes.
+
+    The default deadline comes from DRCODE_TEST_WAIT_TIMEOUT (float seconds,
+    default 30). It is read from os.environ DIRECTLY — the conftest autouse
+    fixture strips DRCODE_* vars from the app's Config, but env vars exported
+    around the pytest process itself are untouched, so operators on
+    slow/loaded machines can raise the deadline without touching the code.
+    """
     import asyncio
+    import os
     import time
+
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("DRCODE_TEST_WAIT_TIMEOUT", "30"))
+        except ValueError:
+            timeout = 30.0
 
     deadline = time.monotonic() + timeout
     while not pred():

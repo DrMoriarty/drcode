@@ -794,6 +794,11 @@ async def test_esc_fast_double_press_is_debounced(
     monkeypatch.setattr(
         app, "notify", lambda message, **kw: toasts.append(str(message))
     )
+    # Under a loaded (xdist) suite the two pilot presses can drift past the
+    # real 250ms debounce and the second press would confirm instead of being
+    # ignored. Widen the debounce for this test and simulate the deliberate
+    # gap by backdating the last accepted press instead of sleeping it out.
+    monkeypatch.setattr(type(app), "_ESC_DEBOUNCE_SECONDS", 10.0)
     async with app.run_test() as pilot:
         await pilot.pause()
         await _dismiss_startup_dialog(pilot)
@@ -806,18 +811,18 @@ async def test_esc_fast_double_press_is_debounced(
         # app-level stop action.
         app.chat_input.focus()
         await pilot.pause()
-        # Two pilot presses land within the default 250ms debounce window.
+        # Two pilot presses land within the (widened) debounce window.
         await pilot.press("escape")
         await pilot.press("escape")
         await pilot.pause()
         assert app._agent_runs == {task.id: 1}, "the debounced press must be ignored"
         assert app._esc_armed_signature is not None, "arming must survive the debounce"
         # A deliberate press after the debounce gap confirms the stop.
-        # (Re-stamp the arming time first: under a loaded suite the two
-        # pauses above can eat into the 2s window, and the point here is
-        # the debounce gap, not the window expiry.)
-        await asyncio.sleep(0.3)
+        # (Re-stamp the arming time first: under a loaded suite the pauses
+        # above can eat into the 2s window, and the point here is the
+        # debounce gap, not the window expiry.)
         app._esc_armed_at = time.monotonic()
+        app._esc_last_press = time.monotonic() - 11.0
         await pilot.press("escape")
         await pilot.pause()
         assert app._agent_runs == {}

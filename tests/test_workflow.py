@@ -194,6 +194,12 @@ def _git_ok(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
+def _git_out(*args: str, cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
+
+
 def test_example_as_shipped_is_valid_and_hookless(project_root: Path) -> None:
     source = _read_example(project_root)
     # No syntax rot in the shipped template itself...
@@ -298,6 +304,67 @@ async def test_uncommented_example_leaves_dirty_checkout_alone(
     assert "NOT merged" in merged.output["text"]
     assert "git merge drcode/t1" in merged.output["text"]
     assert not (project_root / "feature.txt").exists()
+
+
+async def test_failed_example_merge_aborts_conflict(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """A conflicted hook-merge must not leave the shared checkout
+    half-merged: the template aborts it before reporting FAILED, so the
+    NEXT task's hook-merge does not cascade into "NOT merged — the
+    checkout has uncommitted changes" (the #1bfd3666 cascade)."""
+    activated = _activated_example(project_root)
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    # t1 rewrites base.txt on its branch; main rewrites it too — merging
+    # t1 into main conflicts.
+    _git_ok("checkout", "-q", "-b", "drcode/t1", cwd=project_root)
+    (project_root / "base.txt").write_text("t1 version\n")
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "t1", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    (project_root / "base.txt").write_text("main version\n")
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "main change", cwd=project_root)
+    # t2 branches from main's new HEAD and adds a disjoint file — a clean
+    # merge once the conflicted t1 attempt is out of the way.
+    _git_ok("checkout", "-q", "-b", "drcode/t2", cwd=project_root)
+    (project_root / "other.txt").write_text("other\n")
+    _git_ok("add", "other.txt", cwd=project_root)
+    _git_ok("commit", "-m", "t2", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+
+    def worktree(branch: str) -> dict[str, str]:
+        return {
+            "path": str(project_root / ".drcode" / "worktrees" / branch),
+            "branch": branch,
+        }
+
+    task1 = manager.create("t1", "")
+    conflicted = await hooks.call(
+        "on_accepted", task1, cwd=project_root, worktree=worktree("drcode/t1")
+    )
+    assert conflicted.ok, conflicted.error
+    text = conflicted.output["text"]
+    assert "FAILED" in text  # the marker the unmerged-work tracking stamps on
+    assert "aborted" in text
+    # The checkout is back to a clean pre-merge state — no half-done merge.
+    assert _git_out("status", "--porcelain", "-uno", cwd=project_root) == ""
+    assert (project_root / "base.txt").read_text(encoding="utf-8") == "main version\n"
+    # The next hook-merge proceeds normally instead of cascading.
+    task2 = manager.create("t2", "")
+    merged = await hooks.call(
+        "on_accepted", task2, cwd=project_root, worktree=worktree("drcode/t2")
+    )
+    assert merged.ok, merged.error
+    assert "merged drcode/t2" in merged.output["text"]
+    assert "NOT merged" not in merged.output["text"]
 
 
 def test_describe_lists_defined_hooks(project_root: Path) -> None:

@@ -22,7 +22,7 @@ from drcode.settings import (
     ProjectSettingsStore,
     TaskIsolation,
 )
-from drcode.task_env import TaskEnvironment
+from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
 from drcode.workflow import load_hooks
@@ -256,7 +256,17 @@ async def test_hook_can_merge_docs_branch_into_main_checkout(
             pilot,
             what="docs.md merged into the main checkout",
         )
-        await pilot.pause()
+        # The merge lands inside the hook subprocess; the "docs merged"
+        # service event is recorded by the pipeline right after the hook
+        # call returns — wait for it too (a bare pause raced the
+        # continuation and lost the event on app teardown).
+        await wait_until(
+            lambda: any(
+                t.endswith("docs merged") for t in research_hook_events(task)
+            ),
+            pilot,
+            what="docs-merged hook event",
+        )
     assert any(t.endswith("docs merged") for t in research_hook_events(task))
     env = TaskEnvironment(
         isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
@@ -376,6 +386,17 @@ async def test_startup_scan_research_suppressed_by_research_hook(
     (wt / "docs.md").write_text("docs")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", "docs")
+    # The hook's claim must hold: the docs merge really landed (the
+    # tracking audits git, not just the hook's presence).
+    _git(
+        isolated,
+        "merge",
+        "-q",
+        "--no-ff",
+        branch_for(task.id),
+        "-m",
+        "merge docs",
+    )
 
     make_script(isolated, "def on_research_accepted(task):\n    return None\n")
 

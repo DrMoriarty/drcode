@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -395,6 +396,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # merges into the shared main checkout must not interleave (git
         # index.lock, conflicting merges).
         self._accept_hook_lock = asyncio.Lock()
+        # Self-heal audit cache (see _hook_merge_still_owns): task id ->
+        # the completed_at the audit passed against — re-completing a task
+        # (re-queue → finalize again) re-arms the audit.
+        self._hook_merge_audit_ok: dict[str, datetime] = {}
         self.viewed_id: str | None = None
         # Counted run state (parallel development slots): the in-flight
         # agent runs (task id -> generation) and the per-task run
@@ -1036,6 +1041,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 timeout=6,
             )
 
+    # Grace between a task's completion and the self-heal audit of its
+    # accept-hook merge (see _hook_merge_still_owns): right after the
+    # finalization the hook may still be running — do not distrust it yet.
+    HOOK_MERGE_AUDIT_GRACE: ClassVar[timedelta] = timedelta(minutes=5)
+
     def _unmerged_completed_ids(self) -> list[str]:
         """Synchronous half of the unmerged-work tracking: ids of
         completed tasks whose `drcode/<task-id>` branch still holds
@@ -1047,8 +1057,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         FAILED (`task.hook_merge_failed`): a stuck/conflicted merge needs
         a human, so the task counts again exactly as if no hook existed
         (a manual `git merge drcode/<id>` clears it dynamically, and a
-        later successful hook re-run clears the flag). Blocking git
-        calls — run in a worker thread."""
+        later successful hook re-run clears the flag).
+
+        The flag is stamped by the live pipeline at hook time — knowledge
+        a long-lived session can lack (a process started before the
+        stamping code shipped, or a crash between the FAILED event and
+        the save). So for hook-owned tasks the tracking does not trust
+        the flag blindly: past a grace period the actual branch state is
+        audited (see _hook_merge_still_owns) and a failed hook-merge is
+        back-stamped, re-admitting the task no matter which process
+        finalized it. Conversely a stale flag whose branch has since been
+        merged by hand is cleared here. Blocking git calls — run in a
+        worker thread."""
         env = self.task_env
         if not env.active:
             return []
@@ -1057,29 +1077,67 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         for task in list(self.manager.tasks.values()):
             if task.status is not TaskStatus.COMPLETED:
                 continue
-            if task.kind is TaskKind.RESEARCH:
-                if (
-                    workflow is not None
-                    and workflow.has("on_research_accepted")
-                    and not task.hook_merge_failed
-                ):
-                    continue  # the merge is the research hook's job (and it worked)
-            else:
-                if (
-                    workflow is not None
-                    and workflow.has("on_accepted")
-                    and not task.hook_merge_failed
-                ):
-                    continue  # the merge is the hook's job — no reminders
+            research = task.kind is TaskKind.RESEARCH
+            if not research:
                 if task.verification is not VerificationStatus.PASSED:
                     continue
                 if task.review_pending:
                     continue  # the external review has not accepted it yet
+            hook = "on_research_accepted" if research else "on_accepted"
+            if (
+                workflow is not None
+                and workflow.has(hook)
+                and not task.hook_merge_failed
+                and self._hook_merge_still_owns(task, hook)
+            ):
+                continue  # the merge is the hook's job (and it worked)
             candidates.append(task.id)
         if not candidates:
             return []
         unmerged = env.unmerged_ids(candidates)
+        for task_id in candidates:
+            if task_id in unmerged:
+                continue
+            task = self.manager.get(task_id)
+            if task.hook_merge_failed:
+                # A manual `git merge drcode/<id>` (or a successful hook
+                # re-run on another path) merged the branch since the
+                # failure — drop the stale flag instead of keeping it
+                # forever; the dynamic check hides the task either way,
+                # but the flag would survive into toasts/reminders.
+                task.hook_merge_failed = False
+                task.touch()
+                self.manager.storage.save(task)
         return [task_id for task_id in candidates if task_id in unmerged]
+
+    def _hook_merge_still_owns(self, task: Task, hook: str) -> bool:
+        """Whether the kind's accept hook can still be trusted with a
+        COMPLETED task's merge (`task.hook_merge_failed` unset): True
+        keeps the task hidden from the unmerged-work tracking, False
+        re-admits it. The optimistic answer stands while the hook may
+        still be running (within HOOK_MERGE_AUDIT_GRACE of completed_at);
+        after that the branch is audited directly: work still unmerged
+        means the hook-merge failed without anyone stamping the flag
+        (a session on older code, a crash mid-stamp) — the failure is
+        back-stamped and persisted, so `_remind_unmerged_work` and the
+        header tooltip see it too. Audited-merged tasks are cached per
+        (id, completed_at) so the 10 s poll does not re-run git on them
+        forever. Blocking (a couple of git calls) — worker thread."""
+        audited = self._hook_merge_audit_ok.get(task.id)
+        if audited is not None and audited == task.completed_at:
+            return True
+        if task.completed_at is not None and datetime.now(UTC) - task.completed_at < (
+            self.HOOK_MERGE_AUDIT_GRACE
+        ):
+            return True  # too fresh — the hook may still be merging
+        if self.task_env.unmerged_commits(task.id) <= 0:
+            self._hook_merge_audit_ok[task.id] = task.completed_at or datetime.now(UTC)
+            return True  # merged — the hook (or a hand) did its job
+        if not task.hook_merge_failed:
+            task.hook_merge_failed = True
+            task.touch()
+            self.manager.storage.save(task)
+        return False
 
     async def _unmerged_work_startup_scan(self) -> None:
         """Startup reminder for old "stuck" fixes: completed tasks whose

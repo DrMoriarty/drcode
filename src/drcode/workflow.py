@@ -290,9 +290,18 @@ def _merge_task_branch(task, what):
         }
     code, out = _git("-C", str(main), "merge", "--no-edit", branch)
     if code != 0:
+        # A conflicted merge must not stay half-done in the shared
+        # checkout: every later hook-merge would cascade ("the checkout
+        # has uncommitted changes"). Abort it — the tree returns to the
+        # pre-merge state and the branch is reported for a manual merge
+        # instead. The abort is best-effort: when the merge failed
+        # without starting (e.g. an unknown branch) it is a harmless
+        # no-op, and its failure must not mask the original one.
+        _git("-C", str(main), "merge", "--abort")
         return {
-            "text": f"{what}: merge of {branch} into {base} FAILED — sort it "
-            f"out in {main} by hand (git status / git merge --abort):\\n{out}"
+            "text": f"{what}: merge of {branch} into {base} FAILED — the "
+            f"conflicted merge was aborted ({main} is clean on {base} "
+            f"again); sort it out by hand (git merge {branch}):\\n{out}"
         }
     return {"text": f"{what}: merged {branch} into {base}:\\n{out}"}
 

@@ -99,6 +99,44 @@ def parallel_tasks_label(count: int) -> str:
     return "1 task" if count == 1 else f"{count} tasks"
 
 
+class EscAbort(str, enum.Enum):
+    """How ESC stops a running agent/tester (project setting).
+
+    DOUBLE_PRESS (the default): the first ESC only ARMS the stop — a toast
+    asks for a confirmation press within a short window — and only the
+    second ESC actually aborts. This guards against the accidental
+    "closed a modal dialog with ESC, pressed ESC again out of inertia"
+    scenario that silently stopped a working agent. INSTANT: the
+    historical behaviour — a single ESC stops the run immediately.
+    """
+
+    DOUBLE_PRESS = "double_press"
+    INSTANT = "instant"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the Settings UI."""
+        if self is EscAbort.INSTANT:
+            return "instant (one ESC)"
+        return "double-press (confirm)"
+
+    @property
+    def description(self) -> str:
+        """One-line explanation shown in the Settings palette."""
+        if self is EscAbort.INSTANT:
+            return "A single ESC stops the running agent/tester immediately."
+        return (
+            "The first ESC only arms the stop (a toast asks for a second "
+            "press within 2 seconds); the second ESC stops the run."
+        )
+
+
+ESC_ABORT_OPTIONS: tuple[EscAbort, ...] = (
+    EscAbort.DOUBLE_PRESS,
+    EscAbort.INSTANT,
+)
+
+
 class TaskIsolation(str, enum.Enum):
     """Where a task's development happens.
 
@@ -221,6 +259,11 @@ class ProjectSettings(BaseModel):
     # single: testing never occupies a development slot and never runs
     # concurrently with another tester round.
     parallel_tasks: int = 1
+    # How ESC stops a running agent/tester (EscAbort docstring): the safe
+    # double-press default guards the "closed a dialog with ESC, pressed
+    # ESC once more by inertia" accident; "instant" restores the
+    # historical one-press stop.
+    esc_abort: EscAbort = EscAbort.DOUBLE_PRESS
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
     # connection check fails): the sync simply logs an error each cycle

@@ -395,6 +395,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self.tester_running = False
         # Task id the tester worker is currently verifying (for Ctrl+X).
         self._tester_task_id: str | None = None
+        # Armed-ESC confirmation (project setting `esc_abort`, default
+        # double_press): the signature of the run state the arming saw
+        # (None = not armed), the monotonic time it was armed at, the time
+        # of the last ACCEPTED ESC press (debounce of accidental fast
+        # repeats) and the window-expiry timer. All session-only.
+        self._esc_armed_signature: tuple | None = None
+        self._esc_armed_at: float = 0.0
+        self._esc_last_press: float = 0.0
+        self._esc_disarm_timer: Timer | None = None
         self.new_task_kind: TaskKind = TaskKind.FEATURE
         # Per task: incremented on every run_agent() start; the finally
         # block of a superseded (cancelled) run must not touch shared

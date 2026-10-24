@@ -486,6 +486,14 @@ class DrCodeState(App[None]):
     _agent_runs: dict[str, int]
     tester_running: bool
     _tester_task_id: str | None
+    # Armed-ESC confirmation (project setting `esc_abort`, default
+    # double_press): the run-state signature the arming saw (None = not
+    # armed), when it was armed, the last accepted ESC press time (the
+    # debounce base) and the window-expiry timer.
+    _esc_armed_signature: tuple | None
+    _esc_armed_at: float
+    _esc_last_press: float
+    _esc_disarm_timer: Timer | None
     new_task_kind: TaskKind
     # Per-task run generation (superseded-run bookkeeping): a run's
     # teardown may only touch shared state while it is still the task's

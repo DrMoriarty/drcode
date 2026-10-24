@@ -38,6 +38,41 @@ _COMPACTION_TOOL_RESULT_CAP = 20_000
 # of the window so small local models keep a usable budget.
 MECHANICAL_HEADROOM_TOKENS = 32_000
 
+# Tokens reserved on top of the measured prompt pieces (system prompt,
+# template, anchors) for the <conversation>/<previous-summary> scaffolding
+# and rounding slack of the chars/4 heuristic.
+_PROMPT_SCAFFOLD_ALLOWANCE = 512
+
+# Tokens the summarizer may spend on its own output: it must fit into the
+# window alongside the prompt (input + output share the context), and the
+# reduce call's output is the final summary.
+_OUTPUT_ALLOWANCE = 4_096
+
+# Safety margin applied to the computed slice budget: the chars/4 estimate
+# is a heuristic, and gateways count system messages and chat framing too.
+_SLICE_SAFETY_MARGIN = 0.9
+
+# Floor for the slice budget when the window is tiny (tests, exotic
+# gateways): below this the chunker would degenerate into per-block slices.
+_MIN_SLICE_BUDGET = 2_000
+
+# Depth cap of the hierarchical reduce: each level merges already-summarized
+# text, so it converges long before this; past the cap the remaining
+# partials are mechanically trimmed to fit (the guaranteed floor).
+_MAX_REDUCE_DEPTH = 3
+
+# The chars/4 token-size heuristic — same convention as context_layout
+# (duplicated rather than imported: context_layout → agent → compaction is
+# a circular import).
+CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    """≈ tokens of `text` by the chars/4 heuristic (0 for empty text)."""
+    if not text:
+        return 0
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
 
 def build_compaction_agent(config: Config) -> Agent[None, str]:
     """Tool-less summarizer agent used to compact a task's history.
@@ -160,17 +195,20 @@ def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
     return found
 
 
-def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
-    """Render the serialized transcript as readable text for the summarizer.
+def render_history_blocks(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Render the serialized transcript as a list of (kind, text) blocks for
+    the summarizer — the chunkable unit structure behind
+    render_history_for_summary.
 
-    User prompts, assistant text, tool calls and tool results are kept
-    (tool results are the bulk of the working context — file contents and
-    command output the summary must capture); thinking parts are dropped;
-    compaction-summary user-prompt parts are skipped (they are passed
-    separately as <previous-summary>) — including the merged ones pydantic-ai
-    folds into the original-prompt request after a resume.
+    Kinds: "user", "assistant", "tool-call", "tool-result". User prompts,
+    assistant text, tool calls and tool results are kept (tool results are
+    the bulk of the working context — file contents and command output the
+    summary must capture); thinking parts are dropped; compaction-summary
+    user-prompt parts are skipped (they are passed separately as
+    <previous-summary>) — including the merged ones pydantic-ai folds into
+    the original-prompt request after a resume.
     """
-    lines: list[str] = []
+    blocks: list[tuple[str, str]] = []
     for msg in messages:
         is_request = _is_request(msg)
         for part in msg.get("parts", []):
@@ -184,7 +222,7 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
                     and content
                     and not content.startswith(COMPACTION_SUMMARY_PREFIX)
                 ):
-                    lines.append(f"[user]\n{content}")
+                    blocks.append(("user", f"[user]\n{content}"))
             elif kind == "tool-return":
                 # Tool returns live in request messages (ModelRequest with a
                 # ToolReturnPart) — they must be rendered BEFORE the generic
@@ -200,13 +238,18 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
                         text = str(content)
                 if len(text) > _COMPACTION_TOOL_RESULT_CAP:
                     text = text[:_COMPACTION_TOOL_RESULT_CAP] + "\n…[truncated]"
-                lines.append(f"[tool result for {part.get('tool_name', '?')}]\n{text}")
+                blocks.append(
+                    (
+                        "tool-result",
+                        f"[tool result for {part.get('tool_name', '?')}]\n{text}",
+                    )
+                )
             elif is_request:
                 continue
             elif kind == "text":
                 content = part.get("content", "")
                 if content:
-                    lines.append(f"[assistant]\n{content}")
+                    blocks.append(("assistant", f"[assistant]\n{content}"))
             elif kind == "tool-call":
                 args = part.get("args")
                 args_str = (
@@ -214,8 +257,19 @@ def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
                     if isinstance(args, str)
                     else json.dumps(args or {}, ensure_ascii=False)
                 )
-                lines.append(f"[tool call] {part.get('tool_name', '?')}({args_str})")
-    return "\n\n".join(lines)
+                blocks.append(
+                    (
+                        "tool-call",
+                        f"[tool call] {part.get('tool_name', '?')}({args_str})",
+                    )
+                )
+    return blocks
+
+
+def render_history_for_summary(messages: list[dict[str, Any]]) -> str:
+    """Render the serialized transcript as readable text for the summarizer
+    (the blocks of render_history_blocks joined by blank lines)."""
+    return "\n\n".join(text for _, text in render_history_blocks(messages))
 
 
 def build_compaction_prompt(
@@ -261,6 +315,239 @@ def build_compaction_prompt(
         ]
     )
     return "\n".join(parts)
+
+
+def build_reduce_prompt(
+    partials: list[str],
+    template: str,
+    checklist: str | None = None,
+) -> str:
+    """User prompt for the reduce step: merge the sequential partial
+    summaries (one per map slice) into the single structured summary."""
+    rendered = "\n\n".join(
+        f"<partial index={i}>\n{p.strip()}\n</partial>"
+        for i, p in enumerate(partials, 1)
+        if p.strip()
+    )
+    parts = [
+        (
+            "Below are sequential partial summaries of one coding session, "
+            "produced while reading its conversation in order."
+        ),
+        "",
+        "<partial-summaries>",
+        rendered,
+        "</partial-summaries>",
+    ]
+    if checklist:
+        parts.extend(
+            [
+                "",
+                "<task-checklist>",
+                checklist,
+                "</task-checklist>",
+            ]
+        )
+    parts.extend(
+        [
+            "",
+            (
+                "Merge them into a single summary of the whole session: keep "
+                "still-true details, drop stale ones, resolve contradictions in "
+                "favor of the latest partial. Do not lose file paths, identifiers "
+                "or decisions mentioned in any partial."
+            ),
+            "",
+            "Produce the merged summary following exactly this structure:",
+            "",
+            template,
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _output_allowance(config: Config) -> int:
+    """Room reserved for the summarizer's own output: capped by the model's
+    max_tokens and the output allowance, and clamped to a quarter of the
+    window so a small window (tests, exotic gateways) still leaves room for
+    a prompt at all."""
+    base = min(config.max_tokens, _OUTPUT_ALLOWANCE)
+    if config.max_context_tokens <= 0:
+        return base
+    return min(base, max(config.max_context_tokens // 4, 128))
+
+
+def slice_budget_tokens(
+    config: Config,
+    anchor: str | None = None,
+    checklist: str | None = None,
+) -> int:
+    """Token budget for one history slice (or one reduce partials payload):
+    the COMPACTION role's context window minus headroom for the system
+    prompt, the output template, the anchors riding along on every call,
+    the model's own output and the chars/4 heuristic's slack."""
+    system_prompt, template = load_compaction_prompts()
+    reserve = (
+        _estimate_tokens(system_prompt)
+        + _estimate_tokens(template)
+        + _estimate_tokens(anchor or "")
+        + _estimate_tokens(checklist or "")
+        + _PROMPT_SCAFFOLD_ALLOWANCE
+        + _output_allowance(config)
+    )
+    budget = int(max(config.max_context_tokens - reserve, 0) * _SLICE_SAFETY_MARGIN)
+    return max(budget, _MIN_SLICE_BUDGET)
+
+
+def prompt_fits_window(prompt: str, config: Config) -> bool:
+    """True when `prompt` (plus room for the summarizer's output) fits the
+    COMPACTION role's window — the single-shot pre-flight check. An unknown
+    window (max_context_tokens <= 0) is assumed to fit, preserving the
+    pre-map-reduce behavior."""
+    if config.max_context_tokens <= 0:
+        return True
+    return _estimate_tokens(prompt) + _output_allowance(config) <= (
+        config.max_context_tokens
+    )
+
+
+# -- map-reduce chunking ------------------------------------------------------
+
+
+def _atomic_groups(
+    blocks: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]]:
+    """Smallest block groups that must never be separated: a tool call stays
+    glued to its tool return, and a user prompt stays glued to (at least the
+    first group of) its answer."""
+    groups: list[list[tuple[str, str]]] = []
+    i = 0
+    while i < len(blocks):
+        kind, text = blocks[i]
+        if (
+            kind == "tool-call"
+            and i + 1 < len(blocks)
+            and blocks[i + 1][0] == "tool-result"
+        ):
+            groups.append([blocks[i], blocks[i + 1]])
+            i += 2
+        else:
+            groups.append([(kind, text)])
+            i += 1
+    merged: list[list[tuple[str, str]]] = []
+    j = 0
+    while j < len(groups):
+        group = groups[j]
+        if (
+            len(group) == 1
+            and group[0][0] == "user"
+            and j + 1 < len(groups)
+            and groups[j + 1][0][0] != "user"
+        ):
+            merged.append(group + groups[j + 1])
+            j += 2
+        else:
+            merged.append(group)
+            j += 1
+    return merged
+
+
+def _hard_split(text: str, budget_chars: int) -> list[str]:
+    """Last-resort char-level split of an oversized single block (a huge
+    user prompt or a capped-but-still-huge tool result)."""
+    return [text[i : i + budget_chars] for i in range(0, len(text), budget_chars)]
+
+
+def _pack_groups(
+    groups: list[list[tuple[str, str]]],
+    budget_chars: int,
+) -> list[str]:
+    """Greedy packing of atomic groups into slice texts within the char
+    budget; a single oversized group is hard-split."""
+    slices: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for group in groups:
+        texts = [text for _, text in group]
+        group_text = "\n\n".join(texts)
+        group_size = _estimate_tokens(group_text) * CHARS_PER_TOKEN
+        if group_size > budget_chars:
+            # Flush what we have, then emit the oversized group as its own
+            # hard-split slices.
+            if current:
+                slices.append("\n\n".join(current))
+                current, current_size = [], 0
+            joined = "\n\n".join(texts)
+            parts = (
+                _hard_split(joined, budget_chars)
+                if len(texts) == 1
+                else _pack_groups([[block] for block in group], budget_chars)
+            )
+            slices.extend(parts)
+            continue
+        if current and current_size + group_size > budget_chars:
+            slices.append("\n\n".join(current))
+            current, current_size = [], 0
+        current.append(group_text)
+        current_size += group_size
+    if current:
+        slices.append("\n\n".join(current))
+    return slices
+
+
+def chunk_history_for_summary(
+    messages: list[dict[str, Any]],
+    budget_tokens: int,
+) -> list[str]:
+    """Split the rendered history into slices each within ~budget_tokens
+    (chars/4 heuristic), cutting only at conversation boundaries.
+
+    Boundaries: a turn (one [user] block up to the next) is never broken
+    while it fits the budget; inside an oversized turn the cut falls only
+    between atomic groups — a tool call is never separated from its tool
+    return, a user prompt never from the first group of its answer. A single
+    group larger than the whole budget (a giant prompt under the tool-result
+    cap is impossible, but a huge user prompt is not) is hard-split at char
+    boundaries so the chunker always terminates with slices <= budget.
+    """
+    blocks = render_history_blocks(messages)
+    if not blocks:
+        return []
+    groups = _atomic_groups(blocks)
+    # Turns: cut before every group that STARTS with a user block.
+    turns: list[list[list[tuple[str, str]]]] = [[]]
+    for group in groups:
+        if group[0][0] == "user" and turns[-1]:
+            turns.append([])
+        turns[-1].append(group)
+    budget_chars = max(budget_tokens, 1) * CHARS_PER_TOKEN
+
+    def join_groups(groups: list[list[tuple[str, str]]]) -> str:
+        return "\n\n".join(text for group in groups for _, text in group)
+
+    slices: list[str] = []
+    current: list[list[tuple[str, str]]] = []
+    current_size = 0
+    for turn in turns:
+        turn_size = sum(
+            _estimate_tokens(text) * CHARS_PER_TOKEN
+            for group in turn
+            for _, text in group
+        )
+        if turn_size > budget_chars:
+            if current:
+                slices.append(join_groups(current))
+                current, current_size = [], 0
+            slices.extend(_pack_groups(turn, budget_chars))
+            continue
+        if current and current_size + turn_size > budget_chars:
+            slices.append(join_groups(current))
+            current, current_size = [], 0
+        current.extend(turn)
+        current_size += turn_size
+    if current:
+        slices.append(join_groups(current))
+    return slices
 
 
 def compacted_messages(

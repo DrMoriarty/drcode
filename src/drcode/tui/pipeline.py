@@ -35,7 +35,9 @@ from ..agent import (
     build_agent,
     build_compaction_agent,
     build_compaction_prompt,
+    build_reduce_prompt,
     build_tester_agent,
+    chunk_history_for_summary,
     compacted_messages,
     ends_with_open_request,
     extract_previous_summary,
@@ -46,14 +48,17 @@ from ..agent import (
     mechanical_compaction_messages,
     probe_model,
     prompt_fits_context,
+    prompt_fits_window,
     render_history_for_summary,
     resumable_history,
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
+    slice_budget_tokens,
     split_original_prompts,
     todo_instructions,
 )
+from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
 from ..github import (
     issue_commit_hint,
@@ -1041,6 +1046,159 @@ class PipelineLayer(DrCodeState):
             f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
         )
         return compacted_messages(messages, result.output), event, False
+
+    async def _run_summarizer(self, prompt: str) -> str:
+        """One compaction model call: run the tool-less summarizer and
+        record its usage into the session totals like every other model
+        call. Raises on failure — the callers turn that into a non-fatal
+        compaction-failed event."""
+        agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
+        result = await agent.run(prompt)
+        # The summarizer's model calls count toward the session usage too.
+        self._record_session_usage(result.usage)
+        return result.output
+
+    async def _reduce_partials(
+        self,
+        partials: list[str],
+        template: str,
+        checklist: str | None,
+        depth: int = 0,
+    ) -> str:
+        """Merge the map step's partial summaries into the final structured
+        summary. When the accumulated partials overflow the merge call, the
+        partials are grouped into fitting batches and each batch is reduced
+        first (hierarchical reduce, depth-capped); past the cap the payload
+        is mechanically trimmed per partial so the merge call always
+        happens (the guaranteed floor — a bounded summary beats none)."""
+        prompt = build_reduce_prompt(partials, template, checklist)
+        compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
+        if prompt_fits_window(prompt, compaction_cfg) or not partials:
+            return await self._run_summarizer(prompt)
+        if depth >= _MAX_REDUCE_DEPTH:
+            trimmed = self._mechanically_trim_partials(
+                partials, compaction_cfg, checklist
+            )
+            return await self._run_summarizer(
+                build_reduce_prompt(trimmed, template, checklist)
+            )
+        # Hierarchical reduce: batch the partials so each batch's prompt
+        # fits, reduce every batch, then merge the intermediates.
+        batch_budget = slice_budget_tokens(compaction_cfg, checklist=checklist)
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_tokens = 0
+        for p in partials:
+            size = len(p) // CHARS_PER_TOKEN + 1
+            if current and current_tokens + size > batch_budget:
+                batches.append(current)
+                current, current_tokens = [], 0
+            current.append(p)
+            current_tokens += size
+        if current:
+            batches.append(current)
+        if len(batches) == 1 and len(batches[0]) == len(partials):
+            # Single batch covering everything and still overflowing (one
+            # gigantic partial): trim mechanically instead of recursing on
+            # an unchanged payload.
+            trimmed = self._mechanically_trim_partials(
+                partials, compaction_cfg, checklist
+            )
+            return await self._run_summarizer(
+                build_reduce_prompt(trimmed, template, checklist)
+            )
+        intermediates = [
+            await self._reduce_partials(batch, template, checklist, depth + 1)
+            for batch in batches
+        ]
+        return await self._reduce_partials(
+            intermediates, template, checklist, depth + 1
+        )
+
+    @staticmethod
+    def _mechanically_trim_partials(
+        partials: list[str],
+        compaction_cfg: Config,
+        checklist: str | None,
+    ) -> list[str]:
+        """Guaranteed-floor fallback: trim each partial to an equal char
+        share of the reduce budget so the merge call always happens (a
+        bounded, degraded summary beats no compaction at all)."""
+        budget_chars = (
+            max(slice_budget_tokens(compaction_cfg, checklist=checklist), 1)
+            * CHARS_PER_TOKEN
+        )
+        per_partial = max(budget_chars // max(len(partials), 1), 200)
+        return [
+            p[:per_partial] + ("\n…[truncated]" if len(p) > per_partial else "")
+            for p in partials
+        ]
+
+    async def _summarize_history(
+        self,
+        task: Task,
+        messages: list[dict[str, Any]],
+        *,
+        checklist: str | None = None,
+    ) -> str | None:
+        """LLM summarization of `messages` for compaction, shared by the
+        main-agent and tester-round gates.
+
+        Single-shot when the rendered history fits the COMPACTION role's
+        window; otherwise a map-reduce: the history is chunked at
+        conversation boundaries into slices that fit (with headroom for the
+        system prompt, output template, anchors and the reduce step), the
+        slices are summarized sequentially — each map call sees the running
+        partial summaries as its <previous-summary> anchor, mirroring the
+        previous-summary anchoring of the single-shot path — and a final
+        reduce call merges the partials into the structured summary
+        (hierarchical reduce, then a mechanical per-partial trim, when the
+        partials themselves overflow the merge call).
+
+        Every model call's usage is recorded via _record_session_usage, so
+        total extra calls stay visible exactly like the single-shot path.
+        Returns the summary text, or None when a summarizer call failed
+        (compaction must not kill the run) — the callers decide the
+        failure's side effects (_compaction_failed etc.)."""
+        _system_prompt, template = load_compaction_prompts()
+        anchor = extract_previous_summary(messages)
+        try:
+            prompt = build_compaction_prompt(
+                anchor,
+                render_history_for_summary(messages),
+                template,
+                checklist=checklist,
+            )
+            compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
+            if prompt_fits_window(prompt, compaction_cfg):
+                return await self._run_summarizer(prompt)
+            slices = chunk_history_for_summary(
+                messages,
+                slice_budget_tokens(compaction_cfg, anchor, checklist),
+            )
+            if not slices:
+                return None
+            self._show_event(
+                task,
+                f"History too large for one summarizer call — map-reduce "
+                f"over {len(slices)} slice(s)…",
+            )
+            partials: list[str] = []
+            for chunk in slices:
+                running = "\n\n".join(partials) if partials else anchor
+                partials.append(
+                    await self._run_summarizer(
+                        build_compaction_prompt(
+                            running, chunk, template, checklist=checklist
+                        )
+                    )
+                )
+            return await self._reduce_partials(partials, template, checklist)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+            return None
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn

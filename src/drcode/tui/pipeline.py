@@ -74,6 +74,7 @@ from ..settings import (
 )
 from ..task_env import branch_for
 from ..tools import scratch_dir
+from ..transcript import estimate_tokens
 from ..workflow import MAX_REVIEW_REJECTIONS
 from .blocks import (
     AssistantBlock,
@@ -87,6 +88,15 @@ from .usage import (
     _is_retryable_network_error,
     _network_retry_delay,
 )
+
+# Hard-limit compaction level (percent of max_context_tokens): the last
+# safe line before the serving model deterministically rejects the next
+# request with a context-overflow error (HTTP 400). The THRESHOLD level
+# pauses and compacts via the LLM summarizer (and backs off when the
+# summarizer is broken); the HARD-LIMIT level fires even when a previous
+# compaction failed — growth past it must never be allowed, so a failing
+# summarizer there escalates to the mechanical trim instead.
+_HARD_LIMIT_PCT = 97
 
 
 class PipelineLayer(DrCodeState):
@@ -869,6 +879,50 @@ class PipelineLayer(DrCodeState):
             self._live_ctx_tokens.get(task.id), task.messages, self._task_role(task)
         )
 
+    def _fill_over_hard_limit(
+        self,
+        live_tokens: int | None,
+        messages: list[dict[str, Any]],
+        role: AgentRole = AgentRole.CODING,
+    ) -> int | None:
+        """Context fill (tokens) when the HARD-LIMIT level is reached
+        (_HARD_LIMIT_PCT percent of max_context_tokens), None otherwise.
+
+        Unlike the threshold level, the hard limit is measured
+        independently of `_compaction_failed`: past it the next model
+        request is rejected deterministically, so a broken summarizer must
+        never disable this check — it can only downgrade the compaction
+        itself to the mechanical floor (see `_compact_transcript`)."""
+        config = self.resolved_config(role)
+        max_tokens = config.max_context_tokens
+        if max_tokens <= 0:
+            return None
+        tokens = live_tokens
+        if tokens is None:
+            tokens = last_context_tokens(messages)
+        if not tokens or tokens * 100 < _HARD_LIMIT_PCT * max_tokens:
+            return None
+        return tokens
+
+    def _hard_limit_due(self, task: Task) -> bool:
+        """Hard-limit check for the main agent transcript (same role
+        resolution as `_compaction_due`)."""
+        return (
+            self._fill_over_hard_limit(
+                self._live_ctx_tokens.get(task.id),
+                task.messages,
+                self._task_role(task),
+            )
+            is not None
+        )
+
+    def _messages_estimate(self, messages: list[dict[str, Any]]) -> int:
+        """≈ wire size of a serialized transcript in tokens (chars/4 on the
+        json dump — same deliberately conservative estimate the mechanical
+        floor uses). Used to detect that a hard-limit compaction failed to
+        shrink the transcript at all (no-op → the gate must stop firing)."""
+        return estimate_tokens(json.dumps(messages, ensure_ascii=False))
+
     def _mechanical_token_budget(self, role: AgentRole) -> int:
         """Token budget of the mechanical compaction floor for `role`: the
         serving model's window under its compaction threshold, minus a
@@ -912,9 +966,13 @@ class PipelineLayer(DrCodeState):
         task: Task,
         what: str,
         checklist: str | None = None,
-    ) -> tuple[list[dict[str, Any]], str]:
-        """Summarize `messages` into a compacted transcript; returns it
-        together with the success event text.
+        hard: bool = False,
+    ) -> tuple[list[dict[str, Any]], str, bool]:
+        """Summarize `messages` into a compacted transcript; returns it,
+        the success event text and whether the LLM summarizer path failed
+        (`llm_failed` — callers keep `_compaction_failed` set for such
+        tasks, meaning "the summarizer is unavailable", and clear it when
+        the summarizer ran fine).
 
         LLM path first — but only after a pre-flight size check: when the
         rendered prompt plausibly does not fit the COMPACTION role's context
@@ -926,9 +984,15 @@ class PipelineLayer(DrCodeState):
         calls the model. The same floor engages as a fallback when the
         gateway rejects the summary request anyway with a deterministic
         context-overflow error (see `_is_context_overflow_error`) — the
-        chars/4 estimate can under-shoot. Any OTHER summarizer failure is
-        re-raised: a transient outage should retry later, not throw away
-        history.
+        chars/4 estimate can under-shoot.
+
+        Any OTHER summarizer failure is re-raised — a transient outage
+        should retry later, not throw away history — EXCEPT at the
+        hard-limit level (`hard=True`): there the fill is at/near the hard
+        limit, growth past it means a deterministic death of the run, so
+        the failure escalates to the mechanical trim instead. In other
+        words `_compaction_failed` may mean "the summarizer is
+        unavailable", never "growth past the limit is allowed".
         """
         compaction_config = self.resolved_config(AgentRole.COMPACTION)
         system_prompt, template = load_compaction_prompts()
@@ -939,31 +1003,44 @@ class PipelineLayer(DrCodeState):
             checklist=checklist,
         )
         if not prompt_fits_context(prompt, system_prompt, compaction_config):
-            return self._mechanical_compact(messages, summary_role, what)
+            trimmed, event = self._mechanical_compact(messages, summary_role, what)
+            return trimmed, event, False
         agent = build_compaction_agent(compaction_config)
         try:
             result = await agent.run(prompt)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            if not _is_context_overflow_error(e):
+            if _is_context_overflow_error(e):
+                # The estimate under-shot and the gateway rejected the
+                # summary request: fall back to the mechanical floor
+                # instead of failing the whole compaction.
+                self._show_event(
+                    task,
+                    "The summarizer model rejected the transcript "
+                    f"({type(e).__name__}: context overflow) — trimming "
+                    "mechanically instead.",
+                )
+                trimmed, event = self._mechanical_compact(messages, summary_role, what)
+                return trimmed, event, True
+            if not hard:
                 raise
-            # The estimate under-shot and the gateway rejected the summary
-            # request: fall back to the mechanical floor instead of failing
-            # the whole compaction.
+            # The fill is at the hard-limit level: retrying later is not an
+            # option (the run would die deterministically before it), so a
+            # broken summarizer here escalates to the mechanical trim.
             self._show_event(
                 task,
-                "The summarizer model rejected the transcript "
-                f"({type(e).__name__}: context overflow) — trimming "
-                "mechanically instead.",
+                f"The summarizer failed ({type(e).__name__}: {e}) with the "
+                "fill at the hard limit — trimming mechanically instead.",
             )
-            return self._mechanical_compact(messages, summary_role, what)
+            trimmed, event = self._mechanical_compact(messages, summary_role, what)
+            return trimmed, event, True
         # The summarizer's model calls count toward the session usage too.
         self._record_session_usage(result.usage)
         event = (
             f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
         )
-        return compacted_messages(messages, result.output), event
+        return compacted_messages(messages, result.output), event, False
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -982,24 +1059,33 @@ class PipelineLayer(DrCodeState):
         the summary/note, so compaction always terminates with a history
         that fits the serving model's context. A compaction failure is
         never fatal: it is logged into the service events and the run
-        continues with the uncompressed history.
+        continues with the uncompressed history — except at the hard-limit
+        level, where a failed summarizer escalates to the mechanical trim
+        (growth past the hard limit must never be allowed).
         """
         tokens = self._compaction_due(task)
         if tokens is None:
             return
+        hard = self._hard_limit_due(task)
         role_config = self.resolved_config(self._task_role(task))
         pct = round(tokens * 100 / role_config.max_context_tokens)
         _, rest = split_original_prompts(task.messages)
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
             # plus a previous summary): compacting again would be a no-op.
+            if hard:
+                # At the hard-limit level this no-op must also stop the
+                # gate from firing again: the mechanical floor keeps the
+                # original prompts verbatim, so nothing can shrink this
+                # transcript and pause→resume would loop forever.
+                self._hard_limit_exhausted.add(task.id)
             return
         self._show_event(
             task,
             f"Context fill {pct}% — pausing the agent and compacting history…",
         )
         try:
-            new_messages, event = await self._compact_transcript(
+            new_messages, event, llm_failed = await self._compact_transcript(
                 task.messages,
                 summary_role=self._task_role(task),
                 task=task,
@@ -1009,14 +1095,40 @@ class PipelineLayer(DrCodeState):
                     if task.kind is TaskKind.FEATURE and task.todos
                     else None
                 ),
+                hard=hard,
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the run
             self._compaction_failed.add(task.id)
-            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
-            return
-        self._compaction_failed.discard(task.id)
+            if not hard:
+                self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+                return
+            # Hard-limit escalation: the run must not continue
+            # uncompressed past the hard limit — trim mechanically.
+            self._show_event(
+                task,
+                f"compaction failed ({type(e).__name__}: {e}) with the fill "
+                "at the hard limit — trimming mechanically instead.",
+            )
+            new_messages, event = self._mechanical_compact(
+                task.messages, self._task_role(task), "history"
+            )
+            llm_failed = True
+        if llm_failed:
+            self._compaction_failed.add(task.id)
+            self._hard_limit_exhausted.discard(task.id)
+        else:
+            self._compaction_failed.discard(task.id)
+            self._hard_limit_exhausted.discard(task.id)
+        if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
+            task.messages
+        ):
+            # The hard-level compaction could not shrink the transcript
+            # (only the verbatim original prompts are left): disable the
+            # hard-level gate bypass for this task — firing it again would
+            # loop pause→resume with no effect.
+            self._hard_limit_exhausted.add(task.id)
         task.messages = new_messages
         task.touch()
         self.manager.storage.save(task)
@@ -1049,11 +1161,17 @@ class PipelineLayer(DrCodeState):
         the stale live token reading). Returns False when compaction was
         not possible — the threshold is not reached, there is nothing to
         summarize (a no-op), or the summarizer failed with a non-overflow
-        error — in which case the round is resumed uncompressed and the
-        caller adds the task to `_compaction_failed`, so the mid-round gate
-        stays off (a persistently broken summarizer must not loop
-        pause→resume forever); turn-boundary compaction of the main agent
-        still retries on later turns.
+        error below the hard limit — in which case the round is resumed
+        uncompressed and the caller adds the task to `_compaction_failed`,
+        so the mid-round gate stays off at the threshold level (a
+        persistently broken summarizer must not loop pause→resume forever);
+        turn-boundary compaction of the main agent still retries on later
+        turns. At the hard-limit level a failed summarizer escalates to the
+        mechanical trim instead of giving up (growth past the hard limit is
+        never allowed) — unless even the mechanical floor cannot shrink the
+        round (nothing to summarize), in which case the task lands in
+        `_hard_limit_exhausted` and the hard-level gate bypass stops
+        firing.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
         tokens = self._fill_over_threshold(
@@ -1061,6 +1179,10 @@ class PipelineLayer(DrCodeState):
         )
         if tokens is None:
             return False
+        hard = (
+            self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.TESTER)
+            is not None
+        )
         pct = round(
             tokens * 100 / self.resolved_config(AgentRole.TESTER).max_context_tokens
         )
@@ -1070,25 +1192,54 @@ class PipelineLayer(DrCodeState):
             # plus a previous summary): compacting again would be a no-op —
             # resuming the round as-is would hit the gate again.
             self._compaction_failed.add(task.id)
+            if hard:
+                # The mechanical floor keeps the original prompts verbatim
+                # too: nothing can shrink this round — stop the hard-level
+                # gate bypass or pause→resume would loop forever.
+                self._hard_limit_exhausted.add(task.id)
             return False
         self._show_event(
             task,
             f"Context fill {pct}% — compacting the testing round…",
         )
         try:
-            new_messages, event = await self._compact_transcript(
+            new_messages, event, llm_failed = await self._compact_transcript(
                 round_messages,
                 summary_role=AgentRole.TESTER,
                 task=task,
                 what="testing round",
+                hard=hard,
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the round
             self._compaction_failed.add(task.id)
-            self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
-            return False
-        self._compaction_failed.discard(task.id)
+            if not hard:
+                self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+                return False
+            # Hard-limit escalation: the round must not continue
+            # uncompressed past the hard limit — trim mechanically.
+            self._show_event(
+                task,
+                f"compaction failed ({type(e).__name__}: {e}) with the fill "
+                "at the hard limit — trimming mechanically instead.",
+            )
+            new_messages, event = self._mechanical_compact(
+                round_messages, AgentRole.TESTER, "testing round"
+            )
+            llm_failed = True
+        if llm_failed:
+            self._compaction_failed.add(task.id)
+            self._hard_limit_exhausted.discard(task.id)
+        else:
+            self._compaction_failed.discard(task.id)
+            self._hard_limit_exhausted.discard(task.id)
+        if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
+            round_messages
+        ):
+            # The hard-level compaction could not shrink the round:
+            # disable the hard-level gate bypass for this task.
+            self._hard_limit_exhausted.add(task.id)
         task.tester_messages[-1] = new_messages
         task.touch()
         self.manager.storage.save(task)
@@ -1574,12 +1725,26 @@ class PipelineLayer(DrCodeState):
                                 # while-loop's next iteration compact (the
                                 # gate above) and resume via a continuation
                                 # turn. Skipped when compaction keeps
-                                # failing, otherwise a persistently broken
-                                # summarizer would loop
-                                # break→continuation→break.
+                                # failing at the THRESHOLD level, otherwise
+                                # a persistently broken summarizer would
+                                # loop break→continuation→break — but the
+                                # HARD-LIMIT level fires regardless: growth
+                                # past it means a deterministic death of the
+                                # run, so the gate must bypass
+                                # `_compaction_failed` (unless even the
+                                # hard-level escalation proved unable to
+                                # shrink the transcript —
+                                # `_hard_limit_exhausted`).
                                 tokens = self._compaction_due(task)
+                                hard_due = tokens is not None and self._hard_limit_due(
+                                    task
+                                )
                                 if tokens is not None and (
                                     task.id not in self._compaction_failed
+                                    or (
+                                        hard_due
+                                        and task.id not in self._hard_limit_exhausted
+                                    )
                                 ):
                                     pct = round(
                                         tokens
@@ -2233,14 +2398,33 @@ class PipelineLayer(DrCodeState):
                                 # the agent's mid-run gate). Skipped when a
                                 # previous compaction attempt failed, or a
                                 # persistently broken summarizer would loop
-                                # pause→resume forever.
+                                # pause→resume forever — except at the
+                                # HARD-LIMIT level, which fires regardless
+                                # of `_compaction_failed` (a broken
+                                # summarizer there escalates to the
+                                # mechanical trim; unless the escalation
+                                # proved unable to shrink the round —
+                                # `_hard_limit_exhausted`).
                                 tokens = self._fill_over_threshold(
                                     live_tokens,
                                     task.tester_messages[-1],
                                     AgentRole.TESTER,
                                 )
+                                hard_due = (
+                                    tokens is not None
+                                    and self._fill_over_hard_limit(
+                                        live_tokens,
+                                        task.tester_messages[-1],
+                                        AgentRole.TESTER,
+                                    )
+                                    is not None
+                                )
                                 if tokens is not None and (
                                     task.id not in self._compaction_failed
+                                    or (
+                                        hard_due
+                                        and task.id not in self._hard_limit_exhausted
+                                    )
                                 ):
                                     pct = round(
                                         tokens

@@ -598,6 +598,7 @@ class DrCodeState(App[None]):
     # -- context fill / compaction ------------------------------------------
     _live_ctx_tokens: dict[str, int]
     _compaction_failed: set[str]
+    _hard_limit_exhausted: set[str]
     _last_follow: float
     _chat_epoch: int
 

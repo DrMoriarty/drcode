@@ -572,10 +572,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # per-response usage).
         self._live_ctx_tokens: dict[str, int] = {}
         # Tasks whose latest compaction attempt failed: the mid-run
-        # compaction gate must not stop the run for them (a persistently
-        # failing summarizer would otherwise loop break→continuation→break
-        # forever); turn-boundary compaction still retries each turn.
+        # compaction gate must not stop the run for them at the THRESHOLD
+        # level (a persistently failing summarizer would otherwise loop
+        # break→continuation→break forever); turn-boundary compaction still
+        # retries each turn, and the HARD-LIMIT level ignores this flag
+        # entirely (growth past the hard limit is never allowed — it
+        # escalates to the mechanical trim instead).
         self._compaction_failed: set[str] = set()
+        # Tasks whose HARD-LIMIT escalation could not shrink the transcript
+        # either (nothing beyond the verbatim original prompts to trim): the
+        # hard-level gate bypass must stop firing for them, or the pause →
+        # resume cycle would repeat at every tool boundary with no effect.
+        # Cleared as soon as any compaction actually shrinks the transcript.
+        self._hard_limit_exhausted: set[str] = set()
         # Monotonic stamp of the last coalesced follow-the-tail scroll while
         # streaming (see _stream_follow).
         self._last_follow = 0.0

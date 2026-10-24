@@ -91,6 +91,7 @@ task's docs branch into the user's tree from inside the worktree.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import threading
@@ -171,6 +172,21 @@ class TaskEnvironment:
         # racing `worktree add` can deregister a worktree another thread
         # is just creating).
         self._activation_lock = threading.Lock()
+        # Mergedness cache for the batched `unmerged_ids` (see there):
+        # `_unmerged_cache_fingerprint` is the hash of one `show-ref --head`
+        # snapshot — HEAD plus every branch tip, i.e. everything the
+        # per-branch mergedness answers depend on — and `_unmerged_cache`
+        # maps each `drcode/<task-id>` branch name to its mergedness under
+        # THAT snapshot. Any commit on any drcode branch or any movement of
+        # the base (HEAD) changes the fingerprint and wipes the dict, so a
+        # cache hit is always a faithful answer; entries are filled by one
+        # batched `for-each-ref --no-merged` instead of a rev-list per
+        # branch. Polled every 10–30 s by the header indicator and the
+        # dependency gate — in the steady state that is a single cheap
+        # `show-ref` per poll instead of ~3 git processes per task id.
+        self._unmerged_cache_fingerprint: str | None = None
+        self._unmerged_cache: dict[str, bool] = {}
+        self._unmerged_cache_lock = threading.Lock()
 
     # -- state ---------------------------------------------------------------
 
@@ -419,12 +435,16 @@ class TaskEnvironment:
             return out
         return "HEAD"
 
-    def _unmerged_count(self, branch: str) -> int:
+    def _unmerged_count(self, branch: str, base: str | None = None) -> int:
         """How many commits of `branch` are NOT reachable from the base
-        branch (RULE 2's delete-protection counter). 0 also on any git
+        branch (RULE 2's delete-protection counter). `base` — an already
+        resolved `base_branch()` of the caller (remove / cleanup_orphans
+        resolve it once per sweep, not per branch). 0 also on any git
         failure — when git cannot tell, the old delete behavior applies
         (the snapshot above is the real safety net)."""
-        code, out = self._git("rev-list", "--count", f"{self.base_branch()}..{branch}")
+        if base is None:
+            base = self.base_branch()
+        code, out = self._git("rev-list", "--count", f"{base}..{branch}")
         if code != 0:
             return 0
         try:
@@ -465,17 +485,116 @@ class TaskEnvironment:
         the caller re-runs this at every promotion attempt, so a manual
         `git merge drcode/<dep>` unblocks the dependents by itself.
 
-        Blocking (a couple of git calls per id): run via
+        Cost: batched, not per id. One `show-ref --head` snapshots HEAD
+        plus every branch tip — both the existence of the `drcode/<id>`
+        branches and a fingerprint of everything their mergedness depends
+        on. Unchanged fingerprint → the cached per-branch answers are
+        reused as-is (a single cheap git process per call, which is what
+        the 10 s header poll and the 30 s dependency tick hit in the
+        steady state). Otherwise ONE `for-each-ref --no-merged <base>`
+        answers all the requested branches at once — no rev-parse, no
+        symbolic-ref and no rev-list per id (the pre-optimization shape,
+        kept as `_unmerged_ids_slow` for the fallback when git cannot
+        even take the snapshot). Blocking (1–3 git calls total): run via
         `asyncio.to_thread` from the pipeline."""
         if not self.active:
             return set()
+        ids = [task_id for task_id in dict.fromkeys(task_ids) if task_id]
+        if not ids:
+            return set()
+        fingerprint, existing = self._branch_snapshot()
+        if fingerprint is None:
+            # Git could not answer wholesale (broken repository, empty
+            # one): the slow per-id path degrades exactly like before.
+            return self._unmerged_ids_slow(ids)
+        with self._unmerged_cache_lock:
+            if fingerprint != self._unmerged_cache_fingerprint:
+                # Anything moved (a commit on a drcode branch, a merge
+                # into the base, a branch added/removed): every cached
+                # answer is stale — recompute from scratch below.
+                self._unmerged_cache_fingerprint = fingerprint
+                self._unmerged_cache = {}
+            cache = self._unmerged_cache
+            # The snapshot IS the existence check (no rev-parse per id):
+            # absent branches are filtered out here and simply never get
+            # a cache entry — they stay out of the answer via .get().
+            asked = [b for b in (self.branch(t) for t in ids) if b in existing]
+            unknown = [b for b in asked if b not in cache]
+            if unknown:
+                # One batch over exactly the branches with no cached
+                # answer yet (a fresh fingerprint: all of `asked`).
+                batch = self._unmerged_branches(unknown)
+                cache.update((b, b in batch) for b in unknown)
+            return {
+                task_id for task_id in ids if cache.get(self.branch(task_id), False)
+            }
+
+    def _unmerged_ids_slow(self, ids: list[str]) -> set[str]:
+        """The pre-optimization per-id loop: rev-parse + rev-list per
+        branch, base resolved per call. Fallback only — for environments
+        where the batch snapshot cannot be taken."""
         unmerged: set[str] = set()
-        for task_id in task_ids:
+        for task_id in ids:
             branch = self.branch(task_id)
             if not self._branch_exists(branch):
                 continue
             if self._unmerged_count(branch) > 0:
                 unmerged.add(task_id)
+        return unmerged
+
+    def _branch_snapshot(self) -> tuple[str | None, set[str]]:
+        """One `show-ref --head` in the project root: a hash of the full
+        ref dump (HEAD + every branch tip — the complete input of the
+        mergedness answers) and the set of `drcode/<id>` branch names
+        that exist. `(None, set())` on any git failure — the caller
+        falls back to the per-id path."""
+        try:
+            code, out = self._git("show-ref", "--head")
+        except (OSError, subprocess.SubprocessError):
+            return None, set()
+        if code != 0:
+            return None, set()
+        fingerprint = hashlib.sha256(out.encode()).hexdigest()
+        existing: set[str] = set()
+        prefix = f"refs/heads/{BRANCH_PREFIX}"
+        for line in out.splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].startswith(prefix):
+                continue
+            branch = parts[1][len("refs/heads/") :]
+            if branch:  # `drcode/<id>` itself, never a bare "drcode"
+                existing.add(branch)
+        return fingerprint, existing
+
+    def _unmerged_branches(self, branches: list[str]) -> set[str]:
+        """Which of the given `drcode/<id>` branch names hold commits the
+        base branch does not have — ONE `for-each-ref --no-merged` for
+        the whole batch (branch-tip reachability is exactly the
+        `rev-list --count base..branch > 0` question). Only ids of the
+        asked branches can come back: a glob-ish task id must not widen
+        anyone else's answer. Empty set on any git failure — when git
+        cannot tell, the answer is "merged" (same as the rev-list path)."""
+        try:
+            code, out = self._git(
+                "for-each-ref",
+                "--format=%(refname)",
+                "--no-merged",
+                self.base_branch(),
+                *(f"refs/heads/{branch}" for branch in branches),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        if code != 0:
+            return set()
+        asked = set(branches)
+        unmerged: set[str] = set()
+        prefix = "refs/heads/"
+        for line in out.splitlines():
+            branch = line.strip()[len(prefix) :]
+            # Branch names come back exactly as asked (glob-ish task ids
+            # cannot widen anyone else's answer).
+            if branch in asked:
+                unmerged.add(branch)
         return unmerged
 
     def remove(self, task_id: str) -> None:
@@ -500,6 +619,7 @@ class TaskEnvironment:
         wt = self.worktree_path(task_id)
         branch = self.branch(task_id)
         try:
+            base = self.base_branch()
             snap = self.snapshot(task_id, "before removal")
             if (
                 snap is not None
@@ -515,7 +635,7 @@ class TaskEnvironment:
             elif wt.exists():
                 wt.rmdir()  # empty leftover dir
             if self._branch_exists(branch):
-                unmerged = self._unmerged_count(branch)
+                unmerged = self._unmerged_count(branch, base)
                 if unmerged > 0:
                     # RULE 2: commits live in the object store — the
                     # directory was disposable, the branch is not.
@@ -549,6 +669,7 @@ class TaskEnvironment:
             return []
         removed: list[str] = []
         try:
+            base = self.base_branch()
             self._git("worktree", "prune")
             # Directory-based sweep: our worktrees live in one private dir.
             wt_root = self.project_root / WORKTREES_SUBDIR
@@ -587,7 +708,7 @@ class TaskEnvironment:
                     task_id = branch[len(BRANCH_PREFIX) :]
                     if task_id in live_task_ids:
                         continue
-                    unmerged = self._unmerged_count(branch)
+                    unmerged = self._unmerged_count(branch, base)
                     if unmerged > 0:
                         if self.event_log is not None:
                             self.event_log(

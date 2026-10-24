@@ -607,3 +607,92 @@ def test_unmerged_ids_empty_branch_not_blocking(env: TaskEnvironment) -> None:
     # onto) counts as merged.
     _git(env.project_root, "branch", "drcode/empty")
     assert env.unmerged_ids(["empty"]) == set()
+
+
+# -- unmerged_ids batching + cache dynamics ---------------------------------------
+
+
+def _commit_on_branch(root: Path, branch: str, name: str) -> None:
+    """A commit on `branch` made in the main checkout; the tests' base
+    branch (the one the repo was committed on) is restored afterwards."""
+    _git(root, "checkout", "-q", "-B", branch)
+    (root / f"{name}.txt").write_text(name)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", name)
+    _git(root, "checkout", "-q", "-")
+
+
+def test_unmerged_ids_batch_matches_per_branch_answers(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    _commit_on_branch(git_root, "drcode/a", "a")
+    _commit_on_branch(git_root, "drcode/b", "b")
+    _git(git_root, "branch", "drcode/merged")
+    ids = ["a", "b", "merged", "absent"]
+    assert env.unmerged_ids(ids) == {"a", "b"}
+    # The batched answer must equal the reference per-branch loop.
+    assert env.unmerged_ids(ids) == env._unmerged_ids_slow(ids)
+
+
+def test_unmerged_ids_repeated_calls_reuse_cache(
+    env: TaskEnvironment, git_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Steady state (refs unchanged): a poll is one cheap `show-ref`
+    snapshot — no batch re-computation, the cached answers are reused."""
+    _commit_on_branch(git_root, "drcode/work", "work")
+    _git(git_root, "branch", "drcode/merged")
+    ids = ["work", "merged", "absent"]
+    assert env.unmerged_ids(ids) == {"work"}
+    calls: list[tuple[str, ...]] = []
+    original = env._git
+
+    def spy(*args: str, **kwargs: object) -> tuple[int, str]:
+        calls.append(args)
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(env, "_git", spy)
+    assert env.unmerged_ids(ids) == {"work"}
+    assert calls == [("show-ref", "--head")]
+
+
+def test_unmerged_ids_reflects_manual_merge_dynamically(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """A manual `git merge drcode/<id>` must unblock dependents on the
+    next call — the fingerprint cache may not keep a stale 'unmerged'."""
+    _commit_on_branch(git_root, "drcode/work", "work")
+    assert env.unmerged_ids(["work"]) == {"work"}
+    _git(git_root, "merge", "-q", "--no-ff", "drcode/work", "-m", "merge work")
+    assert env.unmerged_ids(["work"]) == set()
+    # ... and stays merged on the now-cached follow-up calls.
+    assert env.unmerged_ids(["work"]) == set()
+
+
+def test_unmerged_ids_reflects_new_commits_dynamically(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    _git(git_root, "branch", "drcode/work")  # at the base tip: merged
+    assert env.unmerged_ids(["work"]) == set()
+    # New work landed on the branch (the tester committed, say) — the
+    # moved branch tip must flip the answer.
+    _commit_on_branch(git_root, "drcode/work", "work")
+    assert env.unmerged_ids(["work"]) == {"work"}
+
+
+def test_unmerged_ids_reflects_branch_removal_dynamically(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    _commit_on_branch(git_root, "drcode/work", "work")
+    assert env.unmerged_ids(["work"]) == {"work"}
+    _git(git_root, "branch", "-D", "drcode/work")
+    assert env.unmerged_ids(["work"]) == set()
+
+
+def test_unmerged_ids_new_branch_appears_dynamically(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """A branch created after the first poll (fresh fingerprint) is
+    picked up by the batch — no stale 'absent' from the first pass."""
+    assert env.unmerged_ids(["work"]) == set()
+    _commit_on_branch(git_root, "drcode/work", "work")
+    assert env.unmerged_ids(["work"]) == {"work"}

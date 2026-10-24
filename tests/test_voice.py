@@ -567,6 +567,130 @@ async def test_voice_dialog_cancel_keeps_settings(project_root: Any) -> None:
         assert app.settings.voice_api_url == ""
 
 
+# -- Dictation context safety ---------------------------------------------------------
+#
+# A dictation belongs to the context it was started in: a task switch, a
+# new-task form enter/leave or a pushed modal must discard the in-flight
+# text instead of inserting it into a stale field.
+
+
+async def _running_app(project_root: Any) -> Any:
+    from drcode.tui.app import DrCodeApp
+
+    app = DrCodeApp(project_root)
+    context = app.run_test()
+    pilot = await context.__aenter__()
+    await pilot.press("escape")  # skip the first-start setup dialog
+    return app, pilot, context
+
+
+def _arm_transcribing(app: Any, target: Any) -> None:
+    """Fake the controller into TRANSCRIBING for `target` (no microphone,
+    no network): the state `_insert` sees after a real ASR round-trip."""
+    from drcode.tui.voice_input import _State
+
+    vi = app.voice_input
+    vi._state = _State.TRANSCRIBING
+    vi._target = target
+    vi._context = vi._snapshot_context(target)
+
+
+async def test_dictation_discarded_after_task_switch(project_root: Any) -> None:
+    app, pilot, context = await _running_app(project_root)
+    try:
+        t1 = app.manager.create("one", "m")
+        t2 = app.manager.create("two", "m")
+        app.view_task(t1.id)
+        await pilot.pause()
+        _arm_transcribing(app, app.chat_input)
+        # The user switches to another task while ASR is in flight.
+        app.view_task(t2.id)
+        await pilot.pause()
+        app.voice_input._insert(app.chat_input, "hello")
+        await pilot.pause()
+        assert app.chat_input.text == ""
+        assert not app.voice_input.active
+    finally:
+        await context.__aexit__(None, None, None)
+
+
+async def test_dictation_inserts_in_same_context(project_root: Any) -> None:
+    app, pilot, context = await _running_app(project_root)
+    try:
+        task = app.manager.create("one", "m")
+        app.view_task(task.id)
+        await pilot.pause()
+        _arm_transcribing(app, app.chat_input)
+        app.voice_input._insert(app.chat_input, "hello")
+        await pilot.pause()
+        assert app.chat_input.text == "hello"
+    finally:
+        await context.__aexit__(None, None, None)
+
+
+async def test_view_task_cancels_active_recording(project_root: Any) -> None:
+    from drcode.tui.voice_input import _State
+    from drcode.voice import MicrophoneRecorder
+
+    app, pilot, context = await _running_app(project_root)
+    try:
+        t1 = app.manager.create("one", "m")
+        t2 = app.manager.create("two", "m")
+        app.view_task(t1.id)
+        await pilot.pause()
+        vi = app.voice_input
+        vi._state = _State.RECORDING
+        recorder = MicrophoneRecorder()
+        vi._recorder = recorder
+        vi._target = app.chat_input
+        vi._context = vi._snapshot_context(app.chat_input)
+        app.view_task(t2.id)
+        await pilot.pause()
+        assert not vi.active
+        assert not recorder.recording
+    finally:
+        await context.__aexit__(None, None, None)
+
+
+async def test_new_task_leave_discards_form_dictation(project_root: Any) -> None:
+    app, pilot, context = await _running_app(project_root)
+    try:
+        app.action_new_task()
+        await pilot.pause()
+        _arm_transcribing(app, app.new_task_input)
+        # Leaving the form hides the editor: the text must not land there.
+        app.cancel_new_task()
+        await pilot.pause()
+        app.voice_input._insert(app.new_task_input, "hello")
+        await pilot.pause()
+        assert app.new_task_input.text == ""
+        assert not app.voice_input.active
+    finally:
+        await context.__aexit__(None, None, None)
+
+
+async def test_push_screen_cancels_active_recording(project_root: Any) -> None:
+    from drcode.tui.voice_input import _State
+    from drcode.voice import MicrophoneRecorder
+
+    app, pilot, context = await _running_app(project_root)
+    try:
+        app.view_task(app.manager.create("one", "m").id)
+        await pilot.pause()
+        vi = app.voice_input
+        vi._state = _State.RECORDING
+        recorder = MicrophoneRecorder()
+        vi._recorder = recorder
+        vi._target = app.chat_input
+        vi._context = vi._snapshot_context(app.chat_input)
+        app.action_change_voice()  # pushes the voice settings dialog
+        await pilot.pause()
+        assert not vi.active
+        assert not recorder.recording
+    finally:
+        await context.__aexit__(None, None, None)
+
+
 # -- TaskManager creation listener -----------------------------------------------------
 
 

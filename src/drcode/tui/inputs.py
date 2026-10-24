@@ -173,6 +173,10 @@ class DepsInput(Input):
         self._app().submit_new_task()
 
     def action_cancel_new_task(self) -> None:
+        # Mirror NewTaskInput: while a voice recording runs, ESC belongs
+        # to it (cancel the recording, keep the form).
+        if self._app().voice_input.cancel():
+            return
         self._app().cancel_new_task()
 
     def action_focus_editor(self) -> None:

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
 
-from . import agent_model, tools
+from . import agent_model, task_search, tools
 from .agent_model import (
     EXTRA_HEADERS,
     AsyncOpenAI,
@@ -543,6 +543,38 @@ def build_agent(
             push is NOT a failure: the commit stays safe locally, the error is
             logged into the task's event log — mention it in your summary."""
             return await _commit_tracked_files(ctx.deps, ctx.deps.root, message)
+
+        @agent.tool
+        async def search_task_history(
+            ctx: RunContext[AgentDeps],
+            keywords: list[str],
+            status: str | None = None,
+            kind: str | None = None,
+        ) -> str:
+            """Search the project's task archive (ALL statuses: queued, hold,
+            active, testing, completed, clarification) by keywords. Case-
+            insensitive substring match over each task's title and user
+            prompts; several keywords are combined with AND. Optional filters:
+            `status` and `kind` (bug/feature/research). Output is one compact
+            line per task — id, status/kind, date, title, a short snippet
+            around the match — capped at 50 results (a longer hit list is
+            truncated with a "refine the query" tail). Use it to assess the
+            state of development around a topic or find past decisions/bug
+            reports without reading raw task JSONs; for a specific task's
+            details, read_file its file <project>/.drcode/tasks/<id>.json.
+            Your own task is excluded from the results."""
+            # The archive lives in the MAIN checkout's .drcode/tasks/ — under
+            # worktree isolation ctx.deps.root is the task's worktree, whose
+            # .drcode/ has no task files. The manager's storage root always
+            # points at the main project root, so search against that.
+            return await _run_tool(
+                task_search.search,
+                ctx.deps.manager.storage.root,
+                keywords,
+                exclude_task_id=ctx.deps.task_id,
+                status=status,
+                kind=kind,
+            )
 
     @agent.tool
     def ask_clarifying_question(

@@ -1068,3 +1068,76 @@ async def test_repeated_failed_queue_rescue_backs_off(
     assert instant_timers == [60.0, 120.0]
     # Successful model calls reset the rescue backoff.
     assert net_app._failed_queue_rounds == 0
+
+
+# -- deterministic context-overflow failures ----------------------------------------
+
+
+def test_context_overflow_classifier() -> None:
+    """HTTP 400 whose body says the request exceeds the model's context
+    window is classified as deterministic; other statuses and other 400s
+    are not."""
+    from drcode.tui.usage import _is_context_overflow_error
+
+    assert _is_context_overflow_error(
+        http_error(
+            400,
+            "This model's maximum context length is 16385 tokens, however "
+            "you requested 20000 tokens in your input. Please reduce the "
+            "length of the input.",
+        )
+    )
+    assert _is_context_overflow_error(
+        http_error(400, "prompt is too long: 210000 tokens > 200000 maximum")
+    )
+    # Other 400s are ordinary failures, even non-400 overflow mentions.
+    assert not _is_context_overflow_error(http_error(400, "invalid tool schema"))
+    assert not _is_context_overflow_error(
+        http_error(500, "maximum context length exceeded upstream")
+    )
+    assert not _is_context_overflow_error(api_error("Connection error."))
+
+
+async def test_context_overflow_failure_is_never_rescued(
+    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
+) -> None:
+    """A 400 context-overflow failure is deterministic: the task is marked
+    dead (a separate set from the session-excluded ones), the failed-queue
+    rescue escape never lifts it, and the user gets a service event plus a
+    notification explaining that manual intervention is needed."""
+    task = net_app.manager.create("big", "summarize the world", kind=TaskKind.RESEARCH)
+    scripted.steps = [
+        http_error(
+            400,
+            "This model's maximum context length is 16385 tokens, however "
+            "you requested 20000 tokens in your input. Please reduce the "
+            "length of the input.",
+        )
+    ]
+    notified: list[str] = []
+    net_app.notifier.task_context_overflow = notified.append  # type: ignore[method-assign]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.QUEUED
+                and task.id in net_app._agent_dead
+                and task.id in net_app._agent_failed
+            ),
+            pilot,
+            what="task demoted and marked dead",
+        )
+        await pilot.pause()
+        # The deadlock escape must NOT fire for a dead-only queue: no
+        # rescue round, no rescue timer, no re-run of the doomed task.
+        assert net_app._failed_queue_rounds == 0
+        assert instant_timers == []
+        net_app._advance()
+        await pilot.pause()
+        assert len(scripted.calls) == 1
+
+    assert notified == [task.title]
+    texts = event_texts(task)
+    assert any("exceeds the model's context window" in t for t in texts)
+    assert any("manual intervention" in t for t in texts)

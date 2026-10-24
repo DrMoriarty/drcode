@@ -30,6 +30,40 @@ def _is_retryable_network_error(e: BaseException) -> bool:
     return isinstance(e, ModelAPIError)
 
 
+# Body/message fragments identifying a deterministic context-window
+# overflow: ModelHTTPError 400s whose text matches are NOT transient —
+# the same transcript will be rejected on every retry, so requeueing and
+# rescuing the task would only loop it through the error forever.
+# Matched case-insensitively against str(error) (which embeds the
+# response body) — the list covers the phrasings of the common gateways
+# (OpenAI "maximum context length" / "context_length_exceeded",
+# Anthropic "prompt is too long", generic "context too long" / "too many
+# tokens" / "reduce the length of the input").
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "context_length",
+    "context too long",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "input too long",
+    "too many tokens",
+    "reduce the length of the input",
+    "longer than the model's context",
+)
+
+
+def _is_context_overflow_error(e: BaseException) -> bool:
+    """Deterministic model failure: HTTP 400 whose body says the request
+    exceeds the model's context window. Unlike transport errors and 429s
+    this cannot succeed on retry — the transcript must shrink (mechanical
+    compaction) or the task must be handled manually."""
+    if not isinstance(e, ModelHTTPError) or e.status_code != 400:
+        return False
+    text = str(e).lower()
+    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
 def _network_retry_delay(attempt: int) -> float:
     """Backoff before retry `attempt` (1-based): 5s doubling, capped."""
     return min(5 * 2 ** (attempt - 1), NETWORK_DELAY_MAX)

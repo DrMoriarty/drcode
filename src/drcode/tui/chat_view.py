@@ -568,6 +568,9 @@ class ChatViewLayer(DrCodeState):
         _agent_failed and would stay stranded until restart otherwise. If
         nothing is running, the pipeline picks the next task immediately."""
         self._agent_failed.clear()
+        # _agent_dead is deliberately NOT cleared: a context-overflow
+        # failure is deterministic — the outage recovery cannot fix an
+        # oversized transcript.
         # The connection is back: a later failed-queue rescue (see
         # _promote_failed_queue) must fire immediately, not after a stale
         # backoff window accumulated during the outage.

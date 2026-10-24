@@ -578,6 +578,21 @@ class Notifier:
             priority=Priority.HIGH,
         )
 
+    def task_context_overflow(self, task_title: str) -> None:
+        """A task's run died with a deterministic context-overflow error:
+        its transcript exceeds the model's context window, so retrying the
+        same history is guaranteed to fail — the task needs manual
+        intervention (delete it, or shrink its transcript)."""
+        self.notify(
+            self._title("task needs manual intervention"),
+            f"Task “{task_title}”: the transcript exceeds the model's "
+            f"context window — the model rejects it on every attempt, "
+            f"retrying cannot help. Delete the task or shrink its "
+            f"transcript.",
+            tags=["warning"],
+            priority=Priority.HIGH,
+        )
+
     def pipeline_busy(self) -> None:
         """A run started (development or testing): reset the settled-state
         dedup so the next idle transition notifies again."""

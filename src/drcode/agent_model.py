@@ -21,7 +21,7 @@ from .config import Config
 from .providers import ModelEntry
 from .version import APP_VERSION
 
-# Гейейвей api-copilot.x5.ru блокирует запросы с UA известных CLI/SDK
+# Гейтвей блокирует запросы с UA известных CLI/SDK
 # (curl, OpenAI/Python, pydantic-ai, …) — против автоматизации.
 # Нейтральный UA проходит; ставим его на уровне клиента и в model_settings
 # (pydantic-ai перебивает client-заголовки per-request заголовком pydantic-ai/x.y).

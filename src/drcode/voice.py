@@ -1,5 +1,5 @@
 """Voice I/O: ASR dictation and TTS announcements over an OpenAI-compatible
-audio API (default gateway: ``https://api-copilot.x5.ru/v1``).
+audio API (default gateway: ``https://provider.ru/v1``).
 
 Three independent pieces live here:
 
@@ -25,7 +25,7 @@ off. The API key may be left empty to reuse the token of the user-catalog
 provider whose host matches the audio URL's host (no second token for the
 common single-gateway case).
 
-The ASR/TTS model ids (e.g. ``x5-asr/x5-asr-large``) contain ``/`` — the
+The ASR/TTS model ids (e.g. ``gigaam_rnnt_v3_e2e``) contain ``/`` — the
 separator of the agent-catalog ``<provider>/<model-id>`` reference format
 (:func:`drcode.providers._reject_slash`) — so they are stored in the project
 settings directly, never in the model catalog.
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 # Default audio-API base URL (offered as the dialog's prefill; the setting
 # stays empty until the user saves the voice dialog — empty = voice off).
-DEFAULT_VOICE_API_URL = "https://api-copilot.x5.ru/v1"
+DEFAULT_VOICE_API_URL = "https://provider.ru/v1"
 
 # Default speaker voice when voice_tts_voice is empty (OpenAI TTS names).
 DEFAULT_TTS_VOICE = "alloy"

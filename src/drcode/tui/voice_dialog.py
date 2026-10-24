@@ -3,11 +3,11 @@
 Opened from the Settings palette ("Voice…"). The form collects:
 
 - the OpenAI-compatible audio-API base URL (default:
-  ``https://api-copilot.x5.ru/v1`` — deliberately NOT the chat provider's
+  ``https://provider.ru/v1`` — deliberately NOT the chat provider's
   base URL, gateways serve audio on their own route),
 - the API key (pre-filled from the user-catalog provider whose host
   matches the audio URL; can be overridden),
-- the ASR model id (full id, e.g. ``x5-asr/x5-asr-large``),
+- the ASR model id (full id, e.g. ``gigaam_rnnt_v3_e2e``),
 - the TTS model id + speaker voice,
 - three checkboxes: which events to voice-announce (task completed,
   tester failure, empty queue).
@@ -166,13 +166,13 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             )
             yield Static("ASR model (full id)", classes="voice-label")
             yield Input(
-                placeholder="x5-asr/x5-asr-large",
+                placeholder="gigaam_rnnt_v3_e2e",
                 value=self._initial["asr_model"],
                 id="voice-asr",
             )
             yield Static("TTS model (full id)", classes="voice-label")
             yield Input(
-                placeholder="x5-tts/tts-1",
+                placeholder="higgs-tts-3-4b",
                 value=self._initial["tts_model"],
                 id="voice-tts-model",
             )

@@ -250,11 +250,11 @@ class ProjectSettings(BaseModel):
     # user-catalog provider whose base_url host matches voice_api_url's
     # host (no second token to manage for the common single-gateway case).
     voice_api_key: str = ""
-    # Full ASR model id, e.g. "x5-asr/x5-asr-large". Model ids may contain
+    # Full ASR model id, e.g. "gigaam_rnnt_v3_e2e". Model ids may contain
     # "/" (unlike the agent-catalog ids), so they are stored here directly
     # instead of the model catalog.
     voice_asr_model: str = ""
-    # TTS model id (e.g. "x5-tts/tts-1") and the speaker voice (e.g.
+    # TTS model id (e.g. "higgs-tts-3-4b") and the speaker voice (e.g.
     # "alloy"); both required for the announcements.
     voice_tts_model: str = ""
     voice_tts_voice: str = ""

@@ -172,12 +172,6 @@ class SettingsPalette(CommandPalette):
         "Theme",
         "Update/create AGENTS.md",
         "Model settings",
-        "Auto-delete completed tasks:",
-        "Task finalization:",
-        "Max development rounds:",
-        "Nudge stalled agent after:",
-        "Task isolation:",
-        "Parallel tasks:",
         "ESC stop behavior:",
         "Task settings",
         "Workflow:",
@@ -288,7 +282,8 @@ class ServiceCommandsProvider(Provider):
     """App-specific commands in the Settings palette.
 
     Registered alongside the system commands via `DrCodeApp.COMMANDS`;
-    every hit is an app action that creates a pre-configured service task.
+    every hit is an app action — most create a pre-configured service
+    task, the ESC-stop entry toggles a project preference.
     """
 
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
@@ -298,6 +293,16 @@ class ServiceCommandsProvider(Provider):
                 "Update/create AGENTS.md",
                 "research task: agent creates or refreshes AGENTS.md",
                 app.action_update_agents_md,
+            ),
+            (
+                f"ESC stop behavior: {app.settings.esc_abort.label}",
+                (
+                    "How ESC stops a running agent/tester: double-press "
+                    "(the first ESC only arms the stop, the second "
+                    "confirms) or instant — the historical single-press "
+                    "stop (project setting)"
+                ),
+                app.action_change_esc_abort,
             ),
         ]
 
@@ -492,72 +497,6 @@ class ProjectSettingsCommandsProvider(Provider):
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
-                f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
-                (
-                    "Delete completed tasks older than the retention period at app "
-                    "startup (project setting)"
-                ),
-                app.action_change_completed_retention,
-            ),
-            (
-                f"Task finalization: {app.settings.task_finalization.label}",
-                (
-                    "What runs after development: tester + git commit, tester "
-                    "without commit, or nothing (project setting)"
-                ),
-                app.action_change_task_finalization,
-            ),
-            (
-                f"Max development rounds: {app.settings.max_dev_rounds}",
-                (
-                    "How many consecutive failed development rounds a task "
-                    "gets when the tester attributes the failure to the "
-                    "task's own changes, before the failure completes the "
-                    "task as failed and a bug report is created instead "
-                    "(project setting)"
-                ),
-                app.action_change_max_dev_rounds,
-            ),
-            (
-                f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
-                (
-                    "Abort and restart an agent/tester run that has shown no "
-                    "activity for this long (project setting)"
-                ),
-                app.action_change_stall_nudge,
-            ),
-            (
-                f"Task isolation: {app._task_isolation_label()}",
-                (
-                    "Give each task its own git worktree (.drcode/"
-                    "worktrees/<id>, branch drcode/<id>) so an interrupted "
-                    "task never leaves its changes to the next one — needs "
-                    "a git repository, otherwise tasks run in the shared "
-                    "project directory (project setting)"
-                ),
-                app.action_change_task_isolation,
-            ),
-            (
-                f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
-                (
-                    "How many tasks may develop in parallel, each in its "
-                    "own git worktree — needs Task isolation: worktree, "
-                    "otherwise tasks run one at a time (project setting; "
-                    "the tester stays single)"
-                ),
-                app.action_change_parallel_tasks,
-            ),
-            (
-                f"ESC stop behavior: {app.settings.esc_abort.label}",
-                (
-                    "How ESC stops a running agent/tester: double-press "
-                    "(the first ESC only arms the stop, the second "
-                    "confirms) or instant — the historical single-press "
-                    "stop (project setting)"
-                ),
-                app.action_change_esc_abort,
-            ),
             (
                 f"Workflow: {app.workflow_status_label()}",
                 (

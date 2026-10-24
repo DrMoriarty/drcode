@@ -205,6 +205,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         dock: bottom;
         width: 100%;
         height: 1;
+        margin-bottom: 1;
         text-align: right;
         padding: 0 1 0 0;
         background: transparent;

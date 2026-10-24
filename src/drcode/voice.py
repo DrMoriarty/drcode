@@ -38,6 +38,7 @@ import queue
 import ssl
 import sys
 import threading
+import time
 import wave
 from array import array
 from collections.abc import Callable
@@ -336,10 +337,20 @@ class MicrophoneRecorder:
 
     SAMPLE_RATE = 16_000
 
+    # A zero-frame recording of a stream that ran at least this long is a
+    # dead recording (the callback never delivered anything): stop() raises
+    # instead of shipping a silent WAV to the ASR endpoint.
+    MIN_AUDIBLE_DURATION = 0.5
+
     def __init__(self) -> None:
         self._chunks: list[array[int]] = []
         self._stream: _AudioStream | None = None
         self._lock = threading.Lock()
+        # Failures of the audio-thread callback (sounddevice swallows
+        # exceptions raised there — "Exception ignored from cffi callback"
+        # — so they must be counted here to be visible at all).
+        self._callback_errors = 0
+        self._opened_at = time.monotonic()
         # Strong reference to the bound callback for as long as the stream
         # lives: sounddevice wraps it into a cffi trampoline, and letting the
         # wrapper be garbage-collected while PortAudio still calls it is a
@@ -376,22 +387,38 @@ class MicrophoneRecorder:
             raise VoiceError(f"Microphone unavailable: {e}") from e
         with self._lock:
             self._chunks = []
+            self._callback_errors = 0
+            self._opened_at = time.monotonic()
             self._stream = stream
 
     def _callback(
         self, indata: object, frames: int, time: object, status: object
     ) -> None:
-        # Audio-thread callback: a plain append of a copy (RawInputStream
-        # hands over a cffi buffer; array.array("h", buffer) copies it into
-        # int16 samples). Cheap and non-blocking under the GIL — all
-        # assembly happens later, on the caller's thread in stop().
+        # Audio-thread callback: a plain append of a copy. RawInputStream
+        # hands over a byte-typed cffi buffer, which array.array("h", ...)
+        # rejects outright (TypeError) — convert through bytes() first.
+        # Cheap and non-blocking under the GIL — all assembly happens
+        # later, on the caller's thread in stop().
+        try:
+            chunk = array("h", bytes(indata))  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001 - a dead callback is invisible otherwise
+            with self._lock:
+                self._callback_errors += 1
+            print(f"drcode voice: microphone callback failed: {e}", file=sys.stderr)
+            return
         with self._lock:
             if self._stream is not None:
-                self._chunks.append(array("h", indata))  # type: ignore[call-overload]
+                self._chunks.append(chunk)
 
     def stop(self) -> bytes:
-        """Close the stream and return the recording as WAV bytes (empty
-        recording still yields a valid, silent WAV header)."""
+        """Close the stream and return the recording as WAV bytes.
+
+        A recording that ended up with zero frames despite the stream
+        having been open longer than a moment (or whose callback failed)
+        raises a distinct VoiceError instead — shipping a silent WAV to
+        the ASR endpoint only surfaces later as the misleading
+        "ASR returned no text". A genuinely brief tap still yields a
+        valid, silent WAV."""
         with self._lock:
             stream, self._stream = self._stream, None
             chunks = self._chunks
@@ -401,6 +428,19 @@ class MicrophoneRecorder:
         pcm = array("h")
         for chunk in chunks:
             pcm.extend(chunk)
+        if not pcm:
+            with self._lock:
+                errors = self._callback_errors
+            if errors:
+                raise VoiceError(
+                    f"Microphone returned no audio: the recording callback "
+                    f"failed {errors} time(s)"
+                )
+            duration = time.monotonic() - self._opened_at
+            if stream is not None and duration >= self.MIN_AUDIBLE_DURATION:
+                raise VoiceError(
+                    f"Microphone returned no audio in {duration:.1f} s of recording"
+                )
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
             wav.setnchannels(1)

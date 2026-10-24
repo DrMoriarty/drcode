@@ -804,17 +804,31 @@ class _FakeStream:
     def close(self) -> None: ...
 
 
+def _cffi_int16_buffer(samples: list[int]) -> object:
+    """The exact object sounddevice's RawInputStream callback hands over: a
+    byte-typed cffi buffer (``ffi.buffer(ptr, frames * 2)``) holding the
+    little-endian int16 samples. array.array("h", <this>) raises TypeError —
+    the regression 0cd2eb3 shipped."""
+    from array import array as _array
+
+    import cffi
+
+    ffi = cffi.FFI()
+    raw = _array("h", samples).tobytes()
+    return ffi.buffer(ffi.new("char[]", raw), len(raw))
+
+
 def test_recorder_wav_assembly() -> None:
     from array import array
 
     recorder = MicrophoneRecorder()
     # Pretend the PortAudio stream is open and feed the audio-thread
     # callback by hand (the real RawInputStream needs a microphone).
-    # The callback receives a flat interleaved int16 buffer (cffi buffer
-    # in production; array.array here) — mono, so one sample per frame.
+    # The callback receives a flat interleaved int16 buffer — a byte-typed
+    # cffi buffer in production — mono, so one sample per frame.
     recorder._stream = _FakeStream()
-    recorder._callback(array("h", [100, -200]), 2, None, None)
-    recorder._callback(array("h", [300]), 1, None, None)
+    recorder._callback(_cffi_int16_buffer([100, -200]), 2, None, None)
+    recorder._callback(_cffi_int16_buffer([300]), 1, None, None)
     assert recorder.recording
 
     wav = recorder.stop()
@@ -830,13 +844,12 @@ def test_recorder_wav_assembly() -> None:
 
 
 def test_recorder_callback_after_stop_is_ignored() -> None:
-    from array import array
 
     recorder = MicrophoneRecorder()
     recorder._stream = _FakeStream()
-    recorder._callback(array("h", [1]), 1, None, None)
+    recorder._callback(_cffi_int16_buffer([1]), 1, None, None)
     recorder.stop()
-    recorder._callback(array("h", [2]), 1, None, None)
+    recorder._callback(_cffi_int16_buffer([2]), 1, None, None)
     # A late audio-thread chunk after the stop must not resurrect the
     # recording (stop() already returned; a new session calls start()).
     with wave.open(io.BytesIO(recorder.stop())) as handle:
@@ -844,14 +857,55 @@ def test_recorder_callback_after_stop_is_ignored() -> None:
 
 
 def test_recorder_discard_drops_audio() -> None:
-    from array import array
 
     recorder = MicrophoneRecorder()
     recorder._stream = _FakeStream()
-    recorder._callback(array("h", [7]), 1, None, None)
+    recorder._callback(_cffi_int16_buffer([7]), 1, None, None)
     recorder.discard()
     assert not recorder.recording
     # A discard leaves nothing to stop() — an empty valid WAV comes back.
+    with wave.open(io.BytesIO(recorder.stop())) as handle:
+        assert handle.getnframes() == 0
+
+
+def test_recorder_stop_raises_on_callback_failure() -> None:
+    """A callback that crashes on every invocation (the 0cd2eb3 regression:
+    array("h", cffi buffer) → TypeError) must surface as a distinct
+    VoiceError from stop(), not as a silent WAV that the ASR endpoint
+    answers with the misleading "ASR returned no text"."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._callback(object(), 1, None, None)  # bytes(<object>) raises
+    recorder._callback(object(), 1, None, None)
+    assert recorder._callback_errors == 2
+    with pytest.raises(VoiceError, match="callback failed"):
+        recorder.stop()
+
+
+def test_recorder_stop_raises_when_silent_after_long_recording(
+    monkeypatch: Any,
+) -> None:
+    """Zero frames while the stream ran longer than a moment = a dead
+    recording: raise instead of shipping silence to the server."""
+    from drcode.voice import MicrophoneRecorder as _Rec
+
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._opened_at = time.monotonic() - 10.0
+    with pytest.raises(VoiceError, match="no audio"):
+        recorder.stop()
+
+    # A stream that was never opened (or already stopped) keeps the old
+    # behavior: an empty but valid silent WAV.
+    recorder2 = _Rec()
+    with wave.open(io.BytesIO(recorder2.stop())) as handle:
+        assert handle.getnframes() == 0
+
+
+def test_recorder_brief_tap_still_yields_silent_wav() -> None:
+    """A stop immediately after a start (a quick tap) is not an error."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
     with wave.open(io.BytesIO(recorder.stop())) as handle:
         assert handle.getnframes() == 0
 

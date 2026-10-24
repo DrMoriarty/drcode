@@ -12,6 +12,7 @@ fixes."""
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -240,6 +241,10 @@ async def test_research_reminder_toast_softened_by_research_hook(
     )
     app.workflow = load_hooks(app.project_root)
     task = finished_task(app, kind=TaskKind.RESEARCH)
+    # The hook has just reported "merged" — within the audit grace its
+    # claim is trusted (the self-healing audit itself is covered below).
+    task.completed_at = datetime.now(UTC)
+    app.manager.storage.save(task)
     commit_on_branch(app.task_env, task.id)
     toasts = track_toasts(app)
     async with app.run_test() as pilot:
@@ -263,6 +268,10 @@ async def test_reminder_toast_softened_by_on_accepted_hook(
     )
     app.workflow = load_hooks(app.project_root)
     task = finished_task(app)
+    # The hook has just reported "merged" — within the audit grace its
+    # claim is trusted (the self-healing audit itself is covered below).
+    task.completed_at = datetime.now(UTC)
+    app.manager.storage.save(task)
     commit_on_branch(app.task_env, task.id)
     toasts = track_toasts(app)
     async with app.run_test() as pilot:
@@ -346,6 +355,17 @@ async def test_startup_scan_silent_with_on_accepted_hook(
         isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
     )
     commit_on_branch(env, task.id)
+    # The hook's claim must hold: the merge really landed (the tracking
+    # audits git, not just the hook's presence).
+    _git(
+        isolated,
+        "merge",
+        "-q",
+        "--no-ff",
+        branch_for(task.id),
+        "-m",
+        "merge it",
+    )
 
     drcode_dir = isolated / ".drcode"
     drcode_dir.mkdir(exist_ok=True)
@@ -436,9 +456,9 @@ async def test_failed_hook_merge_counts_in_unmerged_completed_ids(
     app_env: DrCodeApp,
 ) -> None:
     """With an on_accepted hook defined, a completed task is normally
-    invisible to the unmerged-work tracking — unless its hook-merge
-    failed (the flag re-admits it; research tasks get the same treatment
-    under their own hook)."""
+    invisible to the unmerged-work tracking — but only while its branch
+    is really merged (the tracking audits git, not just the flag);
+    research tasks get the same treatment under their own hook."""
     app = app_env
     _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
     app.workflow = load_hooks(app.project_root)
@@ -446,23 +466,45 @@ async def test_failed_hook_merge_counts_in_unmerged_completed_ids(
     research = finished_task(app, kind=TaskKind.RESEARCH)
     commit_on_branch(app.task_env, task.id)
     commit_on_branch(app.task_env, research.id)
+    _git(
+        app.project_root,
+        "merge",
+        "-q",
+        "--no-ff",
+        branch_for(task.id),
+        "-m",
+        "merge it",
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
-        # Successful hook-merges (no flag): the development task is hidden
-        # (on_accepted owns its merge); the research task counts anyway —
-        # on_accepted does not automate research merges.
+        # Merged branch, no flag: the development task is hidden
+        # (on_accepted owns its merge — and the audit sees it landed);
+        # the research task counts anyway — on_accepted does not
+        # automate research merges, and its branch is unmerged.
         assert app._unmerged_completed_ids() == [research.id]
         # A failed hook-merge — the development task counts again too.
+        commit_on_branch(app.task_env, task.id, name="fix2.txt")
         task.hook_merge_failed = True
         assert sorted(app._unmerged_completed_ids()) == sorted([task.id, research.id])
         # The research counterpart: on_research_accepted defined instead —
-        # it hides the research task until ITS hook-merge fails.
+        # it hides the research task while its merge really landed.
         (app.project_root / ".drcode" / "workflow.py").write_text(
             "def on_research_accepted(task):\n    return None\n"
         )
         app.workflow = load_hooks(app.project_root)
+        commit_on_branch(app.task_env, research.id, name="docs2.txt")
+        _git(
+            app.project_root,
+            "merge",
+            "-q",
+            "--no-ff",
+            branch_for(research.id),
+            "-m",
+            "merge docs",
+        )
         assert app._unmerged_completed_ids() == [task.id]
         research.hook_merge_failed = True
+        commit_on_branch(app.task_env, research.id, name="docs3.txt")
         assert sorted(app._unmerged_completed_ids()) == sorted([task.id, research.id])
         await pilot.pause()
 
@@ -518,3 +560,102 @@ async def test_reminder_toast_not_softened_after_hook_merge_failure(
         await pilot.pause()
     assert any(f"drcode/{task.id}" in text for text in event_texts(task))
     assert any(title == "Unmerged work" for title, _ in toasts)
+
+
+# -- self-healing audit: the flag is stamped by the live pipeline, but a
+# long-lived session on older code (or a crash mid-stamp) never stamps it —
+# the tracking must not take the flag's word for a successful merge ----------
+
+
+async def test_startup_scan_self_heals_unstamped_hook_merge(
+    isolated: Path, configured_env: None
+) -> None:
+    """Version-skew reproduction (#8322696b): a process without the
+    stamping code finalized the task — only the FAILED event exists,
+    `hook_merge_failed` stayed False and the counter stayed hidden. The
+    startup scan audits the branch past the grace period, back-stamps
+    the flag (persisted, so `_remind_unmerged_work` sees it too) and
+    counts the task."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix the bug", "fix the bug")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.completed_at = datetime.now(UTC) - timedelta(minutes=10)
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    commit_on_branch(env, task.id)
+    _workflow_file(isolated, "def on_accepted(task):\n    return None\n")
+
+    app = DrCodeApp(isolated)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: any(title == "Unmerged work" for title, _ in toasts),
+            pilot,
+            what="self-healed unmerged-work toast",
+        )
+    unmerged = [msg for title, msg in toasts if title == "Unmerged work"]
+    assert len(unmerged) == 1
+    assert f"drcode/{task.id}" in unmerged[0]
+    reloaded = TaskManager(isolated).get(task.id)
+    assert reloaded.hook_merge_failed
+
+
+async def test_hook_merge_audit_respects_grace(app_env: DrCodeApp) -> None:
+    """A task finalized moments ago may still have its hook-merge in
+    flight — within the grace period the hook is trusted (no count, no
+    back-stamp); once the grace passes, an unmerged branch counts and is
+    back-stamped."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    task.completed_at = datetime.now(UTC)
+    app.manager.storage.save(task)
+    commit_on_branch(app.task_env, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._unmerged_completed_ids() == []
+        assert not task.hook_merge_failed
+        task.completed_at = datetime.now(UTC) - timedelta(minutes=10)
+        app.manager.storage.save(task)
+        assert app._unmerged_completed_ids() == [task.id]
+        assert task.hook_merge_failed
+        reloaded = TaskManager(app.project_root).get(task.id)
+        assert reloaded.hook_merge_failed
+        await pilot.pause()
+
+
+async def test_stale_hook_merge_failed_cleared_after_manual_merge(
+    app_env: DrCodeApp,
+) -> None:
+    """A manual `git merge drcode/<id>` merges the branch — the stale
+    `hook_merge_failed` flag is dropped instead of surviving forever
+    (the dynamic check hides the task either way, but the flag would
+    leak into toasts/reminders)."""
+    app = app_env
+    _workflow_file(app.project_root, "def on_accepted(task):\n    return None\n")
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    task.hook_merge_failed = True
+    app.manager.storage.save(task)
+    commit_on_branch(app.task_env, task.id)
+    _git(
+        app.project_root,
+        "merge",
+        "-q",
+        "--no-ff",
+        branch_for(task.id),
+        "-m",
+        "manual merge",
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._unmerged_completed_ids() == []
+        assert not task.hook_merge_failed
+        reloaded = TaskManager(app.project_root).get(task.id)
+        assert not reloaded.hook_merge_failed
+        await pilot.pause()

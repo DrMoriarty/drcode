@@ -60,18 +60,16 @@ a = Analysis(
         # does not bundle *.dist-info by default, so copy it in explicitly.
         *copy_metadata("genai_prices"),
         *copy_metadata("pydantic_ai_slim"),
-        # Voice extra (drcode.voice → sounddevice): the macOS/Windows
-        # wheels ship the PortAudio binary library inside the top-level
-        # `_sounddevice_data` package — without collecting it the frozen
-        # app imports sounddevice but fails at the first actual device
-        # call with "OSError: PortAudio library not found". (The Linux
-        # wheel is pure-Python; its PortAudio comes via `binaries`
-        # above.) The voice extra must be installed into the build venv
-        # (build-binary.sh / the CI workflow do `uv sync --extra voice`).
+        # sounddevice (drcode.voice, core dependency): the wheel ships the
+        # PortAudio binary library inside `_sounddevice_data` — without
+        # collecting it the frozen app imports sounddevice but fails at
+        # the first actual device call with "OSError: PortAudio library
+        # not found". It is a core dependency, so a plain `uv sync` puts
+        # it into the build venv.
         *collect_data_files("sounddevice"),
     ],
     # anyio imports its backend dynamically — PyInstaller can't see it
-    # from static analysis alone; sounddevice is the optional voice extra
+    # from static analysis alone; sounddevice is a core dependency
     # (imported lazily by drcode.voice; numpy-free via raw streams).
     hiddenimports=["anyio._backends._asyncio", "sounddevice"],
     hookspath=[],

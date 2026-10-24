@@ -11,18 +11,19 @@ dependencies = [
     "pydantic-ai>=2.56.0",
     "pydantic-settings>=2.16.0",
     "textual>=8.2.8",
+    # Voice I/O (push-to-talk dictation + TTS announcements): sounddevice
+    # needs the PortAudio library (bundled in its wheels; on Linux install
+    # libportaudio2). numpy-free on purpose — the PCM16 buffers are handled
+    # with the stdlib array module via sounddevice's raw streams. The
+    # import is still guarded lazily in voice.py (a missing system
+    # PortAudio library must degrade to a toast, not a crash).
+    "sounddevice>=0.5",
 ]
 
 [project.optional-dependencies]
-# Voice I/O (push-to-talk dictation + TTS announcements): sounddevice
-# needs the PortAudio library (bundled in its wheels; on Linux install
-# libportaudio2). numpy-free on purpose — the PCM16 buffers are handled
-# with the stdlib array module via sounddevice's raw streams. Without the
-# extra the app works fine — the voice features are simply unavailable
-# and the hotkey explains what to install.
-voice = [
-    "sounddevice>=0.5",
-]
+# Historic no-op extra: sounddevice is a core dependency now; `--extra
+# voice` is kept only so older install instructions keep working.
+voice = []
 
 [project.scripts]
 drcode = "drcode:main"

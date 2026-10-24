@@ -23,16 +23,12 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
-# The voice extra goes into the bundle too: sounddevice (PortAudio). Its
-# wheel carries the platform libportaudio binary inside _sounddevice_data
-# on macOS/Windows only — there is no manylinux wheel — so on Linux the
-# matching library is built from source into build/portaudio/ beforehand
-# (see fetch-portaudio.sh) for drcode.spec to bundle next to the
-# executable. The TUI degrades gracefully when the extra is missing, but a
-# voice-capable binary needs it.
-
-uv sync --group build --extra voice
-bash scripts/fetch-portaudio.sh
+# sounddevice (PortAudio) is a core dependency, so a plain `uv sync` puts
+# it into the build venv; its wheel carries the platform libportaudio
+# binary inside _sounddevice_data, which drcode.spec collects into the app
+# (numpy-free: the voice PCM path runs on stdlib array via sounddevice's
+# raw streams).
+uv sync --group build
 .venv/bin/pyinstaller --noconfirm --clean drcode.spec
 
 mkdir -p dist

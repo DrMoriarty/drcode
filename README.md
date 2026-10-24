@@ -36,13 +36,9 @@ Uninstall: `uv tool uninstall drcode`.
 
 The TUI operates on the **current directory** (`Path.cwd()`).
 
-Voice I/O (push-to-talk dictation and spoken announcements, see below) needs
-the optional `voice` extra — `uv tool install '.[voice]'` / `pipx install '.[voice]'` /
-`pip install 'drcode[voice]'`, or `uv sync --extra voice` from source. The
-`sounddevice` wheels bundle the PortAudio library on macOS and Windows; on
-Linux install the system `libportaudio2` (the standalone binary bundles its
-own PortAudio on every platform). Without the extra the app works fine — the
-voice features are simply unavailable and the hotkey explains what to install.
+Voice I/O (push-to-talk dictation and spoken announcements, see below) is
+built in — the `sounddevice` dependency ships with the package; its wheels
+bundle PortAudio (on Linux install `libportaudio2`).
 
 ## Standalone binary
 
@@ -193,7 +189,7 @@ Delivery is fire-and-forget and can never stall the UI or an agent run: it happe
 
 ## Voice I/O
 
-Optional speech features over an OpenAI-compatible audio API (`POST /audio/transcriptions` for ASR, `POST /audio/speech` for TTS), configured per project via Settings → **"Voice: …"**:
+Speech features over an OpenAI-compatible audio API (`POST /audio/transcriptions` for ASR, `POST /audio/speech` for TTS), configured per project via Settings → **"Voice: …"** (the `sounddevice` audio backend ships with the package; off by default — everything empty = the features are off):
 
 - **Push-to-talk dictation** — `ctrl+b` in a chat input or the new-task form starts the microphone; a second press uploads the recording and inserts the recognized text at the cursor (you edit before sending), `escape` discards it. Everything audio/network runs in worker threads, so the UI never freezes; any failure (no config, no microphone, network) is a readable toast.
 - **TTS announcements** — the same events that drive push notifications can be spoken aloud (per-event checkboxes in the dialog: task completed, tester failed, queue became empty). Phrases are synthesized and played one at a time by a background worker with a bounded queue, so a burst of events never stacks up minutes of speech; user-caused events (typing, pressing Done) are never voiced.

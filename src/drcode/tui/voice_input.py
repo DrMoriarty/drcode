@@ -32,6 +32,7 @@ from textual.widgets import TextArea
 from .. import voice
 from ..voice import (
     SOUNDDEVICE_AVAILABLE,
+    VOICE_UNAVAILABLE_HINT,
     MicrophoneRecorder,
     VoiceClient,
     VoiceError,
@@ -142,7 +143,7 @@ class VoiceInputController:
                 f" ({voice._SOUNDDEVICE_ERROR})" if voice._SOUNDDEVICE_ERROR else ""
             )
             self._notify(
-                f"sounddevice is not available{reason} — {availability_hint()}",
+                f"sounddevice is not available{reason} — {VOICE_UNAVAILABLE_HINT}",
                 error=True,
             )
             return

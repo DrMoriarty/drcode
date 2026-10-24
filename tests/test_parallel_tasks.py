@@ -9,7 +9,11 @@ dependency is completed AND merged), the ESC semantics matrix
 viewed task's run), the worktree activation race (serialized
 ensure_root), the settings gating (parallel > 1 without isolation
 behaves as 1, with a warning) and the startup recovery (stale ACTIVE
-tasks demoted, slots refilled).
+tasks demoted, slots refilled). The narrowed promotion gate (variant A)
+is covered too: with parallel slots the queue keeps flowing while the
+tester is busy or a TESTING task waits out its retry backoff, while a
+single-slot pipeline and a ready-to-test task keep the absolute testing
+priority.
 """
 
 from __future__ import annotations
@@ -527,3 +531,150 @@ async def test_watchdog_nudges_only_the_stalled_run(
         assert not b.unfinished
         release.set()
         await wait_until(lambda: not app._agent_runs, pilot, what="runs finished")
+
+
+# -- promotion while the tester is busy ------------------------------------------------
+#
+# Variant A of the "testing has absolute priority" rule: with parallel
+# slots, development is held back only while the tester is FREE and a
+# TESTING task is ready to be tested right now. A tester run in flight
+# (or a TESTING task waiting for the busy tester's slot / its retry
+# backoff) does not stop free development slots from being filled.
+
+
+def _to_testing(app: DrCodeApp, task: Task) -> None:
+    """Move `task` to TESTING directly (as mark_done would after a
+    development run) without touching the pipeline."""
+    task.status = TaskStatus.TESTING
+    app.manager.storage.save(task)
+
+
+async def test_queued_task_promoted_while_tester_busy(parallel_app: DrCodeApp) -> None:
+    """A in TESTING under a running tester, B waits for the tester's slot:
+    the free development slot is filled from the queue instead of idling."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        b = app.manager.create("two", "do b")
+        c = app.manager.create("three", "do c")
+        _to_testing(app, a)
+        _to_testing(app, b)
+        app.tester_running = True  # the tester round for a is in flight
+        app._advance()
+        await pilot.pause()
+        assert c.status is TaskStatus.ACTIVE
+        assert a.status is TaskStatus.TESTING
+        assert b.status is TaskStatus.TESTING
+        assert app.tester_running
+
+
+async def test_promoted_while_testing_task_in_retry_backoff(
+    parallel_app: DrCodeApp,
+) -> None:
+    """A TESTING task whose tester round failed sits in its retry backoff
+    window with the tester idle: the queue still flows into free slots."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        c = app.manager.create("three", "do c")
+        _to_testing(app, a)
+        # The tester round for a failed recently: retry scheduled far out.
+        app._tester_retry_at[a.id] = time.monotonic() + 3600
+        app._advance()
+        await pilot.pause()
+        assert c.status is TaskStatus.ACTIVE
+        assert a.status is TaskStatus.TESTING
+        assert not app.tester_running, "the tester must not start for a backoff task"
+
+
+async def test_ready_testing_still_blocks_promotion(parallel_app: DrCodeApp) -> None:
+    """The tester is free and a TESTING task is ready to be tested right
+    now: the test is dispatched first and the queue is NOT promoted (the
+    old semantics for the case the tester can actually start)."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        c = app.manager.create("three", "do c")
+        _to_testing(app, a)
+        app._advance()
+        # Synchronous assertions: the tester flag is set before the worker
+        # dispatch, and the promotion tail was never reached.
+        assert app.tester_running
+        assert c.status is TaskStatus.QUEUED
+        await pilot.pause()
+
+
+async def test_parallel_one_keeps_absolute_testing_priority(
+    project_root: Path,
+) -> None:
+    """parallel_limit == 1: the historical rule is untouched — no
+    development starts while any task is TESTING, whether the tester is
+    busy or the only TESTING task waits out its retry backoff."""
+    app = DrCodeApp(project_root)
+    assert app.parallel_limit == 1
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        c = app.manager.create("three", "do c")
+        _to_testing(app, a)
+        # Tester busy (a round in flight).
+        app.tester_running = True
+        app._advance()
+        await pilot.pause()
+        assert c.status is TaskStatus.QUEUED
+        # Tester idle, but the TESTING task is within its retry backoff.
+        app.tester_running = False
+        app._tester_retry_at[a.id] = time.monotonic() + 3600
+        app._advance()
+        await pilot.pause()
+        assert c.status is TaskStatus.QUEUED
+
+
+async def test_dependency_gate_promotes_while_tester_busy(
+    parallel_app: DrCodeApp,
+) -> None:
+    """The dependency gate with a busy tester: an UNBLOCKED dependent is
+    promoted into the free slot (via the unblock tick, which re-fires
+    _advance() — a busy tester no longer suppresses it)."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        dep = app.manager.create("dependency", "do s")
+        x = app.manager.create("x", "do x")
+        app.manager.set_dependencies(x.id, [dep.id])
+        _to_testing(app, a)
+        app.tester_running = True
+        _complete(app, dep)  # branch holds no commits: mergedness satisfied
+        app._poll_dependency_unblock()
+        await wait_until(
+            lambda: x.status is TaskStatus.ACTIVE,
+            pilot,
+            what="dependent promoted while the tester is busy",
+        )
+
+
+async def test_dependency_gate_still_blocks_while_tester_busy(
+    parallel_app: DrCodeApp,
+) -> None:
+    """The dependency gate with a busy tester: an unsatisfied dependency
+    keeps its dependent out of the free slot."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "do a")
+        dep = app.manager.create("dependency", "do s")
+        x = app.manager.create("x", "do x")
+        app.manager.set_dependencies(x.id, [dep.id])
+        _to_testing(app, a)
+        app.tester_running = True
+        app._advance()
+        await wait_until(
+            lambda: app._dep_gate.get(x.id, {}).get(dep.id) == "not completed",
+            pilot,
+            what="dependency gate records the unsatisfied dependency",
+        )
+        assert x.status is TaskStatus.QUEUED

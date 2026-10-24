@@ -62,6 +62,10 @@ The `task` argument is one JSON object:
      "task": {"id", "title", "kind", "github_issue"},
      "git":  {"branch": "<current branch or null>", "dirty": <bool>},
      "worktree": {"path": "...", "branch": "drcode/<task-id>"},
+                   # ^ "path" is absent when the worktree directory is
+                   # already removed (worktree_removal: on_completion) —
+                   # the branch (with the task's work) is all that is
+                   # left, and it is all the accept-merge needs.
      "project": {"path": "...", "base_branch": "<branch>"}}
 
 (`project` is present only for `on_research_accepted` — the base branch
@@ -564,9 +568,11 @@ class WorkflowHooks:
         ``cwd`` (the pipeline passes the task's worktree root when
         per-task worktree isolation is on) is where the hook subprocess
         runs and what `git.branch`/`git.dirty` in the payload describe.
-        ``worktree`` ({"path", "branch"}, when the task is isolated) is
-        copied into the payload as the `worktree` key so the script can
-        address the task's tree/branch explicitly. ``extra`` (optional)
+        ``worktree`` ({"path", "branch"}, when the task is isolated;
+        branch-only once the directory is removed under
+        `worktree_removal: on_completion`) is copied into the payload as
+        the `worktree` key so the script can address the task's
+        tree/branch explicitly. ``extra`` (optional)
         adds caller-provided top-level payload keys on top (e.g. the
         `project` entry of `on_research_accepted`).
 

@@ -21,6 +21,7 @@ from drcode.settings import (
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
+    WorktreeRemoval,
 )
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
@@ -30,6 +31,7 @@ from tests.network_mocks import (
     ScriptedState,
     event_texts,
     text_response,
+    tool_response,
     wait_until,
 )
 
@@ -150,6 +152,25 @@ def on_research_accepted(task):
     raise RuntimeError("merge exploded")
 """
 
+# worktree_removal: on_completion: the worktree DIRECTORY is already gone
+# when the hook runs (removed at the COMPLETED transition) — the payload
+# carries the branch only and the hook merges it from the project root.
+ON_COMPLETION_MERGE_HOOK = """
+import json
+import subprocess
+
+def on_research_accepted(task):
+    with open("payload.json", "w") as f:
+        json.dump(task, f)
+    p = task["project"]
+    subprocess.run(
+        ["git", "-C", p["path"], "merge", task["worktree"]["branch"], "-m", "merge docs"],
+        check=True,
+        capture_output=True,
+    )
+    return {"text": "docs merged"}
+"""
+
 
 # -- hook discovery -------------------------------------------------------------------
 
@@ -261,12 +282,63 @@ async def test_hook_can_merge_docs_branch_into_main_checkout(
         # call returns — wait for it too (a bare pause raced the
         # continuation and lost the event on app teardown).
         await wait_until(
-            lambda: any(
-                t.endswith("docs merged") for t in research_hook_events(task)
-            ),
+            lambda: any(t.endswith("docs merged") for t in research_hook_events(task)),
             pilot,
             what="docs-merged hook event",
         )
+    assert any(t.endswith("docs merged") for t in research_hook_events(task))
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    assert env.unmerged_commits(task.id) == 0
+
+
+async def test_hook_merges_after_completion_removal(
+    isolated: Path, configured_env: None, scripted: ScriptedState
+) -> None:
+    """worktree_removal: on_completion — the worktree directory is
+    removed at the COMPLETED transition, BEFORE the accept hook runs.
+    The payload must still carry the `worktree` entry (branch-only, no
+    `path` — the branch with the work survives), so the hook can still
+    merge the docs branch from the project root instead of silently
+    no-oping."""
+    ProjectSettingsStore(isolated).save(
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_removal=WorktreeRemoval.ON_COMPLETION,
+        )
+    )
+    make_script(isolated, ON_COMPLETION_MERGE_HOOK)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task = app.manager.create(
+            "Write docs", "write the docs", kind=TaskKind.RESEARCH
+        )
+        # The agent writes the docs into its worktree; the completion
+        # snapshot commits them onto the branch (RULE 2 keeps the branch
+        # through the removal), then the hook merges it.
+        scripted.steps = [
+            tool_response("write_file", {"path": "docs.md", "content": "docs"}),
+            text_response("docs done"),
+        ]
+        app._advance()
+        await wait_until(
+            lambda: (isolated / "docs.md").exists(),
+            pilot,
+            what="docs.md merged into the main checkout",
+        )
+        await wait_until(
+            lambda: any(t.endswith("docs merged") for t in research_hook_events(task)),
+            pilot,
+            what="docs-merged hook event",
+        )
+    # The worktree directory is really gone (removed at completion) —
+    # the hook ran from the project root (payload.json landed there).
+    assert not (isolated / ".drcode" / "worktrees" / task.id).exists()
+    payload = json.loads((isolated / "payload.json").read_text())
+    assert payload["worktree"] == {"branch": f"drcode/{task.id}"}
+    assert payload["project"]["path"] == str(isolated)
     assert any(t.endswith("docs merged") for t in research_hook_events(task))
     env = TaskEnvironment(
         isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)

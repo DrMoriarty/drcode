@@ -2714,11 +2714,15 @@ class PipelineLayer(DrCodeState):
         """Where a workflow hook for `task` runs: with per-task worktree
         isolation on — inside the task's worktree (the payload describes
         that tree in `git.*` and carries the `worktree` path/branch entry);
-        without it — the project directory as before."""
+        without it — the project directory as before. A branch-only
+        `worktree` entry (the directory is already removed under
+        `worktree_removal: on_completion`, the branch with the task's
+        work survives) also runs the hook from the project root — the
+        accept-merge hooks only need `worktree.branch`."""
         info = self.task_env.worktree_info(task.id)
-        if info is not None:
+        if info is not None and "path" in info:
             return Path(info["path"]), info
-        return self.project_root, None
+        return self.project_root, info
 
     async def _run_task_start_hook(self, task: Task) -> str | None:
         """`on_task_start` before the first activation: branch checkout and

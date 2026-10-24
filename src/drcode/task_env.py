@@ -234,13 +234,26 @@ class TaskEnvironment:
 
     def worktree_info(self, task_id: str) -> dict[str, str] | None:
         """The `worktree` entry for a workflow-hook payload, or None when
-        the task is not isolated right now."""
+        the task is not isolated right now.
+
+        Normally the entry carries both `path` and `branch`. When the
+        worktree DIRECTORY is already gone but the branch survives —
+        `worktree_removal: on_completion` removes it at the COMPLETED
+        transition, while the accept hooks (`on_accepted` /
+        `on_research_accepted`) run right AFTER it and the branch is
+        kept whenever it holds unmerged commits (RULE 2) — the entry
+        degrades to `branch` only: the accept-merge hook needs nothing
+        but the branch name (it merges into the main checkout anyway).
+        A deleted branch (nothing unmerged to merge) is None."""
         if not self.active:
             return None
         wt = self.worktree_path(task_id)
-        if not wt.is_dir():
+        if wt.is_dir():
+            return {"path": str(wt), "branch": self.branch(task_id)}
+        branch = self.branch(task_id)
+        if not self._branch_exists(branch):
             return None
-        return {"path": str(wt), "branch": self.branch(task_id)}
+        return {"branch": branch}
 
     # -- git plumbing (sync subprocesses; callers wrap in to_thread) ----------
 

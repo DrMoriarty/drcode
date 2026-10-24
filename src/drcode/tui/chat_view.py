@@ -389,26 +389,36 @@ class ChatViewLayer(DrCodeState):
         prune) are invisible to this: they never match a desired row and
         are skipped as placement anchors.
         """
+        # Mirror of the tracked rows' DOM order, updated after every
+        # mount/move below. Each row is placed at its absolute desired
+        # position: if live[:i] is already correct, the row now occupying
+        # position i is exactly what must follow the row being placed —
+        # anchoring against anything else let a moved row jump over a
+        # freshly mounted header (two tasks promoted at once could land
+        # ABOVE their "ACTIVE (2)" header).
         live = [child for child in sidebar._nodes if child in tracked]
-        next_live = 0
         for i, item in enumerate(desired):
-            if next_live < len(live) and live[next_live] is item:
-                next_live += 1
+            if i < len(live) and live[i] is item:
                 continue
-            following = live[next_live:]
-            anchor = next(
-                (later for later in desired[i + 1 :] if later in following), None
-            )
-            if item not in tracked:
-                # A row created by THIS refresh (never mounted yet).
-                if anchor is not None:
-                    sidebar.mount(item, before=anchor)
+            following = live[i] if i < len(live) else None
+            if item in live:
+                live.remove(item)
+            if following is not None:
+                if item in tracked:
+                    sidebar.move_child(item, before=following)
+                else:
+                    # A row created by THIS refresh (never mounted yet).
+                    sidebar.mount(item, before=following)
+                live.insert(i, item)
+            else:
+                if item in tracked:
+                    if live:
+                        sidebar.move_child(item, after=live[-1])
+                    # else: no tracked row left to anchor against — its
+                    # position among the pending-prune rows is irrelevant.
                 else:
                     sidebar.mount(item)
-            elif anchor is not None:
-                sidebar.move_child(item, before=anchor)
-            # else: every kept row is already before it and everything
-            # after it will be pruned — its position is already correct.
+                live.append(item)
 
     def refresh_sidebar(self) -> None:
         # Called from worker finally-blocks too — it can fire while the

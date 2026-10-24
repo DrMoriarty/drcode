@@ -134,6 +134,35 @@ async def test_new_task_appends_row_old_rows_reused(app: DrCodeApp, two_tasks) -
         assert row_of(app, b.id) is row_b
 
 
+async def test_promoted_tasks_land_below_their_section_header(
+    app: DrCodeApp, two_tasks
+) -> None:
+    """Two tasks promoted at once must appear UNDER the "ACTIVE (n)" header.
+
+    The QUEUE section displays newest-first (b above a); ACTIVE keeps the
+    created order (a above b). The reconcile used to anchor the freshly
+    mounted header and the reordered rows against a stale DOM snapshot,
+    which left the header BELOW both task rows."""
+    a, b = two_tasks
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        assert [r.task_id for r in task_rows(app)] == [b.id, a.id]
+
+        for t in (a, b):
+            t.status = TaskStatus.ACTIVE
+            t.touch()
+            app.manager.storage.save(t)
+        app.refresh_sidebar()
+        await pilot.pause()
+
+        children = [
+            w.section if w.task_id is None else w.task_id
+            for w in app.sidebar.children
+            if isinstance(w, TaskItem)
+        ]
+        assert children == ["ACTIVE", a.id, b.id]
+
+
 async def test_removed_task_drops_its_row(app: DrCodeApp, two_tasks) -> None:
     a, b = two_tasks
     async with app.run_test() as pilot:

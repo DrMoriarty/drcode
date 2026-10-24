@@ -288,6 +288,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     def __init__(self, project_root: Path) -> None:
         super().__init__()
+        # Resolve once: a relative or symlinked root would leak into storage,
+        # git and the tool sandbox (tools compare resolved paths against it).
+        project_root = Path(project_root).resolve()
         self.project_root = project_root
         # One-time migrations BEFORE the config is built: legacy flat model
         # keys in the user-level / project drcode.json move into the user

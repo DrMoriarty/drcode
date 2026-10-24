@@ -2797,6 +2797,9 @@ class PipelineLayer(DrCodeState):
         workflow = self.workflow
         if workflow is None or not workflow.has("on_tester_passed"):
             return
+        # See _run_accepted_hook: the background completion removal must
+        # have finished before a hook reads the worktree state.
+        await asyncio.to_thread(self.task_env.wait_removal, task.id)
         if task.kind is TaskKind.RESEARCH:
             return  # research tasks never go through testing/finalization
         cwd, wt = self._hook_env(task)
@@ -2851,6 +2854,10 @@ class PipelineLayer(DrCodeState):
         workflow = self.workflow
         if workflow is None or not workflow.has("on_accepted"):
             return
+        # The completion removal (worktree_removal: on_completion) runs in
+        # a background thread — the hook must observe the post-removal
+        # state (branch-only worktree payload, directory really gone).
+        await asyncio.to_thread(self.task_env.wait_removal, task.id)
         async with self._accept_hook_lock:
             cwd, wt = self._hook_env(task)
             result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
@@ -2883,6 +2890,10 @@ class PipelineLayer(DrCodeState):
         workflow = self.workflow
         if workflow is None or not workflow.has("on_research_accepted"):
             return
+        # The completion removal (worktree_removal: on_completion) runs in
+        # a background thread — the hook must observe the post-removal
+        # state (branch-only worktree payload, directory really gone).
+        await asyncio.to_thread(self.task_env.wait_removal, task.id)
         async with self._accept_hook_lock:
             project: dict[str, Any] = {"path": str(self.project_root)}
             if self.task_env.available:
@@ -2963,6 +2974,10 @@ class PipelineLayer(DrCodeState):
         env = self.task_env
         if not env.active:
             return  # no isolation — nothing ever lives on a task branch
+        # The background completion removal must have finished before the
+        # mergedness of the branch is judged (and before a hook payload
+        # would be built from it — see _run_accepted_hook).
+        await asyncio.to_thread(env.wait_removal, task.id)
         unmerged = await asyncio.to_thread(env.unmerged_commits, task.id)
         if unmerged <= 0:
             return  # merged (or never committed) — nothing to remind about

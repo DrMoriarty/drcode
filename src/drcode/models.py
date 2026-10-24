@@ -138,6 +138,13 @@ class Task(BaseModel):
     # the activation → completion span from this (see the expanded header);
     # a re-queued completed task gets a fresh stamp on its next activation.
     activated_at: datetime | None = None
+    # When the task last ENTERED its current status (stamped by
+    # TaskManager.fire_status_change, the single funnel for every status
+    # transition; None for tasks created before the field existed). Drives
+    # the per-status duration counter in the task-statusbar header — every
+    # transition (including back to QUEUED) re-stamps it, so the counter
+    # always measures the current continuous stay, never a cumulative one.
+    status_changed_at: datetime | None = None
     # True when the last agent attempt was interrupted (abort, error) and
     # may have left work undone. Replaces the old "re-queue the consumed
     # prompt" retry marker: the prompt stays in the transcript at its

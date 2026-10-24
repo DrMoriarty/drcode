@@ -164,6 +164,13 @@ class TaskManager:
         AFTER the new status has been assigned to `task`."""
         if task.status is old:
             return
+        # Stamp the moment of entry into the new status BEFORE notifying the
+        # listeners: this is the single funnel for every transition (both
+        # _save_changed and direct pipeline mutations call it), so the
+        # statusbar's duration counter always measures the current stay.
+        # Persisting is the caller's job (_save_changed / the pipeline's own
+        # save right after).
+        task.status_changed_at = _now()
         for listener in list(self._status_listeners):
             try:
                 listener(task, old, task.status, origin)
@@ -174,9 +181,14 @@ class TaskManager:
                 )
 
     def _save_changed(self, task: Task, old: TaskStatus, origin: str) -> None:
-        """Persist a status mutation and notify the observers."""
-        self.storage.save(task)
+        """Persist a status mutation and notify the observers. fire first:
+        it stamps `status_changed_at`, and the save right after must land
+        that stamp on disk (an app death right after the transition must
+        not reset the statusbar's duration counter). fire_status_change
+        never raises (listeners are individually guarded), so the save
+        always runs."""
         self.fire_status_change(task, old, origin)
+        self.storage.save(task)
 
     # -- queries ------------------------------------------------------------
 

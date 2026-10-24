@@ -71,6 +71,7 @@ from ..models import (
     TaskKind,
     TaskStatus,
     VerificationStatus,
+    _now,
 )
 from ..version import APP_VERSION
 from .ctx_dialog import ContextDialog
@@ -835,7 +836,10 @@ class ChatViewLayer(DrCodeState):
     def _fmt_age(seconds: int) -> str:
         if seconds < 60:
             return f"{seconds}s"
-        return f"{seconds // 60}m{seconds % 60:02d}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m{seconds % 60:02d}s"
+        # Hours and up: drop the seconds — nobody reads them there.
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
     def _poll_activity(self) -> None:
         """Every second, show in the sidebar whether the run(s) make
@@ -849,6 +853,10 @@ class ChatViewLayer(DrCodeState):
             # the header is collapsed).
             self._collect_session_stats()
             self._render_header_tall()
+            # Live duration counter in the task-statusbar: only ticks when
+            # the viewed task is ACTIVE/TESTING (otherwise the header has
+            # no timer and the refresh is a no-op re-render anyway).
+            self.refresh_task_status()
             # Touch the widget so the teardown race (the 1s timer ticking
             # while the app is being dismantled) raises NoMatches here.
             _ = self.activity_status
@@ -1744,6 +1752,17 @@ class ChatViewLayer(DrCodeState):
             f"[dim]{created}[/]",
             status,
         ]
+        # Duration counter: only for the statuses where the time spent is
+        # meaningful and live — the developer working (ACTIVE) and the
+        # tester verifying (TESTING). Stamped at every status transition
+        # (fire_status_change), so this measures the current continuous
+        # stay, never a cumulative one; survives restarts via the stamp.
+        if (
+            task.status in (TaskStatus.ACTIVE, TaskStatus.TESTING)
+            and task.status_changed_at is not None
+        ):
+            seconds = max(0, int((_now() - task.status_changed_at).total_seconds()))
+            parts.append(f"[dim]⏱ {self._fmt_age(seconds)}[/]")
         deps_part = self._dependency_status_part(task)
         if deps_part:
             parts.append(deps_part)

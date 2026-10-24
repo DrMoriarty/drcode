@@ -1163,3 +1163,60 @@ def test_requeued_dependency_reblocks(manager: TaskManager) -> None:
     assert manager.blocking_dependencies(b.id) == [a.id]
     assert manager.promote_next() is a
     assert b.status is TaskStatus.QUEUED
+
+
+# -- status_changed_at stamping -------------------------------------------------
+
+
+def test_status_changed_at_stamped_on_active_and_testing(
+    manager: TaskManager,
+) -> None:
+    task = manager.create("t", "input")
+    assert task.status_changed_at is None  # created straight into QUEUED
+    manager.promote_next()
+    assert task.status is TaskStatus.ACTIVE
+    active_stamp = task.status_changed_at
+    assert active_stamp is not None
+    manager.mark_done(task.id)
+    assert task.status is TaskStatus.TESTING
+    assert task.status_changed_at is not None
+    assert task.status_changed_at >= active_stamp
+
+
+def test_status_changed_at_restamped_on_every_transition(
+    manager: TaskManager,
+) -> None:
+    """The counter measures the CURRENT stay, not a cumulative one: every
+    transition — including into non-counted statuses like QUEUED or
+    COMPLETED — overwrites the stamp."""
+    task = manager.create("t", "input")
+    manager.promote_next()
+    manager.mark_done(task.id)
+    testing_stamp = task.status_changed_at
+    assert testing_stamp is not None
+    manager.set_verification(task.id, True)
+    assert task.status is TaskStatus.COMPLETED
+    assert task.status_changed_at is not None
+    assert task.status_changed_at >= testing_stamp
+    completed_stamp = task.status_changed_at
+    # Sending input to a COMPLETED task re-queues it: a fresh stamp again.
+    manager.send(task.id, "one more round")
+    assert task.status is TaskStatus.QUEUED
+    assert task.status_changed_at is not None
+    assert task.status_changed_at >= completed_stamp
+
+
+def test_status_changed_at_survives_round_trip(project_root: Path) -> None:
+    """The stamp is persisted with the transition that set it: a task
+    loaded from disk (e.g. stuck in TESTING after a restart) keeps its
+    old stamp, so the statusbar counter continues from it."""
+    manager = TaskManager(project_root)
+    task = manager.create("t", "input")
+    manager.promote_next()
+    manager.mark_done(task.id)
+    stamp = task.status_changed_at
+    assert stamp is not None
+    reloaded = TaskManager(project_root)
+    loaded = reloaded.get(task.id)
+    assert loaded.status is TaskStatus.TESTING  # not demoted on startup
+    assert loaded.status_changed_at == stamp

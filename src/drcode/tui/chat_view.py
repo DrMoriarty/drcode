@@ -1028,6 +1028,13 @@ class ChatViewLayer(DrCodeState):
         blocks its own task — and through the pipeline gate, the whole
         backlog — so this keeps an overnight run going without human
         intervention."""
+        if self._exit or not self.is_running:
+            # Teardown race: the 1s interval can tick while the app is
+            # being dismantled. With live runs still registered the tick
+            # reaches _show_event → _write_history_line → chat_log on an
+            # already-parsed-away DOM — NoMatches. Skip the tick (same
+            # entry guard as _advance, see 32abee3).
+            return
         limit = self.settings.stall_nudge.minutes
         if limit is None:
             return
@@ -1553,6 +1560,13 @@ class ChatViewLayer(DrCodeState):
                 # this happened implicitly because every mount scrolled to
                 # the end).
                 self.chat_log.scroll_end(animate=False)
+        except NoMatches:
+            # Teardown race: the drain chain (call_after_refresh / the 0.1s
+            # timer fallback) can fire into an already-parsed-away DOM —
+            # nothing left to render into. Drop the batch (same pattern as
+            # _poll_activity's NoMatches catch).
+            self._chat_batching = False
+            self._chat_batch.clear()
         except Exception:
             # Never leave batching stuck on: later live writes would be
             # silently swallowed.

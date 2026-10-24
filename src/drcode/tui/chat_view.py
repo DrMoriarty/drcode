@@ -1762,24 +1762,27 @@ class ChatViewLayer(DrCodeState):
             TaskStatus.COMPLETED: "green",
             TaskStatus.AWAITING_CLARIFICATION: "yellow",
         }
-        status = f"[{status_colors[task.status]}]{task.status.value}[/]"
+        status_color = status_colors[task.status]
+        status = f"[{status_color}]{task.status.value}[/]"
+        # Duration counter: only for the statuses where the time spent is
+        # meaningful and live — the developer working (ACTIVE) and the
+        # tester verifying (TESTING). Stamped at every status transition
+        # (fire_status_change), so this measures the current continuous
+        # stay, never a cumulative one; survives restarts via the stamp.
+        # Rendered in the status's own color, one space after the status
+        # (the other fragments stay separated by the wide join).
+        if (
+            task.status in (TaskStatus.ACTIVE, TaskStatus.TESTING)
+            and task.status_changed_at is not None
+        ):
+            seconds = max(0, int((_now() - task.status_changed_at).total_seconds()))
+            status += f" [{status_color}]⏱ {self._fmt_age(seconds)}[/]"
         parts = [
             kind,
             f"#{task.id} {escape(task.title_display)}",
             f"[dim]{created}[/]",
             status,
         ]
-        # Duration counter: only for the statuses where the time spent is
-        # meaningful and live — the developer working (ACTIVE) and the
-        # tester verifying (TESTING). Stamped at every status transition
-        # (fire_status_change), so this measures the current continuous
-        # stay, never a cumulative one; survives restarts via the stamp.
-        if (
-            task.status in (TaskStatus.ACTIVE, TaskStatus.TESTING)
-            and task.status_changed_at is not None
-        ):
-            seconds = max(0, int((_now() - task.status_changed_at).total_seconds()))
-            parts.append(f"[dim]⏱ {self._fmt_age(seconds)}[/]")
         deps_part = self._dependency_status_part(task)
         if deps_part:
             parts.append(deps_part)

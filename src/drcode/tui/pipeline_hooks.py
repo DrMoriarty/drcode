@@ -12,6 +12,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from textual import work
+
+from ..merge_engine import in_progress as merge_in_progress
 from ..models import Task, TaskKind, TaskStatus
 from ..task_env import branch_for
 from .state import DrCodeState
@@ -103,7 +106,20 @@ class PipelineHooksLayer(DrCodeState):
         An install step must run no matter which path accepted the task.
         Fail-open like `on_accepted` (an
         install step must not park the task the way the fail-closed
-        `on_review` does); its text goes to the service-event log."""
+        `on_review` does); its text goes to the service-event log.
+
+        Guard (the pipeline's own invariant — never the script's job):
+        an install hook reads "whatever lies in the checkout right now",
+        and the main checkout is a mutating shared resource whose state
+        after `on_accepted` is not guaranteed. With MERGE_HEAD set (a
+        half-done hook merge, e.g. the accept hook failed mid-conflict)
+        building the checkout would ship conflict markers — the hook is
+        SKIPPED, `task.install_pending` is stamped and the unmerged-work
+        tracking re-runs the deferred hook exactly once after the conflict
+        is resolved (see _install_rerun_candidates). The hook payload
+        additionally pins `git.commit` — the verified commit (the task
+        branch tip with isolation, the shared checkout's HEAD without) —
+        so a well-written hook never needed the cwd at all."""
         workflow = self.workflow
         if workflow is None or not workflow.has("on_tester_passed"):
             return
@@ -112,8 +128,39 @@ class PipelineHooksLayer(DrCodeState):
         await asyncio.to_thread(self.task_env.wait_removal, task.id)
         if task.kind is TaskKind.RESEARCH:
             return  # research tasks never go through testing/finalization
+        if await asyncio.to_thread(merge_in_progress, self.project_root):
+            # Half-done merge in the MAIN checkout: skip the hook, defer
+            # the install. Loud on purpose — this is the guard that keeps
+            # conflict markers out of installed artifacts.
+            branch = f"drcode/{task.id}" if self.task_env.active else None
+            where = (
+                f"merge of {branch} not resolved"
+                if branch
+                else "unresolved merge in the main checkout"
+            )
+            self._show_event(
+                task,
+                f"on_tester_passed SKIPPED: {where} — installing would "
+                "ship conflict markers; it will re-run after the conflict "
+                "is resolved.",
+                kind="workflow",
+            )
+            if not task.install_pending:
+                task.install_pending = True
+                task.touch()
+                self.manager.storage.save(task)
+            return
+        commit = await self._pinned_commit(task)
         cwd, wt = self._hook_env(task)
-        result = await workflow.call("on_tester_passed", task, cwd=cwd, worktree=wt)
+        result = await workflow.call(
+            "on_tester_passed", task, cwd=cwd, worktree=wt, commit=commit
+        )
+        # The hook actually executed (any outcome — fail-open, like the
+        # normal path): the deferral is over.
+        if task.install_pending:
+            task.install_pending = False
+            task.touch()
+            self.manager.storage.save(task)
         if not result.ok:
             self._show_event(
                 task,
@@ -124,6 +171,50 @@ class PipelineHooksLayer(DrCodeState):
         text = str(result.output.get("text") or "").strip()
         if text:
             self._show_event(task, f"on_tester_passed:\n{text}", kind="workflow")
+
+    async def _pinned_commit(self, task: Task) -> str | None:
+        """The commit SHA the PASSED verdict was stamped on, for the hook
+        payload's `git.commit`: the task branch's tip with isolation (the
+        branch survives the worktree removal — the only task state
+        guaranteed after `on_accepted`), the shared checkout's HEAD
+        without it. None outside a repository. Blocking git — off the
+        event loop."""
+        env = self.task_env
+        if env.active:
+            return await asyncio.to_thread(env.branch_tip, task.id)
+        return await asyncio.to_thread(env.head_commit)
+
+    @work(group="install-rerun")
+    async def _maybe_rerun_pending_installs(self) -> None:
+        """Run the deferred `on_tester_passed` hooks whose blocker is gone
+        (`_install_rerun_ids`, collected by _install_rerun_candidates on
+        the unmerged-tracking poll / the startup scan). The hook's own
+        MERGE_HEAD guard is re-checked on the way: if a merge went
+        half-done again, the run just re-stamps install_pending and the
+        next poll re-collects the task."""
+        if self._install_rerun_running or not self._install_rerun_ids:
+            return
+        self._install_rerun_running = True
+        ids, self._install_rerun_ids = self._install_rerun_ids, []
+        try:
+            for task_id in ids:
+                task = self.manager.get(task_id)
+                if task is None or not task.install_pending:
+                    continue
+                await self._run_tester_passed_hook(task)
+        finally:
+            self._install_rerun_running = False
+
+    async def _poll_pending_installs(self) -> None:
+        """The 10 s poll for deferred installs (the on_tester_passed
+        MERGE_HEAD guard stamped `install_pending`): collect re-runnable
+        ids off the event loop, then fire the re-run worker. A no-op
+        unless some task carries the flag (see _install_rerun_candidates —
+        no git before the first candidate). Runs with and without
+        isolation: the guard covers both, but the git-indicator poll (the
+        isolation-only consumer of the same tracking pass) does not."""
+        await asyncio.to_thread(self._unmerged_completed_ids)
+        self._maybe_rerun_pending_installs()
 
     # Hook-merge failure markers: the workflow template's hooks report a
     # failed `git merge` as free text ("merge of drcode/<id> into main

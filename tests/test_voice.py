@@ -405,8 +405,12 @@ class _FakeOutStream:
 
     BLOCK_FRAMES = 256
 
-    def __init__(self, callback: Any) -> None:
+    def __init__(
+        self, callback: Any, status: Any = None, kwargs: dict[str, Any] | None = None
+    ) -> None:
         self._callback = callback
+        self._status = status
+        self.kwargs = kwargs or {}
         self._stop_evt = threading.Event()
         self.thread: threading.Thread | None = None
         self.delivered = bytearray()  # every block the "device" received
@@ -416,7 +420,7 @@ class _FakeOutStream:
         def run() -> None:
             block = bytearray(self.BLOCK_FRAMES * 2)  # mono int16
             while not self._stop_evt.is_set():
-                self._callback(block, self.BLOCK_FRAMES, None, None)
+                self._callback(block, self.BLOCK_FRAMES, None, self._status)
                 self.delivered.extend(block)
 
         self.thread = threading.Thread(target=run, daemon=True)
@@ -437,6 +441,7 @@ def _play_wav_with_fake_device(
     samples: list[int],
     monkeypatch: pytest.MonkeyPatch,
     rate: int = 24_000,
+    status: Any = None,
 ) -> _FakeOutStream:
     """Run play_wav against a faked sounddevice module and return the fake
     stream with everything it delivered."""
@@ -450,7 +455,7 @@ def _play_wav_with_fake_device(
     class _FakeSdModule:
         @staticmethod
         def RawOutputStream(**kwargs: Any) -> _FakeOutStream:
-            stream = _FakeOutStream(kwargs["callback"])
+            stream = _FakeOutStream(kwargs["callback"], status=status, kwargs=kwargs)
             created.append(stream)
             return stream
 
@@ -517,6 +522,45 @@ def test_play_wav_done_fires_only_after_last_block_reaches_device(
     assert stream.frames_at_stop >= n + tail_frames
     played = array("h", bytes(stream.delivered))
     assert played[n - 1] == 0  # last audible sample is the faded zero
+
+
+def test_play_wav_passes_numeric_latency_and_blocksize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The GIL-starvation fix: the stream must be opened with an explicit
+    # NUMERIC latency (never the string "high", whose ~40–100 ms ring
+    # buffer drains under CPU load) and an explicit blocksize (fewer
+    # callback invocations => fewer GIL grabs). The fake module provides
+    # no query_devices, so the guarded device query degrades to the 0.3 s
+    # fallback — which is itself a valid numeric latency.
+    stream = _play_wav_with_fake_device([100] * 100, monkeypatch)
+    latency = stream.kwargs["latency"]
+    assert isinstance(latency, float)
+    assert latency == 0.3
+    assert stream.kwargs["blocksize"] == 2048
+
+
+def test_play_wav_underflow_counter_lands_in_stderr_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Every callback invoked with a truthy status (paOutputUnderflow for an
+    # output-only stream) counts as one underflow; the final stderr line
+    # reports the count together with the latency actually used.
+    stream = _play_wav_with_fake_device([100] * 1000, monkeypatch, status=1)
+    assert stream.kwargs["latency"] == 0.3
+    err = capsys.readouterr().err
+    assert "underflowed" in err
+    assert "times (latency=0.3s)" in err
+
+
+def test_play_wav_no_underflow_line_on_clean_playback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # With a clean status (None) the stderr stays free of underflow noise.
+    _play_wav_with_fake_device([100] * 100, monkeypatch)
+    assert "underflowed" not in capsys.readouterr().err
 
 
 # -- Notifier voice hooks ------------------------------------------------------------

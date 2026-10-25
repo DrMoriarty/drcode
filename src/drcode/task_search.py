@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -392,6 +393,300 @@ def _stem_hint(keywords: list[list[str]]) -> str:
     return ""
 
 
+@dataclass
+class TaskHit:
+    """One search result as structured data (the UI-facing view).
+
+    `search()` formats these into the agent's one-line strings; the TUI's
+    search dialog renders the same fields as list rows. `unmerged` is left
+    None by the matching core — checking it needs BLOCKING git calls, so
+    the caller decides when it is worth it (`annotate_unmerged`, short
+    result lists only).
+    """
+
+    task_id: str
+    title: str
+    status: str
+    kind: str
+    # Start of the INITIAL user input: the first user-prompt of the
+    # transcript, or — for a task never run (empty/no-prompt transcript) —
+    # the first queued pending_input text (TaskManager.create puts the
+    # first message exactly there).
+    first_prompt: str
+    # Snippet around the most informative keyword occurrence
+    # (_build_snippet; "" when no keyword occurrence survived flattening).
+    snippet: str
+    # Relevance: total keyword occurrences (ties broken newest-first).
+    score: int
+    # Completion date when present, else creation (YYYY-MM-DD).
+    date: str
+    # Short verification label ("passed"/"failed"), "" when unverified.
+    verification: str
+    # Error markers (the "something went wrong" combination): an
+    # interrupted attempt, a FAILED verdict, a failed workflow-hook merge,
+    # and the text of the last error-looking service event.
+    unfinished: bool
+    hook_merge_failed: bool
+    last_error_event: str
+    unmerged: bool | None = None
+
+
+def _first_prompt(data: dict[str, Any]) -> str:
+    """The beginning of the task's initial user input (see TaskHit)."""
+    prompts = _prompt_texts(data.get("messages") or [])
+    if prompts:
+        text = prompts[0]
+    else:
+        pending = _pending_texts(data.get("pending_input") or [])
+        text = pending[0] if pending else ""
+    return " ".join(text.split())
+
+
+# Substrings (lowercase) that mark a service event as error-looking. Events
+# carry no dedicated error kind — failures are logged with the default
+# "system"/"testing"/"workflow" kinds and human texts ("tester failed: …",
+# "merge FAILED: …", "testing failed — returned …"), so the marker is a
+# deliberately coarse keyword filter over the event texts.
+_ERROR_EVENT_HINTS = (
+    "fail",
+    "error",
+    "ошибк",
+    "прерван",
+    "не удал",
+    "aborted",
+)
+
+
+def _last_error_event(data: dict[str, Any]) -> str:
+    """The (flattened) text of the LAST error-looking service event, or ""
+    when the log holds none."""
+    for event in reversed(data.get("events") or []):
+        if not isinstance(event, dict):
+            continue
+        text = event.get("text")
+        if not isinstance(text, str):
+            continue
+        low = text.lower()
+        if any(hint in low for hint in _ERROR_EVENT_HINTS):
+            return " ".join(text.split())
+    return ""
+
+
+def first_prompt_snippet(text: str, cap: int = SNIPPET_MAX) -> str:
+    """A display snippet of a first prompt: flattened and hard-capped."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= cap else flat[:cap] + "…"
+
+
+def load_archive(
+    project_root: Path,
+) -> list[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
+    """Read the whole task archive into memory.
+
+    Returns (task_id, raw task dict, indexed fields) for every readable
+    task file; corrupted/unreadable files are silently skipped (the
+    load_one contract). The id comes from the file stem — the filename is
+    the archive's identity, `data["id"]` is only a copy of it. BLOCKING
+    file I/O: callers on an event loop must run this in a worker thread
+    (the TUI dialog reads it once per session and filters in memory).
+    """
+    tasks_dir = Path(project_root) / PROJECT_STATE_DIRNAME / "tasks"
+    try:
+        paths = sorted(tasks_dir.glob("*.json"))
+    except OSError:
+        return []
+    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]] = []
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            continue  # Corrupted/unreadable: skip silently (load_one contract).
+        if not isinstance(data, dict):
+            continue
+        records.append((path.stem, data, _indexed_fields(data)))
+    return records
+
+
+def _match_records(
+    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    variants_per_keyword: list[list[str]],
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+) -> tuple[
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+]:
+    """Match preloaded archive records against the keyword variants.
+
+    Returns (and_matches, or_matches) — a record lands in the AND list when
+    EVERY keyword occurs, otherwise in the OR list when ANY does. Pure
+    in-memory computation (no I/O), cheap enough to re-run per keystroke.
+    """
+    and_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
+    or_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
+    for task_id, data, fields in records:
+        if status is not None and data.get("status") != status:
+            continue
+        if kind is not None and data.get("kind") != kind:
+            continue
+        haystack = "\n".join(text for _, text in fields).lower()
+        scores = [_count_matches(haystack, vs) for vs in variants_per_keyword]
+        if all(score > 0 for score in scores):
+            and_matches.append((task_id, data, fields, sum(scores)))
+        elif any(score > 0 for score in scores):
+            or_matches.append((task_id, data, fields, sum(scores)))
+    return and_matches, or_matches
+
+
+def _prepare(
+    project_root: Path,
+    keywords: list[str],
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+) -> tuple[
+    list[str],
+    list[list[str]],
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+]:
+    """Shared front half of the archive-loading entry points: validate the
+    keywords and filters, build the stem variants, load the archive and
+    match it.
+
+    Returns (cleaned keywords, variants, and_matches, or_matches) — the
+    variants are needed downstream to build snippets.
+    """
+    return _match_prepared(
+        load_archive(project_root), keywords, status=status, kind=kind
+    )
+
+
+def _hits_from(
+    matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+    variants_per_keyword: list[list[str]],
+    limit: int,
+) -> list[TaskHit]:
+    """Rank matches (occurrences first, ties newest-first), cap to `limit`
+    and shape them into TaskHits (with `unmerged` left to the caller)."""
+    matches.sort(key=lambda m: (-m[3], -_recency(m[1])))
+    hits: list[TaskHit] = []
+    for task_id, data, fields, score in matches[:limit]:
+        hits.append(
+            TaskHit(
+                task_id=task_id,
+                title=" ".join(str(data.get("title") or "").split()),
+                status=str(data.get("status") or ""),
+                kind=str(data.get("kind") or ""),
+                first_prompt=_first_prompt(data),
+                snippet=_build_snippet(fields, variants_per_keyword),
+                score=score,
+                date=_date(data),
+                verification=_verification_marker(data),
+                unfinished=bool(data.get("unfinished")),
+                hook_merge_failed=bool(data.get("hook_merge_failed")),
+                last_error_event=_last_error_event(data),
+            )
+        )
+    return hits
+
+
+def annotate_unmerged(project_root: Path, hits: list[TaskHit]) -> None:
+    """Fill `hit.unmerged` in place for COMPLETED hits with unmerged commits
+    still on their `drcode/<id>` branches.
+
+    BLOCKING git calls (TaskEnvironment.unmerged_ids) — run only for short
+    result lists and OFF the event loop; any failure degrades to "no
+    markers" (hits keep unmerged=None).
+    """
+    completed = [
+        hit.task_id for hit in hits if hit.status == TaskStatus.COMPLETED.value
+    ]
+    if not 0 < len(completed) <= MERGEDNESS_MAX_IDS:
+        return
+    unmerged = _unmerged_ids(Path(project_root), completed)
+    for hit in hits:
+        if hit.task_id in unmerged:
+            hit.unmerged = True
+
+
+def search_records(
+    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    keywords: list[str],
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = MAX_RESULTS,
+) -> list[TaskHit]:
+    """Match keywords against PRELOADED archive records (`load_archive`).
+
+    Same matching/ranking as `search_tasks`, but without any file I/O —
+    the TUI search dialog loads the archive once per session and calls
+    this per keystroke. Raises ValueError on empty keywords; `unmerged`
+    stays None (the caller annotates when it can afford the git calls).
+    """
+    _cleaned, variants, and_matches, or_matches = _match_prepared(
+        records, keywords, status=status, kind=kind
+    )
+    matches = and_matches if and_matches else or_matches
+    return _hits_from(matches, variants, limit)
+
+
+def _match_prepared(
+    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    keywords: list[str],
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+) -> tuple[
+    list[str],
+    list[list[str]],
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+]:
+    """`_prepare` over preloaded records (no archive reading) — shared by
+    `search_records` and the archive-loading variants below."""
+    cleaned = [k.strip().lower() for k in keywords if k and k.strip()]
+    if not cleaned:
+        raise ValueError(
+            "search_task_history needs at least one non-empty keyword; "
+            "pass the words you expect in a task's title, its user prompt, "
+            "edited file paths or the agent's final summary."
+        )
+    status = _validate_choice(status, TaskStatus, "status")
+    kind = _validate_choice(kind, TaskKind, "kind")
+    variants_per_keyword = [_variants(k) for k in cleaned]
+    and_matches, or_matches = _match_records(
+        records, variants_per_keyword, status=status, kind=kind
+    )
+    return cleaned, variants_per_keyword, and_matches, or_matches
+
+
+def search_tasks(
+    project_root: Path,
+    keywords: list[str],
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = MAX_RESULTS,
+) -> list[TaskHit]:
+    """Search the project's task archive by keywords, as structured hits.
+
+    Same matching, ranking and filters as `search` (the agent tool), but
+    returns TaskHit records instead of formatted lines — the building block
+    for UI surfaces. `unmerged` is NOT filled here: the marker needs
+    blocking git calls, so callers opt in via `annotate_unmerged` (short
+    lists, off the event loop). Raises ValueError on empty keywords or an
+    unknown status/kind filter.
+    """
+    _cleaned, variants, and_matches, or_matches = _prepare(
+        project_root, keywords, status=status, kind=kind
+    )
+    matches = and_matches if and_matches else or_matches
+    return _hits_from(matches, variants, limit)
+
+
 def search(
     project_root: Path,
     keywords: list[str],
@@ -419,59 +714,25 @@ def search(
     files are skipped silently. The caller's own task (`exclude_task_id`) is
     excluded from the results, but a one-line notice reports when it matches.
     """
-    cleaned = [k.strip().lower() for k in keywords if k and k.strip()]
-    if not cleaned:
-        raise ValueError(
-            "search_task_history needs at least one non-empty keyword; "
-            "pass the words you expect in a task's title, its user prompt, "
-            "edited file paths or the agent's final summary."
-        )
-    status = _validate_choice(status, TaskStatus, "status")
-    kind = _validate_choice(kind, TaskKind, "kind")
-    variants_per_keyword = [_variants(k) for k in cleaned]
-    tasks_dir = Path(project_root) / PROJECT_STATE_DIRNAME / "tasks"
-    try:
-        paths = sorted(tasks_dir.glob("*.json"))
-    except OSError:
-        return "Task archive is not readable — no results."
-
-    own_matched_and = False
-    own_matched_or = False
-    # A match is (task_id, data, indexed fields, relevance score); the id
-    # comes from the file stem — the filename is the archive's identity,
-    # `data["id"]` is only a copy of it.
-    and_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
-    or_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
-    for path in paths:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            continue  # Corrupted/unreadable: skip silently (load_one contract).
-        if not isinstance(data, dict):
-            continue
-        if status is not None and data.get("status") != status:
-            continue
-        if kind is not None and data.get("kind") != kind:
-            continue
-        fields = _indexed_fields(data)
-        haystack = "\n".join(text for _, text in fields).lower()
-        scores = [_count_matches(haystack, vs) for vs in variants_per_keyword]
-        is_own = exclude_task_id is not None and path.stem == exclude_task_id
-        if all(score > 0 for score in scores):
-            if is_own:
-                own_matched_and = True
-            else:
-                and_matches.append((path.stem, data, fields, sum(scores)))
-        elif any(score > 0 for score in scores) and not is_own:
-            or_matches.append((path.stem, data, fields, sum(scores)))
-        elif any(score > 0 for score in scores):
-            own_matched_or = True
+    cleaned, variants, and_matches, or_matches = _prepare(
+        project_root, keywords, status=status, kind=kind
+    )
+    # The exclude_task_id/notice logic is the agent tool's own concern: a
+    # task id can be in the AND list only when it matched EVERY keyword and
+    # in the OR list only when it matched SOME-but-not-all — exactly the
+    # own_matched_and / own_matched_or distinction.
+    own_matched_and = exclude_task_id is not None and any(
+        task_id == exclude_task_id for task_id, *_ in and_matches
+    )
+    own_matched_or = exclude_task_id is not None and any(
+        task_id == exclude_task_id for task_id, *_ in or_matches
+    )
+    if exclude_task_id is not None:
+        and_matches = [m for m in and_matches if m[0] != exclude_task_id]
+        or_matches = [m for m in or_matches if m[0] != exclude_task_id]
 
     fallback = not and_matches
     matches = and_matches if and_matches else or_matches
-    # Relevance: more keyword occurrences first; ties — newest first.
-    matches.sort(key=lambda m: (-m[3], -_recency(m[1])))
-
     lines: list[str] = []
     total = len(matches)
     if fallback and total:
@@ -479,34 +740,26 @@ def search(
             "No exact AND match — showing OR matches (any keyword occurs), "
             "ranked by occurrences:"
         )
-    shown = matches[:limit]
+    hits = _hits_from(matches, variants, limit)
     # Mergedness needs blocking git calls — only worth it for short outputs.
-    unmerged: set[str] = set()
-    completed_shown = [
-        task_id
-        for task_id, data, _fields, _score in shown
-        if data.get("status") == TaskStatus.COMPLETED.value
-    ]
-    if 0 < len(completed_shown) <= MERGEDNESS_MAX_IDS:
-        unmerged = _unmerged_ids(Path(project_root), completed_shown)
-    for task_id, data, fields, _score in shown:
-        title = " ".join(str(data.get("title") or "").split())
+    annotate_unmerged(project_root, hits)
+    for hit in hits:
+        title = hit.title
         # A long title is as much a context hazard as a long snippet —
         # cap it to keep every line within the compact-output budget.
         if len(title) > SNIPPET_MAX:
             title = title[:SNIPPET_MAX] + "…"
-        snippet = _build_snippet(fields, variants_per_keyword)
-        markers = [m for m in (_verification_marker(data),) if m]
-        if data.get("status") == TaskStatus.COMPLETED.value and task_id in unmerged:
+        markers = [m for m in (hit.verification,) if m]
+        if hit.status == TaskStatus.COMPLETED.value and hit.unmerged:
             markers.append("unmerged")
         marker_text = (" " + " ".join(markers)) if markers else ""
         lines.append(
-            f"#{task_id} [{data.get('status')}/{data.get('kind')}]"
-            f"{marker_text} {_date(data)} {title} — {snippet}"
+            f"#{hit.task_id} [{hit.status}/{hit.kind}]"
+            f"{marker_text} {hit.date} {title} — {hit.snippet}"
         )
-    if total > len(shown):
-        lines.append(f"...and {total - len(shown)} more — refine the query.")
-    if fallback and not matches:
+    if total > len(hits):
+        lines.append(f"...and {total - len(hits)} more — refine the query.")
+    if fallback and not hits:
         # No AND match, no OR match either — say so with guidance; the
         # own-task notice (below) may still point at the searcher's own
         # transcript.
@@ -514,7 +767,7 @@ def search(
             f"No tasks matched: {', '.join(cleaned)}"
             + (f" (status={status})" if status else "")
             + (f" (kind={kind})" if kind else "")
-            + f".{_stem_hint(variants_per_keyword)}"
+            + f".{_stem_hint(variants)}"
             " Try fewer or shorter keywords, drop the status/kind filters, "
             "or search for wording from a file path or the agent's summary."
         )

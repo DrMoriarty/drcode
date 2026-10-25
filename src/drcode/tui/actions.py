@@ -920,6 +920,17 @@ class ActionsLayer(DrCodeState):
         else:
             self.chat_input.focus()
 
+    def action_search_tasks(self) -> None:
+        """Open the task-archive search dialog (Ctrl+F).
+
+        The dialog receives the MAIN checkout's task storage root
+        (`manager.storage.root`) — under worktree isolation the task files
+        live in the main checkout's `.drcode/tasks/`, never in a task
+        worktree (see the note in drcode.task_search's docstring)."""
+        from .search_dialog import SearchDialog
+
+        self.push_screen(SearchDialog(self.manager.storage.root))
+
     def action_settings(self) -> None:
         """Open the Settings modal (the command palette, Ctrl+S)."""
         if isinstance(self.screen, CommandPalette):

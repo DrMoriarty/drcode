@@ -280,6 +280,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+up", "move_task_up", "Move up"),
         ("ctrl+down", "move_task_down", "Move down"),
         ("ctrl+e", "edit_task", "Edit held"),
+        ("ctrl+f", "search_tasks", "Find task"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the
         # footer (and the key dispatch) picks the first one whose

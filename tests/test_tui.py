@@ -1180,6 +1180,85 @@ async def test_notifications_dialog_escape_keeps_settings(
         assert settings.ntfy_topic == "topic-a"
 
 
+# -- task search dialog (Ctrl+F) ---------------------------------------------------
+
+
+def _result_ids(dialog: Any) -> list[str]:
+    """Task ids currently on the search dialog's result list, in order."""
+    from drcode.tui.sidebar import TaskItem
+
+    return [
+        item.task_id
+        for item in dialog.query_one("#srch-results", ListView).children
+        if isinstance(item, TaskItem) and item.task_id
+    ]
+
+
+async def test_search_dialog_finds_and_opens_task(app: DrCodeApp) -> None:
+    from drcode.tui.search_dialog import SearchDialog
+
+    hit = app.manager.create("websocket reconnect", "fix the websocket reconnect flake")
+    other = app.manager.create("unrelated topic", "something else entirely")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+        # Typing into the input (debounced, worker-loaded archive) lists
+        # the matching task.
+        for char in "websocket":
+            await pilot.press(char)
+        await wait_until(
+            lambda: bool(_result_ids(app.screen)) and hit.id in _result_ids(app.screen),
+            pilot,
+        )
+        assert other.id not in _result_ids(app.screen)
+        # Enter opens the task — the sidebar-click flow (view_task +
+        # chat_input.focus) — and dismisses the dialog.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.viewed_id == hit.id
+        assert app.chat_input.has_focus
+        assert not isinstance(app.screen, SearchDialog)
+
+
+async def test_search_dialog_escape_closes(app: DrCodeApp) -> None:
+    from drcode.tui.search_dialog import SearchDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SearchDialog)
+
+
+async def test_search_dialog_copy_id(app: DrCodeApp) -> None:
+    from drcode.tui.search_dialog import SearchDialog
+
+    task = app.manager.create("copyable needle", "a very distinct body text")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+        copied: list[str] = []
+        app._copy_with_fallback = copied.append  # type: ignore[method-assign]
+        for char in "copyable":
+            await pilot.press(char)
+        await wait_until(
+            lambda: task.id in _result_ids(app.screen),
+            pilot,
+        )
+        # Move focus to the results (down) and copy the highlighted id.
+        await pilot.press("down")
+        await pilot.press("c")
+        await pilot.pause()
+        assert copied == [task.id]
+
+
 async def test_pipeline_settled_notification_primes_then_sends(
     app: DrCodeApp,
     monkeypatch: pytest.MonkeyPatch,

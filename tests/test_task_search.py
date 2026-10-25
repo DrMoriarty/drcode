@@ -413,3 +413,137 @@ def test_search_works_against_main_root_not_worktree(
     found = task_search.search(project_root, ["isolation"])
     assert f"#{task.id}" in found
     assert "No tasks matched" in task_search.search(worktree, ["isolation"])
+
+
+# -- structural core (TaskHit / search_tasks) -------------------------------------
+
+
+def test_search_tasks_returns_hits_with_first_prompt(
+    project_root: Path,
+) -> None:
+    """first_prompt: the first transcript user-prompt when the task ran at
+    least once, the first pending_input text when it never did."""
+    from drcode.task_search import TaskHit, search_tasks
+
+    ran = _task(
+        title="ran once",
+        messages=[
+            {"parts": [{"part_kind": "user-prompt", "content": "first ask"}]},
+            {"parts": [{"part_kind": "user-prompt", "content": "second ask"}]},
+        ],
+        pending_input=[{"text": "queued comment"}],
+    )
+    never_ran = _task(
+        title="never ran",
+        pending_input=[{"text": "initial message"}, {"text": "later comment"}],
+    )
+    for t in (ran, never_ran):
+        _write_task(project_root, t)
+    hits = {h.task_id: h for h in search_tasks(project_root, ["once", "never"])}
+    assert isinstance(hits[ran.id], TaskHit)
+    assert hits[ran.id].first_prompt == "first ask"
+    # A never-run task takes its first prompt from pending_input[0] — that
+    # is where TaskManager.create puts the first message.
+    assert hits[never_ran.id].first_prompt == "initial message"
+    # Structural fields ride along.
+    assert hits[ran.id].status == "queued"
+    assert hits[ran.id].kind == "feature"
+    assert len(hits[ran.id].date) == 10  # bare YYYY-MM-DD
+    assert hits[ran.id].verification == ""
+    assert hits[ran.id].snippet  # keyword "once" is in the title
+
+
+def test_search_tasks_first_prompt_falls_back_to_pending_input(
+    project_root: Path,
+) -> None:
+    """A transcript WITHOUT user-prompt parts (e.g. compaction artefacts)
+    still yields pending_input[0]."""
+    from drcode.task_search import search_tasks
+
+    task = _task(
+        title="odd transcript",
+        messages=[{"parts": [{"part_kind": "text", "content": "agent text"}]}],
+        pending_input=[{"text": "the real first message"}],
+    )
+    _write_task(project_root, task)
+    (hit,) = search_tasks(project_root, ["odd"])
+    assert hit.first_prompt == "the real first message"
+
+
+def test_search_tasks_error_markers(project_root: Path) -> None:
+    """The error combination: unfinished, FAILED verification,
+    hook_merge_failed, and the last error-looking event text."""
+    from drcode.task_search import search_tasks
+
+    clean = _task(title="clean task")
+    flagged = _task(
+        title="troubled task",
+        unfinished=True,
+        hook_merge_failed=True,
+        verification=VerificationStatus.FAILED,
+        events=[
+            {"kind": "system", "text": "retry scheduled"},  # not an error
+            {"kind": "testing", "text": "testing failed — round 2"},
+            {"kind": "system", "text": "merge FAILED: conflict in app.py"},
+        ],
+    )
+    for t in (clean, flagged):
+        _write_task(project_root, t)
+    hits = {h.task_id: h for h in search_tasks(project_root, ["task"])}
+    bad = hits[flagged.id]
+    assert bad.unfinished is True
+    assert bad.hook_merge_failed is True
+    assert bad.verification == "failed"
+    # The LAST error-looking event wins (the "round 2" testing failure is
+    # skipped in favour of the later merge failure).
+    assert bad.last_error_event == "merge FAILED: conflict in app.py"
+    good = hits[clean.id]
+    assert good.unfinished is False
+    assert good.hook_merge_failed is False
+    assert good.verification == ""
+    assert good.last_error_event == ""
+
+
+def test_search_tasks_unmerged_left_to_caller_and_annotated(
+    project_root: Path,
+) -> None:
+    """search_tasks never computes mergedness itself (blocking git);
+    annotate_unmerged fills it for short lists of completed hits."""
+    from drcode.task_search import annotate_unmerged, search_tasks
+
+    task = _task(title="floating fix", status=TaskStatus.COMPLETED)
+    _write_task(project_root, task)
+    # No git repo here: the annotation degrades to "no markers".
+    (hit,) = search_tasks(project_root, ["fix"])
+    assert hit.unmerged is None
+    annotate_unmerged(project_root, [hit])
+    assert hit.unmerged is None
+
+
+def test_search_tasks_rejects_bad_input(project_root: Path) -> None:
+    """Same validation contract as the agent tool: empty keywords and
+    unknown filters raise ValueError."""
+    import pytest
+
+    from drcode.task_search import search_tasks
+
+    with pytest.raises(ValueError, match="keyword"):
+        search_tasks(project_root, ["  "])
+    with pytest.raises(ValueError, match="status"):
+        search_tasks(project_root, ["x"], status="done")
+    with pytest.raises(ValueError, match="kind"):
+        search_tasks(project_root, ["x"], kind="spike")
+
+
+def test_search_tasks_ranking_matches_search(project_root: Path) -> None:
+    """search_tasks ranks exactly like the formatter: occurrences first,
+    ties newest-first."""
+    from drcode.task_search import search_tasks
+
+    weak = _task(title="alpha with beta")
+    strong = _task(title="alpha alpha with beta beta beta")
+    _write_task(project_root, weak)
+    _write_task(project_root, strong)
+    hits = search_tasks(project_root, ["alpha", "beta"])
+    assert [h.task_id for h in hits] == [strong.id, weak.id]
+    assert hits[0].score > hits[1].score

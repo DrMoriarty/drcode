@@ -636,7 +636,7 @@ def play_wav(data: bytes) -> None:
 
     raw = pcm.tobytes()
     total = len(raw)
-    state = {"pos": 0, "underflowed": False, "filled": False}
+    state = {"pos": 0, "underflows": 0, "filled": False}
     done = threading.Event()
 
     # Callback mode, not the blocking RawOutputStream.write() pair: with
@@ -651,7 +651,10 @@ def play_wav(data: bytes) -> None:
     def _callback(outdata: object, frames: int, time: object, status: object) -> None:
         try:
             if status:
-                state["underflowed"] = True
+                # Count every callback that reports a flag (for an
+                # output-only stream that is paOutputUnderflow) — a counter
+                # shows how often the device ran dry, a boolean hides it.
+                state["underflows"] += 1
             view = memoryview(outdata).cast("B")  # type: ignore[arg-type]
             end = min(state["pos"] + len(view), total)
             block = end - state["pos"]
@@ -676,14 +679,40 @@ def play_wav(data: bytes) -> None:
             print(f"drcode voice: playback callback failed: {e}", file=sys.stderr)
             done.set()
 
+    def _output_latency() -> float:
+        """Numeric output latency with generous slack against callback
+        delays. A Python callback runs on the PortAudio audio thread and
+        must grab the GIL on every invocation; under CPU load those grabs
+        stall, so the real protection is a deep device ring buffer —
+        "high" (~40–100 ms on most backends) is not enough. Ask the device
+        for its reported high-output latency, but never below 0.3 s; any
+        query failure or nonsensical value degrades to the same 0.3 s.
+        The price — up to 300 ms before the phrase starts — is irrelevant
+        for notifications, and the stop()-drain plus the appended tail
+        silence keep the ending click-free."""
+        fallback = 0.3
+        try:
+            device = sd.default.device[1]
+            high = float(sd.query_devices(device)["default_high_output_latency"])
+        except Exception:  # noqa: BLE001 - a broken query must not kill playback
+            return fallback
+        if high <= 0:
+            return fallback
+        return max(high, fallback)
+
     # The whole playback (including the drain in stop()) stays under the
     # lock so a concurrent recording open/close can never interleave with it.
     with _PORTAUDIO_LOCK:
+        latency = _output_latency()
         stream = sd.RawOutputStream(
             samplerate=rate,
             channels=channels,
             dtype="int16",
-            latency="high",  # extra headroom against mid-phrase dropouts
+            latency=latency,
+            # Explicit block size instead of the variable default (0): fewer
+            # callback invocations per second means fewer GIL acquisitions
+            # on the audio thread, and each call copies a larger chunk.
+            blocksize=2048,
             callback=_callback,
         )
         try:
@@ -698,8 +727,12 @@ def play_wav(data: bytes) -> None:
         finally:
             stream.stop()  # drains the pending audio, like sd.wait()
             stream.close()
-    if state["underflowed"]:
-        print("drcode voice: playback buffer underflowed", file=sys.stderr)
+    if state["underflows"]:
+        print(
+            f"drcode voice: playback buffer underflowed "
+            f"{state['underflows']} times (latency={latency}s)",
+            file=sys.stderr,
+        )
 
 
 class _VoiceSynth(Protocol):

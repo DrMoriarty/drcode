@@ -88,10 +88,13 @@ from .blocks import (
 )
 from .state import DrCodeState
 from .usage import (
+    NETWORK_OUTAGE_PROBE_INTERVAL,
     NETWORK_RETRIES,
+    _in_outage,
     _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
+    tcp_reachable,
 )
 
 # Hard-limit compaction level (percent of max_context_tokens): the last
@@ -220,6 +223,85 @@ class PipelineLayer(DrCodeState):
         self._render_model_status()
         if was_error:
             self._recover_from_outage()
+
+    def _note_network_recovered(self, task: Task, counts: dict[str, int]) -> None:
+        """Outage exit on success: when the task's consecutive-failure count
+        says it was in outage mode, one service event announces the recovery
+        before the caller pops the counter. Called from the per-request
+        success resets of run_agent/run_tester — the first model call that
+        gets through ends the outage."""
+        if counts.get(task.id, 0) > NETWORK_RETRIES:
+            self._show_event(
+                task,
+                "Network restored: the model gateway responds again — resuming.",
+            )
+
+    def _outage_active(self) -> bool:
+        """True while any task is in the outage-mode wait (its consecutive
+        network-failure count is past the ordinary retry budget). Gates the
+        failed-queue rescue (see _promote_failed_queue): rescue rounds must
+        not fire model requests while the outage probe says the gateway is
+        down. Session-only by construction — the counts live in dicts that
+        every success/reset/pop clears."""
+        return any(
+            c > NETWORK_RETRIES
+            for c in [*self._agent_net_count.values(), *self._tester_net_count.values()]
+        )
+
+    def _outage_retry_tick(self, task_id: str, role: AgentRole) -> None:
+        """Outage-mode retry tick: gate the next model attempt behind a
+        cheap TCP connect to the gateway host. Reachable — the ordinary
+        re-run (run_agent / a pipeline advance for the tester) fires;
+        still down — only re-probe at NETWORK_OUTAGE_PROBE_INTERVAL,
+        without burning full model requests (and the transcript entries
+        they would leave behind) on a host that cannot even accept a
+        TCP connection."""
+        if self._exit or not self.is_running:
+            return
+        self.run_worker(
+            partial(self._outage_probe, task_id, role),
+            name=f"outage probe {task_id}",
+            group=f"outage-{task_id}",
+            exclusive=True,
+        )
+
+    async def _outage_probe(self, task_id: str, role: AgentRole) -> None:
+        tester = role is AgentRole.TESTER
+        try:
+            task = self.manager.get(task_id)
+        except KeyError:
+            return
+        expected = TaskStatus.TESTING if tester else TaskStatus.ACTIVE
+        if task.status is not expected:
+            # The task left the waiting state while the probe was pending
+            # (cancelled, re-queued, completed): drop the outage state, or
+            # a stale count would keep _outage_active (and the failed-queue
+            # rescue coordination) latched forever.
+            if tester:
+                self._tester_net_count.pop(task_id, None)
+            else:
+                self._agent_net_count.pop(task_id, None)
+            return
+        base_url = self.resolved_config(role).base_url
+        if await tcp_reachable(base_url):
+            # Only when nothing took over in the meantime: a recovery
+            # (probe/_recover_from_outage) may already have re-run the task.
+            if tester:
+                if not self.tester_running:
+                    self._tester_retry_at.pop(task_id, None)
+                    self._advance()
+            elif task_id not in self._agent_runs:
+                self.run_agent(task_id)
+        else:
+            retry_at = time.monotonic() + NETWORK_OUTAGE_PROBE_INTERVAL
+            if tester:
+                self._tester_retry_at[task_id] = retry_at
+            else:
+                self._agent_net_retry_at[task_id] = retry_at
+            self._schedule_pipeline_timer(
+                NETWORK_OUTAGE_PROBE_INTERVAL,
+                partial(self._outage_retry_tick, task_id, role),
+            )
 
     # -- live output rate (header tok/s) --------------------------------------
 
@@ -523,6 +605,15 @@ class PipelineLayer(DrCodeState):
         re-enters _advance() when the window expires).
         """
         if len(self.manager.active_tasks()) >= self.parallel_limit:
+            return None
+        if self._outage_active():
+            # A network outage is in progress (some task sits in the
+            # outage-mode wait): rescue rounds would only fire full model
+            # requests at a gateway the outage probe just proved
+            # unreachable. The outage ticks re-advance the pipeline, and
+            # the first successful model call resets this escape's backoff
+            # — so the rescue happens right after the recovery, not
+            # against the dead network.
             return None
         queued = self.manager.queued()
         # Only plausibly-transient failures are rescuable: a deterministically
@@ -1802,7 +1893,12 @@ class PipelineLayer(DrCodeState):
                                 # budget for this task starts over, so the
                                 # NEXT network error counts from one again —
                                 # even mid-run, where a single turn makes
-                                # many model requests.
+                                # many model requests. A count past the
+                                # budget means the run was in outage mode:
+                                # this success ends it (announce, then pop).
+                                self._note_network_recovered(
+                                    task, self._agent_net_count
+                                )
                                 self._agent_net_count.pop(task_id, None)
                                 self._agent_net_retry_at.pop(task_id, None)
                                 # The model works again: the failed-queue
@@ -1953,6 +2049,9 @@ class PipelineLayer(DrCodeState):
                     # The turn went through: the network-retry budget for
                     # this task starts over (and the failed-queue rescue
                     # backoff with it — see the model-request branch above).
+                    # A count past the budget = the run was in outage mode:
+                    # announce the recovery before the reset.
+                    self._note_network_recovered(task, self._agent_net_count)
                     self._agent_net_count.pop(task_id, None)
                     self._agent_net_retry_at.pop(task_id, None)
                     self._failed_queue_rounds = 0
@@ -1999,21 +2098,42 @@ class PipelineLayer(DrCodeState):
                     # is transient: instead of requeueing the task right
                     # away, retry the run in place after a backoff delay
                     # (5s doubling up to 60s), at most NETWORK_RETRIES times.
-                    # Only when the budget is exhausted does the ordinary
-                    # failure path below apply.
-                    if (
-                        _is_retryable_network_error(e)
-                        and self._agent_net_count.get(task_id, 0) < NETWORK_RETRIES
-                    ):
+                    # Past the budget (consecutive failures with no
+                    # successful model call — a sustained outage, e.g. the
+                    # machine slept through the gateway's downtime) the run
+                    # does NOT fall through to the ordinary failure path
+                    # below: it enters outage mode (see usage.py) — the task
+                    # keeps its status and keeps retrying in place on a
+                    # longer backoff until the connection returns.
+                    if _is_retryable_network_error(e):
                         attempt = self._agent_net_count.get(task_id, 0) + 1
                         self._agent_net_count[task_id] = attempt
                         self._net_retries_total += 1
-                        delay = _network_retry_delay(attempt)
-                        self._show_event(
-                            task,
-                            f"Network error ({type(e).__name__}): retry {attempt}/"
-                            f"{NETWORK_RETRIES} in {int(delay)} s",
-                        )
+                        outage = _in_outage(attempt)
+                        delay = _network_retry_delay(attempt, outage)
+                        if outage:
+                            if attempt == NETWORK_RETRIES + 1:
+                                self._show_event(
+                                    task,
+                                    f"Network outage: the model gateway has been "
+                                    f"unreachable for {NETWORK_RETRIES} retries "
+                                    f"({type(e).__name__}) — the task keeps its "
+                                    f"status and waits out the outage, retrying "
+                                    f"in place until the connection returns.",
+                                )
+                            else:
+                                self._show_event(
+                                    task,
+                                    f"Network outage: still unreachable "
+                                    f"({type(e).__name__}) — retry {attempt} "
+                                    f"in {int(delay)} s",
+                                )
+                        else:
+                            self._show_event(
+                                task,
+                                f"Network error ({type(e).__name__}): retry {attempt}/"
+                                f"{NETWORK_RETRIES} in {int(delay)} s",
+                            )
                         if self._agent_generations.get(task_id) == generation:
                             self._drop_stream_preview(task_id, generation)
                         self._persist_task_messages(task, run)
@@ -2044,9 +2164,20 @@ class PipelineLayer(DrCodeState):
                         # The task stays ACTIVE — no requeue, no pipeline
                         # advance; the delayed re-run below picks it up.
                         self.manager.storage.save(task)
-                        self._schedule_pipeline_timer(
-                            delay, partial(self.run_agent, task_id)
-                        )
+                        if outage:
+                            # Outage mode: the re-run is gated behind a cheap
+                            # TCP probe of the gateway host — while the host
+                            # is unreachable the tick only re-probes (see
+                            # _outage_retry_tick) instead of firing full
+                            # model requests at a dead gateway.
+                            self._schedule_pipeline_timer(
+                                delay,
+                                partial(self._outage_retry_tick, task_id, role),
+                            )
+                        else:
+                            self._schedule_pipeline_timer(
+                                delay, partial(self.run_agent, task_id)
+                            )
                         return
                     # Persist the failure even for a superseded run: it
                     # happened, and the human must be able to see it.
@@ -2508,7 +2639,12 @@ class PipelineLayer(DrCodeState):
                                 # budget for this testing round starts over,
                                 # so the NEXT network error counts from one
                                 # again (mirrors the agent's per-request
-                                # reset).
+                                # reset). A count past the budget = the round
+                                # was in outage mode: announce the recovery
+                                # before the reset.
+                                self._note_network_recovered(
+                                    task, self._tester_net_count
+                                )
                                 self._tester_net_count.pop(task_id, None)
                             elif Agent.is_call_tools_node(node):
                                 async with node.stream(run.ctx) as stream:
@@ -2647,26 +2783,55 @@ class PipelineLayer(DrCodeState):
                 # round, retry it in place (the task stays TESTING, the
                 # round transcript is kept and the retry resumes it as a
                 # continuation turn) after a backoff delay, at most
-                # NETWORK_RETRIES times — only when the budget is exhausted
-                # does the ordinary failure path below apply (mirrors
-                # run_agent's network handling).
-                if (
-                    _is_retryable_network_error(e)
-                    and self._tester_net_count.get(task_id, 0) < NETWORK_RETRIES
-                ):
+                # NETWORK_RETRIES times — past the budget the run enters
+                # outage mode instead (mirrors run_agent's network
+                # handling): the task keeps TESTING and keeps retrying on
+                # the long outage backoff until the connection returns;
+                # only NON-network errors reach the ordinary failure path
+                # below.
+                if _is_retryable_network_error(e):
                     attempt = self._tester_net_count.get(task_id, 0) + 1
                     self._tester_net_count[task_id] = attempt
                     self._net_retries_total += 1
-                    delay = _network_retry_delay(attempt)
-                    self._show_event(
-                        task,
-                        f"Network error ({type(e).__name__}): tester retry "
-                        f"{attempt}/{NETWORK_RETRIES} in {int(delay)} s",
-                    )
+                    outage = _in_outage(attempt)
+                    delay = _network_retry_delay(attempt, outage)
+                    if outage:
+                        if attempt == NETWORK_RETRIES + 1:
+                            self._show_event(
+                                task,
+                                f"Network outage: the model gateway has been "
+                                f"unreachable for {NETWORK_RETRIES} tester "
+                                f"retries ({type(e).__name__}) — the testing "
+                                f"round is kept and waits out the outage, "
+                                f"retrying in place until the connection "
+                                f"returns.",
+                            )
+                        else:
+                            self._show_event(
+                                task,
+                                f"Network outage: still unreachable "
+                                f"({type(e).__name__}) — tester retry "
+                                f"{attempt} in {int(delay)} s",
+                            )
+                    else:
+                        self._show_event(
+                            task,
+                            f"Network error ({type(e).__name__}): tester retry "
+                            f"{attempt}/{NETWORK_RETRIES} in {int(delay)} s",
+                        )
                     self._persist_tester_messages(task, run)
                     self._tester_resume_round.add(task_id)
                     self._tester_retry_at[task_id] = time.monotonic() + delay
-                    self._schedule_pipeline_timer(delay, self._advance)
+                    if outage:
+                        # Outage mode: gate the retry behind the cheap TCP
+                        # probe (the tick calls _advance when the host is
+                        # back — _next_testing then picks the task up).
+                        self._schedule_pipeline_timer(
+                            delay,
+                            partial(self._outage_retry_tick, task_id, AgentRole.TESTER),
+                        )
+                    else:
+                        self._schedule_pipeline_timer(delay, self._advance)
                     return
                 self._persist_tester_messages(task, run)
                 self._tester_resume_round.discard(task_id)
@@ -2685,8 +2850,10 @@ class PipelineLayer(DrCodeState):
             self.refresh_sidebar()
             if task.status is TaskStatus.COMPLETED:
                 # Success: give the next testing round of this task a fresh
-                # backoff and network-retry budget.
+                # backoff and network-retry budget. A count past the budget
+                # = the round was in outage mode: announce the recovery.
                 self._tester_fail_count.pop(task_id, None)
+                self._note_network_recovered(task, self._tester_net_count)
                 self._tester_net_count.pop(task_id, None)
                 self._tester_resume_round.discard(task_id)
                 self._tester_retry_at.pop(task_id, None)

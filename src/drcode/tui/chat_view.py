@@ -596,6 +596,34 @@ class ChatViewLayer(DrCodeState):
         # backoff window accumulated during the outage.
         self._failed_queue_rounds = 0
         self._failed_queue_retry_at = 0.0
+        # Outage-mode tasks wait on their own TCP-probe ticks: this header
+        # probe just proved the gateway answers — wake them right away
+        # instead of letting them wait out the remaining probe interval.
+        # (The pending probe ticks stay harmless: _outage_probe skips a
+        # task whose run is already back.)
+        for task_id in [
+            tid
+            for tid, c in self._agent_net_count.items()
+            if c > NETWORK_RETRIES and tid not in self._agent_runs
+        ]:
+            try:
+                task = self.manager.get(task_id)
+            except KeyError:
+                self._agent_net_count.pop(task_id, None)
+                continue
+            if task.status is TaskStatus.ACTIVE:
+                self._agent_net_retry_at.pop(task_id, None)
+                self.run_agent(task_id)
+            else:
+                # Cancelled/re-queued while waiting: drop the stale outage
+                # state (it would keep _outage_active latched).
+                self._agent_net_count.pop(task_id, None)
+        for task_id in [
+            tid
+            for tid, c in self._tester_net_count.items()
+            if c > NETWORK_RETRIES and not self.tester_running
+        ]:
+            self._tester_retry_at.pop(task_id, None)
         self._advance()
 
     def refresh_connection(self) -> None:
@@ -896,10 +924,19 @@ class ChatViewLayer(DrCodeState):
                 if retry_at is not None and retry_at > time.monotonic():
                     left = max(1, int(retry_at - time.monotonic()))
                     attempt = self._agent_net_count.get(active.id, 0)
-                    self._render_activity(
-                        "⏳ agent: network retry",
-                        f"#{active.id} attempt {attempt}/{NETWORK_RETRIES} in {left}s",
-                    )
+                    if attempt > NETWORK_RETRIES:
+                        # Outage mode: the budget is spent, the task waits
+                        # for the network (probe-gated) — say so instead of
+                        # a nonsensical "attempt 7/5".
+                        self._render_activity(
+                            "⏳ agent: network outage",
+                            f"#{active.id} offline — waiting {left}s",
+                        )
+                    else:
+                        self._render_activity(
+                            "⏳ agent: network retry",
+                            f"#{active.id} attempt {attempt}/{NETWORK_RETRIES} in {left}s",
+                        )
                     return
             active_tasks = self.manager.active_tasks()
             if active_tasks:

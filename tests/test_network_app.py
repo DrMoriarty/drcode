@@ -9,7 +9,9 @@ Two failure surfaces are simulated:
 
 Rate-limit and tester retry timers are fired immediately (the real backoff
 delays are recorded instead of slept), so the tests stay fast while the
-full retry bookkeeping runs for real.
+full retry bookkeeping runs for real. Outage-mode tests record the
+probe-gated retry ticks instead of running the TCP-probe loop (the probe
+itself gets dedicated tests).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.providers import AgentRole
 from drcode.tui import pipeline as pipeline_module
 from drcode.tui.app import DrCodeApp
+from drcode.tui.usage import NETWORK_RETRIES
 from tests.network_mocks import (
     ScriptedState,
     api_error,
@@ -221,71 +224,117 @@ async def test_research_task_builds_agent_with_research_role_config(
 # -- agent run: rate limiting ---------------------------------------------------------
 
 
-async def test_rate_limited_run_retries_with_backoff_then_exhausts_budget(
-    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
+async def test_rate_limited_run_retries_then_waits_out_outage(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """5 in-place retries within the budget (5s doubling to 60s), then the
+    run enters outage mode instead of the old demote-and-exclude path: the
+    task keeps its ACTIVE status and waits on the long outage backoff until
+    the network recovers."""
     task = net_app.manager.create("limited", "do work", kind=TaskKind.RESEARCH)
     # 5 retries within the budget, then one more 429 that exhausts it.
     scripted.steps = [http_error(429) for _ in range(6)]
+    # The outage tick is gated behind the TCP probe — record the scheduled
+    # ticks instead of running the probe loop (the real tick is covered by
+    # its own test below).
+    ticks: list[tuple[str, Any]] = []
+
+    def _record_tick(tid: str, role: AgentRole) -> None:
+        ticks.append((tid, role))
+
+    monkeypatch.setattr(net_app, "_outage_retry_tick", _record_tick)
 
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
-            lambda: task.status is TaskStatus.QUEUED,
+            lambda: net_app._agent_net_count.get(task.id, 0) == 6,
             pilot,
-            what="task demoted after rate-limit budget exhausted",
+            what="retry budget exhausted, outage mode entered",
+        )
+        await pilot.pause()
+
+        texts = event_texts(task)
+        retries = [t for t in texts if t.startswith("Network error (ModelHTTPError)")]
+        assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
+        # Backoff schedule 5s doubling capped at 60 within the budget, then
+        # the outage schedule takes over (160s at attempt 6 — the cap is
+        # NETWORK_OUTAGE_DELAY_MAX = 900 there).
+        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 160.0]
+        # Outage entry announced, no demotion, no session exclusion.
+        assert any(
+            t.startswith("Network outage: the model gateway has been unreachable")
+            for t in texts
+        )
+        assert task.status is TaskStatus.ACTIVE
+        assert task.id not in net_app._agent_failed
+        assert net_app._outage_active()
+        assert ticks == [(task.id, AgentRole.RESEARCH)]
+        assert task.unfinished
+        assert task.pending_input == []
+        assert ends_with_open_request(task.messages)
+
+        # Outage over: model answers now; the recovery wakes the waiting
+        # task and the pipeline resumes the interrupted attempt.
+        scripted.steps = [text_response("recovered answer")]
+        net_app._recover_from_outage()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="task completed after outage recovery",
         )
 
     texts = event_texts(task)
-    retries = [t for t in texts if t.startswith("Network error (ModelHTTPError)")]
-    assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
-    # Backoff schedule 5s doubling, capped at 60 (NETWORK_RETRIES = 5),
-    # plus the failed-queue rescue window (the task is the only queued one
-    # and is failed, so the deadlock escape arms its 60s backoff timer).
-    assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
-    # The last failure fell through to the generic failure path.
-    assert any(t.startswith("ModelHTTPError") for t in texts)
-    assert task.unfinished
-    assert task.id in net_app._agent_failed
-    # The prompt was consumed into the transcript (not re-queued): the
-    # retry resumes the attempt instead of re-sending the text.
-    assert task.pending_input == []
-    assert ends_with_open_request(task.messages)
+    assert any("Network restored" in t for t in texts)
+    assert not net_app._outage_active()
+    assert net_app._agent_net_count.get(task.id) is None
+    # Six failed attempts (each resumed without re-sending text) plus the
+    # successful recovery call — no rescue round, no demotion.
+    assert scripted.calls == ["do work"] * 7
 
 
 # -- agent run: connection outage -------------------------------------------------------
 
 
-async def test_connection_outage_retried_then_demoted_and_recovery_resumes_it(
-    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
+async def test_connection_outage_retried_then_outage_mode_and_recovery_resumes_it(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = net_app.manager.create("docs", "write the docs", kind=TaskKind.RESEARCH)
     # 5 in-place retries within the budget, then one more connection error
-    # that exhausts it.
+    # that exhausts it — the run enters outage mode instead of demoting.
     scripted.steps = [api_error("Connection error.") for _ in range(6)]
+
+    def _noop_tick(tid: str, role: AgentRole) -> None:
+        """The real tick (TCP probe + re-run) is covered by its own test —
+        here the outage wait must simply hold."""
+
+    monkeypatch.setattr(net_app, "_outage_retry_tick", _noop_tick)
 
     async with net_app.run_test() as pilot:
         await pilot.pause()
         await wait_until(
             lambda: (
-                task.status is TaskStatus.QUEUED
-                and task.unfinished
-                # The failed-queue rescue fired too (the task is the only
-                # queued one): it re-ran the attempt, which failed on the
-                # now-empty script and was re-excluded with a backoff.
-                and net_app._failed_queue_rounds == 1
+                task.status is TaskStatus.ACTIVE
+                and net_app._agent_net_count.get(task.id, 0) == 6
             ),
             pilot,
-            what="task demoted after connection-retry budget exhausted",
+            what="task in outage mode after the retry budget ran out",
         )
         await pilot.pause()
-        assert task.id in net_app._agent_failed
+        assert task.id not in net_app._agent_failed
         texts = event_texts(task)
         retries = [t for t in texts if t.startswith("Network error (ModelAPIError)")]
         assert [f"retry {i}/5" in t for i, t in enumerate(retries, 1)] == [True] * 5
-        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
-        # The last failure fell through to the generic failure path.
-        assert any(t.startswith("ModelAPIError") for t in texts)
+        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 160.0]
+        # The failure never fell through to the generic path (no bare
+        # error event, no requeue, no rescue round).
+        assert not any(t.startswith("ModelAPIError") for t in texts)
+        assert net_app._failed_queue_rounds == 0
         # The consumed prompt lives in the sanitized transcript.
         assert len(task.messages) == 1
         assert ends_with_open_request(task.messages)
@@ -304,10 +353,9 @@ async def test_connection_outage_retried_then_demoted_and_recovery_resumes_it(
     assert [
         text for _, role, text in extract_display(task.messages) if role == "user"
     ] == ["write the docs"]
-    # Six failed attempts (each resumed without re-sending text), the
-    # failed-queue rescue attempt (failed on the empty script) and the
+    # Six failed attempts (each resumed without re-sending text) and the
     # successful recovery call.
-    assert scripted.calls == ["write the docs"] * 8
+    assert scripted.calls == ["write the docs"] * 7
 
 
 # -- tester run: network failure -------------------------------------------------------
@@ -366,6 +414,248 @@ async def test_tester_network_failure_retried_then_verification_passes(
     assert instant_timers == [5.0]
     assert task.id not in net_app._tester_fail_count
     assert task.id not in net_app._tester_retry_at
+
+
+async def test_tester_network_outage_keeps_round_waiting_then_recovers(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Six consecutive tester connection errors: the first five burn the
+    in-budget retries, the sixth switches the round into outage mode — the
+    task keeps TESTING (no generic-failure backoff, no round restart) until
+    the recovery wakes it and the same round finishes."""
+    task = net_app.manager.create("feature", "implement x", kind=TaskKind.FEATURE)
+    scripted.steps = [
+        text_response("work done"),  # development run
+        *[api_error("Connection error.") for _ in range(6)],  # tester failures
+        tool_response("set_verification", {"success": True}),  # resumed round
+        text_response("all checks passed"),
+    ]
+
+    def _noop_tick(tid: str, role: AgentRole) -> None:
+        """The real tick is covered by the probe-gate test below."""
+
+    monkeypatch.setattr(net_app, "_outage_retry_tick", _noop_tick)
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        # The development run completes, the tester round starts and dies
+        # on its first request (in-budget retry scheduled, timer recorded).
+        await wait_until(
+            lambda: net_app._tester_net_count.get(task.id, 0) == 1,
+            pilot,
+            what="first tester network failure",
+        )
+        # Drive the remaining retries manually: the recorded backoff
+        # windows (5..60s) are expired by hand, then _advance re-dispatches
+        # the tester — same pattern as the single-failure test above.
+        for expected in range(2, 6):
+            net_app._tester_retry_at[task.id] = time.monotonic() - 1
+            net_app._advance()
+            await wait_until(
+                lambda expected=expected: (
+                    net_app._tester_net_count.get(task.id, 0) == expected
+                ),
+                pilot,
+                what=f"tester network retry {expected}",
+            )
+        # The sixth failure exhausts the budget → outage mode.
+        net_app._tester_retry_at[task.id] = time.monotonic() - 1
+        net_app._advance()
+        await wait_until(
+            lambda: net_app._tester_net_count.get(task.id, 0) == 6,
+            pilot,
+            what="tester retry budget exhausted, outage mode entered",
+        )
+        await pilot.pause()
+        assert task.status is TaskStatus.TESTING
+        assert net_app._outage_active()
+        texts = event_texts(task)
+        assert any(
+            t.startswith("Network outage: the model gateway has been unreachable")
+            for t in texts
+        )
+        # Outage schedule, not the generic tester-failure backoff (which
+        # would cap at 300 and grow _tester_fail_count).
+        assert instant_timers == [5.0, 10.0, 20.0, 40.0, 60.0, 160.0]
+        assert task.id not in net_app._tester_fail_count
+
+        # Network back: the recovery re-advances the pipeline and the SAME
+        # round resumes as a continuation turn.
+        net_app._recover_from_outage()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="testing round completed after outage recovery",
+        )
+        await wait_until(
+            lambda: not net_app.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    # The outage never restarted the round: one testing round total.
+    assert len(task.tester_messages) == 1
+    assert any("Network restored" in t for t in event_texts(task))
+    assert not net_app._outage_active()
+
+
+# -- outage probe tick (TCP gate) ------------------------------------------------------
+
+
+async def test_outage_probe_tick_gates_retry_on_connectivity(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In outage mode the retry tick dials a cheap TCP connect first: while
+    the gateway host is unreachable the tick only re-arms itself (no model
+    request, no transcript churn); once the host answers, the run resumes
+    and completes."""
+    task = net_app.manager.create("docs", "write the docs", kind=TaskKind.RESEARCH)
+    # Fast-forward into outage mode: pretend five failures already happened
+    # (the counters are what the retry branch keys on) — the startup
+    # promotion's run then fails once more and enters the outage branch.
+    net_app._agent_net_count[task.id] = NETWORK_RETRIES
+    scripted.steps = [api_error("Connection error.")]
+    up = {"tcp": False}
+
+    async def fake_reachable(base_url: str, timeout: float = 5.0) -> bool:
+        return up["tcp"]
+
+    monkeypatch.setattr(pipeline_module, "tcp_reachable", fake_reachable)
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                net_app._agent_net_count.get(task.id, 0) == 6
+                and any(t.startswith("Network outage") for t in event_texts(task))
+            ),
+            pilot,
+            what="outage mode entered",
+        )
+        await pilot.pause()
+        assert task.status is TaskStatus.ACTIVE
+        calls_after_entry = len(scripted.calls)
+
+        # Host still down: the tick re-arms the probe, nothing else happens.
+        net_app._outage_retry_tick(task.id, AgentRole.RESEARCH)
+        await pilot.pause()
+        await pilot.pause()
+        assert len(scripted.calls) == calls_after_entry
+        assert task.status is TaskStatus.ACTIVE
+        # The wait stays visible in the task status (retry_at moved forward).
+        assert net_app._agent_net_retry_at.get(task.id, 0.0) > time.monotonic() - 1
+
+        # Host back up: the tick resumes the run, which succeeds.
+        up["tcp"] = True
+        scripted.steps = [text_response("recovered answer")]
+        net_app._outage_retry_tick(task.id, AgentRole.RESEARCH)
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="task completed after the probe let the run through",
+        )
+
+    assert any("Network restored" in t for t in event_texts(task))
+    assert net_app._agent_net_count.get(task.id) is None
+
+
+async def test_failed_queue_rescue_waits_out_network_outage(
+    net_app: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """While an outage is in progress the failed-queue deadlock escape must
+    not fire rescue rounds (they would only burn model requests against a
+    gateway the probe knows is down); once the outage state clears, the
+    rescue proceeds."""
+    a = net_app.manager.create("a", "brief a", kind=TaskKind.RESEARCH)
+    scripted.steps = [http_error(500)]
+    # No instant timers: the immediate first rescue round runs (fails on
+    # the empty script), the follow-up rounds stay behind their real backoff.
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                a.status is TaskStatus.QUEUED
+                and a.id in net_app._agent_failed
+                and net_app._failed_queue_rounds == 1
+            ),
+            pilot,
+            what="queue settled after the first rescue failed again",
+        )
+        await pilot.pause()
+
+        # Outage in progress (some other task waits it out): the escape is
+        # gated even with its backoff window expired.
+        net_app._agent_net_count["ghost"] = NETWORK_RETRIES + 1
+        net_app._failed_queue_retry_at = 0.0
+        assert net_app._outage_active()
+        assert net_app._promote_failed_queue() is None
+        assert a.id in net_app._agent_failed  # not lifted
+
+        # Outage over: the rescue lifts the exclusion and re-runs the task.
+        net_app._agent_net_count.pop("ghost")
+        scripted.steps = [text_response("done a")]
+        net_app._advance()
+        await wait_until(
+            lambda: a.status is TaskStatus.COMPLETED,
+            pilot,
+            what="rescued task completed after the outage cleared",
+        )
+
+
+# -- outage helpers (unit) -------------------------------------------------------------
+
+
+def test_network_retry_delay_outage_schedule() -> None:
+    """In-budget schedule unchanged (5..60); the outage schedule keeps
+    doubling past it, capped at NETWORK_OUTAGE_DELAY_MAX."""
+    from drcode.tui.usage import (
+        NETWORK_OUTAGE_DELAY_MAX,
+        _in_outage,
+        _network_retry_delay,
+    )
+
+    assert [_network_retry_delay(i) for i in range(1, 6)] == [
+        5.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+    ]
+    assert [_network_retry_delay(i, outage=True) for i in range(6, 10)] == [
+        160.0,
+        320.0,
+        640.0,
+        NETWORK_OUTAGE_DELAY_MAX,
+    ]
+    assert _network_retry_delay(20, outage=True) == NETWORK_OUTAGE_DELAY_MAX
+    assert [_in_outage(i) for i in (1, 5)] == [False, False]
+    assert [_in_outage(i) for i in (6, 20)] == [True, True]
+
+
+async def test_tcp_reachable() -> None:
+    """A listening port is reachable, a refused one is not, and an
+    unparseable URL degrades to reachable (never block a working setup on
+    a probe bug)."""
+    import socket
+
+    from drcode.tui.usage import tcp_reachable
+
+    # Refused: nothing listens on port 1.
+    assert not await tcp_reachable("http://127.0.0.1:1/v1")
+    # Unparseable / hostless: conservative True.
+    assert await tcp_reachable("not a url")
+    # A real listening socket.
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        assert await tcp_reachable(f"http://127.0.0.1:{port}/v1")
 
 
 # -- missing configuration ---------------------------------------------------------------

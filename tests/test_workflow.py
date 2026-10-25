@@ -367,6 +367,140 @@ async def test_failed_example_merge_aborts_conflict(
     assert "NOT merged" not in merged.output["text"]
 
 
+def _isolated_repo(project_root: Path) -> None:
+    """A repo shaped like a worktree-isolated project: main at the base
+    commit plus a REAL worktree for task t1 (the engine path needs it)."""
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    _git_ok(
+        "worktree",
+        "add",
+        "-b",
+        "drcode/t1",
+        str(project_root / ".drcode" / "worktrees" / "t1"),
+        cwd=project_root,
+    )
+
+
+async def test_conflicted_hook_merge_parks_in_task_worktree(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """A conflicted hook-merge never touches the user's checkout when the
+    task's worktree exists: the merge is REVERSED into the worktree
+    (drcode.merge_engine), a triage report is persisted there, and after
+    the resolution the hook-merge fast-forwards the checkout."""
+    activated = _activated_example(project_root)
+    _isolated_repo(project_root)
+    wt = project_root / ".drcode" / "worktrees" / "t1"
+    (wt / "base.txt").write_text("t1 version\n")
+    _git_ok("add", "base.txt", cwd=wt)
+    _git_ok("commit", "-m", "t1", cwd=wt)
+    (project_root / "base.txt").write_text("main version\n")
+    _git_ok("commit", "-qam", "main change", cwd=project_root)
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t1", "")
+    worktree = {"path": str(wt), "branch": "drcode/t1"}
+
+    conflicted = await hooks.call("on_accepted", task, cwd=wt, worktree=worktree)
+    assert conflicted.ok, conflicted.error
+    text = conflicted.output["text"]
+    # The markers the unmerged-work tracking stamps on ("FAILED"), plus
+    # the context a human needs (where, what, how to conclude).
+    assert "FAILED" in text and "CONFLICT" in text
+    assert str(wt) in text and "--ff-only" in text
+    # The checkout is clean and untouched — the conflict lives in the
+    # task's worktree instead.
+    assert _git_out("status", "--porcelain", "-uno", cwd=project_root) == ""
+    assert (project_root / "base.txt").read_text(encoding="utf-8") == "main version\n"
+    assert "<<<<<<<" in (wt / "base.txt").read_text(encoding="utf-8")
+    # The triage report is persisted under the task's real id.
+    assert (project_root / ".drcode" / "merge_reports" / f"{task.id}.json").is_file()
+
+    # Resolve in the worktree (as a human or the future agent resolver
+    # would), conclude the merge, re-run the hook: now a fast-forward.
+    (wt / "base.txt").write_text("resolved version\n")
+    _git_ok("add", "base.txt", cwd=wt)
+    from drcode import merge_engine
+
+    merge_engine.rerere_record(wt)
+    ok, _ = merge_engine.finish(wt)
+    assert ok
+    accepted = await hooks.call("on_accepted", task, cwd=wt, worktree=worktree)
+    assert accepted.ok, accepted.error
+    assert "merged drcode/t1" in accepted.output["text"]
+    assert (project_root / "base.txt").read_text(
+        encoding="utf-8"
+    ) == "resolved version\n"
+    assert _git_out("status", "--porcelain", "-uno", cwd=project_root) == ""
+
+
+async def test_clean_hook_merge_via_worktree_fast_forwards(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """No conflict: the reversed merge still lands in the checkout, as a
+    fast-forward (the worktree merge committed the task's branch on top
+    of the base)."""
+    activated = _activated_example(project_root)
+    _isolated_repo(project_root)
+    wt = project_root / ".drcode" / "worktrees" / "t1"
+    (project_root / "other.txt").write_text("main side\n")
+    _git_ok("add", "other.txt", cwd=project_root)
+    _git_ok("commit", "-m", "main work", cwd=project_root)
+    (wt / "feature.txt").write_text("feature\n")
+    _git_ok("add", "feature.txt", cwd=wt)
+    _git_ok("commit", "-m", "feature", cwd=wt)
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t1", "")
+
+    merged = await hooks.call(
+        "on_accepted",
+        task,
+        cwd=wt,
+        worktree={"path": str(wt), "branch": "drcode/t1"},
+    )
+    assert merged.ok, merged.error
+    assert "merged drcode/t1" in merged.output["text"]
+    assert (project_root / "feature.txt").read_text(encoding="utf-8") == "feature\n"
+    assert (project_root / "other.txt").read_text(encoding="utf-8") == "main side\n"
+
+
+async def test_dirty_task_worktree_hook_merge_reports_not_merged(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """The engine refuses to reverse-merge into a worktree with uncommitted
+    TRACKED changes: reported as NOT merged, checkout untouched."""
+    activated = _activated_example(project_root)
+    _isolated_repo(project_root)
+    wt = project_root / ".drcode" / "worktrees" / "t1"
+    (project_root / "base.txt").write_text("main version\n")
+    _git_ok("commit", "-qam", "main change", cwd=project_root)
+    (project_root / "other.txt").write_text("main side\n")
+    _git_ok("add", "other.txt", cwd=project_root)
+    _git_ok("commit", "-m", "main work", cwd=project_root)
+    (wt / "base.txt").write_text("uncommitted task scratch\n")
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t1", "")
+
+    refused = await hooks.call(
+        "on_accepted",
+        task,
+        cwd=wt,
+        worktree={"path": str(wt), "branch": "drcode/t1"},
+    )
+    assert refused.ok, refused.error
+    text = refused.output["text"]
+    assert "NOT merged" in text
+    assert _git_out("status", "--porcelain", "-uno", cwd=project_root) == ""
+    assert not (project_root / "feature.txt").exists()
+
+
 def test_describe_lists_defined_hooks(project_root: Path) -> None:
     make_script(project_root, "def on_review(task):\n    return None\n")
     hooks = make_hooks(project_root)

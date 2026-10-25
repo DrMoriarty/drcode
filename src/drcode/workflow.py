@@ -208,7 +208,11 @@ WHICH HOOKS TO UNCOMMENT (the three common setups)
     already active — no other edits are needed. Afterwards: task done and
     tester-passed means its commits are in your checkout's branch; each
     merge is recorded in the task's service-event log ("accepted: merged
-    drcode/<id> into <branch>").
+    drcode/<id> into <branch>"). A CONFLICTED merge never touches your
+    checkout: it is reversed into the task's worktree (see
+    _merge_task_branch below) with a triage report in
+    .drcode/merge_reports/<task-id>.json — resolve there, then
+    `git merge --ff-only drcode/<id>`.
 
 2.  TASK ISOLATION, MANUAL MERGE. Tasks work in worktrees, but you merge
     `drcode/<task-id>` into your branch by hand when you are ready.
@@ -273,7 +277,18 @@ def _merge_task_branch(task, what):
     the branch is reported for a manual merge instead of fighting the
     user's uncommitted work (untracked files, e.g. this very script, do
     not block the merge). With isolation off the work already IS in the
-    shared tree: nothing to merge, returns None."""
+    shared tree: nothing to merge, returns None.
+
+    CONFLICTS never touch the user's checkout. When the task's worktree
+    exists and `drcode.merge_engine` is importable, the merge is REVERSED:
+    the engine merges the base branch INTO the task's worktree instead
+    (`drcode.merge_engine.merge_base_into_worktree`). A clean reversal is
+    fast-forwarded into the checkout (`--ff-only`); a conflict stays
+    half-done in the ISOLATED worktree — with a structured triage report
+    in `.drcode/merge_reports/<task-id>.json` — where it is resolved by
+    hand or by an agent, never in the shared tree (the old behaviour
+    aborted a conflicted merge in the user's checkout and told them to
+    "sort it out by hand" with zero context)."""
     worktree = task.get("worktree")
     if not worktree:
         return None
@@ -293,15 +308,65 @@ def _merge_task_branch(task, what):
             f"checkout has uncommitted changes; merge by hand when ready: "
             f"git merge {branch}"
         }
+    wt_path = worktree.get("path")
+    if wt_path and Path(wt_path).is_dir():
+        result = _merge_via_worktree(task, what, branch, base, main, Path(wt_path))
+        if result is not None:
+            return result
+    return _merge_in_checkout(what, branch, base, main)
+
+
+def _merge_via_worktree(task, what, branch, base, main, wt_path):
+    """The reversed merge through `drcode.merge_engine`, or None when the
+    engine is unavailable (very old drcode, a frozen bundle without the
+    module) — the caller then falls back to `_merge_in_checkout`."""
+    try:
+        from drcode import merge_engine
+    except ImportError:
+        return None
+    task_id = task["task"]["id"]
+    report = merge_engine.merge_base_into_worktree(
+        main, task_id, wt_path, base, branch=branch, save=True
+    )
+    if not report.ok:
+        return {
+            "text": f"{what}: branch {branch} NOT merged into {base} — "
+            f"{report.message}. Resolve by hand: git merge {branch}"
+        }
+    if report.conflicted:
+        remaining = ", ".join(f.path for f in report.remaining[:20])
+        report_path = merge_engine.report_path(main, task_id)
+        return {
+            "text": f"{what}: merge of {base} into {branch} FAILED — "
+            f"CONFLICT: the conflicted merge is parked in the task's "
+            f"worktree {wt_path} (the checkout is untouched); resolve the "
+            f"conflicts there ({remaining}), commit, then run "
+            f"`git merge --ff-only {branch}` from {main}. Triage report: "
+            f"{report_path}\\n{report.summary()}"
+        }
+    code, out = _git("-C", str(main), "merge", "--ff-only", "--no-edit", branch)
+    if code != 0:
+        # The checkout moved on between the clean check and here (or the
+        # worktree merge was already merged): never force it.
+        return {
+            "text": f"{what}: fast-forward merge of {branch} into {base} "
+            f"FAILED ({main} is clean again — nothing was written); "
+            f"merge by hand: git merge {branch}:\\n{out}"
+        }
+    return {"text": f"{what}: merged {branch} into {base}:\\n{out}"}
+
+
+def _merge_in_checkout(what, branch, base, main):
+    """The direct merge into the user's checkout (the fallback when the
+    task's worktree is gone or the engine is unavailable). A conflicted
+    merge must not stay half-done in the shared checkout: every later
+    hook-merge would cascade ("the checkout has uncommitted changes").
+    Abort it — the tree returns to the pre-merge state and the branch is
+    reported for a manual merge instead. The abort is best-effort: when
+    the merge failed without starting (e.g. an unknown branch) it is a
+    harmless no-op, and its failure must not mask the original one."""
     code, out = _git("-C", str(main), "merge", "--no-edit", branch)
     if code != 0:
-        # A conflicted merge must not stay half-done in the shared
-        # checkout: every later hook-merge would cascade ("the checkout
-        # has uncommitted changes"). Abort it — the tree returns to the
-        # pre-merge state and the branch is reported for a manual merge
-        # instead. The abort is best-effort: when the merge failed
-        # without starting (e.g. an unknown branch) it is a harmless
-        # no-op, and its failure must not mask the original one.
         _git("-C", str(main), "merge", "--abort")
         return {
             "text": f"{what}: merge of {branch} into {base} FAILED — the "

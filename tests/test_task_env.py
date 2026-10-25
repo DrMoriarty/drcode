@@ -239,6 +239,39 @@ def test_copy_skips_dependency_dirs(env: TaskEnvironment, git_root: Path) -> Non
     assert not (root / "node_modules").exists()
 
 
+def test_copy_skips_nested_cache_dirs_at_any_depth(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """The skip filter matches ANY path component, not just the first:
+    a nested __pycache__ (first component is src/), a node_modules buried
+    in another tool's state directory and a bare .pyc must not reach the
+    fresh worktree — while the plain untracked file next to them does."""
+    (git_root / "src" / "pkg" / "__pycache__").mkdir(parents=True)
+    (git_root / "src" / "pkg" / "__pycache__" / "mod.cpython-312.pyc").write_text("b")
+    (git_root / "src" / "top.pyc").write_text("b")
+    (git_root / "src" / "real.py").write_text("real code")
+    buried = git_root / ".toolstate" / "node_modules" / "dep"
+    buried.mkdir(parents=True)
+    (buried / "lib.js").write_text("x")
+    root, _ = env.ensure_root("t1")
+    assert (root / "src" / "real.py").read_text() == "real code"
+    assert not (root / "src" / "pkg" / "__pycache__").exists()
+    assert not (root / "src" / "top.pyc").exists()
+    assert not (root / ".toolstate").exists()
+
+
+def test_copy_ignores_nested_repositories(env: TaskEnvironment, git_root: Path) -> None:
+    """A nested git repository (its own .git entry) is that repository's
+    business: git never listed its files as "others", and the walk-based
+    enumeration prunes it instead of dragging the whole tree across."""
+    nested = git_root / "vendor" / "tool"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q")
+    (nested / "inner.txt").write_text("belongs to the nested repo")
+    root, _ = env.ensure_root("t1")
+    assert not (root / "vendor" / "tool" / "inner.txt").exists()
+
+
 # -- workflow hook payload -----------------------------------------------------------
 
 

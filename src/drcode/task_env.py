@@ -74,8 +74,8 @@ Files git does not track are not part of a worktree checkout. To keep
 agent, creating a worktree copies the untracked/ignored files of the
 main tree (``git ls-files --others …``) into it, with two documented
 limitations: heavy dependency/cache directories (see `_COPY_SKIP_DIRS`:
-`.venv`, `node_modules`, …) are skipped — recreate them inside the
-worktree with your package manager — and the copy stops at
+`.venv`, `node_modules`, …) are skipped at ANY path depth (as are `*.pyc`
+files) — recreate them inside the worktree with your package manager — and the copy stops at
 `_COPY_FILE_LIMIT` files (a pathological tree must not stall the
 activation for minutes); both are reported into the task's service-event
 log by the pipeline when they bite.
@@ -111,11 +111,12 @@ task's docs branch into the user's tree from inside the worktree.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import threading
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .gitignore import _is_git_repo
 from .models import Task, TaskStatus
@@ -166,6 +167,19 @@ _COPY_SKIP_DIRS: frozenset[str] = frozenset(
 # Hard cap on the file copy into a fresh worktree (beyond it the copy is
 # truncated and the pipeline reports it).
 _COPY_FILE_LIMIT = 5000
+
+
+def _copy_skipped(rel: str) -> bool:
+    """Should this relative (POSIX) path stay out of the untracked-file
+    copy? The skip directories match at ANY path depth — the old
+    first-component-only check let nested caches through (`src/**/__pycache__/
+    *.pyc`, a `node_modules` buried in another tool's state directory), which
+    is where the multi-second activations came from. `*.pyc` files are
+    skipped anywhere too (bytecode regenerates, and cold-cache copies of it
+    are disproportionately slow)."""
+    if rel.endswith(".pyc"):
+        return True
+    return any(part in _COPY_SKIP_DIRS for part in PurePosixPath(rel).parts)
 
 
 def branch_for(task_id: str) -> str:
@@ -384,8 +398,48 @@ class TaskEnvironment:
 
     def _collect_untracked(self) -> list[str]:
         """Untracked (plain + gitignored) files of the main tree, relative
-        POSIX paths. The private `.drcode/` state and the heavy dependency
-        directories are excluded (see module docstring)."""
+        POSIX paths, sorted. The private `.drcode/` state and the heavy
+        dependency/cache directories — at ANY path depth — are excluded
+        (see module docstring).
+
+        Enumeration is a plain `os.walk` that prunes the skip directories
+        in place (never descends into them, and into nested git
+        repositories / submodules) minus git's tracked-file listing —
+        which reads the index and never touches the working tree. That
+        avoids materializing git's full untracked list only to filter it
+        afterwards in Python: a big ignored `.venv` alone is tens of
+        thousands of entries, and the enumeration cost was paid on EVERY
+        activation. When git cannot even produce the tracked listing
+        (broken repository), the git-only fallback below keeps the copy
+        working — just slower."""
+        code, out = self._git("ls-files", "-z")
+        if code != 0:
+            return self._collect_untracked_git()
+        tracked = {rel for rel in (raw.strip() for raw in out.split("\0")) if rel}
+        root = self.project_root
+        files: dict[str, None] = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            here = Path(dirpath)
+            # In-place prune: os.walk never enters a name dropped here.
+            # A directory with its own `.git` entry (a submodule, a nested
+            # repository) belongs to that repository — git never listed
+            # its contents as "others" either.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _COPY_SKIP_DIRS and not (here / d / ".git").exists()
+            ]
+            for name in filenames:
+                rel = (here / name).relative_to(root).as_posix()
+                if rel in tracked or _copy_skipped(rel):
+                    continue
+                files[rel] = None
+        return sorted(files)
+
+    def _collect_untracked_git(self) -> list[str]:
+        """The git-only enumeration (fallback when the tracked listing is
+        unavailable): two `ls-files --others` passes (gitignored + plain)
+        with the same any-depth skip predicate applied afterwards."""
         files: dict[str, None] = {}
         for extra in (["--ignored"], []):
             code, out = self._git(
@@ -399,13 +453,10 @@ class TaskEnvironment:
                 continue
             for raw in out.split("\0"):
                 rel = raw.strip()
-                if not rel or rel in files:
-                    continue
-                first = Path(rel).parts[0] if Path(rel).parts else ""
-                if first in _COPY_SKIP_DIRS:
+                if not rel or rel in files or _copy_skipped(rel):
                     continue
                 files[rel] = None
-        return list(files)
+        return sorted(files)
 
     def _copy_untracked_files(self, wt: Path) -> str:
         """Carry the main tree's untracked/ignored files into a fresh

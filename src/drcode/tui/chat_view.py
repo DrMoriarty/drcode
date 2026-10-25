@@ -194,8 +194,12 @@ class ChatViewLayer(DrCodeState):
         """Re-render the todo panel from the viewed task's checklist.
 
         Visible (auto-sized) only when the task has a non-empty `todos`;
-        hidden otherwise. A fully completed checklist collapses to the
-        single `todos N/N` counter line. Done items render struck-through-dim (rich does
+        hidden otherwise. The default collapse state matches the historic
+        behavior: a fully completed checklist collapses to the single
+        `todos N/N` counter line, anything else shows all items. Clicking
+        the header toggles the state manually (session-only override on
+        the panel, reset when another task is viewed). Done items render
+        struck-through-dim (rich does
         not strike through reliably across terminals — dim is the portable
         equivalent); unchecked ones in the normal text color. Read-only:
         the agent owns the list."""
@@ -207,13 +211,30 @@ class ChatViewLayer(DrCodeState):
         if task is None or not task.todos:
             panel.add_class("hidden")
             return
+        # A manual collapse override lives only within one task's view:
+        # switching tasks falls back to the default auto behavior.
+        if panel.task_id != task.id:
+            panel.task_id = task.id
+            panel.user_collapsed = None
         done = len(task.todos) - len(task.unchecked_todos)
+        collapsed = (
+            panel.user_collapsed
+            if panel.user_collapsed is not None
+            else done == len(task.todos)
+        )
+        # The whole header line is the click target (`@click` action, same
+        # mechanism as the task-id mention links); Textual underlines link
+        # spans on hover, which doubles as the affordance hint.
         lines = [
-            f"[bold $accent]todos[/] [dim]{done}/{len(task.todos)}[/]",
+            (
+                f"[@click=app.toggle_todo_panel][bold $accent]todos[/] "
+                f"[dim]{done}/{len(task.todos)}[/dim][/]"
+            ),
         ]
-        if done == len(task.todos):
-            # Fully completed checklist: collapse to the single counter
-            # line — the items themselves carry no useful signal anymore.
+        if collapsed:
+            # Collapsed: the counter line alone — either the default (a
+            # fully completed checklist carries no useful item signal
+            # anymore) or a user override.
             panel.update("\n".join(lines))
             panel.remove_class("hidden")
             return
@@ -227,6 +248,30 @@ class ChatViewLayer(DrCodeState):
                 lines.append(f"  \\[ ] {i}. {text}")
         panel.update("\n".join(lines))
         panel.remove_class("hidden")
+
+    def action_toggle_todo_panel(self) -> None:
+        """`@click` target of the todo panel's header line: flip the
+        checklist between collapsed and expanded.
+
+        The first click on an untouched panel inverts its DEFAULT state
+        (a fully-completed checklist auto-collapses, anything else is
+        expanded); further clicks simply toggle. The override is
+        session-only — `refresh_todo_panel` resets it on a task switch."""
+        try:
+            panel = self.todo_panel
+        except NoMatches:
+            return
+        task = self.viewed
+        if task is None or not task.todos:
+            return
+        done = len(task.todos) - len(task.unchecked_todos)
+        if panel.user_collapsed is None:
+            # Invert the auto state: default-collapsed → expand, and
+            # vice versa.
+            panel.user_collapsed = done != len(task.todos)
+        else:
+            panel.user_collapsed = not panel.user_collapsed
+        self.refresh_todo_panel()
 
     def _poll_new_tasks(self) -> None:
         """Watch `<project>/.drcode/tasks/` for tasks created by other

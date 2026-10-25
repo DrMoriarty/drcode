@@ -443,3 +443,85 @@ async def test_todo_panel_collapses_when_all_done(project_root: Path) -> None:
         assert "todos" in text and "2/2" in text
         assert "first" not in text
         assert "second" not in text
+
+
+def _panel_text(app: DrCodeApp) -> str:
+    panel = app.query_one("#todo-panel", TodoPanel)
+    return str(panel.render())
+
+
+async def test_todo_panel_click_toggles_completed_list(project_root: Path) -> None:
+    """A fully-completed checklist defaults to collapsed; a header click
+    expands it, a second click collapses it back."""
+    app = DrCodeApp(project_root)
+    task = app.manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    task.todos = [
+        TodoItem(text="first", done=True),
+        TodoItem(text="second", done=True),
+    ]
+    app.manager.storage.save(task)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Default: collapsed to the counter line (unchanged behavior).
+        assert "first" not in _panel_text(app)
+        # Click → expand.
+        app.action_toggle_todo_panel()
+        await pilot.pause()
+        text = _panel_text(app)
+        assert "first" in text and "second" in text
+        # Second click → collapse again.
+        app.action_toggle_todo_panel()
+        await pilot.pause()
+        assert "first" not in _panel_text(app)
+
+
+async def test_todo_panel_click_toggles_open_list(project_root: Path) -> None:
+    """A checklist with unchecked items defaults to expanded; a header
+    click collapses it to the counter line."""
+    app = DrCodeApp(project_root)
+    task = app.manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    task.todos = [TodoItem(text="first"), TodoItem(text="second", done=True)]
+    app.manager.storage.save(task)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        assert "first" in _panel_text(app)
+        app.action_toggle_todo_panel()
+        await pilot.pause()
+        text = _panel_text(app)
+        assert "todos" in text and "1/2" in text
+        assert "first" not in text
+        assert "second" not in text
+        app.action_toggle_todo_panel()
+        await pilot.pause()
+        assert "first" in _panel_text(app)
+
+
+async def test_todo_panel_override_resets_on_task_switch(project_root: Path) -> None:
+    """The manual collapse override is per-view: switching to another task
+    and back falls back to the default auto state."""
+    app = DrCodeApp(project_root)
+    task_a = app.manager.create("feature", "brief a", kind=TaskKind.FEATURE)
+    task_a.todos = [TodoItem(text="alpha"), TodoItem(text="beta")]
+    app.manager.storage.save(task_a)
+    task_b = app.manager.create("feature", "brief b", kind=TaskKind.FEATURE)
+    task_b.todos = [TodoItem(text="gamma")]
+    app.manager.storage.save(task_b)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_a.id)
+        await pilot.pause()
+        app.action_toggle_todo_panel()
+        await pilot.pause()
+        assert "alpha" not in _panel_text(app)
+        app.view_task(task_b.id)
+        await pilot.pause()
+        # Other task: default expanded, untouched by task A's override.
+        assert "gamma" in _panel_text(app)
+        app.view_task(task_a.id)
+        await pilot.pause()
+        # Override was dropped on the switch — back to the default.
+        assert "alpha" in _panel_text(app)

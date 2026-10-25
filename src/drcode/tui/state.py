@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.usage import RunUsage
@@ -587,6 +587,9 @@ class DrCodeState(App[None]):
     _session_durations: list[float]
 
     # -- new-task form ------------------------------------------------------
+    # Tab-cycle order of the task kinds (TaskFormLayer; the lifecycle
+    # layer's kind cycle for existing tasks reads the same order).
+    _KIND_CYCLE: ClassVar[tuple[TaskKind, ...]]
     _new_task_mode: bool
     _new_task_prev_id: str | None
     _editing_task_id: str | None

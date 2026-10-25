@@ -853,6 +853,133 @@ async def test_hard_limit_noop_marks_exhausted(
     assert scripted.calls == []  # nothing was attempted: a no-op either way
 
 
+async def test_tester_round_livelock_terminates_after_bounded_compactions(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """A role whose cap sits BELOW the testing round's irreducible context
+    floor (system prompt + tool schemas + the original prompt verbatim + a
+    summary that cannot shrink further): every compaction succeeds — the
+    estimate shrinks, so the no-op/estimate guards never fire — yet every
+    resumed turn lands over the hard limit again (the wire-level fill
+    includes the system prompt and tools the transcript estimate lacks).
+    The gate must terminate after a bounded number of compactions with a
+    diagnostic event naming the misconfigured cap, instead of cycling
+    pause→compact→resume forever (the bench live-lock: 249 compactions,
+    zero progress)."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    # Hold the task so the pipeline does not promote it while the gate is
+    # exercised directly.
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    # A testing round whose every real request lands over the hard limit
+    # (1050 of the 1000-token window): the cap is below the round's floor.
+    task.tester_messages = [
+        serialize_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content="Verify completed task #1")]
+                ),
+                ModelResponse(
+                    parts=[TextPart("working")],
+                    usage=RequestUsage(input_tokens=1050, output_tokens=8),
+                ),
+            ]
+        )
+    ]
+    net_app_small_ctx.manager.storage.save(task)
+    # Far more summarizer steps than the livelock budget: an unguarded gate
+    # would consume them all (and keep going).
+    scripted.steps = [text_response("THE SUMMARY BODY") for _ in range(10)]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        # The live-lock cycle, 10 times: the gate fires over the hard limit,
+        # the compaction succeeds, the resumed turn adds fresh content again.
+        for _ in range(10):
+            await net_app_small_ctx._maybe_compact_tester_round(task, 1050)
+            await pilot.pause()
+            task.tester_messages[-1].append(
+                serialize_messages(
+                    [
+                        ModelResponse(
+                            parts=[TextPart("more work")],
+                            usage=RequestUsage(input_tokens=1050, output_tokens=8),
+                        )
+                    ]
+                )[0]
+            )
+
+    # Bounded: exactly the livelock budget of compactions ran, then the gate
+    # stopped — the remaining summarizer steps were never consumed.
+    assert len(scripted.calls) == 3
+    assert any(is_summary_message(m) for m in task.tester_messages[-1])
+    # The gate is disabled for the task on both levels: the mid-round pause
+    # condition in run_tester can no longer fire (no pause→resume churn).
+    assert task.id in net_app_small_ctx._hard_limit_exhausted
+    assert task.id in net_app_small_ctx._compaction_failed
+    texts = event_texts(task)
+    diagnostics = [
+        t for t in texts if "cannot bring the testing round below the hard limit" in t
+    ]
+    assert len(diagnostics) == 1
+    assert "max_context_tokens" in diagnostics[0]
+
+
+async def test_main_agent_livelock_terminates_after_bounded_compactions(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """Same guard for the main-agent transcript gate: consecutive hard-limit
+    compactions that never land a turn under the hard limit stop after the
+    bounded budget with a diagnostic event, instead of looping
+    pause→compact→resume forever."""
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.usage import RequestUsage
+
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+    scripted.steps = [text_response("THE SUMMARY BODY") for _ in range(10)]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(10):
+            # Every resumed turn lands over the hard limit again (1050 of
+            # the 1000-token window) and adds fresh content to summarize.
+            net_app_small_ctx._live_ctx_tokens[task.id] = 1050
+            await net_app_small_ctx._maybe_compact(task)
+            await pilot.pause()
+            task.messages.append(
+                serialize_messages(
+                    [
+                        ModelResponse(
+                            parts=[TextPart("more work")],
+                            usage=RequestUsage(input_tokens=1050, output_tokens=8),
+                        )
+                    ]
+                )[0]
+            )
+
+    assert len(scripted.calls) == 3
+    assert any(is_summary_message(m) for m in task.messages)
+    assert task.id in net_app_small_ctx._hard_limit_exhausted
+    assert task.id in net_app_small_ctx._compaction_failed
+    diagnostics = [
+        t
+        for t in event_texts(task)
+        if "cannot bring the history below the hard limit" in t
+    ]
+    assert len(diagnostics) == 1
+
+
 async def test_tester_round_compaction_mechanical_floor(
     net_app_small_ctx: DrCodeApp, scripted: ScriptedState
 ) -> None:

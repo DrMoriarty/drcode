@@ -620,6 +620,9 @@ class DrCodeState(App[None]):
     # never disables another role's gate.
     _resolver_compaction_failed: set[str]
     _resolver_hard_limit_exhausted: set[str]
+    # Consecutive hard-limit compactions of the resolver round (livelock
+    # guard, see _hard_livelock_stop).
+    _resolver_hard_limit_compactions: dict[str, int]
 
     # -- agent failure / network-retry bookkeeping --------------------------
     _agent_failed: set[str]
@@ -705,6 +708,11 @@ class DrCodeState(App[None]):
     _live_ctx_tokens: dict[str, int]
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
+    # Livelock guard: consecutive hard-limit compactions per task that never
+    # landed a turn under the hard limit (see _hard_livelock_stop). Shared by
+    # the main-agent and tester gates (like the sets above); the resolver
+    # keeps its own counter.
+    _hard_limit_compactions: dict[str, int]
     _last_follow: float
     _chat_epoch: int
 

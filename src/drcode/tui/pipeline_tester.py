@@ -321,7 +321,10 @@ class PipelineTesterLayer(DrCodeState):
                                 # summarizer there escalates to the
                                 # mechanical trim; unless the escalation
                                 # proved unable to shrink the round —
-                                # `_hard_limit_exhausted`).
+                                # `_hard_limit_exhausted`, or the livelock
+                                # guard stopped the gate after consecutive
+                                # compactions that never landed under the
+                                # hard limit — both flags set together).
                                 tokens = self._fill_over_threshold(
                                     live_tokens,
                                     task.tester_messages[-1],

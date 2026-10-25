@@ -43,17 +43,19 @@ from ..notifications import Notifier
 from ..providers import AgentRole, ModelRef
 from ..settings import (
     CompletedRetention,
+    GitPolicy,
     ProjectSettings,
     ProjectSettingsStore,
     StallNudge,
-    TaskFinalization,
     TaskIsolation,
+    Verification,
     WorktreeRemoval,
 )
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..workflow import WorkflowHooks
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
+from .command_providers import WorkflowPreset
 from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
@@ -347,9 +349,25 @@ class DrCodeState(App[None]):
 
     def action_change_completed_retention(self) -> None: ...
 
-    def action_set_task_finalization(self, finalization: TaskFinalization) -> None: ...
+    def action_set_verification(self, verification: Verification) -> None: ...
 
-    def action_change_task_finalization(self) -> None: ...
+    def action_change_verification(self) -> None: ...
+
+    def action_set_git_tester(self, policy: GitPolicy) -> None: ...
+
+    def action_change_git_tester(self) -> None: ...
+
+    def action_set_git_research(self, policy: GitPolicy) -> None: ...
+
+    def action_change_git_research(self) -> None: ...
+
+    def action_set_workflow_preset(self, preset: WorkflowPreset) -> None: ...
+
+    def action_workflow_preset_custom(self) -> None: ...
+
+    def action_change_workflow_preset(self) -> None: ...
+
+    def workflow_preset_label(self) -> str: ...
 
     def action_set_worktree_removal(self, removal: WorktreeRemoval) -> None: ...
 

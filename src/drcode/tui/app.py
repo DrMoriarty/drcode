@@ -51,9 +51,11 @@ from ..providers import (
 )
 from ..providers import resolve_effective as resolve_model_config
 from ..settings import (
+    GitPolicy,
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
+    Verification,
     WorktreeRemoval,
 )
 from ..task_env import TaskEnvironment
@@ -1011,6 +1013,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 "but needs Task isolation: worktree (a git repository) — "
                 "tasks run one at a time until it is on.",
                 title="Parallel tasks",
+                severity="warning",
+                timeout=12,
+            )
+        if (
+            self.settings.verification is Verification.NONE
+            and self.settings.git_policy.tester is not GitPolicy.OFF
+        ):
+            # The tester's git policy is persisted even with no tester
+            # round (the user's choice is never rewritten silently) — but
+            # then it is dormant: warn at EVERY startup until verification
+            # is back on or the policy is switched to off.
+            self.notify(
+                "Verification is set to none, but the tester's Git "
+                f"policy ({self.settings.git_policy.tester.label}) is "
+                "saved — no tester runs, so nothing commits. Switch "
+                "Verification to tester or Git (tester) to off in "
+                "Settings (Ctrl+S).",
+                title="Git (tester)",
                 severity="warning",
                 timeout=12,
             )

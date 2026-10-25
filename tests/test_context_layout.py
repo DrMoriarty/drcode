@@ -35,6 +35,7 @@ from drcode.context_layout import (
     tester_tool_schemas as make_tester_tools,
 )
 from drcode.models import TaskKind
+from drcode.settings import GitPolicy
 from drcode.tui.app import DrCodeApp
 from drcode.tui.ctx_dialog import ContextDialog
 from drcode.tui.pipeline import PipelineLayer
@@ -132,8 +133,8 @@ def test_tool_schemas_follow_role_and_kind(project_root: Path) -> None:
     )
     assert "git_commit" in with_commit and "git_commit" not in without_commit
     assert "set_verification" in without_commit
-    # Commit-without-push finalization: the tool stays registered (its
-    # wire-text differs — LOCAL commit, no push promise).
+    # Commit-without-push tester git policy: the tool stays registered
+    # (its wire-text differs — LOCAL commit, no push promise).
     no_push = dict(
         make_tester_tools(
             config, allow_commit=True, allow_push=False, root=project_root
@@ -142,6 +143,43 @@ def test_tool_schemas_follow_role_and_kind(project_root: Path) -> None:
     assert "git_commit" in no_push
     assert "LOCAL" in no_push["git_commit"]
     assert "push the branch" not in no_push["git_commit"]
+    # Research: git_commit_docs follows the research git policy — push by
+    # default, still registered under local, gone under off.
+    research_off = dict(
+        coding_tool_schemas(
+            config, TaskKind.RESEARCH, root=project_root, research_git=GitPolicy.OFF
+        )
+    )
+    research_local = dict(
+        coding_tool_schemas(
+            config, TaskKind.RESEARCH, root=project_root, research_git=GitPolicy.LOCAL
+        )
+    )
+    assert "git_commit_docs" not in research_off
+    assert "git_commit_docs" in research_local
+    assert "this project never pushes" in research_local["git_commit_docs"]
+
+
+def test_system_components_research_git_policy(project_root: Path) -> None:
+    """The context estimate's research prompt mirrors the policy wiring:
+    the push fragment under push, the local fragment under local, neither
+    under off."""
+    push = system_components_coding(
+        TaskKind.RESEARCH, project_root, research_git=GitPolicy.PUSH
+    )
+    local = system_components_coding(
+        TaskKind.RESEARCH, project_root, research_git=GitPolicy.LOCAL
+    )
+    off = system_components_coding(
+        TaskKind.RESEARCH, project_root, research_git=GitPolicy.OFF
+    )
+    push_base = push[0][1] or ""
+    local_base = local[0][1] or ""
+    off_base = off[0][1] or ""
+    assert "pushes the branch when a remote is configured" in push_base
+    assert "never push" in local_base
+    assert "pushes the branch" not in local_base
+    assert "git_commit_docs" not in off_base
 
 
 def test_analyze_buckets_parts_and_finds_heaviest_results() -> None:

@@ -320,6 +320,7 @@ class PipelineAgentRunLayer(DrCodeState):
             self.resolved_config(role),
             kind=task.kind,
             root=root,
+            research_git=self.settings.git_policy.research,
         )
         return root, agent, workflow_instructions
 

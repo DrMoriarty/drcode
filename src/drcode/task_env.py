@@ -12,7 +12,7 @@ activation the facade creates
 (the `.drcode/worktrees/` directory is gitignored — see `drcode.gitignore`)
 and that path becomes the agent's project root: the filesystem tools are
 jailed to it, `{project_path}` in the system prompts points at it and the
-tester commits (TESTING_COMMIT finalization) land on the task's own
+tester commits (tester git policy: local or push) land on the task's own
 branch. An interrupted task simply keeps its worktree — the next task is
 activated in its own, clean one. That is the point of the feature.
 

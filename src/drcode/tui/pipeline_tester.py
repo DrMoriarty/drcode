@@ -111,7 +111,7 @@ class PipelineTesterLayer(DrCodeState):
             # The tester verifies the task in ITS worktree (per-task
             # worktree isolation, see run_agent): the round runs against
             # exactly the tree the development agent worked in, and the
-            # TESTING_COMMIT finalization commits onto the task's branch.
+            # tester's git policy commits onto the task's branch.
             # A worktree lost to a manual deletion is recreated here (the
             # branch with the task's commits is re-checked-out).
             root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
@@ -119,8 +119,8 @@ class PipelineTesterLayer(DrCodeState):
                 self._show_event(task, f"Task isolation unavailable: {iso_note}")
             tester = build_tester_agent(
                 self.resolved_config(AgentRole.TESTER),
-                allow_commit=self.settings.task_finalization.commits,
-                allow_push=self.settings.task_finalization.pushes,
+                allow_commit=self.settings.git_policy.tester.commits,
+                allow_push=self.settings.git_policy.tester.pushes,
                 root=root,
                 # The external review (`.drcode/workflow.py` on_review)
                 # splits "the tester passed" from "the task is accepted":

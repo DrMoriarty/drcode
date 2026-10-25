@@ -23,7 +23,7 @@ The team's process rules in plain language. When the file exists:
 - in the system prompts of the coding agents (feature / bug / research) it
   **replaces** the built-in "Never commit to git" sentence — committing
   becomes part of the workflow, governed by the file's text;
-- it is **appended** to the tester's system prompt, so the finalization
+- it is **appended** to the tester's system prompt, so the git finalization
   (commit / push / PR) follows the same team rules.
 
 A project may also override any bundled system prompt entirely by placing a
@@ -111,7 +111,7 @@ Behaviour per hook:
   (`uv tool install . --force`). A hook failure is **fail-open** (logged,
   the pipeline moves on — an install step must not park tasks). Research
   tasks never trigger it; neither do the cancellation paths or the
-  "Task finalization: None" setting (no PASSED label is stamped there).
+  "Verification: none" setting (no PASSED label is stamped there).
 - **`on_review`** — the external review gate. After the tester stamps the
   task PASSED, the pipeline calls `on_review` (the task stays in TESTING —
   no new development starts while a verdict is outstanding, exactly like an
@@ -147,8 +147,13 @@ arrives days later still finds its task.
 The tester's `git_commit` tool is **not** disabled by a custom workflow: a
 hook that checked out a feature branch receives the tester's commit and push
 on that branch (`git push` falls back to `git push --set-upstream origin
-HEAD`), leaving the default branch untouched. Disabling commits entirely
-remains the existing per-project setting "Task finalization: Testing".
+HEAD`), leaving the default branch untouched. Disabling commits entirely is
+the per-project setting "Git (tester): off" (Settings → Task settings →
+Git); "commit locally" keeps the commit but never pushes. The research
+agent's `git_commit_docs` follows its own "Git (research)" policy the same
+way — `off` removes the tool and the commit paragraph from the research
+prompt, and `.drcode/git-workflow.md` still takes precedence over both:
+its prose rules govern when committing is allowed.
 
 ## Sharing with the team
 

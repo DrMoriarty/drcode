@@ -185,9 +185,18 @@ async def test_research_task_builds_agent_with_research_role_config(
     seen: list[tuple[str, str, str]] = []
     real_build_agent = pipeline_agent_run.build_agent
 
-    def spy_build_agent(config: Any, *, kind: Any = TaskKind.FEATURE, root: Any = None):
+    def spy_build_agent(
+        config: Any,
+        *,
+        kind: Any = TaskKind.FEATURE,
+        root: Any = None,
+        research_git: Any = None,
+    ):
         seen.append((kind.value, config.model, config.base_url))
-        return real_build_agent(config, kind=kind, root=root)
+        kwargs = {"kind": kind, "root": root}
+        if research_git is not None:
+            kwargs["research_git"] = research_git
+        return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
     set_project_custom_model(

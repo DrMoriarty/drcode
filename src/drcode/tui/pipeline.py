@@ -27,7 +27,7 @@ from ..config import Config
 from ..keepawake import statuses_hold_awake
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus
 from ..providers import AgentRole
-from ..settings import TaskFinalization, TaskIsolation
+from ..settings import TaskIsolation, Verification
 from .pipeline_agent_run import PipelineAgentRunLayer
 from .pipeline_compaction import PipelineCompactionLayer
 from .pipeline_deps import PipelineDepsLayer
@@ -263,7 +263,7 @@ class PipelineCoreLayer(DrCodeState):
         if not self.tester_running:
             # Tester-side duties — any of them firing returns: while a
             # test can start right now, no development is promoted.
-            if self.settings.task_finalization is TaskFinalization.NONE:
+            if self.settings.verification is Verification.NONE:
                 # No tester at all: every task that reached TESTING (this
                 # tick or left over from a run started under another
                 # setting) is completed straight away, and the queue

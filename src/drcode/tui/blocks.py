@@ -12,6 +12,7 @@ from rich.markdown import Markdown
 from rich.style import Style
 from rich.syntax import Syntax
 from rich.text import Text
+from textual.containers import VerticalScroll
 from textual.timer import Timer
 from textual.widgets import Static
 
@@ -58,6 +59,29 @@ def linkify(text: Text) -> Text:
         task_id = match.group(1).lower()
         text.stylize(_mention_click_style(task_id), match.start(), match.end())
     return text
+
+
+class ChatLog(VerticalScroll):
+    """The chat-history scroll (#chat-log).
+
+    The gaps between blocks are CSS margin (`#chat-log > * { margin-bottom:
+    1 }`), so those lines belong to NO widget: the block regions in the
+    compositor's map exclude the margin, and the in-between lines are drawn
+    by the parent VerticalScroll's background. The CHOPS renderer only sends
+    dirty regions to the terminal, and on a scroll the gap lines land in
+    dirty regions only by accident (the scrollbar column overlapping every
+    line, a full-screen repaint) — when that doesn't happen, stale text from
+    the previous frame survives in the gaps. The same class of artifact shows
+    under a block that shrank (collapse click, markdown re-render after a
+    stream ends). Full-viewport repaint on every scroll step eliminates it
+    regardless of the compositor's dirty tracking; strip caching keeps the
+    cost low (recompose of ~40 lines per frame).
+    """
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            self.refresh()
 
 
 class UserBlock(Static):

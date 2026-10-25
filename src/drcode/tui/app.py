@@ -21,7 +21,7 @@ from textual.app import (
     SystemCommand,
     get_system_commands_provider,
 )
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widget import Widget
@@ -62,7 +62,12 @@ from ..tools import cleanup_orphan_scratches
 from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
-from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock  # noqa: F401
+from .blocks import (  # noqa: F401
+    AssistantBlock,
+    ChatLog,
+    ReasoningBlock,
+    ToolCallBlock,
+)
 from .chat_view import ChatViewLayer
 from .command_providers import (
     DependencyCommandsProvider,
@@ -709,7 +714,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 with Horizontal(id="task-statusbar"):
                     yield Static("", id="task-status-left")
                     yield Static("", id="task-status-right")
-                yield VerticalScroll(id="chat-log")
+                yield ChatLog(id="chat-log")
                 yield TodoPanel("", id="todo-panel", classes="hidden")
                 yield ChatInput(placeholder="Type a message…", id="chat-input")
                 with Vertical(id="new-task", classes="hidden"):

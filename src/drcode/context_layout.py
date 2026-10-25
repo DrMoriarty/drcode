@@ -88,11 +88,13 @@ def system_components_coding(
 
 
 def system_components_tester(
-    allow_commit: bool, project_root: Path | None
+    allow_commit: bool, project_root: Path | None, allow_push: bool = True
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of the tester run (the tester prompt
     carries no AGENTS.md — `build_tester_agent` never appends it)."""
-    base, git_workflow = load_tester_prompt_components(allow_commit, project_root)
+    base, git_workflow = load_tester_prompt_components(
+        allow_commit, project_root, allow_push
+    )
     return [("base template", base), ("git workflow", git_workflow)]
 
 
@@ -143,11 +145,17 @@ def coding_tool_schemas(
 
 
 def tester_tool_schemas(
-    config: Config, *, allow_commit: bool = True, root: Path | None = None
+    config: Config,
+    *,
+    allow_commit: bool = True,
+    allow_push: bool = True,
+    root: Path | None = None,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the tester agent."""
     return tool_schemas(
-        build_tester_agent(config, allow_commit=allow_commit, root=root)
+        build_tester_agent(
+            config, allow_commit=allow_commit, allow_push=allow_push, root=root
+        )
     )
 
 
@@ -499,6 +507,7 @@ def task_reports(
     *,
     live_tokens: int | None = None,
     tester_allow_commit: bool = True,
+    tester_allow_push: bool = True,
 ) -> tuple[CtxReport | None, CtxReport | None, RunUsage, int]:
     """The two transcript reports of one task plus its whole-task cumulative
     exact usage.
@@ -527,10 +536,13 @@ def task_reports(
             round_messages,
             tester_config,
             system_components=system_components_tester(
-                tester_allow_commit, project_root
+                tester_allow_commit, project_root, tester_allow_push
             ),
             tools=tester_tool_schemas(
-                tester_config, allow_commit=tester_allow_commit, root=project_root
+                tester_config,
+                allow_commit=tester_allow_commit,
+                allow_push=tester_allow_push,
+                root=project_root,
             ),
         )
     usage, requests = cumulative_usage([task.messages, *task.tester_messages])

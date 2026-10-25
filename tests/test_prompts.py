@@ -54,12 +54,48 @@ def test_tester_prompt_substitutes_project_path(tmp_path: Path) -> None:
         assert PROJECT_PATH_PLACEHOLDER not in prompt
 
 
+def test_tester_prompt_no_push_variant(tmp_path: Path) -> None:
+    """The commit-without-push finalization selects the dedicated template:
+    it teaches the commit flow but never promises a push — and the default
+    (pushing) template does."""
+    from drcode.prompts import TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH
+
+    pushy = load_tester_prompt(True, tmp_path)
+    no_push = load_tester_prompt(True, tmp_path, allow_push=False)
+    no_commit = load_tester_prompt(False, tmp_path, allow_push=False)
+    # The no-push prompt is its own template, distinct from both others.
+    assert no_push == TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH.replace(
+        "{project_path}", str(tmp_path)
+    )
+    assert no_push != pushy and no_push != no_commit
+    assert "git_commit" in no_push
+    assert "never push" in no_push
+    # The no-push template must not promise a push anywhere.
+    assert "it also pushes the branch" not in no_push
+    # The default template keeps its push promise.
+    assert "pushes the branch" in pushy
+
+
+def test_tester_prompt_no_push_project_override(tmp_path: Path) -> None:
+    """`.drcode/prompts/tester_commit_no_push.md` overrides the bundled
+    no-push template, like the other tester variants."""
+    override_dir = tmp_path / ".drcode" / "prompts"
+    override_dir.mkdir(parents=True)
+    (override_dir / "tester_commit_no_push.md").write_text(
+        "Working directory (project root): {project_path}\nCustom no-push prompt."
+    )
+    prompt = load_tester_prompt(True, tmp_path, allow_push=False)
+    assert "Custom no-push prompt." in prompt
+    assert str(tmp_path) in prompt
+
+
 def test_system_prompt_templates_carry_placeholder_header() -> None:
     from drcode.prompts import (
         BUG_SYSTEM_PROMPT,
         FEATURE_SYSTEM_PROMPT,
         RESEARCH_SYSTEM_PROMPT,
         TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
         TESTER_SYSTEM_PROMPT_NO_COMMIT,
     )
 
@@ -69,6 +105,7 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
         RESEARCH_SYSTEM_PROMPT,
         TESTER_SYSTEM_PROMPT,
         TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
     ):
         assert template.startswith(
             "Working directory (project root): {project_path}\n"

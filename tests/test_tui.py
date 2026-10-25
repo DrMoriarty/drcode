@@ -1873,6 +1873,42 @@ async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
         )
 
 
+async def test_settings_task_finalization_picker(app: DrCodeApp) -> None:
+    """The "Task finalization" setting: the option palette lists all four
+    modes (including the commit-without-push one) with the current one
+    marked, and picking one persists it into the project settings."""
+    from drcode.settings import (
+        FINALIZATION_OPTIONS,
+        ProjectSettingsStore,
+        TaskFinalization,
+    )
+    from drcode.tui.command_providers import FinalizationOptionsProvider
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        commands = FinalizationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _cb in commands] == [
+            f"{option.label} (current)"
+            if option is app.settings.task_finalization
+            else option.label
+            for option in FINALIZATION_OPTIONS
+        ]
+        assert "Testing + Git commit" in [name for name, _cb in commands]
+        # Pick the commit-without-push option.
+        no_push = next(cb for name, cb in commands if name == "Testing + Git commit")
+        no_push()
+        await pilot.pause()
+        assert app.settings.task_finalization is TaskFinalization.TESTING_COMMIT_NO_PUSH
+        assert (
+            ProjectSettingsStore(app.project_root).load().task_finalization
+            is TaskFinalization.TESTING_COMMIT_NO_PUSH
+        )
+        # Re-opening the palette marks the new current option.
+        commands = FinalizationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert commands[1][0] == "Testing + Git commit (current)"
+
+
 async def test_custom_role_model_dialog_prefills_and_saves(
     app: DrCodeApp, project_root: Path
 ) -> None:

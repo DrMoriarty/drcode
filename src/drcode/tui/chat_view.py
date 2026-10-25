@@ -27,7 +27,6 @@ from ..agent import (
 )
 from ..context_layout import task_reports
 from ..providers import AgentRole
-from ..settings import TaskFinalization
 from .blocks import (
     TASK_MENTION_RE,
     AssistantBlock,
@@ -1917,9 +1916,8 @@ class ChatViewLayer(DrCodeState):
             role.value.upper(),
             self.project_root,
             live_tokens=self._live_ctx_tokens.get(task.id),
-            tester_allow_commit=(
-                self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
-            ),
+            tester_allow_commit=self.settings.task_finalization.commits,
+            tester_allow_push=self.settings.task_finalization.pushes,
         )
         self.push_screen(
             ContextDialog([r for r in (dev, tester) if r is not None], usage, requests)

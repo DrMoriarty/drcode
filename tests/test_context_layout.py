@@ -132,6 +132,16 @@ def test_tool_schemas_follow_role_and_kind(project_root: Path) -> None:
     )
     assert "git_commit" in with_commit and "git_commit" not in without_commit
     assert "set_verification" in without_commit
+    # Commit-without-push finalization: the tool stays registered (its
+    # wire-text differs — LOCAL commit, no push promise).
+    no_push = dict(
+        make_tester_tools(
+            config, allow_commit=True, allow_push=False, root=project_root
+        )
+    )
+    assert "git_commit" in no_push
+    assert "LOCAL" in no_push["git_commit"]
+    assert "push the branch" not in no_push["git_commit"]
 
 
 def test_analyze_buckets_parts_and_finds_heaviest_results() -> None:

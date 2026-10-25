@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from pydantic_ai.exceptions import ModelRetry
@@ -905,6 +908,109 @@ async def test_git_push_success_with_bare_remote(tmp_path: Path) -> None:
     assert "Pushed successfully" in result
     task = deps.manager.get(deps.task_id)
     assert task.events == []
+
+
+def _remote_refs(origin: Path) -> str:
+    return subprocess.run(
+        ["git", "ls-remote", str(origin)], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _git_commit_tool(ag) -> Any:
+    """The registered git_commit tool of a built tester agent."""
+    return next(
+        t for t in ag._function_toolset.tools.values() if t.name == "git_commit"
+    )
+
+
+async def _run_git_commit(tool: Any, deps: Any, message: str) -> str:
+    """Invoke the tool's raw function with a minimal stand-in RunContext
+    (the tester's git_commit only touches `ctx.deps`)."""
+    return cast(
+        "str", await tool.function(cast("Any", SimpleNamespace(deps=deps)), message)
+    )
+
+
+async def test_git_commit_no_push_commits_locally(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """The "Testing + Git commit" finalization: the tester's git_commit tool
+    still creates the commit but never touches the remote — no push is
+    attempted, no push events appear, and the remote stays empty."""
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    origin = tmp_path / "origin.git"
+    _git_init_repo(origin, bare=True)
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+
+    deps = _tester_deps(tmp_path)
+    (tmp_path / "g.txt").write_text("y")
+    tester = agent_mod.build_tester_agent(fake_config, allow_push=False)
+    tool = _git_commit_tool(tester)
+    result = await _run_git_commit(tool, deps, "add g.txt")
+
+    assert "Committed successfully" in result
+    assert "never pushes" in result
+    assert "Pushed" not in result
+    # The commit landed locally…
+    assert "add g.txt" in _git_log(tmp_path)
+    # …but the remote branch was never created: no push happened.
+    assert _remote_refs(origin) == ""
+    task = deps.manager.get(deps.task_id)
+    assert task.events == []
+    # The no-push tool advertises its LOCAL-only behavior in its docstring.
+    assert "LOCAL" in (tool.tool_def.description or "")
+    assert "push the branch" not in (tool.tool_def.description or "")
+
+
+async def test_git_commit_no_push_skips_push_even_with_remote(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """Commit-only finalization on a repo without a remote: the commit still
+    succeeds and no 'no remote' push note is logged (push is never tried)."""
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+
+    deps = _tester_deps(tmp_path)
+    (tmp_path / "g.txt").write_text("y")
+    tester = agent_mod.build_tester_agent(fake_config, allow_push=False)
+    result = await _run_git_commit(_git_commit_tool(tester), deps, "add g.txt")
+    assert "Committed successfully" in result
+    assert "no remote" not in result
+    task = deps.manager.get(deps.task_id)
+    assert task.events == []
+
+
+async def test_git_commit_push_variant_still_pushes(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """Default finalization (commit + push): the same tool body pushes to the
+    configured remote — the split must not have broken the default path."""
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    origin = tmp_path / "origin.git"
+    _git_init_repo(origin, bare=True)
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+
+    deps = _tester_deps(tmp_path)
+    (tmp_path / "g.txt").write_text("y")
+    tester = agent_mod.build_tester_agent(fake_config)
+    result = await _run_git_commit(_git_commit_tool(tester), deps, "add g.txt")
+    assert "Committed successfully" in result
+    assert "Pushed successfully" in result
+    assert _remote_refs(origin) != ""
 
 
 # -- tester set_verification(retry_here=True): the fix loop --------------------------

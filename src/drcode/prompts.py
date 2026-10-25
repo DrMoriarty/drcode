@@ -33,6 +33,9 @@ TESTER_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "tester.md").read_text(encoding="ut
 TESTER_SYSTEM_PROMPT_NO_COMMIT = (SYSTEM_PROMPTS_DIR / "tester_no_commit.md").read_text(
     encoding="utf-8"
 )
+TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH = (
+    SYSTEM_PROMPTS_DIR / "tester_commit_no_push.md"
+).read_text(encoding="utf-8")
 
 # Placeholder in the templates, replaced with the actual project directory.
 PROJECT_PATH_PLACEHOLDER = "{project_path}"
@@ -113,11 +116,18 @@ def load_system_prompt_components(
 
 
 def load_tester_prompt_components(
-    allow_commit: bool = True, project_root: Path | None = None
+    allow_commit: bool = True,
+    project_root: Path | None = None,
+    allow_push: bool = True,
 ) -> tuple[str, str | None]:
     """(base prompt, git workflow or None) for the QA tester — the component
     counterpart of `load_system_prompt_components`."""
-    name = "tester_no_commit.md" if not allow_commit else "tester.md"
+    if not allow_commit:
+        name = "tester_no_commit.md"
+    elif not allow_push:
+        name = "tester_commit_no_push.md"
+    else:
+        name = "tester.md"
     template = _project_prompt_override(project_root, name) or (
         SYSTEM_PROMPTS_DIR / name
     ).read_text(encoding="utf-8")
@@ -145,23 +155,29 @@ def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
 
 
 def load_tester_prompt(
-    allow_commit: bool = True, project_root: Path | None = None
+    allow_commit: bool = True,
+    project_root: Path | None = None,
+    allow_push: bool = True,
 ) -> str:
     """Bundled QA tester system prompt.
 
     With ``allow_commit=False`` (project setting "Task finalization: Testing")
     the commit-free template is returned; otherwise the default one that
-    mentions ``git_commit``. A project may override the template with
-    `<root>/.drcode/prompts/tester.md` (or `tester_no_commit.md`). The
-    ``{project_path}`` placeholder in the template header is replaced with the
-    actual project directory; without a root a neutral ``(unknown)`` marker is
-    substituted.
+    mentions ``git_commit``. With ``allow_push=False`` (project setting
+    "Task finalization: Testing + Git commit") the commit-locally template is
+    returned — it never promises a push. A project may override the template
+    with `<root>/.drcode/prompts/tester.md` (or `tester_no_commit.md` /
+    `tester_commit_no_push.md`). The ``{project_path}`` placeholder in the
+    template header is replaced with the actual project directory; without a
+    root a neutral ``(unknown)`` marker is substituted.
 
     When the project defines `.drcode/git-workflow.md`, its rules are
     appended: the tester must finalize the task according to the same team
     process the coding agent follows.
     """
-    base, git_workflow = load_tester_prompt_components(allow_commit, project_root)
+    base, git_workflow = load_tester_prompt_components(
+        allow_commit, project_root, allow_push
+    )
     return _join_components(base, git_workflow)
 
 

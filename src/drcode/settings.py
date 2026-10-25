@@ -53,11 +53,14 @@ class TaskFinalization(str, enum.Enum):
 
     TESTING_COMMIT: the tester verifies the project, commits the verified
     changes and pushes them to the remote (push failure never fails the
-    task — it is only logged). TESTING: the tester verifies but never
-    commits. NONE: no tester at all — tasks go straight to COMPLETED.
+    task — it is only logged). TESTING_COMMIT_NO_PUSH: the tester commits
+    the verified changes but never pushes — the branch stays local.
+    TESTING: the tester verifies but never commits. NONE: no tester at
+    all — tasks go straight to COMPLETED.
     """
 
     TESTING_COMMIT = "testing_commit"
+    TESTING_COMMIT_NO_PUSH = "testing_commit_no_push"
     TESTING = "testing"
     NONE = "none"
 
@@ -66,13 +69,29 @@ class TaskFinalization(str, enum.Enum):
         """Human-readable option label for the settings UI."""
         if self is TaskFinalization.TESTING_COMMIT:
             return "Testing + Git commit + push"
+        if self is TaskFinalization.TESTING_COMMIT_NO_PUSH:
+            return "Testing + Git commit"
         if self is TaskFinalization.TESTING:
             return "Testing"
         return "None"
 
+    @property
+    def commits(self) -> bool:
+        """Whether the tester is allowed to commit verified changes."""
+        return self in (
+            TaskFinalization.TESTING_COMMIT,
+            TaskFinalization.TESTING_COMMIT_NO_PUSH,
+        )
+
+    @property
+    def pushes(self) -> bool:
+        """Whether the tester pushes the branch after committing."""
+        return self is TaskFinalization.TESTING_COMMIT
+
 
 FINALIZATION_OPTIONS: tuple[TaskFinalization, ...] = (
     TaskFinalization.TESTING_COMMIT,
+    TaskFinalization.TESTING_COMMIT_NO_PUSH,
     TaskFinalization.TESTING,
     TaskFinalization.NONE,
 )

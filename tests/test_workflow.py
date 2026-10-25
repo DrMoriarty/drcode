@@ -521,6 +521,12 @@ def test_tester_prompt_with_git_workflow_appends_rules(project_root: Path) -> No
         prompt = load_tester_prompt(allow_commit, project_root=project_root)
         assert "Always rebase before push." in prompt
         assert GIT_WORKFLOW_HEADER in prompt
+    # The commit-without-push variant gets the workflow rules appended too.
+    no_push_prompt = load_tester_prompt(
+        True, project_root=project_root, allow_push=False
+    )
+    assert "Always rebase before push." in no_push_prompt
+    assert GIT_WORKFLOW_HEADER in no_push_prompt
 
 
 def test_project_prompt_override_wins(project_root: Path) -> None:

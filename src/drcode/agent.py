@@ -706,6 +706,7 @@ def build_tester_agent(
     config: Config,
     *,
     allow_commit: bool = True,
+    allow_push: bool = True,
     root: Path | None = None,
     review_gate: bool = False,
 ) -> Agent[TesterDeps, str]:
@@ -713,7 +714,10 @@ def build_tester_agent(
 
     `allow_commit=False` (project setting "Task finalization: Testing")
     selects the commit-free system prompt and does not register the
-    git_commit tool, so verified changes are left uncommitted. When `root`
+    git_commit tool, so verified changes are left uncommitted.
+    `allow_push=False` (project setting "Task finalization: Testing + Git
+    commit") keeps the git_commit tool but it commits locally without ever
+    pushing — the commit-only system prompt is selected. When `root`
     is given, its actual path is substituted into the system prompt header
     (the `{project_path}` placeholder). With `review_gate=True` (an
     external review is defined in `.drcode/workflow.py`) a successful
@@ -723,7 +727,9 @@ def build_tester_agent(
     model = agent_model.build_model(config)
     agent = Agent(
         model,
-        instructions=load_tester_prompt(allow_commit, project_root=root),
+        instructions=load_tester_prompt(
+            allow_commit, project_root=root, allow_push=allow_push
+        ),
         deps_type=TesterDeps,
         model_settings={
             "extra_headers": EXTRA_HEADERS,
@@ -806,18 +812,11 @@ def build_tester_agent(
 
     # The commit tool exists only when the project setting allows it: with
     # "Task finalization: Testing" the model cannot commit even if it tries.
+    # "Testing + Git commit" keeps the tool but pushes nothing: the shared
+    # body below commits locally and returns, skipping `_git_push`.
     if allow_commit:
 
-        @agent.tool
-        async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
-            """Stage all changed files in the project root and create a git commit
-            with the given message, then push the branch to its remote. Use only
-            after all checks passed, with a short message paraphrasing the
-            original task. Skips gracefully when the project root is not a git
-            repository or there is nothing to commit. A failed push (no network,
-            diverged remote, no upstream, …) is NOT a failure: the push error is
-            recorded in the task's event log and the commit stays safe locally —
-            still proceed with set_verification(success=True)."""
+        async def _tester_git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
             root = ctx.deps.root
             message = message.strip().strip("'\"")
             if not message:
@@ -853,7 +852,36 @@ def build_tester_agent(
                 root, "git log -1 --oneline", extra_writable=ctx.deps.scratch
             )
             result = f"Committed successfully.\n{head}"
-            return result + await _git_push(ctx.deps, root)
+            if allow_push:
+                return result + await _git_push(ctx.deps, root)
+            return result + "\nCommit is local — this project never pushes."
+
+        if allow_push:
+
+            @agent.tool
+            async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
+                """Stage all changed files in the project root and create a git commit
+                with the given message, then push the branch to its remote. Use only
+                after all checks passed, with a short message paraphrasing the
+                original task. Skips gracefully when the project root is not a git
+                repository or there is nothing to commit. A failed push (no network,
+                diverged remote, no upstream, …) is NOT a failure: the push error is
+                recorded in the task's event log and the commit stays safe locally —
+                still proceed with set_verification(success=True)."""
+                return await _tester_git_commit(ctx, message)
+
+        else:
+
+            @agent.tool
+            async def git_commit(ctx: RunContext[TesterDeps], message: str) -> str:
+                """Stage all changed files in the project root and create a LOCAL git
+                commit with the given message — this project never pushes. Use only
+                after all checks passed, with a short message paraphrasing the
+                original task. Do not push yourself and do not mention pushing.
+                Skips gracefully when the project root is not a git repository or
+                there is nothing to commit. Still proceed with
+                set_verification(success=True) afterwards."""
+                return await _tester_git_commit(ctx, message)
 
     @agent.tool
     def set_verification(

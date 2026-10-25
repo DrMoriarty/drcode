@@ -2268,9 +2268,8 @@ class PipelineLayer(DrCodeState):
                 self._show_event(task, f"Task isolation unavailable: {iso_note}")
             tester = build_tester_agent(
                 self.resolved_config(AgentRole.TESTER),
-                allow_commit=(
-                    self.settings.task_finalization is TaskFinalization.TESTING_COMMIT
-                ),
+                allow_commit=self.settings.task_finalization.commits,
+                allow_push=self.settings.task_finalization.pushes,
                 root=root,
                 # The external review (`.drcode/workflow.py` on_review)
                 # splits "the tester passed" from "the task is accepted":

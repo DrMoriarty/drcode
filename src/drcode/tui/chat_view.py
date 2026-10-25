@@ -1531,12 +1531,21 @@ class ChatViewLayer(DrCodeState):
         if self._chat_batching:
             self._chat_batch.append(content)
             self._chat_has_content = True
-            return
-        follow = self._chat_at_bottom()
-        self.chat_log.mount(content)
-        if follow:
-            self.chat_log.scroll_end(animate=False)
-        self._chat_has_content = True
+        else:
+            try:
+                follow = self._chat_at_bottom()
+                self.chat_log.mount(content)
+                if follow:
+                    self.chat_log.scroll_end(animate=False)
+            except NoMatches:
+                # Teardown race: a worker streaming into the open chat (a
+                # tester verdict, an agent delta, an event line) can hit an
+                # already-parsed-away DOM — the app is being dismantled
+                # under it. Drop the write (same pattern as _poll_activity
+                # and _drain_chat_batch): the transcript is persisted, the
+                # next session renders it from there.
+                return
+            self._chat_has_content = True
 
     def _flush_chat_batch(self) -> None:
         """Start mounting the blocks collected by a batched history rebuild.

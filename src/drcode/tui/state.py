@@ -29,7 +29,6 @@ from pydantic_ai.usage import RunUsage
 from rich.console import RenderableType
 from textual import work
 from textual.app import App
-from textual.containers import VerticalScroll
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import ListView, Static
@@ -53,7 +52,7 @@ from ..settings import (
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..workflow import WorkflowHooks
-from .blocks import AssistantBlock, ReasoningBlock, ToolCallBlock
+from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
 from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
@@ -644,8 +643,8 @@ class DrCodeState(App[None]):
 
     # -- widget getters (defined in the DrCodeApp skeleton) -----------------
     @property
-    def chat_log(self) -> VerticalScroll:
-        return self.query_one("#chat-log", VerticalScroll)
+    def chat_log(self) -> ChatLog:
+        return self.query_one("#chat-log", ChatLog)
 
     @property
     def chat_input(self) -> ChatInput: ...

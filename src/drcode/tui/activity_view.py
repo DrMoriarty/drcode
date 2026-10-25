@@ -191,6 +191,10 @@ class ActivityLayer(DrCodeState):
         next tick, no restart needed. The git calls are blocking — run
         them in a worker thread so a slow repo never stalls the UI."""
         ids = await asyncio.to_thread(self._unmerged_completed_ids)
+        # The same pass collects deferred installs whose blocker is gone
+        # (task.install_pending) — fire the re-run worker (a no-op when
+        # the list is empty; see _maybe_rerun_pending_installs).
+        self._maybe_rerun_pending_installs()
         count = len(ids)
         try:
             widget = self.query_one("#header-git", HeaderGitIndicator)

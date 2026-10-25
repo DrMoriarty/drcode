@@ -662,6 +662,20 @@ class DrCodeState(App[None]):
     # into the shared main checkout.
     _accept_hook_lock: asyncio.Lock
 
+    # -- deferred installs (the on_tester_passed MERGE_HEAD guard) -----------
+    # Ids collected by _install_rerun_candidates (a worker thread inside
+    # _unmerged_completed_ids): deferred on_tester_passed installs
+    # (task.install_pending) whose blocker is gone — handed to
+    # _maybe_rerun_pending_installs by the 10 s poll / the startup scan.
+    _install_rerun_ids: list[str]
+    _install_rerun_running: bool
+
+    def _install_rerun_candidates(self, unmerged_ids: list[str]) -> list[str]: ...
+
+    def _maybe_rerun_pending_installs(self) -> Any: ...
+
+    async def _poll_pending_installs(self) -> None: ...
+
     # -- session statistics (expanded header, session-scoped) ---------------
     _session_known_ids: set[str]
     _session_completed_ids: set[str]

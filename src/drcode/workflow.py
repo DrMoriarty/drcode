@@ -37,8 +37,15 @@ skips its step; `task` is the payload dict described below):
         external review — an install/deploy step must run on every path to
         COMPLETED-after-PASSED). The unconditional post-verification hook:
         it needs no on_review gate and never changes pipeline behaviour.
-        Research tasks never trigger it (they skip testing). Return
-        {"text": "..."} for the task's service-event log.
+        Research tasks never trigger it (they skip testing). The payload
+        pins git.commit — the verified commit (the task branch's tip with
+        isolation, the shared checkout's HEAD without it): install/deploy
+        THAT commit, never "whatever lies in the checkout right now". The
+        pipeline itself never runs the hook while the main checkout sits
+        in a half-done merge (MERGE_HEAD — installing would ship conflict
+        markers): it skips, stamps the task as install_pending and re-runs
+        the hook once after the conflict is resolved. Return {"text":
+        "..."} for the task's service-event log.
     def on_review(task) -> dict
         External code review after the tester passed the task. Return
         {"verdict": "accept"} or {"verdict": "reject", "comment": "..."}.
@@ -60,7 +67,9 @@ skips its step; `task` is the payload dict described below):
 The `task` argument is one JSON object:
     {"hook": "<name>",
      "task": {"id", "title", "kind", "github_issue"},
-     "git":  {"branch": "<current branch or null>", "dirty": <bool>},
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>,
+              "commit": "<full sha — pinned only for on_tester_passed: the
+                         verified commit (task branch tip / HEAD)>"},
      "worktree": {"path": "...", "branch": "drcode/<task-id>"},
                    # ^ "path" is absent when the worktree directory is
                    # already removed (worktree_removal: on_completion) —
@@ -104,8 +113,23 @@ A typical script looks like:
         return {"verdict": "accept"}
 
     def on_tester_passed(task):
-        r = subprocess.run(["uv", "tool", "install", ".", "--force"],
-                           capture_output=True, text=True)
+        import shutil, tempfile
+        branch = (task.get("worktree") or {}).get("branch")
+        if not branch:
+            # No isolation: the shared checkout IS the verified tree.
+            r = subprocess.run(["uv", "tool", "install", ".", "--force"],
+                               capture_output=True, text=True)
+            return {"text": r.stdout or r.stderr}
+        # Isolation: export the verified task branch into a temporary
+        # directory (no worktree registration, no race with its removal)
+        # and install from there — never from the mutating main checkout.
+        src = tempfile.mkdtemp(prefix="drcode-install-")
+        subprocess.run(f"git archive {branch} | tar -x -C {src}", shell=True, check=True)
+        try:
+            r = subprocess.run(["uv", "tool", "install", src, "--force"],
+                               capture_output=True, text=True)
+        finally:
+            shutil.rmtree(src, ignore_errors=True)
         return {"text": r.stdout or r.stderr}
 
 A hook failure (non-zero exit, malformed output, timeout) is NEVER fatal:
@@ -234,7 +258,11 @@ Optional extras (rarely needed):
                     its own branch `drcode/<task-id>` in its own tree).
     on_development_done — push / open a PR before testing starts.
     on_tester_passed — install / deploy after every PASSED finalization
-                    (on a review-mode task after the on_accepted merge).
+                    (on a review-mode task after the on_accepted merge);
+                    build it from the pinned git.commit / worktree.branch,
+                    never from the mutating main checkout — the pipeline
+                    skips the hook over a half-done merge and re-runs it
+                    once the conflict is resolved (task.install_pending).
 
 SECURITY: workflow.py is arbitrary code executed with your full
 permissions. Only activate a workflow file you have read and trust.
@@ -434,10 +462,36 @@ def _merge_in_checkout(what, branch, base, main):
 #     On a review-mode task it runs AFTER on_accepted, so the install
 #     sees the merged main checkout. Research tasks never trigger it
 #     (they skip testing). Return {"text": "..."} for the task's
-#     service-event log."""
-#     proc = subprocess.run(
-#         ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
+#     service-event log.
+#
+#     Install the VERIFIED commit, never "whatever lies in the checkout
+#     right now" — the checkout is a mutating shared resource whose state
+#     is not guaranteed (a half-done merge would ship conflict markers).
+#     The pipeline itself never runs this hook while the main checkout
+#     has MERGE_HEAD set: it skips, stamps task.install_pending and
+#     re-runs the hook once after the conflict is resolved."""
+#     import shutil
+#     import tempfile
+#     branch = (task.get("worktree") or {}).get("branch")
+#     if not branch:
+#         # No isolation: the shared checkout IS the verified tree.
+#         proc = subprocess.run(
+#             ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
+#         )
+#         return {"text": proc.stdout or proc.stderr}
+#     # Isolation: export the task branch's snapshot into a temporary
+#     # directory (no worktree registration, no race with its removal)
+#     # and install from there.
+#     src = tempfile.mkdtemp(prefix="drcode-install-")
+#     subprocess.run(
+#         f"git archive {branch} | tar -x -C {src}", shell=True, check=True
 #     )
+#     try:
+#         proc = subprocess.run(
+#             ["uv", "tool", "install", src, "--force"], capture_output=True, text=True
+#         )
+#     finally:
+#         shutil.rmtree(src, ignore_errors=True)
 #     return {"text": proc.stdout or proc.stderr}
 '''
 
@@ -625,6 +679,7 @@ class WorkflowHooks:
         *,
         cwd: Path | None = None,
         worktree: dict[str, Any] | None = None,
+        commit: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> HookResult:
         """Run one hook: `python -c <bootstrap> <script>` in a subprocess
@@ -641,9 +696,13 @@ class WorkflowHooks:
         branch-only once the directory is removed under
         `worktree_removal: on_completion`) is copied into the payload as
         the `worktree` key so the script can address the task's
-        tree/branch explicitly. ``extra`` (optional)
-        adds caller-provided top-level payload keys on top (e.g. the
-        `project` entry of `on_research_accepted`).
+        tree/branch explicitly. ``commit`` (optional) pins
+        `git.commit` in the payload — a verified commit SHA the hook may
+        build/install from instead of the cwd's current state (only
+        `on_tester_passed` passes it: the PASSED-stamped task branch tip,
+        or the shared checkout's HEAD without isolation). ``extra``
+        (optional) adds caller-provided top-level payload keys on top
+        (e.g. the `project` entry of `on_research_accepted`).
 
         Never raises (except cancellation — an aborted run must kill the
         child and unwind); every failure comes back as
@@ -663,6 +722,8 @@ class WorkflowHooks:
         }
         if worktree is not None:
             payload["worktree"] = worktree
+        if commit is not None:
+            payload["git"]["commit"] = commit
         if extra:
             payload.update(extra)
         try:

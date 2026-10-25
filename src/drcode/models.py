@@ -215,6 +215,16 @@ class Task(BaseModel):
     # successful hook re-run) clears the signal again. Persisted like every
     # other Task field; False for old task files (plain default).
     hook_merge_failed: bool = False
+    # True when the on_tester_passed hook (install/deploy) was SKIPPED by
+    # the pipeline because the main checkout sat in a half-done merge
+    # (MERGE_HEAD set — installing would ship conflict markers). The
+    # pipeline re-runs the deferred hook once the blocker is gone (the
+    # task's branch merged / the checkout clean again) and clears the flag
+    # after the hook actually executed — it never runs while MERGE_HEAD
+    # lives in the main checkout, that invariant is the pipeline's, not
+    # the script's. Persisted like every other Task field; False for old
+    # task files (plain default).
+    install_pending: bool = False
     # Ids of tasks that must be COMPLETED *and* merged into the base branch
     # before this task may be taken into development (the promotion gate is
     # dynamic: git state is re-evaluated at every promotion attempt, so a

@@ -9,12 +9,15 @@ Opened from the Settings palette ("Voice…"). The form collects:
   matches the audio URL; can be overridden),
 - the ASR model id (full id, e.g. ``gigaam_rnnt_v3_e2e``),
 - the TTS model id + speaker voice,
+- the announcement language (Russian/English; the dialog preselects the
+  stored value, or the terminal locale's language when nothing is stored),
 - three checkboxes: which events to voice-announce (task completed,
   tester failure, empty queue).
 
 "Check" probes ``GET /models`` in a worker thread; when it succeeds and a
-TTS model is set, the confirmation phrase (:data:`CHECK_PASSED_PHRASE`) is
-synthesized and played in a background thread. Save persists everything
+TTS model is set, the confirmation phrase (from
+:data:`CHECK_PASSED_PHRASES`) is synthesized and played in a background
+thread. Save persists everything
 into the project settings (``<project>/.drcode/settings.json``); ESC — close
 without saving. Everything empty = the voice features are off.
 """
@@ -32,14 +35,17 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static, Switch
+from textual.widgets import Button, Input, Select, Static, Switch
 
 from ..voice import (
     DEFAULT_TTS_VOICE,
     DEFAULT_VOICE_API_URL,
+    VOICE_LANGUAGE_EN,
+    VOICE_LANGUAGE_RU,
     VoiceClient,
     VoiceConfig,
     play_wav,
+    terminal_voice_language,
 )
 
 _VOICE_URLS = {
@@ -47,10 +53,24 @@ _VOICE_URLS = {
     "speech": "/audio/speech",
 }
 
+# The announcement-language dropdown: exactly two options ("ru" and "en";
+# a stored empty value reads as the terminal-derived default).
+LANGUAGE_OPTIONS: list[tuple[str, str]] = [
+    ("Russian", VOICE_LANGUAGE_RU),
+    ("English", VOICE_LANGUAGE_EN),
+]
+
 # Spoken on a successful connection check when a TTS model is present:
-# the same phrase the pipeline announcements use (Russian), so the user
-# hears the familiar announcer voice confirming the setup.
-CHECK_PASSED_PHRASE = "Проверка голосового соединения пройдена, всё хорошо"
+# the same phrase the pipeline announcements use, so the user hears the
+# familiar announcer voice confirming the setup — in the language picked
+# in the dialog.
+CHECK_PASSED_PHRASES: dict[str, str] = {
+    VOICE_LANGUAGE_RU: "Проверка голосового соединения пройдена, всё хорошо",
+    VOICE_LANGUAGE_EN: "Voice connection check passed, everything is fine",
+}
+
+# Kept for backwards compatibility (the Russian default phrase).
+CHECK_PASSED_PHRASE = CHECK_PASSED_PHRASES[VOICE_LANGUAGE_RU]
 
 
 @dataclass
@@ -65,6 +85,7 @@ class VoiceSetup:
     tts_completed: bool
     tts_tester_failed: bool
     tts_queue_empty: bool
+    language: str
 
 
 class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
@@ -99,6 +120,10 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
     }
     #voice-url, #voice-key, #voice-asr, #voice-tts-model, #voice-tts-voice {
         height: 3;
+    }
+    #voice-lang {
+        height: 3;
+        width: 30;
     }
     .voice-row { height: auto; }
     .voice-row Switch { margin-right: 1; }
@@ -140,6 +165,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         tts_completed: bool = False,
         tts_tester_failed: bool = False,
         tts_queue_empty: bool = False,
+        language: str = "",
     ) -> None:
         super().__init__()
         self._initial = {
@@ -149,6 +175,14 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             "tts_model": tts_model,
             "tts_voice": tts_voice,
         }
+        # The dropdown preselects the stored language; an empty setting
+        # (never saved yet) falls back to the terminal locale's language —
+        # the same value the announcements would use without a save.
+        self._language = (
+            language
+            if language in (VOICE_LANGUAGE_RU, VOICE_LANGUAGE_EN)
+            else terminal_voice_language()
+        )
         self._initial_tts = {
             "completed": tts_completed,
             "tester_failed": tts_tester_failed,
@@ -196,6 +230,13 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
                 placeholder=DEFAULT_TTS_VOICE,
                 value=self._initial["tts_voice"],
                 id="voice-tts-voice",
+            )
+            yield Static("Announcement language", classes="voice-label")
+            yield Select(
+                LANGUAGE_OPTIONS,
+                value=self._language,
+                allow_blank=False,
+                id="voice-lang",
             )
             yield Static("Announce (TTS)", classes="voice-label")
             with Horizontal(classes="voice-row"):
@@ -254,6 +295,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             tts_completed=self.query_one("#voice-tts-completed", Switch).value,
             tts_tester_failed=self.query_one("#voice-tts-tester-failed", Switch).value,
             tts_queue_empty=self.query_one("#voice-tts-queue-empty", Switch).value,
+            language=str(self.query_one("#voice-lang", Select).value),
         )
 
     # -- connection check ---------------------------------------------------------
@@ -284,11 +326,15 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         hint = "" if ok else f" (endpoints: {', '.join(_VOICE_URLS.values())})"
         status.update(f"{'✓' if ok else '✗'} {detail}{hint}")
         if ok and config.tts_model:
-            self._announce_check(config)
+            language = str(self.query_one("#voice-lang", Select).value)
+            self._announce_check(
+                config,
+                CHECK_PASSED_PHRASES.get(language, CHECK_PASSED_PHRASE),
+            )
 
     # -- check-passed confirmation ---------------------------------------------
 
-    def _announce_check(self, config: VoiceConfig) -> None:
+    def _announce_check(self, config: VoiceConfig, phrase: str) -> None:
         """Voice the check-passed confirmation when a TTS model is set.
 
         Fire-and-forget daemon thread: both the network synthesis and the
@@ -297,14 +343,14 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         dictation recording)."""
         threading.Thread(
             target=self._announce_run,
-            args=(config,),
+            args=(config, phrase),
             daemon=True,
             name="drcode-voice-check",
         ).start()
 
-    def _announce_run(self, config: VoiceConfig) -> None:
+    def _announce_run(self, config: VoiceConfig, phrase: str) -> None:
         try:
-            wav = VoiceClient(config).speech(CHECK_PASSED_PHRASE)
+            wav = VoiceClient(config).speech(phrase)
             play_wav(wav)
         except Exception as e:  # noqa: BLE001 - a failed confirmation never
             # masks the check result: it is only appended to the status line

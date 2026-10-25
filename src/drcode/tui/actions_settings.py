@@ -572,6 +572,7 @@ class SettingsLayer(DrCodeState):
                 tts_completed=settings.voice_tts_completed,
                 tts_tester_failed=settings.voice_tts_tester_failed,
                 tts_queue_empty=settings.voice_tts_queue_empty,
+                language=settings.voice_language,
             ),
             self._voice_settings_done,
         )
@@ -587,6 +588,7 @@ class SettingsLayer(DrCodeState):
         self.settings.voice_tts_completed = setup.tts_completed
         self.settings.voice_tts_tester_failed = setup.tts_tester_failed
         self.settings.voice_tts_queue_empty = setup.tts_queue_empty
+        self.settings.voice_language = setup.language
         self.settings_store.save(self.settings)
         enabled = bool(setup.api_url and (setup.asr_model or setup.tts_model))
         self.notify(

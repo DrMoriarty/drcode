@@ -382,6 +382,10 @@ class ProjectSettings(BaseModel):
     voice_tts_completed: bool = False
     voice_tts_tester_failed: bool = False
     voice_tts_queue_empty: bool = False
+    # Language of the spoken announcement phrases: "ru" or "en". Empty =
+    # auto-derive from the terminal locale (LC_ALL/LC_MESSAGES/LANG, falling
+    # back to the Python locale; anything non-Russian reads as English).
+    voice_language: str = ""
 
 
 class ProjectSettingsStore:

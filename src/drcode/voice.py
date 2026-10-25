@@ -60,6 +60,81 @@ DEFAULT_VOICE_API_URL = "https://provider.ru/v1"
 # Default speaker voice when voice_tts_voice is empty (OpenAI TTS names).
 DEFAULT_TTS_VOICE = "alloy"
 
+# Spoken-announcement languages (voice_language setting): "ru" or "en".
+# Empty setting = auto-derive from the terminal locale.
+VOICE_LANGUAGE_RU = "ru"
+VOICE_LANGUAGE_EN = "en"
+
+
+def terminal_voice_language() -> str:
+    """The announcement language derived from the terminal environment:
+    the language subtag of ``LC_ALL``/``LC_MESSAGES``/``LANG`` (in that
+    precedence, POSIX form like ``ru_RU.UTF-8``), falling back to Python's
+    ``locale`` when none is set. Russian reads as "ru", everything else
+    (including no locale at all) as "en"."""
+    import os
+
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(var, "").strip()
+        if not value:
+            continue
+        # Strip the encoding and modifier parts: "ru_RU.UTF-8" → "ru".
+        lang = value.split(".", 1)[0].split("@", 1)[0].split("_", 1)[0].lower()
+        if lang:
+            return VOICE_LANGUAGE_RU if lang == "ru" else VOICE_LANGUAGE_EN
+    try:
+        import locale
+
+        lang = (locale.getlocale()[0] or "").split("_", 1)[0].lower()
+    except Exception:  # noqa: BLE001 - a broken locale must never crash
+        lang = ""
+    return VOICE_LANGUAGE_RU if lang == "ru" else VOICE_LANGUAGE_EN
+
+
+def effective_voice_language(settings: ProjectSettings) -> str:
+    """The language the announcements are phrased in: the explicit
+    ``voice_language`` setting ("ru"/"en") or, when it is empty, the
+    terminal-derived default."""
+    stored = settings.voice_language.strip().lower()
+    if stored in (VOICE_LANGUAGE_RU, VOICE_LANGUAGE_EN):
+        return stored
+    return terminal_voice_language()
+
+
+# The spoken announcement phrases, keyed by language (a format template
+# per event kind; ``{title}`` is the task title). The TTS speaks whatever
+# text it is given — choosing the language is choosing the phrase table.
+VOICE_PHRASES: dict[str, dict[str, str]] = {
+    VOICE_LANGUAGE_RU: {
+        "bug_report": "Заведён баг-репорт: {title}",
+        "completed": "Задача «{title}» завершена",
+        "completed_failed": "Задача «{title}» завершена с ошибкой",
+        "requeued": (
+            "Тестирование провалено — задача «{title}» возвращена в разработку"
+        ),
+        "queue_empty": "Очередь пуста — все задачи обработаны",
+    },
+    VOICE_LANGUAGE_EN: {
+        "bug_report": "Bug report created: {title}",
+        "completed": 'Task "{title}" completed',
+        "completed_failed": 'Task "{title}" completed with an error',
+        "requeued": 'Testing failed — task "{title}" returned to development',
+        "queue_empty": "Queue is empty — all tasks processed",
+    },
+}
+
+
+def announcement_phrase(language: str, key: str, **kwargs: object) -> str:
+    """A spoken phrase from :data:`VOICE_PHRASES`, formatted; an unknown
+    language falls back to English (the table is always complete for both,
+    but a hand-edited settings.json may carry anything)."""
+    table = VOICE_PHRASES.get(
+        language if language in VOICE_PHRASES else VOICE_LANGUAGE_EN,
+        VOICE_PHRASES[VOICE_LANGUAGE_EN],
+    )
+    return str(table.get(key, table.get("completed", ""))).format(**kwargs)
+
+
 # Network timeouts: transcription of a long utterance can take a while;
 # the calls run in worker threads, so a generous ceiling costs nothing.
 ASR_TIMEOUT = 60.0

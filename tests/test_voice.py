@@ -291,6 +291,10 @@ class _FakePlayer:
 
 
 def _voice_settings(**tts: Any) -> ProjectSettings:
+    # voice_language defaults to "ru" so the notifier-phrase assertions
+    # below stay deterministic regardless of the test machine's locale;
+    # tests that exercise auto-detection pass voice_language="" explicitly.
+    tts.setdefault("voice_language", "ru")
     return ProjectSettings(
         voice_api_url="https://audio.local/v1",
         voice_tts_model="x5-tts/tts-1",
@@ -656,6 +660,93 @@ def test_notifier_broken_speaker_never_raises() -> None:
     notifier.task_status(task, TaskStatus.TESTING, TaskStatus.COMPLETED)  # no raise
 
 
+# -- Announcement language (voice_language) ---------------------------------------
+
+
+def test_terminal_voice_language_parses_env(monkeypatch: Any) -> None:
+    from drcode.voice import (
+        VOICE_LANGUAGE_EN,
+        VOICE_LANGUAGE_RU,
+        terminal_voice_language,
+    )
+
+    monkeypatch.setenv("LC_ALL", "ru_RU.UTF-8")
+    monkeypatch.setenv("LC_MESSAGES", "")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    assert terminal_voice_language() == VOICE_LANGUAGE_RU
+    monkeypatch.setenv("LC_ALL", "")
+    assert terminal_voice_language() == VOICE_LANGUAGE_EN  # LC_MESSAGES empty → LANG
+    monkeypatch.delenv("LC_MESSAGES")
+    assert terminal_voice_language() == VOICE_LANGUAGE_EN  # LANG=en_US
+    monkeypatch.setenv("LANG", "de_DE.UTF-8")
+    assert terminal_voice_language() == VOICE_LANGUAGE_EN  # anything non-ru
+    monkeypatch.delenv("LANG", raising=False)
+    monkeypatch.setattr("locale.getlocale", lambda: ("ru_RU", "UTF-8"), raising=False)
+    assert terminal_voice_language() == VOICE_LANGUAGE_RU  # locale fallback
+
+
+def test_notifier_english_phrases_when_language_en() -> None:
+    from drcode.models import TaskKind, TaskStatus, VerificationStatus
+
+    settings = _voice_settings(
+        voice_language="en",
+        voice_tts_completed=True,
+        voice_tts_tester_failed=True,
+        voice_tts_queue_empty=True,
+    )
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    task = _task(TaskStatus.COMPLETED, verification=VerificationStatus.PASSED)
+    notifier.task_status(task, TaskStatus.TESTING, TaskStatus.COMPLETED)
+    assert speaker.phrases[-1] == 'Task "Починить кнопку" completed'
+    failed = _task(TaskStatus.COMPLETED, verification=VerificationStatus.FAILED)
+    notifier.task_status(failed, TaskStatus.TESTING, TaskStatus.COMPLETED)
+    assert speaker.phrases[-1] == 'Task "Починить кнопку" completed with an error'
+    bug = _task(TaskStatus.QUEUED, kind=TaskKind.BUG)
+    notifier.bug_report_created(bug, "system")
+    assert speaker.phrases[-1] == "Bug report created: Починить кнопку"
+    notifier.pipeline_idle(blocked=False, detail="")
+    assert speaker.phrases[-1] == "Queue is empty — all tasks processed"
+
+
+def test_notifier_empty_language_defaults_to_terminal(
+    monkeypatch: Any,
+) -> None:
+    """voice_language="" auto-derives from the terminal locale (LANG)."""
+    from drcode.models import TaskStatus, VerificationStatus
+
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    settings = _voice_settings(voice_language="", voice_tts_completed=True)
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    task = _task(TaskStatus.COMPLETED, verification=VerificationStatus.PASSED)
+    notifier.task_status(task, TaskStatus.TESTING, TaskStatus.COMPLETED)
+    assert speaker.phrases[-1] == 'Task "Починить кнопку" completed'
+
+    monkeypatch.setenv("LANG", "ru_RU.UTF-8")
+    settings = _voice_settings(voice_language="", voice_tts_completed=True)
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    notifier.task_status(task, TaskStatus.TESTING, TaskStatus.COMPLETED)
+    assert "завершена" in speaker.phrases[-1]
+
+
+def test_notifier_unknown_language_falls_back_to_terminal(
+    monkeypatch: Any,
+) -> None:
+    """A hand-edited settings.json may carry any string: an unknown value
+    is treated as unset — the terminal locale decides (English here)."""
+    from drcode.models import TaskStatus, VerificationStatus
+
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    settings = _voice_settings(voice_language="fr", voice_tts_completed=True)
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    task = _task(TaskStatus.COMPLETED, verification=VerificationStatus.PASSED)
+    notifier.task_status(task, TaskStatus.TESTING, TaskStatus.COMPLETED)
+    assert speaker.phrases[-1] == 'Task "Починить кнопку" completed'
+
+
 # -- TUI integration (headless app) ----------------------------------------------
 
 
@@ -867,6 +958,36 @@ async def test_voice_dialog_cancel_keeps_settings(project_root: Any) -> None:
         assert app.settings.voice_api_url == ""
 
 
+async def test_voice_dialog_language_select_defaults_to_terminal(
+    project_root: Any, monkeypatch: Any
+) -> None:
+    """The dropdown offers exactly Russian/English; with nothing stored it
+    preselects the terminal locale's language, and Save persists the pick."""
+    from textual.widgets import Button, Select
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_dialog import LANGUAGE_OPTIONS, VoiceSettingsDialog
+    from drcode.voice import VOICE_LANGUAGE_EN, terminal_voice_language
+
+    monkeypatch.setenv("LANG", "ru_RU.UTF-8")
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+        lang_select = dialog.query_one("#voice-lang", Select)
+        assert [value for _, value in LANGUAGE_OPTIONS] == ["ru", "en"]
+        assert lang_select.value == terminal_voice_language() == "ru"
+        lang_select.value = VOICE_LANGUAGE_EN
+        dialog.query_one("#voice-save", Button).press()
+        await pilot.pause()
+        assert app.settings.voice_language == "en"
+        assert ProjectSettingsStore(project_root).load().voice_language == "en"
+
+
 # -- Check-passed spoken confirmation ---------------------------------------------
 
 
@@ -906,6 +1027,7 @@ async def test_voice_check_success_voices_confirmation(
 
     spoken: list[str] = []
     played: list[bytes] = []
+    monkeypatch.setenv("LANG", "ru_RU.UTF-8")  # the dropdown's default phrase
     monkeypatch.setattr(
         vd,
         "VoiceClient",
@@ -928,6 +1050,47 @@ async def test_voice_check_success_voices_confirmation(
         assert spoken == [CHECK_PASSED_PHRASE]
         status_text = str(dialog.query_one("#voice-status", Static).content)
         assert status_text.startswith("✓")
+
+
+async def test_voice_check_confirmation_follows_language_select(
+    project_root: Any, monkeypatch: Any
+) -> None:
+    """The check confirmation is spoken in the language picked in the
+    dialog's dropdown (English here), not the terminal default."""
+    from textual.widgets import Button, Input, Select
+
+    from drcode.tui import voice_dialog as vd
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_dialog import (
+        CHECK_PASSED_PHRASES,
+        VOICE_LANGUAGE_EN,
+        VoiceSettingsDialog,
+    )
+
+    spoken: list[str] = []
+    played: list[bytes] = []
+    monkeypatch.setenv("LANG", "ru_RU.UTF-8")  # the terminal default is Russian
+    monkeypatch.setattr(
+        vd,
+        "VoiceClient",
+        lambda config: _FakeAudioClient(config, spoken, None),
+    )
+    monkeypatch.setattr(vd, "play_wav", played.append)
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+        dialog.query_one("#voice-tts-model", Input).value = "x5-tts/tts-1"
+        dialog.query_one("#voice-lang", Select).value = VOICE_LANGUAGE_EN
+        dialog.query_one("#voice-check", Button).press()
+        await wait_until(
+            lambda: played == [b"RIFF-fake-wav"], pilot=pilot, what="playback"
+        )
+        assert spoken == [CHECK_PASSED_PHRASES[VOICE_LANGUAGE_EN]]
 
 
 async def test_voice_check_without_tts_model_stays_silent(

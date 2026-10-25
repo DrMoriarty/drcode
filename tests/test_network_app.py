@@ -35,6 +35,7 @@ from drcode.agent import (
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.providers import AgentRole
 from drcode.tui import pipeline as pipeline_module
+from drcode.tui import pipeline_agent_run, pipeline_deps, pipeline_net, pipeline_tester
 from drcode.tui.app import DrCodeApp
 from drcode.tui.usage import NETWORK_RETRIES
 from tests.network_mocks import (
@@ -182,13 +183,13 @@ async def test_research_task_builds_agent_with_research_role_config(
     state = ScriptedState()
     monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
     seen: list[tuple[str, str, str]] = []
-    real_build_agent = pipeline_module.build_agent
+    real_build_agent = pipeline_agent_run.build_agent
 
     def spy_build_agent(config: Any, *, kind: Any = TaskKind.FEATURE, root: Any = None):
         seen.append((kind.value, config.model, config.base_url))
         return real_build_agent(config, kind=kind, root=root)
 
-    monkeypatch.setattr(pipeline_module, "build_agent", spy_build_agent)
+    monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
     set_project_custom_model(
         project_root,
         AgentRole.RESEARCH,
@@ -526,7 +527,7 @@ async def test_outage_probe_tick_gates_retry_on_connectivity(
     async def fake_reachable(base_url: str, timeout: float = 5.0) -> bool:
         return up["tcp"]
 
-    monkeypatch.setattr(pipeline_module, "tcp_reachable", fake_reachable)
+    monkeypatch.setattr(pipeline_net, "tcp_reachable", fake_reachable)
 
     async with net_app.run_test() as pilot:
         await pilot.pause()
@@ -1054,9 +1055,12 @@ def scripted_fills(monkeypatch: pytest.MonkeyPatch):
 
     def install(fills: list[int]) -> None:
         queue = iter(fills)
-        monkeypatch.setattr(
-            pipeline_module, "run_context_tokens", lambda run: next(queue, None)
-        )
+        # Both run loops read the helper from their own module namespace
+        # (the agent worker and the tester worker each import it directly).
+        for module in (pipeline_agent_run, pipeline_tester):
+            monkeypatch.setattr(
+                module, "run_context_tokens", lambda run: next(queue, None)
+            )
 
     return install
 
@@ -1741,7 +1745,11 @@ async def test_repeated_failed_queue_rescue_backs_off(
             return self.now
 
     fake_time = _FakeTime()
-    monkeypatch.setattr(pipeline_module, "time", fake_time)
+    # The stdlib `time` module is replaced only in the pipeline layers'
+    # namespaces (the core gate reads it too), so real timers and the
+    # test's own wait_until keep working.
+    for module in (pipeline_module, pipeline_agent_run, pipeline_tester, pipeline_deps):
+        monkeypatch.setattr(module, "time", fake_time)
 
     async with net_app.run_test() as pilot:
         await pilot.pause()

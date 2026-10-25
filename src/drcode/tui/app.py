@@ -71,6 +71,7 @@ from .blocks import (  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
     DependencyCommandsProvider,
+    MergeCommandsProvider,
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
@@ -119,6 +120,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,
+        MergeCommandsProvider,
     }
 
     CSS = """
@@ -286,6 +288,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+down", "move_task_down", "Move down"),
         ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+f", "search_tasks", "Find task"),
+        ("ctrl+m", "open_merge", "Merge…"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the
         # footer (and the key dispatch) picks the first one whose

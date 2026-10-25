@@ -497,6 +497,7 @@ class PipelineResolverLayer(DrCodeState):
             f"worktree, a human must take over.\n{outcome.summary()}",
             kind="workflow",
         )
+        self._suggest_conflict_screen(task)
 
     async def _give_up_to_human(self, task: Task, root: Path | None, base: str) -> None:
         """The last-resort path (repeated failures): restore the pristine
@@ -527,6 +528,7 @@ class PipelineResolverLayer(DrCodeState):
             f"a human must take over.",
             kind="workflow",
         )
+        self._suggest_conflict_screen(task)
 
     # -- persistence -----------------------------------------------------------------
 

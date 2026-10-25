@@ -94,6 +94,7 @@ class SidebarLayer(DrCodeState):
                 t.id == self.viewed_id,
                 t.queue_seq,
                 t.queue_head,
+                t.needs_human,
                 merge_state.get(t.id, ""),
             )
             for t in self.manager.all_tasks()
@@ -337,10 +338,13 @@ class SidebarLayer(DrCodeState):
         # Dependency gate: a task whose depends_on is not satisfied yet
         # gets the lock marker and the ids it waits for.
         deps_suffix = self._dependency_marker(t)
+        # The failed-conflict-fallback marker: the agent resolver gave up
+        # on this task's parked merge — a human must take over (Ctrl+M).
+        human_suffix = " [bold red]✋[/]" if t.needs_human else ""
         viewed = " ●" if t.id == self.viewed_id else ""
         return (
             f"{marker} {kind_letter} #{t.id} "
-            f"{escape(t.title_display)}{suffix}{deps_suffix}{viewed}"
+            f"{escape(t.title_display)}{suffix}{deps_suffix}{human_suffix}{viewed}"
         )
 
     def _sidebar_row(

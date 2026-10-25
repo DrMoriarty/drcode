@@ -1,16 +1,22 @@
+"""Settings palette, its sub-menus and the providers behind them.
+
+Everything reachable from the "Settings" palette: the main palette
+(``SettingsPalette``) with its narrowed layout and deterministic entry
+order, the "Model settings…" and "Task settings…" sub-menu palettes, the
+providers that supply the main-menu entries and the per-option selection
+palettes for each project preference.
+"""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable
 from functools import partial
-from operator import attrgetter
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.color import Color
 from textual.command import (
     CommandInput,
-    CommandList,
     CommandPalette,
     DiscoveryHit,
     Hit,
@@ -20,20 +26,9 @@ from textual.command import (
 )
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
-from textual.css.styles import RulesMap
-from textual.geometry import Size
-from textual.strip import Strip
-from textual.theme import Theme
 from textual.widgets import Button, LoadingIndicator
 
-from ..providers import (
-    AgentRole,
-    ModelRef,
-    UserModelsStore,
-    load_project_custom_models,
-    load_project_model_slots,
-)
-from ..settings import (
+from ...settings import (
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
     FINALIZATION_OPTIONS,
@@ -45,89 +40,10 @@ from ..settings import (
     dev_rounds_label,
     parallel_tasks_label,
 )
+from .base import SpacedCommandList
 
 if TYPE_CHECKING:
-    from .app import DrCodeApp
-
-
-class SpacedCommandList(CommandList):
-    """CommandList that renders one blank line between adjacent options.
-
-    Textual's OptionList lays options out back-to-back with no vertical
-    spacing, and its virtual layout ignores component-class padding, so the
-    gap is implemented at the layout level: every option gets a trailing
-    spacer row (the one after the last option is cropped from the virtual
-    size; no option meta, so clicks/hover on spacers are ignored). Overrides
-    the private layout internals of OptionList (`_update_lines`,
-    `get_content_height`, `render_line`); revisit when upgrading textual.
-    """
-
-    _SPACER: ClassVar[int] = -1
-    """Line-offset sentinel marking a blank separator row."""
-
-    def _update_lines(self) -> None:
-        if not self.scrollable_content_region:
-            return
-        line_cache = self._line_cache
-        lines = line_cache.lines
-        next_index = lines[-1][0] + 1 if lines else 0
-        get_visual = self._get_visual
-        width = self.scrollable_content_region.width - self._get_left_gutter_width()
-
-        if next_index < len(self.options):
-            padding = self.get_component_styles("option-list--option").padding
-            for index, option in enumerate(self.options[next_index:], next_index):
-                line_cache.index_to_line[index] = len(line_cache.lines)
-                # Cast: get_height() wants RulesMap, but the base class
-                # passes its RenderStyles here too (same runtime lookup).
-                line_count = (
-                    get_visual(option).get_height(
-                        cast("RulesMap", self.styles), width - padding.width
-                    )
-                    + option._divider
-                )
-                line_cache.heights[index] = line_count
-                line_cache.lines.extend(
-                    [(index, line_no) for line_no in range(line_count)]
-                )
-                # A spacer after every option; the trailing one after the
-                # last option is cropped from the virtual size below, and
-                # option batches appended later keep their gaps.
-                line_cache.lines.append((index, self._SPACER))
-
-        last_divider = self.options and self.options[-1]._divider
-        virtual_size = Size(
-            width,
-            len(lines) - (1 if last_divider else 0) - (1 if lines else 0),
-        )
-        if virtual_size != self.virtual_size:
-            self.virtual_size = virtual_size
-            self._scroll_update(virtual_size)
-
-    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
-        # One extra row for each gap between adjacent options.
-        return super().get_content_height(container, viewport, width) + max(
-            0, len(self.options) - 1
-        )
-
-    def render_line(self, y: int) -> Strip:
-        # y is viewport-relative; the line cache is indexed by absolute
-        # (scroll-adjusted) line number — same adjustment the base class
-        # makes in OptionList.render_line. Without it the spacer check
-        # below inspects the wrong row once the list is scrolled.
-        try:
-            _, line_offset = self._lines[self.scroll_offset.y + y]
-        except IndexError:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
-        if line_offset == self._SPACER:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
-        return super().render_line(y)
+    from ..app import DrCodeApp
 
 
 class SettingsPalette(CommandPalette):
@@ -429,69 +345,6 @@ class TaskSettingsCommandProvider(Provider):
                 yield Hit(match, matcher.highlight(name), callback, help=help_text)
 
 
-class RoleModelsCommandsProvider(Provider):
-    """Per-role model pickers of the "Model settings…" sub-menu.
-
-    One entry per agent role; its current effective model is shown after
-    the ":". Picking an entry opens the role's selection palette (same UX
-    as the option pickers); Escape dismisses it and keeps the current
-    model.
-    """
-
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
-        app = cast("DrCodeApp", self.app)
-        return [
-            (
-                f"Coding model: {app.role_model_label(AgentRole.CODING)}",
-                (
-                    "Model the development agent runs on; pick from the "
-                    "user-level provider catalog (saved to the project's "
-                    "drcode.json)"
-                ),
-                app.action_change_coding_model,
-            ),
-            (
-                f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
-                (
-                    "Model research tasks run on (analysis/docs profile: "
-                    "reads a lot, writes little — a cheap-input "
-                    "large-context model works well); falls back to the "
-                    "coding model when not set; pick from the user-level "
-                    "provider catalog (saved to the project's drcode.json)"
-                ),
-                app.action_change_research_model,
-            ),
-            (
-                f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
-                (
-                    "Model the QA tester runs on; pick from the user-level "
-                    "provider catalog (saved to the project's drcode.json)"
-                ),
-                app.action_change_tester_model,
-            ),
-            (
-                f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
-                (
-                    "Model that summarizes the history when the context "
-                    "fill hits the threshold; pick from the user-level "
-                    "provider catalog (saved to the project's drcode.json)"
-                ),
-                app.action_change_compaction_model,
-            ),
-        ]
-
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            score = matcher.match(name)
-            if score > 0:
-                yield Hit(score, matcher.highlight(name), callback, help=help_text)
-
-
 class ProjectSettingsCommandsProvider(Provider):
     """Project-preference commands in the Settings palette.
 
@@ -566,69 +419,6 @@ class ProjectSettingsCommandsProvider(Provider):
             score = matcher.match(name)
             if score > 0:
                 yield Hit(score, matcher.highlight(name), callback, help=help_text)
-
-
-class DependencyCommandsProvider(Provider):
-    """Dependency-gate commands for the viewed task in the Settings palette.
-
-    One "Remove dependency: #<id>" entry per current dependency (the
-    force-start: dropping a blocking dependency makes the task eligible
-    immediately and logs the manual override) and one "Add dependency:
-    #<id> <title>" entry per other task. Only offered while a queued or
-    held task is open — dependencies of a running/completed task make no
-    sense (the gate is evaluated at promotion time only)."""
-
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
-        from ..models import TaskStatus
-
-        app = cast("DrCodeApp", self.app)
-        task = app.viewed
-        if task is None or task.status not in (
-            TaskStatus.QUEUED,
-            TaskStatus.HOLD,
-        ):
-            return []
-        commands: list[tuple[str, str, Callable[[], object]]] = []
-        for dep in task.depends_on:
-            dep_task = app.manager.tasks.get(dep)
-            title = f" {dep_task.title_display}" if dep_task else ""
-            commands.append(
-                (
-                    f"Remove dependency: #{dep}{title}",
-                    (
-                        "Force start: drop this dependency — the task stops "
-                        "waiting for it (logged as a manual override into "
-                        "the task's service events)"
-                    ),
-                    partial(app.action_remove_dependency, dep),
-                )
-            )
-        for other in app.manager.all_tasks():
-            if other.id == task.id or other.id in task.depends_on:
-                continue
-            commands.append(
-                (
-                    f"Add dependency: #{other.id} {other.title_display}",
-                    (
-                        "Make this task wait for it: the dependency must be "
-                        "COMPLETED and (under worktree isolation) merged "
-                        "into the base branch before this task is taken "
-                        "into development"
-                    ),
-                    partial(app.action_add_dependency, other.id),
-                )
-            )
-        return commands
-
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback, help=help_text)
 
 
 class TaskSettingsEntriesProvider(Provider):
@@ -950,91 +740,6 @@ class EscAbortOptionsProvider(Provider):
                 yield Hit(match, matcher.highlight(name), callback)
 
 
-def _color_spec(color: Color) -> str:
-    """Color as a textual style spec: hex for ordinary colors, the ANSI
-    name ("ansi_blue", "ansi_default") for ANSI-theme colors — both parse
-    as textual styles."""
-    return color.hex
-
-
-def _theme_preview(
-    theme: Theme, *, current: bool, name: Content | None = None
-) -> Content:
-    """One-line preview of a theme for the picker: the theme's name followed
-    by sample words ("text", "primary", "secondary", "accent") rendered in
-    the theme's own colors on the theme's background, so it is immediately
-    obvious whether the combination is e.g. pink-on-gray or green-on-black.
-    """
-    variables = theme.to_color_system().generate()
-
-    def spec(key: str) -> str:
-        return _color_spec(Color.parse(variables[key]))
-
-    words = (
-        ("text", "foreground"),
-        ("primary", "primary"),
-        ("secondary", "secondary"),
-        ("accent", "accent"),
-    )
-    content = name if name is not None else Content(theme.name)
-    if current:
-        content = content.append_text(" (current)", "dim")
-    content = content.append_text("  ")
-    block_start = content.cell_length
-    content = content.append_text("".join(f" {label} " for label, _ in words))
-    # Word colors overlay the background so each sample word shows its
-    # theme role ("primary" in $primary, …) on the theme's own background.
-    content = content.stylize(f"on {spec('background')}", block_start)
-    offset = block_start
-    for label, key in words:
-        content = content.stylize(spec(key), offset + 1, offset + 1 + len(label))
-        offset += len(label) + 2
-    return content
-
-
-class ThemeOptionsProvider(Provider):
-    """Options of the theme picker.
-
-    Same selection-palette UX as the other option providers: pick a theme to
-    apply it immediately, Escape keeps the current one. The currently active
-    theme is marked with "(current)". Every entry carries a one-line color
-    preview so themes can be told apart without applying them.
-    """
-
-    def _themes(self) -> list[tuple[Theme, bool, Callable[[], None]]]:
-        themes = self.app.available_themes
-
-        def set_app_theme(name: str) -> None:
-            self.app.theme = name
-
-        return [
-            (
-                theme,
-                theme.name == self.app.theme,
-                partial(set_app_theme, theme.name),
-            )
-            for theme in sorted(themes.values(), key=attrgetter("name"))
-        ]
-
-    async def discover(self) -> Hits:
-        for theme, current, callback in self._themes():
-            yield DiscoveryHit(_theme_preview(theme, current=current), callback)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for theme, current, callback in self._themes():
-            if (match := matcher.match(theme.name)) > 0:
-                yield Hit(
-                    match,
-                    _theme_preview(
-                        theme,
-                        current=current,
-                        name=matcher.highlight(theme.name),
-                    ),
-                    callback,
-                )
-
-
 class StallNudgeOptionsProvider(Provider):
     """Options of the "Nudge stalled agent" setting.
 
@@ -1063,62 +768,3 @@ class StallNudgeOptionsProvider(Provider):
         for name, callback in self._commands():
             if (match := matcher.match(name)) > 0:
                 yield Hit(match, matcher.highlight(name), callback)
-
-
-def role_model_options_provider(role: AgentRole) -> type[Provider]:
-    """Selection palette listing the catalog models available for one agent
-    role ("provider/model" entries; the user-level default is marked
-    "(default)", the effective one "(current)"), the saved custom model of
-    the role as "Custom: <model-id>" (selecting it re-activates it without
-    re-entering anything), "(default — user catalog)" to drop the project
-    override (only when a user default exists) and "Custom…" to enter a
-    free-form model via ModelSetupDialog."""
-
-    class RoleModelOptions(Provider):
-        def _commands(self) -> list[tuple[str, Callable[[], object]]]:
-            app = cast("DrCodeApp", self.app)
-            catalog = UserModelsStore().load()
-            slots = load_project_model_slots(app.project_root)
-            slot = slots.get(role)
-            current_ref = slot if isinstance(slot, ModelRef) else None
-            current_custom = slot == "custom"
-            user_default = catalog.defaults.get(role)
-            commands: list[tuple[str, Callable[[], object]]] = []
-            for provider in catalog.providers:
-                for entry in provider.models:
-                    ref = ModelRef(provider=provider.name, model=entry.id)
-                    label = f"{provider.name}/{entry.id}"
-                    if ref == user_default:
-                        label += " (default)"
-                    if ref == current_ref:
-                        label += " (current)"
-                    commands.append(
-                        (label, partial(app.action_set_role_model, role, ref))
-                    )
-            customs = load_project_custom_models(app.project_root)
-            if role in customs:
-                label = f"Custom: {customs[role].model}"
-                if current_custom:
-                    label += " (current)"
-                commands.append((label, partial(app.action_activate_role_custom, role)))
-            if user_default is not None:
-                commands.append(
-                    (
-                        "(default — user catalog)",
-                        partial(app.action_set_role_model, role, None),
-                    )
-                )
-            commands.append(("Custom…", partial(app.action_custom_role_model, role)))
-            return commands
-
-        async def discover(self) -> Hits:
-            for name, callback in self._commands():
-                yield DiscoveryHit(name, callback)
-
-        async def search(self, query: str) -> Hits:
-            matcher = self.matcher(query)
-            for name, callback in self._commands():
-                if (match := matcher.match(name)) > 0:
-                    yield Hit(match, matcher.highlight(name), callback)
-
-    return RoleModelOptions

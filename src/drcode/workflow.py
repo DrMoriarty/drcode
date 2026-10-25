@@ -229,7 +229,8 @@ Optional extras (rarely needed):
                     isolation (with isolation the task already works on
                     its own branch `drcode/<task-id>` in its own tree).
     on_development_done — push / open a PR before testing starts.
-    on_tester_passed — install / deploy after every PASSED finalization.
+    on_tester_passed — install / deploy after every PASSED finalization
+                    (on a review-mode task after the on_accepted merge).
 
 SECURITY: workflow.py is arbitrary code executed with your full
 permissions. Only activate a workflow file you have read and trust.
@@ -323,7 +324,8 @@ def _merge_task_branch(task, what):
 # def on_accepted(task):
 #     """Degenerate accept, part 2 of 3: auto-merge for development tasks.
 #     Runs right after the review accepted the tester-passed task (the
-#     pipeline's only path to on_accepted). Merges `drcode/<task-id>`
+#     pipeline's only path to on_accepted), BEFORE on_tester_passed — the
+#     install step sees the merged checkout. Merges `drcode/<task-id>`
 #     into the main checkout's current branch. Return {"text": "..."} for
 #     the task's service-event log."""
 #     return _merge_task_branch(task, "accepted")
@@ -364,8 +366,10 @@ def _merge_task_branch(task, what):
 #     """Optional extra: right after the tester stamped the task PASSED
 #     and it is finalized (runs on every path to COMPLETED-after-PASSED) —
 #     the unconditional post-verification hook: install / deploy here.
-#     Research tasks never trigger it (they skip testing). Return
-#     {"text": "..."} for the task's service-event log."""
+#     On a review-mode task it runs AFTER on_accepted, so the install
+#     sees the merged main checkout. Research tasks never trigger it
+#     (they skip testing). Return {"text": "..."} for the task's
+#     service-event log."""
 #     proc = subprocess.run(
 #         ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
 #     )

@@ -1029,7 +1029,8 @@ async def test_tester_passed_hook_fires_on_async_review_accept(
     review_app: DrCodeApp, scripted: ScriptedState
 ) -> None:
     """Review mode: a task completed while awaiting the async verdict gets
-    on_tester_passed when the poll finally accepts it (before on_accepted)
+    on_tester_passed when the poll finally accepts it (after on_accepted —
+    the merge lands first, so the install sees the merged checkout)
     — an install step runs on every path to COMPLETED-after-PASSED."""
     make_script(review_app.project_root, REVIEW_ACCEPT_AND_PASSED_SCRIPT)
     review_app.workflow = load_hooks(review_app.project_root)
@@ -1053,7 +1054,7 @@ async def test_tester_passed_hook_fires_on_async_review_accept(
         )
     assert task.status is TaskStatus.COMPLETED
     events = "\n".join(e.text for e in task.events)
-    assert events.index("on_tester_passed:") < events.index("on_accepted:")
+    assert events.index("on_accepted:") < events.index("on_tester_passed:")
 
 
 def test_tester_passed_hook_in_lifecycle_order(project_root: Path) -> None:

@@ -104,9 +104,10 @@ Behaviour per hook:
   Research tasks skip it. A failure is logged and testing proceeds.
 - **`on_tester_passed`** — runs right after the tester stamps the task
   PASSED and the task is finalized — with or without an external review
-  (on a review-mode task it fires when the review finally accepts it, just
-  before `on_accepted`). This is the place for a deterministic
-  post-verification step like `(re)installing the app`
+  (on a review-mode task it fires when the review finally accepts it,
+  right AFTER `on_accepted` — the merge lands first, so an install step
+  builds the merged checkout, not the pre-merge state). This is the place
+  for a deterministic post-verification step like `(re)installing the app`
   (`uv tool install . --force`). A hook failure is **fail-open** (logged,
   the pipeline moves on — an install step must not park tasks). Research
   tasks never trigger it; neither do the cancellation paths or the
@@ -116,7 +117,7 @@ Behaviour per hook:
   no new development starts while a verdict is outstanding, exactly like an
   in-flight tester round):
   - `accept` → the task completes (with the "Verified successfully" label),
-    `on_tester_passed` and then `on_accepted` run;
+    `on_accepted` and then `on_tester_passed` run;
   - `reject` → the reviewer's `comment` becomes the task's new user input
     and the task re-enters the queue — the coding agent reworks it **in the
     same transcript**, seeing the full history plus the review remarks;

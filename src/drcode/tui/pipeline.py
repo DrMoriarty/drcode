@@ -2995,8 +2995,10 @@ class PipelineLayer(DrCodeState):
         and the task is finalized (install, deploy, …). Fires on every path
         to COMPLETED-after-PASSED: without an external review directly from
         the tester round's completion, and on a review-mode task when the
-        review finally accepts it — an install step must run no matter
-        which path accepted the task. Fail-open like `on_accepted` (an
+        review finally accepts it — after `on_accepted` there (the merge
+        must land first, so the install/deploy builds the merged checkout).
+        An install step must run no matter which path accepted the task.
+        Fail-open like `on_accepted` (an
         install step must not park the task the way the fail-closed
         `on_review` does); its text goes to the service-event log."""
         workflow = self.workflow
@@ -3233,8 +3235,10 @@ class PipelineLayer(DrCodeState):
         the tester round, or the retry/async poll). A reject re-queues the
         task with the reviewer's comment as new input (the coding agent
         reworks it in the same transcript); an accept completes it and
-        runs on_accepted; a failure or a pending verdict keeps the task
-        waiting (fail-closed) and schedules a retry."""
+        runs on_accepted (the merge) followed by on_tester_passed (the
+        install/deploy — it must see the merged checkout); a failure or a
+        pending verdict keeps the task waiting (fail-closed) and schedules
+        a retry."""
         task = self.manager.get(task_id)
         workflow = self.workflow
         cwd, wt = self._hook_env(task)
@@ -3276,10 +3280,12 @@ class PipelineLayer(DrCodeState):
             self._apply_review_accept(task)
             self.refresh_sidebar()
             # on_tester_passed fires on every accept path too (a review-mode
-            # task reaches COMPLETED-after-PASSED only here), before
-            # on_accepted — lifecycle order.
-            await self._run_tester_passed_hook(task)
+            # task reaches COMPLETED-after-PASSED only here) — but AFTER
+            # on_accepted: an install/deploy step must see the merged main
+            # checkout, not the pre-merge state (otherwise it always lags
+            # one merge behind; only a version bump would mask it).
             await self._run_accepted_hook(task)
+            await self._run_tester_passed_hook(task)
             await self._remind_unmerged_work(task)
             self._advance()
         elif verdict == "reject":

@@ -1896,6 +1896,7 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
             f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
             f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
             f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
+            f"Resolver model: {app.role_model_label(AgentRole.RESOLVER)}",
         ]
         # Sub-menu providers: the catalog editor plus the role pickers,
         # nothing else (project preferences stay in the main menu).

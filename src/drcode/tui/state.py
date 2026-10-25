@@ -34,7 +34,7 @@ from textual.widget import Widget
 from textual.widgets import ListView, Static
 from textual.worker import Worker
 
-from ..agent import AgentDeps, TesterDeps
+from ..agent import AgentDeps, ResolverDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
@@ -270,6 +270,8 @@ class DrCodeState(App[None]):
 
     def action_change_compaction_model(self) -> None: ...
 
+    def action_change_resolver_model(self) -> None: ...
+
     def action_set_role_model(self, role: AgentRole, ref: ModelRef | None) -> None: ...
 
     def action_activate_role_custom(self, role: AgentRole) -> None: ...
@@ -472,6 +474,34 @@ class DrCodeState(App[None]):
     # fixes the decorated signature (Worker[None]) for the mixin layers.
     def run_tester(self, task_id: str) -> Worker[None]: ...
 
+    def _maybe_start_resolver(self, task_id: str) -> None: ...
+
+    def run_resolver(self, task_id: str) -> Worker[None]: ...
+
+    def _retry_resolver(self) -> None: ...
+
+    async def _verify_resolution(
+        self,
+        task: Task,
+        root: Path,
+        report: Any,
+        deps: ResolverDeps,
+    ) -> Any: ...
+
+    async def _apply_resolver_outcome(
+        self, task: Task, root: Path, base: str, outcome: Any
+    ) -> None: ...
+
+    async def _give_up_to_human(self, task: Task, root: Path, base: str) -> None: ...
+
+    def _persist_resolver_messages(
+        self, task: Task, run: AgentRun[Any, str] | None
+    ) -> None: ...
+
+    async def _maybe_compact_resolver_round(
+        self, task: Task, live_tokens: int | None
+    ) -> bool: ...
+
     # -- external review / workflow hooks (implemented in PipelineLayer) ----
 
     def _next_review(self) -> Task | None: ...
@@ -576,6 +606,20 @@ class DrCodeState(App[None]):
     _tester_retry_at: dict[str, float]
     _tester_net_count: dict[str, int]
     _tester_resume_round: set[str]
+
+    # -- merge-conflict resolver bookkeeping (single-slot worker) -----------
+    _resolver_running: bool
+    _resolver_task_id: str | None
+    _resolver_generation: int
+    _resolver_fail_count: dict[str, int]
+    _resolver_retry_at: dict[str, float]
+    _resolver_net_count: dict[str, int]
+    _resolver_resume_round: set[str]
+    # Compaction-failure bookkeeping of the resolver rounds — separate
+    # from the agent/tester sets so a broken summarizer seen by one role
+    # never disables another role's gate.
+    _resolver_compaction_failed: set[str]
+    _resolver_hard_limit_exhausted: set[str]
 
     # -- agent failure / network-retry bookkeeping --------------------------
     _agent_failed: set[str]

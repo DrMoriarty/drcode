@@ -33,6 +33,7 @@ from .pipeline_compaction import PipelineCompactionLayer
 from .pipeline_deps import PipelineDepsLayer
 from .pipeline_hooks import PipelineHooksLayer
 from .pipeline_net import PipelineNetLayer
+from .pipeline_resolver import PipelineResolverLayer
 from .pipeline_tester import PipelineTesterLayer
 from .state import DrCodeState
 
@@ -208,7 +209,12 @@ class PipelineCoreLayer(DrCodeState):
         drcode.keepawake.BUSY_STATUSES; dependency-blocked QUEUED counts,
         a manual `git merge drcode/<dep>` can unblock it at any time).
         HOLD, AWAITING_CLARIFICATION and COMPLETED do not hold it."""
-        if self.agent_running or self.tester_running or self._review_running:
+        if (
+            self.agent_running
+            or self.tester_running
+            or self._review_running
+            or self._resolver_running
+        ):
             return True
         return statuses_hold_awake(t.status for t in self.manager.all_tasks())
 
@@ -637,6 +643,7 @@ class PipelineLayer(
     PipelineDepsLayer,
     PipelineHooksLayer,
     PipelineTesterLayer,
+    PipelineResolverLayer,
     PipelineAgentRunLayer,
     PipelineCompactionLayer,
     PipelineNetLayer,

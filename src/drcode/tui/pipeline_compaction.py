@@ -608,3 +608,82 @@ class PipelineCompactionLayer(DrCodeState):
         if self.viewed_id == task.id:
             self.view_task(task.id)
         return True
+
+    async def _maybe_compact_resolver_round(
+        self, task: Task, live_tokens: int | None
+    ) -> bool:
+        """Compaction gate for the current conflict-resolver round, called
+        after run_resolver paused the round at a tool boundary.
+
+        Mirrors _maybe_compact_tester_round exactly, but rewrites
+        `task.resolver_messages[-1]` in place and measures the fill
+        against the RESOLVER role's resolved config. The round failure
+        bookkeeping uses the resolver's own sets
+        (`_resolver_compaction_failed` / `_resolver_hard_limit_exhausted`)
+        so a broken summarizer seen by the agent or the tester never
+        disables the resolver's gate (and vice versa).
+        """
+        round_messages = task.resolver_messages[-1] if task.resolver_messages else []
+        tokens = self._fill_over_threshold(
+            live_tokens, round_messages, AgentRole.RESOLVER
+        )
+        if tokens is None:
+            return False
+        hard = (
+            self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.RESOLVER)
+            is not None
+        )
+        pct = round(
+            tokens * 100 / self.resolved_config(AgentRole.RESOLVER).max_context_tokens
+        )
+        _, rest = split_original_prompts(round_messages)
+        if not any(not is_summary_message(m) for m in rest):
+            self._resolver_compaction_failed.add(task.id)
+            if hard:
+                self._resolver_hard_limit_exhausted.add(task.id)
+            return False
+        self._show_event(
+            task,
+            f"Context fill {pct}% — compacting the conflict-resolution round…",
+        )
+        try:
+            new_messages, event, llm_failed = await self._compact_transcript(
+                round_messages,
+                summary_role=AgentRole.RESOLVER,
+                task=task,
+                what="conflict-resolution round",
+                hard=hard,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the round
+            self._resolver_compaction_failed.add(task.id)
+            if not hard:
+                self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+                return False
+            self._show_event(
+                task,
+                f"compaction failed ({type(e).__name__}: {e}) with the fill "
+                "at the hard limit — trimming mechanically instead.",
+            )
+            new_messages, event = self._mechanical_compact(
+                round_messages, AgentRole.RESOLVER, "conflict-resolution round"
+            )
+            llm_failed = True
+        if llm_failed:
+            self._resolver_compaction_failed.add(task.id)
+            self._resolver_hard_limit_exhausted.discard(task.id)
+        else:
+            self._resolver_compaction_failed.discard(task.id)
+            self._resolver_hard_limit_exhausted.discard(task.id)
+        if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
+            round_messages
+        ):
+            self._resolver_hard_limit_exhausted.add(task.id)
+        task.resolver_messages[-1] = new_messages
+        task.touch()
+        self.manager.storage.save(task)
+        self._show_event(task, event)
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        return True

@@ -60,9 +60,10 @@ class TaskFormLayer(DrCodeState):
         entry = custom_entry_from_setup(setup)
         try:
             for role in AgentRole:
-                if role is AgentRole.RESEARCH:
-                    # Unpinned on purpose: research falls back to the
-                    # coding model (see providers.resolve_effective).
+                if role in (AgentRole.RESEARCH, AgentRole.RESOLVER):
+                    # Unpinned on purpose: research and the merge-conflict
+                    # resolver fall back to the coding model (see
+                    # providers.resolve_effective).
                     continue
                 set_project_custom_model(self.project_root, role, entry)
         except OSError as e:
@@ -75,7 +76,7 @@ class TaskFormLayer(DrCodeState):
         else:
             self.notify(
                 "Custom model saved for coding, tester and compaction "
-                "(research follows the coding model)",
+                "(research and the conflict resolver follow the coding model)",
                 title="Model setup",
                 timeout=4,
             )

@@ -489,6 +489,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # new one.
         self._tester_net_count: dict[str, int] = {}
         self._tester_resume_round: set[str] = set()
+        # Merge-conflict resolver (single-slot worker, mirrors the tester's
+        # bookkeeping): singular running flag, per-round generation, failure
+        # counters (model errors vs transient network errors) and the
+        # resume-round set for continuation turns. The compaction-failure
+        # sets are the resolver's own — separate from the agent/tester ones.
+        self._resolver_running: bool = False
+        self._resolver_task_id: str | None = None
+        self._resolver_generation: int = 0
+        self._resolver_fail_count: dict[str, int] = {}
+        self._resolver_retry_at: dict[str, float] = {}
+        self._resolver_net_count: dict[str, int] = {}
+        self._resolver_resume_round: set[str] = set()
+        self._resolver_compaction_failed: set[str] = set()
+        self._resolver_hard_limit_exhausted: set[str] = set()
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
@@ -1262,6 +1276,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             task.hook_merge_failed = True
             task.touch()
             self.manager.storage.save(task)
+            # Re-stamped failure: give the automatic conflict resolver a
+            # shot (no-op without isolation / without a resolver model).
+            self._maybe_start_resolver(task.id)
         return False
 
     async def _unmerged_work_startup_scan(self) -> None:
@@ -1279,6 +1296,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         stuck_ids = await asyncio.to_thread(self._unmerged_completed_ids)
         if not stuck_ids:
             return
+        # Tasks whose hook-merge FAILED (a conflicted merge likely parked
+        # in their worktree): hand each to the automatic conflict resolver
+        # once per session — silently a no-op when the resolver model is
+        # not configured or isolation is off.
+        for task_id in stuck_ids:
+            task = self.manager.tasks.get(task_id)
+            if task is not None and task.hook_merge_failed:
+                self._maybe_start_resolver(task_id)
         stuck = [env.branch(task_id) for task_id in stuck_ids]
         base = await asyncio.to_thread(env.base_branch)
         shown = ", ".join(stuck[:5]) + ("…" if len(stuck) > 5 else "")

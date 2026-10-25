@@ -298,6 +298,21 @@ class ChatTimelineLayer(DrCodeState):
                 if role == "tool-call":
                     text = f"tester: {text}"
                 _add(at, role, text)
+        # Resolver rounds (merge-conflict resolution): same shape as the
+        # tester rounds — an own separator, tool calls prefixed, the
+        # synthetic assignment prompt not shown.
+        for round_messages in task.resolver_messages:
+            if not round_messages:
+                continue
+            round_items = extract_display(round_messages)
+            round_at = next((at for at, _, _ in round_items if at is not None), None)
+            _add(round_at, "resolving-sep", "")
+            for at, role, text in round_items:
+                if role == "user":
+                    continue
+                if role == "tool-call":
+                    text = f"resolver: {text}"
+                _add(at, role, text)
         # Service events (failures, skips) — human-only, with timestamps;
         # interleaved at the position they occurred at.
         for event in task.events:
@@ -626,6 +641,9 @@ class ChatTimelineLayer(DrCodeState):
             )
         elif role == "testing-sep":
             label = f"testing: {text}" if text else "testing"
+            self._write_chat(f"[bold magenta]──── {label} ────[/]", note=note)
+        elif role == "resolving-sep":
+            label = f"conflict resolution: {text}" if text else "conflict resolution"
             self._write_chat(f"[bold magenta]──── {label} ────[/]", note=note)
         elif role == "summary":
             # Compaction summary: a marker separator, then the summary

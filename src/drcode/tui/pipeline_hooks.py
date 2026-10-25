@@ -149,6 +149,12 @@ class PipelineHooksLayer(DrCodeState):
         task.hook_merge_failed = failed
         task.touch()
         self.manager.storage.save(task)
+        if failed:
+            # A conflicted merge (likely parked in the task's worktree by
+            # the merge engine's reversed merge): hand it to the automatic
+            # conflict resolver (no-op when isolation is off, no model is
+            # configured for the resolver role, or a round is running).
+            self._maybe_start_resolver(task.id)
 
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the

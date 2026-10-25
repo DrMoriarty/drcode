@@ -503,6 +503,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._resolver_resume_round: set[str] = set()
         self._resolver_compaction_failed: set[str] = set()
         self._resolver_hard_limit_exhausted: set[str] = set()
+        self._resolver_hard_limit_compactions: dict[str, int] = {}
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
@@ -640,6 +641,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # resume cycle would repeat at every tool boundary with no effect.
         # Cleared as soon as any compaction actually shrinks the transcript.
         self._hard_limit_exhausted: set[str] = set()
+        # Livelock guard: consecutive hard-limit compactions per task that
+        # never landed a turn under the hard limit — past
+        # _HARD_LIMIT_COMPACTION_LIMIT the gate stops compacting (the cap is
+        # below the transcript's irreducible floor; see _hard_livelock_stop).
+        self._hard_limit_compactions: dict[str, int] = {}
         # Monotonic stamp of the last coalesced follow-the-tail scroll while
         # streaming (see _stream_follow).
         self._last_follow = 0.0

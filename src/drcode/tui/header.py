@@ -17,6 +17,8 @@ absolute layer and is never shifted by the added content.
 
 from __future__ import annotations
 
+from typing import cast
+
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal
@@ -53,6 +55,11 @@ class HeaderGitIndicator(Static):
     entirely (display:none) when every task's work is merged. The amber
     bold styling is deliberate — the indicator must stand out from the
     muted header furniture so an unmerged fix is hard to miss.
+
+    A click on the counter opens the conflict screen (the manual
+    resolution entry, same as Ctrl+M) instead of toggling the tall
+    header — the indicator is exactly the surface a stuck conflict
+    advertises itself on.
     """
 
     DEFAULT_CSS = """
@@ -68,6 +75,13 @@ class HeaderGitIndicator(Static):
         display: block;
     }
     """
+
+    def on_click(self, event: Click) -> None:
+        from .app import DrCodeApp  # lazy: the app imports this module
+
+        event.stop()
+        event.prevent_default()
+        cast("DrCodeApp", self.app).action_open_merge()
 
 
 class HeaderTallInfo(Static):

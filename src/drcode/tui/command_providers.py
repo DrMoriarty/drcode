@@ -162,7 +162,8 @@ class SettingsPalette(CommandPalette):
     # adding prefixes for new entries — rearranges the menu arbitrarily;
     # anything not matching a prefix slots in right before the last entry
     # ("Quit"). Head block per the current UX convention: Keys, Screenshot,
-    # Theme; Quit is pinned to the very end. The model-related entries
+    # Theme, then the "Find task…" action; Quit is pinned to the very end.
+    # The model-related entries
     # (provider catalog + per-role picks) live in the "Model settings…"
     # sub-menu (ModelSettingsPalette), and the six task-management
     # preferences live in the "Task settings…" sub-menu
@@ -171,6 +172,7 @@ class SettingsPalette(CommandPalette):
         "Keys",
         "Screenshot",
         "Theme",
+        "Find task…",
         "Update/create AGENTS.md",
         "Model settings",
         "ESC stop behavior:",
@@ -292,6 +294,15 @@ class ServiceCommandsProvider(Provider):
     def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
         app = cast("DrCodeApp", self.app)
         return [
+            (
+                "Find task…",
+                (
+                    "Search the task archive by keywords — title, prompt, "
+                    "edited files, the agent's final summary (the same "
+                    "dialog as Ctrl+F)"
+                ),
+                app.action_search_tasks,
+            ),
             (
                 "Update/create AGENTS.md",
                 "research task: agent creates or refreshes AGENTS.md",

@@ -1222,6 +1222,57 @@ async def test_search_dialog_finds_and_opens_task(app: DrCodeApp) -> None:
         assert not isinstance(app.screen, SearchDialog)
 
 
+async def test_search_dialog_row_shows_prompt_over_two_lines(
+    app: DrCodeApp,
+) -> None:
+    """A result row is two lines: the head (#id, status/kind, date) plus
+    a context line with much more of the original task description than
+    a single-line row could show."""
+    from drcode.tui.search_dialog import SearchDialog
+
+    body = " ".join(["reconnect"] * 15)  # > the old single-line prompt cap
+    task = app.manager.create("two-line needle", body)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+        for char in "two-line":
+            await pilot.press(char)
+        await wait_until(lambda: task.id in _result_ids(app.screen), pilot)
+        from drcode.tui.sidebar import TaskItem
+
+        items = [
+            item
+            for item in app.screen.query_one("#srch-results", ListView).children
+            if isinstance(item, TaskItem) and item.task_id == task.id
+        ]
+        assert len(items) == 1
+        text = items[0].text
+        assert "\n" in text
+        # The description's tail is on the row — it used to be cut off.
+        assert body in text
+
+
+async def test_settings_palette_find_task_opens_search_dialog(
+    app: DrCodeApp,
+) -> None:
+    """The Settings menu has a "Find task…" entry that opens the same
+    search dialog as Ctrl+F."""
+    from drcode.tui.search_dialog import SearchDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        app.action_settings()
+        await pilot.pause()
+        for char in "find task":
+            await pilot.press(char)
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+
+
 async def test_search_dialog_escape_closes(app: DrCodeApp) -> None:
     from drcode.tui.search_dialog import SearchDialog
 

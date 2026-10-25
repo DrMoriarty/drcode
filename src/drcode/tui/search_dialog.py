@@ -12,9 +12,12 @@ list below. The heavy work never touches the event loop:
   in the same worker thread as the filtering, and only for short result
   lists (`MERGEDNESS_MAX_IDS`).
 
-Row format: `#<id> [<status>/<kind>] <markers> <date> — <first prompt>`,
-with the markers styled after the sidebar's TaskItem (kind letter colors,
-verification cross, orange unmerged sign). The dialog has no return value
+Row format: two lines per hit — the head `#<id> [<status>/<kind>]
+<markers> <date>` plus a second line with the first prompt (capped, but
+much longer than one line could hold — more of the original task
+description stays in view), with the markers styled after the sidebar's
+TaskItem (kind letter colors, verification cross, orange unmerged sign).
+The dialog has no return value
 — it acts itself:
 
 - enter on a highlighted row (or enter in the input with results) opens
@@ -46,8 +49,10 @@ from .sidebar import TaskItem
 # Keystroke debounce: the in-memory filtering is cheap, but re-rendering
 # the list per character still costs layout passes — wait for a pause.
 _SEARCH_DEBOUNCE = 0.3
-# Display cap of the first-prompt snippet on a result row.
-_PROMPT_CAP = 90
+# Display cap of the first-prompt snippet on a result row's context
+# line — the prompt gets a whole second line, so it can be much longer
+# than a single-line row could show.
+_PROMPT_CAP = 200
 # Display cap of the last-error text appended to a row.
 _ERROR_CAP = 50
 
@@ -84,7 +89,9 @@ class SearchDialog(ModalScreen[None]):
     #srch-dialog {
         width: 90;
         max-width: 95%;
-        height: 24;
+        /* Two lines per result row — taller than the old single-line
+         * dialog so roughly the same number of tasks stays visible. */
+        height: 32;
         max-height: 90%;
         padding: 1 2;
         background: $panel;
@@ -202,7 +209,9 @@ class SearchDialog(ModalScreen[None]):
 
     @staticmethod
     def _hit_line(hit: TaskHit) -> str:
-        """One result row, styled after the sidebar's TaskItem markers."""
+        """One result row: a head line styled after the sidebar's TaskItem
+        markers, plus a second line with the first prompt — two lines keep
+        more of the original task description in view."""
         kind_color = {"bug": "red", "research": "yellow"}.get(hit.kind, "green")
         # Only the kind letter is colored markup; every literal segment
         # (id, "[status/", "]", prompt, error text) goes through _literal.
@@ -223,8 +232,11 @@ class SearchDialog(ModalScreen[None]):
             if len(text) > _ERROR_CAP:
                 text = text[:_ERROR_CAP] + "…"
             error = f" [dim red]· {_literal(text)}[/]"
+        head_line = f"{head}{markers} {hit.date}{error}"
         prompt = task_search.first_prompt_snippet(hit.first_prompt, _PROMPT_CAP)
-        return f"{head}{markers} {hit.date} — {_literal(prompt)}{error}"
+        if not prompt:
+            return head_line
+        return f"{head_line}\n{_literal(prompt)}"
 
     def _show_hits(self, hits: list[TaskHit]) -> None:
         results = self.query_one("#srch-results", ListView)

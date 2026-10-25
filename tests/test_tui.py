@@ -1225,9 +1225,10 @@ async def test_search_dialog_finds_and_opens_task(app: DrCodeApp) -> None:
 async def test_search_dialog_row_shows_prompt_over_two_lines(
     app: DrCodeApp,
 ) -> None:
-    """A result row is two lines: the head (#id, status/kind, date) plus
-    a context line with much more of the original task description than
-    a single-line row could show."""
+    """A result row is one logical line: the head (#id, status/kind,
+    date) followed by the task description on the SAME line, which
+    visually wraps onto the second line — much more of the original task
+    description than a single-line row could show stays visible."""
     from drcode.tui.search_dialog import SearchDialog
 
     body = " ".join(["reconnect"] * 15)  # > the old single-line prompt cap
@@ -1249,9 +1250,14 @@ async def test_search_dialog_row_shows_prompt_over_two_lines(
         ]
         assert len(items) == 1
         text = items[0].text
-        assert "\n" in text
+        # The description starts on the head line — no second logical line.
+        assert "\n" not in text
+        assert "[bold cyan]#" in text  # the id is highlighted
+        assert "\\[queued/" in text  # the status keeps its raw text
         # The description's tail is on the row — it used to be cut off.
         assert body in text
+        # At render time the row wraps onto two visual lines.
+        await wait_until(lambda: items[0].size.height >= 2, pilot)
 
 
 async def test_settings_palette_find_task_opens_search_dialog(

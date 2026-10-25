@@ -12,11 +12,15 @@ list below. The heavy work never touches the event loop:
   in the same worker thread as the filtering, and only for short result
   lists (`MERGEDNESS_MAX_IDS`).
 
-Row format: two lines per hit — the head `#<id> [<status>/<kind>]
-<markers> <date>` plus a second line with the first prompt (capped, but
-much longer than one line could hold — more of the original task
-description stays in view), with the markers styled after the sidebar's
-TaskItem (kind letter colors, verification cross, orange unmerged sign).
+Row format: one logical line per hit — the head `#<id> [<status>/<kind>]
+<markers> <date>` followed on the SAME line by the first prompt (capped,
+but much longer than one row line could hold), which visually wraps onto
+the second line — more of the original task description stays in view.
+Styling follows the task statusbar (task_status_view): the id in bold
+cyan, the status in its statusbar color, the kind letter colors and the
+markers after the sidebar's TaskItem (verification cross, orange
+unmerged sign); the date is deliberately dimmed so it recedes next to
+the highlighted id and status.
 The dialog has no return value
 — it acts itself:
 
@@ -104,7 +108,12 @@ class SearchDialog(ModalScreen[None]):
         border: none;
         background: $surface-lighten-1;
     }
-    #srch-results > .task-item { padding: 0 1; }
+    # Row padding on the ListItem itself (the .task-item class lives on
+    # the Label inside it) and a full-width label so the prompt wrapped
+    # after the head actually flows onto the second line instead of
+    # being clipped by the Label's auto width.
+    #srch-results > ListItem { padding: 0 1; }
+    #srch-results ListItem Label { width: 1fr; }
     #srch-hint {
         margin-top: 1;
         color: $text-disabled;
@@ -209,14 +218,28 @@ class SearchDialog(ModalScreen[None]):
 
     @staticmethod
     def _hit_line(hit: TaskHit) -> str:
-        """One result row: a head line styled after the sidebar's TaskItem
-        markers, plus a second line with the first prompt — two lines keep
-        more of the original task description in view."""
+        """One result row: the head (#id, [status/kind], markers, date)
+        followed on the same line by the first prompt, which wraps onto
+        the second line at render time — more of the original task
+        description stays in view. The id is bold cyan, the status wears
+        the color of the task statusbar (task_status_view.refresh_
+        task_status), the date is dimmed so it recedes."""
         kind_color = {"bug": "red", "research": "yellow"}.get(hit.kind, "green")
-        # Only the kind letter is colored markup; every literal segment
-        # (id, "[status/", "]", prompt, error text) goes through _literal.
-        head = _literal(f"#{hit.task_id} [{hit.status}/")
-        head += f"[{kind_color}]{_literal(hit.kind)}[/]" + _literal("]")
+        status_color = {
+            "queued": "yellow",
+            "hold": "blue",
+            "active": "cyan",
+            "testing": "magenta",
+            "completed": "green",
+            "clarification": "yellow",
+        }.get(hit.status, "white")
+        # Only the id and kind letter carry their own colors; every
+        # literal segment ("[status/", "]", prompt, error text) goes
+        # through _literal so no accidental markup survives.
+        head = f"[bold cyan]{_literal('#' + hit.task_id)}[/]"
+        head += f" [{status_color}]{_literal('[' + hit.status + '/')}[/]"
+        head += f"[{kind_color}]{_literal(hit.kind)}[/]"
+        head += f"[{status_color}]{_literal(']')}[/]"
         markers = ""
         if hit.verification == "failed":
             markers += " [red]❌[/]"
@@ -232,11 +255,11 @@ class SearchDialog(ModalScreen[None]):
             if len(text) > _ERROR_CAP:
                 text = text[:_ERROR_CAP] + "…"
             error = f" [dim red]· {_literal(text)}[/]"
-        head_line = f"{head}{markers} {hit.date}{error}"
+        head_line = f"{head}{markers} [dim]{hit.date}[/]{error}"
         prompt = task_search.first_prompt_snippet(hit.first_prompt, _PROMPT_CAP)
         if not prompt:
             return head_line
-        return f"{head_line}\n{_literal(prompt)}"
+        return f"{head_line} {_literal(prompt)}"
 
     def _show_hits(self, hits: list[TaskHit]) -> None:
         results = self.query_one("#srch-results", ListView)

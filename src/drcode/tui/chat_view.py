@@ -466,7 +466,19 @@ class ChatViewLayer(DrCodeState):
             (w for w in sidebar._nodes if isinstance(w, TaskItem) and w.highlighted),
             None,
         )
-        keep_cursor = highlighted is not None
+        # The cursor counts as legitimate only when the user is actively
+        # navigating the sidebar (it has focus) or it sits on the viewed
+        # task's row. A cursor parked anywhere else — left behind by a
+        # click or a task switch — is stale: kept, it would paint that row
+        # in the cursor colour while the chat pane shows a different task,
+        # or nothing at all while the new-task form is open.
+        keep_cursor = highlighted is not None and (
+            sidebar.has_focus
+            or (
+                isinstance(highlighted, TaskItem)
+                and highlighted.task_id == self.viewed_id
+            )
+        )
         items: list[TaskItem] = []
         keys: set[tuple[str, str]] = set()
         for name, tasks in self._sidebar_sections():
@@ -579,6 +591,31 @@ class ChatViewLayer(DrCodeState):
             if isinstance(item, TaskItem) and item.task_id == task_id:
                 sidebar.index = index
                 break
+
+    def _sync_sidebar_cursor(self, task_id: str | None) -> None:
+        """Align the ListView cursor with the viewed task: onto its row, or
+        dropped entirely when nothing is viewed (new-task form / empty
+        backlog).
+
+        With a task viewed the sync is skipped while the sidebar has
+        focus — the user's arrow-key position wins there (browsing must
+        not be yanked back by a background view_task of the running
+        task). Clearing is unconditional: with nothing viewed there is no
+        position to protect, and the next arrow key re-establishes the
+        cursor."""
+        try:
+            sidebar = self.sidebar
+        except NoMatches:
+            return
+        if task_id is None:
+            sidebar.index = None
+            for item in sidebar._nodes:
+                if isinstance(item, TaskItem) and item.highlighted:
+                    item.highlighted = False
+            return
+        if sidebar.has_focus:
+            return
+        self._refocus_sidebar_task(task_id)
 
     # -- model connection status ---------------------------------------------
 

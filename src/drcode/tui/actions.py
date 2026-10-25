@@ -228,6 +228,11 @@ class ActionsLayer(DrCodeState):
         self.refresh_task_status()
         self.refresh_todo_panel()
         self.new_task_input.focus()
+        # After the focus move (the cursor may only be kept while the
+        # sidebar itself is focused): drop the ListView cursor that was
+        # parked on the previously viewed row — with viewed_id cleared it
+        # would light that row in the cursor colour while composing.
+        self._sync_sidebar_cursor(None)
 
     # -- editing a held task ---------------------------------------------------
 
@@ -284,6 +289,9 @@ class ActionsLayer(DrCodeState):
         self.refresh_task_status()
         self.refresh_todo_panel()
         self.new_task_input.focus()
+        # See action_new_task: drop the cursor parked on the edited task's
+        # row — nothing is viewed while the editor is open.
+        self._sync_sidebar_cursor(None)
 
     def _leave_new_task_mode(self) -> None:
         # Leaving the form (cancel, submit, sidebar click) is a context
@@ -312,6 +320,8 @@ class ActionsLayer(DrCodeState):
                 task = self._sidebar_top_task()
             if task is not None:
                 self.view_task(task.id)
+            else:
+                self._sync_sidebar_cursor(None)
         self.chat_input.focus()
 
     # Tab cycles the new-task type through all three kinds.
@@ -905,6 +915,7 @@ class ActionsLayer(DrCodeState):
             self.view_task(remaining[0].id)
         else:
             self.refresh_sidebar()
+            self._sync_sidebar_cursor(None)
             self.refresh_status()
             self.refresh_task_status()
 

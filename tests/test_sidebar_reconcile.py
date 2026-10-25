@@ -249,6 +249,48 @@ async def test_cursor_reset_when_row_leaves_sidebar(app: DrCodeApp, two_tasks) -
         assert sidebar.index is None
 
 
+async def test_new_task_form_clears_stuck_cursor(app: DrCodeApp, two_tasks) -> None:
+    """Ctrl+N / creating a task must not leave the previously viewed row
+    lit in the ListView cursor colour.
+
+    The cursor is parked on the clicked row (viewed A), the form clears
+    viewed_id — the row then lost only its .viewed class and kept the
+    bright -highlight cursor background, both while composing and after
+    the new task B was created and viewed."""
+    a, _b = two_tasks
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        sidebar = app.sidebar
+        sidebar.focus()
+        await pilot.pause()
+        # Click on A's row: cursor and viewed task both land on it.
+        app.view_task(a.id)
+        app._refocus_sidebar_task(a.id)
+        await pilot.pause()
+        row_a = row_of(app, a.id)
+        assert sidebar.highlighted_child is row_a
+
+        # Ctrl+N: viewed_id drops to None, focus moves to the form — the
+        # cursor must go with it, not leave row A lit.
+        app.action_new_task()
+        await pilot.pause()
+        assert app.viewed_id is None
+        assert sidebar.highlighted_child is None
+        assert not any(
+            w.highlighted for w in sidebar.children if isinstance(w, TaskItem)
+        )
+
+        # Ctrl+Enter: task B created and viewed — row A stays unlit, only
+        # row B carries the viewed marker.
+        b = app.manager.create("third", "prompt c")
+        app.view_task(b.id)
+        app.refresh_sidebar()
+        await pilot.pause()
+        assert row_of(app, b.id).has_class("viewed")
+        assert not row_a.highlighted
+        assert sidebar.highlighted_child is None
+
+
 async def test_refocus_sidebar_task_contract(app: DrCodeApp, two_tasks) -> None:
     a, _b = two_tasks
     async with app.run_test() as pilot:

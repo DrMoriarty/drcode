@@ -31,6 +31,12 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         config_module, "USER_CONFIG_EXAMPLE_FILE", config_dir / "drcode.json.example"
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    # Keep-awake off for the whole suite: a keep-awake hook active under
+    # pytest would spawn a real `caffeinate` child per run on a macOS dev
+    # machine (the module also guards on PYTEST_CURRENT_TEST — this is the
+    # belt-and-suspenders second layer, and it covers pytest runs nested
+    # via run_bash / dogfooding where the var may be sanitized).
+    monkeypatch.setenv("DRCODE_NO_KEEPAWAKE", "1")
     # Disable the dotenv source: the repository's own .env (and any .env in
     # cwd) must not leak values into configuration tests.
     monkeypatch.setitem(Config.model_config, "env_file", ())

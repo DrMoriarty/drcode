@@ -617,6 +617,10 @@ class ChatViewLayer(DrCodeState):
         poll) go through here, so the corner never goes stale."""
         label = self.model_status
         voice = self.voice_input.indicator
+        # Keep-awake marker: the assertion is held right now (the machine
+        # will not sleep under this run). Appended to whatever the label
+        # shows, below the voice dictation indicator.
+        awake = " · no-sleep" if self.keepawake.active else ""
         self._render_voice_indicator()
         if voice is not None:
             # The dictation indicator outranks the model-activity suffix:
@@ -626,13 +630,13 @@ class ChatViewLayer(DrCodeState):
             return
         tps = self._tokens_per_second()
         if tps is not None:
-            label.update(f"{self._conn_label} · {tps:.0f} tok/s")
+            label.update(f"{self._conn_label} · {tps:.0f} tok/s{awake}")
         elif self.agent_running:
-            label.update(f"{self._conn_label} · waiting")
+            label.update(f"{self._conn_label} · waiting{awake}")
         elif self.tester_running:
-            label.update(f"{self._conn_label} · testing")
+            label.update(f"{self._conn_label} · testing{awake}")
         else:
-            label.update(self._conn_label)
+            label.update(f"{self._conn_label}{awake}")
 
     # -- expanded (tall) header: connection details + session statistics ----
 

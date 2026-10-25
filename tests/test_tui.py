@@ -1772,9 +1772,9 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
 
 
 async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
-    """The main Settings menu collapses the seven task-management entries
+    """The main Settings menu collapses the task-management entries
     into one "Task settings…" item, which opens the sub-menu with exactly
-    those seven preference entries."""
+    those preference entries."""
     from drcode.tui.command_providers import (
         ProjectSettingsCommandsProvider,
         TaskSettingsCommandProvider,
@@ -1825,6 +1825,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
             f"Task isolation: {app._task_isolation_label()}",
             f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
+            "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
         ]
         # The main-menu provider no longer carries the task entries: it
         # keeps only the workflow/github/notifications/voice preferences.

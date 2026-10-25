@@ -333,6 +333,14 @@ class ProjectSettings(BaseModel):
     # ESC once more by inertia" accident; "instant" restores the
     # historical one-press stop.
     esc_abort: EscAbort = EscAbort.DOUBLE_PRESS
+    # Keep the computer awake (a system-sleep assertion) while the pipeline
+    # has work: any task QUEUED/ACTIVE/TESTING or a run in flight. macOS
+    # runs `caffeinate -i -s`, Windows holds SetThreadExecutionState, Linux
+    # is a no-op. A sleeping machine tears the network down and kills every
+    # concurrent run with ModelConnectionError — the retry budget does not
+    # survive a full sleep. Does NOT stop the clamshell (lid closed on
+    # battery) sleep mode.
+    keep_awake: bool = True
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
     # connection check fails): the sync simply logs an error each cycle

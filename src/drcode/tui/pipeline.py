@@ -63,6 +63,7 @@ from ..config import Config
 from ..github import (
     issue_commit_hint,
 )
+from ..keepawake import statuses_hold_awake
 from ..models import (
     PendingInput,
     Task,
@@ -413,6 +414,44 @@ class PipelineLayer(DrCodeState):
         )
 
     def _advance(self) -> None:
+        """The single pipeline gate: every state change re-enters here.
+        Thin wrapper so the keep-awake assertion is re-evaluated on EVERY
+        path — including the early returns of the gate itself (a tester
+        dispatch, an external review) that would otherwise skip a tail
+        hook. See _update_keepawake below."""
+        self._advance_gate()
+        self._update_keepawake()
+
+    def _keepawake_busy(self) -> bool:
+        """Whether the machine must be kept awake right now: a run in
+        flight (agent, tester, external review) or any task in a status
+        the pipeline may still act on (QUEUED/ACTIVE/TESTING — see
+        drcode.keepawake.BUSY_STATUSES; dependency-blocked QUEUED counts,
+        a manual `git merge drcode/<dep>` can unblock it at any time).
+        HOLD, AWAITING_CLARIFICATION and COMPLETED do not hold it."""
+        if self.agent_running or self.tester_running or self._review_running:
+            return True
+        return statuses_hold_awake(t.status for t in self.manager.all_tasks())
+
+    def _update_keepawake(self) -> None:
+        """Recompute the sleep assertion from the busy state and the
+        project setting. Called from the _advance wrapper (every pipeline
+        transition) and the periodic tick in on_mount (which doubles as
+        the caffeinate respawn check). Teardown always releases. When the
+        held/unheld state flips, the header status is re-rendered so the
+        `· no-sleep` marker never goes stale."""
+        was_active = self.keepawake.active
+        if self._exit or not self.is_running:
+            self.keepawake.stop()
+            return
+        if not self.settings.keep_awake or not self._keepawake_busy():
+            self.keepawake.stop()
+        else:
+            self.keepawake.start("drcode: task in flight")
+        if self.keepawake.active != was_active:
+            self.refresh_status()
+
+    def _advance_gate(self) -> None:
         """The single pipeline gate: a test that can start right now has
         absolute priority over development.
 

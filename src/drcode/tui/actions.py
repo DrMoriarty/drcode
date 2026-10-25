@@ -1288,6 +1288,22 @@ class ActionsLayer(DrCodeState):
             )
         )
 
+    def action_toggle_keep_awake(self) -> None:
+        """Settings command: whether the computer is kept awake (a
+        system-sleep assertion) while the pipeline has work — any task
+        QUEUED/ACTIVE/TESTING or a run in flight. Persisted per project
+        (.drcode/settings.json); the change applies immediately (the next
+        _update_keepawake tick releases the assertion when switched off)."""
+        self.settings.keep_awake = not self.settings.keep_awake
+        self.settings_store.save(self.settings)
+        self._update_keepawake()
+        state = "on" if self.settings.keep_awake else "off"
+        self.notify(
+            f"Keep computer awake while working: {state}",
+            title="Project settings",
+            timeout=4,
+        )
+
     def _task_isolation_label(self) -> str:
         """The Settings-entry label of the task-isolation setting: the
         option's own label, plus the dormant marker when worktree is

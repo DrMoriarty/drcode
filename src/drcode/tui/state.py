@@ -37,6 +37,7 @@ from textual.widgets import ListView, Static
 from ..agent import AgentDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
+from ..keepawake import KeepAwake
 from ..models import Clarification, PendingInput, Task, TaskEvent, TaskKind
 from ..notifications import Notifier
 from ..providers import AgentRole, ModelRef
@@ -398,6 +399,8 @@ class DrCodeState(App[None]):
 
     def _advance(self) -> None: ...
 
+    def _update_keepawake(self) -> None: ...
+
     def _promote_failed_queue(self, blocked: set[str] | None = None) -> Task | None: ...
 
     def _poll_dependency_unblock(self) -> None: ...
@@ -487,6 +490,11 @@ class DrCodeState(App[None]):
     # -- ntfy.sh notifications ------------------------------------------------
     notifier: Notifier
     _notifications_primed: bool
+
+    # -- keep-awake (system-sleep assertion while work is in flight) ----------
+    # Created in DrCodeApp.__init__; the busy detection lives in the
+    # pipeline layer (_keepawake_busy/_update_keepawake).
+    keepawake: KeepAwake
 
     # -- run state ----------------------------------------------------------
     viewed_id: str | None

@@ -32,6 +32,7 @@ from textual.widgets import (
 
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
+from ..keepawake import KeepAwake
 from ..models import (
     Clarification,
     PendingInput,
@@ -381,6 +382,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         )
         # Push-to-talk voice dictation (Ctrl+B in the input fields).
         self.voice_input = VoiceInputController(self)
+        # Keep-awake (system-sleep assertion while the pipeline has work):
+        # re-evaluated by the pipeline on every _advance() and by a
+        # periodic tick (see on_mount); released at teardown. The busy
+        # detection and the platform backends live in drcode.keepawake.
+        self.keepawake = KeepAwake()
         # The "queue empty" / "pipeline blocked" notifications are sent only
         # on state transitions; the very first pipeline evaluation after
         # startup only primes the state (a cold start on an empty queue
@@ -939,6 +945,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Clear the tab title so "DrCode — <project>" doesn't stick around
         # in the terminal after the app has exited.
         self._set_terminal_title("")
+        # Teardown must never leave a sleep assertion behind: the machine
+        # is free to sleep once drcode is gone (keepawake.stop is
+        # idempotent and thread-safe; the periodic tick stops calling it
+        # with the DOM gone).
+        self.keepawake.stop()
 
     def on_mount(self) -> None:
         # The app thread is the thread running the asyncio loop: recorded
@@ -1066,6 +1077,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # the pipeline is otherwise idle and nothing re-fires _advance()
         # (see _poll_dependency_unblock).
         self.set_interval(30, self._poll_dependency_unblock)
+        # Keep-awake safety tick (see _update_keepawake): re-evaluates the
+        # busy state independent of pipeline transitions and respawns a
+        # dead caffeinate child while work is in flight.
+        self.set_interval(5, self._update_keepawake)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is

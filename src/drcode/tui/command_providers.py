@@ -701,6 +701,17 @@ class TaskSettingsEntriesProvider(Provider):
                 ),
                 app.action_change_parallel_tasks,
             ),
+            (
+                f"Keep computer awake: {'on' if app.settings.keep_awake else 'off'}",
+                (
+                    "Hold a system-sleep assertion while the pipeline has "
+                    "work (any task queued/active/testing or a run in "
+                    "flight) — a sleeping machine tears the network down "
+                    "and kills the runs (project setting; does not stop "
+                    "the lid-closed clamshell sleep)"
+                ),
+                app.action_toggle_keep_awake,
+            ),
         ]
 
     async def discover(self) -> Hits:

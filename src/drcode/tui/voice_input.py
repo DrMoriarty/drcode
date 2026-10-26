@@ -160,6 +160,20 @@ class VoiceInputController:
             return f"{base}  Ctrl+B — готово, ESC — отмена"
         return base
 
+    def dismiss_sticky_error(self) -> None:
+        """Drop the sticky corner error on ANY user action (a key press,
+        a click — hooked from DrCodeApp.on_event before the event is
+        forwarded to the focused widget). The error explains a failed
+        dictation until the user moves on; once they act on anything
+        else it must not hang in the corner forever. The dictation
+        state machine itself clears the flag on its own actions
+        (new recording, cancel, insert) — this covers everything else."""
+        if self._sticky_error is None:
+            return
+        self._sticky_error = None
+        if self._state is _State.IDLE:
+            self._sync_indicator()
+
     def _notify(self, message: str, *, error: bool = False) -> None:
         try:
             self._app.notify(

@@ -1009,6 +1009,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # with the DOM gone).
         self.keepawake.stop()
 
+    async def on_event(self, event: events.Event) -> None:
+        # Any raw user input (a key press, a click) dismisses the sticky
+        # corner error of a failed dictation — the message must not hang
+        # in the corner forever. Intercepted here, before the event is
+        # forwarded to the focused widget: a widget that consumes the key
+        # (TextArea, bindings) never bubbles it back to the App, so the
+        # forwarded pass is not a reliable hook.
+        if isinstance(event, events.InputEvent) and not event.is_forwarded:
+            self.voice_input.dismiss_sticky_error()
+        await super().on_event(event)
+
     def on_mount(self) -> None:
         # The app thread is the thread running the asyncio loop: recorded
         # here so _on_app_thread() can tell live UI writes (safe) from

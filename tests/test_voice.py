@@ -1122,6 +1122,37 @@ async def test_sticky_error_cleared_by_next_dictation_action(
         assert widget.has_class("hidden")
 
 
+async def test_sticky_error_cleared_by_any_user_action(project_root: Any) -> None:
+    """The sticky corner error must not hang forever: ANY user action (a
+    key press unrelated to dictation, a click) dismisses it — the
+    error explained the failure, the user moving on retires it."""
+    from textual.widgets import Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        widget = app.query_one("#voice-indicator", Static)
+        controller = app.voice_input
+
+        controller._state = _State.RECORDING
+        controller._target = app.chat_input
+        controller._context = controller._snapshot_context(app.chat_input)
+        controller._fail("ASR failed: HTTP 500")
+        app._render_model_status()
+        assert controller._sticky_error is not None
+        assert not widget.has_class("hidden")
+
+        # An unrelated key press (typing into the input) clears it.
+        await pilot.press("a")
+        await pilot.pause()
+        assert controller._sticky_error is None
+        app._render_model_status()
+        assert widget.has_class("hidden")
+
+
 async def test_voice_settings_dialog_saves(project_root: Any) -> None:
     from textual.widgets import Button, Input, Switch
 

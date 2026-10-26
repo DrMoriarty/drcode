@@ -856,6 +856,13 @@ async def test_ff_ready_screen_merges_into_base_and_clears_counter(
         )
         assert (isolated / "fix.txt").exists()
         assert screen.check_action("ff_merge", ()) is False
+        # A successful merge is the logical end of work: the screen
+        # closes itself (the outcome toast outlives it).
+        await wait_until(
+            lambda: not isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="merge screen auto-closed",
+        )
         # Mergedness snapshot + header counter refreshed by the same pass.
         await wait_until(
             lambda: app._merge_state.get(task_id) == "merged",
@@ -964,6 +971,20 @@ async def test_staged_unconcluded_merge_is_not_ff_ready(
             pilot=pilot,
             what="resolution committed",
         )
+        # A successful commit is the logical end of work: the screen
+        # closes itself (the outcome toast outlives it).
+        await wait_until(
+            lambda: not isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="merge screen auto-closed",
+        )
+        # The toast is posted app-level and pumped separately from the
+        # screen dismissal — wait for it instead of asserting directly.
+        await wait_until(
+            lambda: any("Committed on" in m for m in _toasts(app)),
+            pilot=pilot,
+            what="commit toast shown",
+        )
         assert _git(wt, "rev-parse", "HEAD").strip() != head_before
         assert me.is_fast_forward(isolated, branch_for(task.id), "main")
 
@@ -1020,5 +1041,11 @@ async def test_conflicted_mode_keeps_ff_out_and_resolution_in(
             lambda: not me.in_progress(wt),
             pilot=pilot,
             what="resolution committed",
+        )
+        # Auto-close on a successful commit here as well.
+        await wait_until(
+            lambda: not isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="merge screen auto-closed",
         )
         assert me.is_fast_forward(isolated, branch_for(task.id), "main")

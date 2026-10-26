@@ -31,7 +31,9 @@ The screen is a viewer + decision pad, never an autonomous actor:
   resolution state is untouched), ``E`` opens the persisted full report
   in the user's editor, ``s`` commits the resolution on the task branch
   and ``a`` aborts the merge — both only behind an explicit second-press
-  confirmation, mirroring the armed-ESC convention of the app.
+  confirmation, mirroring the armed-ESC convention of the app. A
+  successful commit or ff-merge is the logical end of the work here:
+  the screen closes itself (the outcome toast outlives it).
 
 When the engine's auto-resolution left NOTHING to resolve AND the
 report vouches the fast-forward is real (`fast_forward is True` — a
@@ -44,7 +46,8 @@ That is the contract's user-triggered half: the screen still never
 merges into the base on its own, only behind the explicit ``f`` press,
 and only `--ff-only` — a refusal (the base moved ahead, a dirty tree)
 is an error toast, never a conflicted merge to resolve in the user's
-tree; the user re-runs the reversed merge by reopening the screen.
+tree; the user re-runs the reversed merge by reopening the screen. A
+successful ``f`` closes the screen, same as a successful ``s``.
 
 Every ``v`` run also rewrites the full funnel report (verdict, status
 lines, complete check outputs — modeled on `ResolverOutcome.summary()`)
@@ -1093,7 +1096,10 @@ class ConflictScreen(ModalScreen[None]):
                 f"`git merge --ff-only {branch}` finishes it"
             )
             self.notify(f"Committed on {branch}", title="Merge", timeout=5)
-            await self._reload_files()
+            # A successful commit is the screen's logical end of work —
+            # close it automatically (the toast outlives the screen; the
+            # abort path below already works the same way).
+            self.dismiss()
         else:
             self.notify(
                 f"Commit refused: {out}", title="Merge", severity="error", timeout=8
@@ -1193,6 +1199,9 @@ class ConflictScreen(ModalScreen[None]):
         # ⎇ counter in one pass — the poll's fingerprint cache sees the
         # moved base and recomputes.
         await app._poll_git_indicator()
+        # A successful merge is the screen's logical end of work — close
+        # it automatically (the toast above outlives the screen).
+        self.dismiss()
 
     # -- refresh / close -----------------------------------------------------------
 

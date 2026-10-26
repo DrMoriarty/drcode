@@ -6,6 +6,13 @@ worktree, the agent resolver (#59d85021) tries to clear it unattended —
 and when it gives up (`task.needs_human`) or the user simply wants to
 decide by hand, this screen opens on the parked conflict.
 
+The ``v`` funnel runs with visible per-stage progress: a panel line per
+check (braille spinner + elapsed seconds while running, ok/FAILED/skip
+marks when done, plus a percent/ETA footer estimated from the rolling
+per-check durations persisted across runs next to the verify report) —
+the checks themselves stay serial and off the UI thread, the panel is
+animated by an independent timer while the worker awaits them.
+
 The screen is a viewer + decision pad, never an autonomous actor:
 
 - left: the conflicted files of the triage report with their LIVE status
@@ -58,6 +65,8 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from rich.segment import Segment
@@ -71,6 +80,7 @@ from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from textual.timer import Timer
 from textual.widgets import Label, ListItem, ListView, Static
 
 from .. import merge_resolver
@@ -93,6 +103,42 @@ _ARM_SECONDS = 2.0
 
 # The gutter in front of every content line (cursor marker + space).
 _GUTTER = "  "
+
+# The verification-funnel progress indicator: braille spinner frames and
+# how often the panel's animation timer redraws the running line.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_INTERVAL = 0.15
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    """Compact human duration for the progress panel ("42s", "1m20s")."""
+    if seconds is None:
+        return "?"
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+@dataclass
+class _CheckStage:
+    """One stage of the interactive funnel's live progress: `key` names
+    the persisted-timing slot, `fn_name` the `merge_resolver` function to
+    resolve at CALL time (never captured — tests monkeypatch the module
+    attribute), `status` is pending / running / done."""
+
+    key: str
+    fn_name: str
+    label: str
+    status: str = "pending"
+    result: CheckResult | None = None
+    started: float | None = None
+    duration: float | None = None
+
 
 # Section styles of the zdiff3 view: ours green, the common ancestor dim
 # italic, theirs blue, the marker lines dim.
@@ -455,6 +501,17 @@ class ConflictScreen(ModalScreen[None]):
         # first-shown check ordered as in the panel — the details viewer
         # reads from here.
         self.check_results: list[CheckResult] = []
+        # Live progress of the running funnel: per-stage state, the
+        # panel's animation timer (independent of the worker — it must
+        # tick while the blocking checks run in their threads), the
+        # persisted rolling averages feeding the ETA, and a generation
+        # counter so a cancelled run's cleanup cannot stop the NEXT
+        # run's timer.
+        self._stages: list[_CheckStage] = []
+        self._checks_timer: Timer | None = None
+        self._spinner_frame = 0
+        self._avg_timings: dict[str, float] = {}
+        self._checks_generation = 0
 
     # -- composition ------------------------------------------------------------
 
@@ -472,7 +529,9 @@ class ConflictScreen(ModalScreen[None]):
             with Horizontal(id="merge-body"):
                 yield ListView(id="merge-files")
                 yield ConflictView(id="merge-view")
-            yield Static("", id="merge-checks")
+            # markup=False: the progress lines carry literal [ok] / [ ]
+            # brackets that must never trip Rich markup.
+            yield Static("", id="merge-checks", markup=False)
             yield Static(
                 "o/t/b hunk ours/theirs/both · e edit · v check · "
                 "d details · E report · s commit · a abort · r refresh · esc close",
@@ -694,52 +753,222 @@ class ConflictScreen(ModalScreen[None]):
 
     # -- verification funnel (layer 2, in the worktree) --------------------------
 
+    # The funnel's four serial stages — the order matters (tree soundness
+    # before the expensive suite). `fn_name` is resolved on the module at
+    # call time, so monkeypatching per-stage functions in tests works.
+    _CHECK_STAGES: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        ("compile", "compile_check", "compile"),
+        ("ruff", "ruff_check", "ruff check"),
+        ("pyright", "pyright_check", "pyright"),
+        ("pytest", "run_test_suite", "test suite"),
+    )
+    # ETA defaults (seconds) for a stage with no persisted history yet —
+    # replaced by the rolling averages after the first real runs.
+    _DEFAULT_STAGE_ETAS: ClassVar[dict[str, float]] = {
+        "compile": 5.0,
+        "ruff": 10.0,
+        "pyright": 90.0,
+        "pytest": 180.0,
+    }
+
     def action_verify(self) -> None:
         if self.wt is None or not self.wt.in_progress():
             self.notify("No merge is in progress", title="Merge", timeout=4)
             return
+        self._begin_checks()
+        self._run_checks()
+
+    def _begin_checks(self) -> None:
+        """Reset the per-stage progress state and start the panel's
+        animation timer. The timer is deliberately independent of the
+        worker: the checks run in worker threads, and a braille spinner
+        plus elapsed/ETA line must keep moving while the event loop idles
+        between the `asyncio.to_thread` awaits."""
+        self._checks_generation += 1
+        self._stop_checks_animation()
+        self._stages = [
+            _CheckStage(key, fn_name, label)
+            for key, fn_name, label in self._CHECK_STAGES
+        ]
+        self._spinner_frame = 0
+        self._avg_timings = {}
         panel = self.query_one("#merge-checks", Static)
         panel.add_class("visible")
-        panel.update("Running checks… (compile / ruff / pyright, then tests)")
-        self._run_checks()
+        self._render_checks_panel()
+        self._checks_timer = self.set_interval(
+            _SPINNER_INTERVAL, self._tick_checks_animation
+        )
+
+    def _stop_checks_animation(self) -> None:
+        if self._checks_timer is not None:
+            self._checks_timer.stop()
+            self._checks_timer = None
+
+    def on_unmount(self) -> None:
+        self._stop_checks_animation()
+
+    def _tick_checks_animation(self) -> None:
+        """One spinner frame; redraw only while a stage is actually
+        running (a finished panel is static and needs no redraws)."""
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        if any(stage.status == "running" for stage in self._stages):
+            self._render_checks_panel()
+
+    def _stage_estimate(self, stage: _CheckStage, now: float) -> float:
+        """The historical duration of `stage`: the persisted rolling
+        average when there is one, else the built-in default."""
+        return self._avg_timings.get(stage.key) or self._DEFAULT_STAGE_ETAS.get(
+            stage.key, 30.0
+        )
+
+    def _checks_eta(self) -> float:
+        """ETA over the not-yet-done stages: each remaining stage's
+        historical duration, the running one credited with
+        `historical − elapsed` (floored at 10% of it)."""
+        now = time.monotonic()
+        total = 0.0
+        for stage in self._stages:
+            if stage.status == "done":
+                continue
+            estimate = self._stage_estimate(stage, now)
+            if stage.status == "running" and stage.started is not None:
+                total += max(estimate - (now - stage.started), estimate * 0.1)
+            else:
+                total += estimate
+        return total
+
+    def _checks_percent(self) -> int:
+        """Completed / total checks, the running stage credited
+        proportionally to its historical duration (capped at 95% — it
+        never claims to be done while it is still running)."""
+        if not self._stages:
+            return 0
+        now = time.monotonic()
+        done = 0.0
+        for stage in self._stages:
+            if stage.status == "done":
+                done += 1
+            elif stage.status == "running" and stage.started is not None:
+                done += min(
+                    (now - stage.started) / self._stage_estimate(stage, now), 0.95
+                )
+        return int(done / len(self._stages) * 100)
+
+    def _render_checks_panel(self) -> None:
+        """The live progress view: one status line per stage
+        ("[ok] compile (0.4s)", "[⠹] pyright… (12s)", "[ ] test suite")
+        plus the percent/ETA footer. Plain text (the panel is
+        markup=False) — redrawn between stages and from the animation
+        timer, never from the worker threads."""
+        if not self.is_mounted:
+            return
+        panel = self.query_one("#merge-checks", Static)
+        lines = ["Verification funnel:"]
+        now = time.monotonic()
+        for stage in self._stages:
+            if stage.status == "done":
+                mark = (
+                    "skip"
+                    if (stage.result and stage.result.skipped)
+                    else ("ok" if (stage.result and stage.result.ok) else "FAILED")
+                )
+                lines.append(
+                    f"[{mark}] {stage.label}  ({_fmt_seconds(stage.duration)})"
+                )
+            elif stage.status == "running":
+                frame = _SPINNER_FRAMES[self._spinner_frame]
+                elapsed = (now - stage.started) if stage.started is not None else 0.0
+                lines.append(f"[{frame}] {stage.label}…  ({_fmt_seconds(elapsed)})")
+            else:
+                lines.append(f"[ ] {stage.label}")
+        done_count = sum(1 for stage in self._stages if stage.status == "done")
+        lines.append(
+            f"Checks: {done_count}/{len(self._stages)} · "
+            f"{self._checks_percent()}% · ETA ~{_fmt_seconds(self._checks_eta())}"
+        )
+        panel.update("\n".join(lines))
 
     @work(exclusive=True, group="merge-checks")
     async def _run_checks(self) -> None:
         if self.wt is None:
             return
+        generation = self._checks_generation
         worktree = self.wt.worktree
-        checks = await asyncio.to_thread(merge_resolver.mechanical_checks, worktree)
-        tests = await asyncio.to_thread(merge_resolver.run_test_suite, worktree)
-        self.check_results = [*checks, tests]
-        self._checks_ok = all(c.ok for c in self.check_results)
-        panel = self.query_one("#merge-checks", Static)
-        lines = [c.line for c in self.check_results]
-        # The full funnel report is persisted next to the engine's triage
-        # report — blocking file IO, off the UI thread. Best-effort: a
-        # write failure just drops the path line, never the run itself.
-        report_path = await asyncio.to_thread(
-            merge_resolver.save_verify_report,
-            cast("DrCodeApp", self.app).project_root,
-            self.task_id,
-            checks,
-            tests,
-        )
-        if report_path is not None:
-            lines.append(f"Full report: {report_path}")
-        panel.update("Checks:\n" + "\n".join(f"  {line}" for line in lines))
-        if self._checks_ok:
-            message = "All checks passed"
-        else:
-            failed = merge_resolver.failed_names(self.check_results)
-            message = "Checks FAILED: " + ", ".join(failed)
-            if report_path is not None:
-                message += f" — report: {report_path}"
-        self.notify(
-            message,
-            title="Merge",
-            severity="information" if self._checks_ok else "error",
-            timeout=5,
-        )
+        app = cast("DrCodeApp", self.app)
+        try:
+            # The persisted rolling averages (previous runs' per-check
+            # durations) feed the ETA line from the first tick on —
+            # blocking file IO, off the UI thread.
+            self._avg_timings = await asyncio.to_thread(
+                merge_resolver.load_check_timings, app.project_root, self.task_id
+            )
+            self._render_checks_panel()
+            for stage in self._stages:
+                stage.status = "running"
+                stage.started = time.monotonic()
+                self._render_checks_panel()
+                fn = getattr(merge_resolver, stage.fn_name)
+                result = await asyncio.to_thread(fn, worktree)
+                stage.duration = time.monotonic() - stage.started
+                stage.result = result
+                stage.status = "done"
+                self._render_checks_panel()
+            self.check_results = [
+                s.result for s in self._stages if s.result is not None
+            ]
+            self._checks_ok = all(c.ok for c in self.check_results)
+            # The full funnel report is persisted next to the engine's
+            # triage report, and this run's measured durations merge into
+            # the persisted rolling averages (skipped stages excluded —
+            # a 2ms skip would poison the average). Blocking file IO, off
+            # the UI thread. Both best-effort: a write failure just drops
+            # the path line / the ETA history, never the run itself.
+            report_path = await asyncio.to_thread(
+                merge_resolver.save_verify_report,
+                app.project_root,
+                self.task_id,
+                [s.result for s in self._stages[:-1] if s.result is not None],
+                self._stages[-1].result or CheckResult(name="test suite", ok=True),
+            )
+            measured = {
+                stage.key: stage.duration
+                for stage in self._stages
+                if stage.duration is not None
+                and stage.result is not None
+                and not stage.result.skipped
+            }
+            if measured:
+                self._avg_timings = await asyncio.to_thread(
+                    merge_resolver.save_check_timings,
+                    app.project_root,
+                    self.task_id,
+                    measured,
+                )
+            if self.is_mounted:
+                panel = self.query_one("#merge-checks", Static)
+                lines = [c.line for c in self.check_results]
+                if report_path is not None:
+                    lines.append(f"Full report: {report_path}")
+                panel.update("Checks:\n" + "\n".join(f"  {line}" for line in lines))
+            if self._checks_ok:
+                message = "All checks passed"
+            else:
+                failed = merge_resolver.failed_names(self.check_results)
+                message = "Checks FAILED: " + ", ".join(failed)
+                if report_path is not None:
+                    message += f" — report: {report_path}"
+            self.notify(
+                message,
+                title="Merge",
+                severity="information" if self._checks_ok else "error",
+                timeout=5,
+            )
+        finally:
+            # Stop OUR generation's timer only — a cancelled run (an
+            # exclusive restart by a fresh v press) must not kill the
+            # successor's animation.
+            if generation == self._checks_generation:
+                self._stop_checks_animation()
 
     def action_check_details(self) -> None:
         """d: open the full output of a check in the details viewer —

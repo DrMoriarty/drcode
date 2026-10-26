@@ -10,6 +10,7 @@ no models (the conflict layer is deliberately LLM-free)."""
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -552,6 +553,26 @@ def test_save_verify_report_overwrites_per_run(tmp_path: Path) -> None:
     assert "PASSED" in rewritten
 
 
+def test_check_timings_persist_and_roll(tmp_path: Path) -> None:
+    """The per-check rolling averages persist next to the verify report:
+    the first save plants them, the next merges at 0.7 old / 0.3 new, a
+    corrupted file is skipped (empty history, never fatal)."""
+    assert merge_resolver.load_check_timings(tmp_path, "t1") == {}
+    merge_resolver.save_check_timings(tmp_path, "t1", {"pytest": 100.0, "ruff": 2.0})
+    assert merge_resolver.load_check_timings(tmp_path, "t1") == {
+        "pytest": 100.0,
+        "ruff": 2.0,
+    }
+    merge_resolver.save_check_timings(tmp_path, "t1", {"pytest": 200.0})
+    timings = merge_resolver.load_check_timings(tmp_path, "t1")
+    assert timings["pytest"] == pytest.approx(0.7 * 100.0 + 0.3 * 200.0)
+    assert timings["ruff"] == 2.0
+    path = merge_resolver.check_timings_path(tmp_path, "t1")
+    assert path.name == "t1-verify-timings.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert merge_resolver.load_check_timings(tmp_path, "t1") == {}
+
+
 # -- the screen: failure toast, report file, details viewer ---------------------------
 
 
@@ -567,7 +588,10 @@ async def test_verify_failure_names_checks_writes_report_and_opens_details(
     manager.set_hold(task.id, on=True)
     _env, wt = _parked_content_conflict(isolated, task.id)
     checks, tests = _canned_results()
-    monkeypatch.setattr(merge_resolver, "mechanical_checks", lambda _wt: checks)
+    compile_c, ruff_c, pyright_c = checks
+    monkeypatch.setattr(merge_resolver, "compile_check", lambda _wt: compile_c)
+    monkeypatch.setattr(merge_resolver, "ruff_check", lambda _wt: ruff_c)
+    monkeypatch.setattr(merge_resolver, "pyright_check", lambda _wt: pyright_c)
     monkeypatch.setattr(merge_resolver, "run_test_suite", lambda _wt: tests)
     app = DrCodeApp(isolated)
 
@@ -636,6 +660,85 @@ async def test_verify_failure_names_checks_writes_report_and_opens_details(
         assert app.screen is screen
         assert me.in_progress(wt)
         assert "<<<<<<<" in (wt / "app.py").read_text()
+
+
+async def test_verify_shows_live_progress_and_persists_timings(
+    isolated: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While the funnel runs the #merge-checks panel shows the four
+    stages live — a spinner line for the running check, pending markers
+    for the rest, a percent/ETA footer — and after the run the measured
+    durations are persisted as the rolling-average history (skipped
+    checks excluded)."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    checks, tests = _canned_results()
+    compile_c, ruff_c, pyright_c = checks
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_compile(_wt: Path) -> CheckResult:
+        started.set()
+        release.wait(10)
+        return compile_c
+
+    monkeypatch.setattr(merge_resolver, "compile_check", slow_compile)
+    monkeypatch.setattr(merge_resolver, "ruff_check", lambda _wt: ruff_c)
+    monkeypatch.setattr(merge_resolver, "pyright_check", lambda _wt: pyright_c)
+    monkeypatch.setattr(merge_resolver, "run_test_suite", lambda _wt: tests)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None,
+            pilot=pilot,
+            what="screen prepared",
+        )
+
+        await pilot.press("v")
+        # Mid-run: compile is blocked inside its thread, everything else
+        # pending — the panel animates independently of the worker.
+        await wait_until(
+            lambda: started.is_set(), pilot=pilot, what="compile check running"
+        )
+        await pilot.pause()
+        panel_text = str(screen.query_one("#merge-checks", Static).content)
+        assert "Verification funnel:" in panel_text
+        assert "] compile…" in panel_text  # the spinner line (any frame)
+        assert "[ ] ruff check" in panel_text
+        assert "[ ] pyright" in panel_text
+        assert "[ ] test suite" in panel_text
+        assert "ETA ~" in panel_text
+        assert "%" in panel_text
+        assert screen._checks_timer is not None  # the animation timer runs
+
+        release.set()
+        report = merge_resolver.verify_report_path(isolated, task.id)
+        await wait_until(
+            lambda: report.exists(), pilot=pilot, what="verify report written"
+        )
+        await wait_until(
+            lambda: screen._checks_timer is None, pilot=pilot, what="timer stopped"
+        )
+        # The final panel is the static status list again…
+        final_text = str(screen.query_one("#merge-checks", Static).content)
+        assert "ruff check: FAILED" in final_text
+        # …and the measured durations (skipped pyright excluded) landed
+        # in the persisted rolling averages.
+        timings = merge_resolver.load_check_timings(isolated, task.id)
+        assert set(timings) == {"compile", "ruff", "pytest"}
+        assert all(value > 0 for value in timings.values())
 
 
 async def test_details_key_without_checks_and_report_key_without_file(

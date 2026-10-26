@@ -39,6 +39,7 @@ Sync module (plain subprocesses, mirroring `drcode.task_env` /
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -55,17 +56,22 @@ __all__ = [
     "TEST_TIMEOUT",
     "CheckResult",
     "build_agent_context",
+    "compile_check",
     "conclude",
     "failed_names",
     "format_verify_report",
     "mechanical_checks",
     "prepare",
+    "pyright_check",
     "restore_conflict",
     "review_diffs",
+    "ruff_check",
     "run_test_suite",
     "save_verify_report",
     "verify_report_path",
 ]
+# (check-timings helpers are intentionally not re-exported: they serve the
+# interactive funnel only.)
 
 # Longest a single git/subprocess call may run (mirrors the engine).
 _TIMEOUT = 120
@@ -314,70 +320,86 @@ def _python_files(worktree: Path) -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
+def compile_check(worktree: Path) -> CheckResult:
+    """The MANDATORY compile check: every tracked .py file must
+    byte-compile. Skipped (best-effort) only when the tree tracks no
+    Python files at all."""
+    py_files = _python_files(worktree)
+    if not py_files:
+        return CheckResult(
+            name="compile (py_compile of tracked .py files)",
+            ok=True,
+            skipped=True,
+            output="no tracked .py files",
+        )
+    # Chunk the compile check: a single command line with thousands of
+    # paths can overflow the OS arg limit.
+    chunk = 400
+    ok = True
+    output: list[str] = []
+    for i in range(0, len(py_files), chunk):
+        proc = subprocess.run(
+            [sys.executable, "-m", "py_compile", *py_files[i : i + chunk]],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+            check=False,
+        )
+        if proc.returncode != 0:
+            ok = False
+            output.append((proc.stdout + proc.stderr).strip()[:4000])
+    return CheckResult(
+        name="compile (py_compile of tracked .py files)",
+        ok=ok,
+        output="\n".join(output)[:8000],
+    )
+
+
+def ruff_check(worktree: Path) -> CheckResult:
+    """The best-effort ruff check — MUST come from the project's own
+    environment: a random PATH binary carries a different default
+    ruleset/version and reports phantom failures (e.g. DTZ005 from an old
+    ruff) that roll back a correct resolution. Skipped when the project
+    has no ruff."""
+    plan = _project_python(worktree, "ruff")
+    if plan is None:
+        return CheckResult(name="ruff check", ok=True, skipped=True)
+    cmd, fix_path = plan
+    return _run_checked(
+        "ruff check",
+        [*cmd, "-m", "ruff", "check", "."],
+        worktree,
+        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+    )
+
+
+def pyright_check(worktree: Path) -> CheckResult:
+    """The best-effort pyright check, from the project's own environment
+    (same reasoning as ruff). Skipped when the project has none."""
+    plan = _project_python(worktree, "pyright")
+    if plan is None:
+        return CheckResult(name="pyright", ok=True, skipped=True)
+    cmd, fix_path = plan
+    return _run_checked(
+        "pyright",
+        [*cmd, "-m", "pyright"],
+        worktree,
+        timeout=900,
+        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+    )
+
+
 def mechanical_checks(worktree: Path) -> list[CheckResult]:
     """Level 1 of the funnel: the tree must at least be sound. The
     compile check is MANDATORY (every file git tracks must byte-compile);
     ruff/pyright run when the tool is available (best-effort — a project
-    without them installed is not failed for it)."""
-    results: list[CheckResult] = []
-    py_files = _python_files(worktree)
-    if py_files:
-        # Chunk the compile check: a single command line with thousands of
-        # paths can overflow the OS arg limit.
-        chunk = 400
-        ok = True
-        output: list[str] = []
-        for i in range(0, len(py_files), chunk):
-            proc = subprocess.run(
-                [sys.executable, "-m", "py_compile", *py_files[i : i + chunk]],
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-                check=False,
-            )
-            if proc.returncode != 0:
-                ok = False
-                output.append((proc.stdout + proc.stderr).strip()[:4000])
-        results.append(
-            CheckResult(
-                name="compile (py_compile of tracked .py files)",
-                ok=ok,
-                output="\n".join(output)[:8000],
-            )
-        )
-    # ruff/pyright MUST come from the project's own environment: a random
-    # PATH binary carries a different default ruleset/version and reports
-    # phantom failures (e.g. DTZ005 from an old ruff) that roll back a
-    # correct resolution. Skipped (best-effort) when the project has none.
-    ruff_plan = _project_python(worktree, "ruff")
-    if ruff_plan is not None:
-        ruff_cmd, fix_path = ruff_plan
-        results.append(
-            _run_checked(
-                "ruff check",
-                [*ruff_cmd, "-m", "ruff", "check", "."],
-                worktree,
-                env=_worktree_pythonpath_env(worktree) if fix_path else None,
-            )
-        )
-    else:
-        results.append(CheckResult(name="ruff check", ok=True, skipped=True))
-    pyright_plan = _project_python(worktree, "pyright")
-    if pyright_plan is not None:
-        pyright_cmd, fix_path = pyright_plan
-        results.append(
-            _run_checked(
-                "pyright",
-                [*pyright_cmd, "-m", "pyright"],
-                worktree,
-                timeout=900,
-                env=_worktree_pythonpath_env(worktree) if fix_path else None,
-            )
-        )
-    else:
-        results.append(CheckResult(name="pyright", ok=True, skipped=True))
-    return results
+    without them installed is not failed for it).
+
+    Kept as the serial composition of the per-stage functions
+    (`compile_check` / `ruff_check` / `pyright_check`) so the pipeline and
+    the interactive funnel run byte-identical checks."""
+    return [compile_check(worktree), ruff_check(worktree), pyright_check(worktree)]
 
 
 def run_test_suite(worktree: Path, timeout: int = TEST_TIMEOUT) -> CheckResult:
@@ -473,6 +495,65 @@ def save_verify_report(
         return path
     except OSError:
         return None
+
+
+# -- check timings (ETA history for the interactive funnel) -------------------------
+
+
+def check_timings_path(project_root: Path, task_id: str) -> Path:
+    """Where the rolling per-check durations of `task_id` are persisted —
+    next to the verify report (`<task-id>-verify-timings.json`). Keyed by
+    the short stage key the interactive funnel uses (compile / ruff /
+    pyright / pytest), valued in seconds."""
+    return merge_engine.report_path(project_root, task_id).with_name(
+        f"{task_id}-verify-timings.json"
+    )
+
+
+def load_check_timings(project_root: Path, task_id: str) -> dict[str, float]:
+    """The persisted rolling averages of the task's past check durations;
+    an empty dict (missing / corrupted file — skipped, never fatal) means
+    no history yet and the funnel falls back to its defaults."""
+    path = check_timings_path(project_root, task_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(key): float(value)
+        for key, value in data.items()
+        if isinstance(value, int | float) and value > 0
+    }
+
+
+def save_check_timings(
+    project_root: Path, task_id: str, timings: dict[str, float]
+) -> dict[str, float]:
+    """Merge one run's measured per-check durations into the persisted
+    rolling averages (weight 0.7 old / 0.3 new) and write the file back
+    atomically. Best-effort: any failure is swallowed — the ETA history
+    is a UX nicety, never worth crashing over. Returns the merged
+    averages."""
+    try:
+        old = load_check_timings(project_root, task_id)
+        merged = {
+            **old,
+            **{
+                key: old.get(key, measured) * 0.7 + measured * 0.3
+                for key, measured in timings.items()
+                if measured > 0
+            },
+        }
+        path = check_timings_path(project_root, task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged), encoding="utf-8")
+        tmp.replace(path)
+        return merged
+    except (OSError, ValueError):
+        return {}
 
 
 def review_diffs(

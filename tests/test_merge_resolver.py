@@ -8,7 +8,9 @@ TOOLS are exercised directly through RunContext (no model calls).
 
 from __future__ import annotations
 
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -135,6 +137,7 @@ def test_run_test_suite_pass_and_fail(
     # Force the sys.executable pytest path (deterministic: no uv project
     # environment provisioning inside the test).
     monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    _no_xdist(monkeypatch)
     (repo / "tests").mkdir()
     (repo / "tests" / "__init__.py").write_text("")
     (repo / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
@@ -154,6 +157,148 @@ def test_run_test_suite_skipped_when_pytest_unavailable(
     (repo / "tests").mkdir()
     result = mr.run_test_suite(repo)
     assert result.skipped and result.ok
+
+
+# -- the funnel runs the PROJECT'S environment, never a PATH tool -------
+
+
+def _fake_worktree_venv(repo: Path) -> Path:
+    """A .venv whose python is a shim around the running interpreter that
+    logs every invocation — lets the tests observe WHICH python the
+    funnel picked (the project's own env, never a PATH lookup)."""
+    log = repo / ".venv" / "invocations.log"
+    shim = repo / ".venv" / "bin" / "python"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" >> {shlex.quote(str(log))}\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    return log
+
+
+def _no_xdist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite runs single-process: the xdist probe reports
+    absent, so the funnel never appends `-n 4`."""
+    real = mr._module_importable
+    monkeypatch.setattr(
+        mr,
+        "_module_importable",
+        lambda cmd, module, cwd: real(cmd, module, cwd) if module != "xdist" else False,
+    )
+
+
+def test_run_test_suite_uses_worktree_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _fake_worktree_venv(repo)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)  # no uv on PATH
+    _no_xdist(monkeypatch)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    result = mr.run_test_suite(repo)
+    assert result.ok and not result.skipped
+    lines = log.read_text().splitlines()
+    # The pytest probe ran through the venv python, and the suite itself
+    # too (`-m pytest`, no bare `pytest` from PATH).
+    assert ["-c", "import pytest"] == lines[:2]
+    assert lines[-4:] == ["-m", "pytest", "-q", "-x"]
+
+
+def test_run_test_suite_caps_xdist_fanout(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_worktree_venv(repo)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    captured: dict[str, list[str]] = {}
+
+    def spy(name: str, cmd: list[str], *args: object, **kwargs: object) -> mr.CheckResult:
+        captured["cmd"] = cmd
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    result = mr.run_test_suite(repo)
+    assert result.ok
+    # The project's xdist is available → its addopts `-n auto` would pin
+    # every core; the funnel caps the fan-out explicitly.
+    assert "-m" in captured["cmd"] and "pytest" in captured["cmd"]
+    assert ["-n", "4"] == captured["cmd"][-2:]
+
+
+def test_run_test_suite_falls_through_skeleton_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The 9d29e63d failure class: a .venv exists but holds nothing (a
+    # `--no-sync` skeleton) — the funnel must not end up running a random
+    # PATH pytest that cannot import the project.
+    shim = repo / ".venv" / "bin" / "python"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\nexit 1\n")  # every import probe fails
+    shim.chmod(0o755)
+    monkeypatch.setattr(
+        mr.shutil, "which", lambda name: "/usr/local/bin/uv" if name == "uv" else None
+    )
+    _no_xdist(monkeypatch)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    result = mr.run_test_suite(repo)
+    # Falls back to the interpreter drcode runs under (pytest available,
+    # worktree on the path) — and since the worktree is no uv project, uv
+    # is never allowed to discover an ANCESTOR project's environment.
+    assert result.ok and not result.skipped
+
+
+def test_run_test_suite_skips_with_skeleton_venv_and_no_pytest(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim = repo / ".venv" / "bin" / "python"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\nexit 1\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    monkeypatch.setattr(mr, "_pytest_importable", lambda: False)
+    (repo / "tests").mkdir()
+    result = mr.run_test_suite(repo)
+    assert result.skipped and result.ok
+
+
+def test_mechanical_checks_ruff_from_worktree_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _fake_worktree_venv(repo)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)  # no PATH ruff
+    _no_xdist(monkeypatch)
+    (repo / "app.py").write_text("value = 1\n")  # lint-clean content
+    results = mr.mechanical_checks(repo)
+    ruff = next(c for c in results if c.name == "ruff check")
+    assert ruff.ok and not ruff.skipped
+    lines = log.read_text().splitlines()
+    # ruff was invoked through the venv python (`-m ruff`), never a
+    # random PATH binary with a different default ruleset. (pyright may
+    # follow it in the log — it resolves through the same env.)
+    assert ["-c", "import ruff"] == lines[:2]
+    windows = [lines[i : i + 4] for i in range(len(lines) - 3)]
+    assert ["-m", "ruff", "check", "."] in windows
+
+
+def test_mechanical_checks_skips_ruff_when_project_env_lacks_it(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_worktree_venv(repo)
+    # ruff is importable in THIS process but NOT via the worktree venv
+    # shim? The shim execs this interpreter… force the probe negative.
+    monkeypatch.setattr(
+        mr,
+        "_module_importable",
+        lambda cmd, module, cwd: module != "ruff" and module != "pyright",
+    )
+    results = mr.mechanical_checks(repo)
+    for name in ("ruff check", "pyright"):
+        check = next(c for c in results if c.name == name)
+        assert check.ok and check.skipped
 
 
 # -- review diffs, restore, conclude --------------------------------------------------

@@ -274,6 +274,24 @@ def config_from_settings(settings: ProjectSettings) -> VoiceConfig | None:
     )
 
 
+def _wav_upload_details(wav: bytes) -> str:
+    """A compact human summary of the recorded upload — ``(12.3s, 456 KB)``
+    or ``(34.2s, 1.1 MB)``. The duration comes from the WAV header (any
+    parse failure degrades to 0.0s rather than masking the real error the
+    message is attached to); the size is simply the payload length."""
+    try:
+        with wave.open(io.BytesIO(wav)) as handle:
+            duration = handle.getnframes() / max(handle.getframerate(), 1)
+    except Exception:  # noqa: BLE001 - a broken header must not mask the error
+        duration = 0.0
+    size = len(wav)
+    if size >= 1_048_576:
+        size_s = f"{size / 1_048_576:.1f} MB"
+    else:
+        size_s = f"{size / 1024:.0f} KB"
+    return f"{duration:.1f}s, {size_s}"
+
+
 class VoiceClient:
     """Synchronous OpenAI-compatible audio-API client (worker threads only)."""
 
@@ -323,8 +341,15 @@ class VoiceClient:
     def transcribe(self, wav: bytes) -> str:
         """Speech → text (``POST /audio/transcriptions``): multipart WAV
         upload, the JSON answer carries the recognized text with
-        punctuation and capitalization already in place."""
+        punctuation and capitalization already in place.
+
+        Every failure message carries the recording's duration and upload
+        size ("(12.3s, 456 KB)"): the user can tell at a glance whether a
+        full recording reached the endpoint or the request died with most
+        of the speech never sent (transmission) — versus a capture-side
+        loss, which the recorder reports separately."""
         self._require(self.config.asr_model, "ASR")
+        details = _wav_upload_details(wav)
         try:
             response = self._post(
                 f"{self.config._base()}/audio/transcriptions",
@@ -336,11 +361,13 @@ class VoiceClient:
             response.raise_for_status()
             text = str(response.json().get("text") or "").strip()
         except httpx.HTTPStatusError as e:
-            raise VoiceError(f"ASR failed: HTTP {e.response.status_code}") from e
+            raise VoiceError(
+                f"ASR failed: HTTP {e.response.status_code} ({details})"
+            ) from e
         except (httpx.HTTPError, ValueError) as e:
-            raise VoiceError(f"ASR failed: {type(e).__name__}: {e}") from e
+            raise VoiceError(f"ASR failed: {type(e).__name__}: {e} ({details})") from e
         if not text:
-            raise VoiceError("ASR returned no text")
+            raise VoiceError(f"ASR returned no text ({details})")
         return text
 
     def speech(self, text: str) -> bytes:
@@ -401,6 +428,47 @@ class _AudioStream(Protocol):
     def close(self) -> None: ...
 
 
+def _capture_problem(errors: int, overflows: int) -> str | None:
+    """A readable one-line description of what the capture lost, or None
+    when the recording is complete (both counters are zero)."""
+    parts = []
+    if overflows:
+        parts.append(f"the input buffer overflowed {overflows} time(s)")
+    if errors:
+        parts.append(f"the recording callback failed {errors} time(s)")
+    if not parts:
+        return None
+    return " and ".join(parts)
+
+
+# The input stream mirrors the playback protection: a numeric latency with
+# generous slack plus a fixed block size — the price is a deeper device
+# ring buffer, which is exactly what absorbs GIL stalls on the audio thread.
+_INPUT_LATENCY_FLOOR = 0.3
+_INPUT_BLOCKSIZE = 2048
+
+
+def _input_latency() -> float:
+    """Numeric input latency with generous slack against callback delays
+    (the recording counterpart of play_wav's ``_output_latency``). A Python
+    callback runs on the PortAudio audio thread and must grab the GIL on
+    every invocation; under CPU load (agents, tests) those grabs stall, and
+    with the default short ring buffer PortAudio's only option is to DROP
+    the frames — silent speech loss. Ask the device for its reported
+    high-input latency, but never below :data:`_INPUT_LATENCY_FLOOR`; any
+    query failure or nonsensical value degrades to the same floor."""
+    try:
+        import sounddevice as sd
+
+        device = sd.default.device[0]
+        high = float(sd.query_devices(device)["default_high_input_latency"])
+    except Exception:  # noqa: BLE001 - a broken query must not kill recording
+        return _INPUT_LATENCY_FLOOR
+    if high <= 0:
+        return _INPUT_LATENCY_FLOOR
+    return max(high, _INPUT_LATENCY_FLOOR)
+
+
 class MicrophoneRecorder:
     """Push-to-talk recorder: 16 kHz mono PCM16 from the default input
     device into memory, delivered as a complete WAV file on stop.
@@ -425,6 +493,14 @@ class MicrophoneRecorder:
         # exceptions raised there — "Exception ignored from cffi callback"
         # — so they must be counted here to be visible at all).
         self._callback_errors = 0
+        # Input-buffer overflows reported by PortAudio through the
+        # callback's ``status`` argument (paInputOverflow on an input-only
+        # stream): the device ring buffer ran dry because the audio thread
+        # could not deliver frames in time (GIL stalls under CPU load) and
+        # PortAudio DROPPED them — speech is silently missing from the
+        # recording. Counted for the same reason as callback failures:
+        # without a counter this loss is completely invisible.
+        self._overflows = 0
         self._opened_at = time.monotonic()
         # Strong reference to the bound callback for as long as the stream
         # lives: sounddevice wraps it into a cffi trampoline, and letting the
@@ -435,6 +511,21 @@ class MicrophoneRecorder:
     @property
     def recording(self) -> bool:
         return self._stream is not None
+
+    @property
+    def overflows(self) -> int:
+        """How many input-buffer overflows PortAudio reported so far
+        (frames DROPPED — speech silently missing). Thread-safe: read from
+        the UI thread while the audio thread increments."""
+        with self._lock:
+            return self._overflows
+
+    @property
+    def callback_errors(self) -> int:
+        """How many times the audio-thread callback failed so far.
+        Thread-safe: read from the UI thread."""
+        with self._lock:
+            return self._callback_errors
 
     def start(self) -> None:
         """Open the input stream. Raises VoiceError when the microphone
@@ -454,17 +545,34 @@ class MicrophoneRecorder:
                     samplerate=self.SAMPLE_RATE,
                     channels=1,
                     dtype="int16",
+                    latency=_input_latency(),
+                    # Explicit block size instead of the variable default
+                    # (0), same protection as the playback stream: fewer
+                    # callback invocations per second means fewer GIL
+                    # acquisitions on the audio thread, and each call
+                    # copies a larger chunk.
+                    blocksize=_INPUT_BLOCKSIZE,
                     callback=self._cb,
                 )
+                with self._lock:
+                    # Reset + publish BEFORE stream.start(): the callback
+                    # may begin firing the moment start() runs (or even
+                    # during it), and any chunk it delivers must land in
+                    # the fresh buffer — frames between start() and the
+                    # old post-start assignment were silently dropped.
+                    self._chunks = []
+                    self._callback_errors = 0
+                    self._overflows = 0
+                    self._opened_at = time.monotonic()
+                    self._stream = stream
                 stream.start()
         except Exception as e:
+            # Never started (or start() itself failed): unpublish, so the
+            # callback drops everything and `recording` stays honest.
+            with self._lock:
+                self._stream = None
             self._cb = None
             raise VoiceError(f"Microphone unavailable: {e}") from e
-        with self._lock:
-            self._chunks = []
-            self._callback_errors = 0
-            self._opened_at = time.monotonic()
-            self._stream = stream
 
     def _callback(
         self, indata: object, frames: int, time: object, status: object
@@ -474,6 +582,14 @@ class MicrophoneRecorder:
         # rejects outright (TypeError) — convert through bytes() first.
         # Cheap and non-blocking under the GIL — all assembly happens
         # later, on the caller's thread in stop().
+        if status:
+            # For an input-only stream a truthy status is paInputOverflow:
+            # PortAudio dropped frames it could not deliver. Counted, never
+            # printed per-occurrence (a GIL stall bursts dozens of these) —
+            # the counter is surfaced by the recorder's properties and by
+            # stop().
+            with self._lock:
+                self._overflows += 1
         try:
             chunk = array("h", bytes(indata))  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001 - a dead callback is invisible otherwise
@@ -496,29 +612,46 @@ class MicrophoneRecorder:
         nothing but digital zeros: the device delivers frames but
         captures no sound (wrong input device selected, muted input) —
         that too is caught here. A genuinely brief tap still yields a
-        valid, silent WAV."""
+        valid, silent WAV.
+
+        An INCOMPLETE recording — the callback failed partway through, or
+        PortAudio reported input-buffer overflows (dropped frames) — also
+        raises, even though the PCM is non-empty: a truncated utterance
+        must never travel to the ASR endpoint silently (the user would
+        read confidently wrong text with no hint that speech was lost).
+
+        The stream is stopped BEFORE the chunk buffer is snapshotted:
+        PortAudio guarantees no callbacks after stop() returns, so the
+        final block (up to ``blocksize`` frames of tail speech) is
+        captured too — the old clear-then-close order silently dropped
+        it."""
         with self._lock:
-            stream, self._stream = self._stream, None
-            chunks = self._chunks
-            self._chunks = []
+            stream = self._stream
         _close_stream(stream)
         self._cb = None
+        with self._lock:
+            self._stream = None
+            chunks = self._chunks
+            self._chunks = []
+            errors = self._callback_errors
+            overflows = self._overflows
+        problem = _capture_problem(errors, overflows)
         pcm = array("h")
         for chunk in chunks:
             pcm.extend(chunk)
         if not pcm:
-            with self._lock:
-                errors = self._callback_errors
-            if errors:
-                raise VoiceError(
-                    f"Microphone returned no audio: the recording callback "
-                    f"failed {errors} time(s)"
-                )
+            if problem:
+                raise VoiceError(f"Microphone returned no audio: {problem}")
             duration = time.monotonic() - self._opened_at
             if stream is not None and duration >= self.MIN_AUDIBLE_DURATION:
                 raise VoiceError(
                     f"Microphone returned no audio in {duration:.1f} s of recording"
                 )
+        elif problem:
+            raise VoiceError(
+                f"Recording incomplete: {problem} — parts of the speech "
+                f"are missing; record the utterance again"
+            )
         elif not any(pcm):
             duration = time.monotonic() - self._opened_at
             raise VoiceError(

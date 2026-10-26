@@ -23,7 +23,16 @@ the bottom-right of the window (``#voice-indicator`` — the corner the
 user watches while dictating). The status toasts are gone: they
 auto-dismissed after a few seconds and left a long utterance with no
 visible sign that dictation is still active. Only error toasts remain
-transient.
+transient — and even they have a sticky shadow: the last failure stays
+in the corner (``⚠ <message>``) until the user's next dictation action,
+so a 6-second toast can no longer hide why a transcription died.
+
+Capture-side audio loss is visible in the indicator itself: while the
+recorder reports input-buffer overflows (PortAudio dropping frames) or
+callback failures, the recording line reads ``● запись… (потери!)`` —
+answering at a glance whether speech was lost on capture (microphone/
+buffer, shown live during the recording) or on transmission (HTTP/ASR,
+shown as the sticky ``ASR failed …`` error).
 
 Everything audio/network runs in short-lived daemon worker threads (the
 tool_runtime pattern); the only UI-thread work is inserting the text and
@@ -88,6 +97,10 @@ class VoiceInputController:
         self._context: tuple[str, object] | None = None
         self._last_toggle = 0.0  # auto-repeat guard stamp (monotonic)
         self._recording_since = 0.0
+        # The last dictation failure, kept visible in the corner until the
+        # user's next dictation action (the error toast alone auto-dismisses
+        # after six seconds — exactly long enough to miss).
+        self._sticky_error: str | None = None
 
     @property
     def active(self) -> bool:
@@ -95,13 +108,28 @@ class VoiceInputController:
         handling of the input fields)."""
         return self._state is not _State.IDLE
 
+    def _capture_loss(self) -> bool:
+        """The live recorder reports lost speech on the capture side
+        (input-buffer overframes dropped by PortAudio, or failing
+        audio-thread callbacks)."""
+        recorder = self._recorder
+        if recorder is None:
+            return False
+        return recorder.overflows > 0 or recorder.callback_errors > 0
+
     @property
     def indicator(self) -> str | None:
         """Persistent status text for the header line while busy (None
         when idle) — the auto-dismissing toast alone left any utterance
         longer than a few seconds with no visible sign that dictation
-        was still running."""
+        was still running.
+
+        While recording, a capture-side loss flips the line into the
+        alarm state ``● запись… (потери!)``: the user sees the dropped
+        frames the moment they happen, not only in the (absent) result."""
         if self._state is _State.RECORDING:
+            if self._capture_loss():
+                return "● запись… (потери!)"
             return "● запись…"
         if self._state is _State.TRANSCRIBING:
             return "● распознаю…"
@@ -110,10 +138,21 @@ class VoiceInputController:
     @property
     def corner_indicator(self) -> str | None:
         """Status text for the persistent bottom-right corner widget
-        (None when idle): the base status from ``indicator`` plus the
-        push-to-talk hint while recording — the corner is where the user
-        watches while dictating, so the stop/cancel keys must be right
-        there for the whole session, not just the first four seconds."""
+        (None when there is nothing to show): the base status from
+        ``indicator`` plus the push-to-talk hint while recording — the
+        corner is where the user watches while dictating, so the
+        stop/cancel keys must be right there for the whole session, not
+        just the first four seconds.
+
+        After a failure the corner stays occupied by the sticky error
+        (``⚠ <message>``) even though the state is back to IDLE — the
+        six-second toast is not the only trace of why the dictation
+        died. Cleared by the next dictation action (a new recording,
+        ESC cancel, a successful insert)."""
+        if self._state is _State.IDLE:
+            if self._sticky_error is not None:
+                return f"⚠ {self._sticky_error}"
+            return None
         base = self.indicator
         if base is None:
             return None
@@ -199,6 +238,7 @@ class VoiceInputController:
         self._state = _State.IDLE
         self._target = None
         self._context = None
+        self._sticky_error = None
         if recorder is not None:
             _thread_start(_discard_recorder, recorder)
         self._sync_indicator()
@@ -238,6 +278,9 @@ class VoiceInputController:
         self._context = self._snapshot_context(target)
         self._state = _State.RECORDING
         self._recording_since = time.monotonic()
+        # The user is acting again: the previous failure's sticky corner
+        # error gives way to the fresh recording.
+        self._sticky_error = None
         self._sync_indicator()
         _thread_start(self._open_microphone, recorder)
 
@@ -339,6 +382,9 @@ class VoiceInputController:
         new-task form, a modal dialog, a hidden target), the text is
         dropped with a toast instead of landing in a stale field."""
         self._state = _State.IDLE
+        # A completed insert means transmission worked: the sticky corner
+        # error (from an earlier failed attempt) has served its purpose.
+        self._sticky_error = None
         self._sync_indicator()
         if target is None:
             self._target = None
@@ -365,11 +411,19 @@ class VoiceInputController:
 
     def _fail(self, message: str) -> None:
         """Abort the state machine with a readable error (from any
-        thread)."""
+        thread).
+
+        The error is sticky: besides the six-second toast it stays in the
+        corner (``⚠ <message>``) until the next dictation action — an ASR
+        or capture failure must still be explainable after the toast is
+        gone. The message itself already separates the two loss sites:
+        ``Recording incomplete …`` (capture) vs ``ASR failed: HTTP …
+        (12.3s, 456 KB)`` (transmission)."""
         self._recorder = None
         self._target = None
         self._context = None
         self._state = _State.IDLE
+        self._sticky_error = message
         self._sync_indicator()
         try:
             self._app.call_from_thread(self._notify, message, error=True)

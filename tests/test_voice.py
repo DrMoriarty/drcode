@@ -17,7 +17,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -179,6 +179,53 @@ def test_transcribe_empty_text() -> None:
 
     with pytest.raises(VoiceError, match="no text"):
         _client(handler).transcribe(_WAV_BYTES)
+
+
+def test_transcribe_http_error_includes_duration_and_size() -> None:
+    """Every ASR failure names the recording's duration and upload size —
+    the user can tell whether a full recording reached the endpoint
+    (transmission loss) or the request died with the speech never sent."""
+    from array import array as _array
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(_array("h", [100] * 16_000).tobytes())  # 1.0 s
+    wav_bytes = buffer.getvalue()  # 32 044 bytes ≈ 31 KB
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "boom"})
+
+    with pytest.raises(VoiceError, match=r"ASR failed: HTTP 500 \(1\.0s, 31 KB\)"):
+        _client(handler).transcribe(wav_bytes)
+
+
+def test_transcribe_network_error_includes_details() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(VoiceError, match=r"ConnectError: refused \(0\.0s"):
+        _client(handler).transcribe(_WAV_BYTES)
+
+
+def test_transcribe_empty_text_error_includes_details() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"text": "  "})
+
+    with pytest.raises(VoiceError, match=r"no text \(0\.0s"):
+        _client(handler).transcribe(_WAV_BYTES)
+
+
+def test_transcribe_size_formatted_in_mb_when_large() -> None:
+    big = _WAV_BYTES + b"\x00" * 1_048_576  # payload pushes past 1 MB
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "boom"})
+
+    with pytest.raises(VoiceError, match=r"HTTP 500 \(0\.0s, 1\.0 MB\)"):
+        _client(handler).transcribe(big)
 
 
 def test_transcribe_requires_asr_model() -> None:
@@ -959,6 +1006,122 @@ async def test_corner_indicator_persists_while_busy(project_root: Any) -> None:
         assert widget.has_class("hidden")
 
 
+async def test_recording_indicator_flags_capture_loss(project_root: Any) -> None:
+    """While the recorder reports lost capture (input overframes dropped by
+    PortAudio, or failing callbacks) the recording indicator flips into
+    the alarm state — the user sees the loss the moment it happens, in
+    both the header line and the corner widget."""
+    from textual.widgets import Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+    from drcode.voice import MicrophoneRecorder
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        label = app.model_status
+        widget = app.query_one("#voice-indicator", Static)
+        controller = app.voice_input
+        controller._state = _State.RECORDING
+        recorder = MicrophoneRecorder()
+        controller._recorder = recorder
+        app._render_model_status()
+        text = str(label.render())
+        assert "● запись…" in text
+        assert "потери" not in text
+
+        recorder._callback(object(), 1, None, None)  # a failing callback
+        app._render_model_status()
+        assert "● запись… (потери!)" in str(label.render())
+        assert "потери" in str(widget.render())
+
+        recorder2 = MicrophoneRecorder()
+        controller._recorder = recorder2
+        recorder2._callback(_cffi_int16_buffer([1]), 1, None, 1)  # an overflow
+        app._render_model_status()
+        assert "● запись… (потери!)" in str(label.render())
+
+
+async def test_sticky_error_stays_in_corner_after_fail(project_root: Any) -> None:
+    """A dictation failure leaves the error in the corner (⚠ prefix) after
+    the toast is long gone — visible until the next dictation action."""
+    from textual.widgets import Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        label = app.model_status
+        widget = app.query_one("#voice-indicator", Static)
+        controller = app.voice_input
+        controller._state = _State.RECORDING
+        app._render_model_status()
+        assert not widget.has_class("hidden")
+
+        controller._fail("ASR failed: HTTP 500 (12.3s, 456 KB)")
+        await pilot.pause()
+        app._render_model_status()
+        # Back to IDLE: no dictation status in the header …
+        assert "● запись…" not in str(label.render())
+        # … but the corner carries the sticky error.
+        assert not widget.has_class("hidden")
+        text = str(widget.render())
+        assert "⚠" in text
+        assert "ASR failed: HTTP 500 (12.3s, 456 KB)" in text
+
+
+async def test_sticky_error_cleared_by_next_dictation_action(
+    project_root: Any,
+) -> None:
+    """The sticky corner error lives until the user's next dictation
+    action: a successful insert or a cancel clears it, the corner hides."""
+    from textual.widgets import Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.voice_input import _State
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        widget = app.query_one("#voice-indicator", Static)
+        controller = app.voice_input
+
+        # Insert path: arm TRANSCRIBING for the chat input, fail, then
+        # complete a fresh transcription.
+        controller._state = _State.TRANSCRIBING
+        controller._target = app.chat_input
+        controller._context = controller._snapshot_context(app.chat_input)
+        controller._fail("ASR failed: HTTP 500")
+        assert controller._sticky_error == "ASR failed: HTTP 500"
+        app._render_model_status()
+        assert not widget.has_class("hidden")
+
+        controller._state = _State.TRANSCRIBING
+        controller._target = app.chat_input
+        controller._context = controller._snapshot_context(app.chat_input)
+        controller._insert(app.chat_input, "hello")
+        await pilot.pause()
+        assert controller._sticky_error is None
+        app._render_model_status()
+        assert widget.has_class("hidden")
+
+        # Cancel path: a new failure then ESC.
+        controller._state = _State.RECORDING
+        controller._recorder = MicrophoneRecorder()
+        controller._fail("Recording incomplete: the input buffer overflowed 2 time(s)")
+        app._render_model_status()
+        assert not widget.has_class("hidden")
+        controller._state = _State.RECORDING
+        controller._recorder = MicrophoneRecorder()
+        assert controller.cancel(silent=True)
+        assert controller._sticky_error is None
+        app._render_model_status()
+        assert widget.has_class("hidden")
+
+
 async def test_voice_settings_dialog_saves(project_root: Any) -> None:
     from textual.widgets import Button, Input, Switch
 
@@ -1492,6 +1655,211 @@ def test_recorder_brief_tap_still_yields_silent_wav() -> None:
     recorder._stream = _FakeStream()
     with wave.open(io.BytesIO(recorder.stop())) as handle:
         assert handle.getnframes() == 0
+
+
+# -- Recorder capture diagnostics (overflows, stream params, loss windows) --------
+
+
+def test_recorder_counts_input_overflows() -> None:
+    """A truthy status on an input-only callback is paInputOverflow: frames
+    PortAudio DROPPED. Every occurrence counts — the counter is the only
+    trace of the silent speech loss."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    assert recorder.overflows == 0
+    recorder._callback(_cffi_int16_buffer([1]), 1, None, 1)
+    recorder._callback(_cffi_int16_buffer([2]), 1, None, 1)
+    assert recorder.overflows == 2
+    assert recorder.callback_errors == 0
+    recorder._callback(_cffi_int16_buffer([3]), 1, None, None)
+    assert recorder.overflows == 2  # a clean callback does not add
+
+
+def test_recorder_stop_raises_on_overflow_with_audio() -> None:
+    """A non-empty recording with reported overflows is INCOMPLETE — it
+    must fail loudly, never travel to the ASR endpoint as confident text
+    with speech silently missing."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._callback(_cffi_int16_buffer([100, -100]), 2, None, 1)
+    recorder._callback(_cffi_int16_buffer([200]), 1, None, None)
+    with pytest.raises(VoiceError, match="overflow"):
+        recorder.stop()
+
+
+def test_recorder_stop_raises_on_partial_callback_failure() -> None:
+    """The callback failing only PART of the time (some chunks delivered)
+    used to ship a truncated WAV without a word of warning — same loud
+    VoiceError as the all-failed case."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._callback(_cffi_int16_buffer([100]), 1, None, None)
+    recorder._callback(object(), 1, None, None)  # bytes(<object>) raises
+    recorder._callback(_cffi_int16_buffer([200]), 1, None, None)
+    with pytest.raises(VoiceError, match="callback failed"):
+        recorder.stop()
+
+
+def test_recorder_stop_error_names_every_problem() -> None:
+    """Overflows and callback failures together are named together — the
+    user can tell capture loss (microphone/buffer) from transmission
+    (HTTP/ASR) by the message alone."""
+    recorder = MicrophoneRecorder()
+    recorder._stream = _FakeStream()
+    recorder._callback(object(), 1, None, 1)  # fails AND reports overflow
+    with pytest.raises(VoiceError) as exc:
+        recorder.stop()
+    assert "overflowed 1 time" in str(exc.value)
+    assert "callback failed 1 time" in str(exc.value)
+
+
+def test_recorder_stop_keeps_tail_delivered_during_close() -> None:
+    """The stream is stopped BEFORE the chunk buffer is snapshotted: the
+    final block PortAudio delivers on stop() (up to one blocksize of tail
+    speech) must be captured, not dropped."""
+    from array import array as _array
+
+    recorder = MicrophoneRecorder()
+
+    class _TailStream(_FakeStream):
+        def stop(self) -> None:
+            recorder._callback(_cffi_int16_buffer([999]), 1, None, None)
+
+    recorder._stream = _TailStream()
+    recorder._callback(_cffi_int16_buffer([1]), 1, None, None)
+
+    wav = recorder.stop()
+    with wave.open(io.BytesIO(wav)) as handle:
+        samples = _array("h", handle.readframes(handle.getnframes()))
+    assert samples.tolist() == [1, 999]
+
+
+class _RecordingFakeSd:
+    """Fake sounddevice module for recorder.start(): captures the stream
+    kwargs, offers no query_devices (the guarded device query must degrade
+    to the latency floor)."""
+
+    class _Defaults:
+        device: ClassVar[list[int]] = [0, 0]
+
+    def __init__(self) -> None:
+        self.default = self._Defaults()
+        self.created: list[dict[str, Any]] = []
+
+    def RawInputStream(self, **kwargs: Any) -> _FakeStream:
+        self.created.append(kwargs)
+        return _FakeStream()
+
+
+def _start_recorder_with_fake_sd(
+    monkeypatch: pytest.MonkeyPatch, sd_module: Any
+) -> MicrophoneRecorder:
+    import sys
+
+    import drcode.voice as voice_mod
+
+    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setitem(sys.modules, "sounddevice", sd_module)
+    recorder = MicrophoneRecorder()
+    recorder.start()
+    return recorder
+
+
+def test_recorder_start_passes_latency_and_blocksize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The input stream mirrors the playback GIL-starvation protection: an
+    explicit NUMERIC latency (the 0.3 s floor without a queryable device)
+    and an explicit blocksize."""
+    import drcode.voice as voice_mod
+
+    sd = _RecordingFakeSd()
+    recorder = _start_recorder_with_fake_sd(monkeypatch, sd)
+    kwargs = sd.created[0]
+    assert kwargs["latency"] == 0.3
+    assert isinstance(kwargs["latency"], float)
+    assert kwargs["blocksize"] == voice_mod._INPUT_BLOCKSIZE == 2048
+    assert recorder.recording
+    recorder.discard()
+
+
+def test_recorder_start_latency_uses_device_report_with_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device-reported high-input latency is honored when generous
+    (0.5 s) and raised to the floor when absurdly small (0.01 s)."""
+    import drcode.voice as voice_mod
+
+    for reported, expected in ((0.5, 0.5), (0.01, 0.3)):
+        sd = _RecordingFakeSd()
+
+        def query_devices(index: int, _reported: float = reported) -> dict[str, float]:
+            return {"default_high_input_latency": _reported}
+
+        sd.query_devices = query_devices  # type: ignore[method-assign]
+        recorder = _start_recorder_with_fake_sd(monkeypatch, sd)
+        assert sd.created[0]["latency"] == expected
+        recorder.discard()
+    assert voice_mod._INPUT_LATENCY_FLOOR == 0.3
+
+
+def test_recorder_start_captures_frames_from_stream_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frames delivered the moment the stream starts (the callback fires
+    during start(), before the caller regains control) must land in the
+    buffer — the old publish-after-start order dropped them."""
+    from array import array as _array
+
+    recorder_box: list[MicrophoneRecorder] = []
+
+    class _EarlyStream(_FakeStream):
+        def start(self) -> None:
+            recorder_box[0]._callback(_cffi_int16_buffer([777]), 1, None, None)
+
+    class _EarlySd(_RecordingFakeSd):
+        def RawInputStream(self, **kwargs: Any) -> _FakeStream:
+            return _EarlyStream()
+
+    import sys
+
+    import drcode.voice as voice_mod
+
+    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setitem(sys.modules, "sounddevice", _EarlySd())
+    recorder = MicrophoneRecorder()
+    recorder_box.append(recorder)  # before start(): the callback needs it
+    recorder.start()
+    wav = recorder.stop()
+
+    with wave.open(io.BytesIO(wav)) as handle:
+        samples = _array("h", handle.readframes(handle.getnframes()))
+    assert samples.tolist() == [777]
+
+
+def test_recorder_start_failure_leaves_recorder_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that constructs but fails to start must not leave the
+    recorder pretending to record (the callback would drop everything,
+    and stop() would misdiagnose the session)."""
+    from drcode.voice import VoiceError as _VoiceError
+
+    class _NoStartStream(_FakeStream):
+        def start(self) -> None:
+            raise OSError("device unplugged")
+
+    class _NoStartSd(_RecordingFakeSd):
+        def RawInputStream(self, **kwargs: Any) -> _FakeStream:
+            return _NoStartStream()
+
+    with pytest.raises(_VoiceError, match="Microphone unavailable"):
+        _start_recorder_with_fake_sd(monkeypatch, _NoStartSd())
+    # A fresh recorder instance starts cleanly afterwards (the failed
+    # one is left fully unpublished).
+    recorder = _start_recorder_with_fake_sd(monkeypatch, _RecordingFakeSd())
+    assert recorder.recording
+    recorder.discard()
 
 
 # -- bundled PortAudio shim (frozen Linux bundle) ---------------------------------

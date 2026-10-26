@@ -379,6 +379,16 @@ class ProjectSettings(BaseModel):
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,
     # whatever this says.
     worktree_removal: WorktreeRemoval = WorktreeRemoval.ON_DELETE
+    # Start point of a NEW task branch `drcode/<id>` under worktree
+    # isolation (see drcode.task_env): empty (the default) = the branch
+    # the main checkout's HEAD is on — and a detached HEAD (mid-rebase,
+    # mid-checkout) refuses the isolation for that activation instead of
+    # forking from an unknown commit. A non-empty value = a named local
+    # branch (e.g. "main"): every task branch is forked from THAT branch's
+    # tip, even when the main checkout is detached or on another branch.
+    # A configured branch that does not exist degrades to the auto mode
+    # with a warning in the task's service-event log — never a crash.
+    isolation_start_branch: str = ""
     # How ESC stops a running agent/tester (EscAbort docstring): the safe
     # double-press default guards the "closed a dialog with ESC, pressed
     # ESC once more by inertia" accident; "instant" restores the

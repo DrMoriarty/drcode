@@ -1960,6 +1960,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         assert names == [
             f"Workflow preset: {app.workflow_preset_label()}",
             f"Task isolation: {app._task_isolation_label()}",
+            f"Isolation start branch: {app._isolation_start_branch_label()}",
             f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
             f"Worktree removal: {app.settings.worktree_removal.label}",
             f"Verification: {app.settings.verification.label}",

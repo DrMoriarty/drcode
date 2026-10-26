@@ -116,6 +116,7 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .gitignore import _is_git_repo
@@ -185,6 +186,20 @@ def _copy_skipped(rel: str) -> bool:
 def branch_for(task_id: str) -> str:
     """The dedicated branch of one task's worktree."""
     return f"{BRANCH_PREFIX}{task_id}"
+
+
+@dataclass(frozen=True)
+class _StartPoint:
+    """The resolved start point of a NEW task branch (see
+    `TaskEnvironment._start_point`): the ref (branch name — never a raw
+    SHA, so the created branch always forks from a ref the user can name)
+    and its full SHA for the service-event record. `warning` is a
+    human-readable anomaly notice (e.g. the configured start branch does
+    not exist and the auto-detected HEAD branch was used instead)."""
+
+    ref: str
+    sha: str
+    warning: str | None = None
 
 
 class TaskEnvironment:
@@ -312,6 +327,23 @@ class TaskEnvironment:
         code, _ = self._git("rev-parse", "--verify", "--quiet", branch)
         return code == 0
 
+    def current_branch(self) -> str | None:
+        """Short name of the branch the MAIN checkout's HEAD is on, or
+        None when HEAD is detached (mid-rebase, mid-checkout, an
+        inspection state). Blocking git — callers wrap in to_thread."""
+        code, out = self._git("symbolic-ref", "--short", "HEAD")
+        return out if code == 0 and out else None
+
+    def local_branches(self) -> list[str]:
+        """Short names of the repository's local branches — the options of
+        the settings picker for `isolation_start_branch`. Empty on any git
+        failure (the picker then offers only the auto mode). Blocking git —
+        callers wrap in to_thread."""
+        code, out = self._git("for-each-ref", "--format=%(refname:short)", "refs/heads")
+        if code != 0:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
     # -- verified state of the shared checkout ---------------------------------
 
     def branch_tip(self, task_id: str) -> str | None:
@@ -415,6 +447,96 @@ class TaskEnvironment:
         with self._task_lock(task_id), self._activation_lock:
             return self._ensure_root_locked(task_id)
 
+    def _start_point(self) -> tuple[_StartPoint | None, str]:
+        """Resolve the start point of a NEW task branch.
+
+        Returns ``(start, refusal_note)``: exactly one of the two is
+        meaningful. A non-None `start` is a branch name (never a raw SHA)
+        the new `drcode/<task-id>` branch is forked from, with its full
+        SHA for the service-event record. A non-empty `refusal_note` is a
+        human-readable reason NO start point could be resolved — the main
+        checkout sits in a detached HEAD (mid-rebase / mid-checkout), and
+        forking from an unknown commit is exactly the silent-wrong-fork
+        this method exists to prevent. When both are None/empty the
+        caller treats it as a refusal too (git could not even answer
+        rev-parse).
+
+        Precedence: the `isolation_start_branch` project setting (when it
+        names an existing branch — even with the main checkout detached,
+        the worktree can be created correctly from that branch's tip);
+        otherwise the branch the main checkout's HEAD is on. A configured
+        branch that does not exist degrades to the auto mode with a
+        warning (never a crash, never a silent wrong fork)."""
+        configured = (self.settings.isolation_start_branch or "").strip()
+        warning: str | None = None
+        ref: str | None = None
+        if configured:
+            if self._branch_exists(configured):
+                ref = configured
+            else:
+                warning = (
+                    f"configured isolation start branch '{configured}' "
+                    "does not exist — falling back to the main checkout's "
+                    "current branch"
+                )
+        if ref is None:
+            ref = self.current_branch()
+            if ref is None:
+                return None, (
+                    "checkout is in detached HEAD / mid-rebase — task runs "
+                    "in the project directory (no task branch is forked "
+                    "from an unknown commit)"
+                )
+        code, sha = self._git("rev-parse", "--verify", ref)
+        if code != 0 or not sha:
+            return None, (
+                f"cannot resolve the start branch '{ref}' — task runs in "
+                "the project directory"
+            )
+        return _StartPoint(ref=ref, sha=sha, warning=warning), ""
+
+    def _worktree_add(self, wt: Path, branch: str) -> tuple[int, str, str | None]:
+        """`git worktree add` for the task's branch, with an EXPLICIT
+        start point when the branch must be created (`-b`).
+
+        The historical `git worktree add <wt> -b <branch>` without a
+        start point forks from whatever commit the invoking checkout's
+        HEAD happens to point at — a detached HEAD stranded mid-rebase
+        silently forked task branches from foreign commits (the
+        51f2efc8 incident: 3 of 4 branch commits were duplicates of
+        already-merged work). A new branch is now created ONLY from a
+        named branch: the `isolation_start_branch` setting, else the
+        main checkout's current branch; a detached HEAD refuses the
+        isolation for this activation instead of forking blindly.
+
+        Returns `(code, combined output, created_note)`; `created_note`
+        is the branch-creation service-event text (None when no branch
+        was created — an existing branch was merely checked out — or
+        when `add` failed), prefixed "Warning: " when the start point
+        carried an anomaly."""
+        if self._branch_exists(branch):
+            code, out = self._git("worktree", "add", str(wt), branch)
+            return code, out, None
+        start, refusal = self._start_point()
+        if start is None:
+            # Refusal (detached HEAD / unresolvable ref): report it as a
+            # failed add whose note is the human-readable reason — the
+            # caller surfaces it into the task's service-event history.
+            code, sha = self._git("rev-parse", "HEAD")
+            detail = refusal or (
+                "no usable start point — task runs in the project directory"
+            )
+            if code == 0 and sha:
+                detail += f" (HEAD at {sha[:12]})"
+            return 1, detail, detail
+        code, out = self._git("worktree", "add", str(wt), "-b", branch, start.ref)
+        created: str | None = None
+        if code == 0:
+            created = f"branch {branch} created from {start.sha[:12]} ({start.ref})"
+            if start.warning:
+                created = f"Warning: {start.warning}. {created}"
+        return code, out, created
+
     def _ensure_root_locked(self, task_id: str) -> tuple[Path, str]:
         """The git-touching body of ensure_root, run under the activation
         lock (see __init__)."""
@@ -427,24 +549,24 @@ class TaskEnvironment:
         if wt.is_dir() and wt.iterdir():
             # A non-empty directory: ours, created by an earlier activation.
             return wt, ""
-        if self._branch_exists(branch):
-            code, out = self._git("worktree", "add", str(wt), branch)
-        else:
-            code, out = self._git("worktree", "add", str(wt), "-b", branch)
+        code, out, created = self._worktree_add(wt, branch)
         if code != 0:
             # Last resort: a broken leftover directory blocks `add` —
             # remove it (it is drcode's own private state) and retry.
             shutil.rmtree(wt, ignore_errors=True)
-            if self._branch_exists(branch):
-                code, out = self._git("worktree", "add", str(wt), branch)
-            else:
-                code, out = self._git("worktree", "add", str(wt), "-b", branch)
+            code, out, created = self._worktree_add(wt, branch)
             if code != 0:
                 return self.project_root, (
                     f"git worktree add failed, the task falls back to the "
-                    f"project directory: {out[:500]}"
+                    f"project directory: {(created or out)[:500]}"
                 )
         note = self._copy_untracked_files(wt)
+        if created is not None and self.event_log is not None:
+            # Observability at creation time (the 51f2efc8 lesson): the
+            # task's chat records WHICH commit the branch actually forked
+            # from — an anomaly is visible as a Warning right away, not
+            # as a mystery conflict an hour later.
+            self.event_log(task_id, created)
         return wt, note
 
     def _collect_untracked(self) -> list[str]:
@@ -638,6 +760,44 @@ class TaskEnvironment:
         if not self._branch_exists(branch):
             return 0
         return self._unmerged_count(branch)
+
+    def duplicate_commits(
+        self, task_id: str, base: str | None = None
+    ) -> tuple[int, int] | None:
+        """The wrong-fork detector behind the accept-hook guard: how many
+        commits of the task's `drcode/<id>` branch are PATCH-ID duplicates
+        of commits already on the base branch (`git cherry <base>
+        <branch>` — the `-` lines), and how many are not (`+` lines).
+
+        A task branch forked from the main checkout's current branch can
+        never contain a patch-id its base lacks a copy of — the task's
+        work is always new to the base. Duplicates therefore mean the
+        branch was forked from a WRONG start point (a detached HEAD
+        stranded mid-rebase, a foreign commit): merging would drag the
+        already-merged work through a conflict. `(duplicates, ahead)`;
+        None when the answer is unavailable (isolation off, no repo,
+        branch missing, git failure) — the guard degrades to the
+        historical unconditional merge.
+
+        Note the semantics: a branch whose commits are reachable from the
+        base (already merged the normal way) yields `cherry` NOTHING —
+        `git cherry` only lists commits of `base..branch`, and rebase/
+        cherry-pick twins (same patch-id, different SHA) are the case the
+        `-` lines catch. Blocking git — callers wrap in to_thread."""
+        if not self.available:
+            return None
+        branch = self.branch(task_id)
+        if not self._branch_exists(branch):
+            return None
+        if base is None:
+            base = self.base_branch()
+        code, out = self._git("cherry", base, branch)
+        if code != 0:
+            return None
+        lines = [line for line in out.splitlines() if line.strip()]
+        duplicates = sum(1 for line in lines if line.startswith("-"))
+        ahead = sum(1 for line in lines if line.startswith("+"))
+        return duplicates, ahead
 
     def unmerged_ids(self, task_ids: list[str]) -> set[str]:
         """Which of `task_ids` still have unmerged work: their

@@ -11,6 +11,7 @@ still saved, the mode stays dormant). Plus the two no-loss rules:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -1090,3 +1091,182 @@ def test_cleanup_orphans_ignores_removal_never(
     assert dead.id in removed
     assert not env.worktree_path(dead.id).exists()
     assert env.worktree_path(live.id).is_dir()
+
+
+# -- branch start point (the 51f2efc8 incident) --------------------------------------
+#
+# A task branch must never fork from whatever commit the main checkout's
+# HEAD happens to point at: a detached HEAD stranded mid-rebase silently
+# forked task branches from foreign commits (3 of 4 branch commits were
+# duplicates of already-merged work). New branches are forked from a NAMED
+# branch only, the creation is recorded as a service event, and a detached
+# HEAD refuses the isolation instead of forking blindly.
+
+
+def _capture_events(env: TaskEnvironment) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    return events
+
+
+def test_branch_created_from_head_branch(env: TaskEnvironment) -> None:
+    events = _capture_events(env)
+    root, note = env.ensure_root("t1")
+    assert root == env.worktree_path("t1")
+    assert note == ""
+    assert branch_exists(env.project_root, "drcode/t1")
+    (created,) = [text for tid, text in events if tid == "t1"]
+    assert "branch drcode/t1 created from" in created
+    assert env.base_branch() in created  # the start branch is named
+    assert "Warning" not in created
+
+
+def test_detached_head_refuses_isolation(env: TaskEnvironment, git_root: Path) -> None:
+    _git(git_root, "checkout", "-q", "--detach", "HEAD")
+    events = _capture_events(env)
+    root, note = env.ensure_root("t1")
+    assert root == git_root
+    assert "detached HEAD" in note
+    assert not branch_exists(git_root, "drcode/t1")
+    assert not env.worktree_path("t1").exists()
+    assert events == []  # nothing was created — nothing to record
+
+
+def test_configured_start_branch_wins_even_detached(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """The user pinned the start branch explicitly: the task branch is
+    forked from ITS tip even when the main checkout sits in a detached
+    HEAD (mid-rebase) — the worktree is still created correctly."""
+    # Move the base forward, then strand the checkout on an older commit.
+    base = env.base_branch()
+    (git_root / "second.txt").write_text("second")
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "second")
+    tip = subprocess.run(
+        ["git", "rev-parse", base],
+        cwd=git_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(git_root, "checkout", "-q", "--detach", "HEAD~1")
+    pinned = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE, isolation_start_branch=base
+        ),
+    )
+    events = _capture_events(pinned)
+    root, note = pinned.ensure_root("t1")
+    assert root == pinned.worktree_path("t1")
+    assert note == ""
+    branch_sha = subprocess.run(
+        ["git", "rev-parse", "drcode/t1"],
+        cwd=git_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert branch_sha == tip  # forked from the PINNED tip, not from HEAD
+    (created,) = [text for tid, text in events if tid == "t1"]
+    assert "Warning" not in created
+
+
+def test_missing_configured_start_branch_falls_back_with_warning(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """A configured branch that does not exist is never fatal: the auto
+    mode (the main checkout's current branch) takes over and the service
+    event says so as a Warning."""
+    env.settings.isolation_start_branch = "no-such-branch"
+    events = _capture_events(env)
+    root, note = env.ensure_root("t1")
+    assert root == env.worktree_path("t1")  # still isolated, via the fallback
+    assert note == ""
+    (created,) = [text for tid, text in events if tid == "t1"]
+    assert created.startswith("Warning:")
+    assert "no-such-branch" in created
+
+
+# -- duplicate_commits (git-cherry wrong-fork detector) -------------------------------
+
+
+def test_duplicate_commits_clean_for_normal_branch(env: TaskEnvironment) -> None:
+    """The legitimate case must keep passing the accept-hook guard: a
+    task branch one real commit ahead of the base has no duplicates."""
+    env.ensure_root("t1")
+    _commit_on_branch(env.project_root, "drcode/t1", "fix.txt")
+    assert env.duplicate_commits("t1") == (0, 1)
+
+
+def test_duplicate_commits_zero_after_real_merge(env: TaskEnvironment) -> None:
+    """A branch merged the normal way is fully reachable from the base —
+    `git cherry` prints nothing (no duplicates, nothing ahead)."""
+    env.ensure_root("t1")
+    _commit_on_branch(env.project_root, "drcode/t1", "fix.txt")
+    _git(
+        env.project_root,
+        "merge",
+        "-q",
+        "--no-ff",
+        "drcode/t1",
+        "-m",
+        "merge t1",
+    )
+    assert env.duplicate_commits("t1") == (0, 0)
+
+
+def test_duplicate_commits_flags_patch_id_twins(env: TaskEnvironment) -> None:
+    """The incident shape: the branch carries a commit whose PATCH-ID is
+    already on the base (rebase/cherry-pick twin — different SHA, same
+    change) plus real work. Exactly the merge the guard must block.
+
+    The two "add x" commits get distinct timestamps on purpose: git
+    commits made in the same second with the same parent/tree/message
+    collapse into ONE object (identical SHA), which would turn the twin
+    into the base commit itself and hide the very shape under test."""
+    root = env.project_root
+    wt, _ = env.ensure_root("t1")
+    dates = {
+        "GIT_AUTHOR_DATE": "2024-01-01T00:00:00 +0000",
+        "GIT_COMMITTER_DATE": "2024-01-01T00:00:00 +0000",
+    }
+    twin_dates = {
+        "GIT_AUTHOR_DATE": "2024-01-02T00:00:00 +0000",
+        "GIT_COMMITTER_DATE": "2024-01-02T00:00:00 +0000",
+    }
+
+    def commit(cwd: Path, message: str, when: dict[str, str]) -> None:
+        subprocess.run(
+            ["git", "commit", "-q", "-m", message],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **when},
+        )
+
+    # The base moves on with a real commit...
+    (root / "x.txt").write_text("x")
+    _git(root, "add", "-A")
+    commit(root, "add x", dates)
+    # ...and the task branch (forked BEFORE that commit) re-applies the
+    # same change — a twin git cherry recognizes by patch-id.
+    (wt / "x.txt").write_text("x")
+    _git(wt, "add", "-A")
+    commit(wt, "add x (task side)", twin_dates)
+    (wt / "y.txt").write_text("y")
+    _git(wt, "add", "-A")
+    commit(wt, "real task work", twin_dates)
+    assert env.duplicate_commits("t1") == (1, 1)
+
+
+def test_duplicate_commits_none_without_branch_or_repo(
+    env: TaskEnvironment, project_root: Path
+) -> None:
+    # No branch yet.
+    assert env.duplicate_commits("t9") is None
+    # Isolation off (degenerates to pass-through at the call site).
+    off = TaskEnvironment(project_root, ProjectSettings())
+    assert off.duplicate_commits("t1") is None

@@ -9,6 +9,7 @@ palettes for each project preference.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -311,6 +312,7 @@ class TaskSettingsPalette(SettingsPalette):
         # -- Workflow --
         "Workflow preset:",
         "Task isolation:",
+        "Isolation start branch:",
         "Parallel tasks:",
         "Worktree removal:",
         # -- Testing --
@@ -586,6 +588,18 @@ class TaskSettingsEntriesProvider(Provider):
                     "project directory (project setting)"
                 ),
                 app.action_change_task_isolation,
+            ),
+            (
+                f"Isolation start branch: {app._isolation_start_branch_label()}",
+                (
+                    "Which commit NEW task branches are forked from under "
+                    "worktree isolation: auto (the main checkout's current "
+                    "branch — a detached HEAD then refuses the isolation "
+                    "instead of forking from an unknown commit) or a named "
+                    "branch such as main, used even when the checkout is "
+                    "detached (project setting)"
+                ),
+                app.action_change_isolation_start_branch,
             ),
             (
                 f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
@@ -961,6 +975,54 @@ class WorktreeRemovalOptionsProvider(Provider):
     async def search(self, query: str) -> Hits:
         matcher = self.matcher(query)
         for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class StartBranchOptionsProvider(Provider):
+    """Options of the "Isolation start branch" setting: the auto mode
+    ("auto (HEAD branch)" — fork new task branches from the main
+    checkout's current branch, refusing a detached HEAD) plus every local
+    branch git knows about (fork from THAT branch's tip always, even with
+    the main checkout detached mid-rebase).
+
+    Unlike the enum-valued pickers the options are discovered by git at
+    palette-open time (off the event loop); picking an option applies it
+    immediately, Escape keeps the current value."""
+
+    AUTO_LABEL = "auto (HEAD branch)"
+
+    async def _branches(self) -> list[str]:
+        app = cast("DrCodeApp", self.app)
+        if not app.task_env.available:
+            return []
+        return await asyncio.to_thread(app.task_env.local_branches)
+
+    def _commands(self, branches: list[str]) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.isolation_start_branch
+        commands: list[tuple[str, Callable[[], None]]] = [
+            (
+                self.AUTO_LABEL + (" (current)" if not current else ""),
+                partial(app.action_set_isolation_start_branch, ""),
+            )
+        ]
+        commands.extend(
+            (
+                branch + (" (current)" if branch == current else ""),
+                partial(app.action_set_isolation_start_branch, branch),
+            )
+            for branch in branches
+        )
+        return commands
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands(await self._branches()):
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands(await self._branches()):
             if (match := matcher.match(name)) > 0:
                 yield Hit(match, matcher.highlight(name), callback)
 

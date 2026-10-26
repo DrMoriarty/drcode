@@ -46,6 +46,7 @@ from .command_providers import (
     RetentionOptionsProvider,
     SettingsPalette,
     StallNudgeOptionsProvider,
+    StartBranchOptionsProvider,
     TaskSettingsEntriesProvider,
     TaskSettingsPalette,
     ThemeOptionsProvider,
@@ -459,6 +460,60 @@ class SettingsLayer(DrCodeState):
             SettingsPalette(
                 id="--task-isolation-palette",
                 providers=[IsolationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def _isolation_start_branch_label(self) -> str:
+        """The Settings-entry label of the isolation-start-branch setting:
+        "auto (HEAD branch)" when unset, else the configured branch name."""
+        return self.settings.isolation_start_branch or "auto (HEAD branch)"
+
+    def action_set_isolation_start_branch(self, branch: str) -> None:
+        """Settings command: the branch NEW task branches are forked from
+        under worktree isolation (empty = the main checkout's current
+        branch, with a detached HEAD refusing the isolation instead of
+        forking blindly). Persisted per project (.drcode/settings.json);
+        applies to the next task activation. A branch that does not exist
+        is persisted anyway (the user's choice is never silently
+        rewritten) with a warning — each activation would then fall back
+        to the auto mode and say so in the task's service-event log."""
+        branch = branch.strip()
+        self.settings.isolation_start_branch = branch
+        self.settings_store.save(self.settings)
+        label = branch or "auto (HEAD branch)"
+        if (
+            branch
+            and self.task_env.available
+            and not self.task_env._branch_exists(branch)
+        ):
+            self.notify(
+                f"Isolation start branch: {label} — saved, but no such "
+                "branch exists in this repository: task branches keep "
+                "forking from the main checkout's current branch (with "
+                "the detached-HEAD refusal) until it does.",
+                title="Project settings",
+                severity="warning",
+                timeout=10,
+            )
+            return
+        self.notify(
+            f"Isolation start branch: {label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_isolation_start_branch(self) -> None:
+        """Isolation-start-branch picker, opened from the "Task settings…"
+        entry ("Isolation start branch: …"). Lists the auto mode plus the
+        repository's local branches (discovered by git, off the event
+        loop); picking one applies it, Escape keeps the current value."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--isolation-start-branch-palette",
+                providers=[StartBranchOptionsProvider],
                 placeholder="Search for options…",
             )
         )

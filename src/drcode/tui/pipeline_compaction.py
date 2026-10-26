@@ -57,9 +57,9 @@ _HARD_LIMIT_PCT = 97
 _HARD_LIMIT_COMPACTION_LIMIT = 3
 
 # Threshold-level livelock guard: the maximum number of CONSECUTIVE
-# threshold-level compactions (no gate observation under the threshold in
-# between — every resumed turn re-crosses the threshold before its next
-# boundary) before the gate gives up. Unlike the hard-limit regime this one
+# threshold-level compactions (no reset in between — every resumed segment
+# re-crosses the threshold before it progressed under it again, see
+# _threshold_observation) before the gate gives up. Unlike the hard-limit regime this one
 # does not die deterministically (the fill stays under the hard limit), so
 # each cycle burns summarizer calls and model requests with zero progress
 # (the bench live-lock: 35 compactions, ~667k input tokens, no work done) —
@@ -67,6 +67,17 @@ _HARD_LIMIT_COMPACTION_LIMIT = 3
 # limit the gate is disabled for the task (both levels, like the hard guard)
 # and the diagnostic event names the knob to fix.
 _THRESHOLD_COMPACTION_LIMIT = 3
+
+# How many consecutive gate observations under the threshold it takes to
+# prove that the last compaction DURABLY landed (and reset the threshold
+# livelock counter, see _threshold_observation). One is not enough: the
+# first observation of a resumed segment is under the threshold by
+# construction (the compaction just landed it there — and its live usage
+# reading predates the tool result that re-crosses the threshold), so
+# resetting on it lets the pause→compact→resume cycle repeat forever when
+# every turn's growth re-crosses the threshold (the bench s4 livelock:
+# every cycle a "successful" compaction, the counter never exceeds 1).
+_THRESHOLD_PROGRESS_OBS = 2
 
 
 class _ChunkingImpossible(Exception):
@@ -151,6 +162,42 @@ class PipelineCompactionLayer(DrCodeState):
             is not None
         )
 
+    def _threshold_observation(
+        self,
+        task: Task,
+        tokens: int | None,
+        counter: dict[str, int],
+    ) -> None:
+        """Bookkeeping of one threshold-level gate observation (the
+        mid-round tool-boundary gates and the compact entry points; the
+        layer's own consecutive-compaction counter is passed in).
+
+        An over-threshold observation breaks the under-threshold streak of
+        the task (the compaction it triggers starts a new one). An
+        under-threshold observation credits progress toward resetting the
+        livelock counter — but a SINGLE one never resets it: the first
+        observation of a resumed segment is under the threshold by
+        construction (the compaction just landed it there, and its live
+        usage reading predates the tool result whose size re-crosses the
+        threshold one boundary later), so treating it as proof that the
+        previous compaction durably landed lets the pause→compact→resume
+        cycle repeat forever when every turn's growth re-crosses the
+        threshold. The counter starts over only after
+        _THRESHOLD_PROGRESS_OBS under-threshold observations in a row —
+        the segment has then measurably progressed under the threshold."""
+        if tokens is not None:
+            self._threshold_under_obs.pop(task.id, None)
+            return
+        progress = self._threshold_under_obs.get(task.id, 0) + 1
+        if progress < _THRESHOLD_PROGRESS_OBS:
+            self._threshold_under_obs[task.id] = progress
+            return
+        # The segment demonstrably progressed under the threshold: the
+        # last compaction (if any) durably landed — the counter starts
+        # over (and the streak with it).
+        counter.pop(task.id, None)
+        self._threshold_under_obs.pop(task.id, None)
+
     def _livelock_stop(
         self,
         task: Task,
@@ -167,8 +214,10 @@ class PipelineCompactionLayer(DrCodeState):
         the threshold level), right before compacting.
 
         Counts the CONSECUTIVE compactions of the task at the gate's level
-        (the caller resets the counter whenever a gate observation lands
-        under that level — a previous compaction worked). Past the level's
+        (the caller resets the threshold-level counter once the resumed
+        segment has demonstrably progressed under that level — see
+        _threshold_observation; the hard-level counter is reset by any
+        observation under the hard limit). Past the level's
         limit every resumed turn re-crosses it again and the
         pause→compact→resume cycle would repeat forever (each cycle a
         successful compaction — the estimate-based no-op guards never fire,
@@ -531,17 +580,20 @@ class PipelineCompactionLayer(DrCodeState):
         (the cap below the transcript's irreducible floor, or every turn's
         growth re-crossing the threshold), `_livelock_stop` bounds the
         pause→compact→resume cycle: after the level's limit of consecutive
-        compactions with no turn landing under it, the gate disables itself
+        compactions with no durable landing under it in between (see
+        _threshold_observation), the gate disables itself
         for the task with a diagnostic event and the run continues (at the
         hard limit the next request dies with the deterministic context
         overflow).
         """
         tokens = self._compaction_due(task)
         hard = self._hard_limit_due(task)
+        # An under-threshold observation credits progress toward the
+        # progress-gated reset of the threshold-livelock counter; an
+        # over-threshold one breaks the streak (a single under-threshold
+        # observation proves nothing — see _threshold_observation).
+        self._threshold_observation(task, tokens, self._threshold_compactions)
         if tokens is None:
-            # An observation under the threshold: the previous compaction
-            # (if any) landed — the threshold-livelock counter starts over.
-            self._threshold_compactions.pop(task.id, None)
             return
         if not hard:
             # A reading under the hard limit: the previous compaction (if
@@ -665,20 +717,23 @@ class PipelineCompactionLayer(DrCodeState):
         `_hard_limit_exhausted` and the hard-level gate bypass stops
         firing. The `_livelock_stop` guard bounds the cycle itself on both
         levels: past the level's limit of consecutive compactions without a
-        gate observation under it (hard limit: the cap is below the round's
+        durable landing under it (hard limit: the cap is below the round's
         irreducible context floor; threshold: every turn's growth re-crosses
-        the threshold) the gate stops compacting, disables itself for the
-        task (both sets) and emits a diagnostic event instead of burning
-        the API budget forever.
+        the threshold — the counter is reset only by demonstrated progress,
+        see _threshold_observation) the gate stops compacting, disables
+        itself for the task (both sets) and emits a diagnostic event
+        instead of burning the API budget forever.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
         tokens = self._fill_over_threshold(
             live_tokens, round_messages, AgentRole.TESTER
         )
+        # Under the threshold: credit progress toward the progress-gated
+        # reset of the threshold-livelock counter (a single observation
+        # proves nothing — see _threshold_observation); over it: break
+        # the streak.
+        self._threshold_observation(task, tokens, self._tester_threshold_compactions)
         if tokens is None:
-            # An observation under the threshold: the previous compaction
-            # (if any) landed — the threshold-livelock counter starts over.
-            self._tester_threshold_compactions.pop(task.id, None)
             return False
         hard = (
             self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.TESTER)
@@ -785,10 +840,10 @@ class PipelineCompactionLayer(DrCodeState):
         tokens = self._fill_over_threshold(
             live_tokens, round_messages, AgentRole.RESOLVER
         )
+        # Same progress-gated reset as the tester round (see
+        # _threshold_observation).
+        self._threshold_observation(task, tokens, self._resolver_threshold_compactions)
         if tokens is None:
-            # An observation under the threshold: the previous compaction
-            # (if any) landed — the threshold-livelock counter starts over.
-            self._resolver_threshold_compactions.pop(task.id, None)
             return False
         hard = (
             self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.RESOLVER)

@@ -482,6 +482,13 @@ class DrCodeState(App[None]):
 
     def _hard_limit_due(self, task: Task) -> bool: ...
 
+    def _threshold_observation(
+        self,
+        task: Task,
+        tokens: int | None,
+        counter: dict[str, int],
+    ) -> None: ...
+
     async def _maybe_compact(self, task: Task) -> None: ...
 
     async def _maybe_compact_tester_round(
@@ -751,9 +758,14 @@ class DrCodeState(App[None]):
     _hard_limit_compactions: dict[str, int]
     # The same guard at the threshold level — one counter per layer (the
     # main agent's, the tester rounds' own): a stale count of one layer
-    # must never disable another layer's compaction gate.
+    # must never disable another layer's compaction gate. Reset is
+    # progress-gated (see _threshold_observation).
     _threshold_compactions: dict[str, int]
     _tester_threshold_compactions: dict[str, int]
+    # Progress streak toward the progress-gated reset of the threshold
+    # counters (consecutive under-threshold gate observations; see
+    # _threshold_observation).
+    _threshold_under_obs: dict[str, int]
     _last_follow: float
     _chat_epoch: int
 

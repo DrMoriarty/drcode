@@ -507,11 +507,13 @@ class PipelineAgentRunLayer(DrCodeState):
                     block.start_spinner()
                     self._write_chat(block, note=("tool-call", call_text, None))
         tokens = self._compaction_due(task)
-        if tokens is None:
-            # An observation under the threshold: the previous compaction
-            # (if any) landed — the threshold-livelock counter starts over
-            # (see _livelock_stop).
-            self._threshold_compactions.pop(task.id, None)
+        # Under the threshold: credit progress toward the progress-gated
+        # reset of the threshold-livelock counter (a single observation
+        # proves nothing — the first boundary of a resumed segment reads
+        # the compacted transcript's lagging live usage, which predates
+        # the tool result that re-crosses the threshold — see
+        # _threshold_observation). Over it: the streak breaks.
+        self._threshold_observation(task, tokens, self._threshold_compactions)
         hard_due = tokens is not None and self._hard_limit_due(task)
         if tokens is not None and (
             task.id not in self._compaction_failed

@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 from .models import TaskKind
+from .settings import GitPolicy
 from .workflow import load_git_workflow
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -36,6 +37,16 @@ TESTER_SYSTEM_PROMPT_NO_COMMIT = (SYSTEM_PROMPTS_DIR / "tester_no_commit.md").re
 TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH = (
     SYSTEM_PROMPTS_DIR / "tester_commit_no_push.md"
 ).read_text(encoding="utf-8")
+# Git-policy fragments of the research prompt (appended to the base
+# research.md template by the policy — see load_system_prompt_components).
+# The base template deliberately carries no git section at all: the OFF
+# policy (research never touches git) gets neither fragment nor tool.
+RESEARCH_GIT_PROMPT_PUSH = (SYSTEM_PROMPTS_DIR / "research_git_push.md").read_text(
+    encoding="utf-8"
+)
+RESEARCH_GIT_PROMPT_LOCAL = (SYSTEM_PROMPTS_DIR / "research_git_local.md").read_text(
+    encoding="utf-8"
+)
 RESOLVER_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "resolver.md").read_text(
     encoding="utf-8"
 )
@@ -93,19 +104,27 @@ def _join_components(base: str, git_workflow: str | None) -> str:
 
 
 def load_system_prompt_components(
-    kind: TaskKind, project_root: Path | None = None
+    kind: TaskKind,
+    project_root: Path | None = None,
+    research_git: GitPolicy = GitPolicy.PUSH,
 ) -> tuple[str, str | None]:
     """(base prompt, git workflow or None) for a coding task of the given kind.
 
     The base prompt is the (possibly project-overridden) template with the
     ``{project_path}`` placeholder substituted and — when the project ships
     `.drcode/git-workflow.md` — the bundled "Never commit to git" sentence
-    removed. The second element is the workflow text to append under
-    `GIT_WORKFLOW_HEADER` (None when there is none). Note the base prompt does
-    NOT include the project's AGENTS.md: that appendage is assembled by
-    `drcode.agent.build_agent` (see `load_agents_md`). `load_system_prompt`
-    joins the two components; consumers that must account for the parts
-    separately (the context-layout estimate in the TUI) use this directly.
+    removed. For research tasks the project's git policy (`research_git`,
+    `GitPolicy`) selects the git fragment appended after the base template:
+    PUSH/LOCAL add the git_commit_docs section (`research_git_push.md` /
+    `research_git_local.md`, each overridable project-locally by the same
+    name in `.drcode/prompts/`), OFF adds nothing — the research agent then
+    has no commit step at all. The second element is the workflow text to
+    append under `GIT_WORKFLOW_HEADER` (None when there is none). Note the
+    base prompt does NOT include the project's AGENTS.md: that appendage is
+    assembled by `drcode.agent.build_agent` (see `load_agents_md`).
+    `load_system_prompt` joins the two components; consumers that must
+    account for the parts separately (the context-layout estimate in the
+    TUI) use this directly.
     """
     name = {
         TaskKind.FEATURE: "feature.md",
@@ -115,6 +134,17 @@ def load_system_prompt_components(
     template = _project_prompt_override(project_root, name) or (
         SYSTEM_PROMPTS_DIR / name
     ).read_text(encoding="utf-8")
+    if kind is TaskKind.RESEARCH:
+        fragment_name = {
+            GitPolicy.PUSH: "research_git_push.md",
+            GitPolicy.LOCAL: "research_git_local.md",
+            GitPolicy.OFF: None,
+        }[research_git]
+        if fragment_name is not None:
+            fragment = _project_prompt_override(project_root, fragment_name) or (
+                SYSTEM_PROMPTS_DIR / fragment_name
+            ).read_text(encoding="utf-8")
+            template = f"{template}\n\n{fragment}"
     git_workflow = load_git_workflow(project_root)
     if git_workflow is not None:
         template = _NEVER_COMMIT_RE.sub("", template)
@@ -141,7 +171,11 @@ def load_tester_prompt_components(
     return _substitute_project_path(template, project_root), git_workflow
 
 
-def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
+def load_system_prompt(
+    kind: TaskKind,
+    project_root: Path | None = None,
+    research_git: GitPolicy = GitPolicy.PUSH,
+) -> str:
     """Bundled system prompt for a coding task of the given kind.
 
     Each kind gets its own `.md` template in `prompts/system/` (feature tasks
@@ -149,14 +183,17 @@ def load_system_prompt(kind: TaskKind, project_root: Path | None = None) -> str:
     answer questions / update docs). A project may override the template with
     `<root>/.drcode/prompts/<name>.md`. The ``{project_path}`` placeholder in
     the template header is replaced with the actual project directory; without
-    a root a neutral ``(unknown)`` marker is substituted.
+    a root a neutral ``(unknown)`` marker is substituted. For research tasks
+    `research_git` (the project's git policy for the role) picks the
+    git_commit_docs fragment appended after the base template — none under
+    the OFF policy.
 
     When the project defines `.drcode/git-workflow.md` (team branching /
     commit / review rules), the bundled "Never commit to git" sentence is
     removed (the workflow file governs committing instead) and the workflow
     text is appended under a dedicated header.
     """
-    base, git_workflow = load_system_prompt_components(kind, project_root)
+    base, git_workflow = load_system_prompt_components(kind, project_root, research_git)
     return _join_components(base, git_workflow)
 
 
@@ -167,11 +204,11 @@ def load_tester_prompt(
 ) -> str:
     """Bundled QA tester system prompt.
 
-    With ``allow_commit=False`` (project setting "Task finalization: Testing")
-    the commit-free template is returned; otherwise the default one that
-    mentions ``git_commit``. With ``allow_push=False`` (project setting
-    "Task finalization: Testing + Git commit") the commit-locally template is
-    returned — it never promises a push. A project may override the template
+    With ``allow_commit=False`` (tester git policy: off) the commit-free
+    template is returned; otherwise the default one that
+    mentions ``git_commit``. With ``allow_push=False`` (tester git policy:
+    local) the commit-locally template is returned — it never promises a
+    push. A project may override the template
     with `<root>/.drcode/prompts/tester.md` (or `tester_no_commit.md` /
     `tester_commit_no_push.md`). The ``{project_path}`` placeholder in the
     template header is replaced with the actual project directory; without a

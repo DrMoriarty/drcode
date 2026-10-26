@@ -179,9 +179,11 @@ Headless-CLI (`drcode --bug-report`) только создаёт задачи. �
 - `<workspace>/.drcode/drcode.json` — flat-слой (если нужно) + ключ `models`
   с per-role выборкой.
 - `<workspace>/.drcode/settings.json` (`ProjectSettings`):
-  - `task_finalization`: `"testing"` (без коммитов) или `"testing_commit"`
+  - `git_policy`: `{"tester": "off", "research": "off"}` (без коммитов) или
+    `{"tester": "local", "research": "local"}`
     с локальным bare-remote — **никогда не пушить на GitHub**, прогон не должен
-    зависеть от внешней сети;
+    зависеть от внешней сети (legacy-ключ `task_finalization` также
+    принимается и мигрируется при загрузке);
   - `stall_nudge`: `"never"` на время замеров (отдельный сценарий может
     намеренно включить watchdog);
   - `completed_retention`: `"never"` (cleanup на старте не должен трогать
@@ -512,7 +514,8 @@ drcode-bench/
   выборку для всех ролей — держать окружение чистым.
 - Репозиторный `.env` drcode протекает через pydantic-settings при запуске из
   исходников — в bench-процессе окружение вычищать полностью (свежий subprocess).
-- `git push` тестера: `task_finalization="testing"` или локальный bare-remote;
+- `git push` тестера: `git_policy={"tester": "off", ...}` или локальный
+  bare-remote;
   никогда GitHub.
 - `stall_nudge="never"` на время замеров (иначе watchdog оборвёт медленную
   модель); отдельный сценарий может намеренно его тестировать.

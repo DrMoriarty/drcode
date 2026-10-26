@@ -913,6 +913,61 @@ async def test_ff_merge_refused_when_base_moved(
         assert not screen._ff_done
 
 
+async def test_staged_unconcluded_merge_is_not_ff_ready(
+    isolated: Path, configured_env: None
+) -> None:
+    """A merge resolved and staged but never committed (the screen was
+    closed mid-resolution) reopens WITHOUT the ff-ready mode: f is gated
+    off — no merge commit exists yet, --ff-only would refuse — and the
+    honest title points at `s`, which then concludes the merge."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, wt = _parked_content_conflict(isolated, task.id)
+    # Resolve and stage by hand, do NOT commit — the resuming scenario.
+    (wt / "app.py").write_text("resolved\nb\n")
+    _git(wt, "add", "app.py")
+    head_before = _git(wt, "rev-parse", "HEAD").strip()
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None,
+            pilot=pilot,
+            what="screen prepared",
+        )
+        await pilot.pause()
+        # Not ff-ready: f is inert, the resolution set (s among it) stays.
+        assert screen._ff_ready is False
+        assert screen.check_action("ff_merge", ()) is False
+        assert screen.check_action("commit", ()) is True
+        title = str(screen.query_one("#merge-title", Static).content)
+        assert "NOT committed" in title and "s to commit" in title
+
+        # The offered next step actually works: armed s commits the merge.
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.press("s")
+        await wait_until(
+            lambda: not me.in_progress(wt),
+            pilot=pilot,
+            what="resolution committed",
+        )
+        assert _git(wt, "rev-parse", "HEAD").strip() != head_before
+        assert me.is_fast_forward(isolated, branch_for(task.id), "main")
+
+
 async def test_conflicted_mode_keeps_ff_out_and_resolution_in(
     isolated: Path, configured_env: None
 ) -> None:

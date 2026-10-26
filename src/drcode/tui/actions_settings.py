@@ -1,8 +1,9 @@
 """Settings actions layer — navigation and project preferences.
 
 The navigation actions (focus sidebar/input, archive search), the
-Settings palette and every preference it edits (retention, task
-finalization, worktree removal, dev rounds, stall nudge, keep-awake,
+Settings palette and every preference it edits (retention, verification,
+the per-role git policies, the workflow presets, worktree removal, dev
+rounds, stall nudge, keep-awake,
 task isolation, parallel tasks, ESC-stop behavior), the custom-workflow
 status, the GitHub/notifications/voice dialogs plus the GitHub sync
 scheduler, and the theme picker.
@@ -27,9 +28,10 @@ from ..github import (
 from ..settings import (
     CompletedRetention,
     EscAbort,
+    GitPolicy,
     StallNudge,
-    TaskFinalization,
     TaskIsolation,
+    Verification,
     WorktreeRemoval,
     parallel_tasks_label,
 )
@@ -37,7 +39,8 @@ from ..workflow import describe_project_workflow, load_git_workflow
 from .command_providers import (
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
-    FinalizationOptionsProvider,
+    GitResearchOptionsProvider,
+    GitTesterOptionsProvider,
     IsolationOptionsProvider,
     ParallelTasksOptionsProvider,
     RetentionOptionsProvider,
@@ -46,7 +49,11 @@ from .command_providers import (
     TaskSettingsEntriesProvider,
     TaskSettingsPalette,
     ThemeOptionsProvider,
+    VerificationOptionsProvider,
+    WorkflowPreset,
+    WorkflowPresetOptionsProvider,
     WorktreeRemovalOptionsProvider,
+    workflow_preset_label,
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
 from .notifications_dialog import NotificationsDialog, NotificationsSetup
@@ -129,33 +136,156 @@ class SettingsLayer(DrCodeState):
             )
         )
 
-    def action_set_task_finalization(self, finalization: TaskFinalization) -> None:
-        """Settings command: what happens after a development round finishes
-        (tester + commit / tester / nothing). Persisted per project
-        (.drcode/settings.json); applies to every task finalized from now on.
-        Switching to "None" lets the pipeline complete any tasks currently
-        waiting for testing on the next _advance()."""
-        self.settings.task_finalization = finalization
+    def workflow_preset_label(self) -> str:
+        """The Settings-entry label of the workflow preset: the name of the
+        preset the settings currently match exactly, or "Custom" when any
+        individual setting was changed away from every preset."""
+        return workflow_preset_label(self.settings)
+
+    def action_set_workflow_preset(self, preset: WorkflowPreset) -> None:
+        """Settings command: apply a workflow preset — one named
+        combination of verification, the per-role git policies, task
+        isolation and worktree removal. The preset is an applier, not a
+        persisted entity: only the fields it declares are written (the
+        rest keep their current values) and the file keeps storing the
+        individual settings."""
+        preset.apply(self.settings)
         self.settings_store.save(self.settings)
         self.notify(
-            f"Task finalization: {finalization.label}",
+            f"Workflow preset: {preset.label}",
             title="Project settings",
             timeout=4,
         )
+        # A preset that switches verification off lets the pipeline
+        # complete any tasks waiting for testing on the next _advance().
         self._advance()
 
-    def action_change_task_finalization(self) -> None:
-        """Task-finalization picker, opened from the Settings entry
-        ("Task finalization: …"). Same UX as the retention picker: the
-        narrowed SettingsPalette with the three options; picking one applies
-        it, Escape dismisses without changing anything.
+    def action_workflow_preset_custom(self) -> None:
+        """Picked "Custom" in the preset picker: a no-op (Custom is the
+        display state of settings matching no preset, not a choice)."""
+        self.notify(
+            "Workflow preset: Custom — change the individual settings "
+            "below (isolation, verification, git policies, …).",
+            title="Project settings",
+            timeout=6,
+        )
+
+    def action_change_workflow_preset(self) -> None:
+        """Workflow-preset picker, opened from the Settings entry
+        ("Workflow preset: …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the presets plus the Custom marker;
+        picking a preset applies it, Escape dismisses without changing
+        anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--workflow-preset-palette",
+                providers=[WorkflowPresetOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_verification(self, verification: Verification) -> None:
+        """Settings command: whether the QA tester round runs at all.
+        Persisted per project (.drcode/settings.json); switching to "none"
+        lets the pipeline complete any tasks currently waiting for testing
+        on the next _advance(). The tester's git policy stays persisted
+        but dormant while no tester runs (a startup warning says so)."""
+        self.settings.verification = verification
+        self.settings_store.save(self.settings)
+        if (
+            verification is Verification.NONE
+            and self.settings.git_policy.tester is not GitPolicy.OFF
+        ):
+            self.notify(
+                "Verification: none — the tester's Git policy "
+                f"({self.settings.git_policy.tester.label}) is now "
+                "dormant: no tester runs to commit anything. Set Git "
+                "(tester): off to silence this warning.",
+                title="Project settings",
+                severity="warning",
+                timeout=10,
+            )
+        else:
+            self.notify(
+                f"Verification: {verification.label}",
+                title="Project settings",
+                timeout=4,
+            )
+        self._advance()
+
+    def action_change_verification(self) -> None:
+        """Verification picker, opened from the Settings entry
+        ("Verification: …"). Same UX as the retention picker: the narrowed
+        SettingsPalette with the two options; picking one applies it,
+        Escape dismisses without changing anything.
         """
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(
             SettingsPalette(
-                id="--finalization-palette",
-                providers=[FinalizationOptionsProvider],
+                id="--verification-palette",
+                providers=[VerificationOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_git_tester(self, policy: GitPolicy) -> None:
+        """Settings command: what the tester may do to git after a passed
+        verification (off / local commit / commit + push). Persisted per
+        project (.drcode/settings.json); applies to testing rounds from
+        now on. Dormant while Verification is none."""
+        self.settings.git_policy.tester = policy
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Git (tester): {policy.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_git_tester(self) -> None:
+        """Tester git-policy picker, opened from the Settings entry
+        ("Git (tester): …"). Same UX as the retention picker: the narrowed
+        SettingsPalette with the three policies; picking one applies it,
+        Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--git-tester-palette",
+                providers=[GitTesterOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_git_research(self, policy: GitPolicy) -> None:
+        """Settings command: what the research agent's git_commit_docs may
+        do (off / local commit / commit + push). Persisted per project
+        (.drcode/settings.json); applies to research tasks from now on.
+        Under "off" the tool is not registered and the prompt promises no
+        commit step; edited files stay tracked for the report."""
+        self.settings.git_policy.research = policy
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Git (research): {policy.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_git_research(self) -> None:
+        """Research git-policy picker, opened from the Settings entry
+        ("Git (research): …"). Same UX as the retention picker: the
+        narrowed SettingsPalette with the three policies; picking one
+        applies it, Escape dismisses without changing anything.
+        """
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--git-research-palette",
+                providers=[GitResearchOptionsProvider],
                 placeholder="Search for options…",
             )
         )

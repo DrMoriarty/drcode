@@ -10,6 +10,7 @@ palettes for each project preference.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -31,12 +32,18 @@ from textual.widgets import Button, LoadingIndicator
 from ...settings import (
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
-    FINALIZATION_OPTIONS,
+    GIT_POLICY_OPTIONS,
     ISOLATION_OPTIONS,
     PARALLEL_TASKS_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    VERIFICATION_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
+    GitPolicy,
+    ProjectSettings,
+    TaskIsolation,
+    Verification,
+    WorktreeRemoval,
     dev_rounds_label,
     parallel_tasks_label,
 )
@@ -44,6 +51,116 @@ from .base import SpacedCommandList
 
 if TYPE_CHECKING:
     from ..app import DrCodeApp
+
+
+# -- Workflow presets ----------------------------------------------------------
+#
+# A preset is a multi-field applier over the project settings, NOT a
+# persisted entity: the file keeps storing the individual fields, and any
+# manual change of one of them flips the palette display to "Custom"
+# (`workflow_preset_for` finds no fully-matching preset). A preset touches
+# ONLY the fields it declares (None = leave the current value as-is).
+
+
+@dataclass(frozen=True)
+class WorkflowPreset:
+    """One named combination of the workflow-related project settings.
+
+    Fields left as None are not touched when the preset is applied and
+    are ignored by the match check."""
+
+    key: str
+    label: str
+    description: str
+    verification: Verification | None = None
+    git_tester: GitPolicy | None = None
+    git_research: GitPolicy | None = None
+    isolation: TaskIsolation | None = None
+    worktree_removal: WorktreeRemoval | None = None
+
+    def matches(self, settings: ProjectSettings) -> bool:
+        """Whether the settings currently equal every field this preset
+        declares (fields it does not declare are irrelevant)."""
+        return (
+            (self.verification is None or settings.verification is self.verification)
+            and (
+                self.git_tester is None or settings.git_policy.tester is self.git_tester
+            )
+            and (
+                self.git_research is None
+                or settings.git_policy.research is self.git_research
+            )
+            and (self.isolation is None or settings.task_isolation is self.isolation)
+            and (
+                self.worktree_removal is None
+                or settings.worktree_removal is self.worktree_removal
+            )
+        )
+
+    def apply(self, settings: ProjectSettings) -> None:
+        """Write the declared fields into the settings (the caller saves)."""
+        if self.verification is not None:
+            settings.verification = self.verification
+        if self.git_tester is not None:
+            settings.git_policy.tester = self.git_tester
+        if self.git_research is not None:
+            settings.git_policy.research = self.git_research
+        if self.isolation is not None:
+            settings.task_isolation = self.isolation
+        if self.worktree_removal is not None:
+            settings.worktree_removal = self.worktree_removal
+
+
+WORKFLOW_PRESETS: tuple[WorkflowPreset, ...] = (
+    WorkflowPreset(
+        key="local_sandbox",
+        label="Local sandbox",
+        description=(
+            "Tester on; everything commits locally and never pushes; "
+            "each task in its own worktree, removed with the task"
+        ),
+        verification=Verification.TESTER,
+        git_tester=GitPolicy.LOCAL,
+        git_research=GitPolicy.LOCAL,
+        isolation=TaskIsolation.WORKTREE,
+        worktree_removal=WorktreeRemoval.ON_DELETE,
+    ),
+    WorkflowPreset(
+        key="team_pr_flow",
+        label="Team / PR flow",
+        description=(
+            "Tester commits and pushes both agents' branches to the "
+            "remote (pull-request flow); each task in its own worktree"
+        ),
+        git_tester=GitPolicy.PUSH,
+        git_research=GitPolicy.PUSH,
+        isolation=TaskIsolation.WORKTREE,
+    ),
+    WorkflowPreset(
+        key="minimal",
+        label="Minimal",
+        description=(
+            "No tester, no git at all: tasks complete right after "
+            "development, changes stay uncommitted in the project "
+            "directory (research answers questions / edits docs "
+            "without a commit step)"
+        ),
+        verification=Verification.NONE,
+        git_tester=GitPolicy.OFF,
+        git_research=GitPolicy.OFF,
+    ),
+)
+
+
+def workflow_preset_for(settings: ProjectSettings) -> WorkflowPreset | None:
+    """The preset the current settings exactly match, or None ("Custom")."""
+    return next((p for p in WORKFLOW_PRESETS if p.matches(settings)), None)
+
+
+def workflow_preset_label(settings: ProjectSettings) -> str:
+    """The "Workflow preset:" palette-entry value for the settings."""
+    preset = workflow_preset_for(settings)
+    return preset.label if preset is not None else "Custom"
 
 
 class SettingsPalette(CommandPalette):
@@ -177,25 +294,34 @@ class TaskSettingsPalette(SettingsPalette):
     """Sub-menu of the Settings palette with the task-management entries.
 
     Opened from the single "Task settings…" entry of the main Settings
-    menu: the seven project preferences that govern how tasks behave
-    (retention, finalization, worktree removal, dev rounds, stall nudge,
-    isolation, parallelism). Same narrowed layout and spaced list as the
-    parent; the entry order is its own (task entries only), so the shared
-    prefix-sort in `SettingsPalette._entry_rank` orders this menu
-    independently.
+    menu: the project preferences that govern how tasks behave, grouped
+    into three labeled sections — Workflow (preset, isolation, parallel
+    tasks, worktree removal), Testing (verification, dev rounds, stall
+    nudge) and Git (tester/research policies, retention). Same narrowed
+    layout and spaced list as the parent; the entry order is its own
+    (task entries only), so the shared prefix-sort in
+    `SettingsPalette._entry_rank` orders this menu independently.
     """
 
     # Same prefix-matching contract as SettingsPalette.ENTRY_ORDER, but
-    # scoped to this sub-menu: the seven task-management preferences in
-    # their fixed logical order.
+    # scoped to this sub-menu: the task-management preferences in their
+    # fixed logical order, grouped by section (the section labels live
+    # only in the docstrings/help texts — the palette is a flat list).
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
-        "Auto-delete completed tasks:",
-        "Task finalization:",
-        "Worktree removal:",
-        "Max development rounds:",
-        "Nudge stalled agent after:",
+        # -- Workflow --
+        "Workflow preset:",
         "Task isolation:",
         "Parallel tasks:",
+        "Worktree removal:",
+        # -- Testing --
+        "Verification:",
+        "Max development rounds:",
+        "Nudge stalled agent after:",
+        # -- Git --
+        "Git (tester):",
+        "Git (research):",
+        "Auto-delete completed tasks:",
+        "Keep computer awake:",
     )
 
 
@@ -422,7 +548,10 @@ class ProjectSettingsCommandsProvider(Provider):
 
 
 class TaskSettingsEntriesProvider(Provider):
-    """The seven task-management entries of the "Task settings…" sub-menu.
+    """The task-management entries of the "Task settings…" sub-menu,
+    grouped into three sections: Workflow (preset, isolation, parallel
+    tasks, worktree removal), Testing (verification, dev rounds, stall
+    nudge) and Git (tester/research policies, retention).
 
     One entry per project preference; its current value is shown after the
     ":". Picking an entry opens the option-selection palette (same UX as the
@@ -436,51 +565,17 @@ class TaskSettingsEntriesProvider(Provider):
         app = cast("DrCodeApp", self.app)
         return [
             (
-                f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
+                f"Workflow preset: {app.workflow_preset_label()}",
                 (
-                    "Delete completed tasks older than the retention period at app "
-                    "startup (project setting)"
+                    "Apply a named combination of the workflow settings "
+                    "(verification, per-role git policies, isolation, "
+                    "worktree removal) in one pick — Local sandbox, "
+                    "Team / PR flow or Minimal; any manual change of an "
+                    "individual setting flips this display to Custom"
                 ),
-                app.action_change_completed_retention,
+                app.action_change_workflow_preset,
             ),
-            (
-                f"Task finalization: {app.settings.task_finalization.label}",
-                (
-                    "What runs after development: tester + git commit, tester "
-                    "without commit, or nothing (project setting)"
-                ),
-                app.action_change_task_finalization,
-            ),
-            (
-                f"Worktree removal: {app.settings.worktree_removal.label}",
-                (
-                    "When the per-task worktree directory (.drcode/"
-                    "worktrees/<id>) is deleted automatically: with the "
-                    "task, on task completion, or never — the branch "
-                    "drcode/<id> with the committed work always survives "
-                    "(project setting)"
-                ),
-                app.action_change_worktree_removal,
-            ),
-            (
-                f"Max development rounds: {app.settings.max_dev_rounds}",
-                (
-                    "How many consecutive failed development rounds a task "
-                    "gets when the tester attributes the failure to the "
-                    "task's own changes, before the failure completes the "
-                    "task as failed and a bug report is created instead "
-                    "(project setting)"
-                ),
-                app.action_change_max_dev_rounds,
-            ),
-            (
-                f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
-                (
-                    "Abort and restart an agent/tester run that has shown no "
-                    "activity for this long (project setting)"
-                ),
-                app.action_change_stall_nudge,
-            ),
+            # -- Workflow --
             (
                 f"Task isolation: {app._task_isolation_label()}",
                 (
@@ -501,6 +596,75 @@ class TaskSettingsEntriesProvider(Provider):
                     "the tester stays single)"
                 ),
                 app.action_change_parallel_tasks,
+            ),
+            (
+                f"Worktree removal: {app.settings.worktree_removal.label}",
+                (
+                    "When the per-task worktree directory (.drcode/"
+                    "worktrees/<id>) is deleted automatically: with the "
+                    "task, on task completion, or never — the branch "
+                    "drcode/<id> with the committed work always survives "
+                    "(project setting)"
+                ),
+                app.action_change_worktree_removal,
+            ),
+            # -- Testing --
+            (
+                f"Verification: {app.settings.verification.label}",
+                (
+                    "Whether the QA tester round runs after development: "
+                    "tester (verify before completion) or none (tasks "
+                    "complete right away — project setting)"
+                ),
+                app.action_change_verification,
+            ),
+            (
+                f"Max development rounds: {app.settings.max_dev_rounds}",
+                (
+                    "How many consecutive failed development rounds a task "
+                    "gets when the tester attributes the failure to the "
+                    "task's own changes, before the failure completes the "
+                    "task as failed and a bug report is created instead "
+                    "(project setting)"
+                ),
+                app.action_change_max_dev_rounds,
+            ),
+            (
+                f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
+                (
+                    "Abort and restart an agent/tester run that has shown no "
+                    "activity for this long (project setting)"
+                ),
+                app.action_change_stall_nudge,
+            ),
+            # -- Git --
+            (
+                f"Git (tester): {app.settings.git_policy.tester.label}",
+                (
+                    "What the QA tester may do to git after a passed "
+                    "verification: commit + push, local commit only, or "
+                    "off (verify without committing — project setting; "
+                    "dormant while Verification is none)"
+                ),
+                app.action_change_git_tester,
+            ),
+            (
+                f"Git (research): {app.settings.git_policy.research.label}",
+                (
+                    "What the research agent's git_commit_docs may do: "
+                    "commit + push, local commit only, or off (no commit "
+                    "step at all — edited files are still tracked for the "
+                    "report; project setting)"
+                ),
+                app.action_change_git_research,
+            ),
+            (
+                f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
+                (
+                    "Delete completed tasks older than the retention period at app "
+                    "startup (project setting)"
+                ),
+                app.action_change_completed_retention,
             ),
             (
                 f"Keep computer awake: {'on' if app.settings.keep_awake else 'off'}",
@@ -557,8 +721,8 @@ class RetentionOptionsProvider(Provider):
                 yield Hit(match, matcher.highlight(name), callback)
 
 
-class FinalizationOptionsProvider(Provider):
-    """Options of the "Task finalization" setting.
+class VerificationOptionsProvider(Provider):
+    """Options of the "Verification" setting (tester / none).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
     apply it immediately, Escape keeps the current one. The active option is
@@ -567,14 +731,106 @@ class FinalizationOptionsProvider(Provider):
 
     def _commands(self) -> list[tuple[str, Callable[[], None]]]:
         app = cast("DrCodeApp", self.app)
-        current = app.settings.task_finalization
+        current = app.settings.verification
         return [
             (
                 option.label + (" (current)" if option is current else ""),
-                partial(app.action_set_task_finalization, option),
+                partial(app.action_set_verification, option),
             )
-            for option in FINALIZATION_OPTIONS
+            for option in VERIFICATION_OPTIONS
         ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class GitTesterOptionsProvider(Provider):
+    """Options of the "Git (tester)" setting (off / local / push).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option to
+    apply it immediately, Escape keeps the current one. The active option is
+    marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.git_policy.tester
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_git_tester, option),
+            )
+            for option in GIT_POLICY_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class GitResearchOptionsProvider(Provider):
+    """Options of the "Git (research)" setting (off / local / push).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option to
+    apply it immediately, Escape keeps the current one. The active option is
+    marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.git_policy.research
+        return [
+            (
+                option.label + (" (current)" if option is current else ""),
+                partial(app.action_set_git_research, option),
+            )
+            for option in GIT_POLICY_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class WorkflowPresetOptionsProvider(Provider):
+    """Options of the "Workflow preset" applier (Local sandbox / Team /
+    PR flow / Minimal / Custom).
+
+    Picking a preset applies its declared fields immediately (the current
+    value elsewhere is kept); "Custom" is a no-op marker for settings that
+    match no preset. Escape keeps everything as-is.
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        commands: list[tuple[str, Callable[[], None]]] = [
+            (
+                preset.label,
+                partial(app.action_set_workflow_preset, preset),
+            )
+            for preset in WORKFLOW_PRESETS
+        ]
+        commands.append(("Custom", app.action_workflow_preset_custom))
+        return commands
 
     async def discover(self) -> Hits:
         for name, callback in self._commands():

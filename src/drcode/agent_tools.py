@@ -307,14 +307,18 @@ def _track_edited_file(deps: AgentDeps, resolved: Path) -> None:
         deps.manager.storage.save(task)
 
 
-async def _commit_tracked_files(deps: AgentDeps, root: Path, message: str) -> str:
+async def _commit_tracked_files(
+    deps: AgentDeps, root: Path, message: str, allow_push: bool = True
+) -> str:
     """Commit EXACTLY the files the research agent created/edited itself.
 
     The stage list comes from `task.edited_files` (see `_track_edited_file`)
     — the model cannot widen it, so unrelated working-tree changes are never
-    committed. Pushes via `_git_push` when a remote is configured. The
-    tracked list is cleared after a successful commit so a later call does
-    not re-stage already-committed files.
+    committed. Pushes via `_git_push` when `allow_push` (the project's
+    research git policy: push) and a remote are configured; with
+    `allow_push=False` the commit stays local and the tool result says so.
+    The tracked list is cleared after a successful commit so a later call
+    does not re-stage already-committed files.
     """
     message = message.strip().strip("'\"")
     if not message:
@@ -357,4 +361,7 @@ async def _commit_tracked_files(deps: AgentDeps, root: Path, message: str) -> st
     task.edited_files.clear()
     task.touch()
     deps.manager.storage.save(task)
-    return f"Committed successfully.\n{head}" + await _git_push(deps, root)
+    result = f"Committed successfully.\n{head}"
+    if allow_push:
+        return result + await _git_push(deps, root)
+    return result + "\nCommit is local — this project never pushes."

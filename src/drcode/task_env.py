@@ -339,6 +339,30 @@ class TaskEnvironment:
         code, out = self._git("status", "--porcelain", "-uno")
         return code == 0 and bool(out)
 
+    def ff_merge_branch(self, task_id: str) -> tuple[bool, str]:
+        """Fast-forward the MAIN checkout's base branch to the task's
+        `drcode/<id>` tip (`git merge --ff-only --no-edit` run in
+        `project_root`) — the git mechanics behind the conflict screen's
+        user-triggered "Merge into <base>" action. The contract stands
+        unchanged: drcode never merges into the user's checkout on its
+        own; this runs only behind an explicit user action, and the
+        `--ff-only` mode makes refusal the only failure shape (a moved
+        base or a dirty tree is an error return, never a conflicted
+        merge to resolve in the user's tree).
+
+        Returns (ok, combined git output); False when isolation is off
+        or the branch does not exist. A refusal leaves the main checkout
+        untouched — the caller surfaces the output and lets the user
+        re-run the reversed merge instead. Blocking git — callers wrap
+        in to_thread."""
+        if not self.active:
+            return False, "worktree isolation is off"
+        branch = self.branch(task_id)
+        if not self._branch_exists(branch):
+            return False, f"branch {branch} does not exist"
+        code, out = self._git("merge", "--ff-only", "--no-edit", branch)
+        return code == 0, out
+
     # -- lifecycle -------------------------------------------------------------
 
     def root_now(self, task_id: str) -> Path:

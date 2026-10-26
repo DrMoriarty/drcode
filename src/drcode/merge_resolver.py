@@ -311,6 +311,39 @@ def _worktree_pythonpath_env(worktree: Path) -> dict[str, str]:
     return env
 
 
+def _venv_prefix(python_cmd: list[str]) -> Path | None:
+    """The virtualenv prefix of the plan's interpreter, when it IS a venv
+    python. `uv run` plans are excluded: uv itself exports VIRTUAL_ENV and
+    prepends the venv's bin to the child's PATH, so node-based discovery
+    already lands correctly there."""
+    if python_cmd and python_cmd[0] == "uv":
+        return None
+    bin_dir = Path(python_cmd[0]).parent
+    if bin_dir.name not in ("bin", "Scripts"):
+        return None
+    prefix = bin_dir.parent
+    if not (prefix / "pyvenv.cfg").is_file():
+        return None
+    return prefix
+
+
+def _venv_env(python_cmd: list[str], base_env: dict[str, str] | None) -> dict[str, str]:
+    """Subprocess environment for a tool that does its OWN python
+    discovery — the pip `pyright` package is a node wrapper that ignores
+    the interpreter `-m pyright` ran under and probes VIRTUAL_ENV / PATH
+    instead. Pin the plan's environment explicitly (VIRTUAL_ENV set, the
+    venv's bin prepended to PATH); otherwise that discovery can land on
+    an interpreter without the project's deps and report phantom
+    reportMissingImports for every third-party import (the 9d29e63d
+    failure class)."""
+    env = dict(base_env) if base_env is not None else dict(os.environ)
+    if prefix := _venv_prefix(python_cmd):
+        env["VIRTUAL_ENV"] = str(prefix)
+        bin_dir = prefix / ("Scripts" if os.name == "nt" else "bin")
+        env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
+    return env
+
+
 def _python_files(worktree: Path) -> list[str]:
     """Tracked .py files of the worktree (git ls-files — the worktree may
     sit on a branch with different content than the main checkout)."""
@@ -394,12 +427,69 @@ def mechanical_checks(worktree: Path) -> list[CheckResult]:
     """Level 1 of the funnel: the tree must at least be sound. The
     compile check is MANDATORY (every file git tracks must byte-compile);
     ruff/pyright run when the tool is available (best-effort — a project
-    without them installed is not failed for it).
-
-    Kept as the serial composition of the per-stage functions
-    (`compile_check` / `ruff_check` / `pyright_check`) so the pipeline and
-    the interactive funnel run byte-identical checks."""
-    return [compile_check(worktree), ruff_check(worktree), pyright_check(worktree)]
+    without them installed is not failed for it)."""
+    results: list[CheckResult] = []
+    py_files = _python_files(worktree)
+    if py_files:
+        # Chunk the compile check: a single command line with thousands of
+        # paths can overflow the OS arg limit.
+        chunk = 400
+        ok = True
+        output: list[str] = []
+        for i in range(0, len(py_files), chunk):
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", *py_files[i : i + chunk]],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+                check=False,
+            )
+            if proc.returncode != 0:
+                ok = False
+                output.append((proc.stdout + proc.stderr).strip()[:4000])
+        results.append(
+            CheckResult(
+                name="compile (py_compile of tracked .py files)",
+                ok=ok,
+                output="\n".join(output)[:8000],
+            )
+        )
+    # ruff/pyright MUST come from the project's own environment: a random
+    # PATH binary carries a different default ruleset/version and reports
+    # phantom failures (e.g. DTZ005 from an old ruff) that roll back a
+    # correct resolution. Skipped (best-effort) when the project has none.
+    ruff_plan = _project_python(worktree, "ruff")
+    if ruff_plan is not None:
+        ruff_cmd, fix_path = ruff_plan
+        results.append(
+            _run_checked(
+                "ruff check",
+                [*ruff_cmd, "-m", "ruff", "check", "."],
+                worktree,
+                env=_worktree_pythonpath_env(worktree) if fix_path else None,
+            )
+        )
+    else:
+        results.append(CheckResult(name="ruff check", ok=True, skipped=True))
+    pyright_plan = _project_python(worktree, "pyright")
+    if pyright_plan is not None:
+        pyright_cmd, fix_path = pyright_plan
+        base_env = _worktree_pythonpath_env(worktree) if fix_path else None
+        results.append(
+            _run_checked(
+                "pyright",
+                [*pyright_cmd, "-m", "pyright"],
+                worktree,
+                timeout=900,
+                # Node pyright discovers the environment itself — pin it
+                # to the plan's venv (see _venv_env).
+                env=_venv_env(pyright_cmd, base_env),
+            )
+        )
+    else:
+        results.append(CheckResult(name="pyright", ok=True, skipped=True))
+    return results
 
 
 def run_test_suite(worktree: Path, timeout: int = TEST_TIMEOUT) -> CheckResult:

@@ -266,6 +266,12 @@ class PipelineResolverLayer(DrCodeState):
                                 task.resolver_messages[-1],
                                 AgentRole.RESOLVER,
                             )
+                            if tokens is None:
+                                # An observation under the threshold: the
+                                # previous compaction (if any) landed — the
+                                # threshold-livelock counter starts over
+                                # (see _livelock_stop).
+                                self._resolver_threshold_compactions.pop(task.id, None)
                             hard_due = (
                                 tokens is not None
                                 and self._fill_over_hard_limit(

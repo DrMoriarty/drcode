@@ -330,6 +330,15 @@ class PipelineTesterLayer(DrCodeState):
                                     task.tester_messages[-1],
                                     AgentRole.TESTER,
                                 )
+                                if tokens is None:
+                                    # An observation under the threshold:
+                                    # the previous compaction (if any)
+                                    # landed — the threshold-livelock
+                                    # counter starts over (see
+                                    # _livelock_stop).
+                                    self._tester_threshold_compactions.pop(
+                                        task.id, None
+                                    )
                                 hard_due = (
                                     tokens is not None
                                     and self._fill_over_hard_limit(

@@ -623,8 +623,10 @@ class DrCodeState(App[None]):
     _resolver_compaction_failed: set[str]
     _resolver_hard_limit_exhausted: set[str]
     # Consecutive hard-limit compactions of the resolver round (livelock
-    # guard, see _hard_livelock_stop).
+    # guard, see _livelock_stop).
     _resolver_hard_limit_compactions: dict[str, int]
+    # Same counter at the threshold level (see _livelock_stop).
+    _resolver_threshold_compactions: dict[str, int]
 
     # -- agent failure / network-retry bookkeeping --------------------------
     _agent_failed: set[str]
@@ -725,10 +727,15 @@ class DrCodeState(App[None]):
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
     # Livelock guard: consecutive hard-limit compactions per task that never
-    # landed a turn under the hard limit (see _hard_livelock_stop). Shared by
+    # landed a turn under the hard limit (see _livelock_stop). Shared by
     # the main-agent and tester gates (like the sets above); the resolver
     # keeps its own counter.
     _hard_limit_compactions: dict[str, int]
+    # The same guard at the threshold level — one counter per layer (the
+    # main agent's, the tester rounds' own): a stale count of one layer
+    # must never disable another layer's compaction gate.
+    _threshold_compactions: dict[str, int]
+    _tester_threshold_compactions: dict[str, int]
     _last_follow: float
     _chat_epoch: int
 

@@ -321,12 +321,24 @@ class PipelineTesterLayer(DrCodeState):
                                 # summarizer there escalates to the
                                 # mechanical trim; unless the escalation
                                 # proved unable to shrink the round —
-                                # `_hard_limit_exhausted`).
+                                # `_hard_limit_exhausted`, or the livelock
+                                # guard stopped the gate after consecutive
+                                # compactions that never landed under the
+                                # hard limit — both flags set together).
                                 tokens = self._fill_over_threshold(
                                     live_tokens,
                                     task.tester_messages[-1],
                                     AgentRole.TESTER,
                                 )
+                                if tokens is None:
+                                    # An observation under the threshold:
+                                    # the previous compaction (if any)
+                                    # landed — the threshold-livelock
+                                    # counter starts over (see
+                                    # _livelock_stop).
+                                    self._tester_threshold_compactions.pop(
+                                        task.id, None
+                                    )
                                 hard_due = (
                                     tokens is not None
                                     and self._fill_over_hard_limit(

@@ -34,7 +34,7 @@ from textual.widget import Widget
 from textual.widgets import ListView, Static
 from textual.worker import Worker
 
-from ..agent import AgentDeps, TesterDeps
+from ..agent import AgentDeps, ResolverDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
@@ -168,6 +168,8 @@ class DrCodeState(App[None]):
 
     def _unmerged_completed_ids(self) -> list[str]: ...
 
+    def _suggest_conflict_screen(self, task: Task) -> None: ...
+
     async def _poll_git_indicator(self) -> None: ...
 
     def _poll_stall(self) -> None: ...
@@ -271,6 +273,8 @@ class DrCodeState(App[None]):
     def action_change_tester_model(self) -> None: ...
 
     def action_change_compaction_model(self) -> None: ...
+
+    def action_change_resolver_model(self) -> None: ...
 
     def action_set_role_model(self, role: AgentRole, ref: ModelRef | None) -> None: ...
 
@@ -490,6 +494,34 @@ class DrCodeState(App[None]):
     # fixes the decorated signature (Worker[None]) for the mixin layers.
     def run_tester(self, task_id: str) -> Worker[None]: ...
 
+    def _maybe_start_resolver(self, task_id: str) -> None: ...
+
+    def run_resolver(self, task_id: str) -> Worker[None]: ...
+
+    def _retry_resolver(self) -> None: ...
+
+    async def _verify_resolution(
+        self,
+        task: Task,
+        root: Path,
+        report: Any,
+        deps: ResolverDeps,
+    ) -> Any: ...
+
+    async def _apply_resolver_outcome(
+        self, task: Task, root: Path, base: str, outcome: Any
+    ) -> None: ...
+
+    async def _give_up_to_human(self, task: Task, root: Path, base: str) -> None: ...
+
+    def _persist_resolver_messages(
+        self, task: Task, run: AgentRun[Any, str] | None
+    ) -> None: ...
+
+    async def _maybe_compact_resolver_round(
+        self, task: Task, live_tokens: int | None
+    ) -> bool: ...
+
     # -- external review / workflow hooks (implemented in PipelineLayer) ----
 
     def _next_review(self) -> Task | None: ...
@@ -595,6 +627,25 @@ class DrCodeState(App[None]):
     _tester_net_count: dict[str, int]
     _tester_resume_round: set[str]
 
+    # -- merge-conflict resolver bookkeeping (single-slot worker) -----------
+    _resolver_running: bool
+    _resolver_task_id: str | None
+    _resolver_generation: int
+    _resolver_fail_count: dict[str, int]
+    _resolver_retry_at: dict[str, float]
+    _resolver_net_count: dict[str, int]
+    _resolver_resume_round: set[str]
+    # Compaction-failure bookkeeping of the resolver rounds — separate
+    # from the agent/tester sets so a broken summarizer seen by one role
+    # never disables another role's gate.
+    _resolver_compaction_failed: set[str]
+    _resolver_hard_limit_exhausted: set[str]
+    # Consecutive hard-limit compactions of the resolver round (livelock
+    # guard, see _livelock_stop).
+    _resolver_hard_limit_compactions: dict[str, int]
+    # Same counter at the threshold level (see _livelock_stop).
+    _resolver_threshold_compactions: dict[str, int]
+
     # -- agent failure / network-retry bookkeeping --------------------------
     _agent_failed: set[str]
     # Deterministically-failed subset of _agent_failed (transcript over the
@@ -630,6 +681,20 @@ class DrCodeState(App[None]):
     # two tasks finalizing in parallel must not run concurrent git merges
     # into the shared main checkout.
     _accept_hook_lock: asyncio.Lock
+
+    # -- deferred installs (the on_tester_passed MERGE_HEAD guard) -----------
+    # Ids collected by _install_rerun_candidates (a worker thread inside
+    # _unmerged_completed_ids): deferred on_tester_passed installs
+    # (task.install_pending) whose blocker is gone — handed to
+    # _maybe_rerun_pending_installs by the 10 s poll / the startup scan.
+    _install_rerun_ids: list[str]
+    _install_rerun_running: bool
+
+    def _install_rerun_candidates(self, unmerged_ids: list[str]) -> list[str]: ...
+
+    def _maybe_rerun_pending_installs(self) -> Any: ...
+
+    async def _poll_pending_installs(self) -> None: ...
 
     # -- session statistics (expanded header, session-scoped) ---------------
     _session_known_ids: set[str]
@@ -679,6 +744,16 @@ class DrCodeState(App[None]):
     _live_ctx_tokens: dict[str, int]
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
+    # Livelock guard: consecutive hard-limit compactions per task that never
+    # landed a turn under the hard limit (see _livelock_stop). Shared by
+    # the main-agent and tester gates (like the sets above); the resolver
+    # keeps its own counter.
+    _hard_limit_compactions: dict[str, int]
+    # The same guard at the threshold level — one counter per layer (the
+    # main agent's, the tester rounds' own): a stale count of one layer
+    # must never disable another layer's compaction gate.
+    _threshold_compactions: dict[str, int]
+    _tester_threshold_compactions: dict[str, int]
     _last_follow: float
     _chat_epoch: int
 

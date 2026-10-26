@@ -73,6 +73,7 @@ from .blocks import (  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
     DependencyCommandsProvider,
+    MergeCommandsProvider,
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
@@ -121,6 +122,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,
+        MergeCommandsProvider,
     }
 
     CSS = """
@@ -288,6 +290,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+down", "move_task_down", "Move down"),
         ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+f", "search_tasks", "Find task"),
+        ("ctrl+m", "open_merge", "Merge…"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the
         # footer (and the key dispatch) picks the first one whose
@@ -443,6 +446,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Replaced wholesale by the worker thread — never mutated in
         # place — so a read on the event loop is always consistent.
         self._merge_state: dict[str, str] = {}
+        # Deferred on_tester_passed installs (task.install_pending — the
+        # hook was skipped over a half-done merge): ids the last
+        # _unmerged_completed_ids pass found re-runnable (branch merged /
+        # checkout clean again), consumed by the 10 s poll and the startup
+        # scan via _maybe_rerun_pending_installs. Replaced wholesale by
+        # the worker thread like _merge_state.
+        self._install_rerun_ids: list[str] = []
+        self._install_rerun_running = False
         self.viewed_id: str | None = None
         # Counted run state (parallel development slots): the in-flight
         # agent runs (task id -> generation) and the per-task run
@@ -491,6 +502,22 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # new one.
         self._tester_net_count: dict[str, int] = {}
         self._tester_resume_round: set[str] = set()
+        # Merge-conflict resolver (single-slot worker, mirrors the tester's
+        # bookkeeping): singular running flag, per-round generation, failure
+        # counters (model errors vs transient network errors) and the
+        # resume-round set for continuation turns. The compaction-failure
+        # sets are the resolver's own — separate from the agent/tester ones.
+        self._resolver_running: bool = False
+        self._resolver_task_id: str | None = None
+        self._resolver_generation: int = 0
+        self._resolver_fail_count: dict[str, int] = {}
+        self._resolver_retry_at: dict[str, float] = {}
+        self._resolver_net_count: dict[str, int] = {}
+        self._resolver_resume_round: set[str] = set()
+        self._resolver_compaction_failed: set[str] = set()
+        self._resolver_hard_limit_exhausted: set[str] = set()
+        self._resolver_hard_limit_compactions: dict[str, int] = {}
+        self._resolver_threshold_compactions: dict[str, int] = {}
         # Same idea for agent runs: a task whose run crashed (e.g. the model
         # gateway is unreachable) is demoted to QUEUED and skipped by
         # promote_next for the rest of the session, so one broken task (or a
@@ -628,6 +655,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # resume cycle would repeat at every tool boundary with no effect.
         # Cleared as soon as any compaction actually shrinks the transcript.
         self._hard_limit_exhausted: set[str] = set()
+        # Livelock guard: consecutive hard-limit compactions per task that
+        # never landed a turn under the hard limit — past
+        # _HARD_LIMIT_COMPACTION_LIMIT the gate stops compacting (the cap is
+        # below the transcript's irreducible floor; see _livelock_stop).
+        self._hard_limit_compactions: dict[str, int] = {}
+        # The same guard at the threshold level: consecutive threshold
+        # compactions per task with no gate observation under the threshold
+        # in between (every turn's growth re-crosses it — the bench
+        # live-lock of successful-but-useless compactions). One counter per
+        # layer: a stale count of one layer must never disable another
+        # layer's gate.
+        self._threshold_compactions: dict[str, int] = {}
+        self._tester_threshold_compactions: dict[str, int] = {}
         # Monotonic stamp of the last coalesced follow-the-tail scroll while
         # streaming (see _stream_follow).
         self._last_follow = 0.0
@@ -1066,6 +1106,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 group="git-indicator",
             )
             self.set_interval(10, self._poll_git_indicator)
+        # Deferred installs (on_tester_passed skipped over a half-done
+        # merge — task.install_pending): poll for the resolution
+        # UNCONDITIONALLY. The guard applies with and without isolation,
+        # but the git-indicator poll above only runs with it; the scan is
+        # cheap when no task carries the flag (no git before the first
+        # candidate, see _install_rerun_candidates).
+        self.set_interval(10, self._poll_pending_installs)
         self.refresh_project_info()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty
@@ -1190,6 +1237,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         env = self.task_env
         if not env.active:
             self._merge_state = {}
+            # No isolation — no branches; the only deferred-install
+            # blocker is the shared checkout itself (mid-merge / dirty).
+            self._install_rerun_ids = self._install_rerun_candidates([])
             return []
         workflow = self.workflow
         # Candidates come from task statuses alone — no git here.
@@ -1206,6 +1256,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             candidates.append(task)
         if not candidates:
             self._merge_state = {}
+            self._install_rerun_ids = self._install_rerun_candidates([])
             return []
         # ONE wholesale mergedness answer for every candidate branch (a
         # snapshot + glob over refs/heads/drcode/, cached per the
@@ -1249,7 +1300,41 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 task.hook_merge_failed = False
                 task.touch()
                 self.manager.storage.save(task)
+        # Same pass, different flag: deferred installs whose blocker just
+        # disappeared (the branch is merged — exactly the ids NOT in the
+        # unmerged result above).
+        self._install_rerun_ids = self._install_rerun_candidates(result)
         return result
+
+    def _install_rerun_candidates(self, unmerged_ids: list[str]) -> list[str]:
+        """Completed PASSED tasks with a deferred on_tester_passed install
+        (`task.install_pending` — the hook was skipped over a half-done
+        merge) whose blocker is GONE: the branch is merged (or there is
+        no isolation — the branch was never the blocker) and the main
+        checkout is clean again — no MERGE_HEAD, no uncommitted tracked
+        changes. The returned ids are handed to
+        _maybe_rerun_pending_installs by the poll/startup-scan callers.
+        Blocking git — run in a worker thread."""
+        if self.workflow is None or not self.workflow.has("on_tester_passed"):
+            return []
+        unmerged = set(unmerged_ids)
+        tasks = [
+            task
+            for task in list(self.manager.tasks.values())
+            if task.install_pending
+            and task.id not in unmerged
+            and task.status is TaskStatus.COMPLETED
+            and task.kind is not TaskKind.RESEARCH
+            and task.verification is VerificationStatus.PASSED
+            and not task.review_pending
+        ]
+        if not tasks:
+            return []
+        from ..merge_engine import in_progress as merge_in_progress
+
+        if merge_in_progress(self.project_root) or self.task_env.main_checkout_dirty():
+            return []  # the checkout is still mid-merge / dirty — wait
+        return [task.id for task in tasks]
 
     def _hook_merge_still_owns(
         self, task: Task, hook: str, unmerged_branches: set[str]
@@ -1282,6 +1367,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             task.hook_merge_failed = True
             task.touch()
             self.manager.storage.save(task)
+            # Re-stamped failure: give the automatic conflict resolver a
+            # shot (no-op without isolation / without a resolver model).
+            self._maybe_start_resolver(task.id)
         return False
 
     async def _unmerged_work_startup_scan(self) -> None:
@@ -1297,8 +1385,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         indicator (see _unmerged_completed_ids)."""
         env = self.task_env
         stuck_ids = await asyncio.to_thread(self._unmerged_completed_ids)
+        # Deferred installs resolved while the app was down (the user
+        # merged the branch by hand): the same scan re-runs them.
+        self._maybe_rerun_pending_installs()
         if not stuck_ids:
             return
+        # Tasks whose hook-merge FAILED (a conflicted merge likely parked
+        # in their worktree): hand each to the automatic conflict resolver
+        # once per session — silently a no-op when the resolver model is
+        # not configured or isolation is off.
+        for task_id in stuck_ids:
+            task = self.manager.tasks.get(task_id)
+            if task is not None and task.hook_merge_failed:
+                self._maybe_start_resolver(task_id)
         stuck = [env.branch(task_id) for task_id in stuck_ids]
         base = await asyncio.to_thread(env.base_branch)
         shown = ", ".join(stuck[:5]) + ("…" if len(stuck) > 5 else "")

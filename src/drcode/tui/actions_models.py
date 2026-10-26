@@ -104,7 +104,7 @@ class ModelSelectionLayer(DrCodeState):
         ref = UserModelsStore().load().defaults.get(role)
         if ref is not None:
             return f"{ref.provider}/{ref.model}"
-        if role is AgentRole.RESEARCH:
+        if role in (AgentRole.RESEARCH, AgentRole.RESOLVER):
             return f"{self.role_model_label(AgentRole.CODING)} (inherits coding)"
         return "not set"
 
@@ -119,6 +119,9 @@ class ModelSelectionLayer(DrCodeState):
 
     def action_change_compaction_model(self) -> None:
         self._open_role_model_picker(AgentRole.COMPACTION)
+
+    def action_change_resolver_model(self) -> None:
+        self._open_role_model_picker(AgentRole.RESOLVER)
 
     def _open_role_model_picker(self, role: AgentRole) -> None:
         """Selection palette with the catalog models for a role (grouped by

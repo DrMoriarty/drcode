@@ -47,6 +47,27 @@ from .usage import _is_context_overflow_error
 # summarizer there escalates to the mechanical trim instead.
 _HARD_LIMIT_PCT = 97
 
+# Livelock guard: the maximum number of CONSECUTIVE hard-limit compactions
+# (no gate observation under the hard limit in between — every resumed turn
+# lands over the hard limit again) before the gate gives up. Past it the
+# role's cap is below the transcript's irreducible floor (system prompt +
+# tool schemas + original prompts verbatim + a summary that cannot shrink
+# further) and compacting again can only burn the API budget: the gate is
+# disabled for the task and the diagnostic event tells the user what to fix.
+_HARD_LIMIT_COMPACTION_LIMIT = 3
+
+# Threshold-level livelock guard: the maximum number of CONSECUTIVE
+# threshold-level compactions (no gate observation under the threshold in
+# between — every resumed turn re-crosses the threshold before its next
+# boundary) before the gate gives up. Unlike the hard-limit regime this one
+# does not die deterministically (the fill stays under the hard limit), so
+# each cycle burns summarizer calls and model requests with zero progress
+# (the bench live-lock: 35 compactions, ~667k input tokens, no work done) —
+# per-turn growth outpaces the headroom the cap + threshold leave. Past the
+# limit the gate is disabled for the task (both levels, like the hard guard)
+# and the diagnostic event names the knob to fix.
+_THRESHOLD_COMPACTION_LIMIT = 3
+
 
 class _ChunkingImpossible(Exception):
     """The history cannot be chunked into map-reduce slices that fit the
@@ -129,6 +150,89 @@ class PipelineCompactionLayer(DrCodeState):
             )
             is not None
         )
+
+    def _livelock_stop(
+        self,
+        task: Task,
+        counter: dict[str, int],
+        exhausted: set[str],
+        gate_failed: set[str],
+        role: AgentRole,
+        pct: int,
+        what: str,
+        hard: bool = True,
+    ) -> bool:
+        """Livelock guard of the compaction gates — call at gate entry when
+        the fill is over the gate's level (`hard` selects the hard-limit or
+        the threshold level), right before compacting.
+
+        Counts the CONSECUTIVE compactions of the task at the gate's level
+        (the caller resets the counter whenever a gate observation lands
+        under that level — a previous compaction worked). Past the level's
+        limit every resumed turn re-crosses it again and the
+        pause→compact→resume cycle would repeat forever (each cycle a
+        successful compaction — the estimate-based no-op guards never fire,
+        the wire-level fill re-crosses the level): at the hard limit the
+        cap is below the transcript's irreducible floor; at the threshold
+        level one turn's growth outpaces the headroom the cap + threshold
+        leave. The gate is then disabled for the task (both the hard-level
+        bypass flag and the threshold-level failed set, so the mid-round
+        pauses stop too) and a diagnostic service event names the knob to
+        fix. Returns True when the caller must NOT compact: the round is
+        resumed as-is — at the hard limit the next model request dies with
+        the deterministic context overflow, whose ordinary error handling
+        (agent: `_agent_dead`; tester/resolver: backoff) takes over."""
+        count = counter.get(task.id, 0) + 1
+        counter[task.id] = count
+        if hard:
+            limit = _HARD_LIMIT_COMPACTION_LIMIT
+            level = "hard limit"
+        else:
+            limit = _THRESHOLD_COMPACTION_LIMIT
+            level = "threshold"
+        if count <= limit:
+            return False
+        if task.id in exhausted:
+            # Already stopped for this task: a later fire (e.g. a direct
+            # gate call in a test) must not repeat the diagnostic.
+            return True
+        exhausted.add(task.id)
+        gate_failed.add(task.id)
+        config = self.resolved_config(role)
+        cap = config.max_context_tokens
+        if hard:
+            detail = (
+                f"the {role.value} model's context cap ({cap} tokens) is at "
+                "or below its irreducible floor (system prompt, tool schemas "
+                "and the original prompt(s) kept verbatim)"
+            )
+            tail = (
+                "Compaction stopped; the next model request will fail with "
+                "a context overflow. Raise the model's max_context_tokens "
+                "in the provider catalog (drcode-models)."
+            )
+        else:
+            threshold = min(max(config.compaction_threshold, 1), 100)
+            detail = (
+                f"every turn's growth re-crosses it (the {role.value} "
+                f"model's context cap ({cap} tokens) at a {threshold}% "
+                "compaction threshold leaves less headroom than one turn's "
+                "growth)"
+            )
+            tail = (
+                "Compaction stopped for this task: it runs without "
+                "mid-round compaction and a request past the hard limit "
+                "will fail with a context overflow. Raise the model's "
+                "max_context_tokens or lower the compaction threshold in "
+                "the provider catalog (drcode-models)."
+            )
+        self._show_event(
+            task,
+            f"Context fill {pct}% is still over the {level} after "
+            f"{limit} consecutive compactions — compaction cannot bring "
+            f"the {what} below the {level}: {detail}. {tail}",
+        )
+        return True
 
     def _messages_estimate(self, messages: list[dict[str, Any]]) -> int:
         """≈ wire size of a serialized transcript in tokens (chars/4 on the
@@ -422,12 +526,28 @@ class PipelineCompactionLayer(DrCodeState):
         never fatal: it is logged into the service events and the run
         continues with the uncompressed history — except at the hard-limit
         level, where a failed summarizer escalates to the mechanical trim
-        (growth past the hard limit must never be allowed).
+        (growth past the hard limit must never be allowed). When even
+        successful compactions cannot bring the fill under the gate's level
+        (the cap below the transcript's irreducible floor, or every turn's
+        growth re-crossing the threshold), `_livelock_stop` bounds the
+        pause→compact→resume cycle: after the level's limit of consecutive
+        compactions with no turn landing under it, the gate disables itself
+        for the task with a diagnostic event and the run continues (at the
+        hard limit the next request dies with the deterministic context
+        overflow).
         """
         tokens = self._compaction_due(task)
-        if tokens is None:
-            return
         hard = self._hard_limit_due(task)
+        if tokens is None:
+            # An observation under the threshold: the previous compaction
+            # (if any) landed — the threshold-livelock counter starts over.
+            self._threshold_compactions.pop(task.id, None)
+            return
+        if not hard:
+            # A reading under the hard limit: the previous compaction (if
+            # any) landed — the consecutive hard-compaction counter of the
+            # livelock guard starts over.
+            self._hard_limit_compactions.pop(task.id, None)
         role_config = self.resolved_config(self._task_role(task))
         pct = round(tokens * 100 / role_config.max_context_tokens)
         _, rest = split_original_prompts(task.messages)
@@ -440,6 +560,17 @@ class PipelineCompactionLayer(DrCodeState):
                 # original prompts verbatim, so nothing can shrink this
                 # transcript and pause→resume would loop forever.
                 self._hard_limit_exhausted.add(task.id)
+            return
+        if self._livelock_stop(
+            task,
+            self._hard_limit_compactions if hard else self._threshold_compactions,
+            self._hard_limit_exhausted,
+            self._compaction_failed,
+            self._task_role(task),
+            pct,
+            "history",
+            hard=hard,
+        ):
             return
         self._show_event(
             task,
@@ -532,18 +663,32 @@ class PipelineCompactionLayer(DrCodeState):
         never allowed) — unless even the mechanical floor cannot shrink the
         round (nothing to summarize), in which case the task lands in
         `_hard_limit_exhausted` and the hard-level gate bypass stops
-        firing.
+        firing. The `_livelock_stop` guard bounds the cycle itself on both
+        levels: past the level's limit of consecutive compactions without a
+        gate observation under it (hard limit: the cap is below the round's
+        irreducible context floor; threshold: every turn's growth re-crosses
+        the threshold) the gate stops compacting, disables itself for the
+        task (both sets) and emits a diagnostic event instead of burning
+        the API budget forever.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
         tokens = self._fill_over_threshold(
             live_tokens, round_messages, AgentRole.TESTER
         )
         if tokens is None:
+            # An observation under the threshold: the previous compaction
+            # (if any) landed — the threshold-livelock counter starts over.
+            self._tester_threshold_compactions.pop(task.id, None)
             return False
         hard = (
             self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.TESTER)
             is not None
         )
+        if not hard:
+            # A reading under the hard limit: the previous compaction (if
+            # any) landed — the consecutive hard-compaction counter of the
+            # livelock guard starts over.
+            self._hard_limit_compactions.pop(task.id, None)
         pct = round(
             tokens * 100 / self.resolved_config(AgentRole.TESTER).max_context_tokens
         )
@@ -558,6 +703,19 @@ class PipelineCompactionLayer(DrCodeState):
                 # too: nothing can shrink this round — stop the hard-level
                 # gate bypass or pause→resume would loop forever.
                 self._hard_limit_exhausted.add(task.id)
+            return False
+        if self._livelock_stop(
+            task,
+            self._hard_limit_compactions
+            if hard
+            else self._tester_threshold_compactions,
+            self._hard_limit_exhausted,
+            self._compaction_failed,
+            AgentRole.TESTER,
+            pct,
+            "testing round",
+            hard=hard,
+        ):
             return False
         self._show_event(
             task,
@@ -602,6 +760,106 @@ class PipelineCompactionLayer(DrCodeState):
             # disable the hard-level gate bypass for this task.
             self._hard_limit_exhausted.add(task.id)
         task.tester_messages[-1] = new_messages
+        task.touch()
+        self.manager.storage.save(task)
+        self._show_event(task, event)
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        return True
+
+    async def _maybe_compact_resolver_round(
+        self, task: Task, live_tokens: int | None
+    ) -> bool:
+        """Compaction gate for the current conflict-resolver round, called
+        after run_resolver paused the round at a tool boundary.
+
+        Mirrors _maybe_compact_tester_round exactly, but rewrites
+        `task.resolver_messages[-1]` in place and measures the fill
+        against the RESOLVER role's resolved config. The round failure
+        bookkeeping uses the resolver's own sets
+        (`_resolver_compaction_failed` / `_resolver_hard_limit_exhausted`)
+        so a broken summarizer seen by the agent or the tester never
+        disables the resolver's gate (and vice versa).
+        """
+        round_messages = task.resolver_messages[-1] if task.resolver_messages else []
+        tokens = self._fill_over_threshold(
+            live_tokens, round_messages, AgentRole.RESOLVER
+        )
+        if tokens is None:
+            # An observation under the threshold: the previous compaction
+            # (if any) landed — the threshold-livelock counter starts over.
+            self._resolver_threshold_compactions.pop(task.id, None)
+            return False
+        hard = (
+            self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.RESOLVER)
+            is not None
+        )
+        if not hard:
+            # A reading under the hard limit: the previous compaction (if
+            # any) landed — the consecutive hard-compaction counter of the
+            # livelock guard starts over.
+            self._resolver_hard_limit_compactions.pop(task.id, None)
+        pct = round(
+            tokens * 100 / self.resolved_config(AgentRole.RESOLVER).max_context_tokens
+        )
+        _, rest = split_original_prompts(round_messages)
+        if not any(not is_summary_message(m) for m in rest):
+            self._resolver_compaction_failed.add(task.id)
+            if hard:
+                self._resolver_hard_limit_exhausted.add(task.id)
+            return False
+        if self._livelock_stop(
+            task,
+            self._resolver_hard_limit_compactions
+            if hard
+            else self._resolver_threshold_compactions,
+            self._resolver_hard_limit_exhausted,
+            self._resolver_compaction_failed,
+            AgentRole.RESOLVER,
+            pct,
+            "conflict-resolution round",
+            hard=hard,
+        ):
+            return False
+        self._show_event(
+            task,
+            f"Context fill {pct}% — compacting the conflict-resolution round…",
+        )
+        try:
+            new_messages, event, llm_failed = await self._compact_transcript(
+                round_messages,
+                summary_role=AgentRole.RESOLVER,
+                task=task,
+                what="conflict-resolution round",
+                hard=hard,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the round
+            self._resolver_compaction_failed.add(task.id)
+            if not hard:
+                self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+                return False
+            self._show_event(
+                task,
+                f"compaction failed ({type(e).__name__}: {e}) with the fill "
+                "at the hard limit — trimming mechanically instead.",
+            )
+            new_messages, event = self._mechanical_compact(
+                round_messages, AgentRole.RESOLVER, "conflict-resolution round"
+            )
+            llm_failed = True
+        if llm_failed:
+            self._resolver_compaction_failed.add(task.id)
+            self._resolver_hard_limit_exhausted.discard(task.id)
+        else:
+            self._resolver_compaction_failed.discard(task.id)
+            self._resolver_hard_limit_exhausted.discard(task.id)
+        if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
+            round_messages
+        ):
+            self._resolver_hard_limit_exhausted.add(task.id)
+        task.resolver_messages[-1] = new_messages
         task.touch()
         self.manager.storage.save(task)
         self._show_event(task, event)

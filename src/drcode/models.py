@@ -119,6 +119,18 @@ class Task(BaseModel):
     # tester-only tool calls (set_verification, create_bug_report) in its
     # model history.
     tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
+    # Serialized transcripts of the automatic merge-conflict resolver
+    # rounds (one entry per round), isolated from `messages` and
+    # `tester_messages` for the same reason: the resolver's tool calls
+    # (set_resolution, git plumbing) must never leak into the coding
+    # agent's or the tester's model history.
+    resolver_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
+    # True when an automatic conflict-resolution attempt FAILED its
+    # verification (mechanics/tests/intent review, or the resolver gave
+    # up): the conflicted merge is left untouched in the task's worktree
+    # and a human must take over (the visual screen of the follow-up
+    # task). Cleared when a later resolver round succeeds.
+    needs_human: bool = False
     # User messages typed while the task is queued/not yet processed,
     # stamped with the moment they were typed (see PendingInput).
     pending_input: list[PendingInput] = Field(default_factory=list)
@@ -203,6 +215,16 @@ class Task(BaseModel):
     # successful hook re-run) clears the signal again. Persisted like every
     # other Task field; False for old task files (plain default).
     hook_merge_failed: bool = False
+    # True when the on_tester_passed hook (install/deploy) was SKIPPED by
+    # the pipeline because the main checkout sat in a half-done merge
+    # (MERGE_HEAD set — installing would ship conflict markers). The
+    # pipeline re-runs the deferred hook once the blocker is gone (the
+    # task's branch merged / the checkout clean again) and clears the flag
+    # after the hook actually executed — it never runs while MERGE_HEAD
+    # lives in the main checkout, that invariant is the pipeline's, not
+    # the script's. Persisted like every other Task field; False for old
+    # task files (plain default).
+    install_pending: bool = False
     # Ids of tasks that must be COMPLETED *and* merged into the base branch
     # before this task may be taken into development (the promotion gate is
     # dynamic: git state is re-evaluated at every promotion attempt, so a

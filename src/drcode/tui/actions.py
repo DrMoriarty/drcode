@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from .actions_forms import TaskFormLayer
 from .actions_lifecycle import TaskLifecycleLayer
+from .actions_merge import MergeActionsLayer
 from .actions_models import ModelSelectionLayer
 from .actions_settings import SettingsLayer
 from .state import DrCodeState
@@ -34,6 +35,7 @@ from .state import DrCodeState
 class ActionsLayer(
     TaskFormLayer,
     TaskLifecycleLayer,
+    MergeActionsLayer,
     ModelSelectionLayer,
     SettingsLayer,
     DrCodeState,

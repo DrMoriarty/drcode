@@ -60,6 +60,81 @@ DEFAULT_VOICE_API_URL = "https://provider.ru/v1"
 # Default speaker voice when voice_tts_voice is empty (OpenAI TTS names).
 DEFAULT_TTS_VOICE = "alloy"
 
+# Spoken-announcement languages (voice_language setting): "ru" or "en".
+# Empty setting = auto-derive from the terminal locale.
+VOICE_LANGUAGE_RU = "ru"
+VOICE_LANGUAGE_EN = "en"
+
+
+def terminal_voice_language() -> str:
+    """The announcement language derived from the terminal environment:
+    the language subtag of ``LC_ALL``/``LC_MESSAGES``/``LANG`` (in that
+    precedence, POSIX form like ``ru_RU.UTF-8``), falling back to Python's
+    ``locale`` when none is set. Russian reads as "ru", everything else
+    (including no locale at all) as "en"."""
+    import os
+
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(var, "").strip()
+        if not value:
+            continue
+        # Strip the encoding and modifier parts: "ru_RU.UTF-8" → "ru".
+        lang = value.split(".", 1)[0].split("@", 1)[0].split("_", 1)[0].lower()
+        if lang:
+            return VOICE_LANGUAGE_RU if lang == "ru" else VOICE_LANGUAGE_EN
+    try:
+        import locale
+
+        lang = (locale.getlocale()[0] or "").split("_", 1)[0].lower()
+    except Exception:  # noqa: BLE001 - a broken locale must never crash
+        lang = ""
+    return VOICE_LANGUAGE_RU if lang == "ru" else VOICE_LANGUAGE_EN
+
+
+def effective_voice_language(settings: ProjectSettings) -> str:
+    """The language the announcements are phrased in: the explicit
+    ``voice_language`` setting ("ru"/"en") or, when it is empty, the
+    terminal-derived default."""
+    stored = settings.voice_language.strip().lower()
+    if stored in (VOICE_LANGUAGE_RU, VOICE_LANGUAGE_EN):
+        return stored
+    return terminal_voice_language()
+
+
+# The spoken announcement phrases, keyed by language (a format template
+# per event kind; ``{title}`` is the task title). The TTS speaks whatever
+# text it is given — choosing the language is choosing the phrase table.
+VOICE_PHRASES: dict[str, dict[str, str]] = {
+    VOICE_LANGUAGE_RU: {
+        "bug_report": "Заведён баг-репорт: {title}",
+        "completed": "Задача «{title}» завершена",
+        "completed_failed": "Задача «{title}» завершена с ошибкой",
+        "requeued": (
+            "Тестирование провалено — задача «{title}» возвращена в разработку"
+        ),
+        "queue_empty": "Очередь пуста — все задачи обработаны",
+    },
+    VOICE_LANGUAGE_EN: {
+        "bug_report": "Bug report created: {title}",
+        "completed": 'Task "{title}" completed',
+        "completed_failed": 'Task "{title}" completed with an error',
+        "requeued": 'Testing failed — task "{title}" returned to development',
+        "queue_empty": "Queue is empty — all tasks processed",
+    },
+}
+
+
+def announcement_phrase(language: str, key: str, **kwargs: object) -> str:
+    """A spoken phrase from :data:`VOICE_PHRASES`, formatted; an unknown
+    language falls back to English (the table is always complete for both,
+    but a hand-edited settings.json may carry anything)."""
+    table = VOICE_PHRASES.get(
+        language if language in VOICE_PHRASES else VOICE_LANGUAGE_EN,
+        VOICE_PHRASES[VOICE_LANGUAGE_EN],
+    )
+    return str(table.get(key, table.get("completed", ""))).format(**kwargs)
+
+
 # Network timeouts: transcription of a long utterance can take a while;
 # the calls run in worker threads, so a generous ceiling costs nothing.
 ASR_TIMEOUT = 60.0
@@ -561,7 +636,7 @@ def play_wav(data: bytes) -> None:
 
     raw = pcm.tobytes()
     total = len(raw)
-    state = {"pos": 0, "underflowed": False, "filled": False}
+    state = {"pos": 0, "underflows": 0, "filled": False}
     done = threading.Event()
 
     # Callback mode, not the blocking RawOutputStream.write() pair: with
@@ -576,7 +651,10 @@ def play_wav(data: bytes) -> None:
     def _callback(outdata: object, frames: int, time: object, status: object) -> None:
         try:
             if status:
-                state["underflowed"] = True
+                # Count every callback that reports a flag (for an
+                # output-only stream that is paOutputUnderflow) — a counter
+                # shows how often the device ran dry, a boolean hides it.
+                state["underflows"] += 1
             view = memoryview(outdata).cast("B")  # type: ignore[arg-type]
             end = min(state["pos"] + len(view), total)
             block = end - state["pos"]
@@ -601,14 +679,40 @@ def play_wav(data: bytes) -> None:
             print(f"drcode voice: playback callback failed: {e}", file=sys.stderr)
             done.set()
 
+    def _output_latency() -> float:
+        """Numeric output latency with generous slack against callback
+        delays. A Python callback runs on the PortAudio audio thread and
+        must grab the GIL on every invocation; under CPU load those grabs
+        stall, so the real protection is a deep device ring buffer —
+        "high" (~40–100 ms on most backends) is not enough. Ask the device
+        for its reported high-output latency, but never below 0.3 s; any
+        query failure or nonsensical value degrades to the same 0.3 s.
+        The price — up to 300 ms before the phrase starts — is irrelevant
+        for notifications, and the stop()-drain plus the appended tail
+        silence keep the ending click-free."""
+        fallback = 0.3
+        try:
+            device = sd.default.device[1]
+            high = float(sd.query_devices(device)["default_high_output_latency"])
+        except Exception:  # noqa: BLE001 - a broken query must not kill playback
+            return fallback
+        if high <= 0:
+            return fallback
+        return max(high, fallback)
+
     # The whole playback (including the drain in stop()) stays under the
     # lock so a concurrent recording open/close can never interleave with it.
     with _PORTAUDIO_LOCK:
+        latency = _output_latency()
         stream = sd.RawOutputStream(
             samplerate=rate,
             channels=channels,
             dtype="int16",
-            latency="high",  # extra headroom against mid-phrase dropouts
+            latency=latency,
+            # Explicit block size instead of the variable default (0): fewer
+            # callback invocations per second means fewer GIL acquisitions
+            # on the audio thread, and each call copies a larger chunk.
+            blocksize=2048,
             callback=_callback,
         )
         try:
@@ -623,8 +727,12 @@ def play_wav(data: bytes) -> None:
         finally:
             stream.stop()  # drains the pending audio, like sd.wait()
             stream.close()
-    if state["underflowed"]:
-        print("drcode voice: playback buffer underflowed", file=sys.stderr)
+    if state["underflows"]:
+        print(
+            f"drcode voice: playback buffer underflowed "
+            f"{state['underflows']} times (latency={latency}s)",
+            file=sys.stderr,
+        )
 
 
 class _VoiceSynth(Protocol):

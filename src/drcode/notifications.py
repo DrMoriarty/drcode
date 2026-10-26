@@ -444,6 +444,16 @@ class Notifier:
         except Exception as e:  # noqa: BLE001 - announcements never break anything
             self._report_error(f"voice announcement failed: {e}")
 
+    def _phrase(self, key: str, **kwargs: object) -> str:
+        """A spoken phrase in the language configured for this project
+        (``voice_language``, auto-derived from the terminal locale when
+        empty) — see :func:`drcode.voice.effective_voice_language`."""
+        from .voice import announcement_phrase, effective_voice_language
+
+        return announcement_phrase(
+            effective_voice_language(self._settings_getter()), key, **kwargs
+        )
+
     def bug_report_created(self, task: Task, origin: str) -> None:
         """A bug report task was created (TaskManager creation listener).
         Voiced under the "tester failure" checkbox — together with the
@@ -453,7 +463,7 @@ class Notifier:
         if origin != "user" and task.kind.value == "bug":
             self._speak(
                 self._settings_getter().voice_tts_tester_failed,
-                f"Заведён баг-репорт: {task.title}",
+                self._phrase("bug_report", title=task.title),
             )
 
     # -- pipeline events --------------------------------------------------------
@@ -488,17 +498,14 @@ class Notifier:
                     if failed
                     else self._settings_getter().voice_tts_completed
                 ),
-                (
-                    f"Задача «{task.title}» завершена с ошибкой"
-                    if failed
-                    else f"Задача «{task.title}» завершена"
+                self._phrase(
+                    "completed_failed" if failed else "completed", title=task.title
                 ),
             )
         elif new.value == "queued" and old.value == "testing":
             self._speak(
                 self._settings_getter().voice_tts_tester_failed,
-                f"Тестирование провалено — задача «{task.title}» "
-                "возвращена в разработку",
+                self._phrase("requeued", title=task.title),
             )
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
@@ -556,7 +563,7 @@ class Notifier:
         else:
             self._speak(
                 self._settings_getter().voice_tts_queue_empty,
-                "Очередь пуста — все задачи обработаны",
+                self._phrase("queue_empty"),
             )
             self.notify(
                 self._title("queue empty"),

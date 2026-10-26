@@ -69,6 +69,17 @@ class RoleModelsCommandsProvider(Provider):
                 ),
                 app.action_change_compaction_model,
             ),
+            (
+                f"Resolver model: {app.role_model_label(AgentRole.RESOLVER)}",
+                (
+                    "Model the automatic merge-conflict resolver runs on "
+                    "(resolves conflicts parked in a task's worktree by "
+                    "the merge engine); falls back to the coding model "
+                    "when not set; pick from the user-level provider "
+                    "catalog (saved to the project's drcode.json)"
+                ),
+                app.action_change_resolver_model,
+            ),
         ]
 
     async def discover(self) -> Hits:

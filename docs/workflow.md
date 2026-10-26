@@ -63,9 +63,27 @@ def on_tester_passed(task):
     """Right after the tester stamped the task PASSED and the task is
     finalized (install, deploy, ...). The unconditional post-verification
     hook: no on_review gate needed, research tasks never trigger it. The
-    returned text goes to the task's service-event log."""
-    r = subprocess.run(["uv", "tool", "install", ".", "--force"],
-                       capture_output=True, text=True)
+    returned text goes to the task's service-event log.
+
+    Install the VERIFIED commit — `git.commit` in the payload — never
+    "whatever lies in the checkout right now"."""
+    import shutil, tempfile
+    branch = (task.get("worktree") or {}).get("branch")
+    if not branch:
+        # No isolation: the shared checkout IS the verified tree.
+        r = subprocess.run(["uv", "tool", "install", ".", "--force"],
+                           capture_output=True, text=True)
+        return {"text": r.stdout or r.stderr}
+    # Isolation: export the verified task branch into a temporary
+    # directory (no worktree registration, no race with its removal)
+    # and install from there.
+    src = tempfile.mkdtemp(prefix="drcode-install-")
+    subprocess.run(f"git archive {branch} | tar -x -C {src}", shell=True, check=True)
+    try:
+        r = subprocess.run(["uv", "tool", "install", src, "--force"],
+                           capture_output=True, text=True)
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
     return {"text": r.stdout or r.stderr}
 
 def on_review(task):
@@ -90,7 +108,8 @@ The payload passed to every hook:
   "hook": "<name>",
   "task": {"id": "...", "title": "...", "kind": "feature|bug|research",
            "github_issue": 42},
-  "git":  {"branch": "main", "dirty": false}
+  "git":  {"branch": "main", "dirty": false,
+           "commit": "<full sha — pinned only for on_tester_passed>"}
 }
 ```
 
@@ -108,10 +127,34 @@ Behaviour per hook:
   right AFTER `on_accepted` — the merge lands first, so an install step
   builds the merged checkout, not the pre-merge state). This is the place
   for a deterministic post-verification step like `(re)installing the app`
-  (`uv tool install . --force`). A hook failure is **fail-open** (logged,
+  (`uv tool install … --force`). A hook failure is **fail-open** (logged,
   the pipeline moves on — an install step must not park tasks). Research
   tasks never trigger it; neither do the cancellation paths or the
   "Verification: none" setting (no PASSED label is stamped there).
+
+  Build/install the **verified commit**, not "whatever lies in the
+  checkout right now" — the checkout is a mutating shared resource whose
+  state after `on_accepted` is not guaranteed. The payload pins
+  `git.commit` (the verified commit: the task branch's tip with worktree
+  isolation, the shared checkout's HEAD without it). With isolation,
+  export the task branch into a temporary directory and install from
+  there — `git archive <worktree.branch> | tar -x -C <tmp>` (no worktree
+  registration, no race with its removal); without isolation the cwd is
+  the verified tree and a plain `uv tool install . --force` is correct.
+  See the example hook above.
+
+  **MERGE_HEAD guard** (the pipeline's invariant, not the script's): the
+  hook never runs while the main checkout sits in a half-done merge —
+  installing then would ship conflict markers. Instead the pipeline
+  SKIPS the hook, writes a loud service event
+  (`on_tester_passed SKIPPED: merge of drcode/<id> not resolved …`),
+  stamps the task as `install_pending` (persisted) and **re-runs the
+  deferred hook exactly once** after the conflict is resolved — the task
+  branch merged into the base (by hand or via the resolver + `git merge
+  --ff-only`) and the checkout clean again (no MERGE_HEAD, no uncommitted
+  tracked changes). The re-run is caught by the same 10 s unmerged-work
+  poll that notices manual merges and by the startup scan, so a merge
+  finished while the app was down is picked up on the next start.
 - **`on_review`** — the external review gate. After the tester stamps the
   task PASSED, the pipeline calls `on_review` (the task stays in TESTING —
   no new development starts while a verdict is outstanding, exactly like an

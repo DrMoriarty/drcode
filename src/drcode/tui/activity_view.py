@@ -191,6 +191,10 @@ class ActivityLayer(DrCodeState):
         next tick, no restart needed. The git calls are blocking — run
         them in a worker thread so a slow repo never stalls the UI."""
         ids = await asyncio.to_thread(self._unmerged_completed_ids)
+        # The same pass collects deferred installs whose blocker is gone
+        # (task.install_pending) — fire the re-run worker (a no-op when
+        # the list is empty; see _maybe_rerun_pending_installs).
+        self._maybe_rerun_pending_installs()
         count = len(ids)
         try:
             widget = self.query_one("#header-git", HeaderGitIndicator)
@@ -266,6 +270,8 @@ class ActivityLayer(DrCodeState):
         ]
         if self.tester_running and self._tester_task_id:
             running.append((self._tester_task_id, "tester"))
+        if self._resolver_running and self._resolver_task_id:
+            running.append((self._resolver_task_id, "resolver"))
         for task_id, who in running:
             stamped = self._last_activity.get(task_id)
             if stamped is None:
@@ -319,3 +325,15 @@ class ActivityLayer(DrCodeState):
             self._current_tool[task.id] = None
             self.refresh_status()
             self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+        elif self._resolver_running and self._resolver_task_id == task.id:
+            # A hung conflict-resolver round: abort it and restart the
+            # round (the transcript is kept; the round resumes as a
+            # continuation turn).
+            self.workers.cancel_group(self, "resolver")
+            self._resolver_running = False
+            self._resolver_task_id = None
+            self._current_tool[task.id] = None
+            self.refresh_status()
+            self._schedule_pipeline_timer(
+                self._NUDGE_RESTART_DELAY, partial(self.run_resolver, task.id)
+            )

@@ -312,6 +312,33 @@ class TaskEnvironment:
         code, _ = self._git("rev-parse", "--verify", "--quiet", branch)
         return code == 0
 
+    # -- verified state of the shared checkout ---------------------------------
+
+    def branch_tip(self, task_id: str) -> str | None:
+        """Full SHA of the task's `drcode/<id>` branch tip (the commit the
+        PASSED verdict is stamped on — the only task state that survives
+        the worktree removal), or None when isolation is off or the branch
+        is gone. Blocking git — callers wrap in to_thread."""
+        if not self.active:
+            return None
+        code, out = self._git("rev-parse", "--verify", "--quiet", self.branch(task_id))
+        return out if code == 0 and out else None
+
+    def head_commit(self) -> str | None:
+        """Full SHA of the MAIN checkout's HEAD, or None outside a
+        repository (without isolation the shared checkout IS the verified
+        tree, so HEAD is what a hook should pin). Blocking git — callers
+        wrap in to_thread."""
+        code, out = self._git("rev-parse", "HEAD")
+        return out if code == 0 and out else None
+
+    def main_checkout_dirty(self) -> bool:
+        """Uncommitted TRACKED changes in the main checkout
+        (`git status --porcelain -uno`) — False outside a repository.
+        Blocking git — callers wrap in to_thread."""
+        code, out = self._git("status", "--porcelain", "-uno")
+        return code == 0 and bool(out)
+
     # -- lifecycle -------------------------------------------------------------
 
     def root_now(self, task_id: str) -> Path:

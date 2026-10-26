@@ -12,7 +12,7 @@ receive live here too.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
@@ -33,7 +33,12 @@ from .agent_tools import (
 )
 from .config import Config
 from .models import Clarification, TaskKind, TaskStatus
-from .prompts import load_system_prompt, load_tester_prompt
+from .prompts import (
+    load_resolver_prompt,
+    load_resolver_reviewer_prompt,
+    load_system_prompt,
+    load_tester_prompt,
+)
 from .settings import GitPolicy
 from .task_manager import TaskManager
 from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
@@ -41,8 +46,12 @@ from .transcript import _context_status, ctx_context_tokens
 
 __all__ = [
     "AgentDeps",
+    "ResolutionVerdict",
+    "ResolverDeps",
     "TesterDeps",
     "build_agent",
+    "build_resolver_agent",
+    "build_resolver_reviewer_agent",
     "build_tester_agent",
 ]
 
@@ -59,6 +68,20 @@ class AgentDeps:
     manager: TaskManager
     task_id: str
     scratch: Path
+
+
+@dataclass
+class ResolutionVerdict:
+    """The outcome the resolver (or the reviewer) reported through its
+    verdict tool. Stored on ResolverDeps so the pipeline — not the agent —
+    owns the follow-up: the agent's `resolved=True` never commits by
+    itself, the mandatory verification funnel decides. `label` keeps the
+    exact verdict word ("resolved"/"refused" for the resolver,
+    "intact"/"lost"/"unsure" for the reviewer)."""
+
+    resolved: bool
+    report: str = ""
+    label: str = ""
 
 
 @dataclass
@@ -85,6 +108,24 @@ class TesterDeps:
     scratch: Path
     review_gate: bool = False
     max_dev_rounds: int = 3
+
+
+@dataclass
+class ResolverDeps:
+    """Dependencies for the merge-conflict resolver agent (and its
+    reviewer pass): the RESOLVED worktree the conflicted merge is parked
+    in (`root` — writes are jailed to it like to any other project root),
+    plus the task bookkeeping the service-event logger needs.
+
+    `verdicts` accumulates the agent's set_resolution / set_review
+    outcomes; the pipeline reads the LAST one after the run ends.
+    """
+
+    root: Path
+    manager: TaskManager
+    task_id: str
+    scratch: Path
+    verdicts: list[ResolutionVerdict] = field(default_factory=list)
 
 
 def build_agent(
@@ -710,5 +751,234 @@ def build_tester_agent(
                 "the external review, which decides the final completion."
             )
         return f"Verification label set: {verdict}; task completed."
+
+    return agent
+
+
+def _resolver_shared_tools(agent: Agent[ResolverDeps, str], config: Config) -> None:
+    """The read/inspect toolset shared by the resolver and its reviewer:
+    reading works anywhere, everything else resolves against the RESOLVED
+    worktree (`deps.root`). No write tools here — the reviewer is
+    read-only by design, and the resolver gets its edit tools registered
+    separately (see build_resolver_agent)."""
+
+    @agent.tool
+    async def read_file(
+        ctx: RunContext[ResolverDeps], path: str, offset: int = 1, limit: int = 2000
+    ) -> str:
+        """Read a text file from anywhere on the filesystem (relative paths resolve
+        against the project root). Lines are numbered, starting from `offset`
+        (1-based), up to `limit` lines."""
+        current_usage = ctx_context_tokens(ctx) or 0
+        return await _run_tool_logged(
+            ctx.deps,
+            "read_file",
+            tools.read_file,
+            ctx.deps.root,
+            path,
+            offset,
+            limit,
+            current_usage=current_usage,
+            max_context_tokens=config.max_context_tokens,
+            compaction_threshold=config.compaction_threshold,
+        )
+
+    @agent.tool
+    async def context_status(ctx: RunContext[ResolverDeps]) -> str:
+        """Report the current context fill: how many tokens the model's context
+        slot holds at the latest request (prompt history + generated output) out
+        of the configured maximum, the percent used and how many tokens remain
+        before the compaction threshold. Use it when you are unsure how much
+        room you have — it gives the exact current numbers so you can decide
+        when to stop reading, without having to guess or fret over a vague
+        "nearly full" signal."""
+        return _context_status(
+            ctx_context_tokens(ctx),
+            config.max_context_tokens,
+            config.compaction_threshold,
+        )
+
+    @agent.tool
+    async def glob_files(ctx: RunContext[ResolverDeps], pattern: str) -> list[str]:
+        """Find files by glob pattern relative to project root, e.g. 'src/**/*.py'."""
+        return await _run_tool(tools.glob_files, ctx.deps.root, pattern)
+
+    @agent.tool
+    async def grep_search(
+        ctx: RunContext[ResolverDeps], pattern: str, include: str = ""
+    ) -> list[str]:
+        """Regex search in file contents. `include` is an optional glob mask
+        filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
+        return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
+
+
+def build_resolver_agent(
+    config: Config,
+    *,
+    root: Path | None = None,
+) -> Agent[ResolverDeps, str]:
+    """Build the merge-conflict resolver agent.
+
+    Runs a conflicted merge that the algorithmic triage could not clear:
+    the worktree (passed as `root` — its actual path is substituted into
+    the system prompt's ``{project_path}`` placeholder) already carries
+    the zdiff3 markers, the agent edits the conflicted files and reports
+    through set_resolution. NO commit tool: the pipeline commits only
+    after the mandatory verification funnel (mechanics + tests +
+    intent-preservation review) passes — the resolver's verdict alone can
+    never finalize anything.
+    """
+    model = agent_model.build_model(config)
+    instructions = load_resolver_prompt(root)
+    if root is not None:
+        agents_md = load_agents_md(root)
+        if agents_md.strip():
+            instructions = (
+                f"{instructions}\n\n# Project instructions (AGENTS.md)\n\n{agents_md}"
+            )
+    agent = Agent(
+        model,
+        instructions=instructions,
+        deps_type=ResolverDeps,
+        model_settings={
+            "extra_headers": EXTRA_HEADERS,
+            "max_tokens": config.max_tokens,
+        },
+        retries=10,
+    )
+    _resolver_shared_tools(agent, config)
+
+    @agent.tool(sequential=True)
+    async def write_file(ctx: RunContext[ResolverDeps], path: str, content: str) -> str:
+        """Create or overwrite a file. Only the resolved worktree (with all
+        subdirectories) and your scratch directory /tmp/drcode/<task-id> are
+        writable; use the scratch directory to test hypotheses."""
+        return await _run_tool_logged(
+            ctx.deps,
+            "write_file",
+            tools.write_file,
+            ctx.deps.root,
+            path,
+            content,
+            extra_writable=ctx.deps.scratch,
+        )
+
+    @agent.tool(sequential=True)
+    async def edit_file(
+        ctx: RunContext[ResolverDeps], path: str, old_string: str, new_string: str
+    ) -> str:
+        """Replace an exact unique substring in a file. old_string must match exactly once.
+        Only the resolved worktree (with all subdirectories) and your scratch
+        directory /tmp/drcode/<task-id> are writable; use the scratch directory
+        to test hypotheses."""
+        return await _run_tool_logged(
+            ctx.deps,
+            "edit_file",
+            tools.edit_file,
+            ctx.deps.root,
+            path,
+            old_string,
+            new_string,
+            extra_writable=ctx.deps.scratch,
+        )
+
+    @agent.tool
+    async def run_bash(
+        ctx: RunContext[ResolverDeps], command: str, timeout: int | None = None
+    ) -> str:
+        """Run a shell command in the resolved worktree and return its output.
+        The command is killed after `timeout` seconds (default 120); pass a
+        larger timeout for long-running commands — values above 3600 (60
+        minutes) are clamped to 3600. Use it for quick read-only inspection
+        (git log/diff, compiling a module) — NOT for committing, merging or
+        the full verification suite (the pipeline runs those checks itself
+        and its verdict decides).
+        rm/mv/cp are only allowed with paths inside the worktree or your
+        scratch directory /tmp/drcode/<task-id>."""
+        return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
+
+    @agent.tool
+    def set_resolution(
+        ctx: RunContext[ResolverDeps], resolved: bool, report: str
+    ) -> str:
+        """Report the conflict-resolution outcome. resolved=True when every
+        conflicted file from the assignment is resolved (no conflict markers
+        remain) and `report` explains per file what was done and why each
+        side's intent survives; resolved=False when you cannot resolve with
+        confidence — `report` says what blocks you and what a human should
+        decide. This call does NOT commit anything: the pipeline runs the
+        mandatory verification (mechanics, tests, intent review) and only a
+        full pass commits the resolution."""
+        ctx.deps.verdicts.append(
+            ResolutionVerdict(
+                resolved=bool(resolved),
+                report=report.strip(),
+                label="resolved" if resolved else "refused",
+            )
+        )
+        if resolved:
+            return (
+                "Resolution recorded. The pipeline will now run the "
+                "verification funnel (mechanics, tests, intent-preservation "
+                "review); only a full pass commits it. End your turn."
+            )
+        return (
+            "Refusal recorded: the conflict stays untouched and a human "
+            "takes over. End your turn."
+        )
+
+    return agent
+
+
+def build_resolver_reviewer_agent(
+    config: Config,
+    *,
+    root: Path | None = None,
+) -> Agent[ResolverDeps, str]:
+    """Build the intent-preservation reviewer of a resolved merge.
+
+    A single-purpose read-only pass: it receives diff(resolved, ours) and
+    diff(resolved, theirs) in its prompt and answers via set_review
+    whether a piece of either side was lost (the #6c065401 incident
+    class). Reuses ResolverDeps (`root` = the resolved worktree); its
+    verdict lands in the same `verdicts` list.
+    """
+    model = agent_model.build_model(config)
+    agent = Agent(
+        model,
+        instructions=load_resolver_reviewer_prompt(root),
+        deps_type=ResolverDeps,
+        model_settings={
+            "extra_headers": EXTRA_HEADERS,
+            "max_tokens": config.max_tokens,
+        },
+        retries=10,
+    )
+    _resolver_shared_tools(agent, config)
+
+    @agent.tool
+    def set_review(ctx: RunContext[ResolverDeps], verdict: str, report: str) -> str:
+        """Deliver the review verdict: "intact" (every change in both diffs
+        is justified, each side's intent survives), "lost" (a piece of one
+        side was dropped without a semantic reason — name the file and the
+        lost piece in `report`) or "unsure" (cannot tell — blocks the
+        auto-commit, a human reviews instead)."""
+        normalized = verdict.strip().lower()
+        if normalized not in ("intact", "lost", "unsure"):
+            return (
+                "Invalid verdict — call set_review again with exactly "
+                '"intact", "lost" or "unsure".'
+            )
+        ctx.deps.verdicts.append(
+            ResolutionVerdict(
+                resolved=normalized == "intact",
+                report=report.strip(),
+                label=normalized,
+            )
+        )
+        return (
+            f"Review verdict '{normalized}' recorded. End your turn — the "
+            "pipeline owns the follow-up."
+        )
 
     return agent

@@ -22,7 +22,7 @@ from .service_events import log_violation
 from .tools import PathViolation
 
 if TYPE_CHECKING:
-    from .agent import AgentDeps, TesterDeps
+    from .agent import AgentDeps, ResolverDeps, TesterDeps
 
 # Errors tools raise for situations the model can fix (bad path, missing
 # old_string, broken regex). pydantic-ai 2.x converts only ModelRetry and
@@ -39,7 +39,7 @@ async def _run_tool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 async def _run_tool_logged(
-    deps: AgentDeps | TesterDeps,
+    deps: AgentDeps | TesterDeps | ResolverDeps,
     tool: str,
     fn: Callable[..., Any],
     *args: Any,
@@ -55,7 +55,10 @@ async def _run_tool_logged(
 
 
 async def _run_bash_logged(
-    deps: AgentDeps | TesterDeps, root: Path, command: str, timeout: float | None = None
+    deps: AgentDeps | TesterDeps | ResolverDeps,
+    root: Path,
+    command: str,
+    timeout: float | None = None,
 ) -> str:
     try:
         return await tools.run_bash(

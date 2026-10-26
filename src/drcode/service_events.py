@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING
 from .models import TaskEvent
 
 if TYPE_CHECKING:
-    from .agent import AgentDeps, TesterDeps
+    from .agent import AgentDeps, ResolverDeps, TesterDeps
 
 
-def log_service_event(deps: AgentDeps | TesterDeps, kind: str, text: str) -> None:
+def log_service_event(
+    deps: AgentDeps | TesterDeps | ResolverDeps, kind: str, text: str
+) -> None:
     """Persist a service event into the task's event log.
 
     Like all TaskEvents, it is shown in the chat under the "service events"
@@ -29,6 +31,8 @@ def log_service_event(deps: AgentDeps | TesterDeps, kind: str, text: str) -> Non
     deps.manager.storage.save(task)
 
 
-def log_violation(deps: AgentDeps | TesterDeps, tool: str, error: str) -> None:
+def log_violation(
+    deps: AgentDeps | TesterDeps | ResolverDeps, tool: str, error: str
+) -> None:
     """Persist a permission violation into the task's service-event log."""
     log_service_event(deps, "permission", f"{tool}: {error}")

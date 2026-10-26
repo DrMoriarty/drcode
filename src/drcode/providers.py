@@ -161,12 +161,17 @@ class AgentRole(str, enum.Enum):
     codegen model there). When nothing is selected for it anywhere, research
     tasks fall back to the coding model (`resolve_effective`), so existing
     configs keep working unchanged.
+
+    RESOLVER serves the automatic merge-conflict resolver rounds (a
+    conflicted merge parked in the task's worktree by the merge engine):
+    same fallback to the coding model when nothing is selected for it.
     """
 
     CODING = "coding"
     RESEARCH = "research"
     TESTER = "tester"
     COMPACTION = "compaction"
+    RESOLVER = "resolver"
 
 
 class ModelRef(BaseModel):
@@ -712,19 +717,20 @@ def resolve(config: Config, role: AgentRole) -> Config:
 
 
 def resolve_effective(config: Config, role: AgentRole) -> Config:
-    """Resolve the effective model for a role, with the research fallback.
+    """Resolve the effective model for a role, with the fallback roles.
 
-    The RESEARCH role has no default of its own: when nothing is selected
-    for it (project slot, custom model, catalog default — all unset), it
-    falls back to the resolved CODING model, so research tasks transparently
-    run on whatever the coding role uses and existing configs keep working.
-    The env override (`DRCODE_MODEL` / `DRCODE_BASE_URL`) applies to research
-    exactly as to every other role — and makes the fallback unreachable,
-    since the env layer leaves every role ready. Every other role resolves
-    as usual (`resolve`).
+    The RESEARCH and RESOLVER roles have no default of their own: when
+    nothing is selected for them (project slot, custom model, catalog
+    default — all unset), they fall back to the resolved CODING model, so
+    research tasks and conflict-resolver rounds transparently run on
+    whatever the coding role uses and existing configs keep working.
+    The env override (`DRCODE_MODEL` / `DRCODE_BASE_URL`) applies to every
+    role exactly the same — and makes the fallbacks unreachable, since the
+    env layer leaves every role ready. Every other role resolves as usual
+    (`resolve`).
     """
     resolved = resolve(config, role)
-    if role is AgentRole.RESEARCH and not resolved.is_ready:
+    if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
         return resolve(config, AgentRole.CODING)
     return resolved
 

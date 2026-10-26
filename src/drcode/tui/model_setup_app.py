@@ -58,6 +58,7 @@ _ROLES: tuple[AgentRole, ...] = (
     AgentRole.RESEARCH,
     AgentRole.TESTER,
     AgentRole.COMPACTION,
+    AgentRole.RESOLVER,
 )
 
 

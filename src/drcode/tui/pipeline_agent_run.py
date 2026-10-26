@@ -507,6 +507,11 @@ class PipelineAgentRunLayer(DrCodeState):
                     block.start_spinner()
                     self._write_chat(block, note=("tool-call", call_text, None))
         tokens = self._compaction_due(task)
+        if tokens is None:
+            # An observation under the threshold: the previous compaction
+            # (if any) landed — the threshold-livelock counter starts over
+            # (see _livelock_stop).
+            self._threshold_compactions.pop(task.id, None)
         hard_due = tokens is not None and self._hard_limit_due(task)
         if tokens is not None and (
             task.id not in self._compaction_failed

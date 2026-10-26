@@ -47,6 +47,12 @@ RESEARCH_GIT_PROMPT_PUSH = (SYSTEM_PROMPTS_DIR / "research_git_push.md").read_te
 RESEARCH_GIT_PROMPT_LOCAL = (SYSTEM_PROMPTS_DIR / "research_git_local.md").read_text(
     encoding="utf-8"
 )
+RESOLVER_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "resolver.md").read_text(
+    encoding="utf-8"
+)
+RESOLVER_REVIEWER_PROMPT = (SYSTEM_PROMPTS_DIR / "resolver_reviewer.md").read_text(
+    encoding="utf-8"
+)
 
 # Placeholder in the templates, replaced with the actual project directory.
 PROJECT_PATH_PLACEHOLDER = "{project_path}"
@@ -216,6 +222,31 @@ def load_tester_prompt(
         allow_commit, project_root, allow_push
     )
     return _join_components(base, git_workflow)
+
+
+def load_resolver_prompt(project_root: Path | None = None) -> str:
+    """Bundled merge-conflict resolver system prompt.
+
+    The ``{project_path}`` placeholder in the template header is replaced
+    with the RESOLVED worktree's path (the isolated tree the conflicted
+    merge is parked in), not the project root. A project may override the
+    template with ``<root>/.drcode/prompts/resolver.md``.
+    """
+    template = _project_prompt_override(project_root, "resolver.md") or (
+        SYSTEM_PROMPTS_DIR / "resolver.md"
+    ).read_text(encoding="utf-8")
+    return _substitute_project_path(template, project_root)
+
+
+def load_resolver_reviewer_prompt(project_root: Path | None = None) -> str:
+    """Bundled prompt of the intent-preservation reviewer: the pass that
+    receives diff(resolved, ours) and diff(resolved, theirs) and answers
+    whether a piece of either side was lost (the #6c065401 incident
+    class). A project may override it with
+    ``<root>/.drcode/prompts/resolver_reviewer.md``."""
+    return _project_prompt_override(project_root, "resolver_reviewer.md") or (
+        SYSTEM_PROMPTS_DIR / "resolver_reviewer.md"
+    ).read_text(encoding="utf-8")
 
 
 def load_compaction_prompts() -> tuple[str, str]:

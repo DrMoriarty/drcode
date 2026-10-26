@@ -305,6 +305,39 @@ def _worktree_pythonpath_env(worktree: Path) -> dict[str, str]:
     return env
 
 
+def _venv_prefix(python_cmd: list[str]) -> Path | None:
+    """The virtualenv prefix of the plan's interpreter, when it IS a venv
+    python. `uv run` plans are excluded: uv itself exports VIRTUAL_ENV and
+    prepends the venv's bin to the child's PATH, so node-based discovery
+    already lands correctly there."""
+    if python_cmd and python_cmd[0] == "uv":
+        return None
+    bin_dir = Path(python_cmd[0]).parent
+    if bin_dir.name not in ("bin", "Scripts"):
+        return None
+    prefix = bin_dir.parent
+    if not (prefix / "pyvenv.cfg").is_file():
+        return None
+    return prefix
+
+
+def _venv_env(python_cmd: list[str], base_env: dict[str, str] | None) -> dict[str, str]:
+    """Subprocess environment for a tool that does its OWN python
+    discovery — the pip `pyright` package is a node wrapper that ignores
+    the interpreter `-m pyright` ran under and probes VIRTUAL_ENV / PATH
+    instead. Pin the plan's environment explicitly (VIRTUAL_ENV set, the
+    venv's bin prepended to PATH); otherwise that discovery can land on
+    an interpreter without the project's deps and report phantom
+    reportMissingImports for every third-party import (the 9d29e63d
+    failure class)."""
+    env = dict(base_env) if base_env is not None else dict(os.environ)
+    if prefix := _venv_prefix(python_cmd):
+        env["VIRTUAL_ENV"] = str(prefix)
+        bin_dir = prefix / ("Scripts" if os.name == "nt" else "bin")
+        env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
+    return env
+
+
 def _python_files(worktree: Path) -> list[str]:
     """Tracked .py files of the worktree (git ls-files — the worktree may
     sit on a branch with different content than the main checkout)."""
@@ -366,13 +399,16 @@ def mechanical_checks(worktree: Path) -> list[CheckResult]:
     pyright_plan = _project_python(worktree, "pyright")
     if pyright_plan is not None:
         pyright_cmd, fix_path = pyright_plan
+        base_env = _worktree_pythonpath_env(worktree) if fix_path else None
         results.append(
             _run_checked(
                 "pyright",
                 [*pyright_cmd, "-m", "pyright"],
                 worktree,
                 timeout=900,
-                env=_worktree_pythonpath_env(worktree) if fix_path else None,
+                # Node pyright discovers the environment itself — pin it
+                # to the plan's venv (see _venv_env).
+                env=_venv_env(pyright_cmd, base_env),
             )
         )
     else:

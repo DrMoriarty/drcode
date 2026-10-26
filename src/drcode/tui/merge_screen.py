@@ -26,6 +26,19 @@ The screen is a viewer + decision pad, never an autonomous actor:
   and ``a`` aborts the merge — both only behind an explicit second-press
   confirmation, mirroring the armed-ESC convention of the app.
 
+When the engine's auto-resolution left NOTHING to resolve AND the
+report vouches the fast-forward is real (`fast_forward is True` — a
+clean merge, an up-to-date branch or the rerere replay that concluded),
+the screen switches to its "ff-ready" mode instead: the
+resolution keys are disabled (the footer names them as unavailable) and
+``f`` becomes the one relevant action — it fast-forwards the MAIN
+checkout's base branch to `drcode/<id>` (`task_env.ff_merge_branch`).
+That is the contract's user-triggered half: the screen still never
+merges into the base on its own, only behind the explicit ``f`` press,
+and only `--ff-only` — a refusal (the base moved ahead, a dirty tree)
+is an error toast, never a conflicted merge to resolve in the user's
+tree; the user re-runs the reversed merge by reopening the screen.
+
 Every ``v`` run also rewrites the full funnel report (verdict, status
 lines, complete check outputs — modeled on `ResolverOutcome.summary()`)
 to ``.drcode/merge_reports/<task-id>-verify.txt`` next to the engine's
@@ -33,10 +46,12 @@ triage report, so the failure details survive the screen being closed.
 
 The contract holds unchanged: the commit lands on the task's own branch
 `drcode/<id>`; the merge into the user's checkout afterwards is a
-fast-forward that the workflow hook or the user performs — the screen
-never merges into the base branch itself. Every blocking call (git,
-file IO, the checks) runs in a worker thread; every worker writes back
-to the UI from the event loop only.
+fast-forward that the workflow hook or the user performs — and the only
+merge the screen itself performs into the base is the explicit, `--ff-only`
+``f`` action above (refusal, never a conflict, when the base is not an
+ancestor). Every blocking call (git, file IO, the checks) runs in a
+worker thread; every worker writes back to the UI from the event loop
+only.
 """
 
 from __future__ import annotations
@@ -66,7 +81,7 @@ from ..conflict import (
     Hunk,
     parse_hunks,
 )
-from ..merge_engine import MergeReport
+from ..merge_engine import MergeReport, is_fast_forward
 from ..merge_resolver import CheckResult
 
 if TYPE_CHECKING:
@@ -362,8 +377,24 @@ class ConflictScreen(ModalScreen[None]):
         Binding("E", "open_report", "Report", priority=True),
         Binding("s", "commit", "Commit", priority=True),
         Binding("a", "abort_merge", "Abort", priority=True),
+        Binding("f", "ff_merge", "Merge into base", priority=True),
         Binding("r", "refresh_state", "Refresh", priority=True),
     ]
+
+    # The resolution keys that lose their meaning in the ff-ready mode
+    # ("nothing to resolve"): check_action disables them so a stray
+    # press does nothing, and the footer names them as unavailable —
+    # the keys stay documented instead of silently vanishing.
+    _FF_DISABLED_ACTIONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "resolve",
+            "external_edit",
+            "verify",
+            "check_details",
+            "commit",
+            "abort_merge",
+        }
+    )
 
     DEFAULT_CSS = """
     ConflictScreen {
@@ -415,6 +446,12 @@ class ConflictScreen(ModalScreen[None]):
         self.wt: ConflictWorktree | None = None
         self._armed: str | None = None
         self._checks_ok: bool | None = None
+        # ff-ready mode: the engine's auto-resolution left nothing to
+        # resolve (report ok, not conflicted) — the branch is ready to
+        # be fast-forwarded into the base. `_ff_done` marks the merge
+        # already performed here (further f presses would be no-ops).
+        self._ff_ready: bool = False
+        self._ff_done: bool = False
         # The last verification run (checks + the test suite), newest
         # first-shown check ordered as in the panel — the details viewer
         # reads from here.
@@ -443,6 +480,41 @@ class ConflictScreen(ModalScreen[None]):
                 id="merge-footer",
             )
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Gate the key set by the mode: in the ff-ready state the
+        resolution keys are inert (nothing to resolve — the footer names
+        them as unavailable), and `f` exists only there (and only until
+        the merge actually lands)."""
+        if action == "ff_merge":
+            return self._ff_ready and not self._ff_done
+        return not (self._ff_ready and action in self._FF_DISABLED_ACTIONS)
+
+    def _update_footer(self) -> None:
+        """Rewrite the key hint line for the current mode — the footer
+        is the screen's only key documentation, so the ff-ready state
+        must swap it explicitly (a late worker may land after unmount:
+        a no-op there)."""
+        if not self.is_mounted:
+            return
+        footer = self.query_one("#merge-footer", Static)
+        if self._ff_ready:
+            base = "base"
+            if self.wt is not None and self.wt.report is not None:
+                base = self.wt.report.base_branch or "base"
+            if self._ff_done:
+                text = f"merged into {base} · r refresh · esc close"
+            else:
+                text = (
+                    f"f merge into {base} (ff-only) · r refresh · esc close · "
+                    "o/t/b/e/v/d/s/a disabled — nothing to resolve"
+                )
+        else:
+            text = (
+                "o/t/b hunk ours/theirs/both · e edit · v check · "
+                "d details · E report · s commit · a abort · r refresh · esc close"
+            )
+        footer.update(text)
+
     # -- preparation (the engine's reversed merge) -------------------------------
 
     def on_mount(self) -> None:
@@ -469,14 +541,44 @@ class ConflictScreen(ModalScreen[None]):
         )
         self.wt = ConflictWorktree(app.project_root, self.task_id, root, report=report)
         if not report.ok:
+            self._ff_ready = False
             self._set_title(f"Merge conflicts — {report.message}")
+            self._update_footer()
             return
         if not report.conflicted:
-            self._set_title(
-                f"{report.message} — nothing to resolve; "
-                "`git merge --ff-only` from the base checkout finishes it"
-            )
+            # ff-ready ONLY when the engine vouches the fast-forward is
+            # actually possible (the base tip is an ancestor of the
+            # branch tip): ok+not-conflicted alone also covers a branch
+            # already contained in the base (a --ff-only merge would
+            # refuse) and a resumed merge staged but never concluded (no
+            # merge commit exists yet) — neither may offer f.
+            if report.fast_forward is True:
+                self._ff_ready = True
+                self._set_title(
+                    f"{report.message} — nothing to resolve; "
+                    f"press f to merge {report.branch} into "
+                    f"{report.base_branch} (ff-only)"
+                )
+                self._update_footer()
+                return
+            self._ff_ready = False
+            if report.fast_forward is False:
+                self._set_title(
+                    f"{report.message} — {report.branch} holds no commits "
+                    f"beyond {report.base_branch}; there is nothing to "
+                    "merge into the base"
+                )
+            else:
+                # fast_forward is None: the merge is resolved and staged
+                # in the worktree but not committed — s (not f) is the
+                # next step, and it stays live below.
+                self._set_title(
+                    f"#{self.task_id} — the merge is resolved but NOT "
+                    f"committed on {report.branch}; press s to commit it"
+                )
+            self._update_footer()
             return
+        self._ff_ready = False
         self._set_title(
             f"#{self.task_id} — merge {report.base_branch} into "
             f"{report.branch}: {len(report.remaining)} file(s) to resolve"
@@ -793,6 +895,75 @@ class ConflictScreen(ModalScreen[None]):
             self.notify(
                 f"Abort failed: {out}", title="Merge", severity="error", timeout=6
             )
+
+    # -- ff-merge (ff-ready mode: nothing left to resolve) -----------------------
+
+    def action_ff_merge(self) -> None:
+        """f: fast-forward the MAIN checkout's base branch to the task's
+        branch — available only in the ff-ready state (report ok, not
+        conflicted) and only once (check_action gates both)."""
+        if self.wt is None or not self._ff_ready or self._ff_done:
+            return
+        self._do_ff_merge()
+
+    @work(exclusive=True, group="merge-ff")
+    async def _do_ff_merge(self) -> None:
+        app = cast("DrCodeApp", self.app)
+        env = app.task_env
+        report = self.wt.report if self.wt is not None else None
+        if report is None:
+            return
+        branch = report.branch or f"drcode/{self.task_id}"
+        base = report.base_branch or "base"
+        # The base may have moved between the screen's prepare and this
+        # press — re-verify the ff-possibility at press time so the
+        # refusal names the reason instead of raw git output.
+        if not await asyncio.to_thread(is_fast_forward, app.project_root, branch, base):
+            self.notify(
+                f"git merge --ff-only {branch} into {base} refused: "
+                f"{base} is no longer an ancestor of {branch} (the base "
+                "moved ahead) — reopen the screen to re-run the merge there",
+                title="Merge",
+                severity="error",
+                timeout=8,
+            )
+            return
+        ok, out = await asyncio.to_thread(env.ff_merge_branch, self.task_id)
+        if not ok:
+            # --ff-only refuses instead of conflicting: the base moved
+            # ahead (or the tree is dirty). Nothing else to try here —
+            # the user re-runs the reversed merge by reopening the
+            # screen (prepare re-detects and re-triages).
+            self.notify(
+                f"git merge --ff-only {branch} into {base} refused: {out} "
+                "— reopen the screen to re-run the merge there",
+                title="Merge",
+                severity="error",
+                timeout=8,
+            )
+            return
+        self._ff_done = True
+        self._set_title(f"#{self.task_id} — {branch} merged into {base} (ff-only)")
+        self._update_footer()
+        task = app.manager.get(self.task_id)
+        if task.needs_human:
+            task.needs_human = False
+            task.touch()
+            app.manager.storage.save(task)
+        app._show_event(
+            task,
+            f"merged {branch} into {base} (ff-only) via the conflict screen",
+            kind="workflow",
+        )
+        self.notify(
+            f"{branch} merged into {base}",
+            title="Merge",
+            timeout=5,
+        )
+        # Refresh the mergedness snapshot (_merge_state) and the header's
+        # ⎇ counter in one pass — the poll's fingerprint cache sees the
+        # moved base and recomputes.
+        await app._poll_git_indicator()
 
     # -- refresh / close -----------------------------------------------------------
 

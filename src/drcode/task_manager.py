@@ -753,7 +753,7 @@ class TaskManager:
 
     def complete_without_verification(self, task_id: str) -> Task:
         """Finish the task without a tester round (project setting
-        "Task finalization: None"): a task that reached TESTING is completed
+        "Verification: none"): a task that reached TESTING is completed
         right away, with no verification label."""
         task = self.get(task_id)
         old = task.status

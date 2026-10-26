@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from drcode.settings import (
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     CompletedRetention,
+    GitPolicy,
+    GitPolicySetting,
     ProjectSettings,
     ProjectSettingsStore,
     StallNudge,
+    Verification,
     WorktreeRemoval,
 )
 
@@ -191,3 +196,127 @@ def test_store_save_leaves_no_tmp_files(project_root: Path) -> None:
     store = ProjectSettingsStore(project_root)
     store.save(ProjectSettings())
     assert list(store.path.parent.glob("*.tmp")) == []
+
+
+# -- Verification / GitPolicy ---------------------------------------------------
+
+
+def test_default_verification_and_git_policy() -> None:
+    settings = ProjectSettings()
+    # The historical behavior: tester on, both roles commit + push.
+    assert settings.verification is Verification.TESTER
+    assert settings.git_policy.tester is GitPolicy.PUSH
+    assert settings.git_policy.research is GitPolicy.PUSH
+
+
+def test_verification_values_and_labels() -> None:
+    assert Verification.TESTER.value == "tester"
+    assert Verification.NONE.value == "none"
+    assert Verification.TESTER.label == "tester"
+    assert Verification.NONE.label == "none"
+
+
+def test_git_policy_values_and_labels() -> None:
+    # Persisted in settings.json — must not change silently.
+    assert GitPolicy.OFF.value == "off"
+    assert GitPolicy.LOCAL.value == "local"
+    assert GitPolicy.PUSH.value == "push"
+    assert GitPolicy.OFF.label == "off"
+    assert GitPolicy.LOCAL.label == "commit locally"
+    assert GitPolicy.PUSH.label == "commit + push"
+
+
+def test_git_policy_commits_and_pushes() -> None:
+    assert GitPolicy.OFF.commits is False
+    assert GitPolicy.LOCAL.commits is True
+    assert GitPolicy.PUSH.commits is True
+    assert not GitPolicy.OFF.pushes and not GitPolicy.LOCAL.pushes
+    assert GitPolicy.PUSH.pushes is True
+
+
+def test_store_git_policy_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    settings = ProjectSettings(
+        verification=Verification.NONE,
+        git_policy=GitPolicySetting(tester=GitPolicy.LOCAL, research=GitPolicy.OFF),
+    )
+    store.save(settings)
+    assert store.load() == settings
+    # The nested shape lands in the file as an object.
+    data = json.loads(store.path.read_text())
+    assert data["git_policy"] == {"tester": "local", "research": "off"}
+    assert data["verification"] == "none"
+    assert "task_finalization" not in data
+
+
+# -- Legacy task_finalization migration ------------------------------------------
+
+
+def _write_raw_settings(project_root: Path, data: dict) -> ProjectSettingsStore:
+    store = ProjectSettingsStore(project_root)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(json.dumps(data))
+    return store
+
+
+@pytest.mark.parametrize(
+    ("legacy", "verification", "tester_policy"),
+    [
+        ("testing_commit", Verification.TESTER, GitPolicy.PUSH),
+        ("testing_commit_no_push", Verification.TESTER, GitPolicy.LOCAL),
+        ("testing", Verification.TESTER, GitPolicy.OFF),
+        ("none", Verification.NONE, GitPolicy.PUSH),
+    ],
+)
+def test_legacy_finalization_migration(
+    project_root: Path,
+    legacy: str,
+    verification: Verification,
+    tester_policy: GitPolicy,
+) -> None:
+    """Each legacy `task_finalization` value maps onto the orthogonal
+    fields: the tester policy follows the legacy commit/push combination
+    (NONE completes without verification) and the research policy keeps
+    its default (push — the historical behavior)."""
+    store = _write_raw_settings(project_root, {"task_finalization": legacy})
+    settings = store.load()
+    assert settings.verification is verification
+    assert settings.git_policy.tester is tester_policy
+    assert settings.git_policy.research is GitPolicy.PUSH
+    # Saving writes only the new shape: the legacy key is gone.
+    store.save(settings)
+    data = json.loads(store.path.read_text())
+    assert "task_finalization" not in data
+
+
+def test_legacy_finalization_migration_unknown_value(
+    project_root: Path,
+) -> None:
+    """An unrecognized legacy value must not corrupt the settings: the
+    new fields keep their defaults."""
+    store = _write_raw_settings(project_root, {"task_finalization": "bogus"})
+    settings = store.load()
+    assert settings == ProjectSettings()
+
+
+def test_legacy_finalization_migration_new_keys_win(project_root: Path) -> None:
+    """When the file already carries the new fields, the legacy key is
+    dropped and the new values survive untouched."""
+    store = _write_raw_settings(
+        project_root,
+        {
+            "task_finalization": "testing",
+            "verification": "tester",
+            "git_policy": {"tester": "push", "research": "local"},
+        },
+    )
+    settings = store.load()
+    assert settings.verification is Verification.TESTER
+    assert settings.git_policy.tester is GitPolicy.PUSH
+    assert settings.git_policy.research is GitPolicy.LOCAL
+
+
+def test_git_policy_stale_value_returns_defaults(project_root: Path) -> None:
+    """A stale/unknown policy value must not break the app either."""
+    store = _write_raw_settings(project_root, {"git_policy": {"tester": "rebase-all"}})
+    assert store.load() == ProjectSettings()

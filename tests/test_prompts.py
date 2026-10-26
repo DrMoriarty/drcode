@@ -12,6 +12,7 @@ from drcode.prompts import (
     load_system_prompt,
     load_tester_prompt,
 )
+from drcode.settings import GitPolicy
 
 
 def test_load_compaction_prompts_returns_two_nonempty_strings() -> None:
@@ -55,9 +56,9 @@ def test_tester_prompt_substitutes_project_path(tmp_path: Path) -> None:
 
 
 def test_tester_prompt_no_push_variant(tmp_path: Path) -> None:
-    """The commit-without-push finalization selects the dedicated template:
-    it teaches the commit flow but never promises a push — and the default
-    (pushing) template does."""
+    """The commit-without-push tester git policy selects the dedicated
+    template: it teaches the commit flow but never promises a push — and
+    the default (pushing) template does."""
     from drcode.prompts import TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH
 
     pushy = load_tester_prompt(True, tmp_path)
@@ -86,6 +87,65 @@ def test_tester_prompt_no_push_project_override(tmp_path: Path) -> None:
     )
     prompt = load_tester_prompt(True, tmp_path, allow_push=False)
     assert "Custom no-push prompt." in prompt
+    assert str(tmp_path) in prompt
+
+
+def test_research_prompt_git_policy_push_default(tmp_path: Path) -> None:
+    """The default research prompt (git policy push) appends the push
+    fragment: git_commit_docs is taught with the push promise — and the
+    base template itself carries no git section (so the OFF policy can
+    drop it entirely)."""
+    from drcode.prompts import RESEARCH_SYSTEM_PROMPT
+
+    push = load_system_prompt(
+        TaskKind.RESEARCH, project_root=tmp_path, research_git=GitPolicy.PUSH
+    )
+    base = load_system_prompt(
+        TaskKind.RESEARCH, project_root=tmp_path, research_git=GitPolicy.OFF
+    )
+    # The base template has no commit section at all.
+    assert "git_commit_docs" not in base
+    assert "Documentation assignments" not in base
+    assert "Never commit to git unless explicitly asked" in base
+    # The push fragment rides after the base template.
+    assert "git_commit_docs" in push
+    assert "MUST finish the task by calling git_commit_docs" in push
+    assert "pushes the branch when a remote is configured" in push
+    assert "Never commit to git unless explicitly asked" in push
+    assert push.startswith(base.rstrip("\n"))
+    # The module constant is the base template; the push fragment is its
+    # own bundled file.
+    assert RESEARCH_SYSTEM_PROMPT == base.replace(str(tmp_path), "{project_path}")
+
+
+def test_research_prompt_git_policy_local(tmp_path: Path) -> None:
+    """The local research prompt teaches git_commit_docs but never
+    promises a push — it explicitly forbids pushing instead."""
+    local = load_system_prompt(
+        TaskKind.RESEARCH, project_root=tmp_path, research_git=GitPolicy.LOCAL
+    )
+    push = load_system_prompt(
+        TaskKind.RESEARCH, project_root=tmp_path, research_git=GitPolicy.PUSH
+    )
+    assert "git_commit_docs" in local
+    assert "MUST finish the task by calling git_commit_docs" in local
+    assert "never push" in local
+    # The local template must not promise a push anywhere.
+    assert "pushes the branch" not in local
+    assert local != push
+
+
+def test_research_prompt_git_fragment_project_override(tmp_path: Path) -> None:
+    """`.drcode/prompts/research_git_local.md` overrides the bundled
+    local fragment, mirroring the tester variants."""
+    override_dir = tmp_path / ".drcode" / "prompts"
+    override_dir.mkdir(parents=True)
+    (override_dir / "research_git_local.md").write_text("Custom local fragment.")
+    prompt = load_system_prompt(
+        TaskKind.RESEARCH, project_root=tmp_path, research_git=GitPolicy.LOCAL
+    )
+    assert "Custom local fragment." in prompt
+    # The base template (and its project override) is still there.
     assert str(tmp_path) in prompt
 
 

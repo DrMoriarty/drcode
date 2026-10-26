@@ -8,10 +8,12 @@ TOOLS are exercised directly through RunContext (no model calls).
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic_ai import RunContext
@@ -213,7 +215,9 @@ def test_run_test_suite_caps_xdist_fanout(
     monkeypatch.setattr(mr.shutil, "which", lambda name: None)
     captured: dict[str, list[str]] = {}
 
-    def spy(name: str, cmd: list[str], *args: object, **kwargs: object) -> mr.CheckResult:
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
         captured["cmd"] = cmd
         return mr.CheckResult(name=name, ok=True)
 
@@ -299,6 +303,59 @@ def test_mechanical_checks_skips_ruff_when_project_env_lacks_it(
     for name in ("ruff check", "pyright"):
         check = next(c for c in results if c.name == name)
         assert check.ok and check.skipped
+
+
+def test_pyright_check_pins_the_venv_environment(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The 9d29e63d failure class: pip pyright is a node wrapper — node
+    # pyright does its own environment discovery (VIRTUAL_ENV / PATH) and
+    # must not land on a foreign interpreter. The funnel pins the plan's
+    # venv into the subprocess env explicitly.
+    _fake_worktree_venv(repo)
+    (repo / ".venv" / "pyvenv.cfg").write_text("home = /fake\n")
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
+        if name == "pyright":
+            captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    (repo / "app.py").write_text("value = 1\n")
+    mr.mechanical_checks(repo)
+    env = captured["env"]
+    assert env is not None
+    assert env["VIRTUAL_ENV"] == str(repo / ".venv")
+    assert env["PATH"].startswith(str(repo / ".venv" / "bin") + os.pathsep)
+
+
+def test_pyright_check_leaves_uv_run_env_alone(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `uv run` already exports VIRTUAL_ENV and prepends the venv bin to
+    # the child's PATH — the funnel must not clobber that.
+    (repo / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
+        if name == "pyright":
+            captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    monkeypatch.setattr(
+        mr.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    monkeypatch.setattr(mr, "_module_importable", lambda cmd, module, cwd: True)
+    mr.mechanical_checks(repo)
+    env = captured["env"]
+    assert env is not None
+    assert "VIRTUAL_ENV" not in env or env["VIRTUAL_ENV"] != str(repo / ".venv")
 
 
 # -- review diffs, restore, conclude --------------------------------------------------

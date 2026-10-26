@@ -30,7 +30,7 @@ from drcode import agent_model
 from drcode.agent import serialize_messages
 from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
-from drcode.settings import parallel_tasks_label
+from drcode.settings import ProjectSettings, parallel_tasks_label
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
@@ -1923,7 +1923,10 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     assert "Task settings" in SettingsPalette.ENTRY_ORDER
     for prefix in (
         "Auto-delete completed tasks:",
-        "Task finalization:",
+        "Verification:",
+        "Git (tester):",
+        "Git (research):",
+        "Workflow preset:",
         "Worktree removal:",
         "Max development rounds:",
         "Nudge stalled agent after:",
@@ -1955,13 +1958,16 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             cast(Command, command).hit.text or "" for command in command_list._options
         ]
         assert names == [
-            f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
-            f"Task finalization: {app.settings.task_finalization.label}",
-            f"Worktree removal: {app.settings.worktree_removal.label}",
-            f"Max development rounds: {app.settings.max_dev_rounds}",
-            f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
+            f"Workflow preset: {app.workflow_preset_label()}",
             f"Task isolation: {app._task_isolation_label()}",
             f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
+            f"Worktree removal: {app.settings.worktree_removal.label}",
+            f"Verification: {app.settings.verification.label}",
+            f"Max development rounds: {app.settings.max_dev_rounds}",
+            f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
+            f"Git (tester): {app.settings.git_policy.tester.label}",
+            f"Git (research): {app.settings.git_policy.research.label}",
+            f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
             "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
         ]
         # The main-menu provider no longer carries the task entries: it
@@ -2011,40 +2017,194 @@ async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
         )
 
 
-async def test_settings_task_finalization_picker(app: DrCodeApp) -> None:
-    """The "Task finalization" setting: the option palette lists all four
-    modes (including the commit-without-push one) with the current one
-    marked, and picking one persists it into the project settings."""
+async def test_settings_verification_picker(app: DrCodeApp) -> None:
+    """The "Verification" setting: the option palette lists both modes with
+    the current one marked, and picking one persists it into the project
+    settings."""
     from drcode.settings import (
-        FINALIZATION_OPTIONS,
+        VERIFICATION_OPTIONS,
         ProjectSettingsStore,
-        TaskFinalization,
+        Verification,
     )
-    from drcode.tui.command_providers import FinalizationOptionsProvider
+    from drcode.tui.command_providers import VerificationOptionsProvider
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        commands = FinalizationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        commands = VerificationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [name for name, _cb in commands] == [
             f"{option.label} (current)"
-            if option is app.settings.task_finalization
+            if option is app.settings.verification
             else option.label
-            for option in FINALIZATION_OPTIONS
+            for option in VERIFICATION_OPTIONS
         ]
-        assert "Testing + Git commit" in [name for name, _cb in commands]
-        # Pick the commit-without-push option.
-        no_push = next(cb for name, cb in commands if name == "Testing + Git commit")
-        no_push()
+        assert "tester (current)" in [name for name, _cb in commands]
+        # Pick "none".
+        none_cb = next(cb for name, cb in commands if name == "none")
+        none_cb()
         await pilot.pause()
-        assert app.settings.task_finalization is TaskFinalization.TESTING_COMMIT_NO_PUSH
+        assert app.settings.verification is Verification.NONE
         assert (
-            ProjectSettingsStore(app.project_root).load().task_finalization
-            is TaskFinalization.TESTING_COMMIT_NO_PUSH
+            ProjectSettingsStore(app.project_root).load().verification
+            is Verification.NONE
         )
         # Re-opening the palette marks the new current option.
-        commands = FinalizationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert commands[1][0] == "Testing + Git commit (current)"
+        commands = VerificationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert commands[1][0] == "none (current)"
+
+
+async def test_settings_git_policy_pickers(app: DrCodeApp) -> None:
+    """The "Git (tester)" / "Git (research)" settings: each palette lists
+    the three policies with the current one marked, and picking one
+    persists it into the project's nested git_policy object."""
+    from drcode.settings import GitPolicy, ProjectSettingsStore
+    from drcode.tui.command_providers import (
+        GitResearchOptionsProvider,
+        GitTesterOptionsProvider,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        commands = GitTesterOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _cb in commands] == [
+            "commit + push (current)",
+            "commit locally",
+            "off",
+        ]
+        # Pick the local policy for the tester.
+        local_cb = next(cb for name, cb in commands if name == "commit locally")
+        local_cb()
+        await pilot.pause()
+        assert app.settings.git_policy.tester is GitPolicy.LOCAL
+        stored = ProjectSettingsStore(app.project_root).load()
+        assert stored.git_policy.tester is GitPolicy.LOCAL
+        assert stored.git_policy.research is GitPolicy.PUSH  # untouched
+
+        commands = GitResearchOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        off_cb = next(cb for name, cb in commands if name == "off")
+        off_cb()
+        await pilot.pause()
+        assert app.settings.git_policy.research is GitPolicy.OFF
+        stored = ProjectSettingsStore(app.project_root).load()
+        assert stored.git_policy.research is GitPolicy.OFF
+        assert stored.git_policy.tester is GitPolicy.LOCAL  # untouched
+
+
+async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
+    """The "Workflow preset" applier: picking a preset writes exactly the
+    documented field combination into the project settings; the display
+    flips to Custom when an individual setting changes."""
+    from drcode.settings import (
+        GitPolicy,
+        ProjectSettingsStore,
+        TaskIsolation,
+        Verification,
+        WorktreeRemoval,
+    )
+    from drcode.tui.command_providers import (
+        WorkflowPresetOptionsProvider,
+        workflow_preset_for,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        commands = WorkflowPresetOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [name for name, _cb in commands] == [
+            "Local sandbox",
+            "Team / PR flow",
+            "Minimal",
+            "Custom",
+        ]
+
+        # Default settings (tester+push, no isolation) match no preset.
+        assert workflow_preset_for(app.settings) is None
+        assert app.workflow_preset_label() == "Custom"
+
+        # Local sandbox: verification tester; both policies local;
+        # isolation worktree; removal on_delete.
+        sandbox = next(cb for name, cb in commands if name == "Local sandbox")
+        sandbox()
+        await pilot.pause()
+        assert app.settings.verification is Verification.TESTER
+        assert app.settings.git_policy.tester is GitPolicy.LOCAL
+        assert app.settings.git_policy.research is GitPolicy.LOCAL
+        assert app.settings.task_isolation is TaskIsolation.WORKTREE
+        assert app.settings.worktree_removal is WorktreeRemoval.ON_DELETE
+        assert app.workflow_preset_label() == "Local sandbox"
+        stored = ProjectSettingsStore(app.project_root).load()
+        assert stored.git_policy.tester is GitPolicy.LOCAL
+
+        # Team / PR flow: both policies push, isolation worktree — it
+        # does NOT touch verification or worktree removal.
+        team = next(cb for name, cb in commands if name == "Team / PR flow")
+        team()
+        await pilot.pause()
+        assert app.settings.git_policy.tester is GitPolicy.PUSH
+        assert app.settings.git_policy.research is GitPolicy.PUSH
+        assert app.settings.task_isolation is TaskIsolation.WORKTREE
+        assert app.settings.verification is Verification.TESTER  # untouched
+        assert app.settings.worktree_removal is WorktreeRemoval.ON_DELETE  # kept
+        assert app.workflow_preset_label() == "Team / PR flow"
+
+        # Minimal: no tester, both policies off.
+        minimal = next(cb for name, cb in commands if name == "Minimal")
+        minimal()
+        await pilot.pause()
+        assert app.settings.verification is Verification.NONE
+        assert app.settings.git_policy.tester is GitPolicy.OFF
+        assert app.settings.git_policy.research is GitPolicy.OFF
+        assert app.workflow_preset_label() == "Minimal"
+
+        # Any manual change of an individual setting flips to Custom.
+        app.action_set_git_research(GitPolicy.LOCAL)
+        await pilot.pause()
+        assert app.workflow_preset_label() == "Custom"
+
+        # Picking "Custom" is a no-op.
+        custom = next(cb for name, cb in commands if name == "Custom")
+        before = app.settings.model_copy(deep=True)
+        custom()
+        await pilot.pause()
+        assert app.settings == before
+
+
+async def test_git_policy_tester_dormant_warning(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """verification=none with a non-off tester git policy: the policy is
+    persisted but dormant — the app warns at EVERY startup (like the
+    dormant parallelism), and switching verification back to none live
+    warns too."""
+    from drcode.settings import GitPolicy, ProjectSettingsStore, Verification
+
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(verification=Verification.NONE))
+    app = DrCodeApp(project_root)
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert any("dormant" in t or "no tester runs" in t for t in toasts), (
+            "startup must warn that the tester's git policy is dormant"
+        )
+        # A dormant policy switched to off stops the warnings.
+        toasts.clear()
+        app.action_set_git_tester(GitPolicy.OFF)
+        assert app.settings.git_policy.tester is GitPolicy.OFF
+        app.action_set_verification(Verification.NONE)
+        await pilot.pause()
+        assert not any("dormant" in t for t in toasts)
+        # ... and with the policy back on, "Verification: none" warns live.
+        app.action_set_git_tester(GitPolicy.LOCAL)
+        app.action_set_verification(Verification.TESTER)
+        toasts.clear()
+        app.action_set_verification(Verification.NONE)
+        await pilot.pause()
+        assert any("dormant" in t for t in toasts)
 
 
 async def test_custom_role_model_dialog_prefills_and_saves(

@@ -22,7 +22,7 @@ from drcode.conflict import (
     parse_hunks,
 )
 from drcode.merge_resolver import CheckResult
-from drcode.models import TaskStatus
+from drcode.models import TaskStatus, VerificationStatus
 from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
@@ -223,6 +223,56 @@ def test_abort_rolls_back(repo: Path) -> None:
     assert ok
     assert not me.in_progress(wt)
     assert (wt / "app.py").read_text() == "a\nTASK\nc\n"
+
+
+# -- TaskEnvironment.ff_merge_branch (the user-triggered ff-merge) -------------------
+
+
+def _branch_with_work(repo: Path, task_id: str) -> tuple[TaskEnvironment, Path]:
+    """A task worktree on `drcode/<id>` holding one commit the main
+    checkout lacks (no conflict — the branch is simply ahead)."""
+    env = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    wt, _note = env.ensure_root(task_id)
+    (wt / "fix.txt").write_text("fixed\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", f"fix for {task_id}")
+    return env, wt
+
+
+def test_ff_merge_branch_fast_forwards_main_checkout(repo: Path) -> None:
+    env, _wt = _branch_with_work(repo, "t5")
+    assert env.unmerged_commits("t5") == 1
+    ok, _out = env.ff_merge_branch("t5")
+    assert ok
+    assert (repo / "fix.txt").read_text() == "fixed\n"
+    assert env.unmerged_commits("t5") == 0
+
+
+def test_ff_merge_branch_refuses_when_base_moved(repo: Path) -> None:
+    env, _wt = _branch_with_work(repo, "t5")
+    # The base moves ahead while the task branch sits unmerged: a ff is
+    # no longer possible — the refusal must leave the checkout untouched
+    # (no merge commit, no conflict to resolve in the user's tree).
+    (repo / "app.py").write_text("a\nMAIN NEWER\nc\n")
+    _git(repo, "commit", "-qam", "main moves on")
+    main_head = _git(repo, "rev-parse", "HEAD").strip()
+    ok, out = env.ff_merge_branch("t5")
+    assert not ok
+    assert out  # git names the refusal for the error toast
+    assert not (repo / "fix.txt").exists()
+    assert _git(repo, "rev-parse", "HEAD").strip() == main_head
+    assert env.unmerged_commits("t5") == 1
+
+
+def test_ff_merge_branch_without_branch_or_isolation(repo: Path) -> None:
+    env = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    ok, out = env.ff_merge_branch("ghost")
+    assert not ok
+    assert "does not exist" in out
+    off = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.OFF))
+    ok, out = off.ff_merge_branch("t5")
+    assert not ok
+    assert "isolation" in out
 
 
 # -- the TUI screen -----------------------------------------------------------------
@@ -627,3 +677,245 @@ async def test_details_key_without_checks_and_report_key_without_file(
             for m in (n.message for n in app._notifications._notifications.values())
         )
         assert not isinstance(app.screen, CheckDetailsScreen)
+
+
+# -- the ff-ready mode (nothing to resolve; f merges into the base) -------------------
+
+
+def _finished_task_with_branch(repo: Path) -> tuple[str, Path]:
+    """A completed PASSED task whose `drcode/<id>` branch holds one clean
+    commit the main checkout lacks — the ff-ready screen scenario."""
+    manager = TaskManager(repo)
+    # TaskManager scaffolds an untracked .gitignore — track it BEFORE the
+    # task branch diverges, or the ff-merge below refuses over it (in a
+    # real repo the file is already committed).
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "gitignore")
+    task = manager.create("Fix app", "fix the app")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.touch()
+    manager.storage.save(task)
+    env = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    wt, _note = env.ensure_root(task.id)
+    (wt / "fix.txt").write_text("fixed\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "fix app")
+    return task.id, wt
+
+
+def _toasts(app: DrCodeApp) -> list[str]:
+    return [n.message for n in app._notifications._notifications.values()]
+
+
+async def test_ff_ready_screen_merges_into_base_and_clears_counter(
+    isolated: Path, configured_env: None
+) -> None:
+    """The bug-example scenario: an unmerged task branch with nothing to
+    resolve opens the screen in ff-ready mode; `f` fast-forwards the
+    MAIN checkout to the task branch, the mergedness snapshot flips to
+    "merged" (the header's ⎇ counter drains) and a further `f` is a
+    no-op (check_action gates it off)."""
+    task_id, _wt = _finished_task_with_branch(isolated)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and screen._ff_ready,
+            pilot=pilot,
+            what="ff-ready state reached",
+        )
+        # Nothing to resolve: the resolution keys are gated off, the f
+        # key is live, the footer names both facts.
+        assert screen.check_action("resolve", ("ours",)) is False
+        assert screen.check_action("commit", ()) is False
+        assert screen.check_action("abort_merge", ()) is False
+        assert screen.check_action("ff_merge", ()) is True
+        footer = str(screen.query_one("#merge-footer", Static).content)
+        assert "f merge into main (ff-only)" in footer
+        assert "disabled — nothing to resolve" in footer
+
+        await pilot.press("f")
+        await wait_until(
+            lambda: screen._ff_done,
+            pilot=pilot,
+            what="main checkout fast-forwarded",
+        )
+        assert (isolated / "fix.txt").exists()
+        assert screen.check_action("ff_merge", ()) is False
+        # Mergedness snapshot + header counter refreshed by the same pass.
+        await wait_until(
+            lambda: app._merge_state.get(task_id) == "merged",
+            pilot=pilot,
+            what="mergedness snapshot refreshed",
+        )
+        assert app._unmerged_completed_ids() == []
+        # The service event records the merge.
+        assert any(
+            "ff-only" in event.text
+            for event in TaskManager(isolated).get(task_id).events
+        )
+
+
+async def test_ff_merge_refused_when_base_moved(
+    isolated: Path, configured_env: None
+) -> None:
+    """`f` when the base moved ahead: --ff-only refuses, the error toast
+    names it, the main checkout stays untouched and the screen stays in
+    the (still ff-ready) pre-merge state."""
+    task_id, _wt = _finished_task_with_branch(isolated)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and screen._ff_ready,
+            pilot=pilot,
+            what="ff-ready state reached",
+        )
+        # The base moves on while the screen is open.
+        (isolated / "app.py").write_text("a\nMAIN NEWER\nc\n")
+        _git(isolated, "commit", "-qam", "main moves on")
+        main_head = _git(isolated, "rev-parse", "HEAD").strip()
+
+        await pilot.press("f")
+        await pilot.pause()
+        await pilot.pause()
+        await wait_until(
+            lambda: any("refused" in m for m in _toasts(app)),
+            pilot=pilot,
+            what="refusal toast",
+        )
+        # No merge happened in the user's checkout, no ff-done state.
+        assert not (isolated / "fix.txt").exists()
+        assert _git(isolated, "rev-parse", "HEAD").strip() == main_head
+        assert not screen._ff_done
+
+
+async def test_staged_unconcluded_merge_is_not_ff_ready(
+    isolated: Path, configured_env: None
+) -> None:
+    """A merge resolved and staged but never committed (the screen was
+    closed mid-resolution) reopens WITHOUT the ff-ready mode: f is gated
+    off — no merge commit exists yet, --ff-only would refuse — and the
+    honest title points at `s`, which then concludes the merge."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, wt = _parked_content_conflict(isolated, task.id)
+    # Resolve and stage by hand, do NOT commit — the resuming scenario.
+    (wt / "app.py").write_text("resolved\nb\n")
+    _git(wt, "add", "app.py")
+    head_before = _git(wt, "rev-parse", "HEAD").strip()
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None,
+            pilot=pilot,
+            what="screen prepared",
+        )
+        await pilot.pause()
+        # Not ff-ready: f is inert, the resolution set (s among it) stays.
+        assert screen._ff_ready is False
+        assert screen.check_action("ff_merge", ()) is False
+        assert screen.check_action("commit", ()) is True
+        title = str(screen.query_one("#merge-title", Static).content)
+        assert "NOT committed" in title and "s to commit" in title
+
+        # The offered next step actually works: armed s commits the merge.
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.press("s")
+        await wait_until(
+            lambda: not me.in_progress(wt),
+            pilot=pilot,
+            what="resolution committed",
+        )
+        assert _git(wt, "rev-parse", "HEAD").strip() != head_before
+        assert me.is_fast_forward(isolated, branch_for(task.id), "main")
+
+
+async def test_conflicted_mode_keeps_ff_out_and_resolution_in(
+    isolated: Path, configured_env: None
+) -> None:
+    """Regression: a genuinely conflicted merge keeps the classic key
+    set — f is gated OFF, the resolution keys stay live, and the footer
+    documents the working set (s/commit still completes the parked
+    merge as before)."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and bool(screen.files_list.children)
+                and screen.view.current_hunk() is not None
+            ),
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+        assert not screen._ff_ready
+        assert screen.check_action("ff_merge", ()) is False
+        assert screen.check_action("resolve", ("ours",)) is True
+        assert screen.check_action("commit", ()) is True
+        footer = str(screen.query_one("#merge-footer", Static).content)
+        assert "s commit" in footer and "f merge" not in footer
+
+        # The classic flow still works end to end: resolve, armed commit.
+        await pilot.press("o")
+        await wait_until(
+            lambda: _git(wt, "ls-files", "-u").strip() == "",
+            pilot=pilot,
+            what="hunk resolved and staged",
+        )
+        await pilot.press("s")
+        await pilot.press("s")
+        await wait_until(
+            lambda: not me.in_progress(wt),
+            pilot=pilot,
+            what="resolution committed",
+        )
+        assert me.is_fast_forward(isolated, branch_for(task.id), "main")

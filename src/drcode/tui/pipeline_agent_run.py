@@ -116,7 +116,9 @@ class PipelineAgentRunLayer(DrCodeState):
             # work back up.
             while task.status is TaskStatus.ACTIVE:
                 run = None
-                turn = self._consume_turn_input(task, task_id, workflow_instructions)
+                turn = await self._consume_turn_input(
+                    task, task_id, workflow_instructions
+                )
                 if turn is None:
                     # Nothing queued and no unfinished attempt: the run is
                     # over (the epilogue below decides what the task
@@ -324,7 +326,7 @@ class PipelineAgentRunLayer(DrCodeState):
         )
         return root, agent, workflow_instructions
 
-    def _consume_turn_input(
+    async def _consume_turn_input(
         self,
         task: Task,
         task_id: str,
@@ -342,7 +344,16 @@ class PipelineAgentRunLayer(DrCodeState):
 
         Returns (text, consumed entries, possibly-injected workflow
         instructions) or None when there is nothing to run (no queued
-        input, no unfinished attempt) — the caller ends the run."""
+        input, no unfinished attempt) — the caller ends the run.
+
+        Async because of the interrupted-but-finished branch below: the
+        mid-run gate can pause the run on the TERMINAL empty tools node
+        pydantic-ai emits right after the final text response (the fill
+        crossed the threshold exactly at that boundary) — the exchange is
+        already complete, but the pause announced a compaction, and this
+        is the last safe point to honor it: the turn-boundary gate would
+        never run again (the loop ends here), and the task would finish
+        over the threshold with the promise unkept."""
         if task.pending_input:
             # Batch consumption: everything queued before this turn
             # (the original brief plus comments typed while the task
@@ -379,8 +390,15 @@ class PipelineAgentRunLayer(DrCodeState):
         if task.unfinished:
             if not ends_with_open_request(task.messages):
                 # The interrupted attempt actually finished its
-                # exchange — nothing to resume; clear the flag so
-                # the task can complete normally below.
+                # exchange — nothing to resume. But the pause that set
+                # the flag may have announced a compaction (the gate
+                # fires on every tools node, including the terminal
+                # empty one after the final response): run the
+                # turn-boundary gate here, before ending the run — the
+                # announced compaction must actually happen (no-op when
+                # the fill is under the threshold, or the livelock
+                # guard / a failed summarizer keeps it silent).
+                await self._maybe_compact(task)
                 task.unfinished = False
                 self.manager.storage.save(task)
                 return None

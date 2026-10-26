@@ -1540,6 +1540,66 @@ async def test_mid_run_compaction_pauses_and_resumes(
     assert not task.unfinished
 
 
+async def test_mid_run_compaction_on_terminal_node_still_compacts(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    scripted_fills: Any,
+    project_root: Path,
+) -> None:
+    """The fill crossing the threshold exactly at the LAST tool-node
+    boundary of a turn — the empty call-tools node pydantic-ai emits
+    after the final text response — pauses the run with the exchange
+    already complete. The resume path sees no open request (nothing to
+    continue), but the pause promised a compaction: the gate must run
+    there, before the run ends — otherwise the task finishes over the
+    threshold with no summarizer call at all."""
+    (project_root / "README.md").write_text("hello readme")
+    task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
+    scripted_fills([100, 900])
+    scripted.steps = [
+        # 100 of 1000 — below the 80% threshold, the run goes on.
+        tool_response("read_file", {"path": "README.md"}, "c1"),
+        # 900 of 1000 — past the threshold, and this response is the
+        # FINAL one (plain text): the gate fires on the terminal empty
+        # tools node right after it and pauses.
+        text_response("final answer"),
+        text_response("THE SUMMARY BODY"),  # compaction summarizer
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and not net_app_small_ctx.agent_running
+            ),
+            pilot,
+            what="task completed with the promised compaction honored",
+        )
+
+    texts = event_texts(task)
+    assert any(t.startswith("Context fill 90% — pausing the run") for t in texts)
+    assert any("Context compacted" in t for t in texts)
+    # Three model round-trips: the two development requests plus the
+    # summarizer — the compaction really ran on resume.
+    assert len(scripted.calls) == 3
+    # Transcript replaced: original prompt verbatim + one summary request
+    # (still two unmerged requests — no continuation turn ran after the
+    # compaction to make pydantic-ai fold them together).
+    assert [m["kind"] for m in task.messages] == ["request", "request"]
+    prompt_contents = [
+        p["content"]
+        for m in task.messages
+        for p in m["parts"]
+        if p["part_kind"] == "user-prompt"
+    ]
+    assert prompt_contents[0] == "long task"
+    assert any("[context summary]" in c for c in prompt_contents)
+    assert any("THE SUMMARY BODY" in c for c in prompt_contents)
+    assert not task.unfinished
+
+
 async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
     net_app_small_ctx: DrCodeApp,
     wide_compaction: None,

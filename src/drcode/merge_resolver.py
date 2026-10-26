@@ -39,6 +39,7 @@ Sync module (plain subprocesses, mirroring `drcode.task_env` /
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -212,16 +213,96 @@ def build_agent_context(
 
 
 def _run_checked(
-    name: str, cmd: list[str], cwd: Path, timeout: int = _TIMEOUT
+    name: str,
+    cmd: list[str],
+    cwd: Path,
+    timeout: int = _TIMEOUT,
+    env: dict[str, str] | None = None,
 ) -> CheckResult:
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return CheckResult(name=name, ok=False, output=f"{type(e).__name__}: {e}")
     out = (proc.stdout + "\n" + proc.stderr).strip()
     return CheckResult(name=name, ok=proc.returncode == 0, output=out[:8000])
+
+
+def _venv_python(worktree: Path) -> Path | None:
+    """The worktree's own virtualenv interpreter, when one exists."""
+    for rel in (".venv/bin/python", ".venv/Scripts/python.exe"):
+        candidate = worktree / rel
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
+    """True when `module` imports in the environment the given python
+    command resolves to — probed with the SAME launcher the check would
+    use, never a PATH lookup. Generous timeout: for `uv run` the probe
+    doubles as the one-time sync of a fresh worktree's environment."""
+    try:
+        proc = subprocess.run(
+            [*python_cmd, "-c", f"import {module}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _project_python(worktree: Path, module: str) -> tuple[list[str], bool] | None:
+    """A command that runs the project's OWN python inside `worktree` —
+    the interpreter whose environment actually holds the project's
+    tooling — plus whether the worktree's code must be put on the path
+    explicitly. None when no usable environment exists.
+
+    Preference order: the worktree's synced .venv, then `uv run` (sync
+    ALLOWED — a fresh worktree has no .venv, and `--no-sync` would create
+    an empty skeleton from which uv silently falls back to whatever
+    pytest/ruff sits on PATH, reporting environment artifacts as merge
+    regressions), then the interpreter drcode itself runs under. The
+    probed `module` (pytest, ruff, …) must really import there — a
+    skeleton or partially synced venv falls through to the next option."""
+    venv_python = _venv_python(worktree)
+    if venv_python is not None and _module_importable(
+        [str(venv_python)], module, worktree
+    ):
+        return [str(venv_python)], False
+    if (
+        shutil.which("uv") is not None
+        and (worktree / "pyproject.toml").is_file()
+        and _module_importable(["uv", "run", "python"], module, worktree)
+    ):
+        return ["uv", "run", "python"], False
+    if _pytest_importable() and _module_importable([sys.executable], module, worktree):
+        return [sys.executable], True
+    return None
+
+
+def _worktree_pythonpath_env(worktree: Path) -> dict[str, str]:
+    """Environment for the drcode-interpreter fallback: the WORKTREE's
+    code must be what the checks import, never drcode's own checkout
+    (an editable install would otherwise shadow the resolved tree)."""
+    env = dict(os.environ)
+    src = worktree / "src"
+    parts = [str(src if src.is_dir() else worktree)]
+    if existing := env.get("PYTHONPATH"):
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 
 def _python_files(worktree: Path) -> list[str]:
@@ -265,12 +346,35 @@ def mechanical_checks(worktree: Path) -> list[CheckResult]:
                 output="\n".join(output)[:8000],
             )
         )
-    if shutil.which("ruff") is not None:
-        results.append(_run_checked("ruff check", ["ruff", "check", "."], worktree))
+    # ruff/pyright MUST come from the project's own environment: a random
+    # PATH binary carries a different default ruleset/version and reports
+    # phantom failures (e.g. DTZ005 from an old ruff) that roll back a
+    # correct resolution. Skipped (best-effort) when the project has none.
+    ruff_plan = _project_python(worktree, "ruff")
+    if ruff_plan is not None:
+        ruff_cmd, fix_path = ruff_plan
+        results.append(
+            _run_checked(
+                "ruff check",
+                [*ruff_cmd, "-m", "ruff", "check", "."],
+                worktree,
+                env=_worktree_pythonpath_env(worktree) if fix_path else None,
+            )
+        )
     else:
         results.append(CheckResult(name="ruff check", ok=True, skipped=True))
-    if shutil.which("pyright") is not None:
-        results.append(_run_checked("pyright", ["pyright"], worktree, timeout=900))
+    pyright_plan = _project_python(worktree, "pyright")
+    if pyright_plan is not None:
+        pyright_cmd, fix_path = pyright_plan
+        results.append(
+            _run_checked(
+                "pyright",
+                [*pyright_cmd, "-m", "pyright"],
+                worktree,
+                timeout=900,
+                env=_worktree_pythonpath_env(worktree) if fix_path else None,
+            )
+        )
     else:
         results.append(CheckResult(name="pyright", ok=True, skipped=True))
     return results
@@ -278,23 +382,32 @@ def mechanical_checks(worktree: Path) -> list[CheckResult]:
 
 def run_test_suite(worktree: Path, timeout: int = TEST_TIMEOUT) -> CheckResult:
     """Level 2 of the funnel: the project's test suite in the resolved
-    tree. `uv run pytest` when uv is available (it provisions the
-    project's own environment), the current interpreter's pytest as the
-    fallback. Skipped (never a failure) when the project has no tests
-    directory or no way to run pytest at all."""
+    tree, run with the project's OWN environment (`_project_python`) —
+    never a PATH pytest that cannot even `import drcode`. The xdist
+    fan-out is capped at 4 workers (a project whose addopts carry
+    `-n auto` would otherwise pin every core). Skipped (never a failure)
+    when the project has no tests directory or no usable pytest
+    environment at all."""
     if not (worktree / "tests").is_dir():
         return CheckResult(
             name="test suite", ok=True, skipped=True, output="no tests/ directory"
         )
-    if shutil.which("uv") is not None:
-        cmd = ["uv", "run", "--no-sync", "pytest", "-q", "-x"]
-    elif _pytest_importable():
-        cmd = [sys.executable, "-m", "pytest", "-q", "-x"]
-    else:
+    plan = _project_python(worktree, "pytest")
+    if plan is None:
         return CheckResult(
             name="test suite", ok=True, skipped=True, output="pytest unavailable"
         )
-    return _run_checked("test suite (pytest -q -x)", cmd, worktree, timeout=timeout)
+    python_cmd, fix_path = plan
+    args = ["-m", "pytest", "-q", "-x"]
+    if _module_importable(python_cmd, "xdist", worktree):
+        args += ["-n", "4"]
+    return _run_checked(
+        "test suite (pytest -q -x)",
+        [*python_cmd, *args],
+        worktree,
+        timeout=timeout,
+        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+    )
 
 
 def _pytest_importable() -> bool:

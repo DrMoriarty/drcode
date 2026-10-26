@@ -42,6 +42,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,11 +55,15 @@ __all__ = [
     "CheckResult",
     "build_agent_context",
     "conclude",
+    "failed_names",
+    "format_verify_report",
     "mechanical_checks",
     "prepare",
     "restore_conflict",
     "review_diffs",
     "run_test_suite",
+    "save_verify_report",
+    "verify_report_path",
 ]
 
 # Longest a single git/subprocess call may run (mirrors the engine).
@@ -298,6 +303,63 @@ def _pytest_importable() -> bool:
     except ImportError:
         return False
     return True
+
+
+def failed_names(results: list[CheckResult]) -> list[str]:
+    """The names of the checks that actually failed (a skipped check
+    never counts — it reports the absence of tooling, not a failure)."""
+    return [c.name for c in results if not c.ok and not c.skipped]
+
+
+# -- manual verification report ----------------------------------------------------
+
+
+def verify_report_path(project_root: Path, task_id: str) -> Path:
+    """Where the manual verification report of `task_id` is persisted —
+    next to the engine's triage report (`merge_engine.report_path`).
+    Rewritten on every manual `v` run of the ConflictScreen; survives
+    the screen being closed."""
+    return merge_engine.report_path(project_root, task_id).with_name(
+        f"{task_id}-verify.txt"
+    )
+
+
+def format_verify_report(checks: list[CheckResult], tests: CheckResult) -> str:
+    """The human-readable full report of one manual verification run
+    (the ConflictScreen's `v` funnel) — modeled on
+    `ResolverOutcome.summary()`: the verdict, one status line per check,
+    then every check's full captured output."""
+    all_checks = [*checks, tests]
+    ok = all(c.ok for c in all_checks)
+    lines = [f"Conflict resolution verification: {'PASSED' if ok else 'FAILED'}"]
+    failed = failed_names(all_checks)
+    if failed:
+        lines.append(f"failed checks: {', '.join(failed)}")
+    for c in all_checks:
+        lines.append("")
+        lines.append(c.line)
+        if c.output:
+            lines.append(textwrap.indent(c.output, "    "))
+    return "\n".join(lines) + "\n"
+
+
+def save_verify_report(
+    project_root: Path,
+    task_id: str,
+    checks: list[CheckResult],
+    tests: CheckResult,
+) -> Path | None:
+    """Persist the verification report (atomically, like the engine's
+    triage report); best-effort — None on failure."""
+    path = verify_report_path(project_root, task_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".txt.tmp")
+        tmp.write_text(format_verify_report(checks, tests), encoding="utf-8")
+        tmp.replace(path)
+        return path
+    except OSError:
+        return None
 
 
 def review_diffs(

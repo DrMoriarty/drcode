@@ -185,9 +185,18 @@ async def test_research_task_builds_agent_with_research_role_config(
     seen: list[tuple[str, str, str]] = []
     real_build_agent = pipeline_agent_run.build_agent
 
-    def spy_build_agent(config: Any, *, kind: Any = TaskKind.FEATURE, root: Any = None):
+    def spy_build_agent(
+        config: Any,
+        *,
+        kind: Any = TaskKind.FEATURE,
+        root: Any = None,
+        research_git: Any = None,
+    ):
         seen.append((kind.value, config.model, config.base_url))
-        return real_build_agent(config, kind=kind, root=root)
+        kwargs = {"kind": kind, "root": root}
+        if research_git is not None:
+            kwargs["research_git"] = research_git
+        return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
     set_project_custom_model(
@@ -1116,10 +1125,13 @@ async def test_threshold_livelock_counter_resets_on_under_threshold_observation(
     wide_compaction: None,
     scripted: ScriptedState,
 ) -> None:
-    """Healthy interleaving must not trip the threshold guard: a gate
-    observation under the threshold (a resumed turn that started below it)
-    resets the consecutive-compaction counter, so any number of spread-out
-    compactions stays allowed."""
+    """Healthy interleaving must not trip the threshold guard: a STREAK of
+    gate observations under the threshold (a resumed turn that measurably
+    progressed below it) resets the consecutive-compaction counter, so any
+    number of spread-out compactions stays allowed. A single under-threshold
+    observation does not reset it — the first one after a compaction is the
+    resumed segment's lagging reading by construction (see
+    _threshold_observation)."""
     from pydantic_ai.messages import (
         ModelRequest,
         ModelResponse,
@@ -1149,9 +1161,11 @@ async def test_threshold_livelock_counter_resets_on_under_threshold_observation(
     async with net_app_small_ctx.run_test() as pilot:
         await pilot.pause()
         for _ in range(5):
-            # One compaction, then a boundary observation under the
-            # threshold: the counter starts over every cycle.
+            # One compaction, then two boundary observations under the
+            # threshold: the streak proves the compaction durably landed
+            # and the counter starts over every cycle.
             assert await net_app_small_ctx._maybe_compact_tester_round(task, 850)
+            assert not await net_app_small_ctx._maybe_compact_tester_round(task, 500)
             assert not await net_app_small_ctx._maybe_compact_tester_round(task, 500)
             await pilot.pause()
             task.tester_messages[-1].append(
@@ -1170,6 +1184,91 @@ async def test_threshold_livelock_counter_resets_on_under_threshold_observation(
     assert task.id not in net_app_small_ctx._hard_limit_exhausted
     assert task.id not in net_app_small_ctx._compaction_failed
     assert not any("consecutive compactions" in t for t in event_texts(task))
+
+
+async def test_threshold_livelock_ignores_lagging_under_reading_of_resumed_round(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """The bench s4_compaction_tester regime: every compaction lands the
+    fill under the threshold, but the very next tool call re-crosses it.
+    The FIRST gate observation of every resumed round is under the threshold
+    BY CONSTRUCTION — its live usage reading predates the tool result that
+    re-crosses the threshold — so resetting the consecutive-compaction
+    counter on it keeps the counter at 1 forever: the pause→compact→resume
+    cycle repeats with zero progress until an external timeout kills the
+    run (no guard ever fires, each cycle a "successful" compaction). The
+    reset must be progress-gated: the counter accumulates over the cycles
+    and the gate stops after its budget with the diagnostic event."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    task.tester_messages = [
+        serialize_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content="Verify completed task #1")]
+                ),
+                ModelResponse(
+                    parts=[TextPart("working")],
+                    usage=RequestUsage(input_tokens=850, output_tokens=8),
+                ),
+            ]
+        )
+    ]
+    net_app_small_ctx.manager.storage.save(task)
+    # Far more summarizer steps than the livelock budget: an unguarded gate
+    # would consume them all (and keep going).
+    scripted.steps = [text_response("THE SUMMARY BODY") for _ in range(10)]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        for cycle in range(10):
+            # First tool boundary of the resumed round: the live usage
+            # reading still belongs to the request that saw only the
+            # compacted transcript — under the threshold. (The boundary
+            # site in run_tester feeds the same helper.)
+            net_app_small_ctx._threshold_observation(
+                task, None, net_app_small_ctx._tester_threshold_compactions
+            )
+            # Second boundary: the tool result re-crossed the threshold —
+            # the round pauses and the entry point compacts. The counter
+            # must accumulate (no reset happened): after the budget the
+            # gate stops compacting.
+            compacted = await net_app_small_ctx._maybe_compact_tester_round(task, 850)
+            assert compacted == (cycle < 3)
+            await pilot.pause()
+            task.tester_messages[-1].append(
+                serialize_messages(
+                    [
+                        ModelResponse(
+                            parts=[TextPart("more work")],
+                            usage=RequestUsage(input_tokens=850, output_tokens=8),
+                        )
+                    ]
+                )[0]
+            )
+
+    # Bounded: exactly the threshold-livelock budget of compactions ran,
+    # then the gate stopped — the remaining summarizer steps were never
+    # consumed.
+    assert len(scripted.calls) == 3
+    assert task.id in net_app_small_ctx._hard_limit_exhausted
+    assert task.id in net_app_small_ctx._compaction_failed
+    texts = event_texts(task)
+    diagnostics = [
+        t for t in texts if "cannot bring the testing round below the threshold" in t
+    ]
+    assert len(diagnostics) == 1
+    assert "max_context_tokens" in diagnostics[0]
 
 
 async def test_tester_round_compaction_mechanical_floor(

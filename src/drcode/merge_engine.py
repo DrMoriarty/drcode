@@ -254,6 +254,24 @@ class MergeReport:
         if self.up_to_date:
             return f"{self.branch} already contains {self.base_branch}"
         if not self.conflicted:
+            if self.fast_forward is None:
+                # A resumed merge fully staged but never concluded (or a
+                # finish() that refused): nothing is committed yet — the
+                # next step is the commit, not the fast-forward.
+                return (
+                    f"the merge of {self.base_branch} into {self.branch} "
+                    f"is resolved but NOT committed in {self.worktree} — "
+                    f"conclude it (commit), then `git merge --ff-only "
+                    f"{self.branch}` from the base checkout"
+                )
+            if not self.fast_forward:
+                # The branch holds nothing beyond the base tip — a
+                # --ff-only merge into the base would refuse.
+                return (
+                    f"{self.branch} holds no commits beyond "
+                    f"{self.base_branch} — there is nothing to merge "
+                    f"into the base"
+                )
             return (
                 f"merged {self.base_branch} into {self.branch} cleanly "
                 f"({self.worktree}); the merge into the base is now a "

@@ -19,9 +19,11 @@ from .deps import DependencyCommandsProvider
 from .merge import MergeCommandsProvider
 from .models import RoleModelsCommandsProvider, role_model_options_provider
 from .settings import (
+    WORKFLOW_PRESETS,
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
-    FinalizationOptionsProvider,
+    GitResearchOptionsProvider,
+    GitTesterOptionsProvider,
     IsolationOptionsProvider,
     ModelCatalogCommandProvider,
     ModelSettingsCommandProvider,
@@ -35,15 +37,22 @@ from .settings import (
     TaskSettingsCommandProvider,
     TaskSettingsEntriesProvider,
     TaskSettingsPalette,
+    VerificationOptionsProvider,
+    WorkflowPreset,
+    WorkflowPresetOptionsProvider,
     WorktreeRemovalOptionsProvider,
+    workflow_preset_for,
+    workflow_preset_label,
 )
 from .themes import ThemeOptionsProvider
 
 __all__ = [
+    "WORKFLOW_PRESETS",
     "DependencyCommandsProvider",
     "DevRoundsOptionsProvider",
     "EscAbortOptionsProvider",
-    "FinalizationOptionsProvider",
+    "GitResearchOptionsProvider",
+    "GitTesterOptionsProvider",
     "IsolationOptionsProvider",
     "MergeCommandsProvider",
     "ModelCatalogCommandProvider",
@@ -61,6 +70,11 @@ __all__ = [
     "TaskSettingsEntriesProvider",
     "TaskSettingsPalette",
     "ThemeOptionsProvider",
+    "VerificationOptionsProvider",
+    "WorkflowPreset",
+    "WorkflowPresetOptionsProvider",
     "WorktreeRemovalOptionsProvider",
     "role_model_options_provider",
+    "workflow_preset_for",
+    "workflow_preset_label",
 ]

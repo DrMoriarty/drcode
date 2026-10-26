@@ -19,7 +19,8 @@ reconstructed by reusing the exact wiring of `drcode.agent`
 (`build_agent` / `build_tester_agent` / `load_agents_md`) and
 `drcode.prompts` (`load_*_components`), so the tool set matches the role and
 kind (todo — FEATURE only, create_* — RESEARCH only, the tester's
-git_commit — only when the finalization setting allows commits) and the
+git_commit — only when the tester's git policy allows commits,
+git_commit_docs — only under a non-off research git policy) and the
 prompt matches the `.drcode/prompts/` overrides.
 """
 
@@ -39,6 +40,7 @@ from .prompts import (
     load_system_prompt_components,
     load_tester_prompt_components,
 )
+from .settings import GitPolicy
 from .transcript import (  # noqa: F401 - CHARS_PER_TOKEN is re-exported
     CHARS_PER_TOKEN,
     COMPACTION_SUMMARY_PREFIX,
@@ -73,12 +75,16 @@ def format_tokens(n: int) -> str:
 
 
 def system_components_coding(
-    kind: TaskKind, project_root: Path | None
+    kind: TaskKind,
+    project_root: Path | None,
+    research_git: GitPolicy = GitPolicy.PUSH,
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of a coding agent run: the base template
     (project override honored), the project's AGENTS.md and the git-workflow
-    rules — exactly what `build_agent` assembles into the instructions."""
-    base, git_workflow = load_system_prompt_components(kind, project_root)
+    rules — exactly what `build_agent` assembles into the instructions.
+    For research tasks `research_git` selects the git fragment (or none
+    under the OFF policy), matching `build_agent(research_git=...)`."""
+    base, git_workflow = load_system_prompt_components(kind, project_root, research_git)
     agents_md = load_agents_md(project_root) if project_root is not None else ""
     return [
         ("base template", base),
@@ -137,11 +143,16 @@ def tool_schemas(agent: Any) -> list[tuple[str, str]]:
 
 
 def coding_tool_schemas(
-    config: Config, kind: TaskKind, root: Path | None = None
+    config: Config,
+    kind: TaskKind,
+    root: Path | None = None,
+    research_git: GitPolicy = GitPolicy.PUSH,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
-    no network, pure wiring)."""
-    return tool_schemas(build_agent(config, kind=kind, root=root))
+    no network, pure wiring). `research_git` matches `build_agent`."""
+    return tool_schemas(
+        build_agent(config, kind=kind, root=root, research_git=research_git)
+    )
 
 
 def tester_tool_schemas(
@@ -508,13 +519,16 @@ def task_reports(
     live_tokens: int | None = None,
     tester_allow_commit: bool = True,
     tester_allow_push: bool = True,
+    research_git: GitPolicy = GitPolicy.PUSH,
 ) -> tuple[CtxReport | None, CtxReport | None, RunUsage, int]:
     """The two transcript reports of one task plus its whole-task cumulative
     exact usage.
 
     Development: `task.messages` measured against `dev_config` — the resolved
     config of the role serving the task (`_task_role`: research tasks run on
-    the research model, everything else on coding). Testing: the latest round
+    the research model, everything else on coding); `research_git` mirrors
+    the project's research git policy so prompt and tool set match the real
+    wiring. Testing: the latest round
     of `task.tester_messages` against `tester_config` (the rounds are
     separate contexts — the tester never sees the development transcript).
     """
@@ -524,8 +538,12 @@ def task_reports(
             f"Development ({dev_role_label})",
             task.messages,
             dev_config,
-            system_components=system_components_coding(task.kind, project_root),
-            tools=coding_tool_schemas(dev_config, task.kind, root=project_root),
+            system_components=system_components_coding(
+                task.kind, project_root, research_git
+            ),
+            tools=coding_tool_schemas(
+                dev_config, task.kind, root=project_root, research_git=research_git
+            ),
             exact_tokens=live_tokens,
         )
     tester: CtxReport | None = None

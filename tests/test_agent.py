@@ -46,6 +46,7 @@ from drcode.agent import (
 )
 from drcode.config import Config
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
+from drcode.settings import GitPolicy
 from drcode.task_manager import TaskManager
 from drcode.tools import PathViolation
 
@@ -853,6 +854,14 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
 
+def _git_out(repo: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+
+
 def _tester_deps(root: Path) -> agent_mod.TesterDeps:
     manager = TaskManager(root)
     task = manager.create("t", "x")
@@ -1175,6 +1184,41 @@ async def test_git_commit_docs_commits_only_tracked_files(tmp_path: Path) -> Non
     assert deps.manager.get(deps.task_id).edited_files == []
 
 
+async def test_git_commit_docs_local_policy_never_pushes(tmp_path: Path) -> None:
+    """Research git policy local: the commit happens, the push never —
+    even with a remote configured the result says the commit is local."""
+    _git_init_repo(tmp_path)
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "README.md").write_text("# readme")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("guide")
+    deps = _research_deps(tmp_path)
+    deps.manager.get(deps.task_id).edited_files[:] = ["docs/guide.md"]
+    origin = tmp_path / "origin.git"
+    _git_init_repo(origin, bare=True)
+    _git(tmp_path, "remote", "add", "origin", str(origin))
+    _git(tmp_path, "push", "-q", "origin", "HEAD")
+    branch = _git_out(tmp_path, "branch", "--show-current").strip()
+    remote_before = _git_out(tmp_path, "ls-remote", "origin", branch).split()[0]
+
+    result = await agent_mod._commit_tracked_files(
+        deps, tmp_path, "docs: add guide", allow_push=False
+    )
+
+    assert "Committed successfully" in result
+    assert "Commit is local — this project never pushes." in result
+    assert "Pushed successfully" not in result
+    # The commit landed locally, the remote branch did not move.
+    local_head = _git_out(tmp_path, "rev-parse", "HEAD").strip()
+    remote_after = _git_out(tmp_path, "ls-remote", "origin", branch).split()[0]
+    assert local_head != remote_before
+    assert remote_after == remote_before
+    assert sorted(_committed_files(tmp_path)) == ["docs/guide.md"]
+
+
 async def test_git_commit_docs_without_tracked_files(tmp_path: Path) -> None:
     _git_init_repo(tmp_path)
     _git(tmp_path, "config", "user.email", "t@t")
@@ -1242,6 +1286,32 @@ def test_git_commit_docs_tool_only_for_research(fake_config: Config) -> None:
         assert "git_commit_docs" not in _tool_names(ag)
 
 
+def test_git_commit_docs_tool_unregistered_under_off(fake_config: Config) -> None:
+    """Research git policy off: the tool is not registered at all — the
+    model cannot commit even if it tries (the prompt teaches no commit
+    step either)."""
+    from drcode.agent import build_agent
+
+    research = build_agent(
+        fake_config, kind=TaskKind.RESEARCH, research_git=GitPolicy.OFF
+    )
+    assert "git_commit_docs" not in _tool_names(research)
+    assert "search_task_history" in _tool_names(research)  # others stay
+    instructions = _instructions_text(research)
+    assert "git_commit_docs" not in instructions
+
+
+def test_git_commit_docs_tool_registered_under_local(fake_config: Config) -> None:
+    """Research git policy local: the tool stays registered (the commit
+    happens), only the push is dropped."""
+    from drcode.agent import build_agent
+
+    research = build_agent(
+        fake_config, kind=TaskKind.RESEARCH, research_git=GitPolicy.LOCAL
+    )
+    assert "git_commit_docs" in _tool_names(research)
+
+
 def test_search_task_history_tool_only_for_research(fake_config: Config) -> None:
     from drcode.agent import build_agent, build_tester_agent
 
@@ -1261,10 +1331,17 @@ def test_research_prompt_documents_task_search() -> None:
 
 
 def test_research_prompt_documents_commit_flow() -> None:
-    from drcode.agent import RESEARCH_SYSTEM_PROMPT
+    """The default research agent (git policy push) carries the push
+    fragment teaching git_commit_docs; the OFF policy strips the whole
+    git section from the prompt."""
+    from drcode.agent import RESEARCH_SYSTEM_PROMPT, load_system_prompt
 
-    assert "git_commit_docs" in RESEARCH_SYSTEM_PROMPT
-    assert "MUST finish the task by calling git_commit_docs" in RESEARCH_SYSTEM_PROMPT
+    assert "Documentation assignments" not in RESEARCH_SYSTEM_PROMPT
+    push = load_system_prompt(TaskKind.RESEARCH, research_git=GitPolicy.PUSH)
+    assert "git_commit_docs" in push
+    assert "MUST finish the task by calling git_commit_docs" in push
+    off = load_system_prompt(TaskKind.RESEARCH, research_git=GitPolicy.OFF)
+    assert "git_commit_docs" not in off
 
 
 # -- agent construction (no network calls) ------------------------------------------

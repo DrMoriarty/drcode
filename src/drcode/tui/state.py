@@ -43,17 +43,19 @@ from ..notifications import Notifier
 from ..providers import AgentRole, ModelRef
 from ..settings import (
     CompletedRetention,
+    GitPolicy,
     ProjectSettings,
     ProjectSettingsStore,
     StallNudge,
-    TaskFinalization,
     TaskIsolation,
+    Verification,
     WorktreeRemoval,
 )
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..workflow import WorkflowHooks
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
+from .command_providers import WorkflowPreset
 from .github_dialog import GitHubSetup
 from .header import ModelStatusHeader
 from .inputs import ChatInput, NewTaskInput
@@ -351,9 +353,25 @@ class DrCodeState(App[None]):
 
     def action_change_completed_retention(self) -> None: ...
 
-    def action_set_task_finalization(self, finalization: TaskFinalization) -> None: ...
+    def action_set_verification(self, verification: Verification) -> None: ...
 
-    def action_change_task_finalization(self) -> None: ...
+    def action_change_verification(self) -> None: ...
+
+    def action_set_git_tester(self, policy: GitPolicy) -> None: ...
+
+    def action_change_git_tester(self) -> None: ...
+
+    def action_set_git_research(self, policy: GitPolicy) -> None: ...
+
+    def action_change_git_research(self) -> None: ...
+
+    def action_set_workflow_preset(self, preset: WorkflowPreset) -> None: ...
+
+    def action_workflow_preset_custom(self) -> None: ...
+
+    def action_change_workflow_preset(self) -> None: ...
+
+    def workflow_preset_label(self) -> str: ...
 
     def action_set_worktree_removal(self, removal: WorktreeRemoval) -> None: ...
 
@@ -463,6 +481,13 @@ class DrCodeState(App[None]):
     def _compaction_due(self, task: Task) -> int | None: ...
 
     def _hard_limit_due(self, task: Task) -> bool: ...
+
+    def _threshold_observation(
+        self,
+        task: Task,
+        tokens: int | None,
+        counter: dict[str, int],
+    ) -> None: ...
 
     async def _maybe_compact(self, task: Task) -> None: ...
 
@@ -733,9 +758,14 @@ class DrCodeState(App[None]):
     _hard_limit_compactions: dict[str, int]
     # The same guard at the threshold level — one counter per layer (the
     # main agent's, the tester rounds' own): a stale count of one layer
-    # must never disable another layer's compaction gate.
+    # must never disable another layer's compaction gate. Reset is
+    # progress-gated (see _threshold_observation).
     _threshold_compactions: dict[str, int]
     _tester_threshold_compactions: dict[str, int]
+    # Progress streak toward the progress-gated reset of the threshold
+    # counters (consecutive under-threshold gate observations; see
+    # _threshold_observation).
+    _threshold_under_obs: dict[str, int]
     _last_follow: float
     _chat_epoch: int
 

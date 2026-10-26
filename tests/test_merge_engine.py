@@ -106,6 +106,36 @@ def test_task_branch_already_contains_base(repo: Path) -> None:
     assert report2.ok and report2.up_to_date
 
 
+def test_resumed_staged_merge_is_not_ff_ready(repo: Path) -> None:
+    """A merge resolved and staged but never committed (the screen was
+    closed mid-resolution): the re-run refuses to conclude anything —
+    ok + not conflicted, but NO merge commit exists, so `fast_forward`
+    stays None and the summary must not claim a clean merge."""
+    wt = _task_worktree(repo, "t1")
+    (wt / "app.py").write_text("task\nb\n")
+    _run(wt, "commit", "-qam", "task edit")
+    (repo / "app.py").write_text("main\nb\n")
+    _run(repo, "commit", "-qam", "main edit")
+    report = me.merge_base_into_worktree(repo, "t1", wt, "main")
+    assert report.conflicted
+
+    # Resolve and stage by hand, do NOT commit, re-run the prepare.
+    (wt / "app.py").write_text("resolved\nb\n")
+    _run(wt, "add", "app.py")
+    report2 = me.merge_base_into_worktree(repo, "t1", wt, "main")
+
+    assert report2.ok and not report2.conflicted
+    assert report2.fast_forward is None  # nothing concluded — no ff claim
+    assert me.in_progress(wt)  # the merge is still half-done
+    _head_before = _head(wt)
+    summary = report2.summary()
+    assert "NOT committed" in summary
+    assert "--ff-only" in summary
+    assert "cleanly" not in summary
+    # The branch tip did not move: only a commit concludes it.
+    assert _head(wt) == _head_before
+
+
 # -- the triage report -------------------------------------------------------------
 
 
@@ -457,3 +487,17 @@ def test_summary_shapes(repo: Path) -> None:
     refused.ok = False
     refused.message = "refused"
     assert refused.summary() == "refused"
+    # ok + not conflicted but the ff flag says NO: the branch holds
+    # nothing beyond the base — no "fast-forward" claim.
+    behind = me.MergeReport(
+        task_id="t1",
+        branch="drcode/t1",
+        base_branch="main",
+        worktree=str(wt),
+        ok=True,
+        fast_forward=False,
+        message="merged main into drcode/t1 cleanly",
+    )
+    behind_summary = behind.summary()
+    assert "no commits beyond main" in behind_summary
+    assert "fast-forward" not in behind_summary

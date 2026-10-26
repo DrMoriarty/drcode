@@ -226,8 +226,9 @@ class TaskStatusLayer(DrCodeState):
             role.value.upper(),
             self.project_root,
             live_tokens=self._live_ctx_tokens.get(task.id),
-            tester_allow_commit=self.settings.task_finalization.commits,
-            tester_allow_push=self.settings.task_finalization.pushes,
+            tester_allow_commit=self.settings.git_policy.tester.commits,
+            tester_allow_push=self.settings.git_policy.tester.pushes,
+            research_git=self.settings.git_policy.research,
         )
         self.push_screen(
             ContextDialog([r for r in (dev, tester) if r is not None], usage, requests)

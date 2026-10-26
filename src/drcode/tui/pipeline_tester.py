@@ -106,12 +106,19 @@ class PipelineTesterLayer(DrCodeState):
             # (crash before any snapshot) is skipped when rendering.
             if not resume_round:
                 task.tester_messages.append([])
+                # A fresh round starts with a clean threshold-livelock
+                # slate: the previous round's counter (and its
+                # under-threshold progress streak) must not fire the
+                # guard on this round's first compactions (see
+                # _threshold_observation).
+                self._tester_threshold_compactions.pop(task_id, None)
+                self._threshold_under_obs.pop(task_id, None)
                 if self.viewed_id == task_id:
                     self._write_history_line("testing-sep", "")
             # The tester verifies the task in ITS worktree (per-task
             # worktree isolation, see run_agent): the round runs against
             # exactly the tree the development agent worked in, and the
-            # TESTING_COMMIT finalization commits onto the task's branch.
+            # tester's git policy commits onto the task's branch.
             # A worktree lost to a manual deletion is recreated here (the
             # branch with the task's commits is re-checked-out).
             root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
@@ -119,8 +126,8 @@ class PipelineTesterLayer(DrCodeState):
                 self._show_event(task, f"Task isolation unavailable: {iso_note}")
             tester = build_tester_agent(
                 self.resolved_config(AgentRole.TESTER),
-                allow_commit=self.settings.task_finalization.commits,
-                allow_push=self.settings.task_finalization.pushes,
+                allow_commit=self.settings.git_policy.tester.commits,
+                allow_push=self.settings.git_policy.tester.pushes,
                 root=root,
                 # The external review (`.drcode/workflow.py` on_review)
                 # splits "the tester passed" from "the task is accepted":
@@ -330,15 +337,21 @@ class PipelineTesterLayer(DrCodeState):
                                     task.tester_messages[-1],
                                     AgentRole.TESTER,
                                 )
-                                if tokens is None:
-                                    # An observation under the threshold:
-                                    # the previous compaction (if any)
-                                    # landed — the threshold-livelock
-                                    # counter starts over (see
-                                    # _livelock_stop).
-                                    self._tester_threshold_compactions.pop(
-                                        task.id, None
-                                    )
+                                # Under the threshold: credit progress
+                                # toward the progress-gated reset of the
+                                # threshold-livelock counter — a single
+                                # observation proves nothing (the first
+                                # boundary of a resumed round reads the
+                                # compacted transcript's lagging live
+                                # usage, which predates the tool result
+                                # that re-crosses the threshold — see
+                                # _threshold_observation). Over it: the
+                                # streak breaks.
+                                self._threshold_observation(
+                                    task,
+                                    tokens,
+                                    self._tester_threshold_compactions,
+                                )
                                 hard_due = (
                                     tokens is not None
                                     and self._fill_over_hard_limit(

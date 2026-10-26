@@ -31,7 +31,23 @@ The screen is a viewer + decision pad, never an autonomous actor:
   resolution state is untouched), ``E`` opens the persisted full report
   in the user's editor, ``s`` commits the resolution on the task branch
   and ``a`` aborts the merge — both only behind an explicit second-press
-  confirmation, mirroring the armed-ESC convention of the app.
+  confirmation, mirroring the armed-ESC convention of the app. A
+  successful commit or ff-merge is the logical end of the work here:
+  the screen closes itself (the outcome toast outlives it).
+
+When the engine's auto-resolution left NOTHING to resolve AND the
+report vouches the fast-forward is real (`fast_forward is True` — a
+clean merge, an up-to-date branch or the rerere replay that concluded),
+the screen switches to its "ff-ready" mode instead: the
+resolution keys are disabled (the footer names them as unavailable) and
+``f`` becomes the one relevant action — it fast-forwards the MAIN
+checkout's base branch to `drcode/<id>` (`task_env.ff_merge_branch`).
+That is the contract's user-triggered half: the screen still never
+merges into the base on its own, only behind the explicit ``f`` press,
+and only `--ff-only` — a refusal (the base moved ahead, a dirty tree)
+is an error toast, never a conflicted merge to resolve in the user's
+tree; the user re-runs the reversed merge by reopening the screen. A
+successful ``f`` closes the screen, same as a successful ``s``.
 
 When the engine's auto-resolution left NOTHING to resolve (the report
 is ok and not conflicted — a clean merge, an up-to-date branch or the
@@ -90,7 +106,7 @@ from ..conflict import (
     Hunk,
     parse_hunks,
 )
-from ..merge_engine import MergeReport
+from ..merge_engine import MergeReport, is_fast_forward
 from ..merge_resolver import CheckResult
 
 if TYPE_CHECKING:
@@ -604,15 +620,36 @@ class ConflictScreen(ModalScreen[None]):
             self._update_footer()
             return
         if not report.conflicted:
-            # Nothing to resolve (clean merge / up to date / rerere
-            # replay): the branch is ready to be fast-forwarded into the
-            # base — the f action below does it on an explicit press.
-            self._ff_ready = True
-            self._set_title(
-                f"{report.message} — nothing to resolve; "
-                f"press f to merge {report.branch} into {report.base_branch} "
-                "(ff-only)"
-            )
+            # ff-ready ONLY when the engine vouches the fast-forward is
+            # actually possible (the base tip is an ancestor of the
+            # branch tip): ok+not-conflicted alone also covers a branch
+            # already contained in the base (a --ff-only merge would
+            # refuse) and a resumed merge staged but never concluded (no
+            # merge commit exists yet) — neither may offer f.
+            if report.fast_forward is True:
+                self._ff_ready = True
+                self._set_title(
+                    f"{report.message} — nothing to resolve; "
+                    f"press f to merge {report.branch} into "
+                    f"{report.base_branch} (ff-only)"
+                )
+                self._update_footer()
+                return
+            self._ff_ready = False
+            if report.fast_forward is False:
+                self._set_title(
+                    f"{report.message} — {report.branch} holds no commits "
+                    f"beyond {report.base_branch}; there is nothing to "
+                    "merge into the base"
+                )
+            else:
+                # fast_forward is None: the merge is resolved and staged
+                # in the worktree but not committed — s (not f) is the
+                # next step, and it stays live below.
+                self._set_title(
+                    f"#{self.task_id} — the merge is resolved but NOT "
+                    f"committed on {report.branch}; press s to commit it"
+                )
             self._update_footer()
             return
         self._ff_ready = False
@@ -1071,7 +1108,10 @@ class ConflictScreen(ModalScreen[None]):
                 f"`git merge --ff-only {branch}` finishes it"
             )
             self.notify(f"Committed on {branch}", title="Merge", timeout=5)
-            await self._reload_files()
+            # A successful commit is the screen's logical end of work —
+            # close it automatically (the toast outlives the screen; the
+            # abort path below already works the same way).
+            self.dismiss()
         else:
             self.notify(
                 f"Commit refused: {out}", title="Merge", severity="error", timeout=8
@@ -1122,6 +1162,19 @@ class ConflictScreen(ModalScreen[None]):
             return
         branch = report.branch or f"drcode/{self.task_id}"
         base = report.base_branch or "base"
+        # The base may have moved between the screen's prepare and this
+        # press — re-verify the ff-possibility at press time so the
+        # refusal names the reason instead of raw git output.
+        if not await asyncio.to_thread(is_fast_forward, app.project_root, branch, base):
+            self.notify(
+                f"git merge --ff-only {branch} into {base} refused: "
+                f"{base} is no longer an ancestor of {branch} (the base "
+                "moved ahead) — reopen the screen to re-run the merge there",
+                title="Merge",
+                severity="error",
+                timeout=8,
+            )
+            return
         ok, out = await asyncio.to_thread(env.ff_merge_branch, self.task_id)
         if not ok:
             # --ff-only refuses instead of conflicting: the base moved
@@ -1158,6 +1211,9 @@ class ConflictScreen(ModalScreen[None]):
         # ⎇ counter in one pass — the poll's fingerprint cache sees the
         # moved base and recomputes.
         await app._poll_git_indicator()
+        # A successful merge is the screen's logical end of work — close
+        # it automatically (the toast above outlives the screen).
+        self.dismiss()
 
     # -- refresh / close -----------------------------------------------------------
 

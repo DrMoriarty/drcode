@@ -51,9 +51,11 @@ from ..providers import (
 )
 from ..providers import resolve_effective as resolve_model_config
 from ..settings import (
+    GitPolicy,
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
+    Verification,
     WorktreeRemoval,
 )
 from ..task_env import TaskEnvironment
@@ -659,13 +661,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # below the transcript's irreducible floor; see _livelock_stop).
         self._hard_limit_compactions: dict[str, int] = {}
         # The same guard at the threshold level: consecutive threshold
-        # compactions per task with no gate observation under the threshold
-        # in between (every turn's growth re-crosses it — the bench
-        # live-lock of successful-but-useless compactions). One counter per
+        # compactions per task with no demonstrated progress under the
+        # threshold in between (every turn's growth re-crosses it — the
+        # bench live-lock of successful-but-useless compactions; the
+        # counter is reset only by _threshold_observation's progress
+        # streak). One counter per
         # layer: a stale count of one layer must never disable another
         # layer's gate.
         self._threshold_compactions: dict[str, int] = {}
         self._tester_threshold_compactions: dict[str, int] = {}
+        # Progress streak toward the threshold-livelock counter's reset:
+        # consecutive gate observations under the threshold since the last
+        # over-threshold one. The counter starts over only after
+        # _THRESHOLD_PROGRESS_OBS of them (the first observation of a
+        # resumed segment is under the threshold by construction — see
+        # _threshold_observation). One dict for all three layers: a task
+        # runs at most one of them at a time.
+        self._threshold_under_obs: dict[str, int] = {}
         # Monotonic stamp of the last coalesced follow-the-tail scroll while
         # streaming (see _stream_follow).
         self._last_follow = 0.0
@@ -1051,6 +1063,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 "but needs Task isolation: worktree (a git repository) — "
                 "tasks run one at a time until it is on.",
                 title="Parallel tasks",
+                severity="warning",
+                timeout=12,
+            )
+        if (
+            self.settings.verification is Verification.NONE
+            and self.settings.git_policy.tester is not GitPolicy.OFF
+        ):
+            # The tester's git policy is persisted even with no tester
+            # round (the user's choice is never rewritten silently) — but
+            # then it is dormant: warn at EVERY startup until verification
+            # is back on or the policy is switched to off.
+            self.notify(
+                "Verification is set to none, but the tester's Git "
+                f"policy ({self.settings.git_policy.tester.label}) is "
+                "saved — no tester runs, so nothing commits. Switch "
+                "Verification to tester or Git (tester) to off in "
+                "Settings (Ctrl+S).",
+                title="Git (tester)",
                 severity="warning",
                 timeout=12,
             )

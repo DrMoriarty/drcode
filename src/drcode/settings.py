@@ -48,53 +48,99 @@ RETENTION_OPTIONS: tuple[CompletedRetention, ...] = (
 )
 
 
-class TaskFinalization(str, enum.Enum):
-    """What happens to a task after its development round finishes.
+class Verification(str, enum.Enum):
+    """Whether the QA tester round runs at all (project setting).
 
-    TESTING_COMMIT: the tester verifies the project, commits the verified
-    changes and pushes them to the remote (push failure never fails the
-    task — it is only logged). TESTING_COMMIT_NO_PUSH: the tester commits
-    the verified changes but never pushes — the branch stays local.
-    TESTING: the tester verifies but never commits. NONE: no tester at
-    all — tasks go straight to COMPLETED.
+    TESTER (the default): after development the tester verifies the
+    project before the task completes. NONE: no tester at all —
+    development tasks go straight to COMPLETED when the agent finishes
+    (the same completion path research tasks have always used).
     """
 
-    TESTING_COMMIT = "testing_commit"
-    TESTING_COMMIT_NO_PUSH = "testing_commit_no_push"
-    TESTING = "testing"
+    TESTER = "tester"
     NONE = "none"
 
     @property
     def label(self) -> str:
         """Human-readable option label for the settings UI."""
-        if self is TaskFinalization.TESTING_COMMIT:
-            return "Testing + Git commit + push"
-        if self is TaskFinalization.TESTING_COMMIT_NO_PUSH:
-            return "Testing + Git commit"
-        if self is TaskFinalization.TESTING:
-            return "Testing"
-        return "None"
+        if self is Verification.TESTER:
+            return "tester"
+        return "none"
+
+
+VERIFICATION_OPTIONS: tuple[Verification, ...] = (
+    Verification.TESTER,
+    Verification.NONE,
+)
+
+
+class GitPolicy(str, enum.Enum):
+    """What git actions a role may take on the task's branch (project
+    setting, one per role — see `GitPolicySetting`).
+
+    OFF: the role never touches git — no tool is registered and the
+    system prompt promises no commit step (for the tester that means
+    verification only; for the research agent the edited files are still
+    tracked, but only for the "edited files" report). LOCAL: the role
+    commits to the task's branch `drcode/<id>` but never pushes — the
+    branch stays local. PUSH (the default): commit + push to the remote
+    (the historical behavior; a push failure is never fatal — logged
+    into the task's event log only).
+    """
+
+    OFF = "off"
+    LOCAL = "local"
+    PUSH = "push"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is GitPolicy.OFF:
+            return "off"
+        if self is GitPolicy.LOCAL:
+            return "commit locally"
+        return "commit + push"
 
     @property
     def commits(self) -> bool:
-        """Whether the tester is allowed to commit verified changes."""
-        return self in (
-            TaskFinalization.TESTING_COMMIT,
-            TaskFinalization.TESTING_COMMIT_NO_PUSH,
-        )
+        """Whether the role is allowed to commit at all."""
+        return self is not GitPolicy.OFF
 
     @property
     def pushes(self) -> bool:
-        """Whether the tester pushes the branch after committing."""
-        return self is TaskFinalization.TESTING_COMMIT
+        """Whether the role pushes the branch after committing."""
+        return self is GitPolicy.PUSH
 
 
-FINALIZATION_OPTIONS: tuple[TaskFinalization, ...] = (
-    TaskFinalization.TESTING_COMMIT,
-    TaskFinalization.TESTING_COMMIT_NO_PUSH,
-    TaskFinalization.TESTING,
-    TaskFinalization.NONE,
+GIT_POLICY_OPTIONS: tuple[GitPolicy, ...] = (
+    GitPolicy.PUSH,
+    GitPolicy.LOCAL,
+    GitPolicy.OFF,
 )
+
+
+class GitPolicySetting(BaseModel):
+    """Per-role git policies (persisted as a nested `git_policy` object
+    in settings.json). `tester` governs the QA tester's final commit;
+    `research` the research agent's git_commit_docs. The tester policy is
+    DORMANT while `verification` is NONE (no tester runs to commit
+    anything) — the value stays persisted (the user's choice is never
+    silently rewritten) and the app warns about the dormant mode at
+    startup, mirroring `parallel_tasks` under isolation off."""
+
+    tester: GitPolicy = GitPolicy.PUSH
+    research: GitPolicy = GitPolicy.PUSH
+
+
+# Legacy `task_finalization` values → (verification, git_policy.tester).
+# The research policy is NOT part of the legacy setting: it keeps its
+# default (push — the historical behavior) on migration.
+_LEGACY_FINALIZATION_MAP: dict[str, tuple[Verification, GitPolicy]] = {
+    "testing_commit": (Verification.TESTER, GitPolicy.PUSH),
+    "testing_commit_no_push": (Verification.TESTER, GitPolicy.LOCAL),
+    "testing": (Verification.TESTER, GitPolicy.OFF),
+    "none": (Verification.NONE, GitPolicy.PUSH),
+}
 
 
 # Options of the `max_dev_rounds` setting (the fix-loop cap), offered in the
@@ -303,7 +349,12 @@ GITHUB_SYNC_INTERVAL_OPTIONS: tuple[GitHubSyncInterval, ...] = (
 
 class ProjectSettings(BaseModel):
     completed_retention: CompletedRetention = CompletedRetention.DAYS_7
-    task_finalization: TaskFinalization = TaskFinalization.TESTING_COMMIT
+    # Whether the QA tester round runs at all (Verification docstring).
+    verification: Verification = Verification.TESTER
+    # Per-role git policies (GitPolicySetting docstring): what the tester
+    # and the research agent may do to git — nothing / local commit /
+    # commit + push. The tester slot is dormant while verification is NONE.
+    git_policy: GitPolicySetting = GitPolicySetting()
     # Fix-loop cap: how many consecutive development rounds the tester may
     # fail with a "the bug is this task's own change" verdict (retry_here)
     # before the failure completes the task as FAILED and the bug report is
@@ -388,6 +439,31 @@ class ProjectSettings(BaseModel):
     voice_language: str = ""
 
 
+def _migrate_legacy_finalization(data: dict) -> dict:
+    """Map the legacy flat `task_finalization` key onto the orthogonal
+    `verification` + `git_policy` fields (in place; the legacy key is
+    dropped so the next save writes only the new shape).
+
+    New keys win when both are present (a settings file already saved by
+    the new code carries no legacy key anyway). The research policy is
+    not part of the legacy setting and stays at its default.
+    """
+    legacy = data.pop("task_finalization", None)
+    if legacy is None:
+        return data
+    mapping = _LEGACY_FINALIZATION_MAP.get(legacy)
+    if mapping is None:
+        # Unknown legacy value: leave the new fields untouched (a stale
+        # key must not corrupt the current settings).
+        return data
+    verification, tester_policy = mapping
+    if "verification" not in data:
+        data["verification"] = verification.value
+    if "git_policy" not in data:
+        data["git_policy"] = {"tester": tester_policy.value}
+    return data
+
+
 class ProjectSettingsStore:
     """Loads/saves project settings from `<project>/.drcode/settings.json`."""
 
@@ -402,6 +478,8 @@ class ProjectSettingsStore:
         except (OSError, json.JSONDecodeError):
             # Corrupt settings must never keep the app from starting.
             return ProjectSettings()
+        if isinstance(data, dict):
+            data = _migrate_legacy_finalization(data)
         try:
             return ProjectSettings.model_validate(data)
         except ValidationError:

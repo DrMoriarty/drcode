@@ -39,6 +39,7 @@ from .prompts import (
     load_system_prompt,
     load_tester_prompt,
 )
+from .settings import GitPolicy
 from .task_manager import TaskManager
 from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
 from .transcript import _context_status, ctx_context_tokens
@@ -128,16 +129,30 @@ class ResolverDeps:
 
 
 def build_agent(
-    config: Config, kind: TaskKind = TaskKind.FEATURE, root: Path | None = None
+    config: Config,
+    kind: TaskKind = TaskKind.FEATURE,
+    root: Path | None = None,
+    research_git: GitPolicy = GitPolicy.PUSH,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
     new classes, research tasks answer questions / update docs. The research
     agent additionally gets the task-creation tools (bug reports and feature
     requests). When the project root contains AGENTS.md, its content is
-    appended to the instructions."""
+    appended to the instructions.
+
+    `research_git` (project git policy for the research role) applies to
+    research tasks only: PUSH (the default) registers git_commit_docs with
+    push; LOCAL keeps the tool but the commit stays local; OFF does not
+    register the tool at all and selects the fragment-free prompt — file
+    tracking (`task.edited_files`) stays on for the "edited files" report.
+    Feature/bug agents ignore the policy: they never commit themselves —
+    the tester commits their verified changes.
+    """
     model = agent_model.build_model(config)
-    instructions = load_system_prompt(kind, project_root=root)
+    instructions = load_system_prompt(
+        kind, project_root=root, research_git=research_git
+    )
     if root is not None:
         agents_md = load_agents_md(root)
         if agents_md.strip():
@@ -397,19 +412,51 @@ def build_agent(
             parameter of create_bug_report/create_feature_request."""
             return await _run_tool(_set_task_dependencies, ctx.deps, task_id, deps)
 
-        @agent.tool(sequential=True)
-        async def git_commit_docs(ctx: RunContext[AgentDeps], message: str) -> str:
-            """Commit and push the documentation changes you made in this task.
-            Stages EXACTLY the files you created or edited yourself (tracked
-            automatically by write_file/edit_file) — never any other change in
-            the working tree — commits them with the given message and pushes
-            the branch when a remote is configured. Call it once, when the
-            documentation assignment is complete; do NOT call it for pure
-            question-answering tasks where you changed no files. Skips
-            gracefully when the project root is not a git repository. A failed
-            push is NOT a failure: the commit stays safe locally, the error is
-            logged into the task's event log — mention it in your summary."""
-            return await _commit_tracked_files(ctx.deps, ctx.deps.root, message)
+        # The commit tool follows the project's research git policy:
+        # OFF registers nothing (the model cannot commit even if it
+        # tries); LOCAL keeps the tool but the shared body below commits
+        # locally and returns, skipping `_git_push` (mirrors the tester's
+        # allow_push wiring below). The docstring mirrors the policy too,
+        # exactly like the tester's git_commit variants.
+        if research_git is not GitPolicy.OFF:
+            if research_git is GitPolicy.PUSH:
+
+                @agent.tool(sequential=True)
+                async def git_commit_docs(
+                    ctx: RunContext[AgentDeps], message: str
+                ) -> str:
+                    """Commit and push the documentation changes you made in this task.
+                    Stages EXACTLY the files you created or edited yourself (tracked
+                    automatically by write_file/edit_file) — never any other change in
+                    the working tree — commits them with the given message and pushes
+                    the branch when a remote is configured. Call it once, when the
+                    documentation assignment is complete; do NOT call it for pure
+                    question-answering tasks where you changed no files. Skips
+                    gracefully when the project root is not a git repository. A failed
+                    push is NOT a failure: the commit stays safe locally, the error is
+                    logged into the task's event log — mention it in your summary."""
+                    return await _commit_tracked_files(
+                        ctx.deps, ctx.deps.root, message, allow_push=True
+                    )
+
+            else:
+
+                @agent.tool(sequential=True)
+                async def git_commit_docs(
+                    ctx: RunContext[AgentDeps], message: str
+                ) -> str:
+                    """Commit the documentation changes you made in this task — LOCALLY,
+                    this project never pushes. Stages EXACTLY the files you created or
+                    edited yourself (tracked automatically by write_file/edit_file) —
+                    never any other change in the working tree — and commits them with
+                    the given message. Do not push yourself and do not mention pushing.
+                    Call it once, when the documentation assignment is complete; do NOT
+                    call it for pure question-answering tasks where you changed no
+                    files. Skips gracefully when the project root is not a git
+                    repository."""
+                    return await _commit_tracked_files(
+                        ctx.deps, ctx.deps.root, message, allow_push=False
+                    )
 
         @agent.tool
         async def search_task_history(
@@ -489,11 +536,11 @@ def build_tester_agent(
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
-    `allow_commit=False` (project setting "Task finalization: Testing")
+    `allow_commit=False` (tester git policy: off)
     selects the commit-free system prompt and does not register the
     git_commit tool, so verified changes are left uncommitted.
-    `allow_push=False` (project setting "Task finalization: Testing + Git
-    commit") keeps the git_commit tool but it commits locally without ever
+    `allow_push=False` (tester git policy: local) keeps the git_commit
+    tool but it commits locally without ever
     pushing — the commit-only system prompt is selected. When `root`
     is given, its actual path is substituted into the system prompt header
     (the `{project_path}` placeholder). With `review_gate=True` (an
@@ -587,9 +634,9 @@ def build_tester_agent(
         )
         return f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
 
-    # The commit tool exists only when the project setting allows it: with
-    # "Task finalization: Testing" the model cannot commit even if it tries.
-    # "Testing + Git commit" keeps the tool but pushes nothing: the shared
+    # The commit tool exists only when the project's tester git policy
+    # allows it: with policy off the model cannot commit even if it
+    # tries. Policy local keeps the tool but pushes nothing: the shared
     # body below commits locally and returns, skipping `_git_push`.
     if allow_commit:
 

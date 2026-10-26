@@ -18,9 +18,18 @@ The screen is a viewer + decision pad, never an autonomous actor:
   hunk, ``e`` opens the file in the user's editor (or ``git mergetool``
   when no editor is configured), ``v`` runs the verification funnel of
   layer 2 (compile/ruff/pyright + the test suite) IN the worktree and
-  shows the result, ``s`` commits the resolution on the task branch and
-  ``a`` aborts the merge — both only behind an explicit second-press
+  shows the result (a failure is named check-by-check in the toast),
+  ``d`` opens the full output of the selected check in a log viewer
+  (``[`` / ``]`` step through the checks, ESC returns here — the
+  resolution state is untouched), ``E`` opens the persisted full report
+  in the user's editor, ``s`` commits the resolution on the task branch
+  and ``a`` aborts the merge — both only behind an explicit second-press
   confirmation, mirroring the armed-ESC convention of the app.
+
+Every ``v`` run also rewrites the full funnel report (verdict, status
+lines, complete check outputs — modeled on `ResolverOutcome.summary()`)
+to ``.drcode/merge_reports/<task-id>-verify.txt`` next to the engine's
+triage report, so the failure details survive the screen being closed.
 
 The contract holds unchanged: the commit lands on the task's own branch
 `drcode/<id>`; the merge into the user's checkout afterwards is a
@@ -58,6 +67,7 @@ from ..conflict import (
     parse_hunks,
 )
 from ..merge_engine import MergeReport
+from ..merge_resolver import CheckResult
 
 if TYPE_CHECKING:
     from .app import DrCodeApp
@@ -212,6 +222,123 @@ class ConflictView(ScrollView, can_focus=True):
         return Strip.blank(self.size.width)
 
 
+class CheckOutputView(ScrollView, can_focus=True):
+    """The raw output of one verification check: no-wrap line rendering
+    with virtual sizing computed from the longest line — pyright's lines
+    are wide, horizontal overflow scrolls instead of soft-wrapping (the
+    same line-API approach as `ConflictView`)."""
+
+    DEFAULT_CSS = """
+    CheckOutputView {
+        background: $surface;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._lines: list[str] = []
+
+    def set_output(self, text: str) -> None:
+        """Replace the shown output and scroll back to the top-left."""
+        self._lines = text.split("\n") if text else ["(no output)"]
+        self.virtual_size = Size(
+            max((len(line) for line in self._lines), default=1) + 2,
+            len(self._lines),
+        )
+        self.scroll_to(x=0, y=0, animate=False)
+        self.refresh()
+
+    def render_line(self, y: int) -> Strip:
+        line_no = self.scroll_offset.y + y
+        if 0 <= line_no < len(self._lines):
+            padded = ("  " + self._lines[line_no]).ljust(
+                max(self.virtual_size.width, self.size.width) - 2
+            )
+            return Strip([Segment(padded, None)])
+        return Strip.blank(self.size.width)
+
+
+class CheckDetailsScreen(ModalScreen[None]):
+    """Full-screen viewer of one check's raw output, pushed OVER the
+    ConflictScreen: esc returns without touching the resolution state
+    (the conflict screen stays mounted underneath), ``[`` / ``]`` step
+    through the check list — skipped checks show their explanatory
+    output ("no tests/ directory", "pytest unavailable")."""
+
+    BINDINGS: ClassVar = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("left_square_bracket", "prev_check", "Previous check", show=False),
+        Binding("right_square_bracket", "next_check", "Next check", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    CheckDetailsScreen {
+        align: center middle;
+    }
+    #check-details-dialog {
+        width: 95%;
+        max-width: 160;
+        height: 95%;
+        padding: 0 1 1 1;
+        background: $panel;
+        border: thick $accent;
+    }
+    #check-details-header {
+        height: 1;
+        padding: 0 1;
+        color: $text;
+        text-style: bold;
+    }
+    #check-details-view { height: 1fr; }
+    #check-details-footer {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, checks: list[CheckResult], index: int = 0) -> None:
+        super().__init__()
+        self._checks = checks
+        self._index = max(0, min(index, len(checks) - 1))
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="check-details-dialog"):
+            # markup=False: check names / the "[n/m]" counter would trip
+            # Rich markup.
+            yield Static("", id="check-details-header", markup=False)
+            yield CheckOutputView(id="check-details-view")
+            yield Static(
+                "[ ] prev/next check · arrows scroll · esc back",
+                id="check-details-footer",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        self._show()
+
+    def _show(self) -> None:
+        check = self._checks[self._index]
+        self.query_one("#check-details-header", Static).update(
+            f"[{self._index + 1}/{len(self._checks)}] {check.line}"
+        )
+        self.query_one("#check-details-view", CheckOutputView).set_output(check.output)
+
+    def action_prev_check(self) -> None:
+        if self._checks:
+            self._index = (self._index - 1) % len(self._checks)
+            self._show()
+
+    def action_next_check(self) -> None:
+        if self._checks:
+            self._index = (self._index + 1) % len(self._checks)
+            self._show()
+
+    def action_back(self) -> None:
+        self.dismiss()
+
+
 class FileItem(ListItem):
     """One row of the conflicted-file list; carries the path for the
     selection handler."""
@@ -231,6 +358,8 @@ class ConflictScreen(ModalScreen[None]):
         Binding("b", "resolve('both')", "Both", priority=True),
         Binding("e", "external_edit", "Edit", priority=True),
         Binding("v", "verify", "Check", priority=True),
+        Binding("d", "check_details", "Details", priority=True),
+        Binding("E", "open_report", "Report", priority=True),
         Binding("s", "commit", "Commit", priority=True),
         Binding("a", "abort_merge", "Abort", priority=True),
         Binding("r", "refresh_state", "Refresh", priority=True),
@@ -286,6 +415,10 @@ class ConflictScreen(ModalScreen[None]):
         self.wt: ConflictWorktree | None = None
         self._armed: str | None = None
         self._checks_ok: bool | None = None
+        # The last verification run (checks + the test suite), newest
+        # first-shown check ordered as in the panel — the details viewer
+        # reads from here.
+        self.check_results: list[CheckResult] = []
 
     # -- composition ------------------------------------------------------------
 
@@ -306,7 +439,7 @@ class ConflictScreen(ModalScreen[None]):
             yield Static("", id="merge-checks")
             yield Static(
                 "o/t/b hunk ours/theirs/both · e edit · v check · "
-                "s commit · a abort · r refresh · esc close",
+                "d details · E report · s commit · a abort · r refresh · esc close",
                 id="merge-footer",
             )
 
@@ -497,16 +630,79 @@ class ConflictScreen(ModalScreen[None]):
         worktree = self.wt.worktree
         checks = await asyncio.to_thread(merge_resolver.mechanical_checks, worktree)
         tests = await asyncio.to_thread(merge_resolver.run_test_suite, worktree)
-        self._checks_ok = all(c.ok for c in checks) and tests.ok
+        self.check_results = [*checks, tests]
+        self._checks_ok = all(c.ok for c in self.check_results)
         panel = self.query_one("#merge-checks", Static)
-        lines = [c.line for c in checks] + [tests.line]
+        lines = [c.line for c in self.check_results]
+        # The full funnel report is persisted next to the engine's triage
+        # report — blocking file IO, off the UI thread. Best-effort: a
+        # write failure just drops the path line, never the run itself.
+        report_path = await asyncio.to_thread(
+            merge_resolver.save_verify_report,
+            cast("DrCodeApp", self.app).project_root,
+            self.task_id,
+            checks,
+            tests,
+        )
+        if report_path is not None:
+            lines.append(f"Full report: {report_path}")
         panel.update("Checks:\n" + "\n".join(f"  {line}" for line in lines))
+        if self._checks_ok:
+            message = "All checks passed"
+        else:
+            failed = merge_resolver.failed_names(self.check_results)
+            message = "Checks FAILED: " + ", ".join(failed)
+            if report_path is not None:
+                message += f" — report: {report_path}"
         self.notify(
-            "All checks passed" if self._checks_ok else "Checks FAILED",
+            message,
             title="Merge",
             severity="information" if self._checks_ok else "error",
             timeout=5,
         )
+
+    def action_check_details(self) -> None:
+        """d: open the full output of a check in the details viewer —
+        defaulting to the first FAILED check when any failed."""
+        if not self.check_results:
+            self.notify("No checks yet — press v to run them", title="Merge", timeout=4)
+            return
+        start = 0
+        for index, check in enumerate(self.check_results):
+            if not check.ok and not check.skipped:
+                start = index
+                break
+        self.app.push_screen(CheckDetailsScreen(self.check_results, start))
+
+    def action_open_report(self) -> None:
+        """E: open the persisted verification report in the user's
+        editor (same suspend-and-subprocess pattern as `e`)."""
+        app = cast("DrCodeApp", self.app)
+        path = merge_resolver.verify_report_path(app.project_root, self.task_id)
+        if not path.exists():
+            self.notify(
+                "No report yet — press v to run the checks", title="Merge", timeout=4
+            )
+            return
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            self.notify(
+                "No editor configured ($VISUAL/$EDITOR)",
+                title="Merge",
+                severity="error",
+                timeout=5,
+            )
+            return
+        try:
+            with self.app.suspend():
+                subprocess.run([*editor.split(), str(path)], check=False)
+        except Exception as e:  # noqa: BLE001 - any launch failure is a toast
+            self.notify(
+                f"Editor failed: {type(e).__name__}: {e}",
+                title="Merge",
+                severity="error",
+                timeout=6,
+            )
 
     # -- commit / abort (armed, second-press confirmation) -----------------------
 

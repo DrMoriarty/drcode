@@ -13,18 +13,21 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from textual.widgets import Static
 
 from drcode import merge_engine as me
+from drcode import merge_resolver
 from drcode.conflict import (
     ConflictWorktree,
     parse_hunks,
 )
+from drcode.merge_resolver import CheckResult
 from drcode.models import TaskStatus
 from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
-from drcode.tui.merge_screen import ConflictScreen
+from drcode.tui.merge_screen import CheckDetailsScreen, ConflictScreen
 from tests.network_mocks import wait_until
 
 # -- shared fixtures (mirroring tests/test_merge_engine.py / test_unmerged_reminder.py)
@@ -272,9 +275,11 @@ async def test_screen_resolves_hunk_and_commits(
         screen = app.screen
         assert isinstance(screen, ConflictScreen)
         await wait_until(
-            lambda: screen.wt is not None
-            and bool(screen.files_list.children)
-            and screen.view.current_hunk() is not None,
+            lambda: (
+                screen.wt is not None
+                and bool(screen.files_list.children)
+                and screen.view.current_hunk() is not None
+            ),
             pilot=pilot,
             what="conflict screen prepared",
         )
@@ -426,3 +431,199 @@ async def test_screen_close(isolated: Path, configured_env: None) -> None:
         assert not isinstance(app.screen, ConflictScreen)
         assert me.in_progress(wt)
         assert task.status is TaskStatus.HOLD  # the screen touches no status
+
+
+# -- the verification report (merge_resolver helpers) --------------------------------
+
+
+def _canned_results() -> tuple[list[CheckResult], CheckResult]:
+    """One funnel run: compile ok, ruff FAILED, pyright skipped (with
+    its explanatory output), the test suite FAILED."""
+    checks = [
+        CheckResult(
+            name="compile (py_compile of tracked .py files)", ok=True, output=""
+        ),
+        CheckResult(name="ruff check", ok=False, output="app.py:1:1: F401 unused"),
+        CheckResult(name="pyright", ok=True, skipped=True, output="no node / npx"),
+    ]
+    tests = CheckResult(
+        name="test suite (pytest -q -x)",
+        ok=False,
+        output="FAILED tests/test_app.py::test_x - assert False",
+    )
+    return checks, tests
+
+
+def test_failed_names_lists_real_failures_only() -> None:
+    checks, tests = _canned_results()
+    assert merge_resolver.failed_names([*checks, tests]) == [
+        "ruff check",
+        "test suite (pytest -q -x)",
+    ]
+
+
+def test_format_verify_report_carries_full_output() -> None:
+    checks, tests = _canned_results()
+    text = merge_resolver.format_verify_report(checks, tests)
+    assert "Conflict resolution verification: FAILED" in text
+    assert "failed checks: ruff check, test suite (pytest -q -x)" in text
+    assert "app.py:1:1: F401 unused" in text  # the full ruff output
+    assert "assert False" in text  # the full pytest output
+    assert "no node / npx" in text  # skipped checks keep their explanation
+    # A clean (or fully skipped) run reads PASSED and names nothing.
+    ok_text = merge_resolver.format_verify_report(
+        [CheckResult(name="ruff check", ok=True, skipped=True, output="ruff missing")],
+        CheckResult(name="test suite (pytest -q -x)", ok=True),
+    )
+    assert "PASSED" in ok_text
+    assert "failed checks" not in ok_text
+
+
+def test_save_verify_report_overwrites_per_run(tmp_path: Path) -> None:
+    checks, tests = _canned_results()
+    path = merge_resolver.save_verify_report(tmp_path, "t1", checks, tests)
+    assert path == tmp_path / ".drcode" / "merge_reports" / "t1-verify.txt"
+    assert path is not None
+    assert "F401" in path.read_text()
+    # The next `v` run rewrites the report in place — with a clean run.
+    merge_resolver.save_verify_report(
+        tmp_path,
+        "t1",
+        [
+            CheckResult(
+                name="compile (py_compile of tracked .py files)", ok=True, output=""
+            ),
+            CheckResult(name="ruff check", ok=True),
+        ],
+        CheckResult(name="test suite (pytest -q -x)", ok=True),
+    )
+    rewritten = path.read_text()
+    assert "assert False" not in rewritten
+    assert "PASSED" in rewritten
+
+
+# -- the screen: failure toast, report file, details viewer ---------------------------
+
+
+async def test_verify_failure_names_checks_writes_report_and_opens_details(
+    isolated: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`v` with failing checks: the toast names them, the full funnel
+    report is persisted next to the triage report, and `d` opens the
+    details viewer on the first FAILED check — esc returns to the
+    resolution state untouched."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, wt = _parked_content_conflict(isolated, task.id)
+    checks, tests = _canned_results()
+    monkeypatch.setattr(merge_resolver, "mechanical_checks", lambda _wt: checks)
+    monkeypatch.setattr(merge_resolver, "run_test_suite", lambda _wt: tests)
+    app = DrCodeApp(isolated)
+
+    def toasts() -> list[str]:
+        return [n.message for n in app._notifications._notifications.values()]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and bool(screen.files_list.children),
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+
+        await pilot.press("v")
+        report = merge_resolver.verify_report_path(isolated, task.id)
+        await wait_until(
+            lambda: report.exists(), pilot=pilot, what="verify report written"
+        )
+        assert "F401" in report.read_text()
+        assert "assert False" in report.read_text()
+        # The toast names the failing checks by name (plus the report path).
+        await wait_until(
+            lambda: any(
+                "Checks FAILED: ruff check, test suite (pytest -q -x)" in message
+                and f"{task.id}-verify.txt" in message
+                for message in toasts()
+            ),
+            pilot=pilot,
+            what="named-failure toast",
+        )
+        # The panel stays a compact status list, but mentions the report.
+        panel_text = str(screen.query_one("#merge-checks", Static).content)
+        assert "ruff check: FAILED" in panel_text
+        assert f"Full report: {report}" in panel_text
+
+        # d opens the details viewer, defaulting to the first FAILED check.
+        await pilot.press("d")
+        await wait_until(
+            lambda: isinstance(app.screen, CheckDetailsScreen),
+            pilot=pilot,
+            what="details viewer open",
+        )
+        details = app.screen
+        assert isinstance(details, CheckDetailsScreen)
+        assert details._checks[details._index].name == "ruff check"
+        # [ / ] step through ALL checks, skipped included.
+        await pilot.press("]")
+        assert details._checks[details._index].name == "pyright"
+        await pilot.press("]")
+        assert details._checks[details._index].name == "test suite (pytest -q -x)"
+        await pilot.press("]")
+        assert details._checks[details._index].name.startswith("compile")
+        # esc returns to the conflict screen — resolution state intact.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is screen
+        assert me.in_progress(wt)
+        assert "<<<<<<<" in (wt / "app.py").read_text()
+
+
+async def test_details_key_without_checks_and_report_key_without_file(
+    isolated: Path, configured_env: None
+) -> None:
+    """`d` before any `v` run and `E` without a persisted report are
+    polite no-op toasts — never crashes, never a half-open viewer."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None, pilot=pilot, what="screen prepared"
+        )
+        await pilot.press("d")
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictScreen)
+        assert any(
+            "No checks yet" in m
+            for m in (n.message for n in app._notifications._notifications.values())
+        )
+        await pilot.press("E")
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictScreen)
+        assert any(
+            "No report yet" in m
+            for m in (n.message for n in app._notifications._notifications.values())
+        )
+        assert not isinstance(app.screen, CheckDetailsScreen)

@@ -247,6 +247,55 @@ class PipelineHooksLayer(DrCodeState):
             # configured for the resolver role, or a round is running).
             self._maybe_start_resolver(task.id)
 
+    async def _guard_wrong_fork_merge(self, task: Task, hook: str) -> bool:
+        """The git-cherry guard before an accept-hook merge: when the
+        task's branch contains commits whose PATCH-IDS are already on the
+        base branch (`git cherry` `-` lines), the branch was forked from
+        a wrong start point (a detached HEAD stranded mid-rebase — the
+        51f2efc8 incident: 3 of 4 branch commits were duplicates of
+        already-merged work) and an automatic merge would only drag the
+        duplicates through a conflict. The merge is NOT run: a service
+        event explains the situation, `task.hook_merge_failed` parks the
+        branch for manual analysis (the unmerged-work tracking — the
+        header counter and the startup reminder — picks it up; the
+        conflict resolver is deliberately NOT started: there is no parked
+        conflict to resolve, only a wrong fork point a human must judge).
+
+        Returns True when the merge was blocked (the caller skips the
+        hook). A fully-merged branch (`cherry` prints nothing — commits
+        reachable from the base are not listed at all) and the normal
+        one-task-commit-ahead case produce no duplicates and pass. The
+        check degrades to pass-through whenever git cannot answer."""
+        env = self.task_env
+        if not env.active:
+            return False
+        check = await asyncio.to_thread(env.duplicate_commits, task.id)
+        if check is None or not (check[0] > 0 and check[1] > 0):
+            # No duplicates, nothing to merge (fully merged), or git
+            # could not tell — the historical behavior applies.
+            return False
+        duplicates, ahead = check
+        branch = branch_for(task.id)
+        base = await asyncio.to_thread(env.base_branch)
+        text = (
+            f"{hook} SKIPPED: branch {branch} contains {duplicates} "
+            f"commit(s) whose changes are already present in {base} "
+            f"({ahead} other commit(s) ahead) — likely forked from a "
+            "wrong HEAD (e.g. a detached checkout mid-rebase). Automatic "
+            "merge blocked; rebase the branch onto the current tip or "
+            "cherry-pick the real work by hand."
+        )
+        self._show_event(task, text, kind="workflow")
+        if not task.hook_merge_failed:
+            task.hook_merge_failed = True
+            task.touch()
+            self.manager.storage.save(task)
+        # The chat may be open on another task — also raise a toast.
+        self.notify(
+            text, title="Suspicious task branch", severity="warning", timeout=12
+        )
+        return True
+
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the
         branch, …). Its text goes to the service-event log. Never fatal.
@@ -265,6 +314,8 @@ class PipelineHooksLayer(DrCodeState):
         # a background thread — the hook must observe the post-removal
         # state (branch-only worktree payload, directory really gone).
         await asyncio.to_thread(self.task_env.wait_removal, task.id)
+        if await self._guard_wrong_fork_merge(task, "on_accepted"):
+            return
         async with self._accept_hook_lock:
             cwd, wt = self._hook_env(task)
             result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
@@ -301,6 +352,8 @@ class PipelineHooksLayer(DrCodeState):
         # a background thread — the hook must observe the post-removal
         # state (branch-only worktree payload, directory really gone).
         await asyncio.to_thread(self.task_env.wait_removal, task.id)
+        if await self._guard_wrong_fork_merge(task, "on_research_accepted"):
+            return
         async with self._accept_hook_lock:
             project: dict[str, Any] = {"path": str(self.project_root)}
             if self.task_env.available:

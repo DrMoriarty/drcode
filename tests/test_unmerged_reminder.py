@@ -203,7 +203,10 @@ async def test_reminder_silent_when_merged_or_absent(app_env: DrCodeApp) -> None
         )
         await app._remind_unmerged_work(task)
         await pilot.pause()
-    assert event_texts(task) == []
+    # The only event is the branch-creation record (the worktree
+    # environment logs every drcode/<id> creation now); no REMINDER of
+    # unmerged work — the branch is merged.
+    assert not [t for t in event_texts(task) if "not merged" in t]
     assert not toasts
 
 
@@ -774,3 +777,121 @@ async def test_sidebar_row_marker_follows_merge_state(app_env: DrCodeApp) -> Non
         assert "✓" in plain
         assert "[orange]" not in plain and "[green]✓" not in plain
         await pilot.pause()
+
+
+# -- the wrong-fork guard before the accept-hook merge (git cherry) --------------------
+
+
+def _wrong_fork_branch(app: DrCodeApp, task: Any) -> None:
+    """Give the task's branch the incident shape: a patch-id TWIN of a
+    commit already on the base (the branch was forked before the base got
+    that change) plus one real commit. The two twin commits get distinct
+    timestamps — same-second commits with the same parent/tree collapse
+    into one SHA and would hide the shape."""
+    import os
+
+    root = app.project_root
+    wt, _ = app.task_env.ensure_root(task.id)
+    dates = {
+        "GIT_AUTHOR_DATE": "2024-01-01T00:00:00 +0000",
+        "GIT_COMMITTER_DATE": "2024-01-01T00:00:00 +0000",
+    }
+    twin_dates = {
+        "GIT_AUTHOR_DATE": "2024-01-02T00:00:00 +0000",
+        "GIT_COMMITTER_DATE": "2024-01-02T00:00:00 +0000",
+    }
+
+    def commit(cwd: Path, message: str, when: dict[str, str]) -> None:
+        subprocess.run(
+            ["git", "commit", "-q", "-m", message],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **when},
+        )
+
+    # Stage exactly x.txt: the main tree carries untracked-but-not-ignored
+    # .drcode/ files (workflow.py, settings.json) that `add -A` would pull
+    # into the base commit and break the patch-id match with the twin.
+    (root / "x.txt").write_text("x")
+    _git(root, "add", "x.txt")
+    commit(root, "add x", dates)
+    (wt / "x.txt").write_text("x")
+    _git(wt, "add", "x.txt")
+    commit(wt, "add x (task side)", twin_dates)
+    (wt / "y.txt").write_text("y")
+    _git(wt, "add", "-A")
+    commit(wt, "real task work", twin_dates)
+
+
+async def test_wrong_fork_branch_blocks_accept_hook(app_env: DrCodeApp) -> None:
+    """A task branch carrying patch-id duplicates of merged work (forked
+    from a wrong HEAD) is never auto-merged: the on_accepted hook is
+    skipped, the situation is explained in the service events and
+    `task.hook_merge_failed` parks the branch for manual analysis."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    _wrong_fork_branch(app, task)
+    toasts = track_toasts(app)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+    assert task.hook_merge_failed
+    reloaded = TaskManager(app.project_root).get(task.id)
+    assert reloaded.hook_merge_failed
+    events = "\n".join(event_texts(task))
+    assert "on_accepted SKIPPED" in events
+    assert "already present" in events
+    assert "on_accepted:\nmerged" not in events  # the hook never ran
+    assert any(title == "Suspicious task branch" for title, _ in toasts)
+
+
+async def test_wrong_fork_branch_blocks_research_hook(
+    app_env: DrCodeApp,
+) -> None:
+    """Same guard on the research completion path
+    (on_research_accepted)."""
+    app = app_env
+    _workflow_file(
+        app.project_root,
+        "def on_research_accepted(task):\n    return {'text': 'merged'}\n",
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app, kind=TaskKind.RESEARCH)
+    _wrong_fork_branch(app, task)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_research_accepted_hook(task)
+        await pilot.pause()
+    assert task.hook_merge_failed
+    events = "\n".join(event_texts(task))
+    assert "on_research_accepted SKIPPED" in events
+    assert "on_research_accepted:\nmerged" not in events
+
+
+async def test_normal_branch_still_merges_through_hook(
+    app_env: DrCodeApp,
+) -> None:
+    """The legitimate one-commit-ahead branch passes the git-cherry guard
+    and the accept hook runs as before (the dependency-gate scenario is
+    untouched: the guard only looks at patch-id duplicates)."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    commit_on_branch(app.task_env, task.id)
+    assert app.task_env.duplicate_commits(task.id) == (0, 1)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+    assert not task.hook_merge_failed
+    assert "on_accepted:\nmerged" in "\n".join(event_texts(task))

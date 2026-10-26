@@ -165,6 +165,10 @@ class PipelineResolverLayer(DrCodeState):
             # -- the agent round -----------------------------------------------------
             if not resume_round:
                 task.resolver_messages.append([])
+                # A fresh round starts with a clean threshold-livelock
+                # slate (see run_tester / _threshold_observation).
+                self._resolver_threshold_compactions.pop(task_id, None)
+                self._threshold_under_obs.pop(task_id, None)
                 if self.viewed_id == task_id:
                     self._write_history_line("resolving-sep", "")
             agent = build_resolver_agent(
@@ -266,12 +270,14 @@ class PipelineResolverLayer(DrCodeState):
                                 task.resolver_messages[-1],
                                 AgentRole.RESOLVER,
                             )
-                            if tokens is None:
-                                # An observation under the threshold: the
-                                # previous compaction (if any) landed — the
-                                # threshold-livelock counter starts over
-                                # (see _livelock_stop).
-                                self._resolver_threshold_compactions.pop(task.id, None)
+                            # Progress-gated threshold-livelock reset (a
+                            # single under-threshold observation proves
+                            # nothing — see _threshold_observation).
+                            self._threshold_observation(
+                                task,
+                                tokens,
+                                self._resolver_threshold_compactions,
+                            )
                             hard_due = (
                                 tokens is not None
                                 and self._fill_over_hard_limit(

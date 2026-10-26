@@ -127,24 +127,31 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
     }
     .voice-row { height: auto; }
     .voice-row Switch { margin-right: 1; }
+    /* TTS voice + announcement language share one row to save vertical
+       space; each half is a label-above-widget column. */
+    .voice-pair { height: auto; }
+    .voice-pair > Vertical { width: auto; height: auto; }
+    .voice-pair .voice-label { margin-top: 1; }
     #voice-tts-voice { width: 30; }
-    #voice-check-row { height: auto; margin-top: 1; }
-    #voice-check { width: auto; margin-right: 1; }
-    #voice-status {
-        height: auto;
-        min-height: 1;
-        margin-top: 1;
-        color: $text-muted;
-    }
-    #voice-status.ok { color: $success; }
-    #voice-status.error { color: $error; }
-    #voice-buttons {
+    /* Pinned footer (dock survives the dialog's scroll): Check + Save on
+       one line with the esc hint, the Check status line below it — both
+       always visible even when the form above is clipped/scrolling. */
+    #voice-footer {
         dock: bottom;
         height: auto;
         margin-top: 1;
         background: $panel;
     }
+    #voice-buttons { height: auto; }
+    #voice-check { width: auto; margin-right: 1; }
     #voice-save { width: auto; }
+    #voice-status {
+        height: auto;
+        min-height: 1;
+        color: $text-muted;
+    }
+    #voice-status.ok { color: $success; }
+    #voice-status.error { color: $error; }
     #voice-hint {
         width: 1fr;
         padding: 1 0 0 1;
@@ -225,19 +232,22 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
                 value=self._initial["tts_model"],
                 id="voice-tts-model",
             )
-            yield Static("TTS voice", classes="voice-label")
-            yield Input(
-                placeholder=DEFAULT_TTS_VOICE,
-                value=self._initial["tts_voice"],
-                id="voice-tts-voice",
-            )
-            yield Static("Announcement language", classes="voice-label")
-            yield Select(
-                LANGUAGE_OPTIONS,
-                value=self._language,
-                allow_blank=False,
-                id="voice-lang",
-            )
+            with Horizontal(classes="voice-pair"):
+                with Vertical():
+                    yield Static("TTS voice", classes="voice-label")
+                    yield Input(
+                        placeholder=DEFAULT_TTS_VOICE,
+                        value=self._initial["tts_voice"],
+                        id="voice-tts-voice",
+                    )
+                with Vertical():
+                    yield Static("Announcement language", classes="voice-label")
+                    yield Select(
+                        LANGUAGE_OPTIONS,
+                        value=self._language,
+                        allow_blank=False,
+                        id="voice-lang",
+                    )
             yield Static("Announce (TTS)", classes="voice-label")
             with Horizontal(classes="voice-row"):
                 yield Switch(
@@ -258,12 +268,12 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
                     id="voice-tts-queue-empty",
                 )
                 yield Static("queue empty", classes="voice-label")
-            with Horizontal(id="voice-check-row"):
-                yield Button("Check", variant="default", id="voice-check")
+            with Vertical(id="voice-footer"):
+                with Horizontal(id="voice-buttons"):
+                    yield Button("Check", variant="default", id="voice-check")
+                    yield Button("Save", variant="primary", id="voice-save")
+                    yield Static("esc — close without saving", id="voice-hint")
                 yield Static("", id="voice-status")
-            with Horizontal(id="voice-buttons"):
-                yield Button("Save", variant="primary", id="voice-save")
-                yield Static("esc — close without saving", id="voice-hint")
 
     def on_mount(self) -> None:
         self.query_one("#voice-url", Input).focus()

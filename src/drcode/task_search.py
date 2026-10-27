@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -489,6 +490,7 @@ def first_prompt_snippet(text: str, cap: int = SNIPPET_MAX) -> str:
 
 def load_archive(
     project_root: Path,
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
     """Read the whole task archive into memory.
 
@@ -498,14 +500,19 @@ def load_archive(
     the archive's identity, `data["id"]` is only a copy of it. BLOCKING
     file I/O: callers on an event loop must run this in a worker thread
     (the TUI dialog reads it once per session and filters in memory).
+
+    *progress*, when given, is called after every processed file with
+    (done, total) counts — the caller owns any throttling/UI marshalling
+    (the callback fires on THIS thread, right inside the blocking loop).
     """
     tasks_dir = Path(project_root) / PROJECT_STATE_DIRNAME / "tasks"
     try:
         paths = sorted(tasks_dir.glob("*.json"))
     except OSError:
         return []
+    total = len(paths)
     records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]] = []
-    for path in paths:
+    for done, path in enumerate(paths, 1):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
@@ -513,6 +520,8 @@ def load_archive(
         if not isinstance(data, dict):
             continue
         records.append((path.stem, data, _indexed_fields(path.stem, data)))
+        if progress is not None:
+            progress(done, total)
     return records
 
 

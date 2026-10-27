@@ -36,6 +36,8 @@ The dialog has no return value
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -43,11 +45,14 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Input, ListView, Static
 
 from .. import task_search
 from ..task_search import TaskHit
+from .blocks import _SPINNER_FRAMES, _SPINNER_INTERVAL
 from .sidebar import TaskItem
 
 # Keystroke debounce: the in-memory filtering is cheap, but re-rendering
@@ -138,6 +143,15 @@ class SearchDialog(ModalScreen[None]):
             list[tuple[str, dict[str, Any], list[tuple[str, str]]]] | None
         ) = None
         self._search_timer = None
+        # Loading-indicator state: a braille spinner + elapsed-seconds
+        # timer + real progress counts (see _load_archive). The timer
+        # lives until the load worker finishes OR the dialog is torn
+        # down, whichever comes first.
+        self._load_start = 0.0
+        self._spin_timer: Timer | None = None
+        self._spin_frame = 0
+        self._load_done = 0
+        self._load_total = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="srch-dialog"):
@@ -154,21 +168,90 @@ class SearchDialog(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self.query_one("#srch-input", Input).focus()
-        self._set_status("Loading task archive…")
+        self._start_loading_indicator()
         self.run_worker(self._load_archive(), exclusive=True, group="srch-load")
 
+    def on_unmount(self) -> None:
+        # The dialog may be dismissed while the load worker is still
+        # running (escape during the ~20s cold load) — the timer must
+        # not outlive the dialog (it is stopped by the teardown anyway,
+        # the explicit stop just makes that contract obvious).
+        self._stop_loading_indicator()
+
     def action_cancel(self) -> None:
+        self._stop_loading_indicator()
         self.dismiss(None)
+
+    # -- loading indicator (spinner + elapsed + progress) ----------------------
+
+    def _start_loading_indicator(self) -> None:
+        """Animate #srch-status while the archive loads: a braille frame
+        (same set/intervals as ReasoningBlock's thinking spinner), the
+        elapsed seconds next to it and, once the progress callback starts
+        arriving, the indexed-files count — the user sees the dialog is
+        alive during the multi-second cold load."""
+        self._load_start = time.monotonic()
+        self._spin_frame = 0
+        self._render_loading_status()
+        self._spin_timer = self.set_interval(
+            _SPINNER_INTERVAL, self._spin_loading_status
+        )
+
+    def _stop_loading_indicator(self) -> None:
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+
+    def _spin_loading_status(self) -> None:
+        self._spin_frame = (self._spin_frame + 1) % len(_SPINNER_FRAMES)
+        if self.is_attached:
+            self._render_loading_status()
+
+    def _render_loading_status(self) -> None:
+        elapsed = int(time.monotonic() - self._load_start)
+        if self._load_total:
+            text = f"Индексация… {self._load_done}/{self._load_total} · {elapsed} с"
+        else:
+            text = f"Загрузка архива… {elapsed} с"
+        # Teardown race: the timer (and the worker's progress callback)
+        # can fire after the dialog's DOM is parsed away — drop the
+        # write (same pattern as _poll_activity in chat_timeline).
+        try:
+            self._set_status(f"{_SPINNER_FRAMES[self._spin_frame]} {text}")
+        except NoMatches:
+            pass
+
+    def _on_load_progress(self, done: int, total: int) -> None:
+        """Progress callback, marshalled onto the event loop by
+        call_from_thread; fires on the worker thread inside the blocking
+        read loop, so it must never touch the DOM directly."""
+        self._load_done = done
+        self._load_total = total
 
     # -- archive loading (worker thread) --------------------------------------
 
     async def _load_archive(self) -> None:
-        records = await asyncio.to_thread(task_search.load_archive, self._project_root)
+        def progress(done: int, total: int) -> None:
+            # call_from_thread raises RuntimeError once the app/loop is
+            # gone (dialog dismissed → app exit) — progress is cosmetic,
+            # never fatal.
+            with suppress(RuntimeError):
+                self.app.call_from_thread(self._on_load_progress, done, total)
+
+        records = await asyncio.to_thread(
+            task_search.load_archive, self._project_root, progress
+        )
         self._records = records
-        self._set_status("")
-        # The user may have typed while the archive was loading — run the
-        # pending query now.
-        self._run_search_now()
+        self._stop_loading_indicator()
+        try:
+            self._set_status("")
+            # The user may have typed while the archive was loading — run
+            # the pending query now.
+            self._run_search_now()
+        except NoMatches:
+            # The dialog was dismissed before the load finished: the
+            # records are dropped with it, nothing left to render into.
+            return
 
     # -- debounced in-memory search -------------------------------------------
 

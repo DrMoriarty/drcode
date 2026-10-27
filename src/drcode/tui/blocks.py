@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -457,6 +458,11 @@ class ToolCallBlock(Static):
         self.at = at or datetime.now()
         self._spin_timer: Timer | None = None
         self._spin_frame = 0
+        # Elapsed-execution counter: monotonic start of the running call and
+        # the value frozen by stop_spinner() (kept in the header afterwards —
+        # how long the call took is more useful than no number at all).
+        self._run_started: float | None = None
+        self._elapsed_frozen: float | None = None
         # Highlighted-JSON body, computed lazily on first expand (the
         # pygments pass is not free and a collapsed block never shows it);
         # width-independent, so it survives terminal resizes.
@@ -469,11 +475,15 @@ class ToolCallBlock(Static):
         switched away) — stops it."""
         if self._spin_timer is None:
             self._spin_timer = self.set_interval(_SPINNER_INTERVAL, self._spin)
+            self._run_started = time.monotonic()
+            self._elapsed_frozen = None
 
     def stop_spinner(self) -> None:
         if self._spin_timer is not None:
             self._spin_timer.stop()
             self._spin_timer = None
+            if self._run_started is not None and self._elapsed_frozen is None:
+                self._elapsed_frozen = time.monotonic() - self._run_started
         if self.is_attached:
             self._redraw()
 
@@ -537,6 +547,23 @@ class ToolCallBlock(Static):
         # changes (terminal resize).
         self._redraw()
 
+    def _elapsed_text(self) -> str:
+        """The " · 12s" header suffix while the call runs (live counter,
+        fed by the same tick as the spinner frames) and the frozen value
+        after stop_spinner(); "" when the call never ran."""
+        if self._spin_timer is not None:
+            if self._run_started is None:
+                return ""
+            seconds = time.monotonic() - self._run_started
+        elif self._elapsed_frozen is not None:
+            seconds = self._elapsed_frozen
+        else:
+            return ""
+        total = int(seconds)
+        if total >= 60:
+            return f" · {total // 60}m{total % 60:02d}s"
+        return f" · {total}s"
+
     def _redraw(self) -> None:
         # Plain Text, not a markup string — tool arguments are model JSON and
         # may contain bracket sequences Textual's markup parser takes for tags.
@@ -545,6 +572,9 @@ class ToolCallBlock(Static):
             _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "⚙"
         )
         text = Text(f"{arrow} {marker} {self._header}")
+        elapsed = self._elapsed_text()
+        if elapsed:
+            text.append(elapsed, "dim")
         _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
         if not self.has_class("collapsed") and self._args:
             if self._body is None:

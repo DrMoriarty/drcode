@@ -35,6 +35,7 @@ from .agent_tools import (
     _commit_tracked_files,
     _git_push,
     _retry_failed_here,
+    _run_project_check,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -76,6 +77,13 @@ from .prompts import (
 )
 from .service_events import log_service_event
 from .service_events import log_violation as _log_violation
+from .subagents import (
+    SubagentDeps,
+    SubagentGate,
+    build_subagent_agent,
+    run_delegate_tool,
+    subagent_limit_for,
+)
 from .task_manager import TaskManager
 from .tool_runtime import (
     _run_bash_logged,
@@ -118,6 +126,8 @@ __all__ = [
     "ModelFetchError",
     "ResolutionVerdict",
     "ResolverDeps",
+    "SubagentDeps",
+    "SubagentGate",
     "TaskManager",
     "TesterDeps",
     "_commit_tracked_files",
@@ -126,6 +136,7 @@ __all__ = [
     "_log_violation",
     "_retry_failed_here",
     "_run_bash_logged",
+    "_run_project_check",
     "_run_tool",
     "_run_tool_logged",
     "_set_task_dependencies",
@@ -141,6 +152,7 @@ __all__ = [
     "build_reduce_prompt",
     "build_resolver_agent",
     "build_resolver_reviewer_agent",
+    "build_subagent_agent",
     "build_tester_agent",
     "chunk_history_for_summary",
     "compacted_messages",
@@ -167,10 +179,12 @@ __all__ = [
     "render_history_for_summary",
     "resumable_history",
     "run_context_tokens",
+    "run_delegate_tool",
     "sanitized_messages",
     "serialize_messages",
     "slice_budget_tokens",
     "split_original_prompts",
+    "subagent_limit_for",
     "task_search",
     "todo_dynamic_instructions",
     "todo_instructions",

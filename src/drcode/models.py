@@ -164,6 +164,20 @@ class Task(BaseModel):
     # agent resumes the attempt without new user text on the next
     # activation (run_agent's continuation turn).
     unfinished: bool = False
+    # The worktree-isolation mode this task is PINNED to, stamped at its
+    # FIRST activation (None = never activated — the live `task_isolation`
+    # setting decides). True/False freeze the mode for the task's whole
+    # lifetime, including re-queueing a COMPLETED task with new input: the
+    # user may toggle the setting mid-task, and a run boundary (unfinished
+    # resume, tester round, conflict resolver) that re-read the live value
+    # would silently move the work — a tester would verify an empty worktree
+    # forked from the branch tip while the coder's uncommitted changes sit
+    # in the main checkout, or the mirror image (a run jumping from the
+    # task's worktree to a main checkout that has none of its work).
+    # Persisted with the task, so the pin survives restarts; the pin dies
+    # with the task. Old task files load with None and stamp on their next
+    # activation (no migration).
+    isolation_pinned: bool | None = None
     # Set while the agent is waiting for the user to answer a question.
     clarification: Clarification | None = None
     # Service events (tester/agent failures, skips) with timestamps. Human

@@ -622,3 +622,138 @@ def test_search_tasks_ranking_matches_search(project_root: Path) -> None:
     hits = search_tasks(project_root, ["alpha", "beta"])
     assert [h.task_id for h in hits] == [strong.id, weak.id]
     assert hits[0].score > hits[1].score
+
+
+# -- incremental archive cache (load_archive) ---------------------------------
+
+
+def test_load_archive_is_incremental(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm searches reuse cached records; only files whose (mtime_ns, size)
+    changed get re-read and re-parsed."""
+    import os
+
+    from drcode.task_search import _extract_record
+
+    a = _task(title="alpha one")
+    b = _task(title="beta two")
+    _write_task(project_root, a)
+    _write_task(project_root, b)
+
+    calls: list[str] = []
+    real = _extract_record
+    monkeypatch.setattr(
+        task_search,
+        "_extract_record",
+        lambda task_id, data: (calls.append(task_id), real(task_id, data))[1],
+    )
+
+    first = task_search.load_archive(project_root)
+    assert sorted(task_id for task_id, _, _ in first) == sorted([a.id, b.id])
+    assert sorted(calls) == sorted([a.id, b.id])  # cold: both parsed
+
+    calls.clear()
+    second = task_search.load_archive(project_root)
+    assert calls == []  # warm: nothing re-parsed
+    assert sorted(task_id for task_id, _, _ in second) == sorted([a.id, b.id])
+
+    # A mtime-only touch re-parses exactly that file (a +2s bump is coarse
+    # enough for any filesystem's timestamp granularity).
+    path = project_root / ".drcode" / "tasks" / f"{a.id}.json"
+    stat = path.stat()
+    bumped = stat.st_mtime_ns + 2_000_000_000
+    os.utime(path, ns=(bumped, bumped))
+    calls.clear()
+    task_search.load_archive(project_root)
+    assert calls == [a.id]
+
+    # Changed content: the file is re-parsed and its reduced data refreshed.
+    _write_task(project_root, _task(id=a.id, title="alpha renamed"))
+    calls.clear()
+    records = task_search.load_archive(project_root)
+    assert calls == [a.id]
+    data = next(d for task_id, d, _ in records if task_id == a.id)
+    assert data["title"] == "alpha renamed"
+
+    # A new file: only the newcomer is parsed.
+    c = _task(title="gamma three")
+    _write_task(project_root, c)
+    calls.clear()
+    records = task_search.load_archive(project_root)
+    assert calls == [c.id]
+    assert sorted(task_id for task_id, _, _ in records) == sorted([a.id, b.id, c.id])
+
+    # A deleted file drops out of the (re)cached results without a parse.
+    (project_root / ".drcode" / "tasks" / f"{b.id}.json").unlink()
+    calls.clear()
+    records = task_search.load_archive(project_root)
+    assert calls == []
+    assert sorted(task_id for task_id, _, _ in records) == sorted([a.id, c.id])
+
+
+def test_load_archive_records_are_reduced(project_root: Path) -> None:
+    """Cached records hold the search-relevant fields only — the raw
+    transcript is extracted at build time and never kept in memory."""
+    task = _task(
+        title="reduced check",
+        messages=[
+            {"parts": [{"part_kind": "user-prompt", "content": "hello index"}]},
+            {"parts": [{"part_kind": "text", "content": "final answer"}]},
+        ],
+    )
+    _write_task(project_root, task)
+    records = task_search.load_archive(project_root)
+    assert len(records) == 1
+    task_id, data, fields = records[0]
+    assert task_id == task.id
+    assert "messages" not in data
+    assert "tester_messages" not in data
+    assert data["prompts"] == ["hello index"]
+    assert ("prompt", "hello index") in fields
+    assert ("summary", "final answer") in fields
+    # A warm reload reuses the SAME reduced record (no transcript anywhere).
+    again = task_search.load_archive(project_root)
+    assert again[0] is records[0]
+
+
+def test_load_archive_survives_broken_cache(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupted/foreign cache entry is quietly rebuilt from disk — the
+    load_one contract, never fatal."""
+    task = _task(title="cache casualty")
+    _write_task(project_root, task)
+    task_search.load_archive(project_root)  # warm the real cache first
+
+    monkeypatch.setitem(
+        task_search._ARCHIVE_CACHES, str(project_root), {"junk": object()}
+    )
+    records = task_search.load_archive(project_root)
+    assert [task_id for task_id, _, _ in records] == [task.id]
+    assert records[0][1]["title"] == "cache casualty"
+    # The cache is healed: the next call is warm and identical.
+    assert task_search.load_archive(project_root)[0] is records[0]
+
+
+def test_load_archive_skips_corrupted_files(project_root: Path) -> None:
+    """A corrupted task file is skipped silently and never poisons the
+    cache — fixing the file makes it visible again without a restart."""
+    good = _task(title="good task")
+    _write_task(project_root, good)
+    bad_path = project_root / ".drcode" / "tasks" / "badjob.json"
+    bad_path.parent.mkdir(parents=True, exist_ok=True)
+    bad_path.write_text("{not json", encoding="utf-8")
+
+    records = task_search.load_archive(project_root)
+    assert [task_id for task_id, _, _ in records] == [good.id]
+
+    records = task_search.load_archive(project_root)
+    assert [task_id for task_id, _, _ in records] == [good.id]  # warm, still
+
+    bad_path.write_text(
+        _task(id="badjob", title="repaired task").model_dump_json(),
+        encoding="utf-8",
+    )
+    records = task_search.load_archive(project_root)
+    assert sorted(task_id for task_id, _, _ in records) == sorted([good.id, "badjob"])

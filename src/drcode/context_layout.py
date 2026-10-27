@@ -96,12 +96,19 @@ def system_components_coding(
 def system_components_tester(
     allow_commit: bool, project_root: Path | None, allow_push: bool = True
 ) -> list[tuple[str, str | None]]:
-    """Labeled system-prompt pieces of the tester run (the tester prompt
-    carries no AGENTS.md — `build_tester_agent` never appends it)."""
+    """Labeled system-prompt pieces of the tester run: the base template
+    (project override honored), the project's AGENTS.md and the git-workflow
+    rules — exactly what `build_tester_agent` assembles into the
+    instructions."""
     base, git_workflow = load_tester_prompt_components(
         allow_commit, project_root, allow_push
     )
-    return [("base template", base), ("git workflow", git_workflow)]
+    agents_md = load_agents_md(project_root) if project_root is not None else ""
+    return [
+        ("base template", base),
+        ("AGENTS.md", agents_md.strip() or None),
+        ("git workflow", git_workflow),
+    ]
 
 
 def _tool_schema_text(name: str, description: str, schema: Any) -> str:
@@ -147,11 +154,20 @@ def coding_tool_schemas(
     kind: TaskKind,
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
+    subagent_limit: int = 0,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
-    no network, pure wiring). `research_git` matches `build_agent`."""
+    no network, pure wiring). `research_git` and `subagent_limit` match
+    `build_agent` — pass the real setting, or the estimate misses (or
+    invents) the delegate_research schema."""
     return tool_schemas(
-        build_agent(config, kind=kind, root=root, research_git=research_git)
+        build_agent(
+            config,
+            kind=kind,
+            root=root,
+            research_git=research_git,
+            subagent_limit=subagent_limit,
+        )
     )
 
 
@@ -520,6 +536,7 @@ def task_reports(
     tester_allow_commit: bool = True,
     tester_allow_push: bool = True,
     research_git: GitPolicy = GitPolicy.PUSH,
+    subagent_limit: int = 0,
 ) -> tuple[CtxReport | None, CtxReport | None, RunUsage, int]:
     """The two transcript reports of one task plus its whole-task cumulative
     exact usage.
@@ -542,7 +559,11 @@ def task_reports(
                 task.kind, project_root, research_git
             ),
             tools=coding_tool_schemas(
-                dev_config, task.kind, root=project_root, research_git=research_git
+                dev_config,
+                task.kind,
+                root=project_root,
+                research_git=research_git,
+                subagent_limit=subagent_limit,
             ),
             exact_tokens=live_tokens,
         )

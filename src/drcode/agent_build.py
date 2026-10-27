@@ -12,6 +12,7 @@ receive live here too.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from .agent_tools import (
     _deps_suffix,
     _git_push,
     _retry_failed_here,
+    _run_project_check,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -40,6 +42,7 @@ from .prompts import (
     load_tester_prompt,
 )
 from .settings import GitPolicy
+from .subagents import SubagentGate, run_delegate_tool
 from .task_manager import TaskManager
 from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
 from .transcript import _context_status, ctx_context_tokens
@@ -62,12 +65,20 @@ class AgentDeps:
 
     `scratch` is the task's personal writable scratch directory
     (/tmp/drcode/<task-id>, see tools.scratch_dir): the only place outside
-    the project root the tools may write to."""
+    the project root the tools may write to.
+
+    `subagent_gate` carries the per-run delegate_research slot counter
+    (None = delegation not configured — the tool is not even registered
+    when the limit is 0); `activity`, when set, is called by the nested
+    subagent run to keep the parent's stall-watchdog fed while the
+    parent itself emits nothing during the delegation."""
 
     root: Path
     manager: TaskManager
     task_id: str
     scratch: Path
+    subagent_gate: SubagentGate | None = None
+    activity: Callable[[], None] | None = None
 
 
 @dataclass
@@ -133,6 +144,7 @@ def build_agent(
     kind: TaskKind = TaskKind.FEATURE,
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
+    subagent_limit: int = 0,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -148,6 +160,12 @@ def build_agent(
     tracking (`task.edited_files`) stays on for the "edited files" report.
     Feature/bug agents ignore the policy: they never commit themselves —
     the tester commits their verified changes.
+
+    `subagent_limit` (the project's subagents_coder / subagents_researcher
+    setting, chosen by the pipeline per the serving role) registers the
+    delegate_research tool when above 0; at 0 (the default) the tool is
+    not registered at all — the agent never sees it. The limit is baked
+    into the tool description so the model knows its actual budget.
     """
     model = agent_model.build_model(config)
     instructions = load_system_prompt(
@@ -526,6 +544,36 @@ def build_agent(
             "end your turn now and do not call any more tools."
         )
 
+    # Read-only subagent delegation (project settings subagents_coder /
+    # subagents_researcher): registered ONLY when the limit is above 0 —
+    # at the default 0 the tool does not exist for the model at all. The
+    # actual limit is baked into the description (the tool is rebuilt per
+    # run, so a settings change reaches the very next activation). Not
+    # sequential: several subagents may run in parallel within the limit.
+    if subagent_limit > 0:
+
+        async def delegate_research(ctx: RunContext[AgentDeps], task: str) -> str:
+            return await run_delegate_tool(ctx.deps, config, task)
+
+        # The docstring is assigned (not written as an f-string in the
+        # def): pydantic-ai parses the tool description out of the SOURCE
+        # and an f-string docstring yields an empty description.
+        delegate_research.__doc__ = f"""Spawn a READ-ONLY research subagent and delegate a piece of THIS
+            task to it. You may run up to {subagent_limit} subagent{"" if subagent_limit == 1 else "s"} in parallel; the
+            call returns the subagent's final report (its intermediate tool
+            traffic stays invisible to your context) plus a one-line usage
+            summary. The subagent can only read: read_file, grep_search,
+            glob_files, search_task_archive — no writing, no shell.
+            `task` is a SELF-CONTAINED brief for the subagent: state the
+            question or investigation goal precisely, name the starting
+            points you already know (files, symbols, error text), and spell
+            out what the report must contain (file paths, line numbers).
+            The subagent cannot ask you questions — the brief must be enough
+            on its own. Use delegation for wide but shallow reading (mapping
+            call sites, surveying a subsystem, scanning many files for a
+            pattern); do the targeted verification reads yourself."""
+        agent.tool(delegate_research)
+
     return agent
 
 
@@ -546,17 +594,28 @@ def build_tester_agent(
     tool but it commits locally without ever
     pushing — the commit-only system prompt is selected. When `root`
     is given, its actual path is substituted into the system prompt header
-    (the `{project_path}` placeholder). With `review_gate=True` (an
+    (the `{project_path}` placeholder). When the project root contains
+    AGENTS.md, its content is appended to the instructions — the tester
+    writes/commits code and runs the project's checks in the real
+    repository, so the project rules apply to it just like to the coding
+    agent. With `review_gate=True` (an
     external review is defined in `.drcode/workflow.py`) a successful
     verdict only labels the task PASSED and leaves it TESTING — the
     external review decides the final completion.
     """
     model = agent_model.build_model(config)
+    instructions = load_tester_prompt(
+        allow_commit, project_root=root, allow_push=allow_push
+    )
+    if root is not None:
+        agents_md = load_agents_md(root)
+        if agents_md.strip():
+            instructions = (
+                f"{instructions}\n\n# Project instructions (AGENTS.md)\n\n{agents_md}"
+            )
     agent = Agent(
         model,
-        instructions=load_tester_prompt(
-            allow_commit, project_root=root, allow_push=allow_push
-        ),
+        instructions=instructions,
         deps_type=TesterDeps,
         model_settings={
             "extra_headers": EXTRA_HEADERS,
@@ -625,6 +684,26 @@ def build_tester_agent(
         rm/mv/cp are only allowed with paths inside the project root or your
         scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
+
+    @agent.tool
+    async def run_check(
+        ctx: RunContext[TesterDeps],
+        module: str,
+        args: list[str],
+        timeout: int | None = None,
+    ) -> str:
+        """Run a Python check tool from the project's OWN environment:
+        `python -m <module> <args>` with the interpreter of the project's
+        .venv / uv environment. Use it for pytest, ruff, mypy, pyright and
+        any other Python tooling instead of run_bash — a bare `ruff` or
+        `pytest` from PATH can be a different version with a different
+        default ruleset and report phantom failures the project's own gate
+        never produces. Example: run_check("ruff", ["check", "."]). When the
+        result says the module is not installed in the project environment,
+        treat that check as skipped — NEVER fall back to a PATH binary.
+        The command is killed after `timeout` seconds (default 120); values
+        above 3600 are clamped."""
+        return await _run_tool(_run_project_check, ctx.deps.root, module, args, timeout)
 
     @agent.tool
     def create_bug_report(

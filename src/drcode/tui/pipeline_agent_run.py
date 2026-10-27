@@ -26,6 +26,7 @@ from pydantic_ai.usage import UsageLimits
 
 from ..agent import (
     AgentDeps,
+    SubagentGate,
     backdate_user_prompt,
     build_agent,
     ends_with_open_request,
@@ -35,6 +36,7 @@ from ..agent import (
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
+    subagent_limit_for,
 )
 from ..models import PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole
@@ -102,9 +104,12 @@ class PipelineAgentRunLayer(DrCodeState):
                     "available.",
                 )
                 return
-            root, agent, workflow_instructions = await self._prepare_agent_run(
-                task, task_id, role, generation
-            )
+            (
+                root,
+                agent,
+                workflow_instructions,
+                subagent_gate,
+            ) = await self._prepare_agent_run(task, task_id, role, generation)
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
             # once and is NEVER re-queued/re-sent. Each activation first
@@ -142,6 +147,11 @@ class PipelineAgentRunLayer(DrCodeState):
                             manager=self.manager,
                             task_id=task_id,
                             scratch=scratch_dir(task_id),
+                            subagent_gate=subagent_gate,
+                            # The nested subagent runs touch this while
+                            # the parent itself emits nothing during the
+                            # delegation tool call (see drcode.subagents).
+                            activity=partial(self._touch_activity, task_id),
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -283,10 +293,11 @@ class PipelineAgentRunLayer(DrCodeState):
         task_id: str,
         role: AgentRole,
         generation: int,
-    ) -> tuple[Path, Agent[AgentDeps, str], str | None]:
+    ) -> tuple[Path, Agent[AgentDeps, str], str | None, SubagentGate | None]:
         """Register the run and assemble everything the turn loop needs:
-        the (worktree) root the tools run in, the built agent and the
-        on_task_start hook's instructions for the first prompt."""
+        the (worktree) root the tools run in, the built agent, the
+        on_task_start hook's instructions for the first prompt and the
+        run's subagent gate (None when delegation is off)."""
         self._agent_runs[task_id] = generation
         self._agent_failed.discard(task_id)
         self._agent_dead.discard(task_id)
@@ -301,8 +312,15 @@ class PipelineAgentRunLayer(DrCodeState):
         # own worktree, so an interrupted (unfinished) task never
         # hands its dirty tree to the next one in the queue. The
         # worktree is created when missing and reused as-is (an
-        # unfinished task resumes its own snapshot).
-        root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+        # unfinished task resumes its own snapshot). Passing the task
+        # resolves the run against its isolation PIN (stamped on first
+        # activation) — a mid-task toggle of the setting must not move
+        # the work between the worktree and the main checkout.
+        pinned_before = task.isolation_pinned is not None
+        root, iso_note = await asyncio.to_thread(
+            self.task_env.ensure_root, task_id, task
+        )
+        self._isolation_pin_note(task, save=not pinned_before)
         if root != self.project_root:
             message = f"Task isolated in worktree {root} (branch drcode/{task_id})."
             if iso_note:
@@ -318,13 +336,20 @@ class PipelineAgentRunLayer(DrCodeState):
         # With isolation on the hook runs INSIDE the worktree (see
         # _hook_env).
         workflow_instructions = await self._run_task_start_hook(task)
+        # Read-only subagent delegation (project settings): the cap follows
+        # the role serving this task (subagents_researcher for research,
+        # subagents_coder for coding); 0 = the tool is not registered at
+        # all and the gate stays None.
+        subagent_limit = subagent_limit_for(self.settings, role)
         agent = build_agent(
             self.resolved_config(role),
             kind=task.kind,
             root=root,
             research_git=self.settings.git_policy.research,
+            subagent_limit=subagent_limit,
         )
-        return root, agent, workflow_instructions
+        subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
+        return root, agent, workflow_instructions, subagent_gate
 
     async def _consume_turn_input(
         self,

@@ -21,6 +21,10 @@ Lifecycle contract (enforced here and by the pipeline):
 - activation (`ensure_root`): the worktree is created when missing
   (also after a manual deletion or a restart); an existing worktree —
   including an unfinished task's dirty one — is reused as-is.
+- isolation pin: the mode a task FIRST activated under is frozen onto it
+  (`Task.isolation_pinned`) — toggling `task_isolation` mid-task moves
+  neither the running task nor its later rounds (tester, resolver,
+  re-queues); the setting only affects tasks that never started.
 - unfinished / re-queue: the worktree is PRESERVED (nothing calls
   remove); the task resumes in its own snapshot.
 - completion (tester PASSED, research done): the work and the worktree
@@ -115,7 +119,7 @@ import os
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -407,7 +411,68 @@ class TaskEnvironment:
                 return wt
         return self.project_root
 
-    def ensure_root(self, task_id: str) -> tuple[Path, str]:
+    def _isolation_pin(self, task: Task | None) -> bool | None:
+        """The task's isolation pin (`task.isolation_pinned`), stamping it
+        on the task's FIRST activation.
+
+        The isolation mode is a property of a task's active work, not of
+        the moment it is read: a run boundary (unfinished resume, tester
+        round, resolver) that re-read the live setting after the user
+        toggled it mid-task would silently move the work between the
+        worktree and the main checkout — neither tree holds the other's
+        changes. So the mode observed at the first activation is frozen
+        onto the task and every later activation honors it; the setting
+        then only affects tasks that never started. Only None→value
+        transitions happen here, so parallel development slots racing
+        their first stamps are harmless (all of them read the same live
+        value). Callers without a Task (internal/tests) get None and
+        keep the historic live-setting behavior."""
+        if task is None:
+            return None
+        if task.isolation_pinned is None:
+            task.isolation_pinned = self.active
+        return task.isolation_pinned
+
+    def prestamp_isolation_pins(self, tasks: Iterable[Task]) -> list[Task]:
+        """Startup hardening of the narrow window the pin cannot cover by
+        itself: the app died while tasks were mid-work, and the
+        `task_isolation` setting changed before the next start. Each
+        candidate (mid-work, never pinned under this feature) gets its
+        mode reconstructed from the surviving evidence:
+
+        - a worktree directory or a `drcode/<id>` branch exists → pinned
+          True: the task's work lives there, and a fresh worktree forked
+          from the branch tip would NOT contain its uncommitted changes;
+        - otherwise the task demonstrably ran (unfinished attempt — the
+          status filter guarantees it) with no worktree and no branch →
+          pinned False: it worked in the shared checkout, which a fresh
+          worktree would not contain either.
+
+        Tasks that never started keep None and stamp at their first
+        activation as usual (no backfill). Blocking (a `rev-parse` per
+        candidate without a worktree directory) — run at app startup
+        before the pipeline's first `_advance()` (the resumed tester
+        round must not resolve the mode from the live setting first).
+        Returns the stamped tasks; the caller persists them."""
+        stamped: list[Task] = []
+        for task in tasks:
+            if task.isolation_pinned is not None:
+                continue
+            mid_work = task.status is TaskStatus.TESTING or (
+                task.status is TaskStatus.QUEUED and task.unfinished
+            )
+            if not mid_work:
+                continue
+            if self.worktree_path(task.id).is_dir() or self._branch_exists(
+                self.branch(task.id)
+            ):
+                task.isolation_pinned = True
+            else:
+                task.isolation_pinned = False
+            stamped.append(task)
+        return stamped
+
+    def ensure_root(self, task_id: str, task: Task | None = None) -> tuple[Path, str]:
         """The task's working root, with the worktree CREATED when missing.
 
         Returns ``(root, note)``: ``note`` is empty on success, otherwise a
@@ -418,10 +483,22 @@ class TaskEnvironment:
         re-checked-out so earlier commits survive a manual worktree
         deletion.
 
+        When `task` is given, the run is resolved against the task's
+        isolation PIN (`_isolation_pin`, stamped on first activation)
+        instead of the live `task_isolation` setting: `pinned True` keeps
+        the worktree path even after the setting was turned off, `pinned
+        False` keeps the project root even after it was turned on.
+
         Blocking (git + the untracked-file copy): call via
         `asyncio.to_thread` from the pipeline.
         """
-        if not self.enabled:
+        pin = self._isolation_pin(task)
+        if pin is False:
+            # Pinned to the shared project directory (the task activated
+            # before worktree isolation was switched on): the live
+            # setting never moves it mid-task.
+            return self.project_root, ""
+        if not self.enabled and pin is not True:
             # Isolation off: the task works in the project directory. An
             # existing worktree of this task (left over from a session
             # where the setting was on) is NOT reused silently — removing
@@ -674,12 +751,15 @@ class TaskEnvironment:
         Returns a human-readable result for the service-event log —
         either "snapshot committed on <branch> @ <sha>" or "worktree
         clean, nothing to snapshot". None is a true no-op: isolation is
-        off / not a git repo / the worktree does not exist / git failed.
+        off (and this task has no worktree directory — a task PINNED to a
+        worktree keeps snapshotting even after the setting moved on,
+        RULE 1 protects the task's own tree) / not a git repo / the
+        worktree does not exist / git failed.
 
         This is pipeline-level bookkeeping, NOT model work: blocking git
         calls — run via asyncio.to_thread from the pipeline/listeners.
         """
-        if not self.active:
+        if not self.active and not self.worktree_path(task_id).is_dir():
             return None
         wt = self.worktree_path(task_id)
         if not wt.is_dir():

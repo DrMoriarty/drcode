@@ -46,3 +46,16 @@ If the request is ambiguous or missing a detail you cannot resolve from the code
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
 more tools.
+
+# Read-only subagents: delegate_research
+
+If the delegation tool is available (it exists only when the project's
+subagents setting is enabled), you may spawn read-only research subagents and
+delegate wide-but-shallow reading to them: surveying a subsystem, comparing
+several candidate areas, scanning many files for a pattern. Each call runs up
+to the limit stated in the tool description concurrently and returns ONLY the
+subagent's final report — its intermediate tool results stay out of your
+context. Write the brief as a self-contained task (goal, known starting
+points, what the report must contain); the subagent can only read (files,
+grep, glob, task archive) and cannot ask you questions. Verification reads
+on specific files you do yourself.

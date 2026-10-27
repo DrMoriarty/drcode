@@ -602,10 +602,17 @@ class ConflictScreen(ModalScreen[None]):
         on. Blocking git — off the UI thread."""
         app = cast("DrCodeApp", self.app)
         env = app.task_env
-        if not env.active:
+        # The task's isolation PIN overrides the live setting here too:
+        # a task pinned to its worktree keeps its parked merge reachable
+        # even after `task_isolation` was switched off mid-task.
+        task = app.manager.tasks.get(self.task_id)
+        if not env.active and not (task is not None and task.isolation_pinned is True):
             self._set_title("Merge conflicts — worktree isolation is off")
             return
-        root, note = await asyncio.to_thread(env.ensure_root, self.task_id)
+        pinned_before = task is not None and task.isolation_pinned is not None
+        root, note = await asyncio.to_thread(env.ensure_root, self.task_id, task)
+        if task is not None:
+            app._isolation_pin_note(task, save=not pinned_before)
         if note:
             self._set_title(f"Merge conflicts — unavailable: {note}")
             return

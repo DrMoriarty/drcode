@@ -167,6 +167,20 @@ def parallel_tasks_label(count: int) -> str:
     return "1 task" if count == 1 else f"{count} tasks"
 
 
+# Options of the `subagents_coder` / `subagents_researcher` settings (the
+# per-role cap on concurrently running read-only subagents the coding /
+# research agent may spawn via delegate_research). 0 (the default) = the
+# delegation tool is not registered at all — the agent never sees it.
+SUBAGENTS_OPTIONS: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+
+def subagents_label(count: int) -> str:
+    """Human-readable option label for the Settings UI."""
+    if count == 0:
+        return "off"
+    return "1 subagent" if count == 1 else f"{count} subagents"
+
+
 class EscAbort(str, enum.Enum):
     """How ESC stops a running agent/tester (project setting).
 
@@ -377,6 +391,15 @@ class ProjectSettings(BaseModel):
     # single: testing never occupies a development slot and never runs
     # concurrently with another tester round.
     parallel_tasks: int = 1
+    # How many read-only research subagents the CODING agent may run in
+    # parallel at once (spawned via its delegate_research tool; each
+    # returns only its final answer, so the parent's context stays small).
+    # 0 (the default) = delegation is off: the tool is not registered and
+    # the agent neither knows about nor can use subagents.
+    subagents_coder: int = 0
+    # The same cap for the RESEARCH agent's runs (its resolved model
+    # serves the subagents; the counter is per parent run/generation).
+    subagents_researcher: int = 0
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

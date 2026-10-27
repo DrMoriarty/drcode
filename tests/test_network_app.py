@@ -191,6 +191,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         kind: Any = TaskKind.FEATURE,
         root: Any = None,
         research_git: Any = None,
+        subagent_limit: int = 0,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}

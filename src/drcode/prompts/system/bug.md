@@ -22,3 +22,15 @@ each other's stashed changes and silently swap working trees. If you need a clea
 tree for a check run, create a throwaway worktree instead:
 `git worktree add <tmp-dir> HEAD && cd <tmp-dir> && <check>` — place <tmp-dir>
 inside your scratch directory.
+
+# Read-only subagents: delegate_research
+
+If the delegation tool is available (it exists only when the project's
+subagents setting is enabled), you may spawn read-only research subagents and
+delegate wide-but-shallow reading to them — e.g. scanning many files for the
+bug's footprint or mapping call sites — while you keep the fix itself tight
+and hands-on. Each call runs up to the limit stated in the tool description
+concurrently and returns ONLY the subagent's final report; its intermediate
+tool traffic never reaches your context. Write the brief as a self-contained
+task (goal, known starting points, what the report must contain); the
+subagent can only read and cannot ask you questions.

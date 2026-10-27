@@ -35,6 +35,7 @@ from ..settings import (
     Verification,
     WorktreeRemoval,
     parallel_tasks_label,
+    subagents_label,
 )
 from ..workflow import describe_project_workflow, load_git_workflow
 from .command_providers import (
@@ -48,6 +49,8 @@ from .command_providers import (
     SettingsPalette,
     StallNudgeOptionsProvider,
     StartBranchOptionsProvider,
+    SubagentsCoderOptionsProvider,
+    SubagentsResearcherOptionsProvider,
     ThemeOptionsProvider,
     VerificationOptionsProvider,
     WorkflowPreset,
@@ -593,6 +596,65 @@ class SettingsLayer(DrCodeState):
             SettingsPalette(
                 id="--parallel-tasks-palette",
                 providers=[ParallelTasksOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_subagents_coder(self, count: int) -> None:
+        """Settings command: how many read-only research subagents the
+        CODING agent may run in parallel (its delegate_research tool).
+        0 = off: the tool is not registered at all. Persisted per project
+        (.drcode/settings.json); applies from the next task activation on
+        (agents are built per run, so a raised limit reaches the next
+        promotion, never the in-flight run)."""
+        self.settings.subagents_coder = max(0, count)
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Subagents (coder): {subagents_label(self.settings.subagents_coder)}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_subagents_coder(self) -> None:
+        """Subagents-(coder) picker, opened from the "Task settings…"
+        entry. Same UX as the retention picker: the narrowed
+        SettingsPalette with the options; picking one applies it, Escape
+        dismisses without changing anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--subagents-coder-palette",
+                providers=[SubagentsCoderOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_subagents_researcher(self, count: int) -> None:
+        """Settings command: how many read-only research subagents the
+        RESEARCH agent may run in parallel (its delegate_research tool).
+        0 = off: the tool is not registered at all. Persisted per project
+        (.drcode/settings.json); applies from the next task activation on."""
+        self.settings.subagents_researcher = max(0, count)
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Subagents (researcher): "
+            f"{subagents_label(self.settings.subagents_researcher)}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_subagents_researcher(self) -> None:
+        """Subagents-(researcher) picker, opened from the "Task
+        settings…" entry. Same UX as the retention picker: the narrowed
+        SettingsPalette with the options; picking one applies it, Escape
+        dismisses without changing anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--subagents-researcher-palette",
+                providers=[SubagentsResearcherOptionsProvider],
                 placeholder="Search for options…",
             )
         )

@@ -38,6 +38,7 @@ from ...settings import (
     PARALLEL_TASKS_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     GitPolicy,
@@ -47,6 +48,7 @@ from ...settings import (
     WorktreeRemoval,
     dev_rounds_label,
     parallel_tasks_label,
+    subagents_label,
 )
 from .base import SpacedCommandList
 
@@ -315,6 +317,8 @@ class TaskSettingsPalette(SettingsPalette):
         "Isolation start branch:",
         "Parallel tasks:",
         "Worktree removal:",
+        "Subagents (coder):",
+        "Subagents (researcher):",
         # -- Testing --
         "Verification:",
         "Max development rounds:",
@@ -621,6 +625,27 @@ class TaskSettingsEntriesProvider(Provider):
                     "(project setting)"
                 ),
                 app.action_change_worktree_removal,
+            ),
+            (
+                f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
+                (
+                    "How many read-only research subagents the CODING agent "
+                    "may run in parallel via its delegate_research tool — "
+                    "each returns only its final report, saving the agent's "
+                    "context; off removes the tool entirely (project "
+                    "setting)"
+                ),
+                app.action_change_subagents_coder,
+            ),
+            (
+                f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
+                (
+                    "The same delegation cap for the RESEARCH agent's runs "
+                    "(its resolved model serves the subagents; the counter "
+                    "is per run) — off removes the delegate_research tool "
+                    "(project setting)"
+                ),
+                app.action_change_subagents_researcher,
             ),
             # -- Testing --
             (
@@ -966,6 +991,70 @@ class WorktreeRemovalOptionsProvider(Provider):
                 partial(app.action_set_worktree_removal, option),
             )
             for option in WORKTREE_REMOVAL_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class SubagentsCoderOptionsProvider(Provider):
+    """Options of the "Subagents (coder)" setting (off / 1–4 concurrent
+    read-only subagents the coding agent may spawn via
+    delegate_research).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.subagents_coder
+        return [
+            (
+                subagents_label(count) + (" (current)" if count == current else ""),
+                partial(app.action_set_subagents_coder, count),
+            )
+            for count in SUBAGENTS_OPTIONS
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback in self._commands():
+            yield DiscoveryHit(name, callback)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback in self._commands():
+            if (match := matcher.match(name)) > 0:
+                yield Hit(match, matcher.highlight(name), callback)
+
+
+class SubagentsResearcherOptionsProvider(Provider):
+    """Options of the "Subagents (researcher)" setting (off / 1–4
+    concurrent read-only subagents the research agent may spawn via
+    delegate_research).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.subagents_researcher
+        return [
+            (
+                subagents_label(count) + (" (current)" if count == current else ""),
+                partial(app.action_set_subagents_researcher, count),
+            )
+            for count in SUBAGENTS_OPTIONS
         ]
 
     async def discover(self) -> Hits:

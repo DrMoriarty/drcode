@@ -31,6 +31,7 @@ from ..agent import (
     render_history_for_summary,
     slice_budget_tokens,
     split_original_prompts,
+    subagent_limit_for,
 )
 from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
@@ -346,7 +347,11 @@ class PipelineCompactionLayer(DrCodeState):
                 research_git = self.settings.git_policy.research
                 components = system_components_coding(task.kind, root, research_git)
                 tools = coding_tool_schemas(
-                    cfg, kind=task.kind, root=root, research_git=research_git
+                    cfg,
+                    kind=task.kind,
+                    root=root,
+                    research_git=research_git,
+                    subagent_limit=subagent_limit_for(self.settings, role),
                 )
         except Exception:  # noqa: BLE001 - a measurement gap must not kill compaction
             return None

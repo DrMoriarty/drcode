@@ -13,7 +13,7 @@ from rich.markup import escape
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
-from ..agent import last_context_tokens
+from ..agent import last_context_tokens, subagent_limit_for
 from ..context_layout import task_reports
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from ..providers import AgentRole
@@ -229,6 +229,7 @@ class TaskStatusLayer(DrCodeState):
             tester_allow_commit=self.settings.git_policy.tester.commits,
             tester_allow_push=self.settings.git_policy.tester.pushes,
             research_git=self.settings.git_policy.research,
+            subagent_limit=subagent_limit_for(self.settings, role),
         )
         self.push_screen(
             ContextDialog([r for r in (dev, tester) if r is not None], usage, requests)

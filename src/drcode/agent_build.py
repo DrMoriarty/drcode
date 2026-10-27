@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from . import agent_model, task_search, tools
 from .agent_model import EXTRA_HEADERS
@@ -34,6 +35,7 @@ from .agent_tools import (
     todo_dynamic_instructions,
 )
 from .config import Config
+from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
 from .models import Clarification, TaskKind, TaskStatus
 from .prompts import (
     load_resolver_prompt,
@@ -991,6 +993,30 @@ def build_resolver_agent(
         decide. This call does NOT commit anything: the pipeline runs the
         mandatory verification (mechanics, tests, intent review) and only a
         full pass commits the resolution."""
+        if resolved:
+            # Cheap pre-check before the verdict is recorded (the
+            # a6a6df25 incident class: the resolution was described in
+            # prose but never written into the files). A ModelRetry here
+            # feeds the marker list straight back into THIS round — the
+            # agent still has the transcript and can apply the edits —
+            # instead of burning the whole verification funnel on a
+            # syntactically still-conflicted tree.
+            hits = conflict_marker_hits(
+                ctx.deps.root,
+                unresolved_conflict_paths(
+                    ctx.deps.manager.storage.root, ctx.deps.task_id, ctx.deps.root
+                ),
+            )
+            if hits:
+                raise ModelRetry(
+                    "set_resolution(resolved=True) rejected: conflict markers "
+                    "are still present — the resolution was never written to "
+                    "the files. Markers found:\n"
+                    + "\n".join(hits)
+                    + "\nApply the resolution with edit_file/write_file (remove "
+                    "every marker, keep both sides' intent), then call "
+                    "set_resolution again."
+                )
         ctx.deps.verdicts.append(
             ResolutionVerdict(
                 resolved=bool(resolved),

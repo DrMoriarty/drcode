@@ -1175,6 +1175,24 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # busy state independent of pipeline transitions and respawns a
         # dead caffeinate child while work is in flight.
         self.set_interval(5, self._update_keepawake)
+        # Pre-stamp the isolation pins of tasks that were mid-work at the
+        # previous shutdown (see prestamp_isolation_pins): this must land
+        # BEFORE the pipeline's first _advance() below — the resumed
+        # tester round resolves its root through ensure_root and would
+        # otherwise read the (possibly toggled) live setting first and
+        # silently move the task into the wrong tree. At most one cheap
+        # git call per candidate (a stat when the worktree directory
+        # exists); failures are swallowed — the tasks then stamp at their
+        # next activation as before.
+        if self.task_env.available:
+            try:
+                pinned = self.task_env.prestamp_isolation_pins(
+                    list(self.manager.tasks.values())
+                )
+            except (OSError, subprocess.SubprocessError):
+                pinned = []
+            for t in pinned:
+                self.manager.storage.save(t)
         # Resume after restart. _advance() re-tests TESTING tasks (the app
         # died during testing) FIRST — the startup demotion (active ->
         # queued) leaves pending_input stranded unless the queue is

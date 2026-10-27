@@ -90,6 +90,37 @@ class ChatTimelineLayer(DrCodeState):
         if self.viewed_id == task.id:
             self._write_history_line("event", self._format_event(task.events[-1]))
 
+    def _isolation_pin_note(self, task: Task, *, save: bool) -> None:
+        """Run-boundary bookkeeping for the isolation pin
+        (`task.isolation_pinned`, stamped by `ensure_root` on the task's
+        first activation): persist a fresh stamp and — when the run
+        activated under a pin that differs from the LIVE
+        `task_isolation` setting — say so in the task's chat (the user
+        toggled the setting mid-task; the task keeps its mode for the
+        rest of its life). Deduplicated per task and wording: the
+        identical line is not appended twice."""
+        pin = task.isolation_pinned
+        if pin is None:
+            return
+        if pin != self.task_env.active:
+            text = (
+                "Task pinned to worktree isolation (the setting is now off)."
+                if pin
+                else "Task pinned to the project directory (worktree "
+                "isolation is now on)."
+            )
+            if not any(e.text == text for e in task.events):
+                # _log_event persists the task — a freshly stamped pin
+                # rides along with the event.
+                self._show_event(task, text)
+            return
+        if save:
+            # Pin matches the live setting: no event, but a stamp that
+            # only lives in memory must be persisted anyway (a crash
+            # before the next regular save would otherwise lose it).
+            task.touch()
+            self.manager.storage.save(task)
+
     def view_task(self, task_id: str) -> None:
         # Opening a task cancels a pending new-task creation: the click on a
         # sidebar item is an explicit "leave the form" from the user.

@@ -301,8 +301,15 @@ class PipelineAgentRunLayer(DrCodeState):
         # own worktree, so an interrupted (unfinished) task never
         # hands its dirty tree to the next one in the queue. The
         # worktree is created when missing and reused as-is (an
-        # unfinished task resumes its own snapshot).
-        root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+        # unfinished task resumes its own snapshot). Passing the task
+        # resolves the run against its isolation PIN (stamped on first
+        # activation) — a mid-task toggle of the setting must not move
+        # the work between the worktree and the main checkout.
+        pinned_before = task.isolation_pinned is not None
+        root, iso_note = await asyncio.to_thread(
+            self.task_env.ensure_root, task_id, task
+        )
+        self._isolation_pin_note(task, save=not pinned_before)
         if root != self.project_root:
             message = f"Task isolated in worktree {root} (branch drcode/{task_id})."
             if iso_note:

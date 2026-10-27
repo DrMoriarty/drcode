@@ -120,8 +120,16 @@ class PipelineTesterLayer(DrCodeState):
             # exactly the tree the development agent worked in, and the
             # tester's git policy commits onto the task's branch.
             # A worktree lost to a manual deletion is recreated here (the
-            # branch with the task's commits is re-checked-out).
-            root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+            # branch with the task's commits is re-checked-out). Passing
+            # the task resolves the round against its isolation PIN —
+            # a mid-task toggle of the setting must not send the tester
+            # to the other tree (it would verify an empty worktree or a
+            # main checkout without the task's work).
+            pinned_before = task.isolation_pinned is not None
+            root, iso_note = await asyncio.to_thread(
+                self.task_env.ensure_root, task_id, task
+            )
+            self._isolation_pin_note(task, save=not pinned_before)
             if iso_note:
                 self._show_event(task, f"Task isolation unavailable: {iso_note}")
             tester = build_tester_agent(

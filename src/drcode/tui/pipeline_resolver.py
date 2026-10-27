@@ -89,14 +89,20 @@ class PipelineResolverLayer(DrCodeState):
 
     def _maybe_start_resolver(self, task_id: str) -> None:
         """Start a resolver round for `task_id` when the situation calls
-        for one: worktree isolation is active, the RESOLVER role resolves
-        to a model (it falls back to the coding model) and no round is
-        already running. Triggered from the hook-merge failure marker and
-        the startup scan; silently does nothing otherwise (a conflict
-        without a model is business as usual — the human path)."""
-        if self._resolver_running or not self.task_env.active:
+        for one: worktree isolation is active (or the task is PINNED to a
+        worktree from before the setting was turned off — its parked
+        merge lives in its own worktree regardless of the live setting),
+        the RESOLVER role resolves to a model (it falls back to the
+        coding model) and no round is already running. Triggered from the
+        hook-merge failure marker and the startup scan; silently does
+        nothing otherwise (a conflict without a model is business as
+        usual — the human path)."""
+        if self._resolver_running:
             return
-        if task_id not in self.manager.tasks:
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            return
+        if not self.task_env.active and task.isolation_pinned is not True:
             return
         if not self.resolved_config(AgentRole.RESOLVER).is_ready:
             return
@@ -128,7 +134,14 @@ class PipelineResolverLayer(DrCodeState):
         try:
             self._current_tool[task_id] = None
             self._touch_activity(task_id)
-            root, iso_note = await asyncio.to_thread(self.task_env.ensure_root, task_id)
+            # The resolver works in the task's worktree, resolved against
+            # its isolation PIN (see run_agent): a mid-task toggle of the
+            # setting must not move the parked merge out from under it.
+            pinned_before = task.isolation_pinned is not None
+            root, iso_note = await asyncio.to_thread(
+                self.task_env.ensure_root, task_id, task
+            )
+            self._isolation_pin_note(task, save=not pinned_before)
             if iso_note:
                 self._show_event(task, f"Task isolation unavailable: {iso_note}")
                 return

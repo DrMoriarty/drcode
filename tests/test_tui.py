@@ -1910,14 +1910,16 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
 
 async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     """The main Settings menu collapses the task-management entries
-    into one "Task settings…" item, which opens the sub-menu with exactly
-    those preference entries."""
+    into one "Task settings…" item, which opens the modal
+    TaskSettingsDialog with all the preference fields."""
+    from textual.widgets import Label, Select, Switch
+
     from drcode.tui.command_providers import (
         ProjectSettingsCommandsProvider,
         TaskSettingsCommandProvider,
         TaskSettingsEntriesProvider,
-        TaskSettingsPalette,
     )
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
 
     # The main menu has no direct task entries anymore.
     assert "Task settings" in SettingsPalette.ENTRY_ORDER
@@ -1945,19 +1947,48 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         ]
         app.action_open_task_settings()
         await pilot.pause()
-        palette = app.screen
-        assert isinstance(palette, TaskSettingsPalette)
-        # Wait for the palette's gather worker to finish.
-        command_list = palette.query_one(CommandList)
-        for _ in range(100):
-            if "-ready" in palette.classes and command_list.option_count:
-                break
-            await pilot.pause()
-        await pilot.pause()
-        names = [
-            cast(Command, command).hit.text or "" for command in command_list._options
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+        # The 11 field widgets are all there, grouped under their three
+        # section headers (plus the workflow-preset header on top).
+        for selector in (
+            "#ts-isolation",
+            "#ts-start-branch",
+            "#ts-parallel",
+            "#ts-removal",
+            "#ts-verification",
+            "#ts-dev-rounds",
+            "#ts-nudge",
+            "#ts-git-tester",
+            "#ts-git-research",
+            "#ts-retention",
+            "#ts-keep-awake",
+        ):
+            assert dialog.query_one(selector)
+        assert dialog.query_one("#ts-verification", Select).value is (
+            app.settings.verification
+        )
+        assert dialog.query_one("#ts-keep-awake", Switch).value is (
+            app.settings.keep_awake
+        )
+        sections = [
+            str(cast(Label, label).render())
+            for label in dialog.query(".ts-section").results(Label)
         ]
-        assert names == [
+        assert sections == ["Workflow preset", "Workflow", "Testing", "Git"]
+        # The main-menu provider no longer carries the task entries: it
+        # keeps only the workflow/github/notifications/voice preferences.
+        main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        main_names = [name for name, _help, _cb in main]
+        assert main_names == [
+            f"Workflow: {app.workflow_status_label()}",
+            (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
+            (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
+            f"Voice: {app.voice_status_label()}",
+        ]
+        # The per-field sub-menu entries (quick toggles) are unchanged.
+        entries = TaskSettingsEntriesProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [
             f"Workflow preset: {app.workflow_preset_label()}",
             f"Task isolation: {app._task_isolation_label()}",
             f"Isolation start branch: {app._isolation_start_branch_label()}",
@@ -1970,20 +2001,219 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Git (research): {app.settings.git_policy.research.label}",
             f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
             "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
-        ]
-        # The main-menu provider no longer carries the task entries: it
-        # keeps only the workflow/github/notifications/voice preferences.
-        main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        main_names = [name for name, _help, _cb in main]
-        assert main_names == [
-            f"Workflow: {app.workflow_status_label()}",
-            (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
-            (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
-            f"Voice: {app.voice_status_label()}",
-        ]
-        # Sub-menu providers: the seven task entries, nothing else.
-        entries = TaskSettingsEntriesProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _help, _cb in entries] == names
+        ] == [name for name, _help, _cb in entries]
+
+
+async def test_task_settings_dialog_draft_isolation_and_apply(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dialog works on a deep copy: nothing is persisted until Apply,
+    ESC discards everything, and Apply persists ONCE and replays the same
+    side effects as the per-field actions (_advance, _update_keepawake)."""
+    from textual.widgets import Button, Select, Switch
+
+    from drcode.settings import ProjectSettingsStore, Verification
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        saves: list[ProjectSettings] = []
+        real_save = app.settings_store.save
+
+        def _counting_save(s: ProjectSettings) -> None:
+            saves.append(s)
+            real_save(s)
+
+        monkeypatch.setattr(
+            app.settings_store,
+            "save",
+            _counting_save,  # pyright: ignore[reportAttributeAccessIssue,reportArgumentType]
+        )
+        events: list[str] = []
+        monkeypatch.setattr(
+            app,
+            "_advance",
+            lambda: events.append("advance"),  # pyright: ignore[reportAttributeAccessIssue,reportArgumentType]
+        )
+        monkeypatch.setattr(
+            app,
+            "_update_keepawake",
+            lambda: events.append("keepawake"),  # pyright: ignore[reportAttributeAccessIssue,reportArgumentType]
+        )
+
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+
+        # Edit two fields through the widgets.
+        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        await pilot.pause()
+        dialog.query_one("#ts-keep-awake", Switch).value = False
+        await pilot.pause()
+        # Nothing persisted while editing; the live settings are untouched.
+        assert saves == []
+        assert events == []
+        assert app.settings.verification is Verification.TESTER
+        assert app.settings.keep_awake is True
+
+        # ESC cancels: no save, no side effect, nothing changed.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert saves == []
+        assert events == []
+        assert app.settings.verification is Verification.TESTER
+
+        # Re-open, change, Apply: one save, both side effects, live
+        # settings + file updated.
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        await pilot.pause()
+        dialog.query_one("#ts-apply", Button).press()
+        await pilot.pause()
+        assert len(saves) == 1
+        assert app.settings.verification is Verification.NONE
+        assert ProjectSettingsStore(app.project_root).load().verification is (
+            Verification.NONE
+        )
+        assert events == ["advance", "keepawake"]
+
+
+async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:
+    """Picking a preset rewrites the field widgets; the first manual
+    change flips the radio row to "Custom"."""
+    from textual.widgets import RadioButton, Select
+
+    from drcode.settings import GitPolicy, TaskIsolation, Verification
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+
+        # Defaults match no preset → "Custom" is selected.
+        assert dialog.query_one("#ts-preset-custom", RadioButton).value
+
+        # Pick "Local sandbox": every declared field updates in place.
+        dialog.query_one("#ts-preset-local_sandbox", RadioButton).value = True
+        await pilot.pause()
+        assert dialog.query_one("#ts-verification", Select).value is (
+            Verification.TESTER
+        )
+        assert dialog.query_one("#ts-git-tester", Select).value is GitPolicy.LOCAL
+        assert dialog.query_one("#ts-git-research", Select).value is GitPolicy.LOCAL
+        assert dialog.query_one("#ts-isolation", Select).value is (
+            TaskIsolation.WORKTREE
+        )
+        assert dialog.query_one("#ts-preset-custom", RadioButton).value is False
+        # Fields the preset changed relative to the saved settings are
+        # marked; the ones it left alone are not.
+        assert dialog.query_one("#ts-isolation", Select).has_class("changed")
+        assert not dialog.query_one("#ts-verification", Select).has_class("changed")
+
+        # A manual change away from the preset → "Custom" auto-selected.
+        dialog.query_one("#ts-git-research", Select).value = GitPolicy.OFF
+        await pilot.pause()
+        assert dialog.query_one("#ts-preset-custom", RadioButton).value is True
+        assert dialog.query_one("#ts-preset-local_sandbox", RadioButton).value is False
+
+
+async def test_task_settings_dialog_hints_and_fix_button(app: DrCodeApp) -> None:
+    """The hint panel re-renders on every draft change; a dormant hint
+    carries a fix button that mutates the draft only when pressed."""
+    from textual.widgets import Button, Select
+
+    from drcode.settings import TaskIsolation
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        # git_available=True: the fixed draft (worktree) is then clean.
+        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        app.push_screen(dialog)
+        await pilot.pause()
+        assert not dialog.query("#ts-hints .ts-hint")
+
+        # parallel > 1 without isolation → dormant hint with a fix button.
+        dialog.query_one("#ts-parallel", Select).value = 2
+        await pilot.pause()
+        rows = list(dialog.query("#ts-hints .ts-hint"))
+        assert len(rows) == 1
+        assert "dormant" in rows[0].classes
+        assert "Parallel tasks" in str(rows[0].query_one(".ts-hint-text").render())
+        fix_button = rows[0].query_one(".ts-fix", Button)
+        fix_button.press()
+        await pilot.pause()
+        # The fix enabled the isolation (and the hint is gone).
+        assert dialog.query_one("#ts-isolation", Select).value is (
+            TaskIsolation.WORKTREE
+        )
+        assert not dialog.query("#ts-hints .ts-hint")
+
+
+async def test_task_settings_dialog_conflict_without_git(app: DrCodeApp) -> None:
+    """Worktree isolation without a git repository is a conflict hint
+    (no fix button — resolving it is the user's call)."""
+    from textual.widgets import Select
+
+    from drcode.settings import TaskIsolation
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        dialog = TaskSettingsDialog(app.settings, git_available=False)
+        app.push_screen(dialog)
+        await pilot.pause()
+        assert not dialog.query("#ts-hints .ts-hint")
+
+        dialog.query_one("#ts-isolation", Select).value = TaskIsolation.WORKTREE
+        await pilot.pause()
+        rows = list(dialog.query("#ts-hints .ts-hint"))
+        assert len(rows) == 1
+        assert "conflict" in rows[0].classes
+        assert not rows[0].query(".ts-fix")
+
+
+async def test_task_settings_dialog_dormant_fields_dim_and_park(
+    app: DrCodeApp,
+) -> None:
+    """Fields governed by task isolation are dimmed while isolation is
+    off but stay editable: the parked value activates when isolation
+    turns on (never silently rewritten)."""
+    from textual.widgets import Select
+
+    from drcode.settings import TaskIsolation, WorktreeRemoval
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        app.push_screen(dialog)
+        await pilot.pause()
+        removal_select = dialog.query_one("#ts-removal", Select)
+        assert dialog.query_one("#ts-isolation", Select).value is TaskIsolation.OFF
+        # Dormant: dimmed but editable.
+        for selector in ("#ts-start-branch", "#ts-parallel", "#ts-removal"):
+            assert dialog.query_one(selector, Select).has_class("ts-dormant")
+        removal_select.value = WorktreeRemoval.NEVER
+        await pilot.pause()
+        assert dialog._draft.worktree_removal is WorktreeRemoval.NEVER  # pyright: ignore[reportAttributeAccessIssue]
+        # Turning isolation on un-dims the governed fields.
+        dialog.query_one("#ts-isolation", Select).value = TaskIsolation.WORKTREE
+        await pilot.pause()
+        for selector in ("#ts-start-branch", "#ts-parallel", "#ts-removal"):
+            assert not dialog.query_one(selector, Select).has_class("ts-dormant")
 
 
 async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:

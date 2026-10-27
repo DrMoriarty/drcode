@@ -29,6 +29,7 @@ from ..settings import (
     CompletedRetention,
     EscAbort,
     GitPolicy,
+    ProjectSettings,
     StallNudge,
     TaskIsolation,
     Verification,
@@ -47,8 +48,6 @@ from .command_providers import (
     SettingsPalette,
     StallNudgeOptionsProvider,
     StartBranchOptionsProvider,
-    TaskSettingsEntriesProvider,
-    TaskSettingsPalette,
     ThemeOptionsProvider,
     VerificationOptionsProvider,
     WorkflowPreset,
@@ -92,19 +91,53 @@ class SettingsLayer(DrCodeState):
             return
         self.push_screen(SettingsPalette(id="--command-palette"))
 
+    def _apply_settings_side_effects(self) -> None:
+        """The shared tail of EVERY task-settings mutation — the
+        per-field ``action_set_*`` actions and the atomic
+        Task-settings dialog alike (``action_apply_task_settings``):
+        re-run the pipeline gate (verification / preset changes can
+        complete tasks waiting for testing, a raised parallel limit can
+        start waiting tasks) and re-evaluate the keep-awake assertion.
+        One helper so the quick palettes and the dialog can never drift
+        apart."""
+        self._advance()
+        self._update_keepawake()
+
+    def action_apply_task_settings(self, draft: ProjectSettings) -> None:
+        """Apply the Task-settings dialog's accepted draft ATOMICALLY:
+        persist once, then replay the same side effects the per-field
+        actions run (see `_apply_settings_side_effects`). The draft is a
+        deep copy made by the dialog; it is merged into the LIVE settings
+        object in place (TaskEnvironment holds the same instance)."""
+        from .task_settings_dialog import copy_task_settings
+
+        copy_task_settings(self.settings, draft)
+        self.settings_store.save(self.settings)
+        self.notify(
+            "Task settings applied",
+            title="Project settings",
+            timeout=4,
+        )
+        self._apply_settings_side_effects()
+
+    def _task_settings_done(self, result: ProjectSettings | None) -> None:
+        if result is None:
+            return  # ESC / Cancel — nothing persisted, nothing replayed.
+        self.action_apply_task_settings(result)
+
     def action_open_task_settings(self) -> None:
-        """Open the "Task settings…" sub-menu: the six task-management
-        project preferences in one palette. Runs as the callback of a
-        palette entry — the palette has already dismissed itself by the
-        time this executes, so pushing the sub-palette is safe."""
+        """Open the "Task settings…" dialog: all task-management project
+        preferences in one modal form (workflow preset on top, live
+        coupling hints at the bottom, atomic Apply). Runs as the callback
+        of a palette entry — the palette has already dismissed itself by
+        the time this executes, so pushing the dialog is safe."""
         if isinstance(self.screen, CommandPalette):
             return
+        from .task_settings_dialog import TaskSettingsDialog
+
         self.push_screen(
-            TaskSettingsPalette(
-                id="--task-settings-palette",
-                providers=[TaskSettingsEntriesProvider],
-                placeholder="Task settings…",
-            )
+            TaskSettingsDialog(self.settings),
+            self._task_settings_done,
         )
 
     def action_set_completed_retention(self, retention: CompletedRetention) -> None:
@@ -158,8 +191,8 @@ class SettingsLayer(DrCodeState):
             timeout=4,
         )
         # A preset that switches verification off lets the pipeline
-        # complete any tasks waiting for testing on the next _advance().
-        self._advance()
+        # complete any tasks waiting for testing on the next gate run.
+        self._apply_settings_side_effects()
 
     def action_workflow_preset_custom(self) -> None:
         """Picked "Custom" in the preset picker: a no-op (Custom is the
@@ -214,7 +247,7 @@ class SettingsLayer(DrCodeState):
                 title="Project settings",
                 timeout=4,
             )
-        self._advance()
+        self._apply_settings_side_effects()
 
     def action_change_verification(self) -> None:
         """Verification picker, opened from the Settings entry
@@ -394,7 +427,7 @@ class SettingsLayer(DrCodeState):
         _update_keepawake tick releases the assertion when switched off)."""
         self.settings.keep_awake = not self.settings.keep_awake
         self.settings_store.save(self.settings)
-        self._update_keepawake()
+        self._apply_settings_side_effects()
         state = "on" if self.settings.keep_awake else "off"
         self.notify(
             f"Keep computer awake while working: {state}",

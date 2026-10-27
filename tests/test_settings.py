@@ -320,3 +320,87 @@ def test_git_policy_stale_value_returns_defaults(project_root: Path) -> None:
     """A stale/unknown policy value must not break the app either."""
     store = _write_raw_settings(project_root, {"git_policy": {"tester": "rebase-all"}})
     assert store.load() == ProjectSettings()
+
+
+# -- task_settings_hints -------------------------------------------------------
+
+
+def test_hints_parallel_dormant_without_isolation() -> None:
+    """parallel_tasks > 1 without worktree isolation is dormant, and its
+    fix (a callable the user opts into) enables the isolation."""
+    from drcode.settings import TaskIsolation, task_settings_hints
+
+    draft = ProjectSettings(parallel_tasks=3)
+    hints = task_settings_hints(draft, git_available=True)
+    dormant = [
+        h for h in hints if h.severity == "dormant" and "Parallel tasks" in h.text
+    ]
+    assert len(dormant) == 1
+    hint = dormant[0]
+    assert hint.fix is not None
+    assert hint.fix_label
+    hint.fix(draft)
+    assert draft.task_isolation is TaskIsolation.WORKTREE
+
+
+def test_hints_no_parallel_hint_under_isolation() -> None:
+    from drcode.settings import TaskIsolation, task_settings_hints
+
+    draft = ProjectSettings(parallel_tasks=3, task_isolation=TaskIsolation.WORKTREE)
+    assert not [
+        h
+        for h in task_settings_hints(draft, git_available=True)
+        if "Parallel tasks" in h.text
+    ]
+
+
+def test_hints_tester_git_policy_dormant_under_no_verification() -> None:
+    """A non-off tester git policy with verification none is dormant; the
+    fix sets the tester policy to off."""
+    from drcode.settings import GitPolicy, task_settings_hints
+
+    draft = ProjectSettings(
+        verification=Verification.NONE,
+        git_policy=GitPolicySetting(tester=GitPolicy.LOCAL),
+    )
+    hints = task_settings_hints(draft, git_available=True)
+    dormant = [h for h in hints if h.severity == "dormant" and "Git (tester)" in h.text]
+    assert len(dormant) == 1
+    assert dormant[0].fix is not None
+    dormant[0].fix(draft)
+    assert draft.git_policy.tester is GitPolicy.OFF
+
+
+def test_hints_tester_git_policy_fine_with_verification() -> None:
+    from drcode.settings import task_settings_hints
+
+    draft = ProjectSettings(verification=Verification.TESTER)
+    assert task_settings_hints(draft, git_available=True) == []
+
+
+def test_hints_parked_fields_under_isolation_off() -> None:
+    """A configured start branch / non-default removal are inert without
+    isolation (dormant); the defaults stay silent."""
+    from drcode.settings import WorktreeRemoval, task_settings_hints
+
+    base = ProjectSettings()
+    assert task_settings_hints(base, git_available=True) == []
+
+    parked = ProjectSettings(
+        isolation_start_branch="main", worktree_removal=WorktreeRemoval.NEVER
+    )
+    texts = [h.text for h in task_settings_hints(parked, git_available=True)]
+    assert any("main" in t for t in texts)
+    assert any("Worktree removal" in t for t in texts)
+
+
+def test_hints_worktree_without_git_is_conflict() -> None:
+    """Worktree isolation without a git repository is a conflict, not a
+    dormant value (it cannot work here at all)."""
+    from drcode.settings import TaskIsolation, task_settings_hints
+
+    draft = ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    hints = task_settings_hints(draft, git_available=False)
+    assert [h.severity for h in hints] == ["conflict"]
+    # With git available the same draft is clean.
+    assert task_settings_hints(draft, git_available=True) == []

@@ -11,7 +11,10 @@ import enum
 import json
 import os
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
@@ -447,6 +450,121 @@ class ProjectSettings(BaseModel):
     # auto-derive from the terminal locale (LC_ALL/LC_MESSAGES/LANG, falling
     # back to the Python locale; anything non-Russian reads as English).
     voice_language: str = ""
+
+
+@dataclass
+class SettingsHint:
+    """One live hint about the current task-settings combination, shown
+    in the Task-settings dialog (and reusable by the startup warnings).
+
+    severity:
+    - "dormant" — a persisted value that is currently INERT: some other
+      setting (the governing field) keeps it from having any effect. The
+      user's choice is parked, never rewritten.
+    - "conflict" — a combination that makes no sense at all (it cannot
+      work here even in principle, e.g. worktrees without a git repo).
+    - "info" — everything else worth a line.
+
+    `fix` is a mutation of a ProjectSettings draft that resolves the
+    hint. It runs ONLY when the user presses the matching fix button in
+    the dialog — never automatically (the settings philosophy: the
+    user's choice is never silently rewritten).
+    """
+
+    severity: Literal["dormant", "conflict", "info"]
+    text: str
+    fix: Callable[[ProjectSettings], None] | None = None
+    # Button label for the fix (shown only when fix is set).
+    fix_label: str = ""
+
+
+def task_settings_hints(
+    draft: ProjectSettings, *, git_available: bool
+) -> list[SettingsHint]:
+    """The single source of the coupling rules between the task-management
+    settings — every combination the UI/startup warnings must tell the
+    user about, in one function, so the dialog and future warning wiring
+    can never diverge.
+
+    Pure: reads `draft` (and the git availability of the project), never
+    mutates it; fixes are separate callables the user opts into.
+    """
+    hints: list[SettingsHint] = []
+    isolated = draft.task_isolation is TaskIsolation.WORKTREE
+
+    # -- parallel slots need worktree isolation -------------------------------
+    if draft.parallel_tasks > 1 and not isolated:
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    f"Parallel tasks: {parallel_tasks_label(draft.parallel_tasks)} "
+                    "is dormant without worktree isolation — every parallel "
+                    "task needs its own git worktree, so the effective limit "
+                    "is 1."
+                ),
+                fix=lambda s: setattr(s, "task_isolation", TaskIsolation.WORKTREE),
+                fix_label="Enable isolation",
+            )
+        )
+
+    # -- worktree mode without a git repository -------------------------------
+    if isolated and not git_available:
+        hints.append(
+            SettingsHint(
+                severity="conflict",
+                text=(
+                    "Task isolation: worktree cannot work — this project has "
+                    "no git repository, so tasks keep running in the shared "
+                    "project directory. Init git (git init) or set isolation "
+                    "to off."
+                ),
+            )
+        )
+
+    # -- the tester's git policy is pointless without a tester ----------------
+    if draft.verification is Verification.NONE and (
+        draft.git_policy.tester is not GitPolicy.OFF
+    ):
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    f"Git (tester): {draft.git_policy.tester.label} is dormant "
+                    "— verification is none, no tester runs to commit "
+                    "anything."
+                ),
+                fix=lambda s: setattr(s.git_policy, "tester", GitPolicy.OFF),
+                fix_label="Set Git (tester): off",
+            )
+        )
+
+    # -- parked fields under isolation off ------------------------------------
+    if not isolated and draft.isolation_start_branch:
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    f"Isolation start branch: {draft.isolation_start_branch} "
+                    "is parked — it governs which branch NEW task branches "
+                    "are forked from, which only exists under worktree "
+                    "isolation."
+                ),
+            )
+        )
+    if not isolated and draft.worktree_removal is not WorktreeRemoval.ON_DELETE:
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    f"Worktree removal: {draft.worktree_removal.label} is "
+                    "parked — there are no task worktrees without "
+                    "isolation."
+                ),
+            )
+        )
+
+    return hints
 
 
 def _migrate_legacy_finalization(data: dict) -> dict:

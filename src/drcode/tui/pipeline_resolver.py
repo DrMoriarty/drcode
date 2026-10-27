@@ -82,6 +82,8 @@ from .usage import NETWORK_RETRIES, _is_retryable_network_error
 # resolver round waiting out an outage in 300 s backoffs is fine.
 _MAX_RESOLVER_ATTEMPTS = 5
 _MAX_RESOLVER_NETWORK_ATTEMPTS = NETWORK_RETRIES * 3
+# Base of the capped exponential backoff between attempts (5, 10, 20 ... s).
+_RETRY_BASE_DELAY_S = 5.0
 
 
 class PipelineResolverLayer(DrCodeState):
@@ -127,6 +129,11 @@ class PipelineResolverLayer(DrCodeState):
         self._resolver_resume_round.discard(task_id)
         run: AgentRun[ResolverDeps, str] | None = None
         cancelled = False
+        # True when the except-branch scheduled a retry: the finally-block
+        # must then leave the retry state alone (needs_human may be a
+        # stale flag from a PREVIOUS round — popping here would cancel the
+        # retry the same moment it was scheduled, the a6a6df25 silence).
+        scheduled_retry = False
         # Initialized before the try: the handlers below reference them
         # even when the failure happened before ensure_root/base_branch.
         root: Path | None = None
@@ -352,11 +359,12 @@ class PipelineResolverLayer(DrCodeState):
                 )
                 await self._give_up_to_human(task, root, base)
                 return
-            delay = min(5 * 2 ** (attempt - 1), 300)
+            delay = min(_RETRY_BASE_DELAY_S * 2 ** (attempt - 1), 300)
             self._resolver_retry_at[task_id] = time.monotonic() + delay
             # The round continues where it stopped (the transcript is
             # kept) — no re-sent prompt.
             self._resolver_resume_round.add(task_id)
+            scheduled_retry = True
             self._show_event(
                 task,
                 f"Conflict resolver failed ({type(e).__name__}: {e}) — "
@@ -371,7 +379,11 @@ class PipelineResolverLayer(DrCodeState):
             self.refresh_status()
             self.refresh_sidebar()
             if not cancelled:
-                if task.needs_human:
+                # Clean the retry state only when THIS attempt handed the
+                # task to a human (needs_human freshly set, no retry
+                # pending). A stale needs_human from a previous round must
+                # not erase a just-scheduled retry.
+                if task.needs_human and not scheduled_retry:
                     self._resolver_fail_count.pop(task_id, None)
                     self._resolver_retry_at.pop(task_id, None)
                     self._resolver_resume_round.discard(task_id)
@@ -381,17 +393,28 @@ class PipelineResolverLayer(DrCodeState):
         """A scheduled resolver retry: pick the task waiting out its
         backoff (if it still exists) and restart its round."""
         now = time.monotonic()
+        # A hair of tolerance: a timer firing marginally before its
+        # deadline must not leave the entry stranded with no timer left
+        # to ever pick it up.
+        due = [tid for tid, at in self._resolver_retry_at.items() if at <= now + 0.05]
+        if not due:
+            return
         task_id = next(
-            (
-                tid
-                for tid, at in self._resolver_retry_at.items()
-                if at <= now and tid in self.manager.tasks
-            ),
+            (tid for tid in due if tid in self.manager.tasks),
             None,
         )
-        if task_id is not None:
-            self._resolver_retry_at.pop(task_id, None)
-            self._maybe_start_resolver(task_id)
+        if task_id is None:
+            # Due entries whose tasks no longer exist would otherwise
+            # linger forever and swallow every later timer fire silently.
+            self.log(
+                f"resolver retry timer fired, but scheduled task(s) "
+                f"{due} no longer exist — dropping them"
+            )
+            for tid in due:
+                self._resolver_retry_at.pop(tid, None)
+            return
+        self._resolver_retry_at.pop(task_id, None)
+        self._maybe_start_resolver(task_id)
 
     # -- verification funnel ---------------------------------------------------------
 
@@ -411,8 +434,14 @@ class PipelineResolverLayer(DrCodeState):
         outcome.agent_report = verdict.report if verdict else ""
         if not outcome.agent_resolved:
             return outcome
-        # Level 1: mechanics.
-        outcome.checks = await asyncio.to_thread(mechanical_checks, root)
+        # Level 1: mechanics. The marker scan inside mechanical_checks
+        # runs over the triage report's conflicted paths (staged or not)
+        # — a prose-only resolution fails here in seconds, before the
+        # compile/ruff/pyright/pytest battery burns on a still-conflicted
+        # tree (the a6a6df25 incident class).
+        outcome.checks = await asyncio.to_thread(
+            mechanical_checks, root, [f.path for f in report.files]
+        )
         if any(not c.ok and not c.skipped for c in outcome.checks):
             return outcome
         # Level 2: tests.

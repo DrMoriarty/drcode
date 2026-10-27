@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from . import agent_model, task_search, tools
 from .agent_model import EXTRA_HEADERS
@@ -25,6 +26,7 @@ from .agent_tools import (
     _deps_suffix,
     _git_push,
     _retry_failed_here,
+    _run_project_check,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -33,6 +35,7 @@ from .agent_tools import (
     todo_dynamic_instructions,
 )
 from .config import Config
+from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
 from .models import Clarification, TaskKind, TaskStatus
 from .prompts import (
     load_resolver_prompt,
@@ -593,17 +596,28 @@ def build_tester_agent(
     tool but it commits locally without ever
     pushing — the commit-only system prompt is selected. When `root`
     is given, its actual path is substituted into the system prompt header
-    (the `{project_path}` placeholder). With `review_gate=True` (an
+    (the `{project_path}` placeholder). When the project root contains
+    AGENTS.md, its content is appended to the instructions — the tester
+    writes/commits code and runs the project's checks in the real
+    repository, so the project rules apply to it just like to the coding
+    agent. With `review_gate=True` (an
     external review is defined in `.drcode/workflow.py`) a successful
     verdict only labels the task PASSED and leaves it TESTING — the
     external review decides the final completion.
     """
     model = agent_model.build_model(config)
+    instructions = load_tester_prompt(
+        allow_commit, project_root=root, allow_push=allow_push
+    )
+    if root is not None:
+        agents_md = load_agents_md(root)
+        if agents_md.strip():
+            instructions = (
+                f"{instructions}\n\n# Project instructions (AGENTS.md)\n\n{agents_md}"
+            )
     agent = Agent(
         model,
-        instructions=load_tester_prompt(
-            allow_commit, project_root=root, allow_push=allow_push
-        ),
+        instructions=instructions,
         deps_type=TesterDeps,
         model_settings={
             "extra_headers": EXTRA_HEADERS,
@@ -672,6 +686,26 @@ def build_tester_agent(
         rm/mv/cp are only allowed with paths inside the project root or your
         scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
+
+    @agent.tool
+    async def run_check(
+        ctx: RunContext[TesterDeps],
+        module: str,
+        args: list[str],
+        timeout: int | None = None,
+    ) -> str:
+        """Run a Python check tool from the project's OWN environment:
+        `python -m <module> <args>` with the interpreter of the project's
+        .venv / uv environment. Use it for pytest, ruff, mypy, pyright and
+        any other Python tooling instead of run_bash — a bare `ruff` or
+        `pytest` from PATH can be a different version with a different
+        default ruleset and report phantom failures the project's own gate
+        never produces. Example: run_check("ruff", ["check", "."]). When the
+        result says the module is not installed in the project environment,
+        treat that check as skipped — NEVER fall back to a PATH binary.
+        The command is killed after `timeout` seconds (default 120); values
+        above 3600 are clamped."""
+        return await _run_tool(_run_project_check, ctx.deps.root, module, args, timeout)
 
     @agent.tool
     def create_bug_report(
@@ -959,6 +993,30 @@ def build_resolver_agent(
         decide. This call does NOT commit anything: the pipeline runs the
         mandatory verification (mechanics, tests, intent review) and only a
         full pass commits the resolution."""
+        if resolved:
+            # Cheap pre-check before the verdict is recorded (the
+            # a6a6df25 incident class: the resolution was described in
+            # prose but never written into the files). A ModelRetry here
+            # feeds the marker list straight back into THIS round — the
+            # agent still has the transcript and can apply the edits —
+            # instead of burning the whole verification funnel on a
+            # syntactically still-conflicted tree.
+            hits = conflict_marker_hits(
+                ctx.deps.root,
+                unresolved_conflict_paths(
+                    ctx.deps.manager.storage.root, ctx.deps.task_id, ctx.deps.root
+                ),
+            )
+            if hits:
+                raise ModelRetry(
+                    "set_resolution(resolved=True) rejected: conflict markers "
+                    "are still present — the resolution was never written to "
+                    "the files. Markers found:\n"
+                    + "\n".join(hits)
+                    + "\nApply the resolution with edit_file/write_file (remove "
+                    "every marker, keep both sides' intent), then call "
+                    "set_resolution again."
+                )
         ctx.deps.verdicts.append(
             ResolutionVerdict(
                 resolved=bool(resolved),

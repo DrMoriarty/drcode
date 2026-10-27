@@ -426,5 +426,5 @@ class SearchDialog(ModalScreen[None]):
         assert isinstance(app, DrCodeApp)
         # copy_to_clipboard alone is ignored by macOS Terminal.app (OSC52);
         # the app's helper adds the pbcopy fallback there.
-        app._copy_with_fallback(item.task_id)
+        app._copy_with_fallback(f"#{item.task_id}")
         app.notify(f"#{item.task_id} скопирован", title="Find task", timeout=4)

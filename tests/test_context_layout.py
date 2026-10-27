@@ -29,6 +29,7 @@ from drcode.context_layout import (
     cumulative_usage,
     estimate_tokens,
     system_components_coding,
+    system_components_tester,
     task_reports,
 )
 from drcode.context_layout import (
@@ -108,6 +109,28 @@ def test_system_components_split_base_agents_and_git_workflow(
     # Without the files the components are absent (None) — the dialog
     # renders them as "absent".
     empty = system_components_coding(TaskKind.FEATURE, project_root.parent)
+    assert empty[0][1] is not None
+    assert empty[1][1] is None
+    assert empty[2][1] is None
+
+
+def test_system_components_tester_split_base_agents_and_git_workflow(
+    project_root: Path,
+) -> None:
+    (project_root / "AGENTS.md").write_text("# Project rules\n\nbe terse.\n")
+    drcode_dir = project_root / ".drcode"
+    drcode_dir.mkdir(exist_ok=True)
+    (drcode_dir / "git-workflow.md").write_text("- never commit to main\n")
+    parts = system_components_tester(True, project_root)
+    labels = [label for label, _ in parts]
+    assert labels == ["base template", "AGENTS.md", "git workflow"]
+    base, agents_md, git_workflow = (text for _, text in parts)
+    assert base is not None and "{project_path}" not in base
+    assert agents_md is not None and "be terse." in agents_md
+    assert git_workflow is not None and "never commit to main" in git_workflow
+
+    # Without the files the components are absent (None).
+    empty = system_components_tester(True, project_root.parent)
     assert empty[0][1] is not None
     assert empty[1][1] is None
     assert empty[2][1] is None

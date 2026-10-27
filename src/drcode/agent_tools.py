@@ -16,13 +16,16 @@ them, so a module-level import would be a needless cycle.
 
 from __future__ import annotations
 
+import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic_ai import RunContext
 
 from . import tools
+from .merge_resolver import _project_python, _worktree_pythonpath_env
 from .models import (
     Task,
     TaskKind,
@@ -41,6 +44,7 @@ __all__ = [
     "_deps_suffix",
     "_git_push",
     "_retry_failed_here",
+    "_run_project_check",
     "_set_task_dependencies",
     "_todo_create",
     "_todo_update",
@@ -246,6 +250,62 @@ def _retry_failed_here(deps: TesterDeps, report: str) -> str:
     # The task left TESTING while the verdict was in flight (the user
     # re-queued or cancelled it): the stale verdict changed nothing.
     return "Verification label ignored: the task is no longer being tested."
+
+
+# Module names run_check accepts: dotted Python identifiers only — the name
+# is spliced into `python -m <module>` for a resolved interpreter, never into
+# a shell, so the check keeps the tool-selection out of the model's hands.
+_MODULE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _run_project_check(
+    root: Path, module: str, args: list[str], timeout: float | None = None
+) -> str:
+    """Run a check tool from the project's OWN environment: `python -m
+    <module> <args>` with the interpreter whose environment actually holds
+    the project's tooling (the plan of `merge_resolver._project_python`:
+    the worktree's synced .venv → `uv run` → the interpreter drcode runs
+    under, the module must really import there).
+
+    The tester is an LLM with a free-form run_bash, so nothing structural
+    stops it from invoking a bare `ruff`/`pytest` and getting whichever
+    binary PATH supplies — a different version with a different default
+    ruleset, reporting phantom failures the project's own gate never
+    produces (the 3ea596cb class: DTZ005 from an old PATH ruff). This
+    helper takes the environment choice away from the shell entirely.
+    Returns "exit=<code>" plus the output; when the project has no such
+    tool the check is reported as unavailable — the model must treat it
+    as skipped, never fall back to a PATH binary."""
+    module = module.strip()
+    if not _MODULE_NAME_RE.fullmatch(module):
+        raise ValueError(
+            f"Invalid module name {module!r}: expected a Python module "
+            "(e.g. 'pytest', 'ruff'), run non-Python tooling via run_bash."
+        )
+    plan = _project_python(root, module)
+    if plan is None:
+        return (
+            f"'{module}' is not available in the project's own environment "
+            "(no .venv/uv environment there imports it) — the project does "
+            "not have this tool installed. Treat the check as skipped; do "
+            "NOT fall back to a bare PATH binary: a different version or "
+            "default ruleset would report phantom failures."
+        )
+    cmd, fix_path = plan
+    try:
+        proc = subprocess.run(
+            [*cmd, "-m", module, *args],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=tools.clamp_bash_timeout(timeout),
+            env=_worktree_pythonpath_env(root) if fix_path else None,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"exit=-1\n({type(e).__name__}: {e})"
+    out = (proc.stdout + "\n" + proc.stderr).strip()[: tools.MAX_TOOL_OUTPUT]
+    return f"exit={proc.returncode}\n{out or '(no output)'}"
 
 
 async def _git_push(deps: AgentDeps | TesterDeps, root: Path) -> str:

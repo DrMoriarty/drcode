@@ -16,7 +16,8 @@ round that must be deterministic —
   the task's intent (title/description), what each side changed
   (`drcode/<id>` vs the base branch) and the conflicted paths themselves;
 - `mechanical_checks` / `run_test_suite` — level 1 and 2 of the
-  verification funnel (compile/ruff/pyright; the project's test suite);
+  verification funnel (the conflict-marker scan + compile/ruff/pyright;
+  the project's test suite);
 - `review_diffs` — the level-3 payloads: diff(resolved, ours) and
   diff(resolved, theirs), the inputs of the intent-preservation review
   (the direct protection against the #6c065401 incident class — a lost
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +60,8 @@ __all__ = [
     "build_agent_context",
     "compile_check",
     "conclude",
+    "conflict_marker_check",
+    "conflict_marker_hits",
     "failed_names",
     "format_verify_report",
     "mechanical_checks",
@@ -68,6 +72,7 @@ __all__ = [
     "ruff_check",
     "run_test_suite",
     "save_verify_report",
+    "unresolved_conflict_paths",
     "verify_report_path",
 ]
 # (check-timings helpers are intentionally not re-exported: they serve the
@@ -143,6 +148,92 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
     return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+# -- conflict-marker scan -------------------------------------------------------
+# The a6a6df25 incident class: the resolver agent described the resolution in
+# prose and reported set_resolution(resolved=True) WITHOUT ever writing the
+# files — the funnel then burned compile/ruff/pyright/pytest + a reviewer
+# round on a syntactically still-conflicted tree. These helpers are the cheap
+# (no-test-suite, near-no-subprocess) pre-checks that catch it immediately.
+
+
+# A git conflict marker line: exactly seven marker chars at line start,
+# optionally followed by a space + label (`<<<<<<< HEAD`, `||||||| 57cb0d9`,
+# `=======`, `>>>>>>> main`). Eight or more chars (an RST heading, a `# =====`
+# banner) do NOT match — the `(?: .*)?$` tail refuses anything but a space or
+# end-of-line after the seventh char.
+_CONFLICT_MARKER_RE = re.compile(r"^(<{7}|\|{7}|={7}|>{7})(?: .*)?$")
+
+
+def conflict_marker_hits(worktree: Path, paths: list[str]) -> list[str]:
+    """Scan the given worktree-relative paths for leftover conflict
+    markers. Pure file reading, no subprocess; returns `path:line: <line>`
+    entries (capped — a pathological file must not flood the caller)."""
+    hits: list[str] = []
+    for rel in paths:
+        try:
+            text = (worktree / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if _CONFLICT_MARKER_RE.match(line):
+                hits.append(f"{rel}:{lineno}: {line[:80]}")
+                if len(hits) >= 40:
+                    return hits
+    return hits
+
+
+def _triage_remaining_paths(project_root: Path, task_id: str) -> list[str]:
+    """The paths the task's persisted triage report lists as still
+    conflicted (its `remaining` array); empty when the report is missing,
+    corrupted or already fully resolved."""
+    try:
+        data = json.loads(
+            merge_engine.report_path(project_root, task_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return []
+    remaining = data.get("remaining") if isinstance(data, dict) else None
+    if not isinstance(remaining, list):
+        return []
+    return [
+        entry["path"]
+        for entry in remaining
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    ]
+
+
+def unresolved_conflict_paths(
+    project_root: Path, task_id: str, worktree: Path
+) -> list[str]:
+    """The paths that may still carry conflict markers in `worktree`:
+    the triage report's `remaining` set when it is readable, else the
+    in-progress merge's unmerged index entries. Empty = nothing to scan."""
+    paths = _triage_remaining_paths(project_root, task_id)
+    return paths or merge_engine.unmerged_paths(worktree)
+
+
+def conflict_marker_check(
+    worktree: Path, paths: list[str] | None = None
+) -> CheckResult:
+    """Level 0 of the verification funnel: the conflicted files must not
+    carry leftover conflict markers. Scans `paths` (the triage report's
+    conflicted set in the automatic funnel); defaults to the in-progress
+    merge's unmerged index entries. Skipped when there is nothing to
+    scan (no merge in progress)."""
+    if paths is None:
+        paths = merge_engine.unmerged_paths(worktree)
+    if not paths:
+        return CheckResult(
+            name="conflict markers", ok=True, skipped=True, output="no conflicted paths"
+        )
+    hits = conflict_marker_hits(worktree, paths)
+    return CheckResult(
+        name="conflict markers",
+        ok=not hits,
+        output="\n".join(hits)[:8000],
+    )
 
 
 # -- agent context ---------------------------------------------------------------
@@ -423,12 +514,18 @@ def pyright_check(worktree: Path) -> CheckResult:
     )
 
 
-def mechanical_checks(worktree: Path) -> list[CheckResult]:
+def mechanical_checks(
+    worktree: Path, paths: list[str] | None = None
+) -> list[CheckResult]:
     """Level 1 of the funnel: the tree must at least be sound. The
+    conflict-marker scan runs FIRST (a prose-only resolution — the
+    a6a6df25 class — must fail here, not after the test suite); the
     compile check is MANDATORY (every file git tracks must byte-compile);
     ruff/pyright run when the tool is available (best-effort — a project
-    without them installed is not failed for it)."""
-    results: list[CheckResult] = []
+    without them installed is not failed for it). `paths` limits the
+    marker scan to the conflicted set; None scans the unmerged index
+    entries (or skips when no merge is in progress)."""
+    results: list[CheckResult] = [conflict_marker_check(worktree, paths)]
     py_files = _python_files(worktree)
     if py_files:
         # Chunk the compile check: a single command line with thousands of
@@ -708,9 +805,15 @@ class ResolverOutcome:
 
     def summary(self) -> str:
         lines = [f"Conflict resolution: {self.verdict}"]
+        # When the funnel rejected the attempt, the agent's "resolved"
+        # claim must not read as success on its own (the a6a6df25
+        # incident: an optimistic weave description right above the
+        # FAILED line) — couple the claim to its rejection explicitly.
+        rejected = self.agent_resolved and self.verdict != "resolved"
         lines.append(
             "resolver agent: "
             + ("resolved" if self.agent_resolved else "did NOT resolve")
+            + (" (claim REJECTED by the verification below)" if rejected else "")
         )
         if self.agent_report:
             lines.append(f"resolver report:\n{self.agent_report[:4000]}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.content import Content
 
 from drcode.tui.blocks import (
     AssistantBlock,
@@ -57,6 +58,64 @@ async def test_tool_call_block_body_is_full_json() -> None:
         block._redraw()
         assert block._body is not None
         assert block._body.plain == '{\n  "command": "ls"\n}'
+
+
+async def test_tool_call_block_elapsed_counter() -> None:
+    """A running call's header shows the elapsed time, fed by the spinner
+    tick; stop_spinner() freezes the last value instead of clearing it."""
+
+    class _Host(App[None]):
+        def compose(self) -> ComposeResult:
+            yield ToolCallBlock('search_task_history({"query": "compaction"})')
+
+    async with _Host().run_test() as pilot:
+        block = pilot.app.query_one(ToolCallBlock)
+        # A call that never ran shows no counter.
+        assert block._elapsed_text() == ""
+        block.start_spinner()
+        assert block._run_started is not None
+        block._run_started -= 12.5  # simulate a 12.5 s call without sleeping
+        block._redraw()
+        header = block.render()
+        assert isinstance(header, Content)
+        assert "· 12s" in header.plain
+        assert "· 12s" in block._elapsed_text()
+        block.stop_spinner()
+        # Frozen: the value survives the stop, marker back to idle.
+        assert block._elapsed_text() == " · 12s"
+        frozen = block.render()
+        assert isinstance(frozen, Content)
+        assert "· 12s" in frozen.plain
+        # No wrap for an hour-long (exaggerated) call.
+        block.start_spinner()
+        block._run_started -= 3725
+        block._redraw()
+        assert block._elapsed_text() == " · 62m05s"
+        block.stop_spinner()
+
+
+async def test_tool_call_block_counter_restarts_on_reattach() -> None:
+    """A fresh block handed the spinner after a view re-render starts the
+    counter from zero (its own _run_started), with no stale frozen value."""
+
+    class _Host(App[None]):
+        def compose(self) -> ComposeResult:
+            yield ToolCallBlock('run_bash({"command": "ls"})')
+
+    async with _Host().run_test() as pilot:
+        block = pilot.app.query_one(ToolCallBlock)
+        block.start_spinner()
+        assert block._run_started is not None
+        block._run_started -= 20
+        block.stop_spinner()
+        assert block._elapsed_text() == " · 20s"
+        # Fresh block (as _reattach_tool_spinner would get): counter at zero.
+        fresh = ToolCallBlock('run_bash({"command": "ls"})')
+        await pilot.app.mount(fresh)
+        fresh.start_spinner()
+        assert fresh._elapsed_frozen is None
+        assert fresh._elapsed_text() == " · 0s"
+        fresh.stop_spinner()
 
 
 def test_linkify_matches_task_mention() -> None:

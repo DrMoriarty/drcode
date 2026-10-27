@@ -45,6 +45,19 @@ def test_title_display_short() -> None:
     assert Task(title="short").title_display == "short"
 
 
+def test_title_display_collapses_control_characters() -> None:
+    # A literal tab in a stored title made Textual expand it to the next
+    # tab stop in the sidebar, wrapping the row onto two lines.
+    raw = "проверь, почему упал s9_research_count\tdeepseek-v4-baseline"
+    task = Task(title=raw)
+    collapsed = " ".join(raw.split())
+    assert "\t" not in task.title_display
+    assert task.title_display == collapsed[:39] + "…"
+    # Whitespace collapsing happens before the 40-char cut, so the result
+    # never exceeds the single-row budget.
+    assert len(Task(title="a\t" + "x" * 50).title_display) == 40
+
+
 def test_title_display_long_truncated_with_ellipsis() -> None:
     title = "x" * 50
     displayed = Task(title=title).title_display

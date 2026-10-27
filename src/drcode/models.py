@@ -288,7 +288,12 @@ class Task(BaseModel):
 
     @property
     def title_display(self) -> str:
-        return self.title if len(self.title) <= 40 else self.title[:39] + "…"
+        # Collapse control characters (tabs/newlines) and repeated spaces
+        # first: a literal tab survives `escape()` in the TUI and makes
+        # Textual expand the row to the next tab stop, pushing the tail of
+        # the truncated title onto a second sidebar line.
+        title = " ".join(self.title.split())
+        return title if len(title) <= 40 else title[:39] + "…"
 
 
 def render_todos(todos: list[TodoItem]) -> str:

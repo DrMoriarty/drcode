@@ -44,7 +44,17 @@ This module gives the model a deliberately COMPACT view instead:
 - resilience follows the `Storage.load_one` contract (`storage.py`): a
   corrupted or unreadable file is silently skipped, never fatal. Races need
   no handling — `Storage.save` is atomic (`os.replace`), the worst case is
-  missing one task created mid-scan.
+  missing one task created mid-scan;
+- the archive is read through a module-level INCREMENTAL CACHE keyed by the
+  project root (one per process, `threading.Lock`-guarded): each task file
+  is re-read and re-parsed only when its `(mtime_ns, size)` stat pair
+  changed, and the cached entry is a REDUCED record — the raw transcript
+  (`messages`, `tester_messages`, …) is parsed only to extract the search
+  index and immediately dropped, so a 300+ MB archive costs milliseconds
+  on a warm search and a few MB of memory instead of gigabytes. A broken
+  cache entry is quietly rebuilt from disk, never fatal (deliberately
+  in-memory only: no on-disk persistence, no invalidation contract beyond
+  the stat keys).
 
 Worktree isolation note: under `task_isolation: worktree` the task files
 live in the MAIN checkout's `.drcode/tasks/`, not in the task's worktree —
@@ -56,6 +66,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -441,9 +452,14 @@ class TaskHit:
 
 
 def _first_prompt(data: dict[str, Any]) -> str:
-    """The beginning of the task's initial user input (see TaskHit)."""
-    prompts = _prompt_texts(data.get("messages") or [])
-    if prompts:
+    """The beginning of the task's initial user input (see TaskHit).
+
+    Works on the REDUCED record (`load_archive`): the user prompts were
+    extracted at record-build time into `data["prompts"]`; a task never run
+    falls back to its first queued pending_input text.
+    """
+    prompts = data.get("prompts")
+    if isinstance(prompts, list) and prompts:
         text = prompts[0]
     else:
         pending = _pending_texts(data.get("pending_input") or [])
@@ -487,53 +503,171 @@ def first_prompt_snippet(text: str, cap: int = SNIPPET_MAX) -> str:
     return flat if len(flat) <= cap else flat[:cap] + "…"
 
 
-def load_archive(
-    project_root: Path,
-) -> list[tuple[str, dict[str, Any], list[tuple[str, str]]]]:
-    """Read the whole task archive into memory.
+# An archive record: (task_id, reduced task dict, indexed fields). The
+# "reduced" dict holds only the fields the matching/hit-shaping code reads
+# (see _extract_record) — never the raw transcript.
+ArchiveRecord = tuple[str, dict[str, Any], list[tuple[str, str]]]
+# A record with its match score, as produced by _match_records.
+MatchedRecord = tuple[str, dict[str, Any], list[tuple[str, str]], int]
 
-    Returns (task_id, raw task dict, indexed fields) for every readable
+
+# The reduced-record keys copied verbatim from the raw task dict. Everything
+# else (the giant `messages` / `tester_messages` / `resolver_messages`
+# transcripts) is read once during extraction and then dropped — the search
+# never needs it again.
+_REDUCED_KEYS = (
+    "title",
+    "status",
+    "kind",
+    "created_at",
+    "completed_at",
+    "verification",
+    "unfinished",
+    "hook_merge_failed",
+    "pending_input",
+    "edited_files",
+    "events",
+)
+
+
+def _extract_record(task_id: str, data: dict[str, Any]) -> ArchiveRecord:
+    """Reduce a freshly parsed task dict to its search-relevant form.
+
+    Runs ONCE per (re)loaded file: the raw transcript is scanned for the
+    user prompts (kept verbatim — usually small) and the indexed fields,
+    then thrown away. `prompts` is what `_first_prompt` reads on the
+    reduced record; `events` keeps only dict entries (the shape
+    `_last_error_event` tolerates anyway).
+    """
+    reduced: dict[str, Any] = {key: data.get(key) for key in _REDUCED_KEYS}
+    reduced["prompts"] = _prompt_texts(data.get("messages") or [])
+    reduced["events"] = [
+        event for event in reduced["events"] or [] if isinstance(event, dict)
+    ]
+    return task_id, reduced, _indexed_fields(task_id, data)
+
+
+@dataclass
+class _CachedArchive:
+    """The incremental per-project archive cache (see load_archive)."""
+
+    # Records in filename order, as returned by load_archive.
+    records: list[ArchiveRecord]
+    # Reduced record by absolute file path (for per-file reuse).
+    by_path: dict[str, ArchiveRecord]
+    # The (mtime_ns, size) stat pair each cached record was built from.
+    file_keys: dict[str, tuple[int, int]]
+
+
+# One cache per project root, shared by the agent tool (runs in a worker
+# thread via tool_runtime._run_tool) and the TUI dialog. Guarded by a single
+# module-level lock: file I/O is blocking, concurrent callers on the SAME
+# project serialize (the second gets the warm cache), and cross-project
+# contention is not a real scenario.
+_ARCHIVE_LOCK = threading.Lock()
+_ARCHIVE_CACHES: dict[str, _CachedArchive] = {}
+
+
+def clear_archive_cache(project_root: Path | None = None) -> None:
+    """Drop the archive cache (one project, or all when root is None).
+
+    Purely an operational/testing hook — the cache rebuilds on the next
+    `load_archive` call.
+    """
+    with _ARCHIVE_LOCK:
+        if project_root is None:
+            _ARCHIVE_CACHES.clear()
+        else:
+            _ARCHIVE_CACHES.pop(str(Path(project_root)), None)
+
+
+def load_archive(project_root: Path) -> list[ArchiveRecord]:
+    """Read the whole task archive into memory, through the incremental cache.
+
+    Returns (task_id, REDUCED task dict, indexed fields) for every readable
     task file; corrupted/unreadable files are silently skipped (the
     load_one contract). The id comes from the file stem — the filename is
-    the archive's identity, `data["id"]` is only a copy of it. BLOCKING
-    file I/O: callers on an event loop must run this in a worker thread
-    (the TUI dialog reads it once per session and filters in memory).
+    the archive's identity, `data["id"]` is only a copy of it.
+
+    The reduced dict holds only the search-relevant fields (status/kind for
+    filtering, title/dates/verification markers for hit shaping, prompts and
+    events as small lists) — the raw transcripts are parsed during
+    extraction and never kept, so memory stays in the MBs regardless of
+    archive size.
+
+    Incrementality: every task file is stat'ed (cheap — hundreds of stats
+    cost a few ms) and re-read/re-parsed ONLY when its `(mtime_ns, size)`
+    changed; unchanged records are reused from the cache, so a repeat search
+    is milliseconds and only the files the pipeline actually touched pay the
+    JSON price. A broken/unexpected cache entry is quietly rebuilt from
+    disk, never fatal. The cache is deliberately in-memory only (one per
+    process, keyed by the project root, `threading.Lock`-guarded — the agent
+    tool runs in a worker thread, the TUI dialog in another).
+
+    BLOCKING file I/O: callers on an event loop must run this in a worker
+    thread (the TUI dialog reads it once per session and filters in memory).
     """
-    tasks_dir = Path(project_root) / PROJECT_STATE_DIRNAME / "tasks"
+    root = Path(project_root)
+    tasks_dir = root / PROJECT_STATE_DIRNAME / "tasks"
     try:
         paths = sorted(tasks_dir.glob("*.json"))
     except OSError:
         return []
-    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]] = []
+    # Fast path outside the lock: stat everything once (all callers need
+    # fresh keys anyway) — no reason to serialize this across projects.
+    entries: list[tuple[Path, int, int]] = []
     for path in paths:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            continue  # Corrupted/unreadable: skip silently (load_one contract).
-        if not isinstance(data, dict):
-            continue
-        records.append((path.stem, data, _indexed_fields(path.stem, data)))
-    return records
+            stat = path.stat()
+            entries.append((path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            continue  # Vanished mid-scan: skip silently (load_one contract).
+    cache_key = str(root)
+    with _ARCHIVE_LOCK:
+        cached = _ARCHIVE_CACHES.get(cache_key)
+        if not isinstance(cached, _CachedArchive):
+            cached = None  # Broken/foreign entry: rebuild from scratch.
+        old_keys = cached.file_keys if cached else {}
+        records: list[ArchiveRecord] = []
+        by_path: dict[str, ArchiveRecord] = {}
+        file_keys: dict[str, tuple[int, int]] = {}
+        for path, mtime_ns, size in entries:
+            path_key = str(path)
+            key = (mtime_ns, size)
+            record: ArchiveRecord | None = None
+            if old_keys.get(path_key) == key and cached is not None:
+                record = cached.by_path.get(path_key)
+            if record is None:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                    continue  # Corrupted/unreadable: skip (load_one contract).
+                if not isinstance(data, dict):
+                    continue
+                record = _extract_record(path.stem, data)
+            records.append(record)
+            by_path[path_key] = record
+            file_keys[path_key] = key
+        fresh = _CachedArchive(records=records, by_path=by_path, file_keys=file_keys)
+        _ARCHIVE_CACHES[cache_key] = fresh
+        return list(records)
 
 
 def _match_records(
-    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    records: list[ArchiveRecord],
     variants_per_keyword: list[list[str]],
     *,
     status: str | None = None,
     kind: str | None = None,
-) -> tuple[
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-]:
+) -> tuple[list[MatchedRecord], list[MatchedRecord]]:
     """Match preloaded archive records against the keyword variants.
 
     Returns (and_matches, or_matches) — a record lands in the AND list when
     EVERY keyword occurs, otherwise in the OR list when ANY does. Pure
     in-memory computation (no I/O), cheap enough to re-run per keystroke.
     """
-    and_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
-    or_matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]] = []
+    and_matches: list[MatchedRecord] = []
+    or_matches: list[MatchedRecord] = []
     for task_id, data, fields in records:
         if status is not None and data.get("status") != status:
             continue
@@ -554,12 +688,7 @@ def _prepare(
     *,
     status: str | None = None,
     kind: str | None = None,
-) -> tuple[
-    list[str],
-    list[list[str]],
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-]:
+) -> tuple[list[str], list[list[str]], list[MatchedRecord], list[MatchedRecord]]:
     """Shared front half of the archive-loading entry points: validate the
     keywords and filters, build the stem variants, load the archive and
     match it.
@@ -573,7 +702,7 @@ def _prepare(
 
 
 def _hits_from(
-    matches: list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
+    matches: list[MatchedRecord],
     variants_per_keyword: list[list[str]],
     limit: int,
 ) -> list[TaskHit]:
@@ -621,7 +750,7 @@ def annotate_unmerged(project_root: Path, hits: list[TaskHit]) -> None:
 
 
 def search_records(
-    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    records: list[ArchiveRecord],
     keywords: list[str],
     *,
     status: str | None = None,
@@ -643,17 +772,12 @@ def search_records(
 
 
 def _match_prepared(
-    records: list[tuple[str, dict[str, Any], list[tuple[str, str]]]],
+    records: list[ArchiveRecord],
     keywords: list[str],
     *,
     status: str | None = None,
     kind: str | None = None,
-) -> tuple[
-    list[str],
-    list[list[str]],
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-    list[tuple[str, dict[str, Any], list[tuple[str, str]], int]],
-]:
+) -> tuple[list[str], list[list[str]], list[MatchedRecord], list[MatchedRecord]]:
     """`_prepare` over preloaded records (no archive reading) — shared by
     `search_records` and the archive-loading variants below."""
     cleaned = [k.strip().lower() for k in keywords if k and k.strip()]

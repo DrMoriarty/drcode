@@ -9,6 +9,7 @@ is exactly the observable "was promoted" signal used here.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -25,9 +26,20 @@ from drcode.tui.inputs import DepsInput
 from drcode.tui.sidebar import TaskItem
 
 
-async def _settle(pilot, app: DrCodeApp, predicate, timeout_s: float = 5.0) -> bool:
+async def _settle(pilot, app: DrCodeApp, predicate, timeout_s: float | None = None) -> bool:
     """Pump the event loop until `predicate()` holds (the promote worker
-    runs its git check via asyncio.to_thread and resumes asynchronously)."""
+    runs its git check via asyncio.to_thread and resumes asynchronously).
+
+    The default deadline follows the suite-wide DRCODE_TEST_WAIT_TIMEOUT
+    convention (30 s) — the real-git test spawns actual git/worktree
+    subprocesses, which under a fully loaded xdist run can easily exceed
+    a fixed 5 s (the flaky full-suite failure of
+    test_mergedness_gate_with_real_git)."""
+    if timeout_s is None:
+        try:
+            timeout_s = float(os.environ.get("DRCODE_TEST_WAIT_TIMEOUT", "30"))
+        except ValueError:
+            timeout_s = 30.0
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         await pilot.pause(0.05)

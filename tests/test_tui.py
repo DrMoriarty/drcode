@@ -2222,6 +2222,47 @@ async def test_task_settings_dialog_dormant_fields_dim_and_park(
             assert not dialog.query_one(selector, Select).has_class("ts-dormant")
 
 
+async def test_task_settings_dialog_rapid_dual_subagent_change(
+    app: DrCodeApp,
+) -> None:
+    """Changing BOTH subagent selects back-to-back (both Changed events
+    queued before either handler runs — fast user input under load) must
+    not start the sync/event feedback loop: the programmatic writes in
+    _refresh are prevented from posting messages, so both edits settle
+    and no oscillation happens (the old bug flipped the values ~58 times
+    in 2 s and toggled the `changed` border endlessly)."""
+    from textual.widgets import Select
+
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        app.push_screen(dialog)
+        await pilot.pause()
+        coder = dialog.query_one("#ts-subagents-coder", Select)
+        researcher = dialog.query_one("#ts-subagents-researcher", Select)
+        assert coder.value == 0
+        assert researcher.value == 0
+
+        # Both changes land before either handler runs: no pause between
+        # the two assignments.
+        coder.value = 1
+        researcher.value = 1
+        for _ in range(5):
+            await pilot.pause()
+            snapshot = (coder.value, researcher.value)
+            # No self-sustaining loop: the values are identical on every
+            # drain of the message queue...
+            assert snapshot == (1, 1)
+            assert coder.has_class("changed")
+            assert researcher.has_class("changed")
+        # ...and both edits made it into the draft exactly once.
+        assert dialog._draft.subagents_coder == 1  # pyright: ignore[reportAttributeAccessIssue]
+        assert dialog._draft.subagents_researcher == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
 async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
     """The "Worktree removal" setting: the option palette lists the three
     modes with the current one marked, and picking one persists it into

@@ -424,7 +424,15 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _set_select(self, selector: str, value: object) -> None:
         select = self.query_one(selector, Select)
         if select.value != value:
-            select.value = value  # type: ignore[assignment]
+            # Programmatic sync must never post Select.Changed: Textual
+            # delivers messages asynchronously, so such an event can be
+            # STALE by the time its handler runs (the user has already
+            # moved the widget on) — the handler would re-apply the stale
+            # value into the draft and _refresh() would answer by writing
+            # another widget, regenerating events forever (the
+            # both-subagents-selects flicker loop).
+            with self.prevent(Select.Changed):
+                select.value = value  # type: ignore[assignment]
 
     def _sync_preset(self) -> None:
         """Press the radio of the preset the draft currently matches, or
@@ -458,7 +466,8 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-retention", d.completed_retention)
         switch = self.query_one("#ts-keep-awake", Switch)
         if switch.value != d.keep_awake:
-            switch.value = d.keep_awake
+            with self.prevent(Switch.Changed):  # same staleness rule
+                switch.value = d.keep_awake
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -531,11 +540,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._sync_hints()
 
     # -- widgets -> draft ------------------------------------------------------
-    # Every handler guards on "does the widget value already equal the
-    # draft": the sync in _refresh assigns widget values too, and Textual
-    # delivers the resulting Changed messages ASYNCHRONOUSLY (after the
-    # sync flag could have been reset) — the value comparison is the only
-    # reliable loop guard.
+    # Only genuine user edits reach these handlers: the programmatic
+    # widget writes in _refresh are wrapped in self.prevent(...) so they
+    # never post Changed messages at all (Textual delivers messages
+    # asynchronously — an un-prevented sync write can come back as a
+    # STALE event and re-enter its handler after the user has already
+    # moved the widget on). The handlers keep the "does the event value
+    # already equal the draft" guard as the second half of the loop
+    # protection.
 
     @on(RadioSet.Changed, "#ts-preset")
     def _preset_changed(self, event: RadioSet.Changed) -> None:

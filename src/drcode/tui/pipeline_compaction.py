@@ -17,11 +17,14 @@ from ..agent import (
     build_compaction_agent,
     build_compaction_prompt,
     build_reduce_prompt,
+    build_resolver_agent,
     chunk_history_for_summary,
     compacted_messages,
     extract_previous_summary,
     is_summary_message,
     last_context_tokens,
+    load_agents_md,
+    load_resolver_prompt,
     mechanical_compaction_messages,
     prompt_fits_context,
     prompt_fits_window,
@@ -31,6 +34,13 @@ from ..agent import (
 )
 from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
+from ..context_layout import (
+    coding_tool_schemas,
+    system_components_coding,
+    system_components_tester,
+    tester_tool_schemas,
+    tool_schemas,
+)
 from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
@@ -78,6 +88,11 @@ _THRESHOLD_COMPACTION_LIMIT = 3
 # every turn's growth re-crosses the threshold (the bench s4 livelock:
 # every cycle a "successful" compaction, the counter never exceeds 1).
 _THRESHOLD_PROGRESS_OBS = 2
+
+# Safety margin (percent of the serving window) applied when verifying the
+# mechanical floor's result: the chars/4 estimate cannot see chat-template
+# glue and per-message framing, so the trim aims a little below the window.
+_MECHANICAL_MARGIN_PCT = 5
 
 
 class _ChunkingImpossible(Exception):
@@ -290,14 +305,72 @@ class PipelineCompactionLayer(DrCodeState):
         shrink the transcript at all (no-op → the gate must stop firing)."""
         return estimate_tokens(json.dumps(messages, ensure_ascii=False))
 
-    def _mechanical_token_budget(self, role: AgentRole) -> int:
+    def _mechanical_framing(
+        self, task: Task, role: AgentRole
+    ) -> tuple[int, int, int] | None:
+        """Measured request framing of the role actually serving the
+        transcript: (window, framing, output) where `framing` is the ≈
+        chars/4 size of everything a model request carries besides the
+        transcript — the system prompt (base template + AGENTS.md + git
+        workflow, the `.drcode/prompts/` overrides honored) and the
+        serialized tool schemas of the role/kind's real `build_agent`
+        wiring — and `output` the role's `max_tokens` output reserve
+        (clamped to a quarter of the window). None when the window is
+        unknown (≤ 0) or the wiring cannot be reconstructed."""
+        cfg = self.resolved_config(role)
+        window = cfg.max_context_tokens
+        if window <= 0:
+            return None
+        root = self.project_root
+        try:
+            if role is AgentRole.TESTER:
+                policy = self.settings.git_policy.tester
+                components = system_components_tester(
+                    policy.commits, root, policy.pushes
+                )
+                tools = tester_tool_schemas(
+                    cfg,
+                    allow_commit=policy.commits,
+                    allow_push=policy.pushes,
+                    root=root,
+                )
+            elif role is AgentRole.RESOLVER:
+                instructions = load_resolver_prompt(root)
+                agents_md = load_agents_md(root) if root is not None else ""
+                components = [
+                    ("resolver prompt", instructions),
+                    ("AGENTS.md", agents_md.strip() or None),
+                ]
+                tools = tool_schemas(build_resolver_agent(cfg, root=root))
+            else:
+                research_git = self.settings.git_policy.research
+                components = system_components_coding(task.kind, root, research_git)
+                tools = coding_tool_schemas(
+                    cfg, kind=task.kind, root=root, research_git=research_git
+                )
+        except Exception:  # noqa: BLE001 - a measurement gap must not kill compaction
+            return None
+        framing = sum(estimate_tokens(t) for _, t in components if t) + sum(
+            estimate_tokens(t) for _, t in tools
+        )
+        output = min(max(cfg.max_tokens, 0), max(window // 4, 128))
+        return window, framing, output
+
+    def _mechanical_token_budget(
+        self,
+        task: Task,
+        role: AgentRole,
+        measured: tuple[int, int, int] | None = None,
+    ) -> int:
         """Token budget of the mechanical compaction floor for `role`: the
         serving model's window under its compaction threshold, minus a
-        headroom reserve (system prompt, tool schemas, the next turn's
-        output — MECHANICAL_HEADROOM_TOKENS, capped at a quarter of the
-        window). An unknown serving window falls back to the compaction
-        model's (smaller) one; both unknown → 0 (only the original prompts
-        and the note survive)."""
+        headroom reserve MEASURED against the role's real wiring (system
+        prompt incl. AGENTS.md + git workflow, tool schemas, the output
+        reserve — `_mechanical_framing`). An unmeasurable wiring falls back
+        to the flat MECHANICAL_HEADROOM_TOKENS reserve (capped at a quarter
+        of the window). An unknown serving window falls back to the
+        compaction model's (smaller) one; both unknown → 0 (only the
+        original prompts and the note survive)."""
         cfg = self.resolved_config(role)
         window = cfg.max_context_tokens
         if window <= 0:
@@ -305,17 +378,39 @@ class PipelineCompactionLayer(DrCodeState):
         if window <= 0:
             return 0
         threshold = min(max(cfg.compaction_threshold, 1), 100)
-        headroom = min(MECHANICAL_HEADROOM_TOKENS, window // 4)
+        if measured is None:
+            measured = self._mechanical_framing(task, role)
+        if measured is None:
+            headroom = min(MECHANICAL_HEADROOM_TOKENS, window // 4)
+        else:
+            _, framing, output = measured
+            headroom = framing + output
         return max(window * threshold // 100 - headroom, 0)
 
     def _mechanical_compact(
-        self, messages: list[dict[str, Any]], summary_role: AgentRole, what: str
+        self,
+        task: Task,
+        messages: list[dict[str, Any]],
+        summary_role: AgentRole,
+        what: str,
     ) -> tuple[list[dict[str, Any]], str]:
         """The LLM-free floor: trim `messages` at message boundaries into a
-        transcript that fits `summary_role`'s window, plus the success event
-        text announcing it."""
+        transcript that fits `summary_role`'s window, plus the event text
+        announcing it.
+
+        The trim budget is computed from the MEASURED request framing of the
+        serving role (`_mechanical_token_budget`), and the result is
+        verified against the serving window (framing + trimmed transcript +
+        output reserve ≤ window − margin). When the threshold-scaled budget
+        leaves too little room, the trim is repeated against the FULL window
+        (dropping the threshold scaling); when even that cannot fit — the
+        preserved original prompt(s) plus the note plus the framing alone
+        overflow the window — the trim result is kept, `task.needs_human`
+        is set and the event says so honestly instead of resuming into a
+        deterministic context-overflow death of the next request."""
+        measured = self._mechanical_framing(task, summary_role)
         trimmed = mechanical_compaction_messages(
-            messages, self._mechanical_token_budget(summary_role)
+            messages, self._mechanical_token_budget(task, summary_role, measured)
         )
         event = (
             "Context compacted mechanically: the transcript did not fit the "
@@ -323,6 +418,43 @@ class PipelineCompactionLayer(DrCodeState):
             "message boundaries without a summarizer call (original task "
             "prompt(s), the previous summary and the most recent messages "
             "kept)."
+        )
+        if measured is None:
+            return trimmed, event
+        window, framing, output = measured
+        limit = window - max(window * _MECHANICAL_MARGIN_PCT // 100, 1)
+
+        def fits(cand: list[dict[str, Any]]) -> bool:
+            return framing + self._messages_estimate(cand) + output <= limit
+
+        if fits(trimmed):
+            return trimmed, event
+        # The threshold-scaled budget does not leave room for the framing:
+        # re-trim against the full window (the floor's guarantee is "fits
+        # the window", not "lands under the threshold").
+        retrimmed = mechanical_compaction_messages(
+            messages,
+            max(
+                window
+                - framing
+                - output
+                - max(window * _MECHANICAL_MARGIN_PCT // 100, 1),
+                0,
+            ),
+        )
+        if fits(retrimmed):
+            return retrimmed, event
+        task.needs_human = True
+        event = (
+            "Context compacted mechanically, but even the trimmed "
+            f"{what} cannot fit the {summary_role.value} model's "
+            f"{window}-token window: the request framing alone (system "
+            f"prompt and tool schemas ≈{framing} tokens, output reserve "
+            f"≈{output} tokens) plus the original prompt(s) kept verbatim "
+            "already overflow it. Raise the model's max_context_tokens in "
+            "the provider catalog (drcode-models) or shorten the task's "
+            "original prompt — the task is marked as needing human "
+            "attention."
         )
         return trimmed, event
 
@@ -368,7 +500,9 @@ class PipelineCompactionLayer(DrCodeState):
         except _ChunkingImpossible:
             # Chunking cannot produce a slice that fits the window: the
             # mechanical floor is the only path that never overflows.
-            trimmed, event = self._mechanical_compact(messages, summary_role, what)
+            trimmed, event = self._mechanical_compact(
+                task, messages, summary_role, what
+            )
             return trimmed, event, False
         except Exception as e:
             if _is_context_overflow_error(e):
@@ -381,7 +515,9 @@ class PipelineCompactionLayer(DrCodeState):
                     f"({type(e).__name__}: context overflow) — trimming "
                     "mechanically instead.",
                 )
-                trimmed, event = self._mechanical_compact(messages, summary_role, what)
+                trimmed, event = self._mechanical_compact(
+                    task, messages, summary_role, what
+                )
                 return trimmed, event, True
             if not hard:
                 raise
@@ -393,7 +529,9 @@ class PipelineCompactionLayer(DrCodeState):
                 f"The summarizer failed ({type(e).__name__}: {e}) with the "
                 "fill at the hard limit — trimming mechanically instead.",
             )
-            trimmed, event = self._mechanical_compact(messages, summary_role, what)
+            trimmed, event = self._mechanical_compact(
+                task, messages, summary_role, what
+            )
             return trimmed, event, True
         event = (
             f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
@@ -656,7 +794,7 @@ class PipelineCompactionLayer(DrCodeState):
                 "at the hard limit — trimming mechanically instead.",
             )
             new_messages, event = self._mechanical_compact(
-                task.messages, self._task_role(task), "history"
+                task, task.messages, self._task_role(task), "history"
             )
             llm_failed = True
         if llm_failed:
@@ -799,7 +937,7 @@ class PipelineCompactionLayer(DrCodeState):
                 "at the hard limit — trimming mechanically instead.",
             )
             new_messages, event = self._mechanical_compact(
-                round_messages, AgentRole.TESTER, "testing round"
+                task, round_messages, AgentRole.TESTER, "testing round"
             )
             llm_failed = True
         if llm_failed:
@@ -901,7 +1039,7 @@ class PipelineCompactionLayer(DrCodeState):
                 "at the hard limit — trimming mechanically instead.",
             )
             new_messages, event = self._mechanical_compact(
-                round_messages, AgentRole.RESOLVER, "conflict-resolution round"
+                task, round_messages, AgentRole.RESOLVER, "conflict-resolution round"
             )
             llm_failed = True
         if llm_failed:

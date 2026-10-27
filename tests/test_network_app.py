@@ -832,6 +832,206 @@ async def test_compaction_overflow_fallback_trims_mechanically(
     assert "dropped mechanically" in (extract_previous_summary(task.messages) or "")
 
 
+def _coding_window_app(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch, window: int
+) -> DrCodeApp:
+    """An app whose CODING role resolves to a custom model with `window`
+    context tokens, while the COMPACTION role is pinned to a tiny window —
+    so the summarizer path is deterministically impossible
+    (`_ChunkingImpossible`) and compaction lands on the mechanical floor
+    serving from the CODING role."""
+    from drcode.providers import AgentRole, CustomModelEntry, set_project_custom_model
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(
+            model="coding-m",
+            base_url="http://coding/v1",
+            max_context_tokens=window,
+        ),
+    )
+    real = DrCodeApp.resolved_config
+
+    def resolved(self: DrCodeApp, role: AgentRole):  # type: ignore[no-untyped-def]
+        cfg = real(self, role)
+        if role is AgentRole.COMPACTION:
+            return cfg.model_copy(update={"max_context_tokens": 1000})
+        return cfg
+
+    monkeypatch.setattr(DrCodeApp, "resolved_config", resolved)
+    return DrCodeApp(project_root)
+
+
+def _seed_big_transcript(app: DrCodeApp, prompt: str, fill: int) -> Any:
+    """A FEATURE task whose persisted transcript reports a context fill of
+    `fill` tokens and carries a fat tool-result as trim material."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = app.manager.create("docs", prompt, kind=TaskKind.FEATURE)
+    call_id = "call-1"
+    task.messages = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(prompt)]),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="read_file", args={}, tool_call_id=call_id)
+                ],
+                usage=RequestUsage(input_tokens=fill // 2, output_tokens=8),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="read_file",
+                        content="x" * 80_000,
+                        tool_call_id=call_id,
+                    )
+                ]
+            ),
+            ModelResponse(
+                parts=[TextPart("partial work")],
+                usage=RequestUsage(input_tokens=fill, output_tokens=8),
+            ),
+        ]
+    )
+    app.manager.storage.save(task)
+    return task
+
+
+async def test_mechanical_floor_measured_headroom_fits_window(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mechanical floor's headroom is MEASURED against the serving
+    role's real wiring (system prompt + AGENTS.md + tool schemas + output
+    reserve, chars/4): the trimmed transcript plus that framing fits the
+    coding model's window — the flat 32k reserve capped at window//4 would
+    structurally overflow a window this size."""
+    from drcode.providers import AgentRole
+
+    app = _coding_window_app(project_root, monkeypatch, 20_000)
+    task = _seed_big_transcript(app, "long task " * 200, fill=17_000)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert not task.needs_human
+    # The wire-level guarantee: measured framing + trimmed transcript +
+    # output reserve fit the window (minus the safety margin).
+    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    assert window == 20_000
+    assert framing + app._messages_estimate(task.messages) + output <= window - max(
+        window * 5 // 100, 1
+    )
+    # The trim actually happened (the fat tool result did not survive).
+    assert app._messages_estimate(task.messages) < 17_000
+
+
+async def test_mechanical_floor_small_capped_window_fits_via_measured_headroom(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bench scenario (coding cap 5000, threshold 80%, a modest
+    project AGENTS.md): the old flat headroom (32k capped at window//4 =
+    1250) left a message budget the framing alone overflows — the resumed
+    request died deterministically. The MEASURED headroom (framing + output
+    reserve) shrinks the message budget instead, the threshold-scaled trim
+    is re-run against the full window when needed, and the result fits."""
+    from drcode.providers import AgentRole
+
+    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 1000)
+    app = _coding_window_app(project_root, monkeypatch, 6_000)
+    task = _seed_big_transcript(app, "long task " * 200, fill=5_500)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert not task.needs_human
+    # The old flat headroom really did overflow this window…
+    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    assert framing + window * 55 // 100 > window  # the old flat-budget trim overflows
+    # …while the measured result fits the window (minus the margin).
+    assert framing + app._messages_estimate(task.messages) + output <= window - max(
+        window * 5 // 100, 1
+    )
+
+
+async def test_mechanical_floor_cannot_fit_marks_needs_human(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When even the floor cannot fit — the preserved original prompt(s)
+    plus the note plus the measured framing alone overflow the window —
+    the task is marked needs_human with an honest service event instead of
+    resuming into a deterministic context-overflow death."""
+    from drcode.compaction import extract_previous_summary
+
+    app = _coding_window_app(project_root, monkeypatch, 5_000)
+    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 50_000)
+    task = _seed_big_transcript(app, "long task " * 200, fill=4_500)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert any("cannot fit" in t and "needing human" in t for t in texts)
+    assert task.needs_human
+    # Only the verbatim prompt and the note survive — the transcript itself
+    # is as small as the floor can make it.
+    assert [m["kind"] for m in task.messages] == ["request", "request"]
+    assert "dropped mechanically" in (extract_previous_summary(task.messages) or "")
+
+
+async def test_mechanical_floor_huge_agents_md_under_normal_window(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A huge project AGENTS.md under a normal window: the flat 32k
+    headroom is insufficient (framing ≈ 50k AGENTS.md tokens + system
+    prompt + tools), the MEASURED headroom shrinks the message budget so
+    the trimmed transcript plus framing still fits — no overflow, no
+    needs_human."""
+    from drcode.providers import AgentRole
+
+    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 50_000)
+    app = _coding_window_app(project_root, monkeypatch, 100_000)
+    task = _seed_big_transcript(app, "long task " * 200, fill=85_000)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert not task.needs_human
+    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    # The AGENTS.md dominates the framing: far above the old flat 32k.
+    assert framing > 40_000
+    assert framing + app._messages_estimate(task.messages) + output <= window - max(
+        window * 5 // 100, 1
+    )
+
+
 async def test_hard_limit_noop_marks_exhausted(
     net_app_small_ctx: DrCodeApp, scripted: ScriptedState
 ) -> None:
@@ -1277,7 +1477,11 @@ async def test_tester_round_compaction_mechanical_floor(
     """The tester round gate carries the same guarantee: when the
     summarizer cannot run, the round is trimmed mechanically and reported
     as compacted (the caller resumes it and drops the stale live tokens)
-    instead of looping uncompressed through a guaranteed 400."""
+    instead of looping uncompressed through a guaranteed 400. With the
+    1000-token window the tester's MEASURED framing (system prompt + tool
+    schemas ≈ 2k tokens) alone overflows it, so the trim keeps only the
+    verbatim prompt and the note — and the task is flagged needs_human
+    instead of resuming into a deterministic 400."""
     from pydantic_ai.messages import (
         ModelRequest,
         ModelResponse,
@@ -1313,11 +1517,14 @@ async def test_tester_round_compaction_mechanical_floor(
 
     texts = event_texts(task)
     assert any("Context compacted mechanically" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    assert any("cannot fit" in t and "needing human" in t for t in texts)
+    assert task.needs_human
     assert scripted.calls == []
     final_round = task.tester_messages[-1]
-    # The round's tail fits the budget: prompt verbatim, response kept, the
-    # mechanical note request last.
-    assert [m["kind"] for m in final_round] == ["request", "response", "request"]
+    # Nothing fits the window alongside the measured framing: only the
+    # verbatim prompt and the mechanical note request survive.
+    assert [m["kind"] for m in final_round] == ["request", "request"]
     assert not is_summary_message(final_round[0])
     assert is_summary_message(final_round[-1])
     # The developer transcript is untouched, as with the LLM path.

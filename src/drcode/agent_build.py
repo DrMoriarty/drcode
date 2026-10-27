@@ -594,17 +594,28 @@ def build_tester_agent(
     tool but it commits locally without ever
     pushing — the commit-only system prompt is selected. When `root`
     is given, its actual path is substituted into the system prompt header
-    (the `{project_path}` placeholder). With `review_gate=True` (an
+    (the `{project_path}` placeholder). When the project root contains
+    AGENTS.md, its content is appended to the instructions — the tester
+    writes/commits code and runs the project's checks in the real
+    repository, so the project rules apply to it just like to the coding
+    agent. With `review_gate=True` (an
     external review is defined in `.drcode/workflow.py`) a successful
     verdict only labels the task PASSED and leaves it TESTING — the
     external review decides the final completion.
     """
     model = agent_model.build_model(config)
+    instructions = load_tester_prompt(
+        allow_commit, project_root=root, allow_push=allow_push
+    )
+    if root is not None:
+        agents_md = load_agents_md(root)
+        if agents_md.strip():
+            instructions = (
+                f"{instructions}\n\n# Project instructions (AGENTS.md)\n\n{agents_md}"
+            )
     agent = Agent(
         model,
-        instructions=load_tester_prompt(
-            allow_commit, project_root=root, allow_push=allow_push
-        ),
+        instructions=instructions,
         deps_type=TesterDeps,
         model_settings={
             "extra_headers": EXTRA_HEADERS,

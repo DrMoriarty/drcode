@@ -1511,6 +1511,37 @@ def test_build_tester_agent_substitutes_project_path(
     assert str(project_root) in _instructions_text(ag2)
 
 
+def test_build_tester_agent_appends_agents_md(
+    fake_config: Config, project_root: Path
+) -> None:
+    from drcode.agent import build_tester_agent
+    from drcode.prompts import load_tester_prompt
+
+    (project_root / "AGENTS.md").write_text("PROJECT SPECIFIC RULE")
+    ag = build_tester_agent(fake_config, root=project_root)
+    instructions = _instructions_text(ag)
+    assert (
+        load_tester_prompt(project_root=project_root) in instructions
+    )
+    assert "Project instructions (AGENTS.md)" in instructions
+    assert "PROJECT SPECIFIC RULE" in instructions
+    # The commit-free variant gets the same rules.
+    ag2 = build_tester_agent(fake_config, allow_commit=False, root=project_root)
+    assert "PROJECT SPECIFIC RULE" in _instructions_text(ag2)
+
+
+def test_build_tester_agent_without_root_or_empty_agents_md(
+    fake_config: Config, project_root: Path
+) -> None:
+    from drcode.agent import build_tester_agent
+
+    ag = build_tester_agent(fake_config)  # no root passed
+    assert "Project instructions" not in _instructions_text(ag)
+    (project_root / "AGENTS.md").write_text("   \n")  # whitespace only
+    ag2 = build_tester_agent(fake_config, root=project_root)
+    assert "Project instructions" not in _instructions_text(ag2)
+
+
 def test_system_prompts_distinct() -> None:
     from drcode.agent import (
         BUG_SYSTEM_PROMPT,

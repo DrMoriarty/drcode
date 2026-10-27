@@ -55,6 +55,29 @@ def test_tester_prompt_substitutes_project_path(tmp_path: Path) -> None:
         assert PROJECT_PATH_PLACEHOLDER not in prompt
 
 
+def test_tester_prompts_teach_project_environment_checks() -> None:
+    """All three tester templates must route Python tooling through the
+    run_check tool (the project's own environment) and forbid falling back
+    to a bare PATH binary — a PATH ruff of a different version reports
+    phantom failures the project's own gate never produces (3ea596cb)."""
+    from drcode.prompts import (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+    )
+
+    for template in (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+    ):
+        assert "run_check" in template
+        assert "PATH binary" in template
+        assert "phantom" in template
+        # The old wording that never said whose tool runs the checks.
+        assert "Run each detected check via run_bash" not in template
+
+
 def test_tester_prompt_no_push_variant(tmp_path: Path) -> None:
     """The commit-without-push tester git policy selects the dedicated
     template: it teaches the commit flow but never promises a push — and

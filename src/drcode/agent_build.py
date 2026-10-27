@@ -25,6 +25,7 @@ from .agent_tools import (
     _deps_suffix,
     _git_push,
     _retry_failed_here,
+    _run_project_check,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -672,6 +673,26 @@ def build_tester_agent(
         rm/mv/cp are only allowed with paths inside the project root or your
         scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
+
+    @agent.tool
+    async def run_check(
+        ctx: RunContext[TesterDeps],
+        module: str,
+        args: list[str],
+        timeout: int | None = None,
+    ) -> str:
+        """Run a Python check tool from the project's OWN environment:
+        `python -m <module> <args>` with the interpreter of the project's
+        .venv / uv environment. Use it for pytest, ruff, mypy, pyright and
+        any other Python tooling instead of run_bash — a bare `ruff` or
+        `pytest` from PATH can be a different version with a different
+        default ruleset and report phantom failures the project's own gate
+        never produces. Example: run_check("ruff", ["check", "."]). When the
+        result says the module is not installed in the project environment,
+        treat that check as skipped — NEVER fall back to a PATH binary.
+        The command is killed after `timeout` seconds (default 120); values
+        above 3600 are clamped."""
+        return await _run_tool(_run_project_check, ctx.deps.root, module, args, timeout)
 
     @agent.tool
     def create_bug_report(

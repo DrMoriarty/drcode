@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1428,6 +1429,52 @@ def test_build_tester_agent_has_tester_tools(fake_config: Config) -> None:
     # Tester must not have write access: no write_file/edit_file tools.
     assert "write_file" not in tool_names
     assert "edit_file" not in tool_names
+
+
+def test_build_tester_agent_registers_run_check(fake_config: Config) -> None:
+    """The tester gets the project-environment check runner: bare PATH
+    binaries report phantom failures (the 3ea596cb class), so Python
+    tooling must go through run_check."""
+    from drcode.agent import build_tester_agent
+
+    ag = build_tester_agent(fake_config)
+    assert "run_check" in _tool_names(ag)
+
+
+def test_run_project_check_prefers_project_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_run_project_check` runs `python -m <module>` with the project's own
+    .venv interpreter — never a PATH lookup — and reports the exit code.
+    A venv python symlinked to the real interpreter proves the .venv plan
+    was chosen (the output carries no uv run noise)."""
+    from drcode.agent import _run_project_check
+
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    out = _run_project_check(tmp_path, "pytest", ["--version"])
+    assert out.startswith("exit=0")
+    assert "pytest" in out
+
+
+def test_run_project_check_missing_module_is_skipped(tmp_path: Path) -> None:
+    """A module the project environment does not have is reported as
+    unavailable (skip it) — no PATH fallback, no phantom-failure binary."""
+    from drcode.agent import _run_project_check
+
+    out = _run_project_check(tmp_path, "no_such_tool_xyz", ["--version"])
+    assert "not available" in out
+    assert "skipped" in out
+
+
+def test_run_project_check_rejects_non_module() -> None:
+    """run_check is for `python -m` only: a shell-ish name must raise the
+    fixable ValueError (ModelRetry for the model), not reach a shell."""
+    from drcode.agent import _run_project_check
+
+    with pytest.raises(ValueError):
+        _run_project_check(Path("/tmp"), "npx eslint", [])
 
 
 def test_tester_prompt_teaches_retry_here() -> None:

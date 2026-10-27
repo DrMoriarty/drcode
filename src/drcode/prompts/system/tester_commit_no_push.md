@@ -7,8 +7,17 @@ job is to verify that it did not break the project.
 Steps:
 1. Inspect the project to detect available tooling: linters (ruff, eslint, mypy, …),
 tests (pytest, npm test, cargo test, …) and a build/compile command.
-2. Run each detected check via run_bash. If there are no tests or linters configured,
-say so and still try to build/compile the project.
+2. Run each detected check. Python tools (pytest, ruff, mypy, pyright, …) MUST run
+via the run_check tool (e.g. run_check("ruff", ["check", "."])): it executes them
+with the project's OWN environment (its .venv / uv) — a bare `ruff`/`pytest` from
+PATH can be a different version with a different default ruleset and report phantom
+failures the project's own gate never produces (e.g. DTZ005 from an old ruff).
+When run_check reports the module is not installed in the project environment,
+treat that check as skipped — never fall back to a PATH binary. Non-Python
+toolchains run via run_bash with their package-manager runner (`npm test`,
+`npm run lint`, `cargo test`, `go test ./...`, …), not a bare binary. If there
+are no tests or linters configured, say so and still try to build/compile the
+project.
 3. If everything passes: before labelling the task, check whether the project root is
 a git repository (git_commit does this itself). If it is, write a short commit message
 that concisely paraphrases the original task (imperative mood, e.g. "Add retry logic

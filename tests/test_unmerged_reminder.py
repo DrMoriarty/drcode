@@ -138,15 +138,45 @@ def test_unmerged_commits_zero_without_isolation(git_root: Path) -> None:
 # -- pipeline reminder on the PASSED finalization paths -----------------------------
 
 
+def quiet_background_tracking(app: DrCodeApp) -> None:
+    """Neutralize the mount-time background unmerged-tracking actors (the
+    startup-scan worker, the git-indicator poll and the deferred-install
+    poll — all three run `_unmerged_completed_ids` in worker threads, see
+    DrCodeApp.on_mount). The tests below drive that tracking synchronously
+    and assert on its state (flags, `_merge_state`, toasts) immediately
+    after their own mutations: a background pass delayed under load would
+    interleave with them — auditing fresh tasks (grace is skipped for
+    completed_at=None), back-stamping `hook_merge_failed`, starting the
+    conflict resolver (whose engine merge reshapes the task branch behind
+    the git-cherry guard) or clearing a freshly stamped flag via the
+    stale-flag branch. Quiescing the actors makes the synchronous asserts
+    deterministic instead of racing a scheduler."""
+
+    async def _noop() -> None:
+        return None
+
+    app._unmerged_work_startup_scan = _noop  # type: ignore[method-assign]
+    app._poll_git_indicator = _noop  # type: ignore[method-assign]
+    app._poll_pending_installs = _noop  # type: ignore[method-assign]
+    app._maybe_start_resolver = lambda task_id: None  # type: ignore[method-assign]
+
+
 @pytest.fixture
 def app_env(isolated: Path, configured_env: None) -> DrCodeApp:
-    return DrCodeApp(isolated)
+    app = DrCodeApp(isolated)
+    quiet_background_tracking(app)
+    return app
 
 
 def finished_task(app: DrCodeApp, kind: TaskKind = TaskKind.FEATURE) -> Any:
     task = app.manager.create("Fix the bug", "fix the bug")
     task.kind = kind
     task.status = TaskStatus.COMPLETED
+    # mark_done always stamps this; without it the hook-merge audit treats
+    # the task as ancient (the grace check skips completed_at=None) and a
+    # delayed background pass back-stamps hook_merge_failed and starts the
+    # conflict resolver mid-test (#d1f3fa59).
+    task.completed_at = datetime.now(UTC)
     if kind is not TaskKind.RESEARCH:
         task.verification = VerificationStatus.PASSED
     # A real completion stamps completed_at (mark_done). Without it the

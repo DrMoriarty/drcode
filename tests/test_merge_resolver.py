@@ -17,6 +17,7 @@ from typing import cast
 
 import pytest
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -356,6 +357,118 @@ def test_pyright_check_leaves_uv_run_env_alone(
     env = captured["env"]
     assert env is not None
     assert "VIRTUAL_ENV" not in env or env["VIRTUAL_ENV"] != str(repo / ".venv")
+
+
+# -- conflict-marker scan (the a6a6df25 prose-only resolution class) ---------------
+
+
+def test_conflict_marker_hits(repo: Path) -> None:
+    (repo / "conflicted.py").write_text(
+        "x = 1\n<<<<<<< HEAD\n"
+        "task\n||||||| 57cb0d9\nbase\n=======\nmain\n>>>>>>> main\n"
+    )
+    hits = mr.conflict_marker_hits(repo, ["conflicted.py"])
+    lines = [h.split(": ", 1)[1] for h in hits]
+    # All four zdiff3 marker forms are found, with line numbers.
+    assert lines == ["<<<<<<< HEAD", "||||||| 57cb0d9", "=======", ">>>>>>> main"]
+    assert hits[0].startswith("conflicted.py:2:")
+
+
+def test_conflict_marker_hits_ignores_lookalikes(repo: Path) -> None:
+    # Eight-plus marker chars (headings, banners) are NOT conflict markers,
+    # and clean files yield nothing.
+    (repo / "clean.py").write_text(
+        "# ========\nx = 1\nheading =======\nseparator =======\n"
+    )
+    assert mr.conflict_marker_hits(repo, ["clean.py"]) == []
+    assert mr.conflict_marker_hits(repo, ["missing.py"]) == []
+
+
+def test_mechanical_checks_catches_prose_only_resolution(repo: Path) -> None:
+    wt, report = _conflicted_repo(repo, "t1")
+    # The agent never touched the file — the funnel's FIRST check must
+    # fail on the markers, naming file and line.
+    results = mr.mechanical_checks(wt, [f.path for f in report.files])
+    markers = results[0]
+    assert markers.name == "conflict markers"
+    assert not markers.ok and not markers.skipped
+    assert "app.py" in markers.output and "<<<<<<<" in markers.output
+
+    # An actually written resolution passes the scan.
+    (wt / "app.py").write_text("task\nmain\nb\n")
+    results = mr.mechanical_checks(wt, [f.path for f in report.files])
+    assert results[0].ok
+
+
+def test_mechanical_checks_marker_scan_defaults_to_unmerged(repo: Path) -> None:
+    # Without explicit paths the scan runs over the unmerged index entries;
+    # with no merge in progress it is skipped (nothing to scan).
+    results = mr.mechanical_checks(repo)
+    assert results[0].name == "conflict markers"
+    assert results[0].ok and results[0].skipped
+
+    wt, _report = _conflicted_repo(repo, "t1")
+    results = mr.mechanical_checks(wt)
+    assert results[0].name == "conflict markers"
+    assert not results[0].ok
+
+
+def test_unresolved_conflict_paths_triage_and_fallback(repo: Path) -> None:
+    wt, _report = _conflicted_repo(repo, "t1")
+    # The triage report's `remaining` set drives the scan…
+    assert mr.unresolved_conflict_paths(repo, "t1", wt) == ["app.py"]
+    # …with the unmerged index entries as the fallback when the report is
+    # missing (task id without a triage report).
+    assert mr.unresolved_conflict_paths(repo, "no-report", wt) == ["app.py"]
+    # A clean tree has nothing to scan.
+    assert mr.unresolved_conflict_paths(repo, "no-report", repo) == []
+
+
+def test_set_resolution_rejects_markers_with_model_retry(
+    repo: Path, manager: TaskManager, fake_config: Config
+) -> None:
+    wt, _report = _conflicted_repo(repo, "t1")
+    # The verdict is keyed to the task id the triage report was saved
+    # under — exactly how the pipeline wires ResolverDeps.
+    deps = ResolverDeps(root=wt, manager=manager, task_id="t1", scratch=wt / ".s")
+    agent = build_resolver_agent(fake_config, root=wt)
+    set_resolution = _tool(agent, "set_resolution")
+
+    # The prose-only resolution: resolved=True without the edits — the
+    # tool refuses IN ROUND (ModelRetry) and records nothing, so the
+    # agent can apply the edits and call again.
+    with pytest.raises(ModelRetry) as exc:
+        set_resolution(_ctx(deps), resolved=True, report="both sides woven")
+    text = str(exc.value)
+    assert "app.py" in text and "<<<<<<<" in text
+    assert deps.verdicts == []
+
+    # After the file is actually written, the verdict goes through.
+    (wt / "app.py").write_text("task\nmain\nb\n")
+    out = set_resolution(_ctx(deps), resolved=True, report="both sides woven")
+    assert "verification" in out.lower()
+    assert deps.verdicts[-1].resolved and deps.verdicts[-1].label == "resolved"
+
+
+def test_resolver_outcome_summary_couples_rejected_claim(repo: Path) -> None:
+    # The funnel rejected the attempt: the agent's "resolved" claim must
+    # not read as success in the logged report (a6a6df25: an optimistic
+    # weave description right above the FAILED line).
+    outcome = mr.ResolverOutcome(verdict="needs-human")
+    outcome.agent_resolved = True
+    outcome.agent_report = "progress-callback threaded through the cache"
+    outcome.checks = [mr.CheckResult(name="conflict markers", ok=False)]
+    text = outcome.summary()
+    assert "claim REJECTED" in text
+    assert "resolver agent: resolved (claim REJECTED" in text
+
+    # A passing round (or a refusal) carries no annotation.
+    ok_outcome = mr.ResolverOutcome(verdict="resolved")
+    ok_outcome.agent_resolved = True
+    assert "claim REJECTED" not in ok_outcome.summary()
+    refused = mr.ResolverOutcome(verdict="needs-human")
+    refused.agent_resolved = False
+    assert "claim REJECTED" not in refused.summary()
 
 
 # -- review diffs, restore, conclude --------------------------------------------------

@@ -411,8 +411,14 @@ class PipelineResolverLayer(DrCodeState):
         outcome.agent_report = verdict.report if verdict else ""
         if not outcome.agent_resolved:
             return outcome
-        # Level 1: mechanics.
-        outcome.checks = await asyncio.to_thread(mechanical_checks, root)
+        # Level 1: mechanics. The marker scan inside mechanical_checks
+        # runs over the triage report's conflicted paths (staged or not)
+        # — a prose-only resolution fails here in seconds, before the
+        # compile/ruff/pyright/pytest battery burns on a still-conflicted
+        # tree (the a6a6df25 incident class).
+        outcome.checks = await asyncio.to_thread(
+            mechanical_checks, root, [f.path for f in report.files]
+        )
         if any(not c.ok and not c.skipped for c in outcome.checks):
             return outcome
         # Level 2: tests.

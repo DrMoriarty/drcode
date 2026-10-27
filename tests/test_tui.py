@@ -1317,7 +1317,7 @@ async def test_search_dialog_copy_id(app: DrCodeApp) -> None:
         await pilot.press("down")
         await pilot.press("c")
         await pilot.pause()
-        assert copied == [task.id]
+        assert copied == [f"#{task.id}"]
 
 
 async def test_pipeline_settled_notification_primes_then_sends(

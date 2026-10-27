@@ -149,6 +149,17 @@ def finished_task(app: DrCodeApp, kind: TaskKind = TaskKind.FEATURE) -> Any:
     task.status = TaskStatus.COMPLETED
     if kind is not TaskKind.RESEARCH:
         task.verification = VerificationStatus.PASSED
+    # A real completion stamps completed_at (mark_done). Without it the
+    # app's startup audit (_hook_merge_still_owns) treats the task as
+    # ancient: past HOOK_MERGE_AUDIT_GRACE it back-stamps
+    # hook_merge_failed and starts the conflict resolver, whose
+    # base-into-branch merge then races the hook under test — it can land
+    # before the wrong-fork guard's `git cherry` and hide the patch-id
+    # duplicates (the branch now contains everything the base has), so
+    # the guard passes the merge through and the tests flake. A fresh
+    # completed_at keeps the task inside the grace period: the audit
+    # stands down, no resolver round.
+    task.completed_at = datetime.now(UTC)
     app.manager.storage.save(task)
     return task
 

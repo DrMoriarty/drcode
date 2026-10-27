@@ -7,12 +7,13 @@ the old TaskSettingsPalette sub-menu; the per-field palettes and their
 
 - works on a DEEP COPY of the saved settings: nothing is persisted until
   Apply (ESC dismisses with None and discards everything);
-- offers the workflow presets as a radio row on top — picking one applies
-  it to the draft and every field widget updates in place; "Custom" is
-  only the display state of a draft matching no preset (mirrors
-  ``action_workflow_preset_custom``);
+- offers the workflow presets as a two-column radio grid on top — picking
+  one applies it to the draft and every field widget updates in place;
+  "Custom" is only the display state of a draft matching no preset
+  (mirrors ``action_workflow_preset_custom``);
 - groups the 11 field widgets into the three sections of the old sub-menu
-  (Workflow / Testing / Git), marking fields that differ from the saved
+  (Workflow / Testing / Git) — the closely-related fields sit side by side
+  in two-column rows — marking fields that differ from the saved
   values and dimming the currently dormant ones (their value parks and
   activates when the governing field turns on — the user's choice is
   never silently rewritten);
@@ -112,7 +113,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         align: center middle;
     }
     #ts-dialog {
-        width: 78;
+        width: 96;
         max-width: 95%;
         height: auto;
         max-height: 92%;
@@ -127,7 +128,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     }
     #ts-body {
         height: auto;
-        max-height: 20;
+        max-height: 24;
         overflow-y: auto;
     }
     .ts-section {
@@ -143,6 +144,22 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     }
     #ts-preset {
         margin-top: 1;
+        layout: grid;
+        grid-size: 2;
+    }
+    .ts-row {
+        height: auto;
+    }
+    .ts-col {
+        width: 1fr;
+        height: auto;
+    }
+    .ts-col > .ts-label {
+        height: 1;
+        overflow: hidden;
+    }
+    .ts-row .ts-col:first-child {
+        margin-right: 1;
     }
     Select {
         width: 1fr;
@@ -252,54 +269,61 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                         "Custom", value=matched is None, id="ts-preset-custom"
                     )
                 yield Label("Workflow", classes="ts-section")
-                yield Label("Task isolation", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in ISOLATION_OPTIONS],
-                    value=d.task_isolation,
-                    allow_blank=False,
-                    id="ts-isolation",
-                )
-                yield Label(
-                    "Isolation start branch (under worktree isolation)",
-                    classes="ts-label",
-                )
-                yield Select(
-                    self._branch_options(),
-                    value=d.isolation_start_branch,
-                    allow_blank=False,
-                    id="ts-start-branch",
-                )
-                yield Label(
-                    "Parallel tasks (under worktree isolation)", classes="ts-label"
-                )
-                yield Select(
-                    [(parallel_tasks_label(n), n) for n in PARALLEL_TASKS_OPTIONS],
-                    value=d.parallel_tasks,
-                    allow_blank=False,
-                    id="ts-parallel",
-                )
-                yield Label("Worktree removal", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in WORKTREE_REMOVAL_OPTIONS],
-                    value=d.worktree_removal,
-                    allow_blank=False,
-                    id="ts-removal",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Task isolation", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in ISOLATION_OPTIONS],
+                            value=d.task_isolation,
+                            allow_blank=False,
+                            id="ts-isolation",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Isolation start branch", classes="ts-label")
+                        yield Select(
+                            self._branch_options(),
+                            value=d.isolation_start_branch,
+                            allow_blank=False,
+                            id="ts-start-branch",
+                        )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Parallel tasks", classes="ts-label")
+                        yield Select(
+                            [
+                                (parallel_tasks_label(n), n)
+                                for n in PARALLEL_TASKS_OPTIONS
+                            ],
+                            value=d.parallel_tasks,
+                            allow_blank=False,
+                            id="ts-parallel",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Worktree removal", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in WORKTREE_REMOVAL_OPTIONS],
+                            value=d.worktree_removal,
+                            allow_blank=False,
+                            id="ts-removal",
+                        )
                 yield Label("Testing", classes="ts-section")
-                yield Label("Verification", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in VERIFICATION_OPTIONS],
-                    value=d.verification,
-                    allow_blank=False,
-                    id="ts-verification",
-                )
-                yield Label("Max development rounds", classes="ts-label")
-                yield Select(
-                    [(dev_rounds_label(n), n) for n in DEV_ROUNDS_OPTIONS],
-                    value=d.max_dev_rounds,
-                    allow_blank=False,
-                    id="ts-dev-rounds",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Verification", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in VERIFICATION_OPTIONS],
+                            value=d.verification,
+                            allow_blank=False,
+                            id="ts-verification",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Max development rounds", classes="ts-label")
+                        yield Select(
+                            [(dev_rounds_label(n), n) for n in DEV_ROUNDS_OPTIONS],
+                            value=d.max_dev_rounds,
+                            allow_blank=False,
+                            id="ts-dev-rounds",
+                        )
                 yield Label("Nudge stalled agent after", classes="ts-label")
                 yield Select(
                     [(o.label, o) for o in STALL_NUDGE_OPTIONS],
@@ -308,20 +332,23 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-nudge",
                 )
                 yield Label("Git", classes="ts-section")
-                yield Label("Git (tester)", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in GIT_POLICY_OPTIONS],
-                    value=d.git_policy.tester,
-                    allow_blank=False,
-                    id="ts-git-tester",
-                )
-                yield Label("Git (research)", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in GIT_POLICY_OPTIONS],
-                    value=d.git_policy.research,
-                    allow_blank=False,
-                    id="ts-git-research",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Git (tester)", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
+                            value=d.git_policy.tester,
+                            allow_blank=False,
+                            id="ts-git-tester",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Git (research)", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
+                            value=d.git_policy.research,
+                            allow_blank=False,
+                            id="ts-git-research",
+                        )
                 yield Label("Auto-delete completed tasks", classes="ts-label")
                 yield Select(
                     [(o.label, o) for o in RETENTION_OPTIONS],

@@ -940,7 +940,9 @@ async def test_mechanical_floor_measured_headroom_fits_window(
     assert not task.needs_human
     # The wire-level guarantee: measured framing + trimmed transcript +
     # output reserve fit the window (minus the safety margin).
-    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    result = app._mechanical_framing(task, AgentRole.CODING)
+    assert result is not None
+    window, framing, output = result
     assert window == 20_000
     assert framing + app._messages_estimate(task.messages) + output <= window - max(
         window * 5 // 100, 1
@@ -974,7 +976,9 @@ async def test_mechanical_floor_small_capped_window_fits_via_measured_headroom(
     assert not any("compaction failed" in t for t in texts)
     assert not task.needs_human
     # The old flat headroom really did overflow this window…
-    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    result = app._mechanical_framing(task, AgentRole.CODING)
+    assert result is not None
+    window, framing, output = result
     assert framing + window * 55 // 100 > window  # the old flat-budget trim overflows
     # …while the measured result fits the window (minus the margin).
     assert framing + app._messages_estimate(task.messages) + output <= window - max(
@@ -1034,7 +1038,9 @@ async def test_mechanical_floor_huge_agents_md_under_normal_window(
     assert any("Context compacted mechanically" in t for t in texts)
     assert not any("compaction failed" in t for t in texts)
     assert not task.needs_human
-    window, framing, output = app._mechanical_framing(task, AgentRole.CODING)
+    result = app._mechanical_framing(task, AgentRole.CODING)
+    assert result is not None
+    window, framing, output = result
     # The AGENTS.md dominates the framing: far above the old flat 32k.
     assert framing > 40_000
     assert framing + app._messages_estimate(task.messages) + output <= window - max(

@@ -53,6 +53,11 @@ RESOLVER_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "resolver.md").read_text(
 RESOLVER_REVIEWER_PROMPT = (SYSTEM_PROMPTS_DIR / "resolver_reviewer.md").read_text(
     encoding="utf-8"
 )
+# The read-only subagent spawned by the coding/research agents via
+# delegate_research (see drcode.subagents).
+SUBAGENT_SYSTEM_PROMPT = (SYSTEM_PROMPTS_DIR / "subagent.md").read_text(
+    encoding="utf-8"
+)
 
 # Placeholder in the templates, replaced with the actual project directory.
 PROJECT_PATH_PLACEHOLDER = "{project_path}"
@@ -247,6 +252,19 @@ def load_resolver_reviewer_prompt(project_root: Path | None = None) -> str:
     return _project_prompt_override(project_root, "resolver_reviewer.md") or (
         SYSTEM_PROMPTS_DIR / "resolver_reviewer.md"
     ).read_text(encoding="utf-8")
+
+
+def load_subagent_prompt(project_root: Path) -> str:
+    """Bundled system prompt of the read-only research subagent
+    (`delegate_research`, see drcode.subagents). The ``{project_path}``
+    placeholder is replaced with the ROOT the parent agent works in (the
+    task's worktree under isolation, else the project directory): the
+    subagent reads the same tree. A project may override the template
+    with ``<root>/.drcode/prompts/subagent.md``."""
+    template = _project_prompt_override(project_root, "subagent.md") or (
+        SYSTEM_PROMPTS_DIR / "subagent.md"
+    ).read_text(encoding="utf-8")
+    return _substitute_project_path(template, project_root)
 
 
 def load_compaction_prompts() -> tuple[str, str]:

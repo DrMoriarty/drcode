@@ -147,11 +147,20 @@ def coding_tool_schemas(
     kind: TaskKind,
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
+    subagent_limit: int = 0,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
-    no network, pure wiring). `research_git` matches `build_agent`."""
+    no network, pure wiring). `research_git` and `subagent_limit` match
+    `build_agent` — pass the real setting, or the estimate misses (or
+    invents) the delegate_research schema."""
     return tool_schemas(
-        build_agent(config, kind=kind, root=root, research_git=research_git)
+        build_agent(
+            config,
+            kind=kind,
+            root=root,
+            research_git=research_git,
+            subagent_limit=subagent_limit,
+        )
     )
 
 
@@ -520,6 +529,7 @@ def task_reports(
     tester_allow_commit: bool = True,
     tester_allow_push: bool = True,
     research_git: GitPolicy = GitPolicy.PUSH,
+    subagent_limit: int = 0,
 ) -> tuple[CtxReport | None, CtxReport | None, RunUsage, int]:
     """The two transcript reports of one task plus its whole-task cumulative
     exact usage.
@@ -542,7 +552,11 @@ def task_reports(
                 task.kind, project_root, research_git
             ),
             tools=coding_tool_schemas(
-                dev_config, task.kind, root=project_root, research_git=research_git
+                dev_config,
+                task.kind,
+                root=project_root,
+                research_git=research_git,
+                subagent_limit=subagent_limit,
             ),
             exact_tokens=live_tokens,
         )

@@ -30,7 +30,11 @@ from drcode import agent_model
 from drcode.agent import serialize_messages
 from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
-from drcode.settings import ProjectSettings, parallel_tasks_label
+from drcode.settings import (
+    ProjectSettings,
+    parallel_tasks_label,
+    subagents_label,
+)
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
@@ -1994,6 +1998,8 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Isolation start branch: {app._isolation_start_branch_label()}",
             f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
             f"Worktree removal: {app.settings.worktree_removal.label}",
+            f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
+            f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
             f"Verification: {app.settings.verification.label}",
             f"Max development rounds: {app.settings.max_dev_rounds}",
             f"Nudge stalled agent after: {app.settings.stall_nudge.label}",

@@ -56,6 +56,7 @@ from ..settings import (
     PARALLEL_TASKS_OPTIONS,
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
+    SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     CompletedRetention,
@@ -67,6 +68,7 @@ from ..settings import (
     WorktreeRemoval,
     dev_rounds_label,
     parallel_tasks_label,
+    subagents_label,
     task_settings_hints,
 )
 from .command_providers import WORKFLOW_PRESETS, workflow_preset_for
@@ -92,6 +94,8 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.stall_nudge = src.stall_nudge
     dst.task_isolation = src.task_isolation
     dst.parallel_tasks = src.parallel_tasks
+    dst.subagents_coder = src.subagents_coder
+    dst.subagents_researcher = src.subagents_researcher
     dst.worktree_removal = src.worktree_removal
     dst.isolation_start_branch = src.isolation_start_branch
     dst.keep_awake = src.keep_awake
@@ -306,6 +310,23 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-removal",
                         )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Subagents (coder)", classes="ts-label")
+                        yield Select(
+                            [(subagents_label(n), n) for n in SUBAGENTS_OPTIONS],
+                            value=d.subagents_coder,
+                            allow_blank=False,
+                            id="ts-subagents-coder",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Subagents (researcher)", classes="ts-label")
+                        yield Select(
+                            [(subagents_label(n), n) for n in SUBAGENTS_OPTIONS],
+                            value=d.subagents_researcher,
+                            allow_blank=False,
+                            id="ts-subagents-researcher",
+                        )
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -427,6 +448,8 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-start-branch", d.isolation_start_branch)
         self._set_select("#ts-parallel", d.parallel_tasks)
         self._set_select("#ts-removal", d.worktree_removal)
+        self._set_select("#ts-subagents-coder", d.subagents_coder)
+        self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-verification", d.verification)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
@@ -441,6 +464,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
             "#ts-parallel": d.parallel_tasks != o.parallel_tasks,
             "#ts-removal": d.worktree_removal is not o.worktree_removal,
+            "#ts-subagents-coder": d.subagents_coder != o.subagents_coder,
+            "#ts-subagents-researcher": (
+                d.subagents_researcher != o.subagents_researcher
+            ),
             "#ts-verification": d.verification is not o.verification,
             "#ts-dev-rounds": d.max_dev_rounds != o.max_dev_rounds,
             "#ts-nudge": d.stall_nudge is not o.stall_nudge,
@@ -558,6 +585,22 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             event.value is not self._draft.worktree_removal
         ):
             self._draft.worktree_removal = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-subagents-coder")
+    def _subagents_coder_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, int) and (
+            event.value != self._draft.subagents_coder
+        ):
+            self._draft.subagents_coder = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-subagents-researcher")
+    def _subagents_researcher_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, int) and (
+            event.value != self._draft.subagents_researcher
+        ):
+            self._draft.subagents_researcher = event.value
             self._refresh()
 
     @on(Select.Changed, "#ts-verification")

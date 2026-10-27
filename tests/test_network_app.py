@@ -877,6 +877,15 @@ def _seed_big_transcript(app: DrCodeApp, prompt: str, fill: int) -> Any:
     from pydantic_ai.usage import RequestUsage
 
     task = app.manager.create("docs", prompt, kind=TaskKind.FEATURE)
+    # The tests below drive `_maybe_compact` directly and their endpoint is
+    # a black-hole host (nothing must dial it): drop the prompt `create`
+    # parked in pending_input, or the mount-time `_advance()` promotes the
+    # task and runs the real (unmocked) coding agent — its own compaction
+    # gate and network-retry loop then race the test's direct call and
+    # rewrite the transcript mid-assert (a load-dependent flake under
+    # `-n auto`: two "compacted mechanically" rounds plus a re-sent
+    # pending prompt that overflows the window the assert checks).</think><tool_call>read_file<arg_key>limit</arg_key><arg_value>30
+    task.pending_input.clear()
     call_id = "call-1"
     task.messages = serialize_messages(
         [

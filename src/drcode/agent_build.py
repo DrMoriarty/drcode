@@ -467,11 +467,14 @@ def build_agent(
         ) -> str:
             """Search the project's task archive (ALL statuses: queued, hold,
             active, testing, completed, clarification) by keywords. Case-
-            insensitive substring match over each task's title, user prompts,
-            pending input, edited file paths, the agent's final summary
-            response and its service events; a common trailing ending of a
-            keyword is also stripped heuristically ("смерженных" matches
-            "смерженный"), so prefer full natural wordforms. Several keywords
+            insensitive substring match over each task's short id, title,
+            user prompts, pending input, edited file paths, the agent's
+            final summary response and its service events; a common
+            trailing ending of a keyword is also stripped heuristically
+            ("смерженных" matches "смерженный"), so prefer full natural
+            wordforms. Searching by a task's short id (or a prefix of it)
+            finds exactly that task — handy to locate a task you only know
+            by its id from another tool's output. Several keywords
             are combined with AND; when nothing matches the AND, an OR pass
             runs and its results come back under an explicit "no exact AND
             match" preamble. Results are ranked by keyword occurrences

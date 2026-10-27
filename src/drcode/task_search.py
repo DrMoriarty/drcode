@@ -14,7 +14,9 @@ This module gives the model a deliberately COMPACT view instead:
 - a light parse — `json.loads` plus a hand-picked subset of keys, NEVER
   `Task.model_validate` (validating giant `messages` lists for a search is
   pure waste);
-- indexing the cheap, high-signal fields: `title`, every `user-prompt` part
+- indexing the cheap, high-signal fields: the task's short `id` (so a task
+  is findable by its id alone — a never-run task with no events would
+  otherwise surface only by accident), `title`, every `user-prompt` part
   of the transcript, `pending_input` texts, `edited_files` paths (so a file
   name finds the task that touched it), the agent's FINAL text response
   (the closing summary — often bilingual, bridging a Russian prompt and an
@@ -241,13 +243,20 @@ def _pending_texts(pending_input: list[Any]) -> list[str]:
     return texts
 
 
-def _indexed_fields(data: dict[str, Any]) -> list[tuple[str, str]]:
+def _indexed_fields(task_id: str, data: dict[str, Any]) -> list[tuple[str, str]]:
     """The (label, text) pairs that make up a task's search index.
 
     Labels are cheap provenance tags used to decorate snippets ("files:",
     "summary:", "events:") so the model can tell WHERE a match came from.
+    The id comes first as its own field ("id") so the task is findable by
+    its short id alone — a never-run task without events would otherwise
+    be reachable only by accident. It is deliberately NOT snippet-decorated
+    (the id is already shown in `#{task_id}` on every result line).
     """
-    fields: list[tuple[str, str]] = [("title", str(data.get("title") or ""))]
+    fields: list[tuple[str, str]] = [
+        ("id", task_id),
+        ("title", str(data.get("title") or "")),
+    ]
     for text in _prompt_texts(data.get("messages") or []):
         fields.append(("prompt", text))
     for text in _pending_texts(data.get("pending_input") or []):
@@ -320,7 +329,7 @@ def _build_snippet(
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(flat) else ""
     body = (prefix + flat[start:end] + suffix)[:SNIPPET_MAX]
-    if label not in ("title", "prompt"):
+    if label not in ("title", "prompt", "id"):
         body = f"{label}: {body}"
     return body
 
@@ -503,7 +512,7 @@ def load_archive(
             continue  # Corrupted/unreadable: skip silently (load_one contract).
         if not isinstance(data, dict):
             continue
-        records.append((path.stem, data, _indexed_fields(data)))
+        records.append((path.stem, data, _indexed_fields(path.stem, data)))
     return records
 
 
@@ -698,10 +707,11 @@ def search(
 ) -> str:
     """Search the project's task archive by keywords (all statuses).
 
-    Matching is a case-insensitive substring over each task's title, user
-    prompts, pending input, edited file paths, final agent response and
-    event texts; besides each keyword a lightly-stemmed variant (one common
-    trailing ending stripped) is matched too. Multiple keywords are combined
+    Matching is a case-insensitive substring over each task's id, title,
+    user prompts, pending input, edited file paths, final agent response
+    and event texts; besides each keyword a lightly-stemmed variant (one
+    common trailing ending stripped) is matched too. Multiple keywords are
+    combined
     with AND (every keyword must occur); when NOTHING matches the AND, an
     OR pass runs and its results are returned under an explicit "no exact
     AND match" preamble. Results are ranked by keyword occurrences (ties:

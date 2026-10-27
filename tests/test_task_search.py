@@ -275,6 +275,81 @@ def test_search_indexes_events(project_root: Path) -> None:
     assert "events:" in result
 
 
+def test_search_finds_task_by_its_short_id(project_root: Path) -> None:
+    """The task id is an indexed field: searching by the exact short id
+    finds exactly that task, no matter its status/events."""
+    target = _task(id="3717c406", title="rework the cache layer")
+    other = _task(id="deadbeef", title="unrelated work")
+    for t in (target, other):
+        _write_task(project_root, t)
+    hits = task_search.search_tasks(project_root, ["3717c406"])
+    assert [h.task_id for h in hits] == ["3717c406"]
+    # Same via the formatted agent tool output.
+    result = task_search.search(project_root, ["3717c406"])
+    assert "#3717c406" in result
+    assert "#deadbeef" not in result
+
+
+def test_search_by_id_finds_never_run_task_with_no_events(
+    project_root: Path,
+) -> None:
+    """A task that never ran (no prompts, no events, no files) was
+    previously invisible to the search — the id field alone must find it."""
+    task = _task(id="1234abcd", title="just an idea")
+    _write_task(project_root, task)
+    assert "#1234abcd" in task_search.search(project_root, ["1234abcd"])
+
+
+def test_search_by_id_prefix_substring(project_root: Path) -> None:
+    """A partial id (e.g. a 4-char prefix) matches too — matching is a plain
+    case-insensitive substring over the id field."""
+    target = _task(id="3717c406", title="worktree isolation")
+    decoy = _task(id="ffff0000", title="another task")
+    for t in (target, decoy):
+        _write_task(project_root, t)
+    result = task_search.search(project_root, ["3717"])
+    assert "#3717c406" in result
+    assert "#ffff0000" not in result
+
+
+def test_search_id_match_snippet_has_no_provenance_prefix(
+    project_root: Path,
+) -> None:
+    """The id is already shown in `#{task_id}` on the result line, so an
+    id-match snippet carries no "id:" prefix (unlike files:/summary:/…)."""
+    task = _task(id="3717c406", title="quiet title")
+    _write_task(project_root, task)
+    result = task_search.search(project_root, ["3717c406"])
+    (line,) = [ln for ln in result.splitlines() if ln.startswith("#3717c406")]
+    assert "id:" not in line
+
+
+def test_search_own_task_notice_on_own_id(project_root: Path) -> None:
+    """Searching for the searcher's own id excludes the result line but
+    keeps the "your own task also matches" notice."""
+    own = _task(id="3717c406", title="the searcher itself")
+    other = _task(id="deadbeef", title="unrelated work")
+    for t in (own, other):
+        _write_task(project_root, t)
+    result = task_search.search(project_root, ["3717c406"], exclude_task_id="3717c406")
+    assert not [ln for ln in result.splitlines() if ln.startswith("#3717c406")]
+    assert "also matches" in result
+
+
+def test_search_id_keyword_combines_with_other_keywords(project_root: Path) -> None:
+    """AND semantics are unchanged: an id keyword must combine with other
+    keywords like any other field."""
+    both = _task(id="3717c406", title="cache layer")
+    id_only = _task(id="3717c407", title="unrelated")
+    text_only = _task(title="cache layer elsewhere")
+    for t in (both, id_only, text_only):
+        _write_task(project_root, t)
+    result = task_search.search(project_root, ["3717c406", "cache"])
+    assert "#3717c406" in result
+    assert "#3717c407" not in result
+    assert f"#{text_only.id}" not in result
+
+
 def test_search_stem_variant_matches_inflected_forms(
     project_root: Path,
 ) -> None:

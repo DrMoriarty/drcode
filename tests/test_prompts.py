@@ -184,6 +184,14 @@ def test_research_prompt_initiative_boundary() -> None:
     assert "SEPARATE opt-in" in RESEARCH_SYSTEM_PROMPT
     assert "create_bug_report / create_feature_request" in RESEARCH_SYSTEM_PROMPT
     assert "at the implementer's discretion" in RESEARCH_SYSTEM_PROMPT
+    # The information-vs-decision fork: FYI notes stay in prose, verdict-
+    # requiring proposals must go through ask_clarifying_question — with the
+    # explicit anti-example against "say the word and I'll do it" endings.
+    assert "REQUIRES a user verdict" in RESEARCH_SYSTEM_PROMPT
+    assert "must NEVER be left as prose awaiting" in RESEARCH_SYSTEM_PROMPT
+    assert "BAD example" in RESEARCH_SYSTEM_PROMPT
+    assert "word and I'll create the task." in RESEARCH_SYSTEM_PROMPT
+    assert "GOOD: the same question inside" in RESEARCH_SYSTEM_PROMPT
 
 
 def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
@@ -195,6 +203,10 @@ def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
     for template in (BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT):
         assert "keep the user's request separate from your" in template
         assert "(agent's suggestion, not from your request)" in template
+        # The mirror of the information-vs-decision fork: verdict-requiring
+        # proposals ride the tool, never prose.
+        assert "needs the user's verdict" in template
+        assert "never as prose in the answer" in template
 
 
 def test_system_prompt_templates_carry_placeholder_header() -> None:

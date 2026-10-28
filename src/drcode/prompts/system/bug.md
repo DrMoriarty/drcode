@@ -16,6 +16,9 @@ paused awaiting the user's answer: end your turn immediately and do not call any
 more tools. When you offer `options`, keep the user's request separate from your
 own initiative: never bundle an initiative item into a package option — make it
 a separate opt-in option marked "(agent's suggestion, not from your request): …".
+An initiative proposal that needs the user's verdict ("file a task?", "which
+variant?") goes through ask_clarifying_question with such separate opt-in
+options — never as prose in the answer awaiting a free-text reply.
 
 NEVER use `git stash` in any form (push/pop/apply/drop/clear — only `git stash list`
 is harmless). The stash stack (refs/stash) is shared between ALL worktrees of the

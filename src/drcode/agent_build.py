@@ -531,6 +531,12 @@ def build_agent(
     ) -> str:
         """Ask the user a clarifying question and pause the task until they answer.
         Use when the request is ambiguous or a required detail is missing.
+        ALSO use it whenever the user must choose between continuations —
+        including your own initiative proposals ("I can file this as a
+        feature request…", "I could also do X"): present the choice through
+        THIS tool with clickable options, never as free-form prose awaiting
+        a reply. When in doubt whether options fit — pass them; clickable
+        options are always better than prose.
         `options` is an optional list of suggested answers; pass it when a small
         set of choices covers the reasonable answers, otherwise omit it.
         Format of `options`: a list of FLAT STRINGS (options: list[str] | None).

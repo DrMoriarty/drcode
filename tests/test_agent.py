@@ -1402,6 +1402,11 @@ def test_ask_clarifying_question_options_discipline(fake_config: Config) -> None
         assert "never mix what the user requested with" in desc
         assert "SEPARATE opt-in option" in desc
         assert "(agent's suggestion, not from your request)" in desc
+        # Positive trigger: choices between continuations — including the
+        # agent's own initiative proposals — go through THIS tool.
+        assert "choose between continuations" in desc
+        assert "including your own initiative proposals" in desc
+        assert "always better than prose" in desc
 
 
 def test_build_agent_appends_agents_md(fake_config: Config, project_root: Path) -> None:

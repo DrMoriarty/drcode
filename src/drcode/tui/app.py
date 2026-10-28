@@ -203,9 +203,30 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #statusbar { dock: bottom; height: 1; background: $panel; color: $text; padding: 0 1; }
     .section-header { color: $accent; text-style: bold; padding: 0 1; }
     .task-item { padding: 0 1; }
-    # Highlight for the task currently open in the chat pane.
-    TaskItem.viewed { background: $panel; }
-    TaskItem.viewed > .task-item { text-style: bold; }
+    # Highlight for the task currently open in the chat pane: a strong
+    # tint of the sidebar cursor colour (plus bold cursor-coloured text).
+    # The old $panel background was barely distinguishable from the
+    # sidebar's $surface and the viewed row was easy to lose; the cursor
+    # colour keeps the marker consistent with the keyboard cursor across
+    # every built-in theme (alpha blends resolve per theme).
+    TaskItem.viewed { background: $block-cursor-background 30%; }
+    TaskItem.viewed > .task-item {
+        color: $block-cursor-foreground;
+        text-style: bold;
+    }
+    # Sidebar keyboard cursor: the stock blurred style (~30% of the same
+    # colour) is too dim to tell from the surrounding rows. The viewed
+    # marker uses 30%, so the cursor row gets 45% — same colour family,
+    # clearly the brighter of the two; a focused sidebar keeps the stock
+    # full-strength block cursor.
+    #sidebar > ListItem.-highlight {
+        color: $block-cursor-foreground;
+        background: $block-cursor-background 45%;
+        text-style: bold;
+    }
+    #sidebar:focus > ListItem.-highlight {
+        background: $block-cursor-background;
+    }
     #copy-toast {
         layer: toast;
         dock: bottom;

@@ -480,6 +480,13 @@ class TaskLifecycleLayer(DrCodeState):
             self._show_event(task, text)
             self.notify(text, title="Delete task", severity="warning", timeout=8)
             return
+        # Sidebar order as the user sees it: the flattened non-empty
+        # section list. Computed BEFORE the delete — the neighbour choice
+        # needs the deleted row's position (all_tasks() creation order
+        # would jump the view to the oldest archived task, visually far
+        # from the queue tail the user was working with).
+        flat = [t for _name, tasks in self._sidebar_sections() for t in tasks]
+        pos = next((i for i, t in enumerate(flat) if t.id == task.id), None)
         self.manager.delete(task.id)
         # The chat pane shows the deleted task: switch to another one (or
         # an empty pane when the backlog is gone entirely).
@@ -491,9 +498,16 @@ class TaskLifecycleLayer(DrCodeState):
         self._chat_has_content = False
         self._pending_rendered = []
         self._invalidate_chat_delta()
-        remaining = self.manager.all_tasks()
-        if remaining:
-            self.view_task(remaining[0].id)
+        remaining = [t for t in flat if t.id != task.id]
+        if remaining and pos is not None and pos < len(remaining):
+            # The task that FOLLOWED the deleted one in the sidebar (the
+            # rows before it kept their positions, so remaining[pos] is
+            # exactly the next row as displayed).
+            self.view_task(remaining[pos].id)
+        elif remaining:
+            # Deleted task was the last row: fall back to the one that
+            # preceded it.
+            self.view_task(remaining[-1].id)
         else:
             self.refresh_sidebar()
             self._sync_sidebar_cursor(None)

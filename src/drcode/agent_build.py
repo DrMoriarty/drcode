@@ -533,6 +533,13 @@ def build_agent(
         Use when the request is ambiguous or a required detail is missing.
         `options` is an optional list of suggested answers; pass it when a small
         set of choices covers the reasonable answers, otherwise omit it.
+        Format of `options`: a list of FLAT STRINGS (options: list[str] | None).
+        Each element is one COMPLETE ready-to-click answer — never an object
+        or dict like {"title": ..., "description": ...}: such a call is
+        rejected by schema validation ("Input should be a valid string"), the
+        task still pauses with an EMPTY option list, and the user has nothing
+        clickable to answer with. Correct example:
+        options=["Да, заведи багрепорт", "Нет, просто ответ"].
         When constructing `options`, never mix what the user requested with
         your own initiative: do NOT bundle an initiative item into a package
         option like "yes: do X + Y + Z, everything at once" — declining the

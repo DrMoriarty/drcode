@@ -172,6 +172,31 @@ def test_research_prompt_git_fragment_project_override(tmp_path: Path) -> None:
     assert str(tmp_path) in prompt
 
 
+def test_research_prompt_initiative_boundary() -> None:
+    """The research prompt carries the initiative-boundary section: answers
+    separate what was asked from agent's proposals, ask_clarifying_question
+    options never bundle initiative into package opt-ins, and filed task
+    descriptions record only the user-confirmed scope."""
+    from drcode.prompts import RESEARCH_SYSTEM_PROMPT
+
+    assert "# Initiative boundary" in RESEARCH_SYSTEM_PROMPT
+    assert "(agent's suggestion, not from your request)" in RESEARCH_SYSTEM_PROMPT
+    assert "SEPARATE opt-in" in RESEARCH_SYSTEM_PROMPT
+    assert "create_bug_report / create_feature_request" in RESEARCH_SYSTEM_PROMPT
+    assert "at the implementer's discretion" in RESEARCH_SYSTEM_PROMPT
+
+
+def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
+    """The coding agents' prompts (bug/feature) carry the same rule next to
+    their ask_clarifying_question mention: options keep requested work
+    separate from initiative, initiative rides in its own marked opt-in."""
+    from drcode.prompts import BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT
+
+    for template in (BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT):
+        assert "keep the user's request separate from your" in template
+        assert "(agent's suggestion, not from your request)" in template
+
+
 def test_system_prompt_templates_carry_placeholder_header() -> None:
     from drcode.prompts import (
         BUG_SYSTEM_PROMPT,

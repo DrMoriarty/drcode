@@ -1387,6 +1387,22 @@ def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
     } <= _tool_names(ag)
 
 
+def test_ask_clarifying_question_options_discipline(fake_config: Config) -> None:
+    """The shared ask_clarifying_question tool description teaches the
+    options-construction rule: requested work and initiative never mix in
+    one option — initiative items are separate marked opt-ins, so
+    declining them never forces declining the requested scope."""
+    from drcode.agent import build_agent
+
+    for kind in (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH):
+        ag = build_agent(fake_config, kind=kind)
+        tool = ag._function_toolset.tools["ask_clarifying_question"]
+        desc = tool.description or ""
+        assert "never mix what the user requested with" in desc
+        assert "SEPARATE opt-in option" in desc
+        assert "(agent's suggestion, not from your request)" in desc
+
+
 def test_build_agent_appends_agents_md(fake_config: Config, project_root: Path) -> None:
     from drcode.agent import build_agent
     from drcode.prompts import load_system_prompt

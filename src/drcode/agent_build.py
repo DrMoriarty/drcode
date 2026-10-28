@@ -532,7 +532,14 @@ def build_agent(
         """Ask the user a clarifying question and pause the task until they answer.
         Use when the request is ambiguous or a required detail is missing.
         `options` is an optional list of suggested answers; pass it when a small
-        set of choices covers the reasonable answers, otherwise omit it."""
+        set of choices covers the reasonable answers, otherwise omit it.
+        When constructing `options`, never mix what the user requested with
+        your own initiative: do NOT bundle an initiative item into a package
+        option like "yes: do X + Y + Z, everything at once" — declining the
+        bundle would then force declining the requested work too. Each
+        initiative item is its own SEPARATE opt-in option, phrased as a
+        proposal ("(agent's suggestion, not from your request): …"), so the
+        user can accept or decline it independently of the requested scope."""
         task = ctx.deps.manager.get(ctx.deps.task_id)
         task.clarification = Clarification(
             question=question.strip(),

@@ -499,7 +499,7 @@ def _play_wav_with_fake_device(
     import sys
     from array import array
 
-    import drcode.voice as voice_mod
+    import drcode.voice.playback as playback_mod
 
     created: list[_FakeOutStream] = []
 
@@ -510,7 +510,7 @@ def _play_wav_with_fake_device(
             created.append(stream)
             return stream
 
-    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setattr(playback_mod, "SOUNDDEVICE_AVAILABLE", True)
     monkeypatch.setitem(sys.modules, "sounddevice", _FakeSdModule())
 
     buffer = io.BytesIO()
@@ -529,7 +529,11 @@ def test_play_wav_fades_edges_and_appends_tail_silence(
 ) -> None:
     from array import array
 
-    from drcode.voice import _PLAYBACK_FADE_IN_S, _PLAYBACK_FADE_OUT_S, _PLAYBACK_TAIL_S
+    from drcode.voice.playback import (
+        _PLAYBACK_FADE_IN_S,
+        _PLAYBACK_FADE_OUT_S,
+        _PLAYBACK_TAIL_S,
+    )
 
     rate = 24_000
     n = 2_000  # 83 ms of a loud constant — the click-prone shape
@@ -560,7 +564,7 @@ def test_play_wav_done_fires_only_after_last_block_reaches_device(
 ) -> None:
     from array import array
 
-    from drcode.voice import _PLAYBACK_TAIL_S
+    from drcode.voice.playback import _PLAYBACK_TAIL_S
 
     rate = 24_000
     n = 1_000
@@ -1787,9 +1791,9 @@ def _start_recorder_with_fake_sd(
 ) -> MicrophoneRecorder:
     import sys
 
-    import drcode.voice as voice_mod
+    import drcode.voice.recorder as recorder_mod
 
-    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setattr(recorder_mod, "SOUNDDEVICE_AVAILABLE", True)
     monkeypatch.setitem(sys.modules, "sounddevice", sd_module)
     recorder = MicrophoneRecorder()
     recorder.start()
@@ -1802,14 +1806,14 @@ def test_recorder_start_passes_latency_and_blocksize(
     """The input stream mirrors the playback GIL-starvation protection: an
     explicit NUMERIC latency (the 0.3 s floor without a queryable device)
     and an explicit blocksize."""
-    import drcode.voice as voice_mod
+    import drcode.voice.recorder as recorder_mod
 
     sd = _RecordingFakeSd()
     recorder = _start_recorder_with_fake_sd(monkeypatch, sd)
     kwargs = sd.created[0]
     assert kwargs["latency"] == 0.3
     assert isinstance(kwargs["latency"], float)
-    assert kwargs["blocksize"] == voice_mod._INPUT_BLOCKSIZE == 2048
+    assert kwargs["blocksize"] == recorder_mod._INPUT_BLOCKSIZE == 2048
     assert recorder.recording
     recorder.discard()
 
@@ -1819,7 +1823,7 @@ def test_recorder_start_latency_uses_device_report_with_floor(
 ) -> None:
     """A device-reported high-input latency is honored when generous
     (0.5 s) and raised to the floor when absurdly small (0.01 s)."""
-    import drcode.voice as voice_mod
+    import drcode.voice.recorder as recorder_mod
 
     for reported, expected in ((0.5, 0.5), (0.01, 0.3)):
         sd = _RecordingFakeSd()
@@ -1831,7 +1835,7 @@ def test_recorder_start_latency_uses_device_report_with_floor(
         recorder = _start_recorder_with_fake_sd(monkeypatch, sd)
         assert sd.created[0]["latency"] == expected
         recorder.discard()
-    assert voice_mod._INPUT_LATENCY_FLOOR == 0.3
+    assert recorder_mod._INPUT_LATENCY_FLOOR == 0.3
 
 
 def test_recorder_start_captures_frames_from_stream_start(
@@ -1854,9 +1858,9 @@ def test_recorder_start_captures_frames_from_stream_start(
 
     import sys
 
-    import drcode.voice as voice_mod
+    import drcode.voice.recorder as recorder_mod
 
-    monkeypatch.setattr(voice_mod, "SOUNDDEVICE_AVAILABLE", True)
+    monkeypatch.setattr(recorder_mod, "SOUNDDEVICE_AVAILABLE", True)
     monkeypatch.setitem(sys.modules, "sounddevice", _EarlySd())
     recorder = MicrophoneRecorder()
     recorder_box.append(recorder)  # before start(): the callback needs it

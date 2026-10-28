@@ -989,6 +989,108 @@ async def test_staged_unconcluded_merge_is_not_ff_ready(
         assert me.is_fast_forward(isolated, branch_for(task.id), "main")
 
 
+# -- the title's merge description (commit subject / task-title fallback) --------
+
+
+async def test_title_carries_commit_subject_when_ff_ready(
+    isolated: Path, configured_env: None
+) -> None:
+    """The title names WHAT is being resolved — the task branch's last
+    commit subject — and it survives prepare's final title rewrite (the
+    ff-ready state)."""
+    task_id, _wt = _finished_task_with_branch(isolated)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and screen._ff_ready,
+            pilot=pilot,
+            what="ff-ready state reached",
+        )
+        assert screen._merge_desc == "fix app"
+        title = str(screen.query_one("#merge-title", Static).content)
+        assert "«fix app»" in title
+
+
+async def test_title_carries_commit_subject_on_conflict(
+    isolated: Path, configured_env: None
+) -> None:
+    """Same for the conflicted state: the parked merge's title carries
+    the task branch's commit subject."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and bool(screen.files_list.children)
+                and screen.view.current_hunk() is not None
+            ),
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+        assert screen._merge_desc == "task edit"
+        title = str(screen.query_one("#merge-title", Static).content)
+        assert "«task edit»" in title
+
+
+async def test_title_falls_back_to_task_title_without_branch(
+    isolated: Path, configured_env: None
+) -> None:
+    """No commit on the task branch when the screen prepares (the
+    worktree does not even exist yet): the description falls back to the
+    task's title — and the title rewrite of the final (ff-ready) state
+    keeps it."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fallback title", "fix the app")
+    manager.set_hold(task.id, on=True)
+    task.needs_human = True  # the conservative entry gate's open flag
+    task.touch()
+    manager.storage.save(task)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None,
+            pilot=pilot,
+            what="screen prepared",
+        )
+        assert screen._merge_desc == "Fallback title"
+        title = str(screen.query_one("#merge-title", Static).content)
+        assert "«Fallback title»" in title
+
+
 async def test_conflicted_mode_keeps_ff_out_and_resolution_in(
     isolated: Path, configured_env: None
 ) -> None:

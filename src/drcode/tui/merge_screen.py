@@ -629,6 +629,13 @@ class ConflictScreen(ModalScreen[None]):
         self._busy_visible = False
         self._busy_generation = 0
         self._panel_saved: str | None = None
+        # What the merge actually carries (the task branch's last commit
+        # subject, falling back to the task title): fetched once at the
+        # very start of prepare and woven into EVERY title via
+        # `_set_title`, so it survives all the title rewrites of the
+        # prepare's final states. None = unavailable — the titles stay
+        # as they were.
+        self._merge_desc: str | None = None
 
     # -- composition ------------------------------------------------------------
 
@@ -642,7 +649,10 @@ class ConflictScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="merge-dialog"):
-            yield Static("Merge conflicts", id="merge-title")
+            # markup=False: the title embeds a commit subject (and git
+            # notes/messages) that may carry literal [brackets] — they
+            # must never trip Rich markup.
+            yield Static("Merge conflicts", id="merge-title", markup=False)
             with Horizontal(id="merge-body"):
                 yield ListView(id="merge-files")
                 yield ConflictView(id="merge-view")
@@ -713,7 +723,13 @@ class ConflictScreen(ModalScreen[None]):
         and the file list has loaded."""
         app = cast("DrCodeApp", self.app)
         env = app.task_env
+        # The merge description first — one cheap git call BEFORE the
+        # heavy prepare — so the title (and the progress panel's first
+        # line) already say WHAT is being resolved from the first frame.
+        self._merge_desc = await asyncio.to_thread(self._fetch_merge_desc)
         self._begin_prepare()
+        if self._merge_desc:
+            self._set_title(f"#{self.task_id} — merge conflicts")
         # The persisted rolling averages (previous runs' per-step
         # durations) feed the ETA line from the first tick on — blocking
         # file IO, off the UI thread.
@@ -818,12 +834,58 @@ class ConflictScreen(ModalScreen[None]):
         await self._reload_files()
         self._hide_prepare()
 
+    def _titled(self, text: str) -> str:
+        """`text` with the merge description (`_merge_desc`) appended —
+        the single place every title passes through, so the description
+        survives all the rewrites of `_prepare`'s final states (isolation
+        off, note, !report.ok, ff-ready, not-committed, conflicted) and
+        of the later commit/ff outcomes."""
+        if self._merge_desc:
+            return f"{text} — «{self._merge_desc}»"
+        return text
+
     def _set_title(self, text: str) -> None:
         # A worker may reach this after the user already closed the
         # screen (ESC mid-prepare) — an unmounted screen is a no-op.
         if not self.is_mounted:
             return
-        self.query_one("#merge-title", Static).update(text)
+        self.query_one("#merge-title", Static).update(self._titled(text))
+
+    def _fetch_merge_desc(self) -> str | None:
+        """What the merge carries, by descending preference: the subject
+        of the task branch's last commit (`git log -1 --format=%s
+        drcode/<id>` — best describes what actually lands in the base),
+        then the task's title, then None (the titles stay as they were).
+        One cheap git call — designed to run BEFORE the heavy prepare,
+        in a worker thread."""
+        app = cast("DrCodeApp", self.app)
+        branch = f"drcode/{self.task_id}"
+        try:
+            proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(app.project_root),
+                    "log",
+                    "-1",
+                    "--format=%s",
+                    branch,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            subject = proc.stdout.strip()
+            if subject:
+                return subject.splitlines()[0]
+        task = app.manager.tasks.get(self.task_id)
+        if task is not None and task.title:
+            return task.title
+        return None
 
     # -- prepare progress panel (the same #merge-checks zone) --------------------
 
@@ -937,6 +999,8 @@ class ConflictScreen(ModalScreen[None]):
             return
         panel = self.query_one("#merge-checks", Static)
         lines = ["Preparing merge:"]
+        if self._merge_desc:
+            lines.append(f"#{self.task_id}: «{self._merge_desc}»")
         now = time.monotonic()
         for stage in self._prepare_stages:
             if stage.status == "done":

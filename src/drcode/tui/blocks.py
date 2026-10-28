@@ -14,6 +14,7 @@ from rich.style import Style
 from rich.syntax import Syntax
 from rich.text import Text
 from textual.containers import VerticalScroll
+from textual.geometry import Size
 from textual.timer import Timer
 from textual.widgets import Static
 
@@ -22,6 +23,10 @@ from textual.widgets import Static
 # the tool is executing.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_INTERVAL = 0.12
+
+# Trailing rows below the viewport edge that still count as "tracking the
+# chat tail" (see ChatLog.watch_virtual_size and _chat_at_bottom).
+_SCROLL_FOLLOW_THRESHOLD = 4
 
 # Task-id mention: '#' + 8 hex chars (models._short_id() = uuid4().hex[:8]).
 # The lookarounds reject ids inside longer hex tokens: a 9+-char run
@@ -78,6 +83,25 @@ class ChatLog(VerticalScroll):
     regardless of the compositor's dirty tracking; strip caching keeps the
     cost low (recompose of ~40 lines per frame).
     """
+
+    # Live-follow mode of the chunked drain (a split fat live write mounting
+    # in chunks — see chat_timeline._write_chat): while True, every growth of
+    # the virtual size keeps the tail on screen — but only for a reader who
+    # was tracking it before the growth. Armed by the drain's seed tick, it
+    # stays armed past the drain end (the last chunk's layout may land after
+    # the drain chain finished) and disarms itself per growth for any reader
+    # who is no longer at the tail; a history rebuild turns it off.
+    auto_follow: bool = False
+
+    def watch_virtual_size(self, old_size: Size, new_size: Size) -> None:
+        if self.auto_follow:
+            # Was the reader at the bottom BEFORE this growth? (The offset is
+            # still the pre-growth one at watcher time.) A same-tick
+            # scroll_end can't do this check: max_scroll_y is stale until the
+            # layout pass that this watcher fires in.
+            old_max = max(0, old_size.height - self.container_size.height)
+            if self.scroll_offset.y >= old_max - _SCROLL_FOLLOW_THRESHOLD:
+                self.scroll_end(animate=False)
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)

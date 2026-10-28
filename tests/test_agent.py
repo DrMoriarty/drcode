@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1474,6 +1475,41 @@ def test_run_project_check_prefers_project_venv(
     assert "pytest" in out
 
 
+def test_run_project_check_pins_the_venv_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 9d29e63d failure class in the tester's run_check: the pip
+    pyright package is a node wrapper that ignores the interpreter
+    `-m pyright` ran under and probes VIRTUAL_ENV/PATH itself — when
+    drcode is not launched via `uv run` that discovery lands on a foreign
+    interpreter and reports phantom reportMissingImports. The env must be
+    pinned to the plan's venv."""
+    import drcode.agent_tools as at
+
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    (tmp_path / ".venv" / "pyvenv.cfg").write_text("home = /fake\n")
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(at.subprocess, "run", spy)
+    monkeypatch.setattr(
+        at,
+        "_project_python",
+        lambda root, module: ([str(venv_bin / "python")], False),
+    )
+    out = at._run_project_check(tmp_path, "pyright", ["--version"])
+    assert out.startswith("exit=0")
+    env = captured["env"]
+    assert env is not None
+    assert env["VIRTUAL_ENV"] == str(tmp_path / ".venv")
+    assert env["PATH"].startswith(str(venv_bin) + os.pathsep)
+
+
 def test_run_project_check_missing_module_is_skipped(tmp_path: Path) -> None:
     """A module the project environment does not have is reported as
     unavailable (skip it) — no PATH fallback, no phantom-failure binary."""
@@ -1496,20 +1532,30 @@ def test_run_project_check_rejects_non_module() -> None:
 def test_tester_prompt_teaches_retry_here() -> None:
     """Both tester templates must teach the retry_here criterion: a failure
     caused by the task's own changes returns the task to development
-    (retry_here=True, no bug report); a foreign/environmental failure
-    completes it with a bug report (retry_here=False)."""
+    (retry_here=True, no bug report); a foreign/environmental failure is
+    filed as a separate bug report while the task itself PASSES
+    (set_verification(success=True) + create_bug_report)."""
     from drcode.agent import (
         TESTER_SYSTEM_PROMPT,
         TESTER_SYSTEM_PROMPT_NO_COMMIT,
     )
+    from drcode.prompts import TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH
 
-    for prompt in (TESTER_SYSTEM_PROMPT, TESTER_SYSTEM_PROMPT_NO_COMMIT):
+    for prompt in (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+    ):
         assert "retry_here=True" in prompt
         assert "retry_here=False" in prompt
         assert "create_bug_report" in prompt
         # The cap escape must be taught too: after max failed rounds the
         # failure completes the task and the bug report is required again.
         assert "fix-round cap" in prompt
+        # The 572b268d incident rule: an unrelated (pre-existing/foreign)
+        # problem never fails the verified task — it passes and the problem
+        # is filed separately.
+        assert "must NOT be failed" in prompt
 
 
 def test_build_tester_agent_substitutes_project_path(

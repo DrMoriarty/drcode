@@ -316,7 +316,7 @@ class PipelineCompactionLayer(DrCodeState):
         workflow, the `.drcode/prompts/` overrides honored) and the
         serialized tool schemas of the role/kind's real `build_agent`
         wiring — and `output` the role's `max_tokens` output reserve
-        (clamped to a quarter of the window). None when the window is
+        (clamped to an eighth of the window). None when the window is
         unknown (≤ 0) or the wiring cannot be reconstructed."""
         cfg = self.resolved_config(role)
         window = cfg.max_context_tokens
@@ -358,7 +358,13 @@ class PipelineCompactionLayer(DrCodeState):
         framing = sum(estimate_tokens(t) for _, t in components if t) + sum(
             estimate_tokens(t) for _, t in tools
         )
-        output = min(max(cfg.max_tokens, 0), max(window // 4, 128))
+        # Reserve capped at an EIGHTH of the window: a quarter is only
+        # binding below ~32k windows (the 8192 max_tokens default binds
+        # above), and there it starves the transcript below the mechanical
+        # floor's own irreducible minimum (original prompt(s) + note) —
+        # the 6000-token bench window needs ≤1441 for the floor, a quarter
+        # (1500) already overflows it.
+        output = min(max(cfg.max_tokens, 0), max(window // 8, 128))
         return window, framing, output
 
     def _mechanical_token_budget(

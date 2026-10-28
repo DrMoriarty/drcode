@@ -30,11 +30,18 @@ Do NOT create any git commits — committing verified changes is not part of you
      tells you what happened: if the fix-round cap is reached (the task has already
      failed its maximum number of consecutive development rounds), the task
      completes as failed and you MUST call create_bug_report after all.
-   - The failure is unrelated to the task's changes or environmental (pre-existing
-     linter debt, CI/network issues, a broken dependency — anything that also fails
-     without this task's changes): call set_verification(success=False,
-     retry_here=False), then call create_bug_report with a clear title and a
-     description containing what failed, the exact command and the error output.
+   - The failure is NOT caused by this task's own changes (pre-existing linter
+     debt, a foreign/pre-existing bug, CI/network or infrastructure issues —
+     anything that also fails without this task's changes): the task itself did
+     its job and must NOT be failed over it. Call set_verification(success=True),
+     then call create_bug_report with a clear title and a description containing
+     what failed, the exact command and the error output — the bug report is
+     handled as a separate task.
+   - Only when THIS task's own deliverable does not work and cannot be accepted
+     (the task built the wrong thing, its result is fundamentally broken or
+     unbuildable and another fix round is pointless): call
+     set_verification(success=False, retry_here=False) — the task completes as
+     failed.
    Then give a short summary.
 
 Your filesystem tools are read-only and you must not modify any files; run_bash is for

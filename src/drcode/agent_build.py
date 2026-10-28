@@ -533,6 +533,13 @@ def build_agent(
         Use when the request is ambiguous or a required detail is missing.
         `options` is an optional list of suggested answers; pass it when a small
         set of choices covers the reasonable answers, otherwise omit it.
+        Format of `options`: a list of FLAT STRINGS (options: list[str] | None).
+        Each element is one COMPLETE ready-to-click answer — never an object
+        or dict like {"title": ..., "description": ...}: such a call is
+        rejected by schema validation ("Input should be a valid string"), the
+        task still pauses with an EMPTY option list, and the user has nothing
+        clickable to answer with. Correct example:
+        options=["Да, заведи багрепорт", "Нет, просто ответ"].
         When constructing `options`, never mix what the user requested with
         your own initiative: do NOT bundle an initiative item into a package
         option like "yes: do X + Y + Z, everything at once" — declining the
@@ -718,7 +725,11 @@ def build_tester_agent(
     def create_bug_report(
         ctx: RunContext[TesterDeps], title: str, description: str
     ) -> str:
-        """Create a bug report task. It is placed at the head of the execution queue."""
+        """Create a bug report task. It is placed at the head of the execution
+        queue. Use it to file problems found during verification that are NOT
+        caused by the verified task's own changes (pre-existing/foreign bugs,
+        environment or infrastructure issues) — the verified task itself then
+        passes (set_verification(success=True)); see set_verification."""
         # origin="system" — see the research variant of this tool above.
         bug = ctx.deps.manager.create(
             title, description, kind=TaskKind.BUG, origin="system"
@@ -807,17 +818,27 @@ def build_tester_agent(
     ) -> str:
         """Set the verification label on the verified task (passed or failed).
 
-        On failure, first decide who owns the bug:
+        The verdict judges THIS task's own work only. Before failing the
+        task, first decide who owns the bug:
         - retry_here=True: the failure is caused by THIS task's own changes
           (broken behaviour, tests this change should have kept green,
           regressions of previously working functionality). The task returns
           to development in its own worktree and `report` (what failed: the
           exact command and the error output) becomes its next input — do
           NOT call create_bug_report in this case.
-        - retry_here=False: the failure is unrelated to the task's changes
-          or environmental (pre-existing linter debt, CI/network issues, a
-          broken dependency). The task completes as failed — call
-          create_bug_report right after.
+        - retry_here=False: THIS task's own deliverable does not work and
+          cannot be accepted, and another development round is pointless
+          (the task built the wrong thing, its result is fundamentally
+          broken or unbuildable). The task completes as failed.
+
+        Problems NOT caused by this task's changes — pre-existing linter
+        debt, a foreign/pre-existing bug, CI/network or infrastructure
+        issues, anything that also fails without this task's changes — are
+        NOT a failure of this task: its own work is done, so call
+        set_verification(success=True) and then file the unrelated problem
+        separately via create_bug_report (title + description with what
+        failed, the exact command and the error output). Never complete the
+        task as failed over a problem it did not introduce.
 
         If the fix-round cap is reached (the task has already failed the
         maximum number of consecutive development rounds), a retry_here=True

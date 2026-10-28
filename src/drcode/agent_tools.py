@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 from pydantic_ai import RunContext
 
 from . import tools
-from .merge_resolver import _project_python, _worktree_pythonpath_env
+from .merge_resolver import _project_python, _venv_env, _worktree_pythonpath_env
 from .models import (
     Task,
     TaskKind,
@@ -299,8 +299,16 @@ def _run_project_check(
             capture_output=True,
             text=True,
             timeout=tools.clamp_bash_timeout(timeout),
-            env=_worktree_pythonpath_env(root) if fix_path else None,
+            # Some tools do their OWN environment discovery despite being
+            # launched as `-m <tool>`: the pip pyright package is a node
+            # wrapper that probes VIRTUAL_ENV/PATH and ignores the
+            # interpreter it ran under — without the pin it lands on a
+            # foreign python and reports phantom reportMissingImports
+            # (the 9d29e63d class). Pin the plan's venv defensively for
+            # every module.
+            env=_venv_env(cmd, _worktree_pythonpath_env(root) if fix_path else None),
             check=False,
+            **tools.child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"exit=-1\n({type(e).__name__}: {e})"

@@ -165,6 +165,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # 1-column empty gutter on both sides: no text sticks to the window edge.
     #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }
+    # Split continuation parts of an over-long live write (see
+    # _split_chat_text in chat_timeline.py) mount seamlessly: no inter-block
+    # margin inside one logical entry.
+    #chat-log > .chat-cont { margin-bottom: 0; }
     # Read-only todo checklist between the chat log and the input: hidden
     # while the viewed task has no checklist, auto-sized to its items
     # otherwise (capped, so a long list cannot crush the chat log).
@@ -303,7 +307,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+h", "save_task_edit_hold", "Save on hold"),
         ("ctrl+h", "hold_task", "Hold"),
         ("ctrl+h", "resume_task", "Resume"),
-        ("ctrl+delete", "delete_task", "Delete held"),
+        ("ctrl+delete", "delete_task", "Delete held/completed"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+r", "nudge_run", "Nudge agent"),
         ("ctrl+q", "quit", "Quit"),
@@ -696,6 +700,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # mid-drain bumps the epoch and the remaining stale chunks are
         # dropped instead of mounting into the new view's log.
         self._chat_batch_epoch = 0
+        # Scroll policy of the running drain: a history rebuild always lands
+        # on the latest entry (True); a drain seeded by a split fat live
+        # write follows the tail only while the reader is already at the
+        # bottom (False — checked per chunk, see _drain_chat_batch).
+        self._chat_batch_follow = True
         # monotonic() stamp of the last drain-chunk progress: the 1 s poll
         # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
         # chain died or starved (see chat_view._schedule_drain).
@@ -1271,7 +1280,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         completed tasks. Side effect: the same snapshot refreshes
         `_merge_state` (per-task none/unmerged/merged), which the
         sidebar's ✓ marker colors read — the state covers exactly the
-        candidate set of this method. Blocking git calls — run in a
+        candidate set of this method. Verification is not part of the
+        filter: a FAILED verdict (or none at all) does not mean the
+        branch is empty — the safety snapshot at finalization can still
+        have committed real work onto it. Blocking git calls — run in a
         worker thread."""
         env = self.task_env
         if not env.active:
@@ -1287,11 +1299,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             if task.status is not TaskStatus.COMPLETED:
                 continue
             research = task.kind is TaskKind.RESEARCH
-            if not research:
-                if task.verification is not VerificationStatus.PASSED:
-                    continue
-                if task.review_pending:
-                    continue  # the external review has not accepted it yet
+            if not research and task.review_pending:
+                continue  # the external review has not accepted it yet
+            # Verification is NOT filtered: a FAILED completion (or a task
+            # that never reached a verdict) can still carry uncommitted
+            # work — the safety snapshot commits it onto drcode/<id>
+            # anyway (branch kept), so every unmerged branch deserves a
+            # place in the tracking.
             candidates.append(task)
         if not candidates:
             self._merge_state = {}
@@ -1519,7 +1533,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if action == "resume_task":
             return task is not None and task.status is TaskStatus.HOLD
         if action == "delete_task":
-            return task is not None and task.status is TaskStatus.HOLD
+            # Same rules as action_delete_task: HOLD and COMPLETED are
+            # deletable, but a COMPLETED task still awaiting its external
+            # review verdict (open PR) is not.
+            if task is None:
+                return False
+            if task.status is TaskStatus.HOLD:
+                return True
+            if task.status is TaskStatus.COMPLETED:
+                return not task.review_pending
+            return False
         if action == "abort_run":
             return self.agent_running or self.tester_running
         if action == "nudge_run":

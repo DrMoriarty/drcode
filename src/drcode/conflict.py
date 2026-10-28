@@ -49,6 +49,7 @@ from pathlib import Path
 
 from . import merge_engine
 from .merge_engine import MergeReport
+from .tools import child_priority_kwargs
 
 __all__ = [
     "CHOICES",
@@ -223,6 +224,7 @@ class ConflictWorktree:
             text=True,
             timeout=120,
             check=False,
+            **child_priority_kwargs(),
         )
         return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -328,6 +330,7 @@ class ConflictWorktree:
             capture_output=True,
             timeout=120,
             check=False,
+            **child_priority_kwargs(),
         )
         if proc.returncode != 0:
             return False, f"git cat-file failed: {proc.stderr.decode()[:300]}"

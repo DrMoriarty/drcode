@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -783,6 +784,69 @@ def test_clamp_bash_timeout() -> None:
     assert (
         tools.clamp_bash_timeout(tools.BASH_MAX_TIMEOUT + 1) == tools.BASH_MAX_TIMEOUT
     )
+
+
+# -- child process priority -------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX preexec_fn nice")
+def test_child_priority_kwargs_posix() -> None:
+    # POSIX: a preexec_fn that nices the child; no other platform kwargs.
+    kwargs = tools.child_priority_kwargs()
+    assert set(kwargs) == {"preexec_fn"}
+    assert callable(kwargs["preexec_fn"])
+
+
+def test_child_priority_kwargs_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows: BELOW_NORMAL_PRIORITY_CLASS, no preexec_fn (not supported
+    # there). subprocess lacks the constant on POSIX, so stub the module.
+    stub = types.SimpleNamespace(BELOW_NORMAL_PRIORITY_CLASS=0x00004000)
+    monkeypatch.setattr(tools, "subprocess", stub)
+    monkeypatch.setattr(tools.os, "name", "nt")
+    kwargs = tools.child_priority_kwargs()
+    assert kwargs == {"creationflags": 0x00004000}
+
+
+def test_child_priority_kwargs_unknown_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools.os, "name", "java")
+    assert tools.child_priority_kwargs() == {}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX nice inheritance")
+def test_run_bash_child_runs_below_parent_priority(project_root: Path) -> None:
+    # The whole child tree (shell + its children) is niced below the drcode
+    # process, so a CPU-saturating child cannot starve the TUI render loop.
+    # nice clamps at 19 without error, hence the min().
+    parent_nice = os.nice(0)
+    out = asyncio.run(
+        run_bash(project_root, f'"{sys.executable}" -c "import os; print(os.nice(0))"')
+    )
+    child_nice = int(out.splitlines()[-1])
+    assert child_nice == min(parent_nice + 10, 19)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based check")
+def test_run_bash_cancel_still_kills_niced_child(project_root: Path) -> None:
+    # preexec_fn must not break the CancelledError path: cancelling the run
+    # kills the child, nothing outlives the tool call.
+    marker = f"drcode-cancel-{os.getpid()}"
+    asyncio.run(_cancel_run_bash(project_root, marker))
+    leftover = subprocess.run(
+        ["pgrep", "-f", marker], check=False, capture_output=True, text=True
+    )
+    assert leftover.returncode != 0  # no surviving process
+
+
+async def _cancel_run_bash(project_root: Path, marker: str) -> None:
+    src = f"import time; time.sleep(30)  # {marker}"
+    task = asyncio.create_task(run_bash(project_root, f'"{sys.executable}" -c "{src}"'))
+    await asyncio.sleep(1.0)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_run_bash_output_truncated(project_root: Path, monkeypatch) -> None:

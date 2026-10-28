@@ -223,6 +223,35 @@ async def test_reminder_fires_for_unmerged_task(app_env: DrCodeApp) -> None:
     assert any(title == "Unmerged work" for title, _ in toasts)
 
 
+async def test_failed_and_unverified_tasks_count_in_tracking(
+    app_env: DrCodeApp,
+) -> None:
+    """Verification is not part of the unmerged-work filter: a FAILED
+    verdict (tester rejected the task over a pre-existing bug) or no
+    verdict at all does not mean the branch is empty — the safety
+    snapshot at finalization can have committed the agent's work onto
+    `drcode/<id>` (branch kept). Such tasks count in
+    _unmerged_completed_ids and their ✓ marker is colored (merge_state
+    says "unmerged"), like PASSED ones (#572b268d)."""
+    app = app_env
+    failed = finished_task(app)
+    failed.verification = VerificationStatus.FAILED
+    app.manager.storage.save(failed)
+    unverified = finished_task(app)
+    unverified.verification = None
+    app.manager.storage.save(unverified)
+    commit_on_branch(app.task_env, failed.id)
+    commit_on_branch(app.task_env, unverified.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert sorted(app._unmerged_completed_ids()) == sorted(
+            [failed.id, unverified.id]
+        )
+        assert app._merge_state[failed.id] == "unmerged"
+        assert app._merge_state[unverified.id] == "unmerged"
+        await pilot.pause()
+
+
 async def test_reminder_silent_when_merged_or_absent(app_env: DrCodeApp) -> None:
     app = app_env
     task = finished_task(app)

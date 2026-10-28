@@ -1271,7 +1271,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         completed tasks. Side effect: the same snapshot refreshes
         `_merge_state` (per-task none/unmerged/merged), which the
         sidebar's ✓ marker colors read — the state covers exactly the
-        candidate set of this method. Blocking git calls — run in a
+        candidate set of this method. Verification is not part of the
+        filter: a FAILED verdict (or none at all) does not mean the
+        branch is empty — the safety snapshot at finalization can still
+        have committed real work onto it. Blocking git calls — run in a
         worker thread."""
         env = self.task_env
         if not env.active:
@@ -1287,11 +1290,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             if task.status is not TaskStatus.COMPLETED:
                 continue
             research = task.kind is TaskKind.RESEARCH
-            if not research:
-                if task.verification is not VerificationStatus.PASSED:
-                    continue
-                if task.review_pending:
-                    continue  # the external review has not accepted it yet
+            if not research and task.review_pending:
+                continue  # the external review has not accepted it yet
+            # Verification is NOT filtered: a FAILED completion (or a task
+            # that never reached a verdict) can still carry uncommitted
+            # work — the safety snapshot commits it onto drcode/<id>
+            # anyway (branch kept), so every unmerged branch deserves a
+            # place in the tracking.
             candidates.append(task)
         if not candidates:
             self._merge_state = {}

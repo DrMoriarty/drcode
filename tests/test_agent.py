@@ -1496,20 +1496,30 @@ def test_run_project_check_rejects_non_module() -> None:
 def test_tester_prompt_teaches_retry_here() -> None:
     """Both tester templates must teach the retry_here criterion: a failure
     caused by the task's own changes returns the task to development
-    (retry_here=True, no bug report); a foreign/environmental failure
-    completes it with a bug report (retry_here=False)."""
+    (retry_here=True, no bug report); a foreign/environmental failure is
+    filed as a separate bug report while the task itself PASSES
+    (set_verification(success=True) + create_bug_report)."""
     from drcode.agent import (
         TESTER_SYSTEM_PROMPT,
         TESTER_SYSTEM_PROMPT_NO_COMMIT,
     )
+    from drcode.prompts import TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH
 
-    for prompt in (TESTER_SYSTEM_PROMPT, TESTER_SYSTEM_PROMPT_NO_COMMIT):
+    for prompt in (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+    ):
         assert "retry_here=True" in prompt
         assert "retry_here=False" in prompt
         assert "create_bug_report" in prompt
         # The cap escape must be taught too: after max failed rounds the
         # failure completes the task and the bug report is required again.
         assert "fix-round cap" in prompt
+        # The 572b268d incident rule: an unrelated (pre-existing/foreign)
+        # problem never fails the verified task — it passes and the problem
+        # is filed separately.
+        assert "must NOT be failed" in prompt
 
 
 def test_build_tester_agent_substitutes_project_path(

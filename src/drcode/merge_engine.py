@@ -72,6 +72,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .tools import child_priority_kwargs
+
 __all__ = [
     "ADD_ADD",
     "CONTENT",
@@ -309,6 +311,7 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
             text=True,
             timeout=_TIMEOUT,
             check=False,
+            **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
@@ -324,6 +327,7 @@ def _git_bytes(*args: str, cwd: Path) -> tuple[int, bytes]:
             capture_output=True,
             timeout=_TIMEOUT,
             check=False,
+            **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}".encode()

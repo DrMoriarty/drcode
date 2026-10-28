@@ -173,7 +173,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import Task
-from .tools import sanitized_env
+from .tools import child_priority_kwargs, sanitized_env
 
 WORKFLOW_SCRIPT = "workflow.py"
 GIT_WORKFLOW_FILE = "git-workflow.md"
@@ -737,6 +737,7 @@ class WorkflowHooks:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **child_priority_kwargs(),
             )
         except OSError as e:
             return HookResult(ok=False, error=f"cannot start {WORKFLOW_SCRIPT}: {e}")

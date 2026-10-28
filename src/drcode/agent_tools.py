@@ -301,6 +301,7 @@ def _run_project_check(
             timeout=tools.clamp_bash_timeout(timeout),
             env=_worktree_pythonpath_env(root) if fix_path else None,
             check=False,
+            **tools.child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"exit=-1\n({type(e).__name__}: {e})"

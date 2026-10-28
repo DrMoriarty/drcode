@@ -126,6 +126,7 @@ from pathlib import Path, PurePosixPath
 from .gitignore import _is_git_repo
 from .models import Task, TaskStatus
 from .settings import ProjectSettings, TaskIsolation, WorktreeRemoval
+from .tools import child_priority_kwargs
 
 # Optional service-event sink wired by the app: `(task_id, text)`. The
 # worktree environment calls it when something happens the user must know
@@ -323,6 +324,7 @@ class TaskEnvironment:
             text=True,
             timeout=120,
             check=False,
+            **child_priority_kwargs(),
         )
         out = (proc.stdout + proc.stderr).strip()
         return proc.returncode, out

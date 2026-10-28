@@ -456,12 +456,29 @@ class TaskLifecycleLayer(DrCodeState):
             self.refresh_task_status()
 
     def action_delete_task(self) -> None:
-        """Fully remove the viewed held task — from the sidebar and from disk
-        (.drcode/tasks/<id>.json). Only parked tasks can be deleted: nothing
-        is running for them, so no worker state is left behind. Resume from
-        hold is Ctrl+H; deletion is Ctrl+Delete."""
+        """Fully remove the viewed task — from the sidebar and from disk
+        (.drcode/tasks/<id>.json). Deletable statuses: HOLD (nothing is
+        running for a parked task, so no worker state is left behind) and
+        COMPLETED (the work is done; deletion only takes effect earlier
+        than the retention purge would). A COMPLETED task still awaiting
+        its external review verdict (`review_pending` — an open PR) is
+        NOT deletable: a verdict arriving later must not find the task
+        gone. Everything else (QUEUED/ACTIVE/TESTING/AWAITING_CLARIFICATION)
+        is refused. Resume from hold is Ctrl+H; deletion is Ctrl+Delete."""
         task = self.viewed
-        if task is None or task.status is not TaskStatus.HOLD:
+        if task is None or task.status not in (
+            TaskStatus.HOLD,
+            TaskStatus.COMPLETED,
+        ):
+            return
+        if task.status is TaskStatus.COMPLETED and task.review_pending:
+            text = (
+                "Task is not deleted: it still awaits an external review "
+                "verdict (an open PR). Delete it after the verdict arrives "
+                "(or cancel the review)."
+            )
+            self._show_event(task, text)
+            self.notify(text, title="Delete task", severity="warning", timeout=8)
             return
         self.manager.delete(task.id)
         # The chat pane shows the deleted task: switch to another one (or

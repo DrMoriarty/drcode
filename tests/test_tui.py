@@ -840,6 +840,74 @@ async def test_action_toggle_hold_and_delete(app: DrCodeApp) -> None:
         assert not (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
 
 
+async def test_action_delete_completed_task(app: DrCodeApp) -> None:
+    task = app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_done_task()
+        await pilot.pause()
+        assert task.status is TaskStatus.COMPLETED
+
+        app.action_delete_task()
+        await pilot.pause()
+        assert app.manager.all_tasks() == []
+        assert not (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+
+
+async def test_action_delete_refuses_running_statuses(app: DrCodeApp) -> None:
+    task = app.manager.create("work", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # QUEUED is refused (hold it first).
+        app.action_delete_task()
+        assert task.id in app.manager.tasks
+
+        task.status = TaskStatus.ACTIVE
+        app.action_delete_task()
+        assert task.id in app.manager.tasks
+
+        task.status = TaskStatus.TESTING
+        app.action_delete_task()
+        assert task.id in app.manager.tasks
+        assert (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+
+
+async def test_action_delete_completed_review_pending_blocked(app: DrCodeApp) -> None:
+    task = app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_done_task()
+        await pilot.pause()
+        task.review_pending = True  # an open PR awaits its external verdict
+
+        toasts: list[tuple[Any, ...]] = []
+        app.notify = lambda *a, **k: toasts.append(a)  # type: ignore[method-assign]
+        app.action_delete_task()
+        await pilot.pause()
+
+        # The task survives — deleting it would lose the pending verdict.
+        assert task.id in app.manager.tasks
+        assert (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+        assert toasts
+        assert any("review" in e.text for e in task.events)
+
+
+async def test_delete_completed_task_then_purge_no_double_delete(
+    app: DrCodeApp,
+) -> None:
+    app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_done_task()
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+        assert app.manager.all_tasks() == []
+        # The retention purge runs over the remaining tasks only — the
+        # already-deleted one cannot be removed twice.
+        assert app.manager.purge_expired_completed(retention_days=0) == []
+
+
 async def test_action_cycle_task_kind(app: DrCodeApp) -> None:
     task = app.manager.create("typed", "")  # no input: stays queued
     async with app.run_test() as pilot:

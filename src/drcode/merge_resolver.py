@@ -505,7 +505,9 @@ def ruff_check(worktree: Path) -> CheckResult:
         "ruff check",
         [*cmd, "-m", "ruff", "check", "."],
         worktree,
-        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+        # Same pinning as mechanical_checks: tools with their own
+        # environment discovery must not land on a foreign interpreter.
+        env=_venv_env(cmd, _worktree_pythonpath_env(worktree) if fix_path else None),
     )
 
 
@@ -521,7 +523,9 @@ def pyright_check(worktree: Path) -> CheckResult:
         [*cmd, "-m", "pyright"],
         worktree,
         timeout=900,
-        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+        # Node pyright discovers the environment itself — pin it to the
+        # plan's venv (see _venv_env), same as inside mechanical_checks.
+        env=_venv_env(cmd, _worktree_pythonpath_env(worktree) if fix_path else None),
     )
 
 

@@ -1901,7 +1901,7 @@ def _picker_names(app: DrCodeApp, role: AgentRole) -> list[str]:
     provider_cls = role_model_options_provider(role)
     provider = provider_cls(app.screen)
     commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-    return [name for name, _callback in commands]
+    return [c.name for c in commands]
 
 
 def _write_user_catalog(
@@ -2107,7 +2107,7 @@ async def test_role_picker_marks_default_and_clears_slot(
         provider = role_model_options_provider(AgentRole.CODING)(app.screen)
         commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
         callback = next(
-            cb for name, cb in commands if name == "(default — user catalog)"
+            c.callback for c in commands if c.name == "(default — user catalog)"
         )
         callback()
         await pilot.pause()
@@ -2144,9 +2144,7 @@ async def test_role_picker_custom_toggle_roundtrip(
         # model (the project slot points at it): both marks.
         assert "local-swap/small (default) (current)" in names
         provider = role_model_options_provider(AgentRole.TESTER)(app.screen)
-        commands = dict(
-            provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        )
+        commands = {c.name: c.callback for c in provider._commands()}  # pyright: ignore[reportAttributeAccessIssue]
         # Switch back to the custom model: slot flips to "custom", the
         # entry is reused without re-entering anything.
         commands["Custom: custom-m"]()
@@ -2159,7 +2157,7 @@ async def test_role_picker_custom_toggle_roundtrip(
         assert "Custom: custom-m (current)" in names
         commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
         catalog_switch = next(
-            cb for name, cb in commands if name.startswith("local-swap/small")
+            c.callback for c in commands if c.name.startswith("local-swap/small")
         )
         catalog_switch()
         await pilot.pause()
@@ -2238,7 +2236,7 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         await pilot.pause()
         provider = ModelSettingsCommandProvider(app.screen)
         commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [(name, cb) for name, _help, cb in commands] == [
+        assert [(c.name, c.callback) for c in commands] == [
             ("Model settings…", app.action_open_model_settings)
         ]
         app.action_open_model_settings()
@@ -2266,11 +2264,9 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         # Sub-menu providers: the catalog editor plus the role pickers,
         # nothing else (project preferences stay in the main menu).
         commands = RoleModelsCommandsProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert next(name for name, _help, _cb in commands) == (
-            f"Coding model: {app.role_model_label(AgentRole.CODING)}"
-        )
+        assert commands[0].name == f"Coding model: {app.role_model_label(AgentRole.CODING)}"
         catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _help, _cb in catalog] == ["Provider catalog…"]
+        assert [c.name for c in catalog] == ["Provider catalog…"]
 
 
 async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
@@ -2307,7 +2303,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         await pilot.pause()
         provider = TaskSettingsCommandProvider(app.screen)
         commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [(name, cb) for name, _help, cb in commands] == [
+        assert [(c.name, c.callback) for c in commands] == [
             ("Task settings…", app.action_open_task_settings)
         ]
         app.action_open_task_settings()
@@ -2344,7 +2340,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         # The main-menu provider no longer carries the task entries: it
         # keeps only the workflow/github/notifications/voice preferences.
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        main_names = [name for name, _help, _cb in main]
+        main_names = [c.name for c in main]
         assert main_names == [
             f"Workflow: {app.workflow_status_label()}",
             (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
@@ -2368,7 +2364,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Git (research): {app.settings.git_policy.research.label}",
             f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
             "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
-        ] == [name for name, _help, _cb in entries]
+        ] == [c.name for c in entries]
 
 
 async def test_task_settings_dialog_draft_isolation_and_apply(
@@ -2698,12 +2694,12 @@ async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
         await pilot.press("escape")
         await pilot.pause()
         commands = WorktreeRemovalOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _cb in commands] == [
+        assert [c.name for c in commands] == [
             "on task deletion (current)",
             "on task completion",
             "never",
         ]
-        commands[1][1]()  # pick "on task completion"
+        commands[1].callback()  # pick "on task completion"
         await pilot.pause()
         assert app.settings.worktree_removal is WorktreeRemoval.ON_COMPLETION
         assert (
@@ -2734,15 +2730,15 @@ async def test_settings_verification_picker(app: DrCodeApp) -> None:
         await pilot.press("escape")
         await pilot.pause()
         commands = VerificationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _cb in commands] == [
+        assert [c.name for c in commands] == [
             f"{option.label} (current)"
             if option is app.settings.verification
             else option.label
             for option in VERIFICATION_OPTIONS
         ]
-        assert "tester (current)" in [name for name, _cb in commands]
+        assert "tester (current)" in [c.name for c in commands]
         # Pick "none".
-        none_cb = next(cb for name, cb in commands if name == "none")
+        none_cb = next(c.callback for c in commands if c.name == "none")
         none_cb()
         await pilot.pause()
         assert app.settings.verification is Verification.NONE
@@ -2752,7 +2748,7 @@ async def test_settings_verification_picker(app: DrCodeApp) -> None:
         )
         # Re-opening the palette marks the new current option.
         commands = VerificationOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert commands[1][0] == "none (current)"
+        assert commands[1].name == "none (current)"
 
 
 async def test_settings_git_policy_pickers(app: DrCodeApp) -> None:
@@ -2769,13 +2765,13 @@ async def test_settings_git_policy_pickers(app: DrCodeApp) -> None:
         await pilot.press("escape")
         await pilot.pause()
         commands = GitTesterOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _cb in commands] == [
+        assert [c.name for c in commands] == [
             "commit + push (current)",
             "commit locally",
             "off",
         ]
         # Pick the local policy for the tester.
-        local_cb = next(cb for name, cb in commands if name == "commit locally")
+        local_cb = next(c.callback for c in commands if c.name == "commit locally")
         local_cb()
         await pilot.pause()
         assert app.settings.git_policy.tester is GitPolicy.LOCAL
@@ -2784,7 +2780,7 @@ async def test_settings_git_policy_pickers(app: DrCodeApp) -> None:
         assert stored.git_policy.research is GitPolicy.PUSH  # untouched
 
         commands = GitResearchOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        off_cb = next(cb for name, cb in commands if name == "off")
+        off_cb = next(c.callback for c in commands if c.name == "off")
         off_cb()
         await pilot.pause()
         assert app.settings.git_policy.research is GitPolicy.OFF
@@ -2813,7 +2809,7 @@ async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
         await pilot.press("escape")
         await pilot.pause()
         commands = WorkflowPresetOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [name for name, _cb in commands] == [
+        assert [c.name for c in commands] == [
             "Local sandbox",
             "Team / PR flow",
             "Minimal",
@@ -2826,7 +2822,7 @@ async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
 
         # Local sandbox: verification tester; both policies local;
         # isolation worktree; removal on_delete.
-        sandbox = next(cb for name, cb in commands if name == "Local sandbox")
+        sandbox = next(c.callback for c in commands if c.name == "Local sandbox")
         sandbox()
         await pilot.pause()
         assert app.settings.verification is Verification.TESTER
@@ -2840,7 +2836,7 @@ async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
 
         # Team / PR flow: both policies push, isolation worktree — it
         # does NOT touch verification or worktree removal.
-        team = next(cb for name, cb in commands if name == "Team / PR flow")
+        team = next(c.callback for c in commands if c.name == "Team / PR flow")
         team()
         await pilot.pause()
         assert app.settings.git_policy.tester is GitPolicy.PUSH
@@ -2851,7 +2847,7 @@ async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
         assert app.workflow_preset_label() == "Team / PR flow"
 
         # Minimal: no tester, both policies off.
-        minimal = next(cb for name, cb in commands if name == "Minimal")
+        minimal = next(c.callback for c in commands if c.name == "Minimal")
         minimal()
         await pilot.pause()
         assert app.settings.verification is Verification.NONE
@@ -2865,7 +2861,7 @@ async def test_settings_workflow_preset_picker(app: DrCodeApp) -> None:
         assert app.workflow_preset_label() == "Custom"
 
         # Picking "Custom" is a no-op.
-        custom = next(cb for name, cb in commands if name == "Custom")
+        custom = next(c.callback for c in commands if c.name == "Custom")
         before = app.settings.model_copy(deep=True)
         custom()
         await pilot.pause()

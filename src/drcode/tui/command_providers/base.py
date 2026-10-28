@@ -1,13 +1,61 @@
-"""Shared widgets for the command-palette providers."""
+"""Shared widgets and the declarative provider base for the command palettes."""
 
 from __future__ import annotations
 
-from typing import ClassVar, cast
+from collections.abc import Callable
+from typing import ClassVar, NamedTuple, cast
 
-from textual.command import CommandList
+from textual.command import CommandList, DiscoveryHit, Hit, Hits, Provider
 from textual.css.styles import RulesMap
 from textual.geometry import Size
 from textual.strip import Strip
+
+
+class CommandEntry(NamedTuple):
+    """One declarative palette entry of a `CommandListProvider`."""
+
+    name: str
+    """Display name (the fuzzy matcher matches against this)."""
+    callback: Callable[[], object]
+    """Action invoked when the entry is picked."""
+    help: str | None = None
+    """Optional help text shown by the palette."""
+
+
+class CommandListProvider(Provider):
+    """Base for the declarative palette providers of this package.
+
+    Textual's `Provider` requires `discover()`/`search()`; every provider
+    here used to implement them byte-for-byte identically (yield every
+    entry in list order on discovery; fuzzy-match entry names via
+    `self.matcher` and highlight the matched parts on search). Subclasses
+    override ONLY the entry list — `_commands()` (rebuilt on every call so
+    dynamic values such as the current setting are fresh), or `_entries()`
+    when building the list needs to await something.
+    """
+
+    def _commands(self) -> list[CommandEntry]:
+        """The palette entries (synchronous assembly)."""
+        raise NotImplementedError
+
+    async def _entries(self) -> list[CommandEntry]:
+        """Awaitable entry assembly; defaults to the sync `_commands()`."""
+        return self._commands()
+
+    async def discover(self) -> Hits:
+        for entry in await self._entries():
+            yield DiscoveryHit(entry.name, entry.callback, help=entry.help)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for entry in await self._entries():
+            if (match := matcher.match(entry.name)) > 0:
+                yield Hit(
+                    match,
+                    matcher.highlight(entry.name),
+                    entry.callback,
+                    help=entry.help,
+                )
 
 
 class SpacedCommandList(CommandList):

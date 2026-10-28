@@ -120,7 +120,7 @@ class ModelCatalogScreen(ModalScreen[None]):
     }
     #mc-hint {
         width: 1fr;
-        padding: 1 2 0 2;
+        padding: 1 2 1 2;
         color: $text-disabled;
     }
     """
@@ -203,14 +203,14 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Update", id="mc-model-update")
                         yield Button("Remove", id="mc-model-del")
                         yield Button("Add model", id="mc-model-add")
-            yield Static(
-                "esc — close without saving · model table: click or arrow "
-                "keys select a row and fill the editor; Update writes the "
-                "edited id/context/limit back, Add model creates a new "
-                "model from the same fields, Remove deletes it",
-                id="mc-hint",
-            )
             with Horizontal(id="mc-footer"):
+                yield Static(
+                    "esc — close without saving · model table: click or arrow "
+                    "keys select a row and fill the editor; Update writes the "
+                    "edited id/context/limit back, Add model creates a new "
+                    "model from the same fields, Remove deletes it",
+                    id="mc-hint",
+                )
                 yield Button("Save", variant="primary", id="mc-save")
 
     # -- helpers ------------------------------------------------------------

@@ -1010,6 +1010,71 @@ async def test_action_delete_completed_task(app: DrCodeApp) -> None:
         assert not (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
 
 
+async def test_delete_completed_task_via_keybinding(app: DrCodeApp) -> None:
+    """Ctrl+Delete must actually delete a COMPLETED task: the binding goes
+    through check_action, so a gate that still requires HOLD would swallow
+    the key before it reaches action_delete_task (regression from #51192f29)."""
+    task = app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        app.action_done_task()
+        await pilot.pause()
+        assert task.status is TaskStatus.COMPLETED
+        app.view_task(task.id)
+        await pilot.pause()
+
+        await pilot.press("ctrl+delete")
+        await pilot.pause()
+
+        assert app.manager.all_tasks() == []
+        assert not (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+
+
+async def test_delete_keybinding_blocked_for_review_pending_completed(
+    app: DrCodeApp,
+) -> None:
+    """A COMPLETED task with review_pending keeps Ctrl+Delete disabled at
+    the binding gate (mirrors the handler's refusal), so the key press is
+    a no-op and the task survives."""
+    task = app.manager.create("docs", "prompt", kind=TaskKind.RESEARCH)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        app.action_done_task()
+        await pilot.pause()
+        task.review_pending = True  # an open PR awaits its external verdict
+        app.view_task(task.id)
+        await pilot.pause()
+
+        assert app.check_action("delete_task", ()) is False
+
+        await pilot.press("ctrl+delete")
+        await pilot.pause()
+
+        assert task.id in app.manager.tasks
+        assert (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+
+
+async def test_delete_keybinding_refuses_running_statuses_via_pilot(
+    app: DrCodeApp,
+) -> None:
+    """QUEUED/ACTIVE/TESTING keep the ctrl+delete binding disabled: the
+    key press is swallowed by check_action and nothing is deleted."""
+    task = app.manager.create("work", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        app.view_task(task.id)
+        await pilot.pause()
+
+        for status in (TaskStatus.QUEUED, TaskStatus.ACTIVE, TaskStatus.TESTING):
+            task.status = status
+            await pilot.pause()
+            assert app.check_action("delete_task", ()) is False
+            await pilot.press("ctrl+delete")
+            await pilot.pause()
+            assert task.id in app.manager.tasks
+            assert (app.project_root / ".drcode" / "tasks" / f"{task.id}.json").exists()
+
+
 async def test_action_delete_refuses_running_statuses(app: DrCodeApp) -> None:
     task = app.manager.create("work", "prompt")
     async with app.run_test() as pilot:

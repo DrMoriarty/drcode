@@ -1533,7 +1533,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if action == "resume_task":
             return task is not None and task.status is TaskStatus.HOLD
         if action == "delete_task":
-            return task is not None and task.status is TaskStatus.HOLD
+            # Same rules as action_delete_task: HOLD and COMPLETED are
+            # deletable, but a COMPLETED task still awaiting its external
+            # review verdict (open PR) is not.
+            if task is None:
+                return False
+            if task.status is TaskStatus.HOLD:
+                return True
+            if task.status is TaskStatus.COMPLETED:
+                return not task.review_pending
+            return False
         if action == "abort_run":
             return self.agent_running or self.tester_running
         if action == "nudge_run":

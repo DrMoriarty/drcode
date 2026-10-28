@@ -12,6 +12,8 @@ import time
 from collections import deque
 from functools import partial
 
+from textual.css.query import NoMatches
+
 from ..agent import probe_model
 from ..models import Task, TaskStatus
 from ..providers import AgentRole
@@ -21,6 +23,16 @@ from .usage import NETWORK_OUTAGE_PROBE_INTERVAL, NETWORK_RETRIES, tcp_reachable
 
 class PipelineNetLayer(DrCodeState):
     async def _check_model(self) -> None:
+        try:
+            await self._check_model_inner()
+        except NoMatches:
+            # Teardown race: the probe round-trip can outlive the app (ESC
+            # while the gateway answers slowly) — the header label is gone
+            # by the time the worker resumes; the indicator is cosmetic,
+            # so a vanished widget just ends the check quietly.
+            pass
+
+    async def _check_model_inner(self) -> None:
         label = self.model_status
         was_error = label.has_class("error")
         # The header shows the CODING model's connection: the role the

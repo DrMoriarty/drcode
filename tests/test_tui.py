@@ -22,6 +22,7 @@ from pydantic_ai.messages import TextPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from rich.markup import render as render_markup
 from textual.command import Command, CommandList
+from textual.css.query import NoMatches
 from textual.geometry import Offset
 from textual.widgets import ListView, Static, TextArea
 from textual.widgets._list_item import ListItem
@@ -1607,6 +1608,45 @@ async def test_search_dialog_copy_id(app: DrCodeApp) -> None:
         await pilot.press("c")
         await pilot.pause()
         assert copied == [f"#{task.id}"]
+
+
+async def test_search_dialog_dismiss_during_search_does_not_crash(
+    app: DrCodeApp,
+) -> None:
+    """Teardown race: a search worker suspended in its off-loop step can
+    resume after the dialog is dismissed. DOM pruning of a popped screen
+    is gradual (each child leaves in its own message-loop exit), so the
+    resumed worker can find its nodes already gone — it must drop the
+    render instead of raising NoMatches out of the worker (which crashes
+    the app). Reproduced deterministically by resuming the search after
+    the dialog's DOM is fully pruned."""
+    from drcode.tui.search_dialog import SearchDialog
+
+    app.manager.create("prune needle", "dismissed mid search")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, SearchDialog)
+        await wait_until(lambda: dialog._records is not None, pilot)
+        await pilot.press("p")  # any keystroke: debounce runs one search
+        await wait_until(lambda: bool(_result_ids(dialog)), pilot)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SearchDialog)
+
+        def status_pruned() -> bool:
+            try:
+                dialog.query_one("#srch-status")
+            except NoMatches:
+                return True
+            return False
+
+        await wait_until(status_pruned, pilot)
+        # The resumed search runs against the pruned dialog — on the old
+        # code this raised NoMatches out of the worker and crashed.
+        await dialog._search()
 
 
 async def test_pipeline_settled_notification_primes_then_sends(

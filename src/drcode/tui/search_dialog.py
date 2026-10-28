@@ -271,7 +271,15 @@ class SearchDialog(ModalScreen[None]):
         self.run_worker(self._search(), exclusive=True, group="srch-search")
 
     async def _search(self) -> None:
-        query = self.query_one("#srch-input", Input).value
+        # Teardown race: the dialog can be dismissed while this worker is
+        # suspended in to_thread — DOM pruning of a popped screen is
+        # gradual (each child leaves in its own message-loop exit), so
+        # some nodes may already be gone at resume. Drop the render,
+        # same pattern as _render_loading_status.
+        try:
+            query = self.query_one("#srch-input", Input).value
+        except NoMatches:
+            return
         assert self._records is not None
         try:
             hits = await asyncio.to_thread(self._search_sync, query)
@@ -279,11 +287,14 @@ class SearchDialog(ModalScreen[None]):
             # Empty keyword list (whitespace query): show the idle hint.
             self._show_hits([])
             return
-        # A newer keystroke superseded this run (the exclusive worker
-        # usually prevents that; a race at the timer boundary remains).
-        if self.query_one("#srch-input", Input).value != query:
-            return
-        self._show_hits(hits)
+        try:
+            # A newer keystroke superseded this run (the exclusive worker
+            # usually prevents that; a race at the timer boundary remains).
+            if self.query_one("#srch-input", Input).value != query:
+                return
+            self._show_hits(hits)
+        except NoMatches:
+            pass
 
     def _search_sync(self, query: str) -> list[TaskHit]:
         """Filtering + mergedness in one off-loop step (blocking git)."""

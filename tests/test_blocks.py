@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -62,7 +64,7 @@ async def test_tool_call_block_body_is_full_json() -> None:
 
 async def test_tool_call_block_elapsed_counter() -> None:
     """A running call's header shows the elapsed time, fed by the spinner
-    tick; stop_spinner() freezes the last value instead of clearing it."""
+    tick; after stop_spinner() the header carries no time suffix at all."""
 
     class _Host(App[None]):
         def compose(self) -> ComposeResult:
@@ -74,29 +76,39 @@ async def test_tool_call_block_elapsed_counter() -> None:
         assert block._elapsed_text() == ""
         block.start_spinner()
         assert block._run_started is not None
-        block._run_started -= 12.5  # simulate a 12.5 s call without sleeping
+        # Sub-second elapsed time: no suffix (never "0s").
+        block._run_started = time.monotonic() - 0.4
+        block._redraw()
+        assert block._elapsed_text() == ""
+        header = block.render()
+        assert isinstance(header, Content)
+        assert "0s" not in header.plain
+        block._run_started -= 12  # simulate a ~12.5 s call without sleeping
         block._redraw()
         header = block.render()
         assert isinstance(header, Content)
         assert "· 12s" in header.plain
         assert "· 12s" in block._elapsed_text()
         block.stop_spinner()
-        # Frozen: the value survives the stop, marker back to idle.
-        assert block._elapsed_text() == " · 12s"
+        # Stopped: no time suffix at all, marker back to idle.
+        assert block._elapsed_text() == ""
         frozen = block.render()
         assert isinstance(frozen, Content)
-        assert "· 12s" in frozen.plain
+        assert "0s" not in frozen.plain
+        assert "12s" not in frozen.plain
         # No wrap for an hour-long (exaggerated) call.
         block.start_spinner()
         block._run_started -= 3725
         block._redraw()
         assert block._elapsed_text() == " · 62m05s"
         block.stop_spinner()
+        assert block._elapsed_text() == ""
 
 
 async def test_tool_call_block_counter_restarts_on_reattach() -> None:
     """A fresh block handed the spinner after a view re-render starts the
-    counter from zero (its own _run_started), with no stale frozen value."""
+    counter from zero (its own _run_started); a stopped block shows no
+    time suffix whatsoever."""
 
     class _Host(App[None]):
         def compose(self) -> ComposeResult:
@@ -107,15 +119,20 @@ async def test_tool_call_block_counter_restarts_on_reattach() -> None:
         block.start_spinner()
         assert block._run_started is not None
         block._run_started -= 20
-        block.stop_spinner()
         assert block._elapsed_text() == " · 20s"
-        # Fresh block (as _reattach_tool_spinner would get): counter at zero.
+        block.stop_spinner()
+        assert block._elapsed_text() == ""
+        # Fresh block (as _reattach_tool_spinner would get): counter at zero,
+        # which renders as no suffix at all (never "0s").
         fresh = ToolCallBlock('run_bash({"command": "ls"})')
         await pilot.app.mount(fresh)
         fresh.start_spinner()
-        assert fresh._elapsed_frozen is None
-        assert fresh._elapsed_text() == " · 0s"
+        assert fresh._elapsed_text() == ""
+        fresh_header = fresh.render()
+        assert isinstance(fresh_header, Content)
+        assert "0s" not in fresh_header.plain
         fresh.stop_spinner()
+        assert fresh._elapsed_text() == ""
 
 
 def test_linkify_matches_task_mention() -> None:

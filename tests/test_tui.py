@@ -20,6 +20,7 @@ import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from rich.markup import render as render_markup
 from textual.command import Command, CommandList
 from textual.geometry import Offset
 from textual.widgets import ListView, Static, TextArea
@@ -38,6 +39,7 @@ from drcode.settings import (
 from drcode.storage import Storage
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
+from drcode.tui.chat_timeline import _SCROLL_FOLLOW_THRESHOLD, _split_chat_text
 from drcode.tui.command_providers import (
     SettingsPalette,
     role_model_options_provider,
@@ -305,6 +307,160 @@ async def test_view_switch_mid_drain_drops_stale_chunks(app: DrCodeApp) -> None:
         )
         assert "question 0" not in rendered
         assert "other prompt" in rendered
+
+
+# -- fat live writes (split mount through the drain) --------------------------
+
+
+def _fat_tool_output(lines: int = 400) -> str:
+    """A pytest-like tool result big enough to trip the live-mount limit."""
+    return "\n".join(
+        f"PASSED tests/test_mod_{i:03d}.py::test_thing_{i}" for i in range(lines)
+    )
+
+
+def test_split_chat_text_parts_render_standalone() -> None:
+    """Every part of a split markup string must render on its own: the tags
+    still open at a part boundary are closed at its end and re-opened at the
+    next part's start (an unclosed [dim] would raise MarkupError)."""
+    text = (
+        "[dim]head\n"
+        + "\n".join(f"line {i} \\[escaped]" for i in range(300))
+        + "\n[/]tail after close"
+    )
+    parts = _split_chat_text(text, 500)
+    assert len(parts) > 1
+    for part in parts:
+        render_markup(part)  # must not raise
+    assert "line 0" in parts[0]
+    assert "tail after close" in parts[-1]
+    # The still-open tag is re-opened at each continuation part.
+    assert parts[1].startswith("[dim]")
+    # Splitting never invents or loses visible text (tags aside).
+    joined = "".join(render_markup(part).plain for part in parts)
+    for i in (0, 1, 150, 299):
+        # rendered plain text has the escape un-done: \[ → [
+        assert f"line {i} [escaped]" in joined
+
+
+def test_split_chat_text_hard_splits_long_line() -> None:
+    """A single over-long line (no newline to split at) is cut at
+    markup-safe positions; escaped brackets never end up split."""
+    text = "[bold]start \\[lit] " + "y" * 10_000 + " end[/]"
+    parts = _split_chat_text(text, 1_000)
+    assert len(parts) > 5
+    for part in parts:
+        render_markup(part)
+    # No part starts with a bare '[' that used to be an escape sequence.
+    for part in parts[1:]:
+        assert not part.startswith("[lit]")
+
+
+async def test_fat_live_write_mounts_through_drain(app: DrCodeApp) -> None:
+    """A fat live write (a big tool result) is NOT one synchronous mount:
+    it seeds the chunked drain, the ledger counts it as ONE live entry, and
+    once the drain ends the whole text is on screen with batching off."""
+    app.manager.create("task", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        fat = _fat_tool_output()
+        markup = f"[dim]{fat}[/]"
+        assert len(markup) > 16_000
+        app._write_chat(markup, note=("tool", markup, None))
+        assert app._chat_batching  # seeded the drain, not one fat mount
+        assert len(app._live_tail) == 1  # one logical write, not one per part
+        assert app._live_tail[0][1] == markup
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert app._chat_batch == []
+        log = app.query_one("#chat-log")
+        parts = [w for w in log.children if w.__class__.__name__ == "_ChatPart"]
+        assert len(parts) > 1  # actually split, actually several blocks
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert "test_mod_000" in rendered
+        assert "test_mod_399" in rendered
+
+
+async def test_fat_live_write_view_switch_drops_tail(app: DrCodeApp) -> None:
+    """Switching tasks while a split fat write is still draining must not
+    leak its parts into the new view's log (the _chat_epoch guard)."""
+    app.manager.create("task", "prompt")
+    other = app.manager.create("other", "other prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._write_chat(f"[dim]{_fat_tool_output()}[/]")
+        app.view_task(other.id)  # bumps the epoch, owns the log now
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert app._chat_batch == []
+        rendered = "\n".join(
+            str(w.render()) for w in app.query_one("#chat-log").children
+        )
+        assert "test_mod_000" not in rendered
+        assert "other prompt" in rendered
+
+
+async def test_fat_live_write_follows_tail_only_at_bottom(app: DrCodeApp) -> None:
+    """The live-follow drain scrolls like a plain live write: a reader at
+    the bottom keeps tracking the tail across the chunks; a reader who
+    scrolled up is not yanked down."""
+    app.manager.create("task", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        log = app.query_one("#chat-log")
+        app._write_chat(f"[dim]{_fat_tool_output()}[/]")
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        # The reader never scrolled: the tail is being followed.
+        await pilot.pause()  # let the deferred post-layout scroll_end land
+        assert log.scroll_offset.y >= log.max_scroll_y - _SCROLL_FOLLOW_THRESHOLD
+
+        # Now a second fat write with the reader scrolling up after its
+        # first chunk: the remaining chunks must not yank the view down.
+        app._write_chat(f"[dim]{_fat_tool_output(500)}[/]")
+        await pilot.pause()  # first chunk mounts + its deferred scroll lands
+        log.scroll_to(y=0, animate=False)
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert log.scroll_offset.y == 0  # not yanked down by the chunks
+
+
+async def test_fat_live_write_delta_view_reconciles(app: DrCodeApp) -> None:
+    """A split fat write that mirrors a timeline entry (a fat service event)
+    keeps the delta re-render working: one ledger entry reconciles against
+    the timeline and the next view_task of the same task skips the rebuild."""
+    task = app.manager.create("task", "prompt")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        count_before = app._rendered_count
+        assert count_before is not None
+        fat_event = "\n".join(f"detail line {i}" for i in range(2_000))
+        app._show_event(task, fat_event)
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        assert not app._chat_batching
+        assert len(app._live_tail) == 1
+        # The delta path reconciles the single ledger entry against the
+        # timeline tail — no full rebuild, no duplicated event line.
+        assert app._try_delta_view(task.id) is True
+        log = app.query_one("#chat-log")
+        rendered = "\n".join(str(w.render()) for w in log.children)
+        assert rendered.count("detail line 1999") == 1
+        assert app._live_tail == []
 
 
 async def test_service_event_persisted_and_shown(app: DrCodeApp) -> None:

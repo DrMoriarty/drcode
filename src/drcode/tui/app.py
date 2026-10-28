@@ -165,6 +165,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # 1-column empty gutter on both sides: no text sticks to the window edge.
     #chat-log { height: 1fr; border: none; background: $surface; padding: 0 1; }
     #chat-log > * { margin-bottom: 1; }
+    # Split continuation parts of an over-long live write (see
+    # _split_chat_text in chat_timeline.py) mount seamlessly: no inter-block
+    # margin inside one logical entry.
+    #chat-log > .chat-cont { margin-bottom: 0; }
     # Read-only todo checklist between the chat log and the input: hidden
     # while the viewed task has no checklist, auto-sized to its items
     # otherwise (capped, so a long list cannot crush the chat log).
@@ -696,6 +700,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # mid-drain bumps the epoch and the remaining stale chunks are
         # dropped instead of mounting into the new view's log.
         self._chat_batch_epoch = 0
+        # Scroll policy of the running drain: a history rebuild always lands
+        # on the latest entry (True); a drain seeded by a split fat live
+        # write follows the tail only while the reader is already at the
+        # bottom (False — checked per chunk, see _drain_chat_batch).
+        self._chat_batch_follow = True
         # monotonic() stamp of the last drain-chunk progress: the 1 s poll
         # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
         # chain died or starved (see chat_view._schedule_drain).

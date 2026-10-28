@@ -303,7 +303,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+h", "save_task_edit_hold", "Save on hold"),
         ("ctrl+h", "hold_task", "Hold"),
         ("ctrl+h", "resume_task", "Resume"),
-        ("ctrl+delete", "delete_task", "Delete held"),
+        ("ctrl+delete", "delete_task", "Delete held/completed"),
         ("escape", "abort_run", "Stop agent"),
         ("ctrl+r", "nudge_run", "Nudge agent"),
         ("ctrl+q", "quit", "Quit"),

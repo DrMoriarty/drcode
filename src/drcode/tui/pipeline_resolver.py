@@ -89,26 +89,54 @@ _RETRY_BASE_DELAY_S = 5.0
 class PipelineResolverLayer(DrCodeState):
     # -- triggering ----------------------------------------------------------------
 
+    def _resolver_start_refusal(self, task_id: str) -> str | None:
+        """Why a resolver round must NOT start for `task_id` right now
+        (None = it may): worktree isolation is active (or the task is
+        PINNED to a worktree from before the setting was turned off — its
+        parked merge lives in its own worktree regardless of the live
+        setting), the RESOLVER role resolves to a model (it falls back to
+        the coding model) and no round is already running. The single
+        guard behind both trigger paths: `_maybe_start_resolver` (the
+        automatic markers, silent) and `launch_resolver` (the
+        user-triggerable one, which turns the reason into a toast)."""
+        if self._resolver_running:
+            return "an automatic resolution round is already running"
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            return "no such task"
+        if not self.task_env.active and task.isolation_pinned is not True:
+            return "worktree isolation is off"
+        if not self.resolved_config(AgentRole.RESOLVER).is_ready:
+            return "no model is configured for the resolver role"
+        return None
+
     def _maybe_start_resolver(self, task_id: str) -> None:
         """Start a resolver round for `task_id` when the situation calls
-        for one: worktree isolation is active (or the task is PINNED to a
-        worktree from before the setting was turned off — its parked
-        merge lives in its own worktree regardless of the live setting),
-        the RESOLVER role resolves to a model (it falls back to the
-        coding model) and no round is already running. Triggered from the
+        for one (see `_resolver_start_refusal`). Triggered from the
         hook-merge failure marker and the startup scan; silently does
         nothing otherwise (a conflict without a model is business as
         usual — the human path)."""
-        if self._resolver_running:
-            return
-        task = self.manager.tasks.get(task_id)
-        if task is None:
-            return
-        if not self.task_env.active and task.isolation_pinned is not True:
-            return
-        if not self.resolved_config(AgentRole.RESOLVER).is_ready:
-            return
+        if self._resolver_start_refusal(task_id) is None:
+            self.run_resolver(task_id)
+
+    def launch_resolver(self, task_id: str) -> bool:
+        """The user-triggerable half of the resolver trigger (the
+        ConflictScreen's ``A`` key and the unmerged list's ``a``): the
+        same guard as the automatic marker, but a refusal is announced —
+        a user pressed a key and must learn why nothing started. Returns
+        True when the round was started (the caller closes its screen —
+        the round's progress lives in the task's chat)."""
+        reason = self._resolver_start_refusal(task_id)
+        if reason is not None:
+            self.notify(
+                f"Cannot start the automatic resolver for #{task_id}: {reason}",
+                title="Merge",
+                severity="warning",
+                timeout=7,
+            )
+            return False
         self.run_resolver(task_id)
+        return True
 
     @work(exclusive=True, group="resolver")
     async def run_resolver(self, task_id: str) -> None:

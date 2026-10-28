@@ -9,6 +9,11 @@ the task's worktree, a `needs_human` fallback flag, or an unmerged
 task branch); there is nothing to "open" on a healthy task, and drcode
 still never merges anything on its own — the screen itself commits only
 behind an explicit user confirmation.
+
+Exactly ONE ready candidate opens the ConflictScreen directly; MORE than
+one opens the unmerged list (``tui.unmerged_screen``) instead — the user
+picks the concrete task and reaches the same actions (manual resolve,
+automatic resolver, ff-merge / concluding commit) from there.
 """
 
 from __future__ import annotations
@@ -56,20 +61,30 @@ class MergeActionsLayer(DrCodeState):
         candidates.extend(t.id for t in self.manager.all_tasks() if t.needs_human)
         candidates.extend(await asyncio.to_thread(self._unmerged_completed_ids))
         seen: set[str] = set()
+        ready: list[str] = []
         for task_id in candidates:
             if task_id in seen or task_id not in self.manager.tasks:
                 continue
             seen.add(task_id)
             ok, _reason = await asyncio.to_thread(self._merge_screen_ready, task_id)
             if ok:
-                self.open_merge_for(task_id)
-                return
-        self.notify(
-            "No parked merge conflict — nothing to resolve "
-            "(a conflicted task opens this screen from Ctrl+M)",
-            title="Merge",
-            timeout=6,
-        )
+                ready.append(task_id)
+        if not ready:
+            self.notify(
+                "No parked merge conflict — nothing to resolve "
+                "(a conflicted task opens this screen from Ctrl+M)",
+                title="Merge",
+                timeout=6,
+            )
+            return
+        if len(ready) == 1:
+            # Exactly one candidate — straight into the per-task screen,
+            # the list would be a pointless extra click.
+            self.open_merge_for(ready[0])
+            return
+        from .unmerged_screen import UnmergedListScreen
+
+        self.push_screen(UnmergedListScreen(ready))
 
     def _merge_screen_ready(self, task_id: str) -> tuple[bool, str]:
         """Whether the conflict screen has anything to show for `task_id`

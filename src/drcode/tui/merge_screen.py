@@ -42,7 +42,11 @@ The screen is a viewer + decision pad, never an autonomous actor:
   resolution state is untouched), ``E`` opens the persisted full report
   in the user's editor, ``s`` commits the resolution on the task branch
   and ``a`` aborts the merge — both only behind an explicit second-press
-  confirmation, mirroring the armed-ESC convention of the app. A
+  confirmation, mirroring the armed-ESC convention of the app. ``A``
+  hands the parked conflict to the automatic resolver (the same
+  single-round machinery the pipeline markers trigger, via the app's
+  guarded `launch_resolver` — the screen closes on a successful start,
+  the round's progress lives in the task's chat). A
   successful commit or ff-merge is the logical end of the work here:
   the screen closes itself (the outcome toast outlives it).
 
@@ -519,6 +523,7 @@ class ConflictScreen(ModalScreen[None]):
         Binding("E", "open_report", "Report", priority=True),
         Binding("s", "commit", "Commit", priority=True),
         Binding("a", "abort_merge", "Abort", priority=True),
+        Binding("A", "auto_resolve", "Auto resolve", priority=True),
         Binding("f", "ff_merge", "Merge into base", priority=True),
         Binding("r", "refresh_state", "Refresh", priority=True),
     ]
@@ -535,6 +540,7 @@ class ConflictScreen(ModalScreen[None]):
             "check_details",
             "commit",
             "abort_merge",
+            "auto_resolve",
         }
     )
 
@@ -594,6 +600,11 @@ class ConflictScreen(ModalScreen[None]):
         # already performed here (further f presses would be no-ops).
         self._ff_ready: bool = False
         self._ff_done: bool = False
+        # A conflicted merge is actually parked (the report is ok and
+        # conflicted): the only state where the automatic resolver (``A``)
+        # has anything to attack — the ff-ready / staged states have
+        # nothing left for it, the !ok one has no merge at all.
+        self._conflicted: bool = False
         # The last verification run (checks + the test suite), newest
         # first-shown check ordered as in the panel — the details viewer
         # reads from here.
@@ -661,7 +672,8 @@ class ConflictScreen(ModalScreen[None]):
             yield Static("", id="merge-checks", markup=False)
             yield Static(
                 "o/t/b hunk ours/theirs/both · e edit · v check · "
-                "d details · E report · s commit · a abort · r refresh · esc close",
+                "d details · E report · s commit · a abort · "
+                "A auto resolve · r refresh · esc close",
                 id="merge-footer",
             )
 
@@ -702,7 +714,8 @@ class ConflictScreen(ModalScreen[None]):
         else:
             text = (
                 "o/t/b hunk ours/theirs/both · e edit · v check · "
-                "d details · E report · s commit · a abort · r refresh · esc close"
+                "d details · E report · s commit · a abort · "
+                "A auto resolve · r refresh · esc close"
             )
         footer.update(text)
 
@@ -787,6 +800,7 @@ class ConflictScreen(ModalScreen[None]):
         self.wt = ConflictWorktree(app.project_root, self.task_id, root, report=report)
         if not report.ok:
             self._ff_ready = False
+            self._conflicted = False
             self._set_title(f"Merge conflicts — {report.message}")
             self._update_footer()
             self._hide_prepare()
@@ -800,6 +814,7 @@ class ConflictScreen(ModalScreen[None]):
             # merge commit exists yet) — neither may offer f.
             if report.fast_forward is True:
                 self._ff_ready = True
+                self._conflicted = False
                 self._set_title(
                     f"{report.message} — nothing to resolve; "
                     f"press f to merge {report.branch} into "
@@ -809,6 +824,7 @@ class ConflictScreen(ModalScreen[None]):
                 self._hide_prepare()
                 return
             self._ff_ready = False
+            self._conflicted = False
             if report.fast_forward is False:
                 self._set_title(
                     f"{report.message} — {report.branch} holds no commits "
@@ -827,6 +843,7 @@ class ConflictScreen(ModalScreen[None]):
             self._hide_prepare()
             return
         self._ff_ready = False
+        self._conflicted = True
         self._set_title(
             f"#{self.task_id} — merge {report.base_branch} into "
             f"{report.branch}: {len(report.remaining)} file(s) to resolve"
@@ -1662,6 +1679,28 @@ class ConflictScreen(ModalScreen[None]):
         # A successful merge is the screen's logical end of work — close
         # it automatically (the toast above outlives the screen).
         self.dismiss()
+
+    # -- automatic resolver (the user-triggerable launch) --------------------------
+
+    def action_auto_resolve(self) -> None:
+        """A: hand this parked conflict to the automatic resolver — the
+        same single-round machinery the hook-failure marker and the
+        startup scan trigger (`launch_resolver`: refused with a toast
+        when a round is already running, isolation is off, or no model
+        is configured for the resolver role). The screen closes on a
+        successful start — the round's progress lives in the task's chat
+        (the verification funnel and the service events report there),
+        and after a successful round Ctrl+M reopens the branch ff-ready.
+        Available only on a real conflicted merge: check_action disables
+        it in the ff-ready mode (nothing to resolve), and the guard below
+        keeps it inert whenever no merge is parked."""
+        if self._busy is not None:
+            return
+        if not self._conflicted:
+            return
+        app = cast("DrCodeApp", self.app)
+        if app.launch_resolver(self.task_id):
+            self.dismiss()
 
     # -- refresh / close -----------------------------------------------------------
 

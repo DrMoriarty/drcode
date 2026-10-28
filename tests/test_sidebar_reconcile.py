@@ -10,6 +10,7 @@ collapse/expand transitions.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -417,3 +418,112 @@ async def test_second_refresh_same_tick_is_stable(app: DrCodeApp, two_tasks) -> 
         assert all(isinstance(w, TaskItem) for w in app.sidebar.children)
         assert len(app._sidebar_items) == 4
         assert isinstance(app.sidebar, ListView)
+
+
+# -- post-delete selection ---------------------------------------------------------------
+#
+# Deleting a task must open the deleted row's NEIGHBOUR in the sidebar as
+# displayed (_sidebar_sections flattened) — first the row that followed,
+# then the one that preceded — never all_tasks()[0] (creation order, i.e.
+# the oldest archived task).
+
+
+def _complete_with_stamps(app: DrCodeApp, *names: str) -> list:
+    """Create tasks and stamp distinct updated_at values, then mark them
+    COMPLETED. The COMPLETED section renders newest-first, so the sidebar
+    shows them in reverse creation order deterministically."""
+    tasks = [app.manager.create(name, "prompt") for name in names]
+    base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    for i, t in enumerate(tasks):
+        t.updated_at = base + timedelta(seconds=i)
+        t.status = TaskStatus.COMPLETED
+        app.manager.storage.save(t)
+    return tasks
+
+
+async def test_delete_completed_selects_following_sidebar_row(
+    app: DrCodeApp,
+) -> None:
+    """Deleting a middle COMPLETED row opens the row BELOW it (the next
+    one the user sees), not the oldest archived task."""
+    old, mid, new = _complete_with_stamps(app, "old", "mid", "new")
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        # COMPLETED renders newest-first: new, mid, old.
+        assert [r.task_id for r in task_rows(app)] == [new.id, mid.id, old.id]
+
+        app.view_task(mid.id)
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+
+        assert mid.id not in app.manager.tasks
+        assert app.viewed_id == old.id
+        assert row_of(app, old.id).has_class("viewed")
+
+
+async def test_delete_completed_top_row_selects_the_next_one(
+    app: DrCodeApp,
+) -> None:
+    _old, mid, new = _complete_with_stamps(app, "old", "mid", "new")
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        app.view_task(new.id)  # top row
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+
+        assert app.viewed_id == mid.id
+
+
+async def test_delete_last_sidebar_row_selects_preceding(
+    app: DrCodeApp,
+) -> None:
+    """The deleted row was the last one displayed: fall back to the row
+    that preceded it."""
+    old, mid, _new = _complete_with_stamps(app, "old", "mid", "new")
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        app.view_task(old.id)  # bottom row
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+
+        assert app.viewed_id == mid.id
+
+
+async def test_delete_held_task_selects_sidebar_neighbor(
+    app: DrCodeApp,
+) -> None:
+    """HOLD deletion picks the neighbour within the ON HOLD section (its
+    creation order), with the QUEUE rows above it untouched."""
+    a = app.manager.create("queued", "prompt")
+    held_first = app.manager.create("held 1", "prompt")
+    held_second = app.manager.create("held 2", "prompt")
+    for t in (held_first, held_second):
+        app.manager.set_hold(t.id, on=True)
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        # QUEUE first (a), then ON HOLD in creation order.
+        assert [r.task_id for r in task_rows(app)] == [
+            a.id,
+            held_first.id,
+            held_second.id,
+        ]
+
+        app.view_task(held_first.id)
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+
+        # The row that FOLLOWED held_first in the sidebar is held_second.
+        assert app.viewed_id == held_second.id
+        assert row_of(app, held_second.id).has_class("viewed")
+
+        app.view_task(held_second.id)
+        await pilot.pause()
+        app.action_delete_task()
+        await pilot.pause()
+
+        # Last row: fall back to the preceding QUEUE row.
+        assert app.viewed_id == a.id

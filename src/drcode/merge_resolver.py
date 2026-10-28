@@ -53,6 +53,7 @@ from pathlib import Path
 
 from . import merge_engine
 from .merge_engine import MergeReport
+from .tools import child_priority_kwargs
 
 __all__ = [
     "REVIEW_DIFF_CHAR_CAP",
@@ -155,6 +156,7 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
             text=True,
             timeout=_TIMEOUT,
             check=False,
+            **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
@@ -336,6 +338,7 @@ def _run_checked(
             timeout=timeout,
             check=False,
             env=env,
+            **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return CheckResult(name=name, ok=False, output=f"{type(e).__name__}: {e}")
@@ -365,6 +368,7 @@ def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
             text=True,
             timeout=600,
             check=False,
+            **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -480,6 +484,7 @@ def compile_check(worktree: Path) -> CheckResult:
             text=True,
             timeout=_TIMEOUT,
             check=False,
+            **child_priority_kwargs(),
         )
         if proc.returncode != 0:
             ok = False
@@ -505,7 +510,9 @@ def ruff_check(worktree: Path) -> CheckResult:
         "ruff check",
         [*cmd, "-m", "ruff", "check", "."],
         worktree,
-        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+        # Same pinning as mechanical_checks: tools with their own
+        # environment discovery must not land on a foreign interpreter.
+        env=_venv_env(cmd, _worktree_pythonpath_env(worktree) if fix_path else None),
     )
 
 
@@ -521,7 +528,9 @@ def pyright_check(worktree: Path) -> CheckResult:
         [*cmd, "-m", "pyright"],
         worktree,
         timeout=900,
-        env=_worktree_pythonpath_env(worktree) if fix_path else None,
+        # Node pyright discovers the environment itself — pin it to the
+        # plan's venv (see _venv_env), same as inside mechanical_checks.
+        env=_venv_env(cmd, _worktree_pythonpath_env(worktree) if fix_path else None),
     )
 
 
@@ -552,6 +561,7 @@ def mechanical_checks(
                 text=True,
                 timeout=_TIMEOUT,
                 check=False,
+                **child_priority_kwargs(),
             )
             if proc.returncode != 0:
                 ok = False

@@ -24,7 +24,9 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 from pathlib import Path
+from typing import Any
 
 from .config import PROJECT_STATE_DIRNAME
 
@@ -46,6 +48,8 @@ _READ_HEAD_SHARE = 0.75
 # Bytes reserved for the truncation note, so the WHOLE result (slices + note)
 # stays within MAX_READ_RESULT_BYTES.
 _READ_NOTE_RESERVE = 256
+# Nice increment for spawned background children (see child_priority_kwargs).
+_CHILD_NICE = 10
 # Defaults for the context-budget check (overridden per run by the caller):
 # a fresh agent starts with empty context, and the default compaction threshold
 # matches Config.compaction_threshold (80).
@@ -559,6 +563,56 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
                 raise _bash_violation(root, command, base, raw, extra_writable)
 
 
+# -- child process priority ----------------------------------------------------
+#
+# Children spawned for background work (run_bash, the git plumbing, workflow
+# hooks, the resolver's verification funnel) must not compete with the TUI at
+# equal priority: a `pytest -n auto` child tree can hold a dozen xdist workers,
+# saturate the CPU and starve the Textual render loop (a CPU-bound Python
+# process), so keystrokes lag seconds behind. The fix is inversion — lower the
+# children instead of raising the parent (a negative nice needs root): they
+# inherit the lowered nice into their own children, and the TUI stays
+# responsive. Cost for the children is minimal — they still get the CPU as
+# soon as the TUI blocks or idles.
+
+
+def _nice_child() -> None:
+    """preexec_fn body: runs in the forked child right before exec.
+
+    os.nice is one simple syscall (no allocation, no locks) — safe in the
+    pre-exec window. A failure must never fail the spawn itself: a scheduling
+    preference is not worth an error, so it is swallowed.
+    """
+    try:
+        os.nice(_CHILD_NICE)
+    except OSError:
+        pass
+
+
+def child_priority_kwargs() -> dict[str, Any]:
+    """subprocess kwargs that spawn the child BELOW the parent's priority.
+
+    Merge into every subprocess spawn of background work (both the sync
+    `subprocess.run`/`Popen` and the async `asyncio.create_subprocess_*`,
+    which forwards **kwds to `subprocess.Popen`). POSIX uses preexec_fn with
+    os.nice — deliberately NOT a `nice …` wrapper in a command string: the
+    run_bash command line is inspected verbatim (COMMAND_WRAPPERS) and a
+    wrapper would distort that inspection. Windows uses
+    BELOW_NORMAL_PRIORITY_CLASS. Unknown platforms get no kwargs.
+    """
+    if os.name == "nt":
+        # The constant only exists in subprocess on Windows; the fallback
+        # value is its documented stable value (keeps pyright/POSIX happy).
+        return {
+            "creationflags": getattr(
+                subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000
+            )
+        }
+    if os.name == "posix":  # Linux, macOS (darwin), the BSDs, ...
+        return {"preexec_fn": _nice_child}
+    return {}
+
+
 def clamp_bash_timeout(timeout: float | None) -> float:
     """Resolve the effective timeout of a run_bash call.
 
@@ -608,6 +662,7 @@ async def run_bash(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **child_priority_kwargs(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=effective)

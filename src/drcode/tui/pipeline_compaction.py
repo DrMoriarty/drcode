@@ -316,7 +316,7 @@ class PipelineCompactionLayer(DrCodeState):
         workflow, the `.drcode/prompts/` overrides honored) and the
         serialized tool schemas of the role/kind's real `build_agent`
         wiring — and `output` the role's `max_tokens` output reserve
-        (clamped to a quarter of the window). None when the window is
+        (clamped to an eighth of the window). None when the window is
         unknown (≤ 0) or the wiring cannot be reconstructed."""
         cfg = self.resolved_config(role)
         window = cfg.max_context_tokens
@@ -358,7 +358,13 @@ class PipelineCompactionLayer(DrCodeState):
         framing = sum(estimate_tokens(t) for _, t in components if t) + sum(
             estimate_tokens(t) for _, t in tools
         )
-        output = min(max(cfg.max_tokens, 0), max(window // 4, 128))
+        # Reserve capped at an EIGHTH of the window: a quarter is only
+        # binding below ~32k windows (the 8192 max_tokens default binds
+        # above), and there it starves the transcript below the mechanical
+        # floor's own irreducible minimum (original prompt(s) + note) —
+        # the 6000-token bench window needs ≤1441 for the floor, a quarter
+        # (1500) already overflows it.
+        output = min(max(cfg.max_tokens, 0), max(window // 8, 128))
         return window, framing, output
 
     def _mechanical_token_budget(
@@ -714,7 +720,12 @@ class PipelineCompactionLayer(DrCodeState):
         without any LLM call. Either
         way the transcript is replaced by the original user prompt(s) plus
         the summary/note, so compaction always terminates with a history
-        that fits the serving model's context. A compaction failure is
+        that fits the serving model's context. When the transcript is
+        ALREADY only the original prompt(s) plus a previous summary (the
+        last compaction landed at/above the gate's level — nothing left to
+        summarize), the gate disarms itself for the task at the threshold
+        level (`_compaction_failed`; at the hard limit `_hard_limit_exhausted`)
+        instead of looping pause→resume over a guaranteed no-op. A compaction failure is
         never fatal: it is logged into the service events and the run
         continues with the uncompressed history — except at the hard-limit
         level, where a failed summarizer escalates to the mechanical trim
@@ -749,6 +760,12 @@ class PipelineCompactionLayer(DrCodeState):
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
             # plus a previous summary): compacting again would be a no-op.
+            # Disarm the threshold-level mid-run gate too (mirrors
+            # _maybe_compact_tester_round): resuming the run as-is would
+            # hit the gate again and loop pause→resume with one model
+            # request per cycle and no progress — the gate stays off until
+            # a later compaction succeeds (which also re-arms it).
+            self._compaction_failed.add(task.id)
             if hard:
                 # At the hard-limit level this no-op must also stop the
                 # gate from firing again: the mechanical floor keeps the

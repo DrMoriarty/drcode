@@ -123,6 +123,7 @@ from ..conflict import (
 )
 from ..merge_engine import MergeReport, is_fast_forward
 from ..merge_resolver import CheckResult
+from ..tools import child_priority_kwargs
 
 if TYPE_CHECKING:
     from .app import DrCodeApp
@@ -892,6 +893,7 @@ class ConflictScreen(ModalScreen[None]):
                 capture_output=True,
                 text=True,
                 timeout=10,
+                **child_priority_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             proc = None

@@ -33,6 +33,7 @@ from ..models import (
     TaskStatus,
 )
 from .blocks import (
+    _SCROLL_FOLLOW_THRESHOLD,
     TASK_MENTION_RE,
     AssistantBlock,
     ReasoningBlock,
@@ -43,10 +44,114 @@ from .state import DrCodeState, LiveTailEntry
 
 _MIN_TIME = datetime.min.replace(tzinfo=UTC)
 _CHAT_MOUNT_CHUNK = 16
-_SCROLL_FOLLOW_THRESHOLD = 4
 # A history drain chunk that has not progressed for this long while blocks
 # are still pending is considered dead (see _poll_chat_drain).
 _CHAT_DRAIN_STUCK = 2.0
+# Live writes (tool results, tester output) longer than this are NOT mounted
+# as one Static: one fat block is a single long render pass on the event loop
+# (textual also re-applies styles over all mounted widgets per mount) and the
+# keyboard echo lags around it. They are split into parts and mounted through
+# the chunked drain instead (same machinery as the history rebuild).
+_CHAT_LIVE_MOUNT_LIMIT = 16_000
+# Split-part target size: small enough that one drain tick stays cheap.
+_CHAT_LIVE_PART = 4_000
+# Per-tick mount budget of the drain, in "mount cost" units (the text length
+# of the split parts; plain rebuild blocks carry no cost and chunk by count
+# only, as before).
+_CHAT_MOUNT_BYTES = 16_384
+
+# A rich-markup tag (skipping backslash-escaped brackets, which rich's
+# escape() emits for literal text).
+_RICH_TAG_RE = re.compile(r"(?<!\\)\[[^\[\]]*\]")
+
+
+def _safe_markup_cut(line: str, limit: int) -> int:
+    """Largest cut index <= limit that does not split a markup tag or a
+    backslash escape in half — the fallback for a single over-long line
+    (minified output, a base64 blob) that has no newline to split at."""
+    depth = 0
+    cut = 0
+    prev = ""
+    for i, ch in enumerate(line[:limit]):
+        if ch == "[" and prev != "\\":
+            if depth == 0:
+                cut = i  # cutting right before a tag is safe
+            depth += 1
+        elif ch == "]" and prev != "\\":
+            depth = max(depth - 1, 0)
+            cut = i + 1  # cutting right after a closed tag is safe
+        elif depth == 0:
+            cut = i + 1
+        prev = ch
+    # Never split a `\[` escape: the next part must not start with a bare `[`.
+    if cut > 1 and line[cut - 1] == "\\":
+        cut -= 1
+    # Pathological (a tag longer than limit): force a cut rather than loop.
+    return cut if cut > 0 else max(limit, 1)
+
+
+def _split_chat_text(text: str, limit: int) -> list[str]:
+    """Split an over-long markup string into parts of at most ~limit
+    characters each, so each part renders standalone: split at line
+    boundaries (hard-splitting individual over-long lines at markup-safe
+    positions), close the still-open markup tags at each part end and
+    re-open them at the next part start."""
+    if len(text) <= limit:
+        return [text]
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        while len(raw) > limit:
+            cut = _safe_markup_cut(raw, limit)
+            lines.append(raw[:cut])
+            raw = raw[cut:]
+        lines.append(raw)
+    # Open-tag stack after each line: parts are closed/reopened so each
+    # renders standalone (an unclosed [dim] would raise MarkupError).
+    stack: list[str] = []
+    stacks: list[list[str]] = []
+    for line in lines:
+        for m in _RICH_TAG_RE.finditer(line):
+            tag = m.group(0)
+            if tag.startswith("[/"):
+                if stack:
+                    stack.pop()
+            else:
+                stack.append(tag)
+        stacks.append(stack.copy())
+    parts: list[str] = []
+    buf: list[str] = []
+    size = 0
+    reopen = ""
+    for i, line in enumerate(lines):
+        if buf and size + len(line) + 1 > limit:
+            parts.append(reopen + "\n".join(buf) + "[/]" * len(stacks[i - 1]))
+            buf, size = [], 0
+            reopen = "".join(stacks[i - 1])
+        if buf:
+            buf.append(line)
+            size += len(line) + 1
+        else:
+            buf.append(reopen + line)
+            size = len(reopen) + len(line)
+    if buf:
+        parts.append(reopen + "\n".join(buf))
+    return parts
+
+
+class _ChatPart(Static):
+    """One part of a split over-long live write. Carries the part's text
+    length as its mount cost — _drain_chat_batch bounds each tick by the
+    summed cost, so a fat write spreads over several event-loop ticks
+    instead of one long render pass."""
+
+    mount_cost: int
+
+    def __init__(self, text: str, expand: bool, *, cont: bool) -> None:
+        # `cont` (a middle part) drops the inter-block margin so the parts
+        # of one logical entry render seamlessly (see the .chat-cont CSS).
+        classes = "chat-block chat-cont" if cont else "chat-block"
+        super().__init__(text, expand=expand, classes=classes)
+        self.mount_cost = len(text)
 
 
 def _mention_markup(text: str) -> str:
@@ -495,10 +600,30 @@ class ChatTimelineLayer(DrCodeState):
         clarification dialog, an error line, anything outside the
         timeline) invalidates as before.
         """
-        if isinstance(content, Widget):
-            content.add_class("chat-block")
+        parts: list[_ChatPart] | None = None
+        widget: Widget
+        if isinstance(content, str) and len(content) > _CHAT_LIVE_MOUNT_LIMIT:
+            # A fat live write (a big tool result): one Static of the whole
+            # text is a single long render pass on the event loop — keyboard
+            # echo lags around it. Split into parts and mount through the
+            # chunked drain (live-follow mode: scroll only while the reader
+            # is at the bottom), yielding to the loop between ticks — same
+            # machinery as the history rebuild's _drain_chat_batch. The
+            # ledger note appended below still counts the write as ONE live
+            # entry: it carries the full text, so _try_delta_view's
+            # reconciliation is unaffected by how many widgets the write
+            # became.
+            split = _split_chat_text(content, _CHAT_LIVE_PART)
+            parts = [
+                _ChatPart(part, expand, cont=0 < j < len(split) - 1)
+                for j, part in enumerate(split)
+            ]
+            widget = parts[0]
+        elif isinstance(content, Widget):
+            widget = content
+            widget.add_class("chat-block")
         else:
-            content = Static(content, expand=expand, classes="chat-block")
+            widget = Static(content, expand=expand, classes="chat-block")
         if note is not None and self._rendered_count is not None:
             # Live write whose timeline counterpart is known: keep the
             # "mounted log == rendered timeline (+ reconciled live tail)"
@@ -513,12 +638,34 @@ class ChatTimelineLayer(DrCodeState):
             # view_task must rebuild fully.
             self._invalidate_chat_delta()
         if self._chat_batching:
-            self._chat_batch.append(content)
+            self._chat_batch.append(widget)
+            if parts is not None:
+                self._chat_batch.extend(parts[1:])
+            self._chat_has_content = True
+        elif parts is not None:
+            try:
+                # Seed the chunked drain with the parts (live-follow mode):
+                # subsequent live writes keep appending to _chat_batch and
+                # ride along, so block order is preserved. The drain's
+                # epoch guard drops the tail on a mid-append view switch.
+                self._chat_batch.extend(parts)
+                self._chat_batch_follow = False
+                # The ChatLog watcher keeps the tail on screen while the
+                # chunks grow the log — but only while the reader is
+                # tracking it (decided per growth, pre-growth position).
+                self.chat_log.auto_follow = True
+                self._chat_batch_epoch = self._chat_epoch
+                self._chat_batching = True
+                self._chat_drain_at = time.monotonic()
+                self._drain_chat_batch()
+            except NoMatches:
+                # Teardown race (see the plain-mount branch below).
+                return
             self._chat_has_content = True
         else:
             try:
                 follow = self._chat_at_bottom()
-                self.chat_log.mount(content)
+                self.chat_log.mount(widget)
                 if follow:
                     self.chat_log.scroll_end(animate=False)
             except NoMatches:
@@ -543,6 +690,10 @@ class ChatTimelineLayer(DrCodeState):
         last chunk — and ride along with the remaining chunks.
         """
         self._chat_batching = True
+        self._chat_batch_follow = True
+        # A rebuild drain is not live-follow: its final scroll_end is
+        # explicit (always lands on the latest entry).
+        self.chat_log.auto_follow = False
         self._chat_batch_epoch = self._chat_epoch
         self._chat_drain_at = time.monotonic()
         self._drain_chat_batch()
@@ -569,20 +720,47 @@ class ChatTimelineLayer(DrCodeState):
             if self._chat_batching and self._chat_batch_epoch == epoch:
                 self._chat_batching = False
                 self._chat_batch.clear()
+                self.chat_log.auto_follow = False
             return
-        chunk = self._chat_batch[:_CHAT_MOUNT_CHUNK]
-        del self._chat_batch[:_CHAT_MOUNT_CHUNK]
+        chunk: list[Widget] = []
+        cost = 0
+        # Size-aware chunking: split parts of a fat live write carry their
+        # text length as mount_cost, so a tick's total work stays bounded
+        # even when the parts are few; plain rebuild blocks cost 0 and chunk
+        # by count only (as before).
+        while self._chat_batch and len(chunk) < _CHAT_MOUNT_CHUNK:
+            widget = self._chat_batch[0]
+            widget_cost = getattr(widget, "mount_cost", 0)
+            if chunk and cost + widget_cost > _CHAT_MOUNT_BYTES:
+                break
+            chunk.append(widget)
+            cost += widget_cost
+            del self._chat_batch[0]
         try:
             if chunk:
+                # The live-follow scroll (split fat write) is driven by the
+                # ChatLog's virtual-size watcher (auto_follow): a same-tick
+                # scroll_end computes against the stale max_scroll_y (the
+                # chunk's virtual size arrives with the layout pass), and a
+                # deferred one still races the layout — the watcher fires
+                # exactly when the growth lands and re-checks the reader's
+                # position against the PRE-growth size.
                 self.chat_log.mount(*chunk)
             if self._chat_batch:
                 self._schedule_drain(self._chat_epoch)
             else:
                 self._chat_batching = False
-                # Opening a task always lands on the latest entry (previously
-                # this happened implicitly because every mount scrolled to
-                # the end).
-                self.chat_log.scroll_end(animate=False)
+                if self._chat_batch_follow:
+                    # Opening a task always lands on the latest entry
+                    # (previously this happened implicitly because every
+                    # mount scrolled to the end).
+                    self.chat_log.scroll_end(animate=False)
+                # else: a live-follow drain — the ChatLog watcher kept the
+                # tail on screen while the chunks grew the log and stays
+                # armed: the last chunk's layout may land after this tick
+                # (the drain chain outruns it). It disarms itself for any
+                # reader who is no longer at the tail; the next rebuild
+                # (_flush_chat_batch) turns it off explicitly.
         except NoMatches:
             # Teardown race: the drain chain (call_after_refresh / the 0.1s
             # timer fallback) can fire into an already-parsed-away DOM —
@@ -590,11 +768,13 @@ class ChatTimelineLayer(DrCodeState):
             # _poll_activity's NoMatches catch).
             self._chat_batching = False
             self._chat_batch.clear()
+            self.chat_log.auto_follow = False
         except Exception:
             # Never leave batching stuck on: later live writes would be
             # silently swallowed.
             self._chat_batching = False
             self._chat_batch.clear()
+            self.chat_log.auto_follow = False
             raise
 
     def _schedule_drain(self, epoch: int) -> None:

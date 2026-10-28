@@ -333,6 +333,66 @@ def test_pyright_check_pins_the_venv_environment(
     assert env["PATH"].startswith(str(repo / ".venv" / "bin") + os.pathsep)
 
 
+def test_standalone_pyright_check_pins_the_venv_environment(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The 9d29e63d class hit the STANDALONE pyright_check too (the manual
+    # merge screen calls it directly): node pyright does its own
+    # VIRTUAL_ENV/PATH discovery, so the pin must not live only inside
+    # mechanical_checks.
+    _fake_worktree_venv(repo)
+    (repo / ".venv" / "pyvenv.cfg").write_text("home = /fake\n")
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)  # no uv on PATH
+    monkeypatch.setattr(
+        mr, "_module_importable", lambda cmd, module, cwd: module == "pyright"
+    )
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
+        if name == "pyright":
+            captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    result = mr.pyright_check(repo)
+    assert not result.skipped
+    env = captured["env"]
+    assert env is not None
+    assert env["VIRTUAL_ENV"] == str(repo / ".venv")
+    assert env["PATH"].startswith(str(repo / ".venv" / "bin") + os.pathsep)
+
+
+def test_standalone_ruff_check_pins_the_venv_environment(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Symmetry with pyright: the standalone ruff_check (manual merge
+    # screen) pins the plan's venv defensively too.
+    _fake_worktree_venv(repo)
+    (repo / ".venv" / "pyvenv.cfg").write_text("home = /fake\n")
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)  # no uv on PATH
+    monkeypatch.setattr(
+        mr, "_module_importable", lambda cmd, module, cwd: module == "ruff"
+    )
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
+        if name == "ruff check":
+            captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    result = mr.ruff_check(repo)
+    assert not result.skipped
+    env = captured["env"]
+    assert env is not None
+    assert env["VIRTUAL_ENV"] == str(repo / ".venv")
+    assert env["PATH"].startswith(str(repo / ".venv" / "bin") + os.pathsep)
+
+
 def test_pyright_check_leaves_uv_run_env_alone(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

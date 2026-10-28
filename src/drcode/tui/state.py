@@ -789,6 +789,11 @@ class DrCodeState(App[None]):
     _chat_batching: bool
     _chat_batch: list[Widget]
     _chat_drain_at: float
+    # Scroll policy of the running drain: a history rebuild always lands on
+    # the latest entry (True); a drain seeded by a split fat live write
+    # follows the tail only while the reader is already at the bottom
+    # (False — checked per chunk, see _drain_chat_batch).
+    _chat_batch_follow: bool
     _rendered_clarification: Clarification | None
 
     # -- delta re-render bookkeeping ----------------------------------------

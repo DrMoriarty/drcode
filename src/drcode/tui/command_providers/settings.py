@@ -22,8 +22,6 @@ from textual.command import (
     CommandPalette,
     DiscoveryHit,
     Hit,
-    Hits,
-    Provider,
     SearchIcon,
 )
 from textual.containers import Horizontal, Vertical
@@ -50,10 +48,18 @@ from ...settings import (
     parallel_tasks_label,
     subagents_label,
 )
-from .base import SpacedCommandList
+from .base import CommandEntry, CommandListProvider, SpacedCommandList
 
 if TYPE_CHECKING:
     from ..app import DrCodeApp
+
+
+def _marked_option(
+    label: str, current: bool, callback: Callable[[], object]
+) -> CommandEntry:
+    """One enum-option palette entry; the active option is marked with
+    "(current)" (picking it is a no-op re-apply, Escape keeps it)."""
+    return CommandEntry(label + (" (current)" if current else ""), callback)
 
 
 # -- Workflow presets ----------------------------------------------------------
@@ -331,7 +337,7 @@ class TaskSettingsPalette(SettingsPalette):
     )
 
 
-class ServiceCommandsProvider(Provider):
+class ServiceCommandsProvider(CommandListProvider):
     """App-specific commands in the Settings palette.
 
     Registered alongside the system commands via `DrCodeApp.COMMANDS`;
@@ -339,48 +345,33 @@ class ServiceCommandsProvider(Provider):
     task, the ESC-stop entry toggles a project preference.
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 "Find task…",
-                (
-                    "Search the task archive by keywords — title, prompt, "
-                    "edited files, the agent's final summary (the same "
-                    "dialog as Ctrl+F)"
-                ),
                 app.action_search_tasks,
+                "Search the task archive by keywords — title, prompt, "
+                "edited files, the agent's final summary (the same "
+                "dialog as Ctrl+F)",
             ),
-            (
+            CommandEntry(
                 "Update/create AGENTS.md",
-                "research task: agent creates or refreshes AGENTS.md",
                 app.action_update_agents_md,
+                "research task: agent creates or refreshes AGENTS.md",
             ),
-            (
+            CommandEntry(
                 f"ESC stop behavior: {app.settings.esc_abort.label}",
-                (
-                    "How ESC stops a running agent/tester: double-press "
-                    "(the first ESC only arms the stop, the second "
-                    "confirms) or instant — the historical single-press "
-                    "stop (project setting)"
-                ),
                 app.action_change_esc_abort,
+                "How ESC stops a running agent/tester: double-press "
+                "(the first ESC only arms the stop, the second "
+                "confirms) or instant — the historical single-press "
+                "stop (project setting)",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            score = matcher.match(name)
-            if score > 0:
-                yield Hit(score, matcher.highlight(name), callback, help=help_text)
-
-
-class ModelCatalogCommandProvider(Provider):
+class ModelCatalogCommandProvider(CommandListProvider):
     """Provider-catalog entry in the "Model settings…" sub-menu.
 
     Always visible (independent of any configuration state): opens the
@@ -388,63 +379,39 @@ class ModelCatalogCommandProvider(Provider):
     (`~/.config/drcode/models.json`).
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 "Provider catalog…",
-                (
-                    "Edit the user-level catalog of OpenAI-compatible providers "
-                    "and their models (auto-discovery, context sizes, per-role "
-                    "defaults) — stored in ~/.config/drcode/models.json"
-                ),
                 app.action_open_model_catalog,
+                "Edit the user-level catalog of OpenAI-compatible providers "
+                "and their models (auto-discovery, context sizes, per-role "
+                "defaults) — stored in ~/.config/drcode/models.json",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback, help=help_text)
-
-
-class ModelSettingsCommandProvider(Provider):
+class ModelSettingsCommandProvider(CommandListProvider):
     """The single "Model settings…" entry in the main Settings palette.
 
     Opens the ModelSettingsPalette sub-menu with the provider catalog
     editor and the per-role model pickers.
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 "Model settings…",
-                (
-                    "Provider catalog and per-agent model selection "
-                    "(coding / research / tester / compaction)"
-                ),
                 app.action_open_model_settings,
+                "Provider catalog and per-agent model selection "
+                "(coding / research / tester / compaction)",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback, help=help_text)
-
-
-class TaskSettingsCommandProvider(Provider):
+class TaskSettingsCommandProvider(CommandListProvider):
     """The single "Task settings…" entry in the main Settings palette.
 
     Opens the TaskSettingsPalette sub-menu with the seven project
@@ -452,32 +419,20 @@ class TaskSettingsCommandProvider(Provider):
     worktree removal, dev rounds, stall nudge, isolation, parallelism).
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 "Task settings…",
-                (
-                    "Task-management preferences: auto-delete, "
-                    "finalization, worktree removal, dev rounds, stall "
-                    "nudge, isolation, parallelism"
-                ),
                 app.action_open_task_settings,
+                "Task-management preferences: auto-delete, "
+                "finalization, worktree removal, dev rounds, stall "
+                "nudge, isolation, parallelism",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback, help=help_text)
-
-
-class ProjectSettingsCommandsProvider(Provider):
+class ProjectSettingsCommandsProvider(CommandListProvider):
     """Project-preference commands in the Settings palette.
 
     One entry per project preference; its current value is shown after the
@@ -493,67 +448,43 @@ class ProjectSettingsCommandsProvider(Provider):
     are provided by TaskSettingsEntriesProvider.
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 f"Workflow: {app.workflow_status_label()}",
-                (
-                    "Custom branching/review rules: .drcode/git-workflow.md "
-                    "(prose rules for the agents) and .drcode/workflow.py "
-                    "(lifecycle hooks, incl. external code review) — press "
-                    "for details"
-                ),
                 app.action_workflow_info,
+                "Custom branching/review rules: .drcode/git-workflow.md "
+                "(prose rules for the agents) and .drcode/workflow.py "
+                "(lifecycle hooks, incl. external code review) — press "
+                "for details",
             ),
-            (
-                (
-                    "GitHub integration: "
-                    f"{'on' if app.settings.github_enabled else 'off'}"
-                ),
-                (
-                    "Periodically import open GitHub issues as tasks: bug → "
-                    "bug report, enhancement → feature request (project "
-                    "setting)"
-                ),
+            CommandEntry(
+                f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}",
                 app.action_change_github,
+                "Periodically import open GitHub issues as tasks: bug → "
+                "bug report, enhancement → feature request (project "
+                "setting)",
             ),
-            (
-                (
-                    "Notifications: "
-                    f"{'on' if app.settings.notifications_enabled else 'off'}"
-                ),
-                (
-                    "Push notifications about important pipeline events "
-                    "(task status changes, GitHub sync, an idle pipeline) "
-                    "via ntfy.sh (project setting)"
-                ),
+            CommandEntry(
+                "Notifications: "
+                f"{'on' if app.settings.notifications_enabled else 'off'}",
                 app.action_change_notifications,
+                "Push notifications about important pipeline events "
+                "(task status changes, GitHub sync, an idle pipeline) "
+                "via ntfy.sh (project setting)",
             ),
-            (
+            CommandEntry(
                 f"Voice: {app.voice_status_label()}",
-                (
-                    "Speech recognition (push-to-talk dictation into the "
-                    "input fields) and spoken announcements, via an "
-                    "OpenAI-compatible audio API (project setting)"
-                ),
                 app.action_change_voice,
+                "Speech recognition (push-to-talk dictation into the "
+                "input fields) and spoken announcements, via an "
+                "OpenAI-compatible audio API (project setting)",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            score = matcher.match(name)
-            if score > 0:
-                yield Hit(score, matcher.highlight(name), callback, help=help_text)
-
-
-class TaskSettingsEntriesProvider(Provider):
+class TaskSettingsEntriesProvider(CommandListProvider):
     """The task-management entries of the "Task settings…" sub-menu,
     grouped into three sections: Workflow (preset, isolation, parallel
     tasks, worktree removal), Testing (verification, dev rounds, stall
@@ -567,170 +498,133 @@ class TaskSettingsEntriesProvider(Provider):
     the current value.
     """
 
-    def _commands(self) -> list[tuple[str, str, Callable[[], object]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            (
+            CommandEntry(
                 f"Workflow preset: {app.workflow_preset_label()}",
-                (
-                    "Apply a named combination of the workflow settings "
-                    "(verification, per-role git policies, isolation, "
-                    "worktree removal) in one pick — Local sandbox, "
-                    "Team / PR flow or Minimal; any manual change of an "
-                    "individual setting flips this display to Custom"
-                ),
                 app.action_change_workflow_preset,
+                "Apply a named combination of the workflow settings "
+                "(verification, per-role git policies, isolation, "
+                "worktree removal) in one pick — Local sandbox, "
+                "Team / PR flow or Minimal; any manual change of an "
+                "individual setting flips this display to Custom",
             ),
             # -- Workflow --
-            (
+            CommandEntry(
                 f"Task isolation: {app._task_isolation_label()}",
-                (
-                    "Give each task its own git worktree (.drcode/"
-                    "worktrees/<id>, branch drcode/<id>) so an interrupted "
-                    "task never leaves its changes to the next one — needs "
-                    "a git repository, otherwise tasks run in the shared "
-                    "project directory (project setting)"
-                ),
                 app.action_change_task_isolation,
+                "Give each task its own git worktree (.drcode/"
+                "worktrees/<id>, branch drcode/<id>) so an interrupted "
+                "task never leaves its changes to the next one — needs "
+                "a git repository, otherwise tasks run in the shared "
+                "project directory (project setting)",
             ),
-            (
+            CommandEntry(
                 f"Isolation start branch: {app._isolation_start_branch_label()}",
-                (
-                    "Which commit NEW task branches are forked from under "
-                    "worktree isolation: auto (the main checkout's current "
-                    "branch — a detached HEAD then refuses the isolation "
-                    "instead of forking from an unknown commit) or a named "
-                    "branch such as main, used even when the checkout is "
-                    "detached (project setting)"
-                ),
                 app.action_change_isolation_start_branch,
+                "Which commit NEW task branches are forked from under "
+                "worktree isolation: auto (the main checkout's current "
+                "branch — a detached HEAD then refuses the isolation "
+                "instead of forking from an unknown commit) or a named "
+                "branch such as main, used even when the checkout is "
+                "detached (project setting)",
             ),
-            (
+            CommandEntry(
                 f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
-                (
-                    "How many tasks may develop in parallel, each in its "
-                    "own git worktree — needs Task isolation: worktree, "
-                    "otherwise tasks run one at a time (project setting; "
-                    "the tester stays single)"
-                ),
                 app.action_change_parallel_tasks,
+                "How many tasks may develop in parallel, each in its "
+                "own git worktree — needs Task isolation: worktree, "
+                "otherwise tasks run one at a time (project setting; "
+                "the tester stays single)",
             ),
-            (
+            CommandEntry(
                 f"Worktree removal: {app.settings.worktree_removal.label}",
-                (
-                    "When the per-task worktree directory (.drcode/"
-                    "worktrees/<id>) is deleted automatically: with the "
-                    "task, on task completion, or never — the branch "
-                    "drcode/<id> with the committed work always survives "
-                    "(project setting)"
-                ),
                 app.action_change_worktree_removal,
+                "When the per-task worktree directory (.drcode/"
+                "worktrees/<id>) is deleted automatically: with the "
+                "task, on task completion, or never — the branch "
+                "drcode/<id> with the committed work always survives "
+                "(project setting)",
             ),
-            (
+            CommandEntry(
                 f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
-                (
-                    "How many read-only research subagents the CODING agent "
-                    "may run in parallel via its delegate_research tool — "
-                    "each returns only its final report, saving the agent's "
-                    "context; off removes the tool entirely (project "
-                    "setting)"
-                ),
                 app.action_change_subagents_coder,
+                "How many read-only research subagents the CODING agent "
+                "may run in parallel via its delegate_research tool — "
+                "each returns only its final report, saving the agent's "
+                "context; off removes the tool entirely (project "
+                "setting)",
             ),
-            (
-                f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
-                (
-                    "The same delegation cap for the RESEARCH agent's runs "
-                    "(its resolved model serves the subagents; the counter "
-                    "is per run) — off removes the delegate_research tool "
-                    "(project setting)"
-                ),
+            CommandEntry(
+                f"Subagents (researcher): "
+                f"{subagents_label(app.settings.subagents_researcher)}",
                 app.action_change_subagents_researcher,
+                "The same delegation cap for the RESEARCH agent's runs "
+                "(its resolved model serves the subagents; the counter "
+                "is per run) — off removes the delegate_research tool "
+                "(project setting)",
             ),
             # -- Testing --
-            (
+            CommandEntry(
                 f"Verification: {app.settings.verification.label}",
-                (
-                    "Whether the QA tester round runs after development: "
-                    "tester (verify before completion) or none (tasks "
-                    "complete right away — project setting)"
-                ),
                 app.action_change_verification,
+                "Whether the QA tester round runs after development: "
+                "tester (verify before completion) or none (tasks "
+                "complete right away — project setting)",
             ),
-            (
+            CommandEntry(
                 f"Max development rounds: {app.settings.max_dev_rounds}",
-                (
-                    "How many consecutive failed development rounds a task "
-                    "gets when the tester attributes the failure to the "
-                    "task's own changes, before the failure completes the "
-                    "task as failed and a bug report is created instead "
-                    "(project setting)"
-                ),
                 app.action_change_max_dev_rounds,
+                "How many consecutive failed development rounds a task "
+                "gets when the tester attributes the failure to the "
+                "task's own changes, before the failure completes the "
+                "task as failed and a bug report is created instead "
+                "(project setting)",
             ),
-            (
+            CommandEntry(
                 f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
-                (
-                    "Abort and restart an agent/tester run that has shown no "
-                    "activity for this long (project setting)"
-                ),
                 app.action_change_stall_nudge,
+                "Abort and restart an agent/tester run that has shown no "
+                "activity for this long (project setting)",
             ),
             # -- Git --
-            (
+            CommandEntry(
                 f"Git (tester): {app.settings.git_policy.tester.label}",
-                (
-                    "What the QA tester may do to git after a passed "
-                    "verification: commit + push, local commit only, or "
-                    "off (verify without committing — project setting; "
-                    "dormant while Verification is none)"
-                ),
                 app.action_change_git_tester,
+                "What the QA tester may do to git after a passed "
+                "verification: commit + push, local commit only, or "
+                "off (verify without committing — project setting; "
+                "dormant while Verification is none)",
             ),
-            (
+            CommandEntry(
                 f"Git (research): {app.settings.git_policy.research.label}",
-                (
-                    "What the research agent's git_commit_docs may do: "
-                    "commit + push, local commit only, or off (no commit "
-                    "step at all — edited files are still tracked for the "
-                    "report; project setting)"
-                ),
                 app.action_change_git_research,
+                "What the research agent's git_commit_docs may do: "
+                "commit + push, local commit only, or off (no commit "
+                "step at all — edited files are still tracked for the "
+                "report; project setting)",
             ),
-            (
-                f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
-                (
-                    "Delete completed tasks older than the retention period at app "
-                    "startup (project setting)"
-                ),
+            CommandEntry(
+                f"Auto-delete completed tasks: "
+                f"{app.settings.completed_retention.label}",
                 app.action_change_completed_retention,
+                "Delete completed tasks older than the retention period at app "
+                "startup (project setting)",
             ),
-            (
+            CommandEntry(
                 f"Keep computer awake: {'on' if app.settings.keep_awake else 'off'}",
-                (
-                    "Hold a system-sleep assertion while the pipeline has "
-                    "work (any task queued/active/testing or a run in "
-                    "flight) — a sleeping machine tears the network down "
-                    "and kills the runs (project setting; does not stop "
-                    "the lid-closed clamshell sleep)"
-                ),
                 app.action_toggle_keep_awake,
+                "Hold a system-sleep assertion while the pipeline has "
+                "work (any task queued/active/testing or a run in "
+                "flight) — a sleeping machine tears the network down "
+                "and kills the runs (project setting; does not stop "
+                "the lid-closed clamshell sleep)",
             ),
         ]
 
-    async def discover(self) -> Hits:
-        for name, help_text, callback in self._commands():
-            yield DiscoveryHit(name, callback, help=help_text)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, help_text, callback in self._commands():
-            score = matcher.match(name)
-            if score > 0:
-                yield Hit(score, matcher.highlight(name), callback, help=help_text)
-
-
-class RetentionOptionsProvider(Provider):
+class RetentionOptionsProvider(CommandListProvider):
     """Options of the completed-tasks auto-cleanup setting.
 
     Shown in the selection palette opened from the single Settings entry;
@@ -738,29 +632,20 @@ class RetentionOptionsProvider(Provider):
     without changing anything. The currently active option is marked.
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.completed_retention
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_completed_retention, option),
             )
             for option in RETENTION_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class VerificationOptionsProvider(Provider):
+class VerificationOptionsProvider(CommandListProvider):
     """Options of the "Verification" setting (tester / none).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
@@ -768,29 +653,20 @@ class VerificationOptionsProvider(Provider):
     marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.verification
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_verification, option),
             )
             for option in VERIFICATION_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class GitTesterOptionsProvider(Provider):
+class GitTesterOptionsProvider(CommandListProvider):
     """Options of the "Git (tester)" setting (off / local / push).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
@@ -798,29 +674,20 @@ class GitTesterOptionsProvider(Provider):
     marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.git_policy.tester
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_git_tester, option),
             )
             for option in GIT_POLICY_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class GitResearchOptionsProvider(Provider):
+class GitResearchOptionsProvider(CommandListProvider):
     """Options of the "Git (research)" setting (off / local / push).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
@@ -828,29 +695,20 @@ class GitResearchOptionsProvider(Provider):
     marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.git_policy.research
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_git_research, option),
             )
             for option in GIT_POLICY_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class WorkflowPresetOptionsProvider(Provider):
+class WorkflowPresetOptionsProvider(CommandListProvider):
     """Options of the "Workflow preset" applier (Local sandbox / Team /
     PR flow / Minimal / Custom).
 
@@ -859,30 +717,17 @@ class WorkflowPresetOptionsProvider(Provider):
     match no preset. Escape keeps everything as-is.
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
-        commands: list[tuple[str, Callable[[], None]]] = [
-            (
-                preset.label,
-                partial(app.action_set_workflow_preset, preset),
-            )
+        entries = [
+            CommandEntry(preset.label, partial(app.action_set_workflow_preset, preset))
             for preset in WORKFLOW_PRESETS
         ]
-        commands.append(("Custom", app.action_workflow_preset_custom))
-        return commands
-
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
+        entries.append(CommandEntry("Custom", app.action_workflow_preset_custom))
+        return entries
 
 
-class DevRoundsOptionsProvider(Provider):
+class DevRoundsOptionsProvider(CommandListProvider):
     """Options of the "Max development rounds" setting (the fix-loop cap).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
@@ -890,28 +735,20 @@ class DevRoundsOptionsProvider(Provider):
     marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.max_dev_rounds
         return [
-            (
-                dev_rounds_label(rounds) + (" (current)" if rounds == current else ""),
+            _marked_option(
+                dev_rounds_label(rounds),
+                rounds == current,
                 partial(app.action_set_max_dev_rounds, rounds),
             )
             for rounds in DEV_ROUNDS_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        for name, callback in self._commands():
-            if (match := self.matcher(query).match(name)) > 0:
-                yield Hit(match, self.matcher(query).highlight(name), callback)
-
-
-class IsolationOptionsProvider(Provider):
+class IsolationOptionsProvider(CommandListProvider):
     """Options of the "Task isolation" setting (off / git worktree).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option
@@ -919,29 +756,20 @@ class IsolationOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.task_isolation
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_task_isolation, option),
             )
             for option in ISOLATION_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class ParallelTasksOptionsProvider(Provider):
+class ParallelTasksOptionsProvider(CommandListProvider):
     """Options of the "Parallel tasks" setting (the development-slot
     limit, 1–4).
 
@@ -950,30 +778,20 @@ class ParallelTasksOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.parallel_tasks
         return [
-            (
-                parallel_tasks_label(count)
-                + (" (current)" if count == current else ""),
+            _marked_option(
+                parallel_tasks_label(count),
+                count == current,
                 partial(app.action_set_parallel_tasks, count),
             )
             for count in PARALLEL_TASKS_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class WorktreeRemovalOptionsProvider(Provider):
+class WorktreeRemovalOptionsProvider(CommandListProvider):
     """Options of the "Worktree removal" setting (with the task / on
     completion / never).
 
@@ -982,29 +800,20 @@ class WorktreeRemovalOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.worktree_removal
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_worktree_removal, option),
             )
             for option in WORKTREE_REMOVAL_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class SubagentsCoderOptionsProvider(Provider):
+class SubagentsCoderOptionsProvider(CommandListProvider):
     """Options of the "Subagents (coder)" setting (off / 1–4 concurrent
     read-only subagents the coding agent may spawn via
     delegate_research).
@@ -1014,29 +823,20 @@ class SubagentsCoderOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.subagents_coder
         return [
-            (
-                subagents_label(count) + (" (current)" if count == current else ""),
+            _marked_option(
+                subagents_label(count),
+                count == current,
                 partial(app.action_set_subagents_coder, count),
             )
             for count in SUBAGENTS_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class SubagentsResearcherOptionsProvider(Provider):
+class SubagentsResearcherOptionsProvider(CommandListProvider):
     """Options of the "Subagents (researcher)" setting (off / 1–4
     concurrent read-only subagents the research agent may spawn via
     delegate_research).
@@ -1046,29 +846,20 @@ class SubagentsResearcherOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.subagents_researcher
         return [
-            (
-                subagents_label(count) + (" (current)" if count == current else ""),
+            _marked_option(
+                subagents_label(count),
+                count == current,
                 partial(app.action_set_subagents_researcher, count),
             )
             for count in SUBAGENTS_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class StartBranchOptionsProvider(Provider):
+class StartBranchOptionsProvider(CommandListProvider):
     """Options of the "Isolation start branch" setting: the auto mode
     ("auto (HEAD branch)" — fork new task branches from the main
     checkout's current branch, refusing a detached HEAD) plus every local
@@ -1081,42 +872,29 @@ class StartBranchOptionsProvider(Provider):
 
     AUTO_LABEL = "auto (HEAD branch)"
 
-    async def _branches(self) -> list[str]:
-        app = cast("DrCodeApp", self.app)
-        if not app.task_env.available:
-            return []
-        return await asyncio.to_thread(app.task_env.local_branches)
-
-    def _commands(self, branches: list[str]) -> list[tuple[str, Callable[[], None]]]:
+    async def _entries(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.isolation_start_branch
-        commands: list[tuple[str, Callable[[], None]]] = [
-            (
+        branches: list[str] = []
+        if app.task_env.available:
+            branches = await asyncio.to_thread(app.task_env.local_branches)
+        entries = [
+            CommandEntry(
                 self.AUTO_LABEL + (" (current)" if not current else ""),
                 partial(app.action_set_isolation_start_branch, ""),
             )
         ]
-        commands.extend(
-            (
+        entries.extend(
+            CommandEntry(
                 branch + (" (current)" if branch == current else ""),
                 partial(app.action_set_isolation_start_branch, branch),
             )
             for branch in branches
         )
-        return commands
-
-    async def discover(self) -> Hits:
-        for name, callback in self._commands(await self._branches()):
-            yield DiscoveryHit(name, callback)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands(await self._branches()):
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
+        return entries
 
 
-class EscAbortOptionsProvider(Provider):
+class EscAbortOptionsProvider(CommandListProvider):
     """Options of the "ESC stop behavior" setting (double-press confirm /
     instant stop).
 
@@ -1125,29 +903,20 @@ class EscAbortOptionsProvider(Provider):
     option is marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.esc_abort
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_esc_abort, option),
             )
             for option in ESC_ABORT_OPTIONS
         ]
 
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)
-
-
-class StallNudgeOptionsProvider(Provider):
+class StallNudgeOptionsProvider(CommandListProvider):
     """Options of the "Nudge stalled agent" setting.
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option to
@@ -1155,23 +924,14 @@ class StallNudgeOptionsProvider(Provider):
     marked with "(current)".
     """
 
-    def _commands(self) -> list[tuple[str, Callable[[], None]]]:
+    def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         current = app.settings.stall_nudge
         return [
-            (
-                option.label + (" (current)" if option is current else ""),
+            _marked_option(
+                option.label,
+                option is current,
                 partial(app.action_set_stall_nudge, option),
             )
             for option in STALL_NUDGE_OPTIONS
         ]
-
-    async def discover(self) -> Hits:
-        for name, callback in self._commands():
-            yield DiscoveryHit(name, callback)
-
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        for name, callback in self._commands():
-            if (match := matcher.match(name)) > 0:
-                yield Hit(match, matcher.highlight(name), callback)

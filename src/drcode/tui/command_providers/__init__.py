@@ -5,7 +5,8 @@ Re-exports the full public surface of the former single-module
 (``from drcode.tui.command_providers import X``) keep working unchanged.
 
 Modules:
-- ``base`` — SpacedCommandList and shared widgets;
+- ``base`` — SpacedCommandList, the shared widgets and the declarative
+  ``CommandListProvider`` base (``CommandEntry`` lists);
 - ``settings`` — the Settings palette, its sub-menus, main-menu entry
   providers and per-preference option providers;
 - ``models`` — per-role model pickers;
@@ -14,7 +15,7 @@ Modules:
 - ``merge`` — the merge-conflict screen entry.
 """
 
-from .base import SpacedCommandList
+from .base import CommandEntry, CommandListProvider, SpacedCommandList
 from .deps import DependencyCommandsProvider
 from .merge import MergeCommandsProvider
 from .models import RoleModelsCommandsProvider, role_model_options_provider
@@ -51,6 +52,8 @@ from .themes import ThemeOptionsProvider
 
 __all__ = [
     "WORKFLOW_PRESETS",
+    "CommandEntry",
+    "CommandListProvider",
     "DependencyCommandsProvider",
     "DevRoundsOptionsProvider",
     "EscAbortOptionsProvider",

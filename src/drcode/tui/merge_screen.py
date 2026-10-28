@@ -13,6 +13,17 @@ per-check durations persisted across runs next to the verify report) —
 the checks themselves stay serial and off the UI thread, the panel is
 animated by an independent timer while the worker awaits them.
 
+The same panel also carries the OPENING prepare phase (the engine's
+reversed merge + triage + safe auto-resolvers — seconds on small
+repositories, tens of seconds on large ones): one line per step driven
+by `merge_resolver.prepare`'s progress callback, its own percent/ETA
+footer over the rolling per-step durations persisted next to the triage
+report — and it disappears once the outcome is in and the file list has
+loaded. The short blocking ops (``r`` refresh, ``s`` commit, ``a``
+abort, ``f`` ff-merge) show a single busy spinner line in the same
+panel and lock every key but ``esc`` (``check_action``) until their
+worker finishes — a git operation must never race a key press.
+
 The screen is a viewer + decision pad, never an autonomous actor:
 
 - left: the conflicted files of the triage report with their LIVE status
@@ -154,6 +165,76 @@ class _CheckStage:
     result: CheckResult | None = None
     started: float | None = None
     duration: float | None = None
+
+
+@dataclass
+class _PrepareStage:
+    """One step of the screen's prepare phase (the engine's reversed
+    merge + triage + safe auto-resolvers) rendered in the same progress
+    panel as the funnel: `key` names the persisted-timing slot
+    (`<task-id>-prepare-timings.json`), `status` is pending / running /
+    done. The steps advance from `merge_resolver.prepare`'s progress
+    callback, applied on the event loop."""
+
+    key: str
+    label: str
+    status: str = "pending"
+    started: float | None = None
+    duration: float | None = None
+
+
+def _stages_estimate(
+    stage: _CheckStage | _PrepareStage,
+    averages: dict[str, float],
+    defaults: dict[str, float],
+) -> float:
+    """The historical duration of `stage`: the persisted rolling average
+    when there is one, else the built-in default."""
+    return averages.get(stage.key) or defaults.get(stage.key, 30.0)
+
+
+def _stages_eta(
+    stages: list[_CheckStage] | list[_PrepareStage],
+    averages: dict[str, float],
+    defaults: dict[str, float],
+) -> float:
+    """ETA over the not-yet-done stages: each remaining stage's
+    historical duration, the running one credited with
+    `historical − elapsed` (floored at 10% of it)."""
+    now = time.monotonic()
+    total = 0.0
+    for stage in stages:
+        if stage.status == "done":
+            continue
+        estimate = _stages_estimate(stage, averages, defaults)
+        if stage.status == "running" and stage.started is not None:
+            total += max(estimate - (now - stage.started), estimate * 0.1)
+        else:
+            total += estimate
+    return total
+
+
+def _stages_percent(
+    stages: list[_CheckStage] | list[_PrepareStage],
+    averages: dict[str, float],
+    defaults: dict[str, float],
+) -> int:
+    """Completed / total stages, the running one credited proportionally
+    to its historical duration (capped at 95% — it never claims to be
+    done while it is still running)."""
+    if not stages:
+        return 0
+    now = time.monotonic()
+    done = 0.0
+    for stage in stages:
+        if stage.status == "done":
+            done += 1
+        elif stage.status == "running" and stage.started is not None:
+            done += min(
+                (now - stage.started) / _stages_estimate(stage, averages, defaults),
+                0.95,
+            )
+    return int(done / len(stages) * 100)
 
 
 # Section styles of the zdiff3 view: ours green, the common ancestor dim
@@ -528,6 +609,26 @@ class ConflictScreen(ModalScreen[None]):
         self._spinner_frame = 0
         self._avg_timings: dict[str, float] = {}
         self._checks_generation = 0
+        # Live progress of the prepare phase (on_mount's reversed merge):
+        # same panel, same animation mechanics — the steps advance from
+        # `prepare`'s progress callback (applied on the event loop), the
+        # panel disappears once the file list has loaded.
+        self._prepare_stages: list[_PrepareStage] = []
+        self._prepare_timer: Timer | None = None
+        self._prepare_avg_timings: dict[str, float] = {}
+        self._prepare_measured: dict[str, float] = {}
+        self._prepare_failed = False
+        # Busy state of the short blocking ops (r/s/a/f): one spinner
+        # line in the same panel, plus a check_action gate so git cannot
+        # race a key press. `_panel_saved` holds the panel content the
+        # busy line temporarily replaced (e.g. a finished funnel's
+        # summary), restored when the op ends.
+        self._busy: str | None = None
+        self._busy_started: float | None = None
+        self._busy_timer: Timer | None = None
+        self._busy_visible = False
+        self._busy_generation = 0
+        self._panel_saved: str | None = None
 
     # -- composition ------------------------------------------------------------
 
@@ -555,10 +656,16 @@ class ConflictScreen(ModalScreen[None]):
             )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Gate the key set by the mode: in the ff-ready state the
-        resolution keys are inert (nothing to resolve — the footer names
-        them as unavailable), and `f` exists only there (and only until
-        the merge actually lands)."""
+        """Gate the key set by the mode: while a blocking op is busy the
+        whole key set except ``esc`` is inert (a git operation must not
+        race a second one), in the ff-ready state the resolution keys
+        are inert (nothing to resolve — the footer names them as
+        unavailable), and `f` exists only there (and only until the
+        merge actually lands)."""
+        if action == "close":
+            return True  # esc stays live: a worker's write-backs are guarded
+        if self._busy is not None:
+            return False
         if action == "ff_merge":
             return self._ff_ready and not self._ff_done
         return not (self._ff_ready and action in self._FF_DISABLED_ACTIONS)
@@ -599,15 +706,28 @@ class ConflictScreen(ModalScreen[None]):
         """Deploy (or re-detect) the parked conflict through the engine
         (`merge_resolver.prepare`): an already-parked merge is re-triaged
         in place, a fresh one is attempted with the safe auto-resolvers
-        on. Blocking git — off the UI thread."""
+        on. Blocking git — off the UI thread. The steps surface live in
+        the progress panel via `prepare`'s progress callback (applied on
+        the event loop, so the transitions land strictly before this
+        coroutine resumes); the panel disappears once the outcome is in
+        and the file list has loaded."""
         app = cast("DrCodeApp", self.app)
         env = app.task_env
+        self._begin_prepare()
+        # The persisted rolling averages (previous runs' per-step
+        # durations) feed the ETA line from the first tick on — blocking
+        # file IO, off the UI thread.
+        self._prepare_avg_timings = await asyncio.to_thread(
+            merge_resolver.load_prepare_timings, app.project_root, self.task_id
+        )
+        self._render_prepare_panel()
         # The task's isolation PIN overrides the live setting here too:
         # a task pinned to its worktree keeps its parked merge reachable
         # even after `task_isolation` was switched off mid-task.
         task = app.manager.tasks.get(self.task_id)
         if not env.active and not (task is not None and task.isolation_pinned is True):
             self._set_title("Merge conflicts — worktree isolation is off")
+            self._hide_prepare()
             return
         pinned_before = task is not None and task.isolation_pinned is not None
         root, note = await asyncio.to_thread(env.ensure_root, self.task_id, task)
@@ -615,16 +735,45 @@ class ConflictScreen(ModalScreen[None]):
             app._isolation_pin_note(task, save=not pinned_before)
         if note:
             self._set_title(f"Merge conflicts — unavailable: {note}")
+            self._hide_prepare()
             return
         base = await asyncio.to_thread(env.base_branch)
+
+        def progress(stage: str) -> None:
+            # Worker thread → event loop. call_from_thread is
+            # synchronous: by the time the callback returns, the panel
+            # transition has been applied — the finalize below can never
+            # overtake a step boundary.
+            try:
+                self.app.call_from_thread(self._on_prepare_stage, stage)
+            except Exception:  # noqa: BLE001, S110 - best-effort UI update
+                pass
+
         report: MergeReport = await asyncio.to_thread(
-            merge_resolver.prepare, app.project_root, self.task_id, root, base
+            merge_resolver.prepare,
+            app.project_root,
+            self.task_id,
+            root,
+            base,
+            progress=progress,
         )
+        self._finish_prepare_stages(ok=report.ok)
+        if self._prepare_measured:
+            # The measured step durations merge into the persisted
+            # rolling averages feeding the next run's ETA — blocking
+            # file IO, off the UI thread; best-effort by contract.
+            await asyncio.to_thread(
+                merge_resolver.save_prepare_timings,
+                app.project_root,
+                self.task_id,
+                self._prepare_measured,
+            )
         self.wt = ConflictWorktree(app.project_root, self.task_id, root, report=report)
         if not report.ok:
             self._ff_ready = False
             self._set_title(f"Merge conflicts — {report.message}")
             self._update_footer()
+            self._hide_prepare()
             return
         if not report.conflicted:
             # ff-ready ONLY when the engine vouches the fast-forward is
@@ -641,6 +790,7 @@ class ConflictScreen(ModalScreen[None]):
                     f"{report.base_branch} (ff-only)"
                 )
                 self._update_footer()
+                self._hide_prepare()
                 return
             self._ff_ready = False
             if report.fast_forward is False:
@@ -658,6 +808,7 @@ class ConflictScreen(ModalScreen[None]):
                     f"committed on {report.branch}; press s to commit it"
                 )
             self._update_footer()
+            self._hide_prepare()
             return
         self._ff_ready = False
         self._set_title(
@@ -665,6 +816,7 @@ class ConflictScreen(ModalScreen[None]):
             f"{report.branch}: {len(report.remaining)} file(s) to resolve"
         )
         await self._reload_files()
+        self._hide_prepare()
 
     def _set_title(self, text: str) -> None:
         # A worker may reach this after the user already closed the
@@ -672,6 +824,213 @@ class ConflictScreen(ModalScreen[None]):
         if not self.is_mounted:
             return
         self.query_one("#merge-title", Static).update(text)
+
+    # -- prepare progress panel (the same #merge-checks zone) --------------------
+
+    # The prepare phase's observable steps, in engine order. `merge` is
+    # by far the longest (the actual reversed git merge), the rest are
+    # fast — the defaults below are deliberately conservative so the
+    # first-run ETA overestimates rather than lies.
+    _PREPARE_STAGES: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("worktree", "worktree"),
+        ("merge", "merge"),
+        ("triage", "triage"),
+        ("auto-resolve", "auto-resolve"),
+    )
+    _DEFAULT_PREPARE_ETAS: ClassVar[dict[str, float]] = {
+        "worktree": 3.0,
+        "merge": 30.0,
+        "triage": 5.0,
+        "auto-resolve": 10.0,
+    }
+
+    def _begin_prepare(self) -> None:
+        """Reset the prepare steps, mark the first one running and start
+        the panel's animation timer (independent of the worker — it must
+        tick while the blocking git runs in its thread)."""
+        self._stop_prepare_animation()
+        self._prepare_stages = [
+            _PrepareStage(key, label) for key, label in self._PREPARE_STAGES
+        ]
+        first = self._prepare_stages[0]
+        first.status = "running"
+        first.started = time.monotonic()
+        self._prepare_avg_timings = {}
+        self._prepare_measured = {}
+        self._prepare_failed = False
+        self._spinner_frame = 0
+        if self.is_mounted:
+            panel = self.query_one("#merge-checks", Static)
+            panel.add_class("visible")
+            self._render_prepare_panel()
+        self._prepare_timer = self.set_interval(
+            _SPINNER_INTERVAL, self._tick_prepare_animation
+        )
+
+    def _on_prepare_stage(self, key: str) -> None:
+        """One progress-boundary transition from the worker thread,
+        applied HERE on the event loop: the running step (if any) is
+        closed with its measured duration, the named one starts. The
+        first boundary (``worktree``) may name an already-running step —
+        idempotent."""
+        if not self.is_mounted:
+            return
+        now = time.monotonic()
+        for stage in self._prepare_stages:
+            if stage.status == "running":
+                stage.status = "done"
+                stage.duration = now - (stage.started or now)
+        target = next((s for s in self._prepare_stages if s.key == key), None)
+        if target is not None and target.status != "running":
+            target.status = "running"
+            target.started = now
+        self._render_prepare_panel()
+
+    def _finish_prepare_stages(self, ok: bool) -> None:
+        """Close the running step (the callbacks have all been applied —
+        `call_from_thread` is synchronous), drop the steps the run never
+        reached (a clean merge returns before triage), and freeze the
+        final [ok]/[FAILED] render before the panel is hidden."""
+        self._prepare_failed = not ok
+        now = time.monotonic()
+        for stage in self._prepare_stages:
+            if stage.status == "running":
+                stage.status = "done"
+                stage.duration = now - (stage.started or now)
+        self._prepare_stages = [s for s in self._prepare_stages if s.status == "done"]
+        self._prepare_measured = {
+            s.key: s.duration for s in self._prepare_stages if s.duration
+        }
+        self._stop_prepare_animation()
+        self._render_prepare_panel()
+
+    def _hide_prepare(self) -> None:
+        """Prepare is over and the outcome is on screen — the panel goes
+        away (unless a busy op or a funnel run owns it right now: the
+        hide runs at the tail of the prepare worker, and a fast `v`
+        press can already have claimed the zone)."""
+        self._stop_prepare_animation()
+        if not self.is_mounted or self._busy is not None or self._stages:
+            return
+        try:
+            self.query_one("#merge-checks", Static).remove_class("visible")
+        except NoMatches:
+            # The screen is being torn down (is_mounted is still truthy
+            # mid-dismiss) — a late hide is a no-op.
+            pass
+
+    def _stop_prepare_animation(self) -> None:
+        if self._prepare_timer is not None:
+            self._prepare_timer.stop()
+            self._prepare_timer = None
+
+    def _tick_prepare_animation(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        if any(stage.status == "running" for stage in self._prepare_stages):
+            self._render_prepare_panel()
+
+    def _render_prepare_panel(self) -> None:
+        """The live prepare view — identical mechanics to the funnel
+        panel: `[⠹] merge…  (12s)` for the running step, `[ok]` /
+        `[FAILED]` for the finished ones, plus the percent/ETA footer."""
+        if not self.is_mounted:
+            return
+        panel = self.query_one("#merge-checks", Static)
+        lines = ["Preparing merge:"]
+        now = time.monotonic()
+        for stage in self._prepare_stages:
+            if stage.status == "done":
+                mark = "FAILED" if self._prepare_failed else "ok"
+                lines.append(
+                    f"[{mark}] {stage.label}  ({_fmt_seconds(stage.duration)})"
+                )
+            elif stage.status == "running":
+                frame = _SPINNER_FRAMES[self._spinner_frame]
+                elapsed = (now - stage.started) if stage.started is not None else 0.0
+                lines.append(f"[{frame}] {stage.label}…  ({_fmt_seconds(elapsed)})")
+            else:
+                lines.append(f"[ ] {stage.label}")
+        done_count = sum(1 for stage in self._prepare_stages if stage.status == "done")
+        lines.append(
+            f"Preparing: {done_count}/{len(self._prepare_stages)} · "
+            f"{_stages_percent(self._prepare_stages, self._prepare_avg_timings, self._DEFAULT_PREPARE_ETAS)}% · "
+            f"ETA ~{_fmt_seconds(_stages_eta(self._prepare_stages, self._prepare_avg_timings, self._DEFAULT_PREPARE_ETAS))}"
+        )
+        panel.update("\n".join(lines))
+
+    # -- busy state of the short blocking ops (r / s / a / f) --------------------
+
+    def _show_busy(self, label: str) -> None:
+        """A short blocking op (refresh/commit/abort/ff-merge) starts:
+        one spinner line with elapsed seconds in the same panel, and
+        `check_action` locks every key but esc until `_end_busy`. When a
+        funnel run is mid-flight its panel is left alone (the busy gate
+        still applies) — a running panel must not be overwritten."""
+        self._busy_generation += 1
+        self._busy = label
+        self._busy_started = time.monotonic()
+        if not self.is_mounted or any(
+            stage.status == "running" for stage in self._stages
+        ):
+            self._busy_visible = False
+            return
+        self._busy_visible = True
+        self._spinner_frame = 0
+        panel = self.query_one("#merge-checks", Static)
+        if panel.has_class("visible"):
+            # A finished funnel's summary (or anything else the panel
+            # held) comes back when the op ends.
+            self._panel_saved = str(panel.content)
+        else:
+            self._panel_saved = None
+            panel.add_class("visible")
+        self._render_busy_panel()
+        self._busy_timer = self.set_interval(
+            _SPINNER_INTERVAL, self._tick_busy_animation
+        )
+
+    def _end_busy(self) -> None:
+        """The op is over: restore the panel content the busy line had
+        replaced, or hide the panel again. Safe for a late worker after
+        the screen was closed (unmount stops the timer separately)."""
+        self._busy = None
+        self._stop_busy_animation()
+        if not self.is_mounted or not self._busy_visible:
+            self._busy_visible = False
+            return
+        self._busy_visible = False
+        try:
+            panel = self.query_one("#merge-checks", Static)
+        except NoMatches:
+            return
+        if self._panel_saved is not None:
+            panel.update(self._panel_saved)
+            self._panel_saved = None
+        else:
+            panel.remove_class("visible")
+
+    def _stop_busy_animation(self) -> None:
+        if self._busy_timer is not None:
+            self._busy_timer.stop()
+            self._busy_timer = None
+
+    def _tick_busy_animation(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        if self._busy is not None:
+            self._render_busy_panel()
+
+    def _render_busy_panel(self) -> None:
+        if not self.is_mounted or self._busy is None:
+            return
+        elapsed = (
+            (time.monotonic() - self._busy_started)
+            if self._busy_started is not None
+            else 0.0
+        )
+        frame = _SPINNER_FRAMES[self._spinner_frame]
+        self.query_one("#merge-checks", Static).update(
+            f"[{frame}] {self._busy}…  ({_fmt_seconds(elapsed)})"
+        )
 
     # -- file list / viewer ---------------------------------------------------------
 
@@ -727,20 +1086,32 @@ class ConflictScreen(ModalScreen[None]):
         if self.wt is None or not self.is_mounted:
             return
         path = self._selected_path()
+        try:
+            view = self.view
+        except NoMatches:
+            # The screen is being torn down (is_mounted is still truthy
+            # mid-dismiss) — a late refresh is a no-op.
+            return
         if path is None:
-            self.view.set_file("", [])
+            view.set_file("", [])
             return
         content = await asyncio.to_thread(self.wt.read_file, path)
         if content is None:
-            self.view.set_file("(file absent in the worktree)", [])
+            view.set_file("(file absent in the worktree)", [])
             return
-        self.view.set_file(content, parse_hunks(content))
+        try:
+            view = self.view
+        except NoMatches:
+            return
+        view.set_file(content, parse_hunks(content))
 
     # -- hunk decisions -----------------------------------------------------------
 
     def action_resolve(self, choice: str) -> None:
         """o / t / b: apply the decision to the cursor hunk (staged as
         soon as the file is marker-free)."""
+        if self._busy is not None:
+            return
         if self.wt is None:
             return
         path = self._selected_path()
@@ -772,6 +1143,8 @@ class ConflictScreen(ModalScreen[None]):
         `git mergetool` for the whole merge when none is configured. The
         app is suspended for the duration — an interactive subprocess
         cannot run inside Textual's alternate screen."""
+        if self._busy is not None:
+            return
         if self.wt is None:
             return
         path = self._selected_path()
@@ -816,6 +1189,8 @@ class ConflictScreen(ModalScreen[None]):
     }
 
     def action_verify(self) -> None:
+        if self._busy is not None:
+            return
         if self.wt is None or not self.wt.in_progress():
             self.notify("No merge is in progress", title="Merge", timeout=4)
             return
@@ -850,6 +1225,8 @@ class ConflictScreen(ModalScreen[None]):
 
     def on_unmount(self) -> None:
         self._stop_checks_animation()
+        self._stop_prepare_animation()
+        self._stop_busy_animation()
 
     def _tick_checks_animation(self) -> None:
         """One spinner frame; redraw only while a stage is actually
@@ -858,45 +1235,17 @@ class ConflictScreen(ModalScreen[None]):
         if any(stage.status == "running" for stage in self._stages):
             self._render_checks_panel()
 
-    def _stage_estimate(self, stage: _CheckStage, now: float) -> float:
-        """The historical duration of `stage`: the persisted rolling
-        average when there is one, else the built-in default."""
-        return self._avg_timings.get(stage.key) or self._DEFAULT_STAGE_ETAS.get(
-            stage.key, 30.0
-        )
-
     def _checks_eta(self) -> float:
-        """ETA over the not-yet-done stages: each remaining stage's
-        historical duration, the running one credited with
-        `historical − elapsed` (floored at 10% of it)."""
-        now = time.monotonic()
-        total = 0.0
-        for stage in self._stages:
-            if stage.status == "done":
-                continue
-            estimate = self._stage_estimate(stage, now)
-            if stage.status == "running" and stage.started is not None:
-                total += max(estimate - (now - stage.started), estimate * 0.1)
-            else:
-                total += estimate
-        return total
+        """ETA over the not-yet-done funnel stages (see `_stages_eta`)."""
+        return _stages_eta(self._stages, self._avg_timings, self._DEFAULT_STAGE_ETAS)
 
     def _checks_percent(self) -> int:
         """Completed / total checks, the running stage credited
-        proportionally to its historical duration (capped at 95% — it
-        never claims to be done while it is still running)."""
-        if not self._stages:
-            return 0
-        now = time.monotonic()
-        done = 0.0
-        for stage in self._stages:
-            if stage.status == "done":
-                done += 1
-            elif stage.status == "running" and stage.started is not None:
-                done += min(
-                    (now - stage.started) / self._stage_estimate(stage, now), 0.95
-                )
-        return int(done / len(self._stages) * 100)
+        proportionally to its historical duration (see
+        `_stages_percent`)."""
+        return _stages_percent(
+            self._stages, self._avg_timings, self._DEFAULT_STAGE_ETAS
+        )
 
     def _render_checks_panel(self) -> None:
         """The live progress view: one status line per stage
@@ -1075,6 +1424,8 @@ class ConflictScreen(ModalScreen[None]):
         )
 
     def action_commit(self) -> None:
+        if self._busy is not None:
+            return
         if self.wt is None:
             return
         if self._armed != "commit":
@@ -1088,6 +1439,15 @@ class ConflictScreen(ModalScreen[None]):
 
     @work(exclusive=True, group="merge-commit")
     async def _do_commit(self) -> None:
+        if self.wt is None or self.wt.report is None:
+            return
+        self._show_busy("committing")
+        try:
+            await self._commit_resolution()
+        finally:
+            self._end_busy()
+
+    async def _commit_resolution(self) -> None:
         if self.wt is None or self.wt.report is None:
             return
         branch = self.wt.report.branch or f"drcode/{self.task_id}"
@@ -1125,6 +1485,8 @@ class ConflictScreen(ModalScreen[None]):
             )
 
     def action_abort_merge(self) -> None:
+        if self._busy is not None:
+            return
         if self.wt is None:
             return
         if self._armed != "abort":
@@ -1137,7 +1499,11 @@ class ConflictScreen(ModalScreen[None]):
     async def _do_abort(self) -> None:
         if self.wt is None:
             return
-        ok, out = await asyncio.to_thread(self.wt.abort)
+        self._show_busy("aborting")
+        try:
+            ok, out = await asyncio.to_thread(self.wt.abort)
+        finally:
+            self._end_busy()
         if ok:
             self.notify(
                 "Merge aborted — worktree back to the pre-merge state",
@@ -1156,12 +1522,23 @@ class ConflictScreen(ModalScreen[None]):
         """f: fast-forward the MAIN checkout's base branch to the task's
         branch — available only in the ff-ready state (report ok, not
         conflicted) and only once (check_action gates both)."""
+        if self._busy is not None:
+            return
         if self.wt is None or not self._ff_ready or self._ff_done:
             return
         self._do_ff_merge()
 
     @work(exclusive=True, group="merge-ff")
     async def _do_ff_merge(self) -> None:
+        if self.wt is None:
+            return
+        self._show_busy("fast-forwarding")
+        try:
+            await self._run_ff_merge()
+        finally:
+            self._end_busy()
+
+    async def _run_ff_merge(self) -> None:
         app = cast("DrCodeApp", self.app)
         env = app.task_env
         report = self.wt.report if self.wt is not None else None
@@ -1227,6 +1604,8 @@ class ConflictScreen(ModalScreen[None]):
     def action_refresh_state(self) -> None:
         """r: re-triage the live merge and reload everything (an external
         editor may have changed files while the screen was suspended)."""
+        if self._busy is not None:
+            return
         if self.wt is None:
             return
         self._refresh()
@@ -1235,8 +1614,12 @@ class ConflictScreen(ModalScreen[None]):
     async def _refresh(self) -> None:
         if self.wt is None or not self.is_mounted:
             return
-        await asyncio.to_thread(self.wt.refresh)
-        await self._reload_files()
+        self._show_busy("refreshing")
+        try:
+            await asyncio.to_thread(self.wt.refresh)
+            await self._reload_files()
+        finally:
+            self._end_busy()
 
     def action_close(self) -> None:
         self.dismiss()

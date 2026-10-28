@@ -68,6 +68,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -774,6 +775,7 @@ def merge_base_into_worktree(
     branch: str | None = None,
     rerere: bool = True,
     save: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> MergeReport:
     """THE REVERSED MERGE: merge `base_branch` INTO the task's worktree
     (branch `branch`, default: the worktree's checked-out branch) instead
@@ -843,6 +845,11 @@ def merge_base_into_worktree(
         args = ["-c", "merge.conflictstyle=zdiff3", *args]
     if rerere:
         args = ["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false", *args]
+    # Progress boundary: the git merge is by far the longest step (the
+    # pre-checks above are cheap) — the ConflictScreen's prepare panel
+    # keys its ETA on this transition.
+    if progress is not None:
+        progress("merge")
     code, out = _git(*args, cwd=wt)
     if code != 0 and not in_progress(wt):
         # The merge never started (unrelated histories, index.lock, …):
@@ -860,7 +867,11 @@ def merge_base_into_worktree(
     # resolvers stamp `resolution` onto the entries of `files` in place —
     # that list stays the report's `files` even when the post-resolver
     # index is clean (re-triaging then would lose what was resolved).
+    if progress is not None:
+        progress("triage")
     files = triage(wt)
+    if progress is not None:
+        progress("auto-resolve")
     rerere_staged = rerere_replay(wt, files) if rerere else []
     identical = resolve_identical(wt, files)
     report.files = files

@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -119,6 +120,7 @@ def prepare(
     task_id: str,
     worktree: Path,
     base_branch: str,
+    progress: Callable[[str], None] | None = None,
 ) -> MergeReport:
     """Deploy (or re-detect) the conflicted merge in the task's worktree.
 
@@ -129,9 +131,18 @@ def prepare(
     `report.conflicted` — a non-conflicted outcome means there is nothing
     for the agent to do (clean merge, already up to date, or the engine
     refused).
+
+    `progress` is an optional callback invoked from the calling thread at
+    the step boundaries — ``"worktree"`` (this function's own deploy
+    checks), then the engine's ``"merge"`` / ``"triage"`` /
+    ``"auto-resolve"`` — so a UI can show per-step progress (the
+    ConflictScreen's prepare panel). Plain calls from a worker thread;
+    never made when None.
     """
+    if progress is not None:
+        progress("worktree")
     return merge_engine.merge_base_into_worktree(
-        project_root, task_id, worktree, base_branch, save=True
+        project_root, task_id, worktree, base_branch, save=True, progress=progress
     )
 
 
@@ -702,11 +713,10 @@ def check_timings_path(project_root: Path, task_id: str) -> Path:
     )
 
 
-def load_check_timings(project_root: Path, task_id: str) -> dict[str, float]:
-    """The persisted rolling averages of the task's past check durations;
-    an empty dict (missing / corrupted file — skipped, never fatal) means
-    no history yet and the funnel falls back to its defaults."""
-    path = check_timings_path(project_root, task_id)
+def _load_timings(path: Path) -> dict[str, float]:
+    """The persisted rolling averages from one timings file; an empty
+    dict (missing / corrupted file — skipped, never fatal) means no
+    history yet."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -720,16 +730,14 @@ def load_check_timings(project_root: Path, task_id: str) -> dict[str, float]:
     }
 
 
-def save_check_timings(
-    project_root: Path, task_id: str, timings: dict[str, float]
-) -> dict[str, float]:
-    """Merge one run's measured per-check durations into the persisted
-    rolling averages (weight 0.7 old / 0.3 new) and write the file back
+def _save_timings(path: Path, timings: dict[str, float]) -> dict[str, float]:
+    """Merge one run's measured durations into the persisted rolling
+    averages of `path` (weight 0.7 old / 0.3 new) and write the file back
     atomically. Best-effort: any failure is swallowed — the ETA history
     is a UX nicety, never worth crashing over. Returns the merged
     averages."""
     try:
-        old = load_check_timings(project_root, task_id)
+        old = _load_timings(path)
         merged = {
             **old,
             **{
@@ -738,7 +746,6 @@ def save_check_timings(
                 if measured > 0
             },
         }
-        path = check_timings_path(project_root, task_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(merged), encoding="utf-8")
@@ -746,6 +753,52 @@ def save_check_timings(
         return merged
     except (OSError, ValueError):
         return {}
+
+
+def load_check_timings(project_root: Path, task_id: str) -> dict[str, float]:
+    """The persisted rolling averages of the task's past check durations;
+    an empty dict (missing / corrupted file — skipped, never fatal) means
+    no history yet and the funnel falls back to its defaults."""
+    return _load_timings(check_timings_path(project_root, task_id))
+
+
+def save_check_timings(
+    project_root: Path, task_id: str, timings: dict[str, float]
+) -> dict[str, float]:
+    """Merge one run's measured per-check durations into the persisted
+    rolling averages (weight 0.7 old / 0.3 new) and write the file back
+    atomically. Best-effort: any failure is swallowed — the ETA history
+    is a UX nicety, never worth crashing over. Returns the merged
+    averages."""
+    return _save_timings(check_timings_path(project_root, task_id), timings)
+
+
+def prepare_timings_path(project_root: Path, task_id: str) -> Path:
+    """Where the rolling per-STEP durations of the task's prepare phase
+    are persisted — next to the triage report
+    (`<task-id>-prepare-timings.json`, same format as the check
+    timings). Keyed by the short step key the ConflictScreen's prepare
+    panel uses (worktree / merge / triage / auto-resolve), valued in
+    seconds."""
+    return merge_engine.report_path(project_root, task_id).with_name(
+        f"{task_id}-prepare-timings.json"
+    )
+
+
+def load_prepare_timings(project_root: Path, task_id: str) -> dict[str, float]:
+    """The persisted rolling averages of the task's past prepare-step
+    durations; empty when there is no history yet (the prepare panel
+    falls back to its conservative defaults)."""
+    return _load_timings(prepare_timings_path(project_root, task_id))
+
+
+def save_prepare_timings(
+    project_root: Path, task_id: str, timings: dict[str, float]
+) -> dict[str, float]:
+    """Merge one prepare run's measured per-step durations into the
+    persisted rolling averages (same format and weighting as the check
+    timings). Best-effort — a failure just drops the ETA history."""
+    return _save_timings(prepare_timings_path(project_root, task_id), timings)
 
 
 def review_diffs(

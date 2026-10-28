@@ -1049,3 +1049,190 @@ async def test_conflicted_mode_keeps_ff_out_and_resolution_in(
             what="merge screen auto-closed",
         )
         assert me.is_fast_forward(isolated, branch_for(task.id), "main")
+
+
+# -- prepare progress (engine callback + the screen's panel) --------------------------
+
+
+def test_prepare_and_engine_progress_boundaries(repo: Path) -> None:
+    """`prepare` (and the engine's reversed merge under it) report the
+    step boundaries in engine order — the screen's prepare panel keys
+    its stages on exactly these strings."""
+    _env, wt = _parked_content_conflict(repo, "t-prog")
+    me.abort(wt)  # back to the pre-merge state for a fresh, full run
+    events: list[str] = []
+    report = merge_resolver.prepare(repo, "t-prog", wt, "main", progress=events.append)
+    assert events == ["worktree", "merge", "triage", "auto-resolve"]
+    assert report.ok and report.conflicted
+
+
+def test_prepare_timings_persist_and_roll(tmp_path: Path) -> None:
+    """The per-step prepare durations persist next to the triage report
+    in the same format as the check timings: first save plants them,
+    the next merges at 0.7 old / 0.3 new, a corrupted file is skipped."""
+    assert merge_resolver.load_prepare_timings(tmp_path, "t1") == {}
+    merge_resolver.save_prepare_timings(tmp_path, "t1", {"merge": 20.0})
+    assert merge_resolver.load_prepare_timings(tmp_path, "t1") == {"merge": 20.0}
+    merge_resolver.save_prepare_timings(tmp_path, "t1", {"merge": 40.0})
+    timings = merge_resolver.load_prepare_timings(tmp_path, "t1")
+    assert timings["merge"] == pytest.approx(0.7 * 20.0 + 0.3 * 40.0)
+    path = merge_resolver.prepare_timings_path(tmp_path, "t1")
+    assert path.name == "t1-prepare-timings.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert merge_resolver.load_prepare_timings(tmp_path, "t1") == {}
+
+
+async def test_prepare_shows_live_progress_and_hides_after(
+    isolated: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While the reversed merge runs, the #merge-checks panel shows the
+    prepare steps live (spinner line for the running step, pending
+    markers, a percent/ETA footer); when prepare is done and the file
+    list has loaded, the panel disappears — and the measured step
+    durations landed in the persisted rolling averages."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    real_prepare = merge_resolver.prepare
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_prepare(root, tid, wt, base, progress=None):
+        if progress is not None:
+            progress("merge")  # past "worktree", into the long git merge
+        started.set()
+        release.wait(10)
+        return real_prepare(root, tid, wt, base, progress=progress)
+
+    monkeypatch.setattr(merge_resolver, "prepare", slow_prepare)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: started.is_set(), pilot=pilot, what="prepare merge running"
+        )
+        await pilot.pause()
+        panel_text = str(screen.query_one("#merge-checks", Static).content)
+        assert "Preparing merge:" in panel_text
+        assert "[ok] worktree" in panel_text
+        assert "] merge…" in panel_text  # the spinner line (any frame)
+        assert "[ ] triage" in panel_text
+        assert "[ ] auto-resolve" in panel_text
+        assert "Preparing: 1/4" in panel_text
+        assert "ETA ~" in panel_text and "%" in panel_text
+        assert screen._prepare_timer is not None  # the animation timer runs
+
+        release.set()
+        await wait_until(
+            lambda: screen.wt is not None and bool(screen.files_list.children),
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+        await wait_until(
+            lambda: screen._prepare_timer is None, pilot=pilot, what="timer stopped"
+        )
+        # The panel disappeared once the outcome was in and the files loaded.
+        await wait_until(
+            lambda: not screen.query_one("#merge-checks", Static).has_class("visible"),
+            pilot=pilot,
+            what="prepare panel hidden",
+        )
+        # The measured durations (all four steps ran) are persisted.
+        timings = merge_resolver.load_prepare_timings(isolated, task.id)
+        assert "merge" in timings
+        assert set(timings) <= {"worktree", "merge", "triage", "auto-resolve"}
+        assert all(value > 0 for value in timings.values())
+
+
+async def test_busy_op_locks_keys_and_restores_panel(
+    isolated: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short blocking op (r) shows a single busy spinner line, locks
+    every key but esc for its duration, and restores the panel content
+    it temporarily replaced (a finished funnel's summary)."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    checks, tests = _canned_results()
+    compile_c, ruff_c, pyright_c = checks
+    monkeypatch.setattr(merge_resolver, "compile_check", lambda _wt: compile_c)
+    monkeypatch.setattr(merge_resolver, "ruff_check", lambda _wt: ruff_c)
+    monkeypatch.setattr(merge_resolver, "pyright_check", lambda _wt: pyright_c)
+    monkeypatch.setattr(merge_resolver, "run_test_suite", lambda _wt: tests)
+
+    started = threading.Event()
+    release = threading.Event()
+    orig_refresh = ConflictWorktree.refresh
+
+    def slow_refresh(self: ConflictWorktree) -> None:
+        started.set()
+        release.wait(10)
+        return orig_refresh(self)
+
+    monkeypatch.setattr(ConflictWorktree, "refresh", slow_refresh)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and bool(screen.files_list.children),
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+
+        # A finished funnel run leaves its summary in the panel…
+        await pilot.press("v")
+        report = merge_resolver.verify_report_path(isolated, task.id)
+        await wait_until(
+            lambda: report.exists(), pilot=pilot, what="verify report written"
+        )
+        await wait_until(
+            lambda: screen._checks_timer is None, pilot=pilot, what="timer stopped"
+        )
+        assert "ruff check: FAILED" in str(
+            screen.query_one("#merge-checks", Static).content
+        )
+
+        # …then a slow refresh replaces it with the busy line and locks
+        # the key set (esc stays live).
+        await pilot.press("r")
+        await wait_until(
+            lambda: started.is_set(), pilot=pilot, what="refresh worker running"
+        )
+        await pilot.pause()
+        assert screen._busy is not None
+        busy_text = str(screen.query_one("#merge-checks", Static).content)
+        assert "] refreshing…" in busy_text
+        assert "ETA" not in busy_text  # one line, no funnel machinery
+        assert screen.check_action("commit", ()) is False
+        assert screen.check_action("abort_merge", ()) is False
+        assert screen.check_action("refresh_state", ()) is False
+        assert screen.check_action("verify", ()) is False
+        assert screen.check_action("close", ()) is True
+
+        release.set()
+        await wait_until(lambda: screen._busy is None, pilot=pilot, what="busy over")
+        await pilot.pause()
+        # The funnel summary the busy line had replaced is back.
+        restored = str(screen.query_one("#merge-checks", Static).content)
+        assert "ruff check: FAILED" in restored
+        assert screen.check_action("commit", ()) is True

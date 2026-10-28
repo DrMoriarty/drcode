@@ -284,9 +284,10 @@ class SearchDialog(ModalScreen[None]):
         try:
             hits = await asyncio.to_thread(self._search_sync, query)
         except ValueError:
-            # Empty keyword list (whitespace query): show the idle hint.
-            self._show_hits([])
-            return
+            # Empty keyword list (whitespace query): show the idle hint —
+            # via the guarded render below (the dialog may have been
+            # dismissed while the search was suspended in to_thread).
+            hits = []
         try:
             # A newer keystroke superseded this run (the exclusive worker
             # usually prevents that; a race at the timer boundary remains).

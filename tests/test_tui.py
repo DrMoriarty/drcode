@@ -38,6 +38,7 @@ from drcode.settings import (
     subagents_label,
 )
 from drcode.storage import Storage
+from drcode.task_search import TaskHit
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
 from drcode.tui.chat_timeline import _SCROLL_FOLLOW_THRESHOLD, _split_chat_text
@@ -1646,6 +1647,37 @@ async def test_search_dialog_dismiss_during_search_does_not_crash(
         await wait_until(status_pruned, pilot)
         # The resumed search runs against the pruned dialog — on the old
         # code this raised NoMatches out of the worker and crashed.
+        await dialog._search()
+
+
+async def test_search_dialog_valueerror_after_partial_prune_does_not_crash(
+    app: DrCodeApp,
+) -> None:
+    """Same teardown race, ValueError branch: a whitespace-only query makes
+    _search_sync raise ValueError, and pruning is gradual — #srch-status can
+    already be gone while #srch-input/#srch-results are still attached (the
+    exact shape of the field crash: NoMatches on '#srch-status' out of
+    _show_hits). The render must be dropped, not raised out of the worker."""
+    from drcode.tui.search_dialog import SearchDialog
+
+    app.manager.create("prune needle", "valueerror mid search")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, SearchDialog)
+        await wait_until(lambda: dialog._records is not None, pilot)
+        await pilot.press("p")  # any keystroke: debounce runs one search
+        await wait_until(lambda: bool(_result_ids(dialog)), pilot)
+
+        def empty_query(query: str) -> list[TaskHit]:
+            raise ValueError("empty keyword list")
+
+        dialog._search_sync = empty_query  # type: ignore[method-assign]
+        dialog.query_one("#srch-status").remove()
+        await pilot.pause()
+        # On the old code this raised NoMatches out of the worker.
         await dialog._search()
 
 

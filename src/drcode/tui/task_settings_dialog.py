@@ -412,11 +412,15 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if not self.is_mounted:  # dismissed while git ran
             return
         select = self.query_one("#ts-start-branch", Select)
-        if select.value != self._draft.isolation_start_branch:
-            select.value = self._draft.isolation_start_branch
-        # set_options re-applies the current value; do it last so the
-        # freshly fetched branches are all selectable.
-        select.set_options(self._branch_options())
+        # set_options RESETS the selection (to the first option) and posts
+        # a Select.Changed with that reset value — a stale event that would
+        # clobber the draft after this worker returns. Suppress the event
+        # and re-apply the draft value explicitly instead of relying on
+        # set_options preserving it.
+        with self.prevent(Select.Changed):
+            select.set_options(self._branch_options())
+            if select.value != self._draft.isolation_start_branch:
+                select.value = self._draft.isolation_start_branch
         self._refresh()
 
     # -- draft -> widgets ------------------------------------------------------

@@ -2263,6 +2263,69 @@ async def test_task_settings_dialog_rapid_dual_subagent_change(
         assert dialog._draft.subagents_researcher == 1  # pyright: ignore[reportAttributeAccessIssue]
 
 
+async def test_task_settings_dialog_start_branch_survives_branch_load(
+    project_root: Path,
+) -> None:
+    """Regression: reopening the dialog with a persisted
+    isolation_start_branch must keep it. Textual 8.2.8's Select.set_options
+    RESETS the selection to the first option ("auto" / "") and posts a
+    Changed event with that reset value; the stale event used to arrive
+    after _load_branches finished, pass the differs-from-draft guard and
+    write "" into the draft — the dialog then showed "auto (HEAD branch)"
+    and Apply wiped the saved value."""
+    import subprocess
+
+    from textual.widgets import Select
+
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            check=True,
+            capture_output=True,
+        )
+
+    _git("init", "-q", "-b", "main")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    (project_root / "app.py").write_text("a\n")
+    _git("add", "-A")
+    _git("commit", "-qm", "base")
+    # The value IS persisted correctly — the dialog clobbered only its draft.
+    ProjectSettingsStore(project_root).save(
+        ProjectSettings(isolation_start_branch="main")
+    )
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+        select = dialog.query_one("#ts-start-branch", Select)
+        assert select.value == "main"
+
+        # Wait for the _load_branches worker (group "ts-branches") to fetch
+        # the repository's branches and swap in the full option list...
+        await wait_until(
+            lambda: dialog._branches == ["main"],  # pyright: ignore[reportAttributeAccessIssue]
+            pilot,
+            what="start-branch options loaded",
+        )
+        assert [value for _, value in dialog._branch_options()] == ["", "main"]
+        # ...then give any stale Select.Changed event its chance to deliver
+        # (it used to land here and clobber the draft with "").
+        await pilot.pause()
+        await pilot.pause()
+        assert select.value == "main"
+        assert dialog._draft.isolation_start_branch == "main"  # pyright: ignore[reportAttributeAccessIssue]
+
+
 async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
     """The "Worktree removal" setting: the option palette lists the three
     modes with the current one marked, and picking one persists it into

@@ -607,11 +607,16 @@ def run_test_suite(worktree: Path, timeout: int = TEST_TIMEOUT) -> CheckResult:
             name="test suite", ok=True, skipped=True, output="pytest unavailable"
         )
     python_cmd, fix_path = plan
-    args = ["-m", "pytest", "-q", "-x"]
+    # No `-x`: one broken or flaky test at the head of the alphabet must
+    # not mask the results of everything after it (the 10fccdfa incident
+    # — a single early failure hid a real regression further down). The
+    # full pytest output rides in the CheckResult and reaches the service
+    # events via ResolverOutcome.summary().
+    args = ["-m", "pytest", "-q"]
     if _module_importable(python_cmd, "xdist", worktree):
         args += ["-n", "4"]
     return _run_checked(
-        "test suite (pytest -q -x)",
+        "test suite (pytest -q)",
         [*python_cmd, *args],
         worktree,
         timeout=timeout,
@@ -821,6 +826,12 @@ class ResolverOutcome:
             lines.append(c.line)
         if self.tests is not None:
             lines.append(self.tests.line)
+            # A bare "test suite: FAILED" is undiagnosable in the service
+            # events (the 10fccdfa incident: the tree had to be recovered
+            # from dangling git objects to see WHICH test failed) — always
+            # carry the pytest output of a failed run.
+            if not self.tests.ok and not self.tests.skipped and self.tests.output:
+                lines.append(f"test output:\n{self.tests.output}")
         if self.review_verdict:
             lines.append(f"intent review: {self.review_verdict}")
         if self.review_report:

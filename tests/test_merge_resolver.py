@@ -206,7 +206,7 @@ def test_run_test_suite_uses_worktree_venv(
     # The pytest probe ran through the venv python, and the suite itself
     # too (`-m pytest`, no bare `pytest` from PATH).
     assert ["-c", "import pytest"] == lines[:2]
-    assert lines[-4:] == ["-m", "pytest", "-q", "-x"]
+    assert lines[-3:] == ["-m", "pytest", "-q"]
 
 
 def test_run_test_suite_caps_xdist_fanout(
@@ -529,7 +529,16 @@ def test_resolver_outcome_summary(repo: Path) -> None:
     assert "compile: ok" in text
     assert "ruff check: skipped" in text
     assert "test suite: FAILED" in text
+    # A failed suite must carry its pytest output into the report —
+    # a bare FAILED line is undiagnosable in the service events.
+    assert "test output:" in text and "1 failed" in text
     assert "NOTHING committed" in text
+
+    # A skipped suite reports no output (nothing ran); a passing one
+    # stays compact (the short `-q` tail is enough).
+    skipped = mr.ResolverOutcome(verdict="resolved")
+    skipped.tests = mr.CheckResult(name="test suite", ok=True, skipped=True)
+    assert "test output:" not in skipped.summary()
 
 
 # -- the verdict tools ----------------------------------------------------------------

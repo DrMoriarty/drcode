@@ -1336,6 +1336,97 @@ async def test_main_agent_threshold_livelock_terminates_after_bounded_compaction
     assert len(diagnostics) == 1
 
 
+async def test_maybe_compact_nothing_to_summarize_disarms_threshold_gate(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """A compaction that lands AT/above the gate's level leaves the
+    transcript as the original prompt plus the summary carrier only (the
+    bench s3 livelock): the «nothing to summarize» branch must disarm the
+    threshold-level mid-run gate (`_compaction_failed`, mirroring
+    _maybe_compact_tester_round) instead of returning silently — otherwise
+    every tools-node boundary pauses the run again and the
+    pause→resume→turn cycle repeats forever with one model request per
+    cycle and no observable progress."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from drcode.compaction import COMPACTION_SUMMARY_PREFIX
+
+    task = net_app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    # The last compaction "succeeded" but landed over the line: the
+    # transcript is exactly the merged prompt+summary carrier (n_history=1
+    # in the bench evidence).
+    task.messages = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart("long task " * 200),
+                    UserPromptPart(f"{COMPACTION_SUMMARY_PREFIX}\n\nthe summary body"),
+                ]
+            )
+        ]
+    )
+    net_app_small_ctx.manager.storage.save(task)
+    # 900 of the 1000-token window: past the 80% threshold, under the 97%
+    # hard limit.
+    net_app_small_ctx._live_ctx_tokens[task.id] = 900
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    # No summarizer call, no compaction/pause event — and the gate is
+    # disarmed at the threshold level (the mid-run pause condition in
+    # _agent_tools_node can no longer fire), with the hard-level bypass
+    # state untouched.
+    assert len(scripted.calls) == 0
+    assert not any(
+        "pausing the agent" in t or "Context compacted" in t for t in event_texts(task)
+    )
+    assert task.id in net_app_small_ctx._compaction_failed
+    assert task.id not in net_app_small_ctx._hard_limit_exhausted
+
+
+async def test_maybe_compact_nothing_to_summarize_hard_limit_exhausts_gate(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """The same «nothing to summarize» branch at the HARD-limit level:
+    besides the threshold-level disarm, the hard-level gate bypass must be
+    exhausted — the mechanical floor keeps the original prompts verbatim,
+    so pausing again could only loop."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from drcode.compaction import COMPACTION_SUMMARY_PREFIX
+
+    task = net_app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart("long task " * 200),
+                    UserPromptPart(f"{COMPACTION_SUMMARY_PREFIX}\n\nthe summary body"),
+                ]
+            )
+        ]
+    )
+    net_app_small_ctx.manager.storage.save(task)
+    # 990 of the 1000-token window: past the 97% hard limit.
+    net_app_small_ctx._live_ctx_tokens[task.id] = 990
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert len(scripted.calls) == 0
+    assert task.id in net_app_small_ctx._compaction_failed
+    assert task.id in net_app_small_ctx._hard_limit_exhausted
+
+
 async def test_threshold_livelock_counter_resets_on_under_threshold_observation(
     net_app_small_ctx: DrCodeApp,
     wide_compaction: None,

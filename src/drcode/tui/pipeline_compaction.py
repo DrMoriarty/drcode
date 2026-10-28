@@ -714,7 +714,12 @@ class PipelineCompactionLayer(DrCodeState):
         without any LLM call. Either
         way the transcript is replaced by the original user prompt(s) plus
         the summary/note, so compaction always terminates with a history
-        that fits the serving model's context. A compaction failure is
+        that fits the serving model's context. When the transcript is
+        ALREADY only the original prompt(s) plus a previous summary (the
+        last compaction landed at/above the gate's level — nothing left to
+        summarize), the gate disarms itself for the task at the threshold
+        level (`_compaction_failed`; at the hard limit `_hard_limit_exhausted`)
+        instead of looping pause→resume over a guaranteed no-op. A compaction failure is
         never fatal: it is logged into the service events and the run
         continues with the uncompressed history — except at the hard-limit
         level, where a failed summarizer escalates to the mechanical trim
@@ -749,6 +754,12 @@ class PipelineCompactionLayer(DrCodeState):
         if not any(not is_summary_message(m) for m in rest):
             # Nothing to summarize (only the original prompt(s), possibly
             # plus a previous summary): compacting again would be a no-op.
+            # Disarm the threshold-level mid-run gate too (mirrors
+            # _maybe_compact_tester_round): resuming the run as-is would
+            # hit the gate again and loop pause→resume with one model
+            # request per cycle and no progress — the gate stays off until
+            # a later compaction succeeds (which also re-arms it).
+            self._compaction_failed.add(task.id)
             if hard:
                 # At the hard-limit level this no-op must also stop the
                 # gate from firing again: the mechanical floor keeps the

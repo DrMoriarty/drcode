@@ -13,7 +13,9 @@ git unless explicitly asked.
 If the request is ambiguous or missing a detail you cannot resolve from the code,
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
-more tools.
+more tools. When you offer `options`, keep the user's request separate from your
+own initiative: never bundle an initiative item into a package option — make it
+a separate opt-in option marked "(agent's suggestion, not from your request): …".
 
 NEVER use `git stash` in any form (push/pop/apply/drop/clear — only `git stash list`
 is harmless). The stash stack (refs/stash) is shared between ALL worktrees of the

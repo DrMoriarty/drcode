@@ -11,6 +11,8 @@ from pathlib import Path
 
 from .goals import GoalStore
 from .models import (
+    Goal,
+    GoalType,
     PendingInput,
     Task,
     TaskEvent,
@@ -604,6 +606,77 @@ class TaskManager:
             if (dep_task := self.tasks.get(dep)) is not None
             and dep_task.status is not TaskStatus.COMPLETED
         ]
+
+    # -- goals ------------------------------------------------------------------
+
+    def goal_progress(self, goal: Goal) -> tuple[int, int]:
+        """(done, total) of the tasks linked to `goal` — the sidebar's and
+        the GoalScreen's "n/m" counter. Counted over the LIVE tasks whose
+        `goal_id` mirrors the link (a deleted task drops out of both
+        numbers, unlike the completion event's append-only total). For a
+        MILESTONE the counter sums the whole subtree: its own linked tasks
+        plus every descendant goal's, recursively — a milestone is done
+        when its decomposition is, not when tasks point at it directly.
+        IDEAs/GOALs without any linked task report (0, 0) — the UI shows
+        "—" for them."""
+        total = done = 0
+        for task in self.tasks.values():
+            if task.goal_id != goal.id:
+                continue
+            total += 1
+            if task.status is TaskStatus.COMPLETED:
+                done += 1
+        if goal.type is GoalType.MILESTONE:
+            for child_id in self.goals.descendant_ids(goal.id):
+                child = self.goals.goals.get(child_id)
+                if child is not None:
+                    c_done, c_total = self.goal_progress(child)
+                    done += c_done
+                    total += c_total
+        return done, total
+
+    def link_goal(self, task_id: str, goal_id: str) -> Task:
+        """Attach the viewed task to a goal (the "Link goal" palette
+        command). An unknown goal id raises ValueError (the caller
+        surfaces it); a previous link is replaced (the old goal's list
+        loses the id), an identical link is a no-op. The link is kept
+        two-sided: `task.goal_id` (the mirror the counters scan) and the
+        goal's append-only `linked_task_ids`."""
+        task = self.get(task_id)
+        if goal_id not in self.goals:
+            raise ValueError(f"unknown goal id: {goal_id}")
+        if task.goal_id == goal_id:
+            return task
+        if task.goal_id and (old := self.goals.goals.get(task.goal_id)):
+            old.linked_task_ids = [t for t in old.linked_task_ids if t != task_id]
+            old.touch()
+            self.goals.save(old)
+        task.goal_id = goal_id
+        task.touch()
+        self.storage.save(task)
+        goal = self.goals.get(goal_id)
+        if task_id not in goal.linked_task_ids:
+            goal.linked_task_ids.append(task_id)
+            goal.touch()
+            self.goals.save(goal)
+        return task
+
+    def unlink_goal(self, task_id: str) -> Task:
+        """Detach the task from its goal (the "Unlink goal" palette
+        command): both sides of the link are cleared; unlinking a task
+        without a goal is a no-op."""
+        task = self.get(task_id)
+        if not task.goal_id:
+            return task
+        goal = self.goals.goals.get(task.goal_id)
+        if goal is not None:
+            goal.linked_task_ids = [t for t in goal.linked_task_ids if t != task_id]
+            goal.touch()
+            self.goals.save(goal)
+        task.goal_id = None
+        task.touch()
+        self.storage.save(task)
+        return task
 
     def _apply_manual_order(self, order: list[Task]) -> None:
         """Persist a manually adjusted queue order (index 0 = next to run)

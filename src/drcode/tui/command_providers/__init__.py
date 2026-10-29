@@ -12,11 +12,13 @@ Modules:
 - ``models`` — per-role model pickers;
 - ``themes`` — the theme picker;
 - ``deps`` — dependency-gate commands;
+- ``goals`` — task↔goal link commands and goal capture;
 - ``merge`` — the merge-conflict screen entry.
 """
 
 from .base import CommandEntry, CommandListProvider, SpacedCommandList
 from .deps import DependencyCommandsProvider
+from .goals import GoalCommandsProvider
 from .merge import MergeCommandsProvider
 from .models import RoleModelsCommandsProvider, role_model_options_provider
 from .settings import (
@@ -60,6 +62,7 @@ __all__ = [
     "EscAbortOptionsProvider",
     "GitResearchOptionsProvider",
     "GitTesterOptionsProvider",
+    "GoalCommandsProvider",
     "IsolationOptionsProvider",
     "MergeCommandsProvider",
     "ModelCatalogCommandProvider",

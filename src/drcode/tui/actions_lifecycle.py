@@ -519,6 +519,18 @@ class TaskLifecycleLayer(DrCodeState):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem):
+            if item.goal_add:
+                # The "+ add goal" capture row (the same dialog as Ctrl+Y).
+                event.stop()
+                self.open_new_goal_dialog()
+                return
+            if item.goal_id:
+                # A goal row of the GOALS section opens the full-screen
+                # roadmap view focused on that goal (a header toggles the
+                # collapse like every other section's).
+                event.stop()
+                self.action_open_goals(item.goal_id)
+                return
             if item.section is not None:
                 # Enter (or a mouse click) on a section header toggles the
                 # category; focus stays in the sidebar for further toggling.

@@ -1533,11 +1533,12 @@ async def test_sidebar_header_enter_and_space_collapse_section(app: DrCodeApp) -
         assert row_count > 1
 
         # Enter on the header collapses the category: only the header row
-        # (with the "+" marker) remains.
+        # (with the "+" marker) remains — plus the always-mounted GOALS
+        # section (header + "+ add goal" row), which never hides.
         await pilot.press("enter")
         await pilot.pause()
         assert section in app._collapsed_sections
-        assert len(sidebar.children) == 1
+        assert len(sidebar.children) == 3
         header = sidebar.highlighted_child
         assert isinstance(header, TaskItem)
         assert header.text.lstrip().startswith("+")
@@ -1571,11 +1572,12 @@ async def test_sidebar_header_click_toggles_section(app: DrCodeApp) -> None:
             for item in sidebar.children
             if isinstance(item, TaskItem) and item.section
         )
-        # Click the header row: collapses.
+        # Click the header row: collapses (only the header stays of the
+        # section; the always-mounted GOALS header + add-row keep it at 3).
         await pilot.click(header)
         await pilot.pause()
         assert section in app._collapsed_sections
-        assert len(sidebar.children) == 1
+        assert len(sidebar.children) == 3
         # Click again: expands.
         header = sidebar.children[0]
         await pilot.click(header)

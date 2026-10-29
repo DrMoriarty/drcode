@@ -307,9 +307,37 @@ class DrCodeState(App[None]):
 
     def action_new_task(self) -> None: ...
 
+    # -- goals (implemented in tui.actions_goals.GoalsActionsLayer) ----------
+
+    def action_open_goals(self, goal_id: str | None = None) -> None: ...
+
+    def open_new_goal_dialog(
+        self,
+        *,
+        parent_id: str | None = None,
+        parent_label: str | None = None,
+        link_task_id: str | None = None,
+    ) -> None: ...
+
     def action_new_goal(self) -> None: ...
 
     def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None: ...
+
+    def create_goal_from_capture(
+        self,
+        result: tuple[str, str, GoalType],
+        *,
+        parent_id: str | None = None,
+        link_task_id: str | None = None,
+    ) -> Any: ...
+
+    def link_viewed_goal(self, goal_id: str) -> None: ...
+
+    def unlink_viewed_goal(self) -> None: ...
+
+    def start_goal_research(self, goal_id: str) -> None: ...
+
+    def start_goal_task(self, goal_id: str) -> None: ...
 
     def _new_task_chrome(self) -> None: ...
 
@@ -754,6 +782,12 @@ class DrCodeState(App[None]):
     _new_task_mode: bool
     _new_task_prev_id: str | None
     _editing_task_id: str | None
+    # The goal link preset into the new-task form (the GoalScreen's T);
+    # consumed by the fresh-creation submit, cleared with the form.
+    _new_task_goal_id: str | None
+    # What the in-flight goal-capture dialog should wire its result to:
+    # (parent goal id, task id to link).
+    _goal_capture_context: tuple[str | None, str | None]
 
     # -- push-to-talk dictation (Ctrl+B; created in DrCodeApp.__init__) ------
     voice_input: VoiceInputController

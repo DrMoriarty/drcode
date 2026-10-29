@@ -18,13 +18,12 @@ from rich.markup import escape
 from textual.containers import Vertical
 from textual.widgets import Static
 
-from ..models import GoalType, TaskKind, TaskStatus
+from ..models import TaskKind, TaskStatus
 from ..prompts import load_init_repo_prompt
 from ..providers import AgentRole, set_project_custom_model
 from ..task_manager import validate_dependencies
 from .actions_models import custom_entry_from_setup
 from .agents_dialog import AgentsMdDialog
-from .goal_screen import GoalCaptureScreen
 from .inputs import DepsInput, NewTaskInput
 from .setup_dialog import ModelSetup
 from .state import DrCodeState
@@ -143,6 +142,10 @@ class TaskFormLayer(DrCodeState):
         self._editing_task_id = None
         self.new_task_input.clear()
         self._clear_deps_field()
+        # A fresh form has no preset goal (the GoalScreen's T sets it
+        # AFTER entering the form).
+        self._new_task_goal_id = None
+        self.query_one("#nt-goal", Static).update("")
         self._new_task_mode = True
         # The form is not tied to any task: drop the viewed highlight so the
         # sidebar doesn't single out a task while the user composes a new one.
@@ -166,34 +169,9 @@ class TaskFormLayer(DrCodeState):
         # would light that row in the cursor colour while composing.
         self._sync_sidebar_cursor(None)
 
-    # -- capturing a product goal ----------------------------------------------
-
-    def action_new_goal(self) -> None:
-        """Ctrl+G: the minimal goal-capture dialog (title required, type and
-        description optional). The goal lands in .drcode/goals/ immediately
-        and is visible to the research agent's planning from its next
-        activation — no restart, the goals block is recomputed per request.
-        Deliberately capture-only: no listing/editing UI (the Roadmap screen
-        is a separate, unapproved proposal)."""
-        self.push_screen(GoalCaptureScreen(), self._goal_captured)
-
-    def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None:
-        # None — ESC/Cancel: nothing to do, the pipeline is untouched.
-        if result is None:
-            return
-        title, description, goal_type = result
-        goal = self.manager.goals.create(title, description=description)
-        # The captured item starts as an IDEA unless the user explicitly
-        # classified it in the dialog (the agent refines it later too).
-        goal.type = goal_type
-        goal.touch()
-        self.manager.goals.save(goal)
-        self.notify(
-            f"Goal #{goal.id} ({goal.type.value}) '{goal.title_display}' "
-            "created — the research agent sees it from its next activation.",
-            title="Goals",
-            timeout=6,
-        )
+    # Goal capture lives in tui.actions_goals (GoalsActionsLayer): the
+    # plain Ctrl+Y dialog grew a parent preset and a task-link context
+    # shared with the GoalScreen.
 
     # -- editing a held task ---------------------------------------------------
 
@@ -236,6 +214,17 @@ class TaskFormLayer(DrCodeState):
         self._editing_task_id = task.id
         self.new_task_input.load_text(self.manager.editable_condition(task.id))
         self._load_deps_field(task.depends_on)
+        # The edit path never re-links the task: show its current goal as
+        # read-only info (the Link/Unlink palette commands own the link).
+        self._new_task_goal_id = None
+        goal_label = self.query_one("#nt-goal", Static)
+        if task.goal_id and task.goal_id in self.manager.goals:
+            goal = self.manager.goals.get(task.goal_id)
+            goal_label.update(
+                f"goal: [magenta]◆[/] {escape(goal.title_display)} (kept)"
+            )
+        else:
+            goal_label.update("")
         self.new_task_kind = task.kind
         self._new_task_mode = True
         self._new_task_prev_id = self.viewed_id
@@ -261,6 +250,10 @@ class TaskFormLayer(DrCodeState):
         self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
         self.chat_log.remove_class("hidden")
+        # The preset goal link (the GoalScreen's T) belongs to the form
+        # session: consumed by the submit, dropped by a cancel.
+        self._new_task_goal_id = None
+        self.query_one("#nt-goal", Static).update("")
         # Content may be stale (a run streamed while the form was open, or
         # finished in the background): don't resurrect it.
         self._clear_stream_label()
@@ -396,7 +389,13 @@ class TaskFormLayer(DrCodeState):
         deps = self._deps_from_form()
         if deps is None:
             return
-        task = self.manager.create("", text, kind=self.new_task_kind, hold=hold)
+        task = self.manager.create(
+            "",
+            text,
+            kind=self.new_task_kind,
+            hold=hold,
+            goal_id=self._new_task_goal_id,
+        )
         if deps:
             self.manager.set_dependencies(task.id, deps)
         self._leave_new_task_mode()

@@ -286,12 +286,14 @@ class Task(BaseModel):
     # The long-lived product goal this task serves (see drcode.models.Goal
     # and the goals registry under .drcode/goals/). None for tasks created
     # without a goal reference (old task files load with the plain default,
-    # no migration). Written at creation only (TaskManager.create goal_id /
-    # the agent's create_* goal_id parameter): a task never moves between
-    # goals. The goal's completion service event ("цель Y: n/m задач
-    # завершено") counts over the goal's linked_task_ids, which this field
-    # mirrors; a deleted goal id is tolerated at load time (the event
-    # writer just skips it), like a deleted depends_on id.
+    # no migration). Written at creation (TaskManager.create goal_id / the
+    # agent's create_* goal_id parameter) or by the user's explicit
+    # Link/Unlink goal palette commands (TaskManager.link_goal/unlink_goal)
+    # — nothing else moves a task between goals. The goal's completion
+    # service event ("цель Y: n/m задач завершено") counts over the goal's
+    # linked_task_ids, which this field mirrors; a deleted goal id is
+    # tolerated at load time (the event writer just skips it), like a
+    # deleted depends_on id.
     goal_id: str | None = None
 
     @property
@@ -357,7 +359,13 @@ class Goal(BaseModel):
 
     id: str = Field(default_factory=_short_id)
     title: str
+    # Two text fields, deliberately separate (see the GoalScreen's E):
+    # `description` is the short line the research agent's prompt injection
+    # carries (and the tree rows show); `notes` is the long free-form
+    # markdown the agent reads ONLY via its read_goal tool — it NEVER
+    # enters a system prompt (fixed in the goal-tools task).
     description: str = ""
+    notes: str = ""
     type: GoalType = GoalType.IDEA
     status: GoalStatus = GoalStatus.ACTIVE
     # Decomposition: a milestone may have sub-goals pointing at it. No
@@ -368,8 +376,17 @@ class Goal(BaseModel):
     # Ids of tasks created with a reference to this goal (create_bug_report /
     # create_feature_request `goal_id`, the new-task form): the completion
     # service event "цель Y: n/m задач завершено" counts over this list.
-    # Append-only on purpose — a re-queued completed task keeps its link.
+    # A re-queued completed task keeps its link; a task moves between goals
+    # only through the user's explicit Link/Unlink palette commands (the
+    # agent's create_* tools set the reference at creation only).
     linked_task_ids: list[str] = Field(default_factory=list)
+    # Sibling order stamp (like Task.queue_seq for the queue): the position
+    # among goals sharing the same parent_id. Assigned on creation
+    # (GoalStore.create), bumped by the GoalScreen's Ctrl+Up/Down
+    # (GoalStore.move); None = a legacy goal written before the field
+    # existed — it sorts after ordered siblings, by created_at. None of the
+    # ordering is semantic: it only fixes the sidebar/tree display order.
+    order: int | None = None
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
 

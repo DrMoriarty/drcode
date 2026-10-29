@@ -159,9 +159,12 @@ async def test_promoted_tasks_land_below_their_section_header(
         children = [
             w.section if w.task_id is None else w.task_id
             for w in app.sidebar.children
-            if isinstance(w, TaskItem)
+            if isinstance(w, TaskItem) and not (w.goal_id or w.goal_add)
         ]
-        assert children == ["ACTIVE", a.id, b.id]
+        # The GOALS section (header + the "+ add goal" row) trails the
+        # pipeline sections and always stays mounted; only its rows are
+        # goal-bound and excluded above.
+        assert children == ["ACTIVE", a.id, b.id, "GOALS"]
 
 
 async def test_removed_task_drops_its_row(app: DrCodeApp, two_tasks) -> None:
@@ -413,10 +416,11 @@ async def test_second_refresh_same_tick_is_stable(app: DrCodeApp, two_tasks) -> 
         rows = task_rows(app)
         assert [r.task_id for r in rows] == [c.id, b.id, a.id]
         # Every sidebar child is a tracked TaskItem: no duplicate or
-        # half-pruned leftovers (header + 3 task rows).
-        assert len(app.sidebar.children) == 4
+        # half-pruned leftovers (header + 3 task rows + the GOALS
+        # section's always-mounted header and "+ add goal" row).
+        assert len(app.sidebar.children) == 6
         assert all(isinstance(w, TaskItem) for w in app.sidebar.children)
-        assert len(app._sidebar_items) == 4
+        assert len(app._sidebar_items) == 6
         assert isinstance(app.sidebar, ListView)
 
 

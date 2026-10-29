@@ -99,8 +99,54 @@ class GoalStore:
         system prompt carries (done/archived stay out of the context)."""
         return [g for g in self.goals.values() if g.status is GoalStatus.ACTIVE]
 
-    def children(self, goal_id: str) -> list[Goal]:
+    def children(self, goal_id: str | None) -> list[Goal]:
+        """Goals whose parent is `goal_id`; `None` yields the top-level
+        set (the tree roots). Unsorted — see display_children."""
         return [g for g in self.goals.values() if g.parent_id == goal_id]
+
+    # -- ordering / tree lookups ------------------------------------------------
+
+    @staticmethod
+    def _order_key(goal: Goal) -> tuple[int, float, str]:
+        """Display sort key among siblings: an explicit `order` stamp wins
+        (the GoalScreen's Ctrl+Up/Down writes it), legacy goals without one
+        (written before the field existed) trail in creation order."""
+        if goal.order is not None:
+            return (0, float(goal.order), goal.id)
+        return (1, goal.created_at.timestamp(), goal.id)
+
+    def top_level(self) -> list[Goal]:
+        """Goals without a parent, in display order (sidebar tree roots)."""
+        return sorted(
+            (g for g in self.goals.values() if not g.parent_id),
+            key=self._order_key,
+        )
+
+    def display_children(self, goal_id: str) -> list[Goal]:
+        """Children of `goal_id` in display order (the tree's next level)."""
+        return sorted(self.children(goal_id), key=self._order_key)
+
+    def descendant_ids(self, goal_id: str) -> set[str]:
+        """All strict descendants of `goal_id` (the whole subtree below
+        it, any depth). Used by the reparent picker (a goal cannot become
+        its own descendant) and the milestone progress sum."""
+        result: set[str] = set()
+        stack = [child.id for child in self.children(goal_id)]
+        while stack:
+            node = stack.pop()
+            if node in result:
+                continue  # defensive: a manual parent_id cycle cannot loop us
+            result.add(node)
+            stack.extend(child.id for child in self.children(node))
+        return result
+
+    def _next_order(self, parent_id: str | None) -> int:
+        """The next free `order` stamp among `parent_id`'s children (0 for
+        an empty sibling group) — a new goal lands at the end of its
+        sibling list. `children(None)` is exactly the top-level set, so
+        both cases share one expression."""
+        orders = [g.order for g in self.children(parent_id) if g.order is not None]
+        return max(orders, default=-1) + 1
 
     # -- mutations -----------------------------------------------------------
 
@@ -124,6 +170,7 @@ class GoalStore:
             title=title.strip() or "Untitled goal", description=description.strip()
         )
         goal.parent_id = cleaned_parent or None
+        goal.order = self._next_order(goal.parent_id)
         self.goals[goal.id] = goal
         self.save(goal)
         return goal
@@ -147,7 +194,7 @@ class GoalStore:
             fields["status"] = self._validated_enum(
                 fields["status"], GoalStatus, "status"
             )
-        for plain in ("title", "description"):
+        for plain in ("title", "description", "notes"):
             if plain in fields and not isinstance(fields[plain], str):
                 raise ValueError(f"goal {plain} must be a string")
         if "parent_id" in fields:
@@ -196,3 +243,58 @@ class GoalStore:
                 )
             seen.add(node)
             node = self.goals[node].parent_id if node in self.goals else None
+
+    # -- ordering mutations -----------------------------------------------------
+
+    def _normalize_orders(self, parent_id: str | None) -> list[Goal]:
+        """Re-stamp `order` 0..n-1 over the sibling group in display order
+        and persist the changed goals. Legacy goals without a stamp (and
+        any gaps left by deletions/re-parenting) dissolve into a dense
+        sequence, so `move` below only ever swaps two clean integers."""
+        ordered = self.display_children(parent_id) if parent_id else self.top_level()
+        for index, goal in enumerate(ordered):
+            if goal.order != index:
+                goal.order = index
+                goal.touch()
+                self.save(goal)
+        return ordered
+
+    def move(self, goal_id: str, *, up: bool) -> Goal:
+        """Move `goal_id` one position up/down among its siblings
+        (Ctrl+Up/Down on the GoalScreen). Returns the goal; moving past
+        the end of the sibling list is a no-op. Like queue_seq re-stamps,
+        the sibling group is normalized first so the swap is exact."""
+        goal = self.get(goal_id)
+        siblings = self._normalize_orders(goal.parent_id)
+        index = next(i for i, g in enumerate(siblings) if g.id == goal_id)
+        other = index - 1 if up else index + 1
+        if not 0 <= other < len(siblings):
+            return goal
+        siblings[index].order, siblings[other].order = (
+            siblings[other].order,
+            siblings[index].order,
+        )
+        for moved in (siblings[index], siblings[other]):
+            moved.touch()
+            self.save(moved)
+        return goal
+
+    def reparent(self, goal_id: str, new_parent: str | None) -> Goal:
+        """Move `goal_id` under `new_parent` (None = make top-level). The
+        parent must exist and must not be inside the goal's own subtree
+        (the decomposition stays a tree); the goal lands at the end of the
+        new sibling group. ValueError on violation — the picker surfaces
+        it; the acyclicity check is the same _ensure_acyclic update uses."""
+        goal = self.get(goal_id)
+        cleaned = new_parent.strip() if new_parent else None
+        if cleaned == goal.parent_id:
+            return goal  # no-op: already there
+        if cleaned is not None:
+            if cleaned not in self.goals:
+                raise ValueError(f"unknown parent goal id: {cleaned}")
+            self._ensure_acyclic(goal_id, cleaned)
+        goal.parent_id = cleaned or None
+        goal.order = self._next_order(goal.parent_id)
+        goal.touch()
+        self.save(goal)
+        return goal

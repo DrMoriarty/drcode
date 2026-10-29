@@ -7,6 +7,8 @@ mirroring the ``ChatViewLayer`` style):
 
 - :mod:`drcode.tui.actions_forms` — the new-task/edit-task editor, the
   first-start model-setup result and the AGENTS.md offer;
+- :mod:`drcode.tui.actions_goals` — goal capture (Ctrl+Y), task↔goal
+  linking and the full-screen GoalScreen;
 - :mod:`drcode.tui.actions_lifecycle` — user commands over tasks (done,
   cancel, ESC run-stop, nudge, queue ordering, dependencies,
   hold/resume/delete) and submitting user input to a task;
@@ -25,6 +27,7 @@ untouched.
 from __future__ import annotations
 
 from .actions_forms import TaskFormLayer
+from .actions_goals import GoalsActionsLayer
 from .actions_lifecycle import TaskLifecycleLayer
 from .actions_merge import MergeActionsLayer
 from .actions_models import ModelSelectionLayer
@@ -34,6 +37,7 @@ from .state import DrCodeState
 
 class ActionsLayer(
     TaskFormLayer,
+    GoalsActionsLayer,
     TaskLifecycleLayer,
     MergeActionsLayer,
     ModelSelectionLayer,

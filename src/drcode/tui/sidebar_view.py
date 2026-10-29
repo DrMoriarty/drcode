@@ -15,7 +15,15 @@ from rich.markup import escape
 from textual.css.query import NoMatches
 from textual.widgets import ListView
 
-from ..models import Task, TaskKind, TaskStatus, VerificationStatus
+from ..models import (
+    Goal,
+    GoalStatus,
+    GoalType,
+    Task,
+    TaskKind,
+    TaskStatus,
+    VerificationStatus,
+)
 from ..providers import AgentRole
 from .sidebar import TaskItem
 from .state import DrCodeState
@@ -79,25 +87,40 @@ class SidebarLayer(DrCodeState):
         """Lightweight snapshot of everything the sidebar renders: status,
         verification label, title, the viewed-marker, the queue stamp
         (the QUEUE section is order-sensitive) and the mergedness color
-        of the ✓ marker per task. The merge state lives outside the task
+        of the ✓ marker per task — plus the GOALS section's rows (order
+        and parent included: the display is a tree, a re-parent or a
+        reorder must redraw). The merge state lives outside the task
         objects (updated off the event loop by the 10 s git poll), so
         without it here a color-only change would not redraw — the same
         staleness trap _poll_sidebar's fingerprint guards against."""
         merge_state = self._merge_state
-        return tuple(
-            (
-                t.id,
-                t.status.value,
-                t.kind.value,
-                t.verification,
-                t.title_display,
-                t.id == self.viewed_id,
-                t.queue_seq,
-                t.queue_head,
-                t.needs_human,
-                merge_state.get(t.id, ""),
-            )
-            for t in self.manager.all_tasks()
+        return (
+            tuple(
+                (
+                    t.id,
+                    t.status.value,
+                    t.kind.value,
+                    t.verification,
+                    t.title_display,
+                    t.id == self.viewed_id,
+                    t.queue_seq,
+                    t.queue_head,
+                    t.needs_human,
+                    merge_state.get(t.id, ""),
+                )
+                for t in self.manager.all_tasks()
+            ),
+            tuple(
+                (
+                    g.id,
+                    g.status.value,
+                    g.type.value,
+                    g.title_display,
+                    g.parent_id,
+                    g.order,
+                )
+                for g in self.manager.goals.goals.values()
+            ),
         )
 
     def _poll_sidebar(self) -> None:
@@ -338,13 +361,16 @@ class SidebarLayer(DrCodeState):
         # Dependency gate: a task whose depends_on is not satisfied yet
         # gets the lock marker and the ids it waits for.
         deps_suffix = self._dependency_marker(t)
+        # The goal link (◆<goal-id>) next to the task, same pattern.
+        goal_suffix = self._goal_marker(t)
         # The failed-conflict-fallback marker: the agent resolver gave up
         # on this task's parked merge — a human must take over (Ctrl+M).
         human_suffix = " [bold red]✋[/]" if t.needs_human else ""
         viewed = " ●" if t.id == self.viewed_id else ""
         return (
             f"{marker} {kind_letter} #{t.id} "
-            f"{escape(t.title_display)}{suffix}{deps_suffix}{human_suffix}{viewed}"
+            f"{escape(t.title_display)}{suffix}{deps_suffix}{goal_suffix}"
+            f"{human_suffix}{viewed}"
         )
 
     def _sidebar_row(
@@ -356,6 +382,8 @@ class SidebarLayer(DrCodeState):
         header: bool = False,
         section: str | None = None,
         viewed: bool = False,
+        goal_id: str | None = None,
+        goal_add: bool = False,
     ) -> TaskItem:
         """Reuse (or create) the mounted row for *key* and sync it to the
         desired *text*/`viewed` class.
@@ -367,7 +395,14 @@ class SidebarLayer(DrCodeState):
         over a second at a few hundred completed tasks."""
         item = self._sidebar_items.get(key)
         if item is None:
-            item = TaskItem(text, task_id, header=header, section=section)
+            item = TaskItem(
+                text,
+                task_id,
+                header=header,
+                section=section,
+                goal_id=goal_id,
+                goal_add=goal_add,
+            )
             if viewed:
                 item.add_class("viewed")
             self._sidebar_items[key] = item
@@ -494,6 +529,44 @@ class SidebarLayer(DrCodeState):
                         viewed=t.id == self.viewed_id,
                     )
                 )
+
+        # -- GOALS section -----------------------------------------------------
+        # Unlike the pipeline sections above (which vanish when empty and
+        # hide their rows when collapsed), the goals block is never fully
+        # hidden: the counters stay visible even collapsed — a collapsed
+        # GOALS keeps its header plus the top-level rows (only the
+        # sub-goal tree is folded away). The trailing "+ add goal" row is
+        # the capture shortcut (the same dialog as Ctrl+Y).
+        goals_rows = self._goals_section_rows()
+        goals_header = self._sidebar_row(
+            ("header", "GOALS"),
+            f"{'+' if 'GOALS' in self._collapsed_sections else '-'} "
+            f"GOALS ({len(goals_rows)})",
+            header=True,
+            section="GOALS",
+        )
+        keys.add(("header", "GOALS"))
+        items.append(goals_header)
+        top_level_only = "GOALS" in self._collapsed_sections
+        for goal, depth in goals_rows:
+            if top_level_only and depth > 0:
+                continue
+            keys.add(("goal", goal.id))
+            items.append(
+                self._sidebar_row(
+                    ("goal", goal.id),
+                    self._goal_row_text(goal, depth, self.manager.goal_progress(goal)),
+                    goal_id=goal.id,
+                )
+            )
+        keys.add(("goal-add", ""))
+        items.append(
+            self._sidebar_row(
+                ("goal-add", ""),
+                "[dim]+ add goal[/]",
+                goal_add=True,
+            )
+        )
         # Rows whose key disappeared: drop from the tracking dict and
         # remove. The removal is async (a Prune round-trip), so a row can
         # linger in the DOM for a moment — the sidebar's click handler
@@ -532,6 +605,55 @@ class SidebarLayer(DrCodeState):
             if isinstance(item, TaskItem) and item.highlighted and item is not cursor:
                 item.highlighted = False
         self._sidebar_snapshot = self._sidebar_fingerprint()
+
+    def _goal_marker(self, task: Task) -> str:
+        """Sidebar suffix of the goal link (by analogy with the dependency
+        marker): " ◆<goal-id>" for a task attached to a goal, "" when the
+        task has none — or only a dangling one (the goal was deleted; the
+        stale id on the task is tolerated, just not shown)."""
+        if not task.goal_id or task.goal_id not in self.manager.goals:
+            return ""
+        return f" [magenta]◆[/]{task.goal_id}"
+
+    def _goals_section_rows(self) -> list[tuple[Goal, int]]:
+        """The sidebar GOALS tree: ACTIVE goals only (archived and done
+        goals live on the GoalScreen's filters), as (goal, depth) pairs in
+        display order — top-level first, each with its sub-goals indented
+        beneath it."""
+        rows: list[tuple[Goal, int]] = []
+
+        def walk(parent_id: str | None, depth: int) -> None:
+            goals = (
+                self.manager.goals.top_level()
+                if parent_id is None
+                else self.manager.goals.display_children(parent_id)
+            )
+            for goal in goals:
+                if goal.status is not GoalStatus.ACTIVE:
+                    continue
+                rows.append((goal, depth))
+                walk(goal.id, depth + 1)
+
+        walk(None, 0)
+        return rows
+
+    @staticmethod
+    def _goal_row_text(goal: Goal, depth: int, progress: tuple[int, int]) -> str:
+        """Rendered label of a goal row: "◆ <title>  n/m" — the closed/
+        total counter over the goal's linked tasks (a milestone sums its
+        whole subtree; a goal without tasks shows "—"). The type marker:
+        ◆ for a goal/milestone (bold for a milestone), the hollow ◇ for a
+        raw idea. Sub-goals are indented by depth."""
+        indent = "  " * depth
+        if goal.type is GoalType.IDEA:
+            marker = "[dim]◇[/]"
+        elif goal.type is GoalType.MILESTONE:
+            marker = "[bold magenta]◆[/]"
+        else:
+            marker = "[magenta]◆[/]"
+        done, total = progress
+        counter = "[dim]—[/]" if total == 0 else f"{done}/{total}"
+        return f"{indent}{marker} {escape(goal.title_display)}  [dim]{counter}[/]"
 
     def _dependency_marker(self, task: Task) -> str:
         """Sidebar suffix of the dependency gate: " 🔒 ⇢ <id1>,<id2>" for a

@@ -73,6 +73,7 @@ from .blocks import (  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
     DependencyCommandsProvider,
+    GoalCommandsProvider,
     MergeCommandsProvider,
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
@@ -122,6 +123,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,
+        GoalCommandsProvider,
         MergeCommandsProvider,
     }
 
@@ -283,6 +285,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         width: 80%;
         color: $error;
     }
+    #nt-goal {
+        width: 80%;
+        color: $text-muted;
+    }
     # Labels must stay width: auto: a full-width (1fr) sibling disables
     # horizontal centering for the whole #new-task container, leaving the
     # input glued to the left edge.
@@ -306,7 +312,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     """
     BINDINGS: ClassVar = [
         ("ctrl+n", "new_task", "New task"),
-        ("ctrl+g", "new_goal", "New goal"),
+        # Ctrl+Y, not ctrl+g: the new-task editor's TextArea binding owns
+        # ctrl+g ("Depends on", priority=True) — inside the form the
+        # global would never fire; ctrl+y is free everywhere the app
+        # bindings reach (a focused TextArea still eats it — stock
+        # TextArea owns ctrl+y — same limitation ctrl+g had).
+        ("ctrl+y", "new_goal", "New goal"),
         ("ctrl+d", "done_task", "Done"),
         ("ctrl+x", "cancel_task", "Cancel task"),
         ("ctrl+o", "focus_sidebar", "Tasks"),
@@ -618,6 +629,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # new one): the id of that task, None otherwise. submit/hold keys
         # branch on it (create vs merge-and-save).
         self._editing_task_id: str | None = None
+        # The goal link preset into the new-task form (the GoalScreen's
+        # T): the created task is attached to this goal. Consumed by the
+        # submit, cleared with the form (cancel/close) — see
+        # _leave_new_task_mode.
+        self._new_task_goal_id: str | None = None
+        # What the in-flight goal-capture dialog (Ctrl+Y / the palette's
+        # "Create goal…") should wire its result to: (parent goal id,
+        # task id to link). Read back in _goal_captured.
+        self._goal_capture_context: tuple[str | None, str | None] = (None, None)
         # Snapshot of the task state the sidebar was last rendered from; the
         # poller compares against it to redraw only on actual change.
         self._sidebar_snapshot: tuple = ()
@@ -822,6 +842,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                         id="nt-deps",
                     )
                     yield Static("", id="nt-deps-note")
+                    # The preset goal link (the GoalScreen's T): shown as
+                    # a read-only line above the kind selector; cleared
+                    # with the form.
+                    yield Static("", id="nt-goal")
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
                         "tab — switch type   ctrl+enter — create   "

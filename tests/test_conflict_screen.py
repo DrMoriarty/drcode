@@ -276,6 +276,72 @@ def test_ff_merge_branch_without_branch_or_isolation(repo: Path) -> None:
     assert "isolation" in out
 
 
+# -- untracked-collision pre-processing before the ff-merge --------------------------
+
+
+def test_ff_merge_clears_identical_untracked_collision(repo: Path) -> None:
+    env, wt = _branch_with_work(repo, "t6")
+    # The "file conflicts with itself" case: a copy of a file the branch
+    # commits exists in the main checkout as untracked (it was copied
+    # into the worktree and committed there) — the raw merge refuses.
+    artifact = repo / "output" / "playwright"
+    artifact.mkdir(parents=True)
+    (artifact / "ctx-stats.png").write_bytes(b"png-bytes")
+    (wt / "output" / "playwright").mkdir(parents=True)
+    (wt / "output" / "playwright" / "ctx-stats.png").write_bytes(b"png-bytes")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "add artifacts")
+    ok, raw = env.ff_merge_branch("t6")
+    assert not ok
+    assert "untracked working tree files" in raw
+    # The pre-processing clears exactly the identical copy and the ff
+    # then succeeds — git restores the same bytes from the repository.
+    removed, differing = env.clear_identical_untracked_for_ff("t6")
+    assert removed == ["output/playwright/ctx-stats.png"]
+    assert differing == []
+    ok, _out = env.ff_merge_branch("t6")
+    assert ok
+    assert (artifact / "ctx-stats.png").read_bytes() == b"png-bytes"
+
+
+def test_ff_merge_refuses_on_differing_untracked(repo: Path) -> None:
+    env, wt = _branch_with_work(repo, "t7")
+    # An untracked file whose content DIFFERS from the branch version:
+    # never removed, the merge must not run — the caller refuses and
+    # asks for a manual move/remove.
+    out = repo / "output"
+    out.mkdir()
+    (out / "report.txt").write_text("user's own version\n")
+    (wt / "output").mkdir()
+    (wt / "output" / "report.txt").write_text("branch version\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "add report")
+    removed, differing = env.clear_identical_untracked_for_ff("t7")
+    assert removed == []
+    assert differing == ["output/report.txt"]
+    assert (out / "report.txt").read_text() == "user's own version\n"
+
+
+def test_ff_merge_collision_helper_skips_tracked_files(repo: Path) -> None:
+    env, wt = _branch_with_work(repo, "t8")
+    # A file TRACKED in the main checkout with local modifications, also
+    # changed on the branch: not the helper's business — untouched.
+    (repo / "app.py").write_text("a\nDIRTY\nc\n")
+    (wt / "app.py").write_text("a\nBRANCH\nc\n")
+    _git(wt, "commit", "-qam", "branch edit")
+    removed, differing = env.clear_identical_untracked_for_ff("t8")
+    assert removed == []
+    assert differing == []
+    assert (repo / "app.py").read_text() == "a\nDIRTY\nc\n"
+
+
+def test_ff_merge_collision_helper_without_branch_or_isolation(repo: Path) -> None:
+    env = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    assert env.clear_identical_untracked_for_ff("ghost") == ([], [])
+    off = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.OFF))
+    assert off.clear_identical_untracked_for_ff("t5") == ([], [])
+
+
 # -- the TUI screen -----------------------------------------------------------------
 
 

@@ -435,6 +435,31 @@ class UnmergedListScreen(ModalScreen[None]):
                 timeout=8,
             )
             return
+        # Untracked files in the main checkout that the merge would
+        # overwrite: identical copies are removed (git restores the very
+        # same bytes from the repository right after the ff); differing
+        # ones refuse the merge — the user moves/removes them manually.
+        task = app.manager.get(task_id)
+        removed, differing = await asyncio.to_thread(
+            app.task_env.clear_identical_untracked_for_ff, task_id
+        )
+        if removed:
+            app._show_event(
+                task,
+                f"removed {len(removed)} untracked file(s) identical to the "
+                f"branch version before ff-merge: {', '.join(removed)}",
+                kind="workflow",
+            )
+        if differing:
+            self.notify(
+                f"git merge --ff-only {branch} into {base} refused: untracked "
+                "file(s) differ from the branch version — move or remove them "
+                f"manually: {', '.join(differing)}",
+                title="Merge",
+                severity="error",
+                timeout=10,
+            )
+            return
         ok, out = await asyncio.to_thread(app.task_env.ff_merge_branch, task_id)
         if not ok:
             self.notify(
@@ -444,7 +469,6 @@ class UnmergedListScreen(ModalScreen[None]):
                 timeout=8,
             )
             return
-        task = app.manager.get(task_id)
         if task.needs_human:
             task.needs_human = False
             task.touch()

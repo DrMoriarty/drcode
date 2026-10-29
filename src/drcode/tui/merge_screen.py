@@ -1642,6 +1642,31 @@ class ConflictScreen(ModalScreen[None]):
                 timeout=8,
             )
             return
+        # Untracked files in the main checkout that the merge would
+        # overwrite: identical copies are removed (git restores the very
+        # same bytes from the repository right after the ff); differing
+        # ones refuse the merge — the user moves/removes them manually.
+        task = app.manager.get(self.task_id)
+        removed, differing = await asyncio.to_thread(
+            env.clear_identical_untracked_for_ff, self.task_id
+        )
+        if removed:
+            app._show_event(
+                task,
+                f"removed {len(removed)} untracked file(s) identical to the "
+                f"branch version before ff-merge: {', '.join(removed)}",
+                kind="workflow",
+            )
+        if differing:
+            self.notify(
+                f"git merge --ff-only {branch} into {base} refused: untracked "
+                "file(s) differ from the branch version — move or remove them "
+                f"manually: {', '.join(differing)}",
+                title="Merge",
+                severity="error",
+                timeout=10,
+            )
+            return
         ok, out = await asyncio.to_thread(env.ff_merge_branch, self.task_id)
         if not ok:
             # --ff-only refuses instead of conflicting: the base moved
@@ -1659,7 +1684,6 @@ class ConflictScreen(ModalScreen[None]):
         self._ff_done = True
         self._set_title(f"#{self.task_id} — {branch} merged into {base} (ff-only)")
         self._update_footer()
-        task = app.manager.get(self.task_id)
         if task.needs_human:
             task.needs_human = False
             task.touch()

@@ -306,6 +306,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     """
     BINDINGS: ClassVar = [
         ("ctrl+n", "new_task", "New task"),
+        ("ctrl+g", "new_goal", "New goal"),
         ("ctrl+d", "done_task", "Done"),
         ("ctrl+x", "cancel_task", "Cancel task"),
         ("ctrl+o", "focus_sidebar", "Tasks"),

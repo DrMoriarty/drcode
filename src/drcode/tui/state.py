@@ -38,7 +38,14 @@ from ..agent import AgentDeps, ResolverDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
-from ..models import Clarification, PendingInput, Task, TaskEvent, TaskKind
+from ..models import (
+    Clarification,
+    GoalType,
+    PendingInput,
+    Task,
+    TaskEvent,
+    TaskKind,
+)
 from ..notifications import Notifier
 from ..providers import AgentRole, ModelRef
 from ..settings import (
@@ -299,6 +306,10 @@ class DrCodeState(App[None]):
     def _drop_stream_preview(self, task_id: str, generation: int) -> None: ...
 
     def action_new_task(self) -> None: ...
+
+    def action_new_goal(self) -> None: ...
+
+    def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None: ...
 
     def _new_task_chrome(self) -> None: ...
 

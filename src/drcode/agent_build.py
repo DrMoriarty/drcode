@@ -15,6 +15,7 @@ import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
@@ -23,14 +24,19 @@ from . import agent_model, task_search, tools
 from .agent_model import EXTRA_HEADERS
 from .agent_tools import (
     _commit_tracked_files,
+    _create_goal,
     _deps_suffix,
     _git_push,
+    _list_goals,
+    _read_goal,
     _retry_failed_here,
     _run_project_check,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
     _track_edited_file,
+    _update_goal,
+    goals_dynamic_instructions,
     load_agents_md,
     todo_dynamic_instructions,
 )
@@ -141,6 +147,36 @@ class ResolverDeps:
     verdicts: list[ResolutionVerdict] = field(default_factory=list)
 
 
+def _validated_goal_id(ctx: RunContext[AgentDeps], goal_id: str | None) -> str | None:
+    """Normalize the optional `goal_id` of the create_* tools.
+
+    An unknown goal id must not crash the run (a plain ValueError would):
+    it comes back as None with a tool-result error the model can recover
+    from (list_goals shows the valid ids) — the same "fixable mistake"
+    treatment the goal tools get via ModelRetry. Whitespace-only input is
+    treated as absent."""
+    if goal_id is None or not goal_id.strip():
+        return None
+    goal_id = goal_id.strip()
+    if goal_id not in ctx.deps.manager.goals:
+        raise ModelRetry(
+            f"unknown goal id: {goal_id} — call list_goals to see the valid "
+            "ids, then create the task again with a correct goal_id "
+            "(or omit goal_id to create the task without a goal)."
+        )
+    return goal_id
+
+
+def _goal_suffix(ctx: RunContext[AgentDeps], task: Any) -> str:
+    """The goal note appended to a create_* tool result when the task was
+    linked to a goal (`task.goal_id` is set by manager.create)."""
+    if task.goal_id is None:
+        return ""
+    goal = ctx.deps.manager.goals.goals.get(task.goal_id)
+    label = goal.title_display if goal else task.goal_id
+    return f" Linked to goal '{label}' ({task.goal_id})."
+
+
 def build_agent(
     config: Config,
     kind: TaskKind = TaskKind.FEATURE,
@@ -196,6 +232,12 @@ def build_agent(
     # `agent.iter` start and would miss exactly that. For non-feature
     # tasks and empty lists it yields None (excluded from the request).
     agent.instructions(todo_dynamic_instructions)
+    # Same dynamic-instructions pattern for the research role's roadmap:
+    # the compact active-goals block rides on EVERY model request (recomputed
+    # from `manager.goals`), so a goal the agent creates/updates mid-run is
+    # visible to its next request. For non-research tasks and empty
+    # registries it yields None (excluded from the request).
+    agent.instructions(goals_dynamic_instructions)
 
     # All blocking tools run in a worker thread (or as asyncio subprocesses
     # for run_bash): called inline they would stall the event loop, which
@@ -365,6 +407,7 @@ def build_agent(
             title: str,
             description: str,
             depends_on: list[str] | None = None,
+            goal_id: str | None = None,
         ) -> str:
             """Create a bug report task in the backlog. Use ONLY when the user
             explicitly asked for it — if you found a problem on your own, ask
@@ -375,6 +418,8 @@ def build_agent(
             search_task_history output) the new task must wait for — it is not
             promoted until every listed task is COMPLETED and, under worktree
             isolation, its drcode/<id> branch is merged into the base branch.
+            Optional `goal_id`: the id of a product goal (see the goals block)
+            this bug fix serves — the task joins that goal's progress count.
             The returned id lets you chain subsequent creations on it."""
             # origin="system": the tool (not the user) created the task —
             # creation listeners (e.g. the voice announcements) can tell
@@ -385,10 +430,12 @@ def build_agent(
                 kind=TaskKind.BUG,
                 origin="system",
                 depends_on=depends_on,
+                goal_id=_validated_goal_id(ctx, goal_id),
             )
             return (
                 f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
                 + _deps_suffix(bug)
+                + _goal_suffix(ctx, bug)
             )
 
         @agent.tool
@@ -397,6 +444,7 @@ def build_agent(
             title: str,
             description: str,
             depends_on: list[str] | None = None,
+            goal_id: str | None = None,
         ) -> str:
             """Create a feature request task in the backlog. Use ONLY when the
             user explicitly asked for it — if you spotted an improvement on
@@ -407,13 +455,21 @@ def build_agent(
             search_task_history output) the new task must wait for — it is not
             promoted until every listed task is COMPLETED and, under worktree
             isolation, its drcode/<id> branch is merged into the base branch.
+            Optional `goal_id`: the id of a product goal (see the goals block)
+            this feature serves — the task joins that goal's progress count.
             The returned id lets you chain subsequent creations on it."""
             feature = ctx.deps.manager.create(
-                title, description, kind=TaskKind.FEATURE, depends_on=depends_on
+                title,
+                description,
+                kind=TaskKind.FEATURE,
+                depends_on=depends_on,
+                goal_id=_validated_goal_id(ctx, goal_id),
             )
             return (
                 f"Feature request #{feature.id} '{feature.title}' created at "
-                "the tail of the queue." + _deps_suffix(feature)
+                "the tail of the queue."
+                + _deps_suffix(feature)
+                + _goal_suffix(ctx, feature)
             )
 
         @agent.tool(sequential=True)
@@ -523,6 +579,84 @@ def build_agent(
                 exclude_task_id=ctx.deps.task_id,
                 status=status,
                 kind=kind,
+            )
+
+        # Goal-registry tools (stage A passive registry + stage B planning):
+        # research-only — coding agents and the tester are never goal-aware
+        # on this stage. All four run through _run_tool so fixable
+        # ValueErrors (unknown id, bad type/status, decomposition cycle)
+        # become ModelRetry prompts. Every mutation lands a service event
+        # in the task's chat (log_service_event inside the tool bodies) —
+        # the user sees every agent-made goal change, never silently.
+        @agent.tool
+        async def list_goals(
+            ctx: RunContext[AgentDeps], include_done: bool = False
+        ) -> str:
+            """List the product-goal registry, one compact line per goal:
+            [id] (type) title — description excerpt. Active goals by
+            default; pass include_done=True to also see done/archived ones
+            (e.g. to review what has already shipped). The same lines the
+            system prompt carries — read_goal for the details of one."""
+            return await _run_tool(_list_goals, ctx.deps, include_done)
+
+        @agent.tool
+        async def read_goal(ctx: RunContext[AgentDeps], goal_id: str) -> str:
+            """Read ONE goal in full: the complete description, its parent
+            and sub-goals (the decomposition), and every linked task with
+            its live status/kind. `goal_id` is the short id from the goals
+            block or list_goals. Use it before planning against a goal —
+            the system prompt only carries a 1–2-line description excerpt."""
+            return await _run_tool(_read_goal, ctx.deps, goal_id)
+
+        @agent.tool(sequential=True)
+        async def create_goal(
+            ctx: RunContext[AgentDeps],
+            title: str,
+            description: str = "",
+            goal_type: str = "idea",
+            parent_id: str | None = None,
+        ) -> str:
+            """Create a product goal in the registry (available only to you,
+            the research agent). Use ONLY when the user explicitly asked for
+            it or picked it in a clarification answer — never silently.
+            `title` is required; `description` (optional) states what and
+            why; `goal_type` is "idea" (a captured thought), "goal" (an
+            approved direction) or "milestone" (a decomposable checkpoint —
+            give it sub-goals via parent_id); `parent_id` (optional) makes
+            the new goal a sub-goal of an existing one (decomposition).
+            Every creation is logged into the chat's service events."""
+            return await _run_tool(
+                _create_goal, ctx.deps, title, description, goal_type, parent_id
+            )
+
+        @agent.tool(sequential=True)
+        async def update_goal(
+            ctx: RunContext[AgentDeps],
+            goal_id: str,
+            title: str | None = None,
+            description: str | None = None,
+            goal_type: str | None = None,
+            status: str | None = None,
+            parent_id: str | None = None,
+        ) -> str:
+            """Update ONE goal's fields (only the ones you pass change):
+            `title`, `description`, `goal_type` (idea/goal/milestone),
+            `status` (active/done/archived) or `parent_id` (decomposition —
+            pass "" to detach from the parent). Available only to you, the
+            research agent; use ONLY when the user asked for it or picked
+            the change in a clarification answer (e.g. after they chose a
+            decomposition variant). Done/archived goals disappear from the
+            goals block. Every change is logged into the chat's service
+            events — never silent."""
+            return await _run_tool(
+                _update_goal,
+                ctx.deps,
+                goal_id,
+                title=title,
+                description=description,
+                goal_type=goal_type,
+                status=status,
+                parent_id=parent_id,
             )
 
     @agent.tool

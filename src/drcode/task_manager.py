@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from pathlib import Path
 
+from .goals import GoalStore
 from .models import (
     PendingInput,
     Task,
@@ -125,6 +126,11 @@ def validate_dependencies(
 class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
+        # Long-lived product goals (<project>/.drcode/goals/<id>.json): the
+        # passive roadmap registry the research agent plans against. Lives
+        # on the manager so both the agent tools and the TUI reach the same
+        # in-memory state through `manager.goals`.
+        self.goals = GoalStore(project_root)
         # Scaffold the workflow templates (.drcode/workflow.py.example,
         # .drcode/git-workflow.md.example) — idempotent, never overwrites.
         ensure_workflow_examples(project_root)
@@ -163,6 +169,12 @@ class TaskManager:
             if t.status is TaskStatus.ACTIVE:
                 t.status = TaskStatus.QUEUED
                 self.storage.save(t)
+        # Goal-progress loop closure: every transition INTO COMPLETED of a
+        # task with a goal reference appends the "цель Y: n/m задач
+        # завершено" service event to the task's own chat log (registered
+        # FIRST so a caller-registered listener that raises cannot suppress
+        # it — listeners are individually guarded anyway).
+        self.add_completion_listener(self._goal_progress_event)
 
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
@@ -255,6 +267,34 @@ class TaskManager:
         never raises (listeners are individually guarded), so the save
         always runs."""
         self.fire_status_change(task, old, origin)
+        self.storage.save(task)
+
+    def _goal_progress_event(self, task: Task, _old: TaskStatus, _origin: str) -> None:
+        """Completion listener closing the goal-planning loop: a task with a
+        goal reference appends the "цель Y: n/m задач завершено" service
+        event to ITS OWN chat log (human-facing, never fed to the model).
+        n = completed tasks linked to the goal, m = all tasks ever linked
+        (append-only list — a re-queued completed task keeps its link and
+        counts once, by identity). The goal may have been deleted while its
+        tasks lived: then the link is dangling and the event is skipped —
+        the deletion was a deliberate user act, not a data problem."""
+        goal = self.goals.goals.get(task.goal_id) if task.goal_id else None
+        if goal is None:
+            return
+        total = len(goal.linked_task_ids)
+        done = sum(
+            1
+            for tid in goal.linked_task_ids
+            if (t := self.tasks.get(tid)) is not None
+            and t.status is TaskStatus.COMPLETED
+        )
+        task.events.append(
+            TaskEvent(
+                kind="goals",
+                text=f"цель {goal.title_display} ({goal.id}): {done}/{total} задач завершено",
+            )
+        )
+        task.touch()
         self.storage.save(task)
 
     # -- queries ------------------------------------------------------------
@@ -372,6 +412,7 @@ class TaskManager:
         hold: bool = False,
         origin: str = "user",
         depends_on: list[str] | None = None,
+        goal_id: str | None = None,
     ) -> Task:
         # Creation-time validation passes task_id=None (self-reference is
         # impossible — the id does not exist yet, so a dep naming it comes
@@ -379,6 +420,11 @@ class TaskManager:
         # checking. Raises ValueError BEFORE anything is stored or any
         # listener fires — the caller surfaces the message.
         cleaned_deps = validate_dependencies(self.tasks, None, depends_on or [])
+        # The goal reference is validated the same way: an unknown id aborts
+        # the creation before the task (or the goal's linked list) is
+        # touched — the TUI form and the agent tools surface the message.
+        if goal_id is not None and goal_id not in self.goals:
+            raise ValueError(f"unknown goal id: {goal_id}")
         first_line = (
             first_message.splitlines()[0][:60] if first_message.splitlines() else ""
         )
@@ -388,6 +434,14 @@ class TaskManager:
             queue_seq=self._next_queue_seq(),
         )
         task.depends_on = cleaned_deps
+        if goal_id is not None:
+            task.goal_id = goal_id
+            # Append-only link: the goal's progress counter counts over this
+            # list; a re-queued completed task keeps its link.
+            goal = self.goals.get(goal_id)
+            goal.linked_task_ids.append(task.id)
+            goal.touch()
+            self.goals.save(goal)
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
         if hold:

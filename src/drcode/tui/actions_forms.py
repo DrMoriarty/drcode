@@ -18,12 +18,13 @@ from rich.markup import escape
 from textual.containers import Vertical
 from textual.widgets import Static
 
-from ..models import TaskKind, TaskStatus
+from ..models import GoalType, TaskKind, TaskStatus
 from ..prompts import load_init_repo_prompt
 from ..providers import AgentRole, set_project_custom_model
 from ..task_manager import validate_dependencies
 from .actions_models import custom_entry_from_setup
 from .agents_dialog import AgentsMdDialog
+from .goal_screen import GoalCaptureScreen
 from .inputs import DepsInput, NewTaskInput
 from .setup_dialog import ModelSetup
 from .state import DrCodeState
@@ -164,6 +165,35 @@ class TaskFormLayer(DrCodeState):
         # parked on the previously viewed row — with viewed_id cleared it
         # would light that row in the cursor colour while composing.
         self._sync_sidebar_cursor(None)
+
+    # -- capturing a product goal ----------------------------------------------
+
+    def action_new_goal(self) -> None:
+        """Ctrl+G: the minimal goal-capture dialog (title required, type and
+        description optional). The goal lands in .drcode/goals/ immediately
+        and is visible to the research agent's planning from its next
+        activation — no restart, the goals block is recomputed per request.
+        Deliberately capture-only: no listing/editing UI (the Roadmap screen
+        is a separate, unapproved proposal)."""
+        self.push_screen(GoalCaptureScreen(), self._goal_captured)
+
+    def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None:
+        # None — ESC/Cancel: nothing to do, the pipeline is untouched.
+        if result is None:
+            return
+        title, description, goal_type = result
+        goal = self.manager.goals.create(title, description=description)
+        # The captured item starts as an IDEA unless the user explicitly
+        # classified it in the dialog (the agent refines it later too).
+        goal.type = goal_type
+        goal.touch()
+        self.manager.goals.save(goal)
+        self.notify(
+            f"Goal #{goal.id} ({goal.type.value}) '{goal.title_display}' "
+            "created — the research agent sees it from its next activation.",
+            title="Goals",
+            timeout=6,
+        )
 
     # -- editing a held task ---------------------------------------------------
 

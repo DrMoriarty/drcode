@@ -39,6 +39,24 @@ class TaskKind(str, enum.Enum):
     RESEARCH = "research"
 
 
+class GoalType(str, enum.Enum):
+    """Classification of a long-lived product goal (NOT a TaskKind):
+    an idea is a raw captured thought, a goal is an approved direction of
+    development, a milestone is a decomposable checkpoint with sub-goals
+    (parent_id) underneath it. Goals live for months, never pass through
+    the task state machine and are never verified by the tester."""
+
+    IDEA = "idea"
+    GOAL = "goal"
+    MILESTONE = "milestone"
+
+
+class GoalStatus(str, enum.Enum):
+    ACTIVE = "active"
+    DONE = "done"
+    ARCHIVED = "archived"
+
+
 class VerificationStatus(str, enum.Enum):
     # Метка, которую тестировщик ставит задаче: "Проверено успешно" / "Проверено с ошибками".
     PASSED = "Verified successfully"
@@ -265,6 +283,16 @@ class Task(BaseModel):
     # every compaction (see tui/pipeline.py), so the agent cannot "forget"
     # it. Rendered by render_todos below.
     todos: list[TodoItem] = Field(default_factory=list)
+    # The long-lived product goal this task serves (see drcode.models.Goal
+    # and the goals registry under .drcode/goals/). None for tasks created
+    # without a goal reference (old task files load with the plain default,
+    # no migration). Written at creation only (TaskManager.create goal_id /
+    # the agent's create_* goal_id parameter): a task never moves between
+    # goals. The goal's completion service event ("цель Y: n/m задач
+    # завершено") counts over the goal's linked_task_ids, which this field
+    # mirrors; a deleted goal id is tolerated at load time (the event
+    # writer just skips it), like a deleted depends_on id.
+    goal_id: str | None = None
 
     @property
     def unchecked_todos(self) -> list[TodoItem]:
@@ -314,6 +342,64 @@ class Task(BaseModel):
         # the truncated title onto a second sidebar line.
         title = " ".join(self.title.split())
         return title if len(title) <= 40 else title[:39] + "…"
+
+
+class Goal(BaseModel):
+    """A long-lived product-development goal (stage A, the passive registry).
+
+    Deliberately NOT a TaskKind: goals live for months, never enter the
+    task state machine and are never verified by the tester — they are the
+    roadmap layer the research agent plans against. Persisted as one JSON
+    file per goal under `<project>/.drcode/goals/` (see drcode.goals), so
+    they stay local like the tasks. Plain defaults everywhere keep forward
+    compatibility: old tooling reading task JSONs ignores unknown fields,
+    and a goal written by a newer build still loads here."""
+
+    id: str = Field(default_factory=_short_id)
+    title: str
+    description: str = ""
+    type: GoalType = GoalType.IDEA
+    status: GoalStatus = GoalStatus.ACTIVE
+    # Decomposition: a milestone may have sub-goals pointing at it. No
+    # validation beyond "the parent must exist" at write time (see
+    # GoalStore.create/update) — a deleted parent id is tolerated at load
+    # time, exactly like depends_on of tasks.
+    parent_id: str | None = None
+    # Ids of tasks created with a reference to this goal (create_bug_report /
+    # create_feature_request `goal_id`, the new-task form): the completion
+    # service event "цель Y: n/m задач завершено" counts over this list.
+    # Append-only on purpose — a re-queued completed task keeps its link.
+    linked_task_ids: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+
+    def touch(self) -> None:
+        self.updated_at = _now()
+
+    @property
+    def title_display(self) -> str:
+        title = " ".join(self.title.split())
+        return title if len(title) <= 40 else title[:39] + "…"
+
+    def summary_line(self, description_cap: int = 0) -> str:
+        """One compact line for agent-facing listings: `[<id>] (<type>)
+        <title>` plus, when `description_cap > 0`, the first cap characters
+        of the (whitespace-collapsed) description. The context-discipline
+        primitive: the system prompt injection lists goals with a small
+        cap, the full description stays behind read_goal."""
+        parts = [f"[{self.id}]", f"({self.type.value})", self.title_display]
+        if description_cap > 0:
+            text = " ".join(self.description.split())
+            if text:
+                parts.append(
+                    "— "
+                    + (
+                        text
+                        if len(text) <= description_cap
+                        else text[: description_cap - 1] + "…"
+                    )
+                )
+        return " ".join(parts)
 
 
 def render_todos(todos: list[TodoItem]) -> str:

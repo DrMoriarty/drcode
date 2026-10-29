@@ -27,6 +27,9 @@ from pydantic_ai import RunContext
 from . import tools
 from .merge_resolver import _project_python, _venv_env, _worktree_pythonpath_env
 from .models import (
+    Goal,
+    GoalStatus,
+    GoalType,
     Task,
     TaskKind,
     TaskStatus,
@@ -41,14 +44,20 @@ if TYPE_CHECKING:
 __all__ = [
     "TODO_MIN_ITEMS",
     "_commit_tracked_files",
+    "_create_goal",
     "_deps_suffix",
     "_git_push",
+    "_list_goals",
+    "_read_goal",
     "_retry_failed_here",
     "_run_project_check",
     "_set_task_dependencies",
     "_todo_create",
     "_todo_update",
     "_track_edited_file",
+    "_update_goal",
+    "goals_dynamic_instructions",
+    "goals_instructions",
     "load_agents_md",
     "todo_dynamic_instructions",
     "todo_instructions",
@@ -162,6 +171,241 @@ def _deps_suffix(task: Task) -> str:
         " It waits for: "
         + ", ".join(f"#{d}" for d in task.depends_on)
         + " (not promoted until all are COMPLETED and merged)."
+    )
+
+
+# Context discipline of the goal injection: the system prompt carries only
+# the title and the first ~160 chars of each description (1–2 lines) — the
+# full text stays behind read_goal, like todo lists stay behind their own
+# compact rendering. There are deliberately few active goals, but a roadmap
+# description can be a couple of paragraphs; never pour it into the prompt.
+_GOAL_PROMPT_CAP = 160
+
+
+def goals_instructions(active: list[Goal]) -> str | None:
+    """The compact "active goals" block for the research agent's dynamic
+    instructions (None when there are no active goals — the block is then
+    excluded from the request entirely, same contract as
+    todo_instructions).
+
+    Registered as DYNAMIC instructions (evaluated per model request), so a
+    goal created or updated mid-run by this very agent (create_goal /
+    update_goal) is visible to the next request of the same activation —
+    run-level instructions freeze at `agent.iter` start and would miss it.
+    Only status=active goals are listed: done/archived ones leave the
+    context (and the agent's planning surface) as soon as they are closed.
+    """
+    if not active:
+        return None
+    lines = [
+        "# Product goals (current roadmap)",
+        "",
+        "Long-lived goals the user is developing this project towards. Plan",
+        "any roadmap-adjacent work AGAINST them; details via read_goal:",
+        "",
+    ]
+    lines.extend(f"- {g.summary_line(_GOAL_PROMPT_CAP)}" for g in active)
+    lines.append(
+        "\nWhen your work serves one of these goals, say so explicitly in "
+        "the answer (a reference to a specific goal) and link any task you "
+        "create to that goal via its goal_id."
+    )
+    return "\n".join(lines)
+
+
+def goals_dynamic_instructions(ctx: RunContext[AgentDeps]) -> str | None:
+    """Dynamic instructions hook for the research agent: recompute the
+    active-goals block from the manager's CURRENT goal state for every
+    model request (see goals_instructions). Registered on the coding agent
+    for all kinds — only research tasks get goals, everything else yields
+    None (structurally: coding agents and the tester are never goal-aware
+    on this stage)."""
+    task = ctx.deps.manager.get(ctx.deps.task_id)
+    if task.kind is not TaskKind.RESEARCH:
+        return None
+    return goals_instructions(ctx.deps.manager.goals.active())
+
+
+def _list_goals(deps: AgentDeps, include_done: bool = False) -> str:
+    """Compact listing of the goal registry for the research agent.
+
+    Active goals first; done/archived ones only on explicit request (the
+    caller usually plans forward, not backward). One line per goal — the
+    same summary_line primitive the system prompt uses, so the listing
+    stays cheap even when the registry grows."""
+    goals = sorted(deps.manager.goals.goals.values(), key=lambda g: g.created_at)
+    if not include_done:
+        goals = [g for g in goals if g.status is GoalStatus.ACTIVE]
+    if not goals:
+        return "No goals in the registry yet (create one with create_goal)."
+    lines = [g.summary_line(160) for g in goals]
+    if include_done:
+        return "All goals:\n" + "\n".join(lines)
+    hidden = len(deps.manager.goals.goals) - len(goals)
+    suffix = (
+        f"\n(+{hidden} done/archived not shown; call list_goals again with include_done=True.)"
+        if hidden
+        else ""
+    )
+    return "\n".join(lines) + suffix
+
+
+def _read_goal(deps: AgentDeps, goal_id: str) -> str:
+    """Full goal details for the research agent: description (untruncated),
+    decomposition (parent/children), linked tasks with their live status.
+    Raises ValueError (→ ModelRetry via _run_tool) on an unknown id."""
+    try:
+        goal = deps.manager.goals.get(goal_id.strip())
+    except KeyError:
+        known = ", ".join(sorted(deps.manager.goals.goals)) or "(none)"
+        raise ValueError(f"unknown goal id: {goal_id}. Known goals: {known}") from None
+    store = deps.manager.goals
+    lines = [
+        f"Goal #{goal.id} ({goal.type.value}, {goal.status.value}): {goal.title}",
+        f"Created {goal.created_at:%Y-%m-%d}, updated {goal.updated_at:%Y-%m-%d}",
+    ]
+    if goal.description.strip():
+        lines += ["", "Description:", goal.description.strip()]
+    if goal.parent_id is not None:
+        parent = store.goals.get(goal.parent_id)
+        label = (
+            f"#{parent.id} {parent.title_display}"
+            if parent
+            else f"#{goal.parent_id} (deleted)"
+        )
+        lines.append(f"\nParent goal: {label}")
+    children = store.children(goal.id)
+    if children:
+        lines.append("\nSub-goals:")
+        lines.extend(f"- {c.summary_line()}" for c in children)
+    if goal.linked_task_ids:
+        lines.append("\nLinked tasks:")
+        for tid in goal.linked_task_ids:
+            t = deps.manager.tasks.get(tid)
+            if t is None:
+                lines.append(f"- #{tid} (deleted)")
+            else:
+                lines.append(
+                    f"- #{tid} ({t.kind.value}, {t.status.value}): {t.title_display}"
+                )
+    return "\n".join(lines)
+
+
+_GOAL_TYPES = ", ".join(t.value for t in GoalType)
+_GOAL_STATUSES = ", ".join(s.value for s in GoalStatus)
+
+
+def _parse_goal_type(value: str) -> GoalType:
+    normalized = value.strip().lower()
+    try:
+        return GoalType(normalized)
+    except ValueError:
+        raise ValueError(
+            f"invalid goal type: {value!r} — expected one of: {_GOAL_TYPES}"
+        ) from None
+
+
+def _parse_goal_status(value: str) -> GoalStatus:
+    normalized = value.strip().lower()
+    try:
+        return GoalStatus(normalized)
+    except ValueError:
+        raise ValueError(
+            f"invalid goal status: {value!r} — expected one of: {_GOAL_STATUSES}"
+        ) from None
+
+
+def _create_goal(
+    deps: AgentDeps,
+    title: str,
+    description: str = "",
+    goal_type: str = GoalType.IDEA.value,
+    parent_id: str | None = None,
+) -> str:
+    """Agent-side goal creation (research role only).
+
+    Raises ValueError (→ ModelRetry via _run_tool) for a bad type or an
+    unknown parent id. Every agent-made change is logged as a service event
+    in the task's chat — never silent."""
+    parsed_type = _parse_goal_type(goal_type)
+    goal = deps.manager.goals.create(
+        title,
+        description=description,
+        parent_id=parent_id,
+        origin="agent",
+    )
+    goal.type = parsed_type
+    goal.touch()
+    deps.manager.goals.save(goal)
+    note = f"цель {goal.title_display} ({goal.id}) создана агентом: {goal.type.value}"
+    if parent_id:
+        note += f", подцель #{parent_id}"
+    log_service_event(deps, "goals", note)
+    return (
+        f"Goal #{goal.id} ({goal.type.value}) created: {goal.title_display}.\n"
+        "Link the tasks that serve it via create_bug_report / "
+        "create_feature_request with goal_id."
+    )
+
+
+def _update_goal(
+    deps: AgentDeps,
+    goal_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    goal_type: str | None = None,
+    status: str | None = None,
+    parent_id: str | None = None,
+) -> str:
+    """Agent-side partial goal update (research role only).
+
+    Only the explicitly passed fields change; `parent_id=""` detaches the
+    goal from its parent. Raises ValueError (→ ModelRetry via _run_tool)
+    for an unknown goal id, bad enum values, unknown parent or a cycle in
+    the decomposition. The change is logged as a service event — never
+    silent."""
+    goal_id = goal_id.strip()
+    if goal_id not in deps.manager.goals:
+        raise ValueError(f"unknown goal id: {goal_id}")
+    fields: dict[str, object] = {}
+    changes: list[str] = []
+    if title is not None and title.strip():
+        fields["title"] = title.strip()
+        changes.append("название")
+    if description is not None:
+        fields["description"] = description.strip()
+        changes.append("описание")
+    if goal_type is not None:
+        parsed_type = _parse_goal_type(goal_type)
+        fields["type"] = parsed_type
+        changes.append(f"тип → {parsed_type.value}")
+    if status is not None:
+        parsed_status = _parse_goal_status(status)
+        fields["status"] = parsed_status
+        changes.append(f"статус → {parsed_status.value}")
+    if parent_id is not None:
+        fields["parent_id"] = parent_id
+        changes.append(
+            "привязана к родителю #" + parent_id.strip()
+            if parent_id.strip()
+            else "отделена от родителя"
+        )
+    if not fields:
+        raise ValueError(
+            "update_goal: nothing to change — pass at least one field "
+            "(title, description, goal_type, status, parent_id)."
+        )
+    goal = deps.manager.goals.update(goal_id, **fields)
+    log_service_event(
+        deps,
+        "goals",
+        f"цель {goal.title_display} ({goal.id}) уточнена агентом: {', '.join(changes)}",
+    )
+    return (
+        f"Goal #{goal.id} updated ({', '.join(changes)}). "
+        f"Current state: ({goal.type.value}, {goal.status.value}) "
+        f"{goal.title_display}."
     )
 
 

@@ -142,7 +142,6 @@ class ContextDialog(ModalScreen[None]):
         background: $panel;
         border: thick $accent;
     }
-    #ctx-tabs { height: auto; }
     #ctx-scroll { height: 1fr; }
     #ctx-body { width: 1fr; }
     #ctx-close-row {

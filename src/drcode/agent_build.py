@@ -527,7 +527,10 @@ def build_agent(
 
     @agent.tool
     def ask_clarifying_question(
-        ctx: RunContext[AgentDeps], question: str, options: list[str] | None = None
+        ctx: RunContext[AgentDeps],
+        question: str,
+        options: list[str] | None = None,
+        proposals: list[str] | None = None,
     ) -> str:
         """Ask the user a clarifying question and pause the task until they answer.
         Use when the request is ambiguous or a required detail is missing.
@@ -537,26 +540,35 @@ def build_agent(
         THIS tool with clickable options, never as free-form prose awaiting
         a reply. When in doubt whether options fit — pass them; clickable
         options are always better than prose.
-        `options` is an optional list of suggested answers; pass it when a small
-        set of choices covers the reasonable answers, otherwise omit it.
-        Format of `options`: a list of FLAT STRINGS (options: list[str] | None).
-        Each element is one COMPLETE ready-to-click answer — never an object
-        or dict like {"title": ..., "description": ...}: such a call is
-        rejected by schema validation ("Input should be a valid string"), the
-        task still pauses with an EMPTY option list, and the user has nothing
-        clickable to answer with. Correct example:
-        options=["Да, заведи багрепорт", "Нет, просто ответ"].
-        When constructing `options`, never mix what the user requested with
-        your own initiative: do NOT bundle an initiative item into a package
-        option like "yes: do X + Y + Z, everything at once" — declining the
-        bundle would then force declining the requested work too. Each
-        initiative item is its own SEPARATE opt-in option, phrased as a
-        proposal ("(agent's suggestion, not from your request): …"), so the
-        user can accept or decline it independently of the requested scope."""
+        `options` is an optional list of suggested answers covering ONLY what
+        directly follows from the user's request; pass it when a small set of
+        choices covers the reasonable answers, otherwise omit it.
+        `proposals` is an optional list of options you propose on your OWN
+        initiative, beyond the original request (each one a separate opt-in,
+        so the user can accept or decline it independently of the requested
+        scope). NEVER mix initiative into `options` and do NOT bundle an
+        initiative item into a package option like "yes: do X + Y + Z,
+        everything at once" — declining the bundle would force declining the
+        requested work too. Neither `options` nor `proposals` may contain
+        textual markers like "(agent's suggestion, not from your request)":
+        the separation is structural (the proposals parameter), the UI marks
+        proposals itself.
+        Format of both: lists of FLAT STRINGS (list[str] | None) — never an
+        object or dict like {"title": ..., "description": ...}: such a call
+        is rejected by schema validation ("Input should be a valid string"),
+        the task still pauses with an EMPTY option list, and the user has
+        nothing clickable to answer with. Correct example:
+        options=["Да, заведи багрепорт", "Нет, просто ответ"],
+        proposals=["Заведи фичу про X — по твоему усмотрению"].
+        BREVITY: each option/proposal is a SHORT imperative label (~5-10
+        words, e.g. "Заведи багрепорт: зависшие job_runs в running") —
+        reasoning and context go into the question text BEFORE the list,
+        never inside the options."""
         task = ctx.deps.manager.get(ctx.deps.task_id)
         task.clarification = Clarification(
             question=question.strip(),
             options=[o.strip() for o in (options or []) if o.strip()],
+            agent_proposals=[p.strip() for p in (proposals or []) if p.strip()],
         )
         task.status = TaskStatus.AWAITING_CLARIFICATION
         task.touch()

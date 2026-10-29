@@ -583,13 +583,18 @@ class TaskLifecycleLayer(DrCodeState):
         self.refresh_status()
 
     def action_pick_option(self, index: int) -> None:
-        """User clicked a clarifying-question option: submit it as their answer."""
+        """User clicked a clarifying-question option: submit it as their answer.
+
+        The combined list is options + agent_proposals (the starred block
+        renders after `options` with continuing indices), so a click on a
+        proposal submits the proposal text itself."""
         task = self.viewed
         if task is None or task.clarification is None:
             return
-        if not 0 <= index < len(task.clarification.options):
+        combined = task.clarification.options + task.clarification.agent_proposals
+        if not 0 <= index < len(combined):
             return
-        self._submit_user_text(task, task.clarification.options[index])
+        self._submit_user_text(task, combined[index])
 
     def action_open_task(self, task_id: str) -> None:
         """User clicked a task-id mention (#69c8bd30) in the chat or the

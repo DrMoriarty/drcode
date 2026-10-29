@@ -175,38 +175,52 @@ def test_research_prompt_git_fragment_project_override(tmp_path: Path) -> None:
 def test_research_prompt_initiative_boundary() -> None:
     """The research prompt carries the initiative-boundary section: answers
     separate what was asked from agent's proposals, ask_clarifying_question
-    options never bundle initiative into package opt-ins, and filed task
-    descriptions record only the user-confirmed scope."""
+    routes initiative items through the tool's `proposals` parameter (never
+    textual markers in options), and filed task descriptions record only
+    the user-confirmed scope."""
     from drcode.prompts import RESEARCH_SYSTEM_PROMPT
 
-    assert "# Initiative boundary" in RESEARCH_SYSTEM_PROMPT
-    assert "(agent's suggestion, not from your request)" in RESEARCH_SYSTEM_PROMPT
-    assert "SEPARATE opt-in" in RESEARCH_SYSTEM_PROMPT
-    assert "create_bug_report / create_feature_request" in RESEARCH_SYSTEM_PROMPT
-    assert "at the implementer's discretion" in RESEARCH_SYSTEM_PROMPT
+    # Whitespace-normalized: markdown line wrapping must not decide where
+    # the assertions can look.
+    research = " ".join(RESEARCH_SYSTEM_PROMPT.split())
+    assert "# Initiative boundary" in research
+    assert "SEPARATE `proposals` parameter" in research
+    assert "create_bug_report / create_feature_request" in research
+    assert "at the implementer's discretion" in research
+    # The old marker-text convention is DEAD: the phrase survives only as
+    # an explicit ban, never as a positive instruction.
+    assert "do NOT write textual markers" in research
+    assert "the separation is structural" in research
     # The information-vs-decision fork: FYI notes stay in prose, verdict-
     # requiring proposals must go through ask_clarifying_question — with the
     # explicit anti-example against "say the word and I'll do it" endings.
-    assert "REQUIRES a user verdict" in RESEARCH_SYSTEM_PROMPT
-    assert "must NEVER be left as prose awaiting" in RESEARCH_SYSTEM_PROMPT
-    assert "BAD example" in RESEARCH_SYSTEM_PROMPT
-    assert "word and I'll create the task." in RESEARCH_SYSTEM_PROMPT
-    assert "GOOD: the same question inside" in RESEARCH_SYSTEM_PROMPT
+    assert "REQUIRES a user verdict" in research
+    assert "must NEVER be left as prose awaiting" in research
+    assert "BAD example" in research
+    assert "word and I'll create the task." in research
+    assert "GOOD: the same question inside" in research
+    # Brevity discipline: short imperative labels, context in the question.
+    assert "~5–10-word imperative label" in research
 
 
 def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
     """The coding agents' prompts (bug/feature) carry the same rule next to
     their ask_clarifying_question mention: options keep requested work
-    separate from initiative, initiative rides in its own marked opt-in."""
+    separate from initiative (initiative rides the `proposals` parameter,
+    never textual markers), and every option stays a short label."""
     from drcode.prompts import BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT
 
     for template in (BUG_SYSTEM_PROMPT, FEATURE_SYSTEM_PROMPT):
-        assert "keep the user's request separate from your" in template
-        assert "(agent's suggestion, not from your request)" in template
+        normalized = " ".join(template.split())
+        assert "keep the user's request separate from your" in normalized
+        assert "`proposals` parameter" in normalized
+        assert "do NOT write textual markers" in normalized
         # The mirror of the information-vs-decision fork: verdict-requiring
         # proposals ride the tool, never prose.
-        assert "needs the user's verdict" in template
-        assert "never as prose in the answer" in template
+        assert "needs the user's verdict" in normalized
+        assert "never as prose in the answer" in normalized
+        # Brevity discipline.
+        assert "~5–10-word imperative label" in normalized
 
 
 def test_system_prompt_templates_carry_placeholder_header() -> None:

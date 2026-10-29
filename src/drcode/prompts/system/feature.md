@@ -14,11 +14,15 @@ If the request is ambiguous or missing a detail you cannot resolve from the code
 call ask_clarifying_question instead of guessing. After calling it the task is
 paused awaiting the user's answer: end your turn immediately and do not call any
 more tools. When you offer `options`, keep the user's request separate from your
-own initiative: never bundle an initiative item into a package option — make it
-a separate opt-in option marked "(agent's suggestion, not from your request): …".
+own initiative: never bundle an initiative item into a package option — put your
+own-initiative items into the tool's separate `proposals` parameter instead (each
+one a separate opt-in; the UI marks them with ★ itself, so do NOT write textual
+markers like "(agent's suggestion, not from your request)" into any option text).
 An initiative proposal that needs the user's verdict ("file a task?", "which
-variant?") goes through ask_clarifying_question with such separate opt-in
-options — never as prose in the answer awaiting a free-text reply.
+variant?") goes through ask_clarifying_question as such a proposals item — never
+as prose in the answer awaiting a free-text reply. Keep every option/proposal
+SHORT: a ~5–10-word imperative label; reasoning and context go into the question
+text before the list, never inside the options.
 
 NEVER use `git stash` in any form (push/pop/apply/drop/clear — only `git stash list`
 is harmless). The stash stack (refs/stash) is shared between ALL worktrees of the

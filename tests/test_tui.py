@@ -379,17 +379,26 @@ def test_split_agent_marker_canonical_and_fallbacks() -> None:
     assert _split_agent_marker("(предложение агента): своё") == (True, "своё")
     assert _split_agent_marker("(моя инициатива): помочь") == (True, "помочь")
 
-    # Marker must sit in the option's head — not deep in the text.
-    far = "x" * 61 + " mentioning not from your request deep in the text"
-    assert _split_agent_marker(far) == (False, far)
+    # Marker NOT in the head but deep in the text: the option is still
+    # recognized as agent-initiative, and the parenthesized marker span
+    # is cut out of the display text.
+    tail = "Продолжить работу (agent's suggestion, not from your request)"
+    assert _split_agent_marker(tail) == (True, "Продолжить работу")
+    tail_mid = "Починить тесты (agent's suggestion), потом деплой"
+    assert _split_agent_marker(tail_mid) == (True, "Починить тесты, потом деплой")
+
+    # Deep marker WITHOUT parentheses: still starred, text kept whole
+    # (nothing safe to cut).
+    deep = "x" * 61 + " mentioning not from your request deep in the text"
+    assert _split_agent_marker(deep) == (True, deep.strip())
 
     # Plain options pass through untouched.
     plain = "Да, заведи багрепорт"
     assert _split_agent_marker(plain) == (False, plain)
 
-    # Marker without a colon: keep the whole text (display fallback).
+    # Marker without a colon at the head: the parenthesized span is cut.
     no_colon = "(agent's suggestion, not from your request) weird shape"
-    assert _split_agent_marker(no_colon) == (True, no_colon)
+    assert _split_agent_marker(no_colon) == (True, "weird shape")
 
 
 async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
@@ -443,6 +452,88 @@ async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
         tail = rendered().split("Which one?")[1]
         assert "★" not in tail
         assert "option proposed by the agent" not in tail
+
+
+async def test_clarification_render_agent_proposals_block(app: DrCodeApp) -> None:
+    """Structural agent proposals (Clarification.agent_proposals) render as
+    a starred block AFTER the plain options, with click indices continuing
+    the numbering, and turn the ★ footnote on. A legacy Clarification
+    without the field renders as before."""
+    from drcode.models import Clarification
+
+    def rendered() -> str:
+        return "\n".join(
+            str(w.content)  # pyright: ignore[reportAttributeAccessIssue]
+            for w in app.query(".chat-block")
+        )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._write_clarification(
+            Clarification(
+                question="Which fix?",
+                options=["Откатить миграцию", "Починить индекс"],
+                agent_proposals=["Заведи багрепорт: зависшие job_runs"],
+            )
+        )
+        await pilot.pause()
+        text = rendered()
+        # Plain options: no stars, indices 0 and 1.
+        assert "★[/] [@click=app.pick_option(0)]" not in text
+        assert "★[/] [@click=app.pick_option(1)]" not in text
+        assert "[@click=app.pick_option(0)][underline cyan]Откатить миграцию[/]" in text
+        assert "[@click=app.pick_option(1)][underline cyan]Починить индекс[/]" in text
+        # The proposal: starred, its index CONTINUES after the options.
+        assert (
+            "[bold yellow]★[/] [@click=app.pick_option(2)]"
+            "[underline cyan]Заведи багрепорт: зависшие job_runs[/]" in text
+        )
+        # The footnote is on because a starred option exists.
+        assert (
+            "★ — option proposed by the agent on its own initiative, "
+            "not part of your request." in text
+        )
+
+        # Legacy stored clarification without the field: plain render.
+        legacy = Clarification(question="Which one?", options=["a", "b"])
+        assert legacy.agent_proposals == []
+        app._write_clarification(legacy)
+        await pilot.pause()
+        tail = rendered().split("Which one?")[1]
+        assert "★" not in tail
+        assert "option proposed by the agent" not in tail
+
+
+async def test_pick_option_accepts_agent_proposal_index(app: DrCodeApp) -> None:
+    """action_pick_option validates against the COMBINED list (options +
+    agent_proposals): a click on a starred proposal submits the proposal
+    text; an out-of-range index is a no-op."""
+    from drcode.models import Clarification
+
+    task = app.manager.create("feature", "prompt")
+    task.clarification = Clarification(
+        question="Which fix?",
+        options=["Откатить миграцию"],
+        agent_proposals=["Заведи багрепорт: зависшие job_runs"],
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Index 1 is the proposal (continues after the single option).
+        app.action_pick_option(1)
+        await pilot.pause()
+        # (The task's creation prompt also sits in pending_input — it was
+        # never consumed; the proposal is appended after it.)
+        assert [e.text for e in task.pending_input][-1] == (
+            "Заведи багрепорт: зависшие job_runs"
+        )
+        # Out of range: no-op.
+        pending_before = list(task.pending_input)
+        app.action_pick_option(2)
+        app.action_pick_option(-1)
+        await pilot.pause()
+        assert list(task.pending_input) == pending_before
 
 
 async def test_fat_live_write_mounts_through_drain(app: DrCodeApp) -> None:

@@ -67,10 +67,16 @@ class TaskEvent(BaseModel):
 
 
 class Clarification(BaseModel):
-    """A question the agent asked the user and is waiting an answer for."""
+    """A question the agent asked the user and is waiting an answer for.
+
+    `agent_proposals` holds options the agent added on its OWN initiative,
+    outside the user's request — kept structurally separate from `options`
+    so no textual marker ("(agent's suggestion, …)") is needed. Rendered
+    after `options` with a ★; clickable indices continue after them."""
 
     question: str
     options: list[str] = Field(default_factory=list)
+    agent_proposals: list[str] = Field(default_factory=list)
 
 
 class TodoItem(BaseModel):

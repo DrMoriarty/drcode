@@ -172,14 +172,34 @@ def _mention_markup(text: str) -> str:
     return TASK_MENTION_RE.sub(_wrap, text)
 
 
-# Marker the system prompts tell the model to prefix its OWN initiative
-# options with (canonical English form, plus the localized fallbacks a
-# model may drift into). Matched case-insensitively within the first ~60
-# chars of the option text.
+# Marker the system prompts USED to tell the model to prefix its OWN
+# initiative options with (canonical English form, plus the localized
+# fallbacks a model may drift into). Matched case-insensitively anywhere
+# in the option text — models put it at the head AND at the tail. New
+# clarifications carry initiative options structurally (Clarification
+# .agent_proposals); this fallback only cleans up OLD stored options.
 AGENT_SUGGESTION_RE = re.compile(
     r"agent's suggestion|not from your request|предложение агента|моя инициатива",
     re.IGNORECASE,
 )
+
+# A parenthesized span that contains the marker: "(agent's suggestion,
+# not from your request)" and variants. Used to cut the marker out of
+# the middle/tail of an option.
+AGENT_SUGGESTION_PAREN_RE = re.compile(
+    r"\([^()]*(?:agent's suggestion|not from your request"
+    r"|предложение агента|моя инициатива)[^()]*\)",
+    re.IGNORECASE,
+)
+
+
+def _clean_marker_removal(text: str) -> str:
+    """Tidy up a string after a parenthesized marker was cut out:
+    collapse doubled spaces, fix a space before punctuation, drop a
+    leading/trailing hanging comma or dash."""
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip().strip(",;:-–—").strip()
 
 
 def _split_agent_marker(option: str) -> tuple[bool, str]:
@@ -187,15 +207,34 @@ def _split_agent_marker(option: str) -> tuple[bool, str]:
 
     Returns ``(is_agent_suggestion, display_text)``. The marker stays in
     the stored option (it is part of the answer the model receives when
-    the user clicks) — only the RENDERED text loses the prefix, replaced
-    by a ★.
+    the user clicks) — only the RENDERED text loses it, replaced by a ★.
+
+    The marker is searched over the WHOLE option text (models put it at
+    the head and at the tail alike). At the head the canonical shape is
+    "(marker …): real text" — cut through the colon; in the middle or at
+    the tail the parenthesized "(…marker…)" span is removed and the
+    leftovers (doubled spaces, hanging punctuation) cleaned up.
     """
-    if not AGENT_SUGGESTION_RE.search(option[:60]):
+    match = AGENT_SUGGESTION_RE.search(option)
+    if match is None:
         return False, option
-    # Canonical shape: "(marker …): real text" — cut through the colon
-    # that closes the marker prefix. Without a colon, keep the text whole.
-    _, sep, rest = option.partition(":")
-    return True, (rest.strip() if sep else option.strip())
+    # Marker near the head: canonical "(marker …): real text" prefix —
+    # cut through the colon that closes it. Without a colon, strip the
+    # parenthesized marker if it is one, else keep the text whole.
+    if match.start() < 60:
+        _, sep, rest = option.partition(":")
+        if sep and AGENT_SUGGESTION_RE.search(option[: option.index(":")]):
+            return True, rest.strip()
+        stripped = AGENT_SUGGESTION_PAREN_RE.sub("", option)
+        if stripped != option:
+            return True, _clean_marker_removal(stripped)
+        return True, option.strip()
+    # Marker in the middle or at the tail: remove the parenthesized span
+    # holding it (if the text is parenthesized there) and tidy up.
+    stripped = AGENT_SUGGESTION_PAREN_RE.sub("", option)
+    if stripped != option:
+        return True, _clean_marker_removal(stripped)
+    return True, option.strip()
 
 
 class ChatTimelineLayer(DrCodeState):
@@ -906,15 +945,28 @@ class ChatTimelineLayer(DrCodeState):
         lines = [
             f"[bold blue]drcode ❓[/] {_mention_markup(escape(clarification.question))}"
         ]
+        # Plain options first (a legacy agent-marker inside an old option's
+        # text still gets its ★ via _split_agent_marker), then the agent's
+        # own proposals with a ★ — indices CONTINUE after `options`, and
+        # action_pick_option validates against the combined list.
         has_agent_option = False
+
+        def _option_line(index: int, display: str, *, star: bool) -> str:
+            return (
+                f"  ▸ {'[bold yellow]★[/] ' if star else ''}"
+                f"[@click=app.pick_option({index})]"
+                f"[underline cyan]{escape(display)}[/][/]"
+            )
+
         for i, option in enumerate(clarification.options):
             is_agent, display = _split_agent_marker(option)
             has_agent_option = has_agent_option or is_agent
-            star = "[bold yellow]★[/] " if is_agent else ""
-            lines.append(
-                f"  ▸ {star}[@click=app.pick_option({i})]"
-                f"[underline cyan]{escape(display)}[/][/]"
-            )
+            lines.append(_option_line(i, display, star=is_agent))
+        for j, proposal in enumerate(
+            clarification.agent_proposals, start=len(clarification.options)
+        ):
+            has_agent_option = True
+            lines.append(_option_line(j, proposal, star=True))
         if has_agent_option:
             lines.append(
                 "[dim]★ — option proposed by the agent on its own initiative, "

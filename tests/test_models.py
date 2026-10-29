@@ -110,3 +110,11 @@ def test_task_event_defaults() -> None:
 
 def test_clarification_options_default_empty() -> None:
     assert Clarification(question="q?").options == []
+
+
+def test_clarification_agent_proposals_default_empty() -> None:
+    """Old task JSONs without agent_proposals validate as an empty list —
+    no migration needed."""
+    assert Clarification(question="q?").agent_proposals == []
+    legacy = Clarification.model_validate({"question": "q?", "options": ["a"]})
+    assert legacy.agent_proposals == []

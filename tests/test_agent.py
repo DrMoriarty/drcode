@@ -1390,18 +1390,30 @@ def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
 
 def test_ask_clarifying_question_options_discipline(fake_config: Config) -> None:
     """The shared ask_clarifying_question tool description teaches the
-    options-construction rule: requested work and initiative never mix in
-    one option — initiative items are separate marked opt-ins, so
-    declining them never forces declining the requested scope."""
+    options-construction rule: `options` carries only what follows from the
+    request, initiative goes through the separate `proposals` parameter
+    (no textual markers — the separation is structural), and every
+    option/proposal stays a short imperative label."""
     from drcode.agent import build_agent
 
     for kind in (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH):
         ag = build_agent(fake_config, kind=kind)
         tool = ag._function_toolset.tools["ask_clarifying_question"]
-        desc = tool.description or ""
-        assert "never mix what the user requested with" in desc
-        assert "SEPARATE opt-in option" in desc
-        assert "(agent's suggestion, not from your request)" in desc
+        # Whitespace-normalized: the docstring's line wrapping must not
+        # decide where the assertions can look.
+        desc = " ".join((tool.description or "").split())
+        assert (
+            "`proposals` is an optional list of options you propose on your OWN" in desc
+        )
+        assert "NEVER mix initiative into `options`" in desc
+        # The old marker convention is dead: mentioned only as a ban.
+        assert (
+            'textual markers like "(agent\'s suggestion, not from your request)"'
+            in desc
+        )
+        assert "the separation is structural" in desc
+        # Brevity discipline.
+        assert "SHORT imperative label" in desc
         # Positive trigger: choices between continuations — including the
         # agent's own initiative proposals — go through THIS tool.
         assert "choose between continuations" in desc
@@ -1587,9 +1599,7 @@ def test_build_tester_agent_appends_agents_md(
     (project_root / "AGENTS.md").write_text("PROJECT SPECIFIC RULE")
     ag = build_tester_agent(fake_config, root=project_root)
     instructions = _instructions_text(ag)
-    assert (
-        load_tester_prompt(project_root=project_root) in instructions
-    )
+    assert load_tester_prompt(project_root=project_root) in instructions
     assert "Project instructions (AGENTS.md)" in instructions
     assert "PROJECT SPECIFIC RULE" in instructions
     # The commit-free variant gets the same rules.

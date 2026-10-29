@@ -1,0 +1,194 @@
+"""drcode workflow hooks (template).
+
+ACTIVATION: rename this file to `workflow.py` (keep it in the project's
+`.drcode/` directory) and uncomment the hooks you need. drcode scaffolds
+this template on every start, but NEVER overwrites it — edit it in place.
+
+Each defined hook runs in an isolated subprocess (cwd = project root, or
+the task's worktree when per-task worktree isolation is on) and receives
+one JSON payload:
+
+    {"hook": "<name>",
+     "task": {"id", "title", "kind", "github_issue"},
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>},
+     "worktree": {"path", "branch"}        <- only with task isolation on,
+     "project": {"path", "base_branch"}}   <- only on_research_accepted}
+
+Every hook is optional — an absent function simply skips its step. A hook
+failure (non-zero exit, timeout, malformed output) is NEVER fatal: it is
+written into the task's service-event log and the pipeline moves on — with
+one exception: on_review fails CLOSED (the task waits, the review is
+retried with backoff), because an unreachable reviewer must not wave a
+change through.
+
+============================================================================
+WHICH HOOKS TO UNCOMMENT (the three common setups)
+============================================================================
+
+1.  TASK ISOLATION + AUTOMATIC MERGE — the out-of-the-box degenerate
+    accept. You turned `task_isolation: worktree` on (project settings)
+    and want a working loop with no external review: every task develops
+    inside its own worktree on branch `drcode/<task-id>`, and when the
+    tester passes it the finished work is merged into your checkout
+    automatically. Uncomment exactly THREE hooks below: on_review (the
+    degenerate reviewer — accepts everything), on_accepted and
+    on_research_accepted (the mergers). on_review MUST be defined for the
+    merges to happen at all: the pipeline reaches on_accepted only
+    through an accepted review, so the always-accept reviewer unlocks
+    them. The helper functions between this docstring and the hooks are
+    already active — no other edits are needed. Afterwards: task done and
+    tester-passed means its commits are in your checkout's branch; each
+    merge is recorded in the task's service-event log ("accepted: merged
+    drcode/<id> into <branch>").
+
+2.  TASK ISOLATION, MANUAL MERGE. Tasks work in worktrees, but you merge
+    `drcode/<task-id>` into your branch by hand when you are ready.
+    Uncomment NOTHING: without hooks the pipeline simply reminds you
+    about every unmerged task branch.
+
+3.  EXTERNAL REVIEW (CI, a human, a PR gate) instead of the degenerate
+    one. Uncomment on_review and replace its body with real checks
+    ({"verdict": "pending"} while checks run, {"verdict": "reject",
+    "comment": "..."} sends the task back to development); keep
+    on_accepted / on_research_accepted uncommented too if the merge
+    itself should stay automatic — the real verdict then only decides
+    WHEN it happens.
+
+Optional extras (rarely needed):
+    on_task_start — check out a branch / inject instructions into the
+                    first prompt; only meaningful WITHOUT worktree
+                    isolation (with isolation the task already works on
+                    its own branch `drcode/<task-id>` in its own tree).
+    on_development_done — push / open a PR before testing starts.
+    on_tester_passed — install / deploy after every PASSED finalization.
+
+SECURITY: workflow.py is arbitrary code executed with your full
+permissions. Only activate a workflow file you have read and trust.
+"""
+
+import subprocess
+from pathlib import Path
+
+
+def _git(*args, cwd=None):
+    """Shared helper: run git, return (returncode, combined output).
+    Never raises."""
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _main_checkout(task):
+    """Shared helper: the user's main checkout — the tree whose
+    checked-out branch the task's work must finally land on.
+    on_research_accepted carries it in the payload ("project"."path");
+    for every other hook it is derived from git itself: the first entry
+    of `git worktree list` is always the main working tree, and the
+    hook's cwd (the task's worktree) belongs to the same repository."""
+    path = (task.get("project") or {}).get("path")
+    if path:
+        return Path(path)
+    code, out = _git("worktree", "list", "--porcelain")
+    if code == 0 and out:
+        return Path(out.splitlines()[0].removeprefix("worktree "))
+    return Path.cwd()
+
+
+def _merge_task_branch(task, what):
+    """Shared helper: THE DEGENERATE ACCEPT. Merge the finished task's
+    branch `drcode/<task-id>` into whatever branch the main checkout has
+    checked out right now (a fast-forward when possible, a merge commit
+    otherwise). A checkout with modified tracked files is left alone —
+    the branch is reported for a manual merge instead of fighting the
+    user's uncommitted work (untracked files, e.g. this very script, do
+    not block the merge). With isolation off the work already IS in the
+    shared tree: nothing to merge, returns None."""
+    worktree = task.get("worktree")
+    if not worktree:
+        return None
+    branch = worktree["branch"]
+    main = _main_checkout(task)
+    code, head = _git("-C", str(main), "rev-parse", "--abbrev-ref", "HEAD")
+    base = head if code == 0 and head else "(detached HEAD)"
+    code, status = _git("-C", str(main), "status", "--porcelain", "-uno")
+    if code != 0:
+        return {
+            "text": f"{what}: branch {branch} NOT merged — {main} is not a "
+            f"usable git checkout; merge by hand: git merge {branch}"
+        }
+    if status:
+        return {
+            "text": f"{what}: branch {branch} NOT merged into {base} — the "
+            f"checkout has uncommitted changes; merge by hand when ready: "
+            f"git merge {branch}"
+        }
+    code, out = _git("-C", str(main), "merge", "--no-edit", branch)
+    if code != 0:
+        return {
+            "text": f"{what}: merge of {branch} into {base} FAILED — sort it "
+            f"out in {main} by hand (git status / git merge --abort):\n{out}"
+        }
+    return {"text": f"{what}: merged {branch} into {base}:\n{out}"}
+
+
+# def on_review(task):
+#     """Degenerate accept, part 1 of 3: the always-yes reviewer. Needed
+#     whenever you want the automatic merge (below) but have no external
+#     review to gate it — the pipeline runs on_accepted only after an
+#     accepted review, so this hook simply waves everything through.
+#     Replace the body later with real checks (setup 3 in the module
+#     docstring above)."""
+#     return {"verdict": "accept"}
+
+
+# def on_accepted(task):
+#     """Degenerate accept, part 2 of 3: auto-merge for development tasks.
+#     Runs right after the review accepted the tester-passed task (the
+#     pipeline's only path to on_accepted). Merges `drcode/<task-id>`
+#     into the main checkout's current branch. Return {"text": "..."} for
+#     the task's service-event log."""
+#     return _merge_task_branch(task, "accepted")
+
+
+# def on_research_accepted(task):
+#     """Degenerate accept, part 3 of 3: auto-merge for RESEARCH tasks
+#     (they skip testing entirely and never reach on_accepted). Merges
+#     the docs branch `drcode/<task-id>` the same way; the payload also
+#     carries "project": {"path", "base_branch"} — _merge_task_branch
+#     prefers it when present. Return {"text": "..."} for the task's
+#     service-event log."""
+#     return _merge_task_branch(task, "research accepted")
+
+
+# def on_task_start(task):
+#     """Optional extra: before the FIRST activation of a task. Only
+#     meaningful WITHOUT worktree isolation (with isolation the task
+#     already works on its own branch `drcode/<task-id>` in its own
+#     worktree). MUST be idempotent: an abort leaves a dirty tree on the
+#     branch. Return {"instructions": "..."} to inject text into the
+#     coding agent's first prompt."""
+#     subprocess.run(
+#         ["git", "checkout", "-B", f"task/{task['task']['id']}"], check=True
+#     )
+#     return {
+#         "instructions": f"Commit your work to branch task/{task['task']['id']}."
+#     }
+
+
+# def on_development_done(task):
+#     """Optional extra: development finished, before testing (push,
+#     `gh pr create`, ...). Return {"text": "..."} to append context to
+#     the tester's prompt."""
+
+
+# def on_tester_passed(task):
+#     """Optional extra: right after the tester stamped the task PASSED
+#     and it is finalized (runs on every path to COMPLETED-after-PASSED) —
+#     the unconditional post-verification hook: install / deploy here.
+#     Research tasks never trigger it (they skip testing). Return
+#     {"text": "..."} for the task's service-event log."""
+#     proc = subprocess.run(
+#         ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
+#     )
+#     return {"text": proc.stdout or proc.stderr}

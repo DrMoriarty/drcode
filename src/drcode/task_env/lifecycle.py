@@ -120,6 +120,74 @@ class _WorktreeLifecycleMixin:
         code, out = self._git("merge", "--ff-only", "--no-edit", branch)
         return code == 0, out
 
+    def clear_identical_untracked_for_ff(
+        self, task_id: str
+    ) -> tuple[list[str], list[str]]:
+        """Pre-process the ff-merge's untracked-file collisions in the MAIN
+        checkout: paths the merge would overwrite that exist there as
+        untracked files (the "file conflicts with itself" case — a copy
+        was snapshotted into the worktree, committed on the branch and
+        now blocks its own fast-forward). Files whose local blob is
+        IDENTICAL to the branch version are removed (zero risk: after
+        the ff git restores exactly those bytes from the repository);
+        files that DIFFER are returned untouched — the caller must
+        refuse the merge and ask for a manual move/remove.
+
+        Returns (removed, differing) — project-relative path lists, both
+        empty when there is nothing to clean (or isolation is off / the
+        branch is gone — nothing to pre-process either). Tracked files
+        and files absent from the branch are never touched. Blocking
+        git — callers wrap in to_thread."""
+        if not self.active:
+            return [], []
+        branch = self.branch(task_id)
+        if not self._branch_exists(branch):
+            return [], []
+        code, out = self._git("merge-base", self.base_branch(), branch)
+        if code != 0:
+            return [], []
+        merge_base = out.strip()
+        # Paths the ff-merge would CREATE in the main checkout: added on
+        # the task branch since the merge-base (modified/deleted paths
+        # are tracked in the main checkout or absent — no collision).
+        code, out = self._git(
+            "diff", "--name-only", "--diff-filter=A", f"{merge_base}..{branch}"
+        )
+        if code != 0:
+            return [], []
+        removed: list[str] = []
+        differing: list[str] = []
+        for line in out.splitlines():
+            path = line.strip()
+            if not path:
+                continue
+            local = self.project_root / path
+            if not local.is_file():
+                continue
+            # Tracked in the main checkout? The merge handles it (and
+            # its local modifications) — not our case, never touch it.
+            code, tracked = self._git("ls-files", "--", path)
+            if code != 0 or tracked.strip():
+                continue
+            code, branch_hash = self._git("rev-parse", f"{branch}:{path}")
+            if code != 0:
+                differing.append(path)
+                continue
+            code, local_hash = self._git("hash-object", "--", str(local))
+            if code != 0:
+                differing.append(path)
+                continue
+            if local_hash.strip() == branch_hash.strip():
+                try:
+                    local.unlink()
+                except OSError:
+                    differing.append(path)
+                    continue
+                removed.append(path)
+            else:
+                differing.append(path)
+        return removed, differing
+
     # -- lifecycle -------------------------------------------------------------
 
     def root_now(self, task_id: str) -> Path:

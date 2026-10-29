@@ -74,6 +74,7 @@ __all__ = [
     "ruff_check",
     "run_test_suite",
     "save_verify_report",
+    "stage_resolved",
     "unresolved_conflict_paths",
     "verify_report_path",
 ]
@@ -833,10 +834,25 @@ def _cap(text: str, cap: int) -> str:
 # -- outcome -----------------------------------------------------------------------
 
 
+def stage_resolved(worktree: Path, paths: list[str]) -> tuple[bool, str]:
+    """Stage the resolved conflict paths (`git add -- <paths>`) so the
+    concluding commit can proceed: `merge_engine.finish` refuses while
+    unmerged index entries remain, and the resolver agent — by design —
+    never touches the index (the resolved files would otherwise stay
+    unmerged no matter how clean the worktree is). The pipeline calls
+    this AFTER the full verification funnel has passed; `git add` stages
+    a deletion too, so agent-chosen removals resolve correctly. Returns
+    (ok, git output)."""
+    if not paths:
+        return True, ""
+    code, out = _git("add", "--", *paths, cwd=worktree)
+    return code == 0, out[:1000]
+
+
 def conclude(worktree: Path, message: str) -> tuple[bool, str]:
     """Commit the verified resolution (`git commit` of the merge in
     progress). Refuses while unmerged paths remain — the caller must have
-    verified first."""
+    verified first AND staged the resolved paths (`stage_resolved`)."""
     return merge_engine.finish(worktree, message)
 
 

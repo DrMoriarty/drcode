@@ -577,6 +577,34 @@ def test_conclude_refuses_with_unmerged_paths(repo: Path) -> None:
     assert not ok and "remain" in msg
 
 
+def test_stage_resolved_lets_conclude_commit(repo: Path) -> None:
+    # The bcd4a7ad incident class: a clean resolution left in the
+    # worktree only — the index stays unmerged, `finish` refuses. The
+    # pipeline's post-funnel staging must be what unlocks the commit.
+    wt, report = _conflicted_repo(repo, "t1")
+    (wt / "app.py").write_text("task\nmain\nb\n")
+    ok, msg = mr.conclude(wt, "premature")
+    assert not ok and "remain" in msg
+    staged, stage_msg = mr.stage_resolved(wt, [f.path for f in report.files])
+    assert staged, stage_msg
+    ok, msg = mr.conclude(wt, "resolved")
+    assert ok, msg
+    assert me.unmerged_paths(wt) == []
+    assert me.is_fast_forward(repo, "drcode/t1", "main")
+
+
+def test_stage_resolved_handles_deletion(repo: Path) -> None:
+    # The agent resolved a modify/delete conflict by removing the file:
+    # `git add` must stage the deletion, not fail.
+    wt, report = _conflicted_repo(repo, "t1")
+    (wt / "app.py").unlink()
+    staged, stage_msg = mr.stage_resolved(wt, [f.path for f in report.files])
+    assert staged, stage_msg
+    assert me.unmerged_paths(wt) == []
+    ok, msg = mr.conclude(wt, "resolved by deletion")
+    assert ok, msg
+
+
 def test_resolver_outcome_summary(repo: Path) -> None:
     outcome = mr.ResolverOutcome(verdict="resolved")
     outcome.checks = [

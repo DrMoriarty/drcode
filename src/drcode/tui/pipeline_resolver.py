@@ -62,6 +62,7 @@ from ..merge_resolver import (
     restore_conflict,
     review_diffs,
     run_test_suite,
+    stage_resolved,
 )
 from ..models import Task
 from ..providers import AgentRole
@@ -359,7 +360,9 @@ class PipelineResolverLayer(DrCodeState):
 
             # -- the verification funnel ----------------------------------------------
             outcome = await self._verify_resolution(task, root, report, deps)
-            await self._apply_resolver_outcome(task, root, base, outcome)
+            await self._apply_resolver_outcome(
+                task, root, base, outcome, [f.path for f in report.files]
+            )
         except asyncio.CancelledError:
             cancelled = True
             self._persist_resolver_messages(task, run)
@@ -528,17 +531,31 @@ class PipelineResolverLayer(DrCodeState):
         return outcome
 
     async def _apply_resolver_outcome(
-        self, task: Task, root: Path, base: str, outcome: ResolverOutcome
+        self,
+        task: Task,
+        root: Path,
+        base: str,
+        outcome: ResolverOutcome,
+        paths: list[str],
     ) -> None:
         """Commit a fully verified resolution — or restore the pristine
-        conflict and mark the task needs_human."""
+        conflict and mark the task needs_human. `paths` are the resolved
+        conflict paths (the triage report's files — the same set the
+        funnel verified): they are staged here (`git add`) because the
+        resolver agent never touches the index, and `finish` refuses
+        while unmerged entries remain (the bcd4a7ad incident: a fully
+        verified resolution lost to an unstaged index)."""
         branch = self.task_env.branch(task.id)
         if outcome.verdict == "resolved":
-            message = (
-                f"Merge {base} into {branch}: resolve conflicts "
-                f"(drcode automatic resolver)"
-            )
-            ok, msg = await asyncio.to_thread(conclude, root, message)
+            staged, stage_msg = await asyncio.to_thread(stage_resolved, root, paths)
+            if staged:
+                message = (
+                    f"Merge {base} into {branch}: resolve conflicts "
+                    f"(drcode automatic resolver)"
+                )
+                ok, msg = await asyncio.to_thread(conclude, root, message)
+            else:
+                ok, msg = False, f"staging the resolved files failed: {stage_msg}"
             if ok:
                 outcome.committed = True
                 task.needs_human = False

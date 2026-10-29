@@ -39,6 +39,7 @@ from ...settings import (
     SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
+    WORKTREE_SNAPSHOT_OPTIONS,
     GitPolicy,
     ProjectSettings,
     TaskIsolation,
@@ -548,6 +549,15 @@ class TaskSettingsEntriesProvider(CommandListProvider):
                 "(project setting)",
             ),
             CommandEntry(
+                f"Worktree snapshot: {app.settings.worktree_snapshot.label}",
+                app.action_change_worktree_snapshot,
+                "When a settling task's worktree gets the automatic "
+                "snapshot commit on drcode/<id>: always, only when the "
+                "run made no commits of its own (a deliberate uncommitted "
+                "tail is kept — and any removal keeps the worktree with "
+                "it), or never (project setting)",
+            ),
+            CommandEntry(
                 f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
                 app.action_change_subagents_coder,
                 "How many read-only research subagents the CODING agent "
@@ -810,6 +820,28 @@ class WorktreeRemovalOptionsProvider(CommandListProvider):
                 partial(app.action_set_worktree_removal, option),
             )
             for option in WORKTREE_REMOVAL_OPTIONS
+        ]
+
+
+class WorktreeSnapshotOptionsProvider(CommandListProvider):
+    """Options of the "Worktree snapshot" setting (always / only if no
+    commits / never).
+
+    Same selection-palette UX as WorktreeRemovalOptionsProvider: pick an
+    option to apply it immediately, Escape keeps the current one. The
+    active option is marked with "(current)".
+    """
+
+    def _commands(self) -> list[CommandEntry]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.worktree_snapshot
+        return [
+            _marked_option(
+                option.label,
+                option is current,
+                partial(app.action_set_worktree_snapshot, option),
+            )
+            for option in WORKTREE_SNAPSHOT_OPTIONS
         ]
 
 

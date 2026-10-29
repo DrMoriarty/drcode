@@ -11,6 +11,7 @@ from drcode.settings import (
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
+    WORKTREE_SNAPSHOT_OPTIONS,
     CompletedRetention,
     GitPolicy,
     GitPolicySetting,
@@ -19,6 +20,7 @@ from drcode.settings import (
     StallNudge,
     Verification,
     WorktreeRemoval,
+    WorktreeSnapshot,
 )
 
 # -- CompletedRetention -------------------------------------------------------
@@ -124,6 +126,44 @@ def test_store_worktree_removal_roundtrip(project_root: Path) -> None:
     assert store.load().worktree_removal is WorktreeRemoval.ON_COMPLETION
     store.save(ProjectSettings(worktree_removal=WorktreeRemoval.NEVER))
     assert store.load().worktree_removal is WorktreeRemoval.NEVER
+
+
+# -- WorktreeSnapshot -------------------------------------------------------------
+
+
+def test_worktree_snapshot_default() -> None:
+    # The smart default: the snapshot is insurance only when the run made
+    # no commits of its own.
+    assert ProjectSettings().worktree_snapshot is WorktreeSnapshot.ONLY_IF_NO_COMMITS
+
+
+def test_worktree_snapshot_labels() -> None:
+    assert WorktreeSnapshot.ALWAYS.label == "always"
+    assert WorktreeSnapshot.ONLY_IF_NO_COMMITS.label == "only if no commits"
+    assert WorktreeSnapshot.NEVER.label == "never"
+
+
+def test_worktree_snapshot_values_stable() -> None:
+    # Persisted in settings.json — must not change silently.
+    assert WorktreeSnapshot.ALWAYS.value == "always"
+    assert WorktreeSnapshot.ONLY_IF_NO_COMMITS.value == "only-if-no-commits"
+    assert WorktreeSnapshot.NEVER.value == "never"
+
+
+def test_worktree_snapshot_options_order() -> None:
+    assert WORKTREE_SNAPSHOT_OPTIONS == (
+        WorktreeSnapshot.ALWAYS,
+        WorktreeSnapshot.ONLY_IF_NO_COMMITS,
+        WorktreeSnapshot.NEVER,
+    )
+
+
+def test_store_worktree_snapshot_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(worktree_snapshot=WorktreeSnapshot.ALWAYS))
+    assert store.load().worktree_snapshot is WorktreeSnapshot.ALWAYS
+    store.save(ProjectSettings(worktree_snapshot=WorktreeSnapshot.NEVER))
+    assert store.load().worktree_snapshot is WorktreeSnapshot.NEVER
 
 
 # -- ProjectSettings ------------------------------------------------------------
@@ -387,11 +427,14 @@ def test_hints_parked_fields_under_isolation_off() -> None:
     assert task_settings_hints(base, git_available=True) == []
 
     parked = ProjectSettings(
-        isolation_start_branch="main", worktree_removal=WorktreeRemoval.NEVER
+        isolation_start_branch="main",
+        worktree_removal=WorktreeRemoval.NEVER,
+        worktree_snapshot=WorktreeSnapshot.NEVER,
     )
     texts = [h.text for h in task_settings_hints(parked, git_available=True)]
     assert any("main" in t for t in texts)
     assert any("Worktree removal" in t for t in texts)
+    assert any("Worktree snapshot" in t for t in texts)
 
 
 def test_hints_worktree_without_git_is_conflict() -> None:

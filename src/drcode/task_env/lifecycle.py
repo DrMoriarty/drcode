@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..models import TaskStatus
-from ..settings import WorktreeRemoval
+from ..settings import WorktreeRemoval, WorktreeSnapshot
 from ._common import (
     _COPY_FILE_LIMIT,
     _COPY_SKIP_DIRS,
@@ -36,6 +36,17 @@ if TYPE_CHECKING:
     from ..settings import ProjectSettings
     from ._common import EventLog
 
+# Service-event marker of a snapshot the `worktree_snapshot` setting held
+# back — the removal paths match on it to keep the worktree (a dirty tail
+# the setting protected must never be destroyed by the same removal).
+_SNAPSHOT_SKIPPED_PREFIX = "auto-snapshot skipped: "
+
+
+def _dirty_count(status: str) -> int:
+    """Number of uncommitted changes in a `git status --porcelain` output
+    (one line per entry — untracked directories collapse to one line)."""
+    return len([line for line in status.splitlines() if line.strip()])
+
 
 class _WorktreeLifecycleMixin:
     """The creation/snapshot/removal half of `TaskEnvironment` (see
@@ -50,6 +61,7 @@ class _WorktreeLifecycleMixin:
         _activation_lock: threading.Lock
         _removal_cond: threading.Condition
         _removal_pending: set[str]
+        _activation_tips: dict[str, str]
 
         # Facade properties (read-only state) — declared as properties so
         # the facade's real property overrides stay compatible.
@@ -358,6 +370,16 @@ class _WorktreeLifecycleMixin:
                     f"git worktree add failed, the task falls back to the "
                     f"project directory: {(created or out)[:500]}"
                 )
+        # The branch was just (re-)checked out here: this commit is the
+        # baseline the smart snapshot gate measures the run's own commits
+        # against (`worktree_snapshot: only-if-no-commits`). Deliberately
+        # NOT stamped when an existing non-empty worktree directory is
+        # merely reused (the early `return wt, ""` above): a later
+        # activation — the tester round, a resumed attempt — must not
+        # re-base the gate, or commits an earlier run of the same task
+        # authored would look pre-activation and its deliberate dirty tail
+        # would get committed mechanically again.
+        self._remember_activation_tip(task_id, wt)
         note = self._copy_untracked_files(wt)
         if created is not None and self.event_log is not None:
             # Observability at creation time (the 51f2efc8 lesson): the
@@ -457,7 +479,22 @@ class _WorktreeLifecycleMixin:
             )
         return ""
 
-    def snapshot(self, task_id: str, note: str = "") -> str | None:
+    def _remember_activation_tip(self, task_id: str, wt: Path) -> None:
+        """Record the branch tip a fresh worktree activation starts from
+        (the baseline of the smart snapshot gate). Best-effort: when git
+        cannot answer, no stamp is taken and the gate falls back to the
+        historic unconditional snapshot — a missing baseline never blocks
+        the safety commit, it only makes it less picky."""
+        try:
+            code, tip = self._git("rev-parse", "HEAD", cwd=wt)
+        except (OSError, subprocess.SubprocessError):
+            return
+        if code == 0 and tip:
+            self._activation_tips[task_id] = tip
+
+    def snapshot(
+        self, task_id: str, note: str = "", *, force: bool = False
+    ) -> str | None:
         """Commit every change in the task's worktree onto its branch
         (RULE 1: a verdict never leaves the task with a dirty tree).
 
@@ -469,13 +506,29 @@ class _WorktreeLifecycleMixin:
         git_commit tool (or the tree is simply clean) the snapshot is a
         no-op.
 
+        Governed by the `worktree_snapshot` project setting (unless
+        `force`): `never` skips the commit for a dirty tree outright;
+        `only-if-no-commits` (the default) skips it when the branch tip
+        has moved since the worktree was (re)created — the run made its
+        own commits, so a remaining dirty tail is presumed deliberate and
+        is NOT mechanically committed. A skip is never silent: the
+        returned message says so, and the removal paths keep the worktree
+        directory when the tail would otherwise be destroyed by the
+        removal.
+
         Returns a human-readable result for the service-event log —
-        either "snapshot committed on <branch> @ <sha>" or "worktree
-        clean, nothing to snapshot". None is a true no-op: isolation is
-        off (and this task has no worktree directory — a task PINNED to a
-        worktree keeps snapshotting even after the setting moved on,
-        RULE 1 protects the task's own tree) / not a git repo / the
-        worktree does not exist / git failed.
+        either "snapshot committed on <branch> @ <sha>", "worktree
+        clean, nothing to snapshot", or an "auto-snapshot skipped: …"
+        reason. None is a true no-op: isolation is off (and this task has
+        no worktree directory — a task PINNED to a worktree keeps
+        snapshotting even after the setting moved on, RULE 1 protects the
+        task's own tree) / not a git repo / the worktree does not exist /
+        git failed.
+
+        `force` bypasses the setting — for the last-resort protections
+        that run when the worktree is about to be destroyed anyway (the
+        startup orphan sweep of dead tasks' leftovers): there the commit
+        is the only way to keep the work at all.
 
         This is pipeline-level bookkeeping, NOT model work: blocking git
         calls — run via asyncio.to_thread from the pipeline/listeners.
@@ -490,9 +543,11 @@ class _WorktreeLifecycleMixin:
         # RLock makes the nested snapshot from remove/cleanup_orphans a
         # no-op re-entry.
         with self._task_lock(task_id):
-            return self._snapshot_locked(task_id, wt, note)
+            return self._snapshot_locked(task_id, wt, note, force=force)
 
-    def _snapshot_locked(self, task_id: str, wt: Path, note: str) -> str | None:
+    def _snapshot_locked(
+        self, task_id: str, wt: Path, note: str, *, force: bool = False
+    ) -> str | None:
         branch = self.branch(task_id)
         try:
             code, out = self._git(
@@ -502,6 +557,10 @@ class _WorktreeLifecycleMixin:
                 return None
             if not out.strip():
                 return "worktree clean, nothing to snapshot"
+            if not force:
+                skip = self._snapshot_skip_reason(task_id, branch, wt, out)
+                if skip is not None:
+                    return skip
             code, _ = self._git("add", "-A", "--", ".", ":(exclude).drcode", cwd=wt)
             if code != 0:
                 return None
@@ -517,6 +576,46 @@ class _WorktreeLifecycleMixin:
             return f"snapshot committed on {branch} @ {sha if code == 0 else '?'}"
         except (OSError, subprocess.SubprocessError):
             return None
+
+    def _snapshot_skip_reason(
+        self, task_id: str, branch: str, wt: Path, status: str
+    ) -> str | None:
+        """The `worktree_snapshot` gate for a dirty tree: the skip message
+        when the automatic commit must NOT run, None when it proceeds.
+
+        NEVER always skips. ONLY_IF_NO_COMMITS skips when the branch tip
+        moved since the worktree was (re)created (`_activation_tips`, the
+        stamp of the fresh `worktree add`): the run made its own commits,
+        so the remaining changes are the deliberate uncommitted tail —
+        committing them mechanically would litter the branch history with
+        a message the run never authored. No stamp (an activation this
+        process never saw, or git could not answer at stamp time) falls
+        through to the snapshot: the insurance must not get pickier than
+        the evidence allows."""
+        mode = self.settings.worktree_snapshot
+        if mode is WorktreeSnapshot.NEVER:
+            return (
+                f"{_SNAPSHOT_SKIPPED_PREFIX}worktree_snapshot: never — "
+                f"{_dirty_count(status)} uncommitted change(s) stay in "
+                "the worktree"
+            )
+        if mode is not WorktreeSnapshot.ONLY_IF_NO_COMMITS:
+            return None
+        base = self._activation_tips.get(task_id)
+        if base is None:
+            return None
+        try:
+            code, tip = self._git("rev-parse", "HEAD", cwd=wt)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if not (code == 0 and tip) or tip == base:
+            return None
+        return (
+            f"{_SNAPSHOT_SKIPPED_PREFIX}the run made its own commits on "
+            f"{branch} since activation — {_dirty_count(status)} "
+            "uncommitted change(s) stay in the worktree (presumed "
+            "deliberate; commit or clean them by hand)"
+        )
 
     # -- removal -----------------------------------------------------------------
 
@@ -569,6 +668,22 @@ class _WorktreeLifecycleMixin:
                 and self.event_log is not None
             ):
                 self.event_log(task_id, snap)
+            if snap is not None and snap.startswith(_SNAPSHOT_SKIPPED_PREFIX):
+                # The snapshot setting held the commit back — a dirty tail
+                # exists that the branch does NOT hold (the run's own
+                # commits made the smart gate skip it, or `never` disabled
+                # the snapshot). Destroying the directory now would destroy
+                # exactly that tail: keep it instead and say so loudly.
+                # The same duty is covered by `worktree_removal: never`,
+                # but this must hold for on_delete/on_completion too.
+                if self.event_log is not None:
+                    self.event_log(
+                        task_id,
+                        "Warning: worktree kept — "
+                        f"{snap}. Commit or clean the worktree by hand "
+                        f"({wt}); nothing was deleted.",
+                    )
+                return
             if self.settings.worktree_removal is WorktreeRemoval.NEVER:
                 # The user keeps the directory — snapshot (above) is the
                 # only thing this call does.
@@ -693,10 +808,12 @@ class _WorktreeLifecycleMixin:
         here too: a dead task's dirty tree is snapshotted onto its branch
         before the directory goes, and a branch with unmerged commits is
         never deleted (a kept branch is reported through `event_log`).
-        The `worktree_removal` setting is IGNORED here: dead tasks'
-        directories are leftovers of deleted tasks, not live state —
-        under `never` they would otherwise accumulate without bound (see
-        the package docstring).
+        The `worktree_removal` setting is IGNORED here, and the snapshot
+        runs with `force=True` (bypassing `worktree_snapshot`): dead
+        tasks' directories are leftovers of deleted tasks, not live state
+        — under `never` they would otherwise accumulate without bound,
+        and this commit is the last chance to keep the tree's work at all
+        (see the package docstring).
         Blocking (git calls): run via `asyncio.to_thread` at app startup.
         Skipped entirely when there is nothing to sweep (not a git repo,
         or the setting is off and no worktree directory exists).
@@ -721,7 +838,9 @@ class _WorktreeLifecycleMixin:
                     # pattern — serialize instead of racing two
                     # snapshot+delete sequences over one directory.
                     with self._task_lock(entry.name):
-                        snap = self.snapshot(entry.name, "before orphan cleanup")
+                        snap = self.snapshot(
+                            entry.name, "before orphan cleanup", force=True
+                        )
                         if (
                             snap is not None
                             and snap.startswith("snapshot committed")

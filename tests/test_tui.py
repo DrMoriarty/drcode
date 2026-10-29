@@ -428,7 +428,9 @@ async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
             "not part of your request." in text
         )
         # Plain option untouched: rendered verbatim inside the click span.
-        assert "[@click=app.pick_option(0)][underline cyan]Да, заведи багрепорт[/]" in text
+        assert (
+            "[@click=app.pick_option(0)][underline cyan]Да, заведи багрепорт[/]" in text
+        )
 
         # Without agent options: no star, no footnote.
         app._write_clarification(
@@ -2346,7 +2348,10 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         # Sub-menu providers: the catalog editor plus the role pickers,
         # nothing else (project preferences stay in the main menu).
         commands = RoleModelsCommandsProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert commands[0].name == f"Coding model: {app.role_model_label(AgentRole.CODING)}"
+        assert (
+            commands[0].name
+            == f"Coding model: {app.role_model_label(AgentRole.CODING)}"
+        )
         catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [c.name for c in catalog] == ["Provider catalog…"]
 
@@ -2437,6 +2442,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Isolation start branch: {app._isolation_start_branch_label()}",
             f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
             f"Worktree removal: {app.settings.worktree_removal.label}",
+            f"Worktree snapshot: {app.settings.worktree_snapshot.label}",
             f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
             f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
             f"Verification: {app.settings.verification.label}",
@@ -2795,6 +2801,64 @@ async def test_settings_worktree_removal_picker(app: DrCodeApp) -> None:
             ProjectSettingsStore(app.project_root).load().worktree_removal
             is WorktreeRemoval.NEVER
         )
+
+
+async def test_settings_worktree_snapshot_picker(app: DrCodeApp) -> None:
+    """The "Worktree snapshot" setting: the option palette lists the three
+    modes with the current one marked, and picking one persists it into
+    the project settings."""
+    from drcode.settings import ProjectSettingsStore, WorktreeSnapshot
+    from drcode.tui.command_providers import WorktreeSnapshotOptionsProvider
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        commands = WorktreeSnapshotOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [c.name for c in commands] == [
+            "always",
+            "only if no commits (current)",
+            "never",
+        ]
+        commands[0].callback()  # pick "always"
+        await pilot.pause()
+        assert app.settings.worktree_snapshot is WorktreeSnapshot.ALWAYS
+        assert (
+            ProjectSettingsStore(app.project_root).load().worktree_snapshot
+            is WorktreeSnapshot.ALWAYS
+        )
+        app.action_set_worktree_snapshot(WorktreeSnapshot.NEVER)
+        await pilot.pause()
+        assert app.settings.worktree_snapshot is WorktreeSnapshot.NEVER
+        assert (
+            ProjectSettingsStore(app.project_root).load().worktree_snapshot
+            is WorktreeSnapshot.NEVER
+        )
+
+
+async def test_task_settings_dialog_worktree_snapshot_field(
+    app: DrCodeApp,
+) -> None:
+    """The dialog's Worktree snapshot select follows the same rules as the
+    other isolation-governed fields: dimmed while isolation is off but
+    editable, and the edit lands in the draft only."""
+    from textual.widgets import Select
+
+    from drcode.settings import TaskIsolation, WorktreeSnapshot
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        app.push_screen(dialog)
+        await pilot.pause()
+        assert dialog.query_one("#ts-snapshot", Select).has_class("ts-dormant")
+        dialog.query_one("#ts-snapshot", Select).value = WorktreeSnapshot.NEVER
+        await pilot.pause()
+        assert dialog._draft.worktree_snapshot is WorktreeSnapshot.NEVER  # pyright: ignore[reportAttributeAccessIssue]
+        dialog.query_one("#ts-isolation", Select).value = TaskIsolation.WORKTREE
+        await pilot.pause()
+        assert not dialog.query_one("#ts-snapshot", Select).has_class("ts-dormant")
 
 
 async def test_settings_verification_picker(app: DrCodeApp) -> None:

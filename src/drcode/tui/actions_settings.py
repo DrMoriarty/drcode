@@ -34,6 +34,7 @@ from ..settings import (
     TaskIsolation,
     Verification,
     WorktreeRemoval,
+    WorktreeSnapshot,
     parallel_tasks_label,
     subagents_label,
 )
@@ -56,6 +57,7 @@ from .command_providers import (
     WorkflowPreset,
     WorkflowPresetOptionsProvider,
     WorktreeRemovalOptionsProvider,
+    WorktreeSnapshotOptionsProvider,
     workflow_preset_label,
 )
 from .github_dialog import GitHubSettingsDialog, GitHubSetup
@@ -359,6 +361,36 @@ class SettingsLayer(DrCodeState):
             SettingsPalette(
                 id="--worktree-removal-palette",
                 providers=[WorktreeRemovalOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_set_worktree_snapshot(self, mode: WorktreeSnapshot) -> None:
+        """Settings command: when the automatic RULE-1 snapshot commit
+        anchors a settling task's worktree on its branch — always, only
+        when the run made no commits of its own (a deliberate dirty tail
+        is kept in the worktree, and any automatic removal keeps the
+        directory with it), or never. Persisted per project
+        (.drcode/settings.json); applies to transitions from now on."""
+        self.settings.worktree_snapshot = mode
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Worktree snapshot: {mode.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_worktree_snapshot(self) -> None:
+        """Worktree-snapshot picker, opened from the Settings entry
+        ("Worktree snapshot: …"). Same UX as the removal picker: the
+        narrowed SettingsPalette with the three options; picking one
+        applies it, Escape dismisses without changing anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--worktree-snapshot-palette",
+                providers=[WorktreeSnapshotOptionsProvider],
                 placeholder="Search for options…",
             )
         )

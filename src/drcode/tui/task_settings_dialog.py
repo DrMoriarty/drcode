@@ -59,6 +59,7 @@ from ..settings import (
     SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
+    WORKTREE_SNAPSHOT_OPTIONS,
     CompletedRetention,
     GitPolicy,
     ProjectSettings,
@@ -66,6 +67,7 @@ from ..settings import (
     TaskIsolation,
     Verification,
     WorktreeRemoval,
+    WorktreeSnapshot,
     dev_rounds_label,
     parallel_tasks_label,
     subagents_label,
@@ -97,6 +99,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.subagents_coder = src.subagents_coder
     dst.subagents_researcher = src.subagents_researcher
     dst.worktree_removal = src.worktree_removal
+    dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
     dst.keep_awake = src.keep_awake
 
@@ -310,6 +313,13 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-removal",
                         )
+                yield Label("Worktree snapshot", classes="ts-label")
+                yield Select(
+                    [(o.label, o) for o in WORKTREE_SNAPSHOT_OPTIONS],
+                    value=d.worktree_snapshot,
+                    allow_blank=False,
+                    id="ts-snapshot",
+                )
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
                         yield Label("Subagents (coder)", classes="ts-label")
@@ -460,6 +470,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-start-branch", d.isolation_start_branch)
         self._set_select("#ts-parallel", d.parallel_tasks)
         self._set_select("#ts-removal", d.worktree_removal)
+        self._set_select("#ts-snapshot", d.worktree_snapshot)
         self._set_select("#ts-subagents-coder", d.subagents_coder)
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-verification", d.verification)
@@ -477,6 +488,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
             "#ts-parallel": d.parallel_tasks != o.parallel_tasks,
             "#ts-removal": d.worktree_removal is not o.worktree_removal,
+            "#ts-snapshot": d.worktree_snapshot is not o.worktree_snapshot,
             "#ts-subagents-coder": d.subagents_coder != o.subagents_coder,
             "#ts-subagents-researcher": (
                 d.subagents_researcher != o.subagents_researcher
@@ -494,13 +506,19 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             widget.set_class(is_changed, "changed")
         dormant: set[str] = set()
         if d.task_isolation is not TaskIsolation.WORKTREE:
-            dormant |= {"#ts-start-branch", "#ts-parallel", "#ts-removal"}
+            dormant |= {
+                "#ts-start-branch",
+                "#ts-parallel",
+                "#ts-removal",
+                "#ts-snapshot",
+            }
         if d.verification is Verification.NONE:
             dormant.add("#ts-git-tester")
         for selector in (
             "#ts-start-branch",
             "#ts-parallel",
             "#ts-removal",
+            "#ts-snapshot",
             "#ts-git-tester",
         ):
             self.query_one(selector).set_class(selector in dormant, "ts-dormant")
@@ -601,6 +619,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             event.value is not self._draft.worktree_removal
         ):
             self._draft.worktree_removal = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-snapshot")
+    def _snapshot_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, WorktreeSnapshot) and (
+            event.value is not self._draft.worktree_snapshot
+        ):
+            self._draft.worktree_snapshot = event.value
             self._refresh()
 
     @on(Select.Changed, "#ts-subagents-coder")

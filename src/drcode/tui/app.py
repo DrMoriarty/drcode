@@ -21,6 +21,7 @@ from textual.app import (
     SystemCommand,
     get_system_commands_provider,
 )
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.timer import Timer
@@ -193,6 +194,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #chat-input:focus {
         background: $surface-lighten-2;
     }
+    # Same dim style as the new-task form's hint line (#nt-hint); the
+    # padding aligns the text with the editor above it.
+    #chat-hint {
+        width: auto;
+        color: $text-disabled;
+        padding: 0 1;
+    }
     .reasoning { padding: 0 4; color: $text-muted; }
     .reasoning:hover { background: $panel; }
     .tool-call { padding: 0 4; color: $text-muted; }
@@ -308,8 +316,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+n", "new_task", "New task"),
         ("ctrl+d", "done_task", "Done"),
         ("ctrl+x", "cancel_task", "Cancel task"),
-        ("ctrl+o", "focus_sidebar", "Tasks"),
-        ("ctrl+i", "focus_input", "Input"),
+        # Duplicate Tab/Shift+Tab (screen-level tab → app.focus_next/previous,
+        # show=False so the footer is not cluttered — the keys keep working).
+        Binding("ctrl+o", "focus_sidebar", "Tasks", show=False),
+        Binding("ctrl+i", "focus_input", "Input", show=False),
         ("ctrl+t", "cycle_task_kind", "Change type"),
         ("ctrl+up", "move_task_up", "Move up"),
         ("ctrl+down", "move_task_down", "Move down"),
@@ -476,6 +486,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Replaced wholesale by the worker thread — never mutated in
         # place — so a read on the event loop is always consistent.
         self._merge_state: dict[str, str] = {}
+        # Footer visibility of the Merge… binding as of the last
+        # _poll_git_indicator pass: the poll refreshes the bindings only
+        # when this flips (None = never evaluated — the first pass
+        # decides; see check_action "open_merge").
+        self._merge_binding_visible: bool | None = None
+        # Whether the unmerged-work tracking has produced at least ONE
+        # fill (the 10 s poll's immediate first fill, the startup scan,
+        # or an action_open_merge run): until then check_action must not
+        # hide the Merge… item — the candidate state is UNKNOWN, and in
+        # Textual a False from check_action also SUPPRESSES the key
+        # dispatch (App.run_action), silently swallowing ctrl+m.
+        self._merge_poll_done = False
         # Deferred on_tester_passed installs (task.install_pending — the
         # hook was skipped over a half-done merge): ids the last
         # _unmerged_completed_ids pass found re-runnable (branch merged /
@@ -809,6 +831,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 yield ChatLog(id="chat-log")
                 yield TodoPanel("", id="todo-panel", classes="hidden")
                 yield ChatInput(placeholder="Type a message…", id="chat-input")
+                # Dim key hints for the editor above (Send/Voice live here
+                # instead of the footer): rendered by _render_chat_hint.
+                yield Static("", id="chat-hint")
                 with Vertical(id="new-task", classes="hidden"):
                     yield Static(
                         "This is not a live chat with the agent — "
@@ -1168,6 +1193,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # candidate, see _install_rerun_candidates).
         self.set_interval(10, self._poll_pending_installs)
         self.refresh_project_info()
+        self._render_chat_hint()
         self.refresh_sidebar()
         # Open the chat on the task at the top of the first non-empty
         # sidebar section (same pick the sidebar renders first), not on the
@@ -1315,6 +1341,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # No isolation — no branches; the only deferred-install
             # blocker is the shared checkout itself (mid-merge / dirty).
             self._install_rerun_ids = self._install_rerun_candidates([])
+            self._merge_poll_done = True
             return []
         workflow = self.workflow
         # Candidates come from task statuses alone — no git here.
@@ -1334,6 +1361,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if not candidates:
             self._merge_state = {}
             self._install_rerun_ids = self._install_rerun_candidates([])
+            self._merge_poll_done = True
             return []
         # ONE wholesale mergedness answer for every candidate branch (a
         # snapshot + glob over refs/heads/drcode/, cached per the
@@ -1377,6 +1405,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 task.hook_merge_failed = False
                 task.touch()
                 self.manager.storage.save(task)
+        # A fill has completed: check_action "open_merge" may now trust
+        # the negative answer (until the next poll refreshes it).
+        self._merge_poll_done = True
         # Same pass, different flag: deferred installs whose blocker just
         # disappeared (the branch is merged — exactly the ids NOT in the
         # unmerged result above).
@@ -1572,6 +1603,38 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # Only a held task can be edited: the editor merges its text and
             # comments; nothing is running for a parked task.
             return task is not None and task.status is TaskStatus.HOLD
+        if action == "open_merge":
+            # Contextual visibility, same semantics as action_open_merge /
+            # the command palette's merge provider — but SYNCHRONOUS:
+            # only state flags and cheap file stats, no blocking git.
+            # needs_human covers a task parked for a human; _merge_state
+            # is the mergedness snapshot the 10 s git-indicator poll
+            # keeps fresh (see _unmerged_completed_ids), surfaced into
+            # the footer by _poll_git_indicator's refresh_bindings; the
+            # persisted triage report is the engine's marker of a parked
+            # conflict the screen can deploy (one stat per task).
+            #
+            # CAVEAT: in Textual a falsy check_action also SUPPRESSES the
+            # key dispatch (App.run_action), not just the footer entry —
+            # so a False is only safe when the candidate state is KNOWN
+            # to be empty. Until the tracking's first fill
+            # (_merge_poll_done) the state is unknown (an unmerged branch
+            # may exist that no poll has seen yet) — dispatch the action:
+            # it computes candidates itself and toasts "No parked merge
+            # conflict" when there are none, exactly the pre-change
+            # behaviour. Isolation off skips the unknown window (no
+            # branches to track; the stale-report check below keeps a
+            # leftover report visible, matching the old toast path).
+            if not self._merge_poll_done and self.task_env.active:
+                return True
+            from ..merge_engine import report_path
+
+            tasks = self.manager.all_tasks()
+            return (
+                any(t.needs_human for t in tasks)
+                or "unmerged" in self._merge_state.values()
+                or any(report_path(self.project_root, t.id).exists() for t in tasks)
+            )
         if action == "submit_new_task_hold":
             return self._new_task_mode and self._editing_task_id is None
         if action == "save_task_edit_hold":

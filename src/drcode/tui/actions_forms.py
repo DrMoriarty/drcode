@@ -167,11 +167,25 @@ class TaskFormLayer(DrCodeState):
 
     # -- editing a held task ---------------------------------------------------
 
+    def _render_chat_hint(self) -> None:
+        """Dim key-hint line under the chat editor (#chat-hint): Send and
+        Voice live here instead of the footer — a key with a permanent
+        affordance next to its field does not take a footer slot. The
+        voice part appears only while dictation is configured (everything
+        empty = voice off, see voice_dictation_configured)."""
+        text = "enter — send · shift+enter — newline"
+        if self.voice_dictation_configured:
+            text += " · ctrl+b — voice"
+        self.query_one("#chat-hint", Static).update(text)
+
     def _new_task_chrome(self) -> None:
         """Note + hint line of the new-task form, per mode: fresh creation
         vs editing a held task (the same editor, different wording)."""
         note = self.query_one("#nt-note", Static)
         hint = self.query_one("#nt-hint", Static)
+        # Push-to-talk is bound in the form's editor too; advertised only
+        # while it can actually record (see _render_chat_hint).
+        voice = "   ctrl+b — voice" if self.voice_dictation_configured else ""
         if self._editing_task_id is not None:
             note.update(
                 "Editing a held task — its original text and queued comments "
@@ -180,6 +194,7 @@ class TaskFormLayer(DrCodeState):
             hint.update(
                 "tab — switch type   ctrl+g — depends on   "
                 "ctrl+enter — save & queue   ctrl+h — save on hold   esc — cancel"
+                + voice
             )
         else:
             note.update(
@@ -188,7 +203,7 @@ class TaskFormLayer(DrCodeState):
             )
             hint.update(
                 "tab — switch type   ctrl+g — depends on   ctrl+enter — create   "
-                "ctrl+h — create on hold   esc — cancel"
+                "ctrl+h — create on hold   esc — cancel" + voice
             )
 
     def action_edit_task(self) -> None:

@@ -195,6 +195,20 @@ class ActivityLayer(DrCodeState):
         # (task.install_pending) — fire the re-run worker (a no-op when
         # the list is empty; see _maybe_rerun_pending_installs).
         self._maybe_rerun_pending_installs()
+        # The footer's Merge… entry reads the same state (needs_human /
+        # _merge_state / persisted conflict reports) in its synchronous
+        # check_action — refresh the bindings so it appears/disappears
+        # with this poll instead of waiting for an unrelated focus
+        # change. The report stat mirrors check_action "open_merge".
+        from ..merge_engine import report_path
+
+        merge_visible = bool(ids) or any(
+            t.needs_human or report_path(self.project_root, t.id).exists()
+            for t in self.manager.all_tasks()
+        )
+        if merge_visible != self._merge_binding_visible:
+            self._merge_binding_visible = merge_visible
+            self.refresh_bindings()
         count = len(ids)
         try:
             widget = self.query_one("#header-git", HeaderGitIndicator)

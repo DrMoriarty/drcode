@@ -848,6 +848,15 @@ class SettingsLayer(DrCodeState):
 
     # -- voice (ASR dictation + TTS announcements) ------------------------------
 
+    @property
+    def voice_dictation_configured(self) -> bool:
+        """Whether push-to-talk (ctrl+b) actually works: an audio-API base
+        URL and an ASR model are set (everything empty = voice off). Drives
+        the hint lines under the inputs: a dictation that can only answer
+        with the "not configured" toast is not advertised."""
+        s = self.settings
+        return bool(s.voice_api_url.strip() and s.voice_asr_model.strip())
+
     def voice_status_label(self) -> str:
         """Short status of the voice features for the Settings entry:
         which halves are configured (dictation needs an ASR model,
@@ -914,6 +923,9 @@ class SettingsLayer(DrCodeState):
             title="Project settings",
             timeout=4,
         )
+        # The input hint lines advertise ctrl+b only while dictation is
+        # configured — refresh both of them after a settings change.
+        self._render_chat_hint()
 
     # -- GitHub Issues sync ----------------------------------------------------
 

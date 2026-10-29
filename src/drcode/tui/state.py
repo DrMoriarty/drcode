@@ -747,6 +747,11 @@ class DrCodeState(App[None]):
     # -- push-to-talk dictation (Ctrl+B; created in DrCodeApp.__init__) ------
     voice_input: VoiceInputController
 
+    @property
+    def voice_dictation_configured(self) -> bool: ...
+
+    def _render_chat_hint(self) -> None: ...
+
     # -- sidebar / activity -------------------------------------------------
     _sidebar_snapshot: tuple
     # Mounted sidebar rows by key ("header", section) / ("task", id) —
@@ -763,6 +768,13 @@ class DrCodeState(App[None]):
     # ("none"/"unmerged"/"merged") — refreshes off the event loop in
     # _unmerged_completed_ids; the sidebar colors the ✓ marker by it.
     _merge_state: dict[str, str]
+    # Footer visibility of the Merge… binding as of the last git-indicator
+    # poll (None = not evaluated yet); see check_action "open_merge".
+    _merge_binding_visible: bool | None
+    # True once the unmerged-work tracking has completed at least one fill
+    # (the poll's first pass, the startup scan or action_open_merge); until
+    # then the Merge… candidate state is unknown and must not gate the key.
+    _merge_poll_done: bool
 
     # -- live stream / connection -------------------------------------------
     _tps_samples: dict[str, deque[tuple[float, int]]]

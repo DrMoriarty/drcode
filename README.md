@@ -3,9 +3,9 @@
 Console AI coding agent (pydantic-ai + textual), inspired by opencode.
 The center is not a chat session, but a **task** (feature request, bug report, or research question):
 
-- one task is *active* at a time — work on it looks like a dialog that starts with the task description;
+- work on a task looks like a dialog that starts with the task description; by default one task is *active* at a time, but with per-task worktree isolation up to **4 tasks develop in parallel**, each in its own worktree and on its own branch (`parallel_tasks`, see "Parallel development slots" below);
 - while the agent works, you can create new tasks and put them in a **queue**;
-- when the active task is marked done, the next queued task starts **automatically**;
+- when a task finishes or a development slot frees up, the next queued task starts **automatically**;
 - you can browse completed tasks and write into one — it re-enters the queue (or becomes active immediately if nothing is running).
 
 ## Appearance

@@ -130,7 +130,9 @@ class NewTaskInput(WordNavTextArea):
         # this editor and ChatInput (TextArea owns ctrl+u/y/k/w, the app
         # owns n/d/x/o/i/t/e/s/h/r/q). The binding lives on the widget
         # because a focused TextArea stops unhandled keys.
-        Binding("ctrl+b", "push_to_talk", "Voice", priority=True),
+        # Off the footer (show=False): the key is advertised in the form's
+        # hint line (#nt-hint) only while voice is configured.
+        Binding("ctrl+b", "push_to_talk", "Voice", priority=True, show=False),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
@@ -208,11 +210,14 @@ class ChatInput(WordNavTextArea):
     MAX_LINES: ClassVar = 10
 
     BINDINGS: ClassVar = [
-        Binding("enter", "submit", "Send", priority=True),
+        # Send lives off the footer (show=False): the key has a permanent
+        # dim hint right under the editor (#chat-hint, see DrCodeApp).
+        Binding("enter", "submit", "Send", priority=True, show=False),
         # Push-to-talk (voice dictation), same key as NewTaskInput
         # (ctrl+g is free here but the shared muscle memory wins; ctrl+b
-        # is free in the stock TextArea bindings too).
-        Binding("ctrl+b", "push_to_talk", "Voice", priority=True),
+        # is free in the stock TextArea bindings too). Off the footer —
+        # the key shows up in #chat-hint only while voice is configured.
+        Binding("ctrl+b", "push_to_talk", "Voice", priority=True, show=False),
         # ESC during a recording cancels the recording (not the agent
         # run): when nothing is recorded, SkipAction lets the key fall
         # through to the app's abort binding.

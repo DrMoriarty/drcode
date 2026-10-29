@@ -34,6 +34,10 @@ class MergeActionsLayer(DrCodeState):
         the persistent ✋ marker) and the screen must OFFER itself. A
         toast instead of an auto-push: a modal popping mid-run would
         steal focus from whatever the user is doing."""
+        # The footer's Merge… entry reads needs_human in its synchronous
+        # check_action — refresh the bindings so the item appears right
+        # now instead of waiting for the 10 s git-indicator poll.
+        self.refresh_bindings()
         self.notify(
             f"Conflict in #{task.id} needs a human — Ctrl+M (or the ⎇ "
             f"counter in the header) opens the resolution screen",

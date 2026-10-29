@@ -399,7 +399,10 @@ async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
     from drcode.models import Clarification
 
     def rendered() -> str:
-        return "\n".join(str(w.content) for w in app.query(".chat-block"))
+        return "\n".join(
+            str(w.content)  # pyright: ignore[reportAttributeAccessIssue]
+            for w in app.query(".chat-block")
+        )
 
     async with app.run_test() as pilot:
         await pilot.pause()

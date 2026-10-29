@@ -716,6 +716,15 @@ class ConflictScreen(ModalScreen[None]):
             return self._ff_ready and not self._ff_done
         return not (self._ff_ready and action in self._FF_DISABLED_ACTIONS)
 
+    def _static(self, selector: str) -> Static | None:
+        """`query_one` that tolerates a tearing-down screen: `is_mounted`
+        can still be truthy while the widgets are already removed (the
+        shutdown window that crashes late workers with NoMatches)."""
+        try:
+            return self.query_one(selector, Static)
+        except NoMatches:
+            return None
+
     def _update_footer(self) -> None:
         """Rewrite the key hint line for the current mode — the footer
         is the screen's only key documentation, so the ff-ready state
@@ -723,7 +732,9 @@ class ConflictScreen(ModalScreen[None]):
         a no-op there)."""
         if not self.is_mounted:
             return
-        footer = self.query_one("#merge-footer", Static)
+        footer = self._static("#merge-footer")
+        if footer is None:
+            return
         if self._resolver_round:
             text = (
                 "automatic resolver running — o/t/b/e/v/d/s/a/A/f disabled "
@@ -924,7 +935,9 @@ class ConflictScreen(ModalScreen[None]):
         # screen (ESC mid-prepare) — an unmounted screen is a no-op.
         if not self.is_mounted:
             return
-        self.query_one("#merge-title", Static).update(self._titled(text))
+        title = self._static("#merge-title")
+        if title is not None:
+            title.update(self._titled(text))
 
     def _fetch_merge_desc(self) -> str | None:
         """What the merge carries, by descending preference: the subject
@@ -998,9 +1011,10 @@ class ConflictScreen(ModalScreen[None]):
         self._prepare_failed = False
         self._spinner_frame = 0
         if self.is_mounted:
-            panel = self.query_one("#merge-checks", Static)
-            panel.add_class("visible")
-            self._render_prepare_panel()
+            panel = self._static("#merge-checks")
+            if panel is not None:
+                panel.add_class("visible")
+                self._render_prepare_panel()
         self._prepare_timer = self.set_interval(
             _SPINNER_INTERVAL, self._tick_prepare_animation
         )
@@ -1078,7 +1092,12 @@ class ConflictScreen(ModalScreen[None]):
         `[FAILED]` for the finished ones, plus the percent/ETA footer."""
         if not self.is_mounted:
             return
-        panel = self.query_one("#merge-checks", Static)
+        panel = self._static("#merge-checks")
+        if panel is None:
+            # Shutdown race: is_mounted can still be truthy while the
+            # screen's widgets are already torn down (a late prepare
+            # progress tick) — nothing left to paint.
+            return
         lines = ["Preparing merge:"]
         if self._merge_desc:
             lines.append(f"#{self.task_id}: «{self._merge_desc}»")
@@ -1121,7 +1140,9 @@ class ConflictScreen(ModalScreen[None]):
             return
         self._busy_visible = True
         self._spinner_frame = 0
-        panel = self.query_one("#merge-checks", Static)
+        panel = self._static("#merge-checks")
+        if panel is None:
+            return
         if panel.has_class("visible"):
             # A finished funnel's summary (or anything else the panel
             # held) comes back when the op ends.
@@ -1167,15 +1188,16 @@ class ConflictScreen(ModalScreen[None]):
     def _render_busy_panel(self) -> None:
         if not self.is_mounted or self._busy is None:
             return
+        panel = self._static("#merge-checks")
+        if panel is None:
+            return
         elapsed = (
             (time.monotonic() - self._busy_started)
             if self._busy_started is not None
             else 0.0
         )
         frame = _SPINNER_FRAMES[self._spinner_frame]
-        self.query_one("#merge-checks", Static).update(
-            f"[{frame}] {self._busy}…  ({_fmt_seconds(elapsed)})"
-        )
+        panel.update(f"[{frame}] {self._busy}…  ({_fmt_seconds(elapsed)})")
 
     # -- the app's resolver round (watch mode) ------------------------------------
 
@@ -1279,8 +1301,11 @@ class ConflictScreen(ModalScreen[None]):
         task's chat (the rejected variant of streaming it here)."""
         if not self.is_mounted or not self._resolver_round:
             return
+        panel = self._static("#merge-checks")
+        if panel is None:
+            return
         frame = _SPINNER_FRAMES[self._spinner_frame]
-        self.query_one("#merge-checks", Static).update(
+        panel.update(
             f"[{frame}] automatic resolver running…  "
             "(the round's progress is in the task's chat)"
         )

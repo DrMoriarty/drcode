@@ -51,6 +51,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Label, ListItem, ListView, Static
 
@@ -173,7 +174,13 @@ class UnmergedListScreen(ModalScreen[None]):
     def _selected(self) -> _Entry | None:
         if not self._entries or not self.is_mounted:
             return None
-        index = self.list_view.index
+        try:
+            index = self.list_view.index
+        except NoMatches:
+            # Shutdown race: is_mounted can still be true while the
+            # screen's widgets are already torn down (app exit with a
+            # refresh/land worker in flight) — nothing is selected then.
+            return None
         if index is None or not 0 <= index < len(self._entries):
             return None
         return self._entries[index]
@@ -256,7 +263,12 @@ class UnmergedListScreen(ModalScreen[None]):
             )
             self.dismiss()
             return
-        self._render_rows(selected)
+        try:
+            self._render_rows(selected)
+        except NoMatches:
+            # Unmounted between the is_mounted check and the render —
+            # nothing left to paint.
+            pass
 
     def _render_rows(self, selected: str | None = None) -> None:
         list_view = self.list_view
@@ -416,7 +428,8 @@ class UnmergedListScreen(ModalScreen[None]):
         finally:
             self._busy = False
             await app._poll_git_indicator()
-            self._refresh_entries()
+            if self.is_mounted:
+                self._refresh_entries()
 
     async def _ff_merge(self, task_id: str, branch: str, base: str) -> None:
         """The list's half of the ConflictScreen's ``f``: fast-forward the

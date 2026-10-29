@@ -41,7 +41,11 @@ from drcode.storage import Storage
 from drcode.task_search import TaskHit
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock
-from drcode.tui.chat_timeline import _SCROLL_FOLLOW_THRESHOLD, _split_chat_text
+from drcode.tui.chat_timeline import (
+    _SCROLL_FOLLOW_THRESHOLD,
+    _split_agent_marker,
+    _split_chat_text,
+)
 from drcode.tui.command_providers import (
     SettingsPalette,
     role_model_options_provider,
@@ -356,6 +360,84 @@ def test_split_chat_text_hard_splits_long_line() -> None:
     # No part starts with a bare '[' that used to be an escape sequence.
     for part in parts[1:]:
         assert not part.startswith("[lit]")
+
+
+def test_split_agent_marker_canonical_and_fallbacks() -> None:
+    """Agent-initiative options lose the marker prefix in their DISPLAY
+    text (rendered with ★ instead); the stored option keeps it — the
+    click answer must send the full original text back to the model."""
+    canonical = "(agent's suggestion, not from your request): включить попутную находку"
+    assert _split_agent_marker(canonical) == (True, "включить попутную находку")
+
+    # Uppercase / no space after the colon.
+    assert _split_agent_marker("(AGENT'S SUGGESTION, NOT FROM YOUR REQUEST):Do X") == (
+        True,
+        "Do X",
+    )
+
+    # Localized fallback formulations a model may drift into.
+    assert _split_agent_marker("(предложение агента): своё") == (True, "своё")
+    assert _split_agent_marker("(моя инициатива): помочь") == (True, "помочь")
+
+    # Marker must sit in the option's head — not deep in the text.
+    far = "x" * 61 + " mentioning not from your request deep in the text"
+    assert _split_agent_marker(far) == (False, far)
+
+    # Plain options pass through untouched.
+    plain = "Да, заведи багрепорт"
+    assert _split_agent_marker(plain) == (False, plain)
+
+    # Marker without a colon: keep the whole text (display fallback).
+    no_colon = "(agent's suggestion, not from your request) weird shape"
+    assert _split_agent_marker(no_colon) == (True, no_colon)
+
+
+async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
+    """Agent-initiative options render with a ★ and lose the marker prefix;
+    a dim footnote explains the ★ — but only when at least one option has
+    it. The stored option text is untouched (the click sends it verbatim)."""
+    from drcode.models import Clarification
+
+    def rendered() -> str:
+        return "\n".join(str(w.content) for w in app.query(".chat-block"))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._write_clarification(
+            Clarification(
+                question="Register the poll?",
+                options=[
+                    "Да, заведи багрепорт",
+                    (
+                        "(agent's suggestion, not from your request): "
+                        "включить попутную находку"
+                    ),
+                ],
+            )
+        )
+        await pilot.pause()
+        text = rendered()
+        assert "включить попутную находку" in text
+        # The agent option is rendered with a ★, the plain one without.
+        assert "[bold yellow]★[/] [@click=app.pick_option(1)]" in text
+        assert "★[/] [@click=app.pick_option(0)]" not in text
+        # The marker prefix is stripped from the DISPLAY text only.
+        assert "agent's suggestion" not in text
+        assert (
+            "★ — option proposed by the agent on its own initiative, "
+            "not part of your request." in text
+        )
+        # Plain option untouched: rendered verbatim inside the click span.
+        assert "[@click=app.pick_option(0)][underline cyan]Да, заведи багрепорт[/]" in text
+
+        # Without agent options: no star, no footnote.
+        app._write_clarification(
+            Clarification(question="Which one?", options=["a", "b"])
+        )
+        await pilot.pause()
+        tail = rendered().split("Which one?")[1]
+        assert "★" not in tail
+        assert "option proposed by the agent" not in tail
 
 
 async def test_fat_live_write_mounts_through_drain(app: DrCodeApp) -> None:

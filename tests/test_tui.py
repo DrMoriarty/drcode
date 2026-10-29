@@ -21,9 +21,11 @@ from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from rich.markup import render as render_markup
+from textual import events
 from textual.command import Command, CommandList
 from textual.css.query import NoMatches
 from textual.geometry import Offset
+from textual.selection import Selection as ScreenSelection
 from textual.widgets import ListView, Static, TextArea
 from textual.widgets._list_item import ListItem
 from textual.widgets.text_area import Selection
@@ -40,7 +42,7 @@ from drcode.settings import (
 from drcode.storage import Storage
 from drcode.task_search import TaskHit
 from drcode.tui.app import DrCodeApp
-from drcode.tui.blocks import AssistantBlock
+from drcode.tui.blocks import AssistantBlock, UserBlock
 from drcode.tui.chat_timeline import (
     _SCROLL_FOLLOW_THRESHOLD,
     _split_agent_marker,
@@ -3336,3 +3338,31 @@ async def test_copy_on_select_in_multi_line_inputs(
         await pilot.mouse_up(offset=(region.x + 4, region.y))
         await pilot.pause()
         assert copied == ["chat"]
+
+
+async def test_copy_on_select_stale_selection_does_not_crash(
+    app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selection whose start line points past the widget's current content
+    (the block re-rendered — streaming flush / resize — and the markdown
+    re-wrapped to fewer lines) must not crash on TextSelected: upstream
+    Selection.extract clamps only the end line, so the stale start index
+    raises IndexError. The stale selection simply copies nothing."""
+    copied: list[str] = []
+    monkeypatch.setattr(app, "_copy_with_fallback", copied.append)
+    app.manager.create("stale selection", "alpha\nbeta\ngamma")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        block = next(
+            w for w in app.query_one("#chat-log").children if isinstance(w, UserBlock)
+        )
+        assert block.is_attached
+        # 3 content lines (rendered verbatim, no wrapping); a selection
+        # captured when the block still had a 4th line points at y=3.
+        assert len(str(block._render()).splitlines()) == 3
+        app.screen.selections[block] = ScreenSelection(Offset(0, 3), None)
+        assert not app._selected_text()
+        app.post_message(events.TextSelected())
+        await pilot.pause()
+    assert copied == []

@@ -46,7 +46,16 @@ The screen is a viewer + decision pad, never an autonomous actor:
   hands the parked conflict to the automatic resolver (the same
   single-round machinery the pipeline markers trigger, via the app's
   guarded `launch_resolver` — the screen closes on a successful start,
-  the round's progress lives in the task's chat). A
+  the round's progress lives in the task's chat). When a round is
+  ALREADY running for this task when the screen opens (or one starts
+  while it is open — the hook-failure marker and the startup scan
+  trigger without any user key), the screen shows a persistent
+  "automatic resolver running…" spinner line in the progress panel,
+  disables the keys (``A`` first — a press would only bounce off the
+  guard's toast) and polls the app's resolver flags: when the round
+  ends, the line disappears and the engine's prepare re-runs, so the
+  screen reflects the outcome (resolved and committed → ff-ready,
+  rolled back → the pristine conflict with ``A`` live again). A
   successful commit or ff-merge is the logical end of the work here:
   the screen closes itself (the outcome toast outlives it).
 
@@ -641,6 +650,17 @@ class ConflictScreen(ModalScreen[None]):
         self._busy_visible = False
         self._busy_generation = 0
         self._panel_saved: str | None = None
+        # The app's automatic resolver round running FOR THIS TASK: a
+        # persistent spinner line in the same panel (the round mutates
+        # the worktree — the keys must not race it), fed by a 1 s poll
+        # of the app's `_resolver_running`/`_resolver_task_id` flags.
+        # The round has no completion callback — the poll is the only
+        # way the screen learns it ended; `_preparing` defers the watch
+        # hand-off while the prepare worker owns the panel.
+        self._resolver_round = False
+        self._resolver_timer: Timer | None = None
+        self._resolver_poll: Timer | None = None
+        self._preparing = False
         # What the merge actually carries (the task branch's last commit
         # subject, falling back to the task title): fetched once at the
         # very start of prepare and woven into EVERY title via
@@ -681,13 +701,16 @@ class ConflictScreen(ModalScreen[None]):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Gate the key set by the mode: while a blocking op is busy the
         whole key set except ``esc`` is inert (a git operation must not
-        race a second one), in the ff-ready state the resolution keys
-        are inert (nothing to resolve — the footer names them as
-        unavailable), and `f` exists only there (and only until the
-        merge actually lands)."""
+        race a second one), the same holds while the app's resolver
+        round is running for this task (it mutates the worktree — ``A``
+        first of all: a press would only bounce off the
+        `launch_resolver` guard's toast), in the ff-ready state the
+        resolution keys are inert (nothing to resolve — the footer
+        names them as unavailable), and `f` exists only there (and only
+        until the merge actually lands)."""
         if action == "close":
             return True  # esc stays live: a worker's write-backs are guarded
-        if self._busy is not None:
+        if self._busy is not None or self._resolver_round:
             return False
         if action == "ff_merge":
             return self._ff_ready and not self._ff_done
@@ -701,7 +724,12 @@ class ConflictScreen(ModalScreen[None]):
         if not self.is_mounted:
             return
         footer = self.query_one("#merge-footer", Static)
-        if self._ff_ready:
+        if self._resolver_round:
+            text = (
+                "automatic resolver running — o/t/b/e/v/d/s/a/A/f disabled "
+                "until the round ends · esc close"
+            )
+        elif self._ff_ready:
             base = "base"
             if self.wt is not None and self.wt.report is not None:
                 base = self.wt.report.base_branch or "base"
@@ -723,10 +751,39 @@ class ConflictScreen(ModalScreen[None]):
     # -- preparation (the engine's reversed merge) -------------------------------
 
     def on_mount(self) -> None:
-        self._prepare()
+        # The app's resolver flags are checked BEFORE the prepare: an
+        # already-running round owns the worktree (its own
+        # `merge_resolver.prepare` is mid-flight) — a second prepare
+        # here would race it with concurrent git calls. Instead the
+        # screen goes straight into the watch mode and runs the full
+        # prepare only when the round has ended. The poll runs for the
+        # screen's whole life either way: a round triggered by the
+        # hook-failure marker or the startup scan can also start (and
+        # end) while the screen is already open.
+        self._resolver_poll = self.set_interval(1.0, self._poll_resolver_round)
+        if self._resolver_round_active():
+            self._begin_resolver_watch()
+            # `is_mounted` is still False right now (Textual sets it
+            # only after the Mount event's dispatch returns) — the
+            # visuals apply right after the mount settles; the poll
+            # keeps re-asserting them either way.
+            self.call_after_refresh(self._assert_resolver_watch)
+        else:
+            self._prepare()
 
     @work(exclusive=True, group="merge-prepare")
     async def _prepare(self) -> None:
+        """The prepare worker: runs `_prepare_impl` under the
+        `_preparing` flag — the resolver-watch poll defers its panel
+        hand-off to the next tick while this worker owns the progress
+        panel (its renders would clobber the watch line)."""
+        self._preparing = True
+        try:
+            await self._prepare_impl()
+        finally:
+            self._preparing = False
+
+    async def _prepare_impl(self) -> None:
         """Deploy (or re-detect) the parked conflict through the engine
         (`merge_resolver.prepare`): an already-parked merge is re-triaged
         in place, a fresh one is attempted with the safe auto-resolvers
@@ -991,7 +1048,12 @@ class ConflictScreen(ModalScreen[None]):
         hide runs at the tail of the prepare worker, and a fast `v`
         press can already have claimed the zone)."""
         self._stop_prepare_animation()
-        if not self.is_mounted or self._busy is not None or self._stages:
+        if (
+            not self.is_mounted
+            or self._busy is not None
+            or self._stages
+            or self._resolver_round
+        ):
             return
         try:
             self.query_one("#merge-checks", Static).remove_class("visible")
@@ -1113,6 +1175,114 @@ class ConflictScreen(ModalScreen[None]):
         frame = _SPINNER_FRAMES[self._spinner_frame]
         self.query_one("#merge-checks", Static).update(
             f"[{frame}] {self._busy}…  ({_fmt_seconds(elapsed)})"
+        )
+
+    # -- the app's resolver round (watch mode) ------------------------------------
+
+    def _resolver_round_active(self) -> bool:
+        """Whether the app's automatic resolver round is running for
+        THIS task (the flags live on the app/state — the round itself
+        is single per application, `work group="resolver"`)."""
+        app = cast("DrCodeApp", self.app)
+        return app._resolver_running and app._resolver_task_id == self.task_id
+
+    def _poll_resolver_round(self) -> None:
+        """The 1 s re-check of the app's resolver flags — the round has
+        no completion callback, so this is how the screen learns it
+        started (mid-session marker/scan triggers) and ended. While the
+        prepare worker owns the panel a new watch is deferred to the
+        next tick (the prepare's renders would clobber the line)."""
+        if not self.is_mounted:
+            return
+        active = self._resolver_round_active()
+        if active:
+            if not self._resolver_round:
+                if self._preparing:
+                    return
+                self._begin_resolver_watch()
+            else:
+                # Belt and suspenders: re-assert the visuals every tick
+                # while the watch is up — a mount-time activation (the
+                # primary Ctrl+M-during-a-round scenario) applies them
+                # only after the mount settles, and no later clobber
+                # may leave the line hidden or the footer stale.
+                self._assert_resolver_watch()
+        elif self._resolver_round:
+            self._end_resolver_watch()
+
+    def _begin_resolver_watch(self) -> None:
+        """The round is running: the persistent spinner line takes the
+        progress panel over (nothing else owns it in this state — every
+        key but esc is inert, `check_action`), the footer names the
+        disabled keys, and the animation timer keeps the line moving
+        while the round runs in the pipeline."""
+        self._resolver_round = True
+        self._spinner_frame = 0
+        self._assert_resolver_watch()
+        if self._resolver_timer is None:
+            self._resolver_timer = self.set_interval(
+                _SPINNER_INTERVAL, self._tick_resolver_animation
+            )
+
+    def _assert_resolver_watch(self) -> None:
+        """(Re-)apply the watch visuals — the panel line and the footer.
+        Idempotent and cheap: called right after the mount settles
+        (`is_mounted` is False DURING `on_mount` — Textual dispatches
+        the Mount event before setting the flag, so the very first
+        application cannot happen there) and from every poll tick while
+        the watch is up, so a lost `visible` class or a stale footer
+        can never survive a full poll interval."""
+        if not self.is_mounted or not self._resolver_round:
+            return
+        try:
+            panel = self.query_one("#merge-checks", Static)
+        except NoMatches:
+            # The screen is being torn down — a late assert is a no-op.
+            return
+        panel.add_class("visible")
+        self._render_resolver_panel()
+        self._update_footer()
+
+    def _end_resolver_watch(self) -> None:
+        """The round has ended (success, rollback to the pristine
+        conflict, hand-off to a human — the flags alone don't tell):
+        the line goes away and the engine's prepare re-runs so the
+        screen reflects the actual outcome — a committed resolution
+        comes back ff-ready (or with nothing to merge), a rolled-back
+        round comes back as the parked conflict with ``A`` live again.
+        Skipped when the screen is already closing (a late poll)."""
+        self._resolver_round = False
+        self._stop_resolver_spinner()
+        if not self.is_mounted:
+            return
+        if not self._preparing:
+            try:
+                self.query_one("#merge-checks", Static).remove_class("visible")
+            except NoMatches:
+                pass
+        self._update_footer()
+        self._prepare()
+
+    def _stop_resolver_spinner(self) -> None:
+        if self._resolver_timer is not None:
+            self._resolver_timer.stop()
+            self._resolver_timer = None
+
+    def _tick_resolver_animation(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        if self._resolver_round:
+            self._render_resolver_panel()
+
+    def _render_resolver_panel(self) -> None:
+        """The single watch-mode line: `[⠹] automatic resolver running…`
+        — the round's detailed progress deliberately stays in the
+        task's chat (the rejected variant of streaming it here)."""
+        if not self.is_mounted or not self._resolver_round:
+            return
+        frame = _SPINNER_FRAMES[self._spinner_frame]
+        self.query_one("#merge-checks", Static).update(
+            f"[{frame}] automatic resolver running…  "
+            "(the round's progress is in the task's chat)"
         )
 
     # -- file list / viewer ---------------------------------------------------------
@@ -1310,6 +1480,10 @@ class ConflictScreen(ModalScreen[None]):
         self._stop_checks_animation()
         self._stop_prepare_animation()
         self._stop_busy_animation()
+        self._stop_resolver_spinner()
+        if self._resolver_poll is not None:
+            self._resolver_poll.stop()
+            self._resolver_poll = None
 
     def _tick_checks_animation(self) -> None:
         """One spinner frame; redraw only while a stage is actually

@@ -1404,3 +1404,180 @@ async def test_busy_op_locks_keys_and_restores_panel(
         restored = str(screen.query_one("#merge-checks", Static).content)
         assert "ruff check: FAILED" in restored
         assert screen.check_action("commit", ()) is True
+
+
+# -- the resolver-watch mode (a round running while the screen is open) -------------
+
+
+async def test_watch_mode_on_mount_shows_line_and_disables_keys(
+    isolated: Path, configured_env: None
+) -> None:
+    """Primary scenario: the resolver round is ALREADY running for the
+    task when Ctrl+M opens the screen. The screen skips its own prepare
+    (it would race the round's git calls) and, once the mount settles,
+    shows the persistent spinner line in the progress panel, swaps the
+    footer to the disabled-keys variant and gates every key but esc —
+    a press of A must be an inert no-op, not the guard's toast.
+
+    Regression: the Mount event is dispatched BEFORE `is_mounted` is
+    set, so the first visual application has to survive that window
+    (call_after_refresh + the poll's re-assert)."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        # The round is "running" before the screen ever opens.
+        app._resolver_running = True
+        app._resolver_task_id = task.id
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        # app.screen flips before the Mount event's dispatch runs
+        # on_mount (async) — the watch engagement is the thing to wait
+        # for, never an immediate assert.
+        await wait_until(
+            lambda: (
+                screen._resolver_round
+                and screen.query_one("#merge-checks", Static).has_class("visible")
+            ),
+            pilot=pilot,
+            what="watch line visible in the progress panel",
+        )
+        panel = str(screen.query_one("#merge-checks", Static).content)
+        assert "automatic resolver running" in panel
+        footer = str(screen.query_one("#merge-footer", Static).content)
+        assert "automatic resolver running" in footer
+        assert "A auto resolve" not in footer
+        # The whole key set but esc is inert (A first of all — a press
+        # must not reach the launch_resolver guard's toast).
+        assert screen.check_action("auto_resolve", ()) is False
+        assert screen.check_action("resolve", ("ours",)) is False
+        assert screen.check_action("commit", ()) is False
+        assert screen.check_action("close", ()) is True
+        # The prepare was skipped: no worktree state loaded while the
+        # round owns it.
+        assert screen.wt is None
+        await pilot.press("A")
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictScreen)
+        assert app._resolver_task_id == task.id
+
+
+async def test_watch_mode_ends_when_round_ends(
+    isolated: Path, configured_env: None
+) -> None:
+    """The watch is not static: when the round ends while the screen is
+    open (flags cleared — success, rollback, the poll cannot tell), the
+    spinner line disappears and the engine's prepare re-runs, so the
+    parked conflict comes back with A live again."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        app._resolver_running = True
+        app._resolver_task_id = task.id
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen._resolver_round
+                and screen.query_one("#merge-checks", Static).has_class("visible")
+            ),
+            pilot=pilot,
+            what="watch line visible",
+        )
+        # The round ends — the next poll tick (1 s) must end the watch,
+        # re-run the prepare and restore the resolution keys.
+        app._resolver_running = False
+        app._resolver_task_id = None
+        await wait_until(
+            lambda: screen._resolver_round is False,
+            pilot=pilot,
+            what="watch mode ended",
+        )
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and screen._conflicted
+                and not screen.query_one("#merge-checks", Static).has_class("visible")
+            ),
+            pilot=pilot,
+            what="prepare re-ran on the parked conflict",
+        )
+        footer = str(screen.query_one("#merge-footer", Static).content)
+        assert "A auto resolve" in footer
+        assert screen.check_action("auto_resolve", ()) is True
+
+
+async def test_watch_mode_engages_mid_session(
+    isolated: Path, configured_env: None
+) -> None:
+    """A round starting while the screen is already open and prepared
+    (the hook-failure marker / startup scan trigger) engages the watch
+    within a poll tick: the line and the footer swap over, the keys
+    lock; the round ending restores the conflict and A."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, _wt = _parked_content_conflict(isolated, task.id)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and screen._conflicted,
+            pilot=pilot,
+            what="conflict screen prepared",
+        )
+        assert screen.check_action("auto_resolve", ()) is True
+        app._resolver_running = True
+        app._resolver_task_id = task.id
+        await wait_until(
+            lambda: (
+                screen._resolver_round
+                and "automatic resolver running"
+                in str(screen.query_one("#merge-footer", Static).content)
+            ),
+            pilot=pilot,
+            what="watch mode engaged",
+        )
+        assert screen.query_one("#merge-checks", Static).has_class("visible")
+        assert screen.check_action("auto_resolve", ()) is False
+        # And back off again.
+        app._resolver_running = False
+        app._resolver_task_id = None
+        await wait_until(
+            lambda: (
+                screen._resolver_round is False
+                and screen.check_action("auto_resolve", ()) is True
+            ),
+            pilot=pilot,
+            what="watch mode ended, A live again",
+        )

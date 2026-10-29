@@ -172,6 +172,32 @@ def _mention_markup(text: str) -> str:
     return TASK_MENTION_RE.sub(_wrap, text)
 
 
+# Marker the system prompts tell the model to prefix its OWN initiative
+# options with (canonical English form, plus the localized fallbacks a
+# model may drift into). Matched case-insensitively within the first ~60
+# chars of the option text.
+AGENT_SUGGESTION_RE = re.compile(
+    r"agent's suggestion|not from your request|предложение агента|моя инициатива",
+    re.IGNORECASE,
+)
+
+
+def _split_agent_marker(option: str) -> tuple[bool, str]:
+    """Split an agent-initiative marker off a clarification option.
+
+    Returns ``(is_agent_suggestion, display_text)``. The marker stays in
+    the stored option (it is part of the answer the model receives when
+    the user clicks) — only the RENDERED text loses the prefix, replaced
+    by a ★.
+    """
+    if not AGENT_SUGGESTION_RE.search(option[:60]):
+        return False, option
+    # Canonical shape: "(marker …): real text" — cut through the colon
+    # that closes the marker prefix. Without a colon, keep the text whole.
+    _, sep, rest = option.partition(":")
+    return True, (rest.strip() if sep else option.strip())
+
+
 class ChatTimelineLayer(DrCodeState):
     def _log_event(self, task: Task, text: str, *, kind: str = "system") -> None:
         """Persist a service event into the task's event log.
@@ -880,10 +906,19 @@ class ChatTimelineLayer(DrCodeState):
         lines = [
             f"[bold blue]drcode ❓[/] {_mention_markup(escape(clarification.question))}"
         ]
+        has_agent_option = False
         for i, option in enumerate(clarification.options):
+            is_agent, display = _split_agent_marker(option)
+            has_agent_option = has_agent_option or is_agent
+            star = "[bold yellow]★[/] " if is_agent else ""
             lines.append(
-                f"  ▸ [@click=app.pick_option({i})]"
-                f"[underline cyan]{escape(option)}[/][/]"
+                f"  ▸ {star}[@click=app.pick_option({i})]"
+                f"[underline cyan]{escape(display)}[/][/]"
+            )
+        if has_agent_option:
+            lines.append(
+                "[dim]★ — option proposed by the agent on its own initiative, "
+                "not part of your request.[/]"
             )
         lines.append("[dim]Click an option or answer in the input below.[/]")
         self._write_chat("\n".join(lines))

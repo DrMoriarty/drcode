@@ -50,6 +50,7 @@ from ..settings import (
     TaskIsolation,
     Verification,
     WorktreeRemoval,
+    WorktreeSnapshot,
 )
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
@@ -380,6 +381,10 @@ class DrCodeState(App[None]):
     def action_set_worktree_removal(self, removal: WorktreeRemoval) -> None: ...
 
     def action_change_worktree_removal(self) -> None: ...
+
+    def action_set_worktree_snapshot(self, mode: WorktreeSnapshot) -> None: ...
+
+    def action_change_worktree_snapshot(self) -> None: ...
 
     def action_set_max_dev_rounds(self, rounds: int) -> None: ...
 

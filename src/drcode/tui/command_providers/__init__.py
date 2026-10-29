@@ -45,6 +45,7 @@ from .settings import (
     WorkflowPreset,
     WorkflowPresetOptionsProvider,
     WorktreeRemovalOptionsProvider,
+    WorktreeSnapshotOptionsProvider,
     workflow_preset_for,
     workflow_preset_label,
 )
@@ -83,6 +84,7 @@ __all__ = [
     "WorkflowPreset",
     "WorkflowPresetOptionsProvider",
     "WorktreeRemovalOptionsProvider",
+    "WorktreeSnapshotOptionsProvider",
     "role_model_options_provider",
     "workflow_preset_for",
     "workflow_preset_label",

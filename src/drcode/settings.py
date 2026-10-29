@@ -299,6 +299,55 @@ WORKTREE_REMOVAL_OPTIONS: tuple[WorktreeRemoval, ...] = (
 )
 
 
+class WorktreeSnapshot(str, enum.Enum):
+    """When the worktree of a settling task gets the automatic snapshot
+    commit (`git add -A` + "drcode: snapshot of <task-id>") — RULE 1 of
+    the worktree contract, project setting.
+
+    ALWAYS (the historic behaviour): every transition out of active work
+    commits whatever is dirty onto the branch `drcode/<id>` — pure
+    insurance, but it also commits a tail the coding agent left
+    uncommitted ON PURPOSE (WIP, drafts) when it already made its own
+    commits, littering the branch history with a mechanical commit.
+    ONLY_IF_NO_COMMITS (the default): the snapshot runs only when the
+    branch tip is where the activation left it — no run-authored commits
+    since the worktree was created, so the snapshot is still the only
+    anchoring of the work. Once the run made its own commits, the dirty
+    tail is presumed deliberate: the snapshot is skipped with a
+    service-event note and the WORKTREE DIRECTORY IS KEPT on any removal
+    path (deleting it would destroy the unanchored tail — never done
+    automatically; commit or clean the worktree by hand).
+    NEVER: the automatic snapshot is off everywhere except the last-resort
+    protections that run immediately before a worktree is destroyed
+    anyway (the startup orphan sweep) — there the commit is the only way
+    to keep the work, and skipping it would contradict RULE 1 outright.
+
+    The setting never touches the agents' own commit tools (`git_commit`
+    of the tester, the research agent's docs commit) — those are governed
+    by `git_policy`.
+    """
+
+    ALWAYS = "always"
+    ONLY_IF_NO_COMMITS = "only-if-no-commits"
+    NEVER = "never"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is WorktreeSnapshot.ALWAYS:
+            return "always"
+        if self is WorktreeSnapshot.ONLY_IF_NO_COMMITS:
+            return "only if no commits"
+        return "never"
+
+
+WORKTREE_SNAPSHOT_OPTIONS: tuple[WorktreeSnapshot, ...] = (
+    WorktreeSnapshot.ALWAYS,
+    WorktreeSnapshot.ONLY_IF_NO_COMMITS,
+    WorktreeSnapshot.NEVER,
+)
+
+
 class StallNudge(str, enum.Enum):
     """How long an agent/tester run may stay without any sign of life
     (no stream deltas, no tool events) before it is automatically aborted
@@ -405,6 +454,12 @@ class ProjectSettings(BaseModel):
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,
     # whatever this says.
     worktree_removal: WorktreeRemoval = WorktreeRemoval.ON_DELETE
+    # When the settling task's worktree gets the automatic RULE-1 snapshot
+    # commit (WorktreeSnapshot docstring). only-if-no-commits skips it when
+    # the run made its own commits on the branch (a deliberately uncommitted
+    # tail is then kept in the worktree, never auto-removed); never disables
+    # it except before an actual worktree destruction.
+    worktree_snapshot: WorktreeSnapshot = WorktreeSnapshot.ONLY_IF_NO_COMMITS
     # Start point of a NEW task branch `drcode/<id>` under worktree
     # isolation (see drcode.task_env): empty (the default) = the branch
     # the main checkout's HEAD is on — and a detached HEAD (mid-rebase,
@@ -583,6 +638,20 @@ def task_settings_hints(
                     f"Worktree removal: {draft.worktree_removal.label} is "
                     "parked — there are no task worktrees without "
                     "isolation."
+                ),
+            )
+        )
+    if (
+        not isolated
+        and draft.worktree_snapshot is not WorktreeSnapshot.ONLY_IF_NO_COMMITS
+    ):
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    f"Worktree snapshot: {draft.worktree_snapshot.label} is "
+                    "parked — the snapshot anchors a task worktree, and "
+                    "there are none without isolation."
                 ),
             )
         )

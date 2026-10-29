@@ -12,6 +12,7 @@ still saved, the mode stays dormant). Plus the two no-loss rules:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -27,6 +28,7 @@ from drcode.settings import (
     ProjectSettingsStore,
     TaskIsolation,
     WorktreeRemoval,
+    WorktreeSnapshot,
 )
 from drcode.task_env import TaskEnvironment
 from drcode.task_manager import TaskManager
@@ -375,6 +377,249 @@ def test_snapshot_excludes_private_drcode_state(
     # The private state was NOT committed — it stays untracked in the tree.
     assert not any(name.startswith(".drcode") for name in names)
     assert (root / ".drcode" / "scratch.txt").is_file()
+
+
+# -- worktree_snapshot modes (the smart gate) --------------------------------------
+#
+# The snapshot is insurance, not a history garbage collector: when the run
+# already made its own commits on the branch, a remaining dirty tail is
+# presumed deliberate and the mechanical "drcode: snapshot of …" commit is
+# skipped — with the worktree directory KEPT on any removal path, because
+# deleting it would destroy the unanchored tail.
+
+
+def _run_commit(root: Path, message: str) -> None:
+    """A commit the RUN could have authored in its worktree."""
+    subprocess.run(
+        ["git", "add", "-A", "--", ".", ":(exclude).drcode"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", message],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_snapshot_skipped_after_run_commits(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """only-if-no-commits (the default): the run committed its work, so
+    the leftover dirty tail is NOT mechanically committed — and the
+    worktree directory is left alone."""
+    root, _ = env.ensure_root("t1")
+    (root / "feature.py").write_text("committed work")
+    _run_commit(root, "feat: the actual feature")
+    (root / "wip.txt").write_text("deliberate draft")
+    before = unmerged_count(git_root, "drcode/t1")
+    result = env.snapshot("t1", "tester verdict: Verified successfully")
+    assert result is not None
+    assert result.startswith("auto-snapshot skipped:")
+    assert "the run made its own commits" in result
+    # The mechanical commit did not land on the branch.
+    assert unmerged_count(git_root, "drcode/t1") == before
+    assert last_commit_subject(git_root, "drcode/t1") == ("feat: the actual feature")
+    # The tail is still there, uncommitted, in the surviving worktree.
+    assert env.worktree_path("t1").is_dir()
+    assert (env.worktree_path("t1") / "wip.txt").read_text() == "deliberate draft"
+
+
+def test_snapshot_runs_without_run_commits(env: TaskEnvironment) -> None:
+    """only-if-no-commits with a silent branch (tip == the activation
+    stamp): the snapshot is the only anchoring of the work and runs as
+    before — the historic insurance behavior."""
+    root, _ = env.ensure_root("t1")
+    (root / "work.txt").write_text("never committed by the run")
+    result = env.snapshot("t1", "verdict")
+    assert result is not None and result.startswith("snapshot committed")
+
+
+def test_snapshot_always_mode_commits_despite_run_commits(
+    git_root: Path,
+) -> None:
+    """worktree_snapshot: always — the unconditional insurance, run-made
+    commits or not."""
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_snapshot=WorktreeSnapshot.ALWAYS,
+        ),
+    )
+    root, _ = env.ensure_root("t1")
+    (root / "a.py").write_text("committed")
+    _run_commit(root, "feat: mine")
+    (root / "b.py").write_text("tail")
+    result = env.snapshot("t1", "verdict")
+    assert result is not None and result.startswith("snapshot committed")
+    assert last_commit_subject(git_root, "drcode/t1") == (
+        "drcode: snapshot of t1 (verdict)"
+    )
+
+
+def test_snapshot_never_mode_skips(git_root: Path) -> None:
+    """worktree_snapshot: never — the automatic commit is off; the dirty
+    tail stays in the worktree, nothing lands on the branch."""
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_snapshot=WorktreeSnapshot.NEVER,
+        ),
+    )
+    root, _ = env.ensure_root("t1")
+    (root / "work.txt").write_text("uncommitted on purpose")
+    result = env.snapshot("t1", "verdict")
+    assert result is not None
+    assert result.startswith("auto-snapshot skipped:")
+    assert "worktree_snapshot: never" in result
+    assert (
+        not branch_exists(git_root, "drcode/t1")
+        or unmerged_count(git_root, "drcode/t1") == 0
+    )
+    assert (env.worktree_path("t1") / "work.txt").is_file()
+
+
+def test_snapshot_never_mode_still_reports_clean_tree(git_root: Path) -> None:
+    """never only skips the COMMIT: a clean tree is still reported (and
+    the setting never becomes an error)."""
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_snapshot=WorktreeSnapshot.NEVER,
+        ),
+    )
+    env.ensure_root("t1")
+    assert env.snapshot("t1", "verdict") == "worktree clean, nothing to snapshot"
+
+
+def test_removal_keeps_worktree_when_snapshot_skipped(git_root: Path) -> None:
+    """A removal whose snapshot the smart gate skipped keeps the worktree
+    directory (deleting it would destroy the unanchored tail) and warns
+    loudly through the event log."""
+    notices: list[tuple[str, str]] = []
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(task_isolation=TaskIsolation.WORKTREE),
+    )
+    env.event_log = lambda task_id, text: notices.append((task_id, text))
+    root, _ = env.ensure_root("t1")
+    (root / "feature.py").write_text("committed work")
+    _run_commit(root, "feat: the actual feature")
+    (root / "wip.txt").write_text("deliberate draft")
+    env.remove("t1")
+    # The directory survived, the tail is intact, the run's commit is on
+    # the branch.
+    assert env.worktree_path("t1").is_dir()
+    assert (env.worktree_path("t1") / "wip.txt").is_file()
+    assert last_commit_subject(git_root, "drcode/t1") == "feat: the actual feature"
+    assert branch_exists(git_root, "drcode/t1")
+    (warning,) = [t for _, t in notices if "Warning: worktree kept" in t]
+    assert "auto-snapshot skipped" in warning
+
+
+def test_removal_never_snapshot_mode_keeps_dirty_worktree(git_root: Path) -> None:
+    """worktree_snapshot: never + worktree_removal: on_delete — a dirty
+    tree cannot be committed and must not be destroyed: the worktree
+    stays, with the warning."""
+    notices: list[tuple[str, str]] = []
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_snapshot=WorktreeSnapshot.NEVER,
+        ),
+    )
+    env.event_log = lambda task_id, text: notices.append((task_id, text))
+    root, _ = env.ensure_root("t1")
+    (root / "keep.txt").write_text("would be lost")
+    env.remove("t1")
+    assert env.worktree_path("t1").is_dir()
+    assert (env.worktree_path("t1") / "keep.txt").is_file()
+    assert any("Warning: worktree kept" in t for _, t in notices)
+
+
+def test_removal_still_proceeds_when_snapshot_committed(git_root: Path) -> None:
+    """The smart gate only bites when a tail actually remains: a clean
+    removal under only-if-no-commits tears the worktree down as before."""
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(task_isolation=TaskIsolation.WORKTREE),
+    )
+    env.ensure_root("t1")
+    (env.worktree_path("t1") / "late.txt").write_text("anchored")
+    env.remove("t1")
+    assert not env.worktree_path("t1").exists()
+    assert branch_exists(git_root, "drcode/t1")
+    assert last_commit_subject(git_root, "drcode/t1") == (
+        "drcode: snapshot of t1 (before removal)"
+    )
+
+
+def test_cleanup_orphans_forces_snapshot_despite_never(
+    manager: TaskManager, git_root: Path
+) -> None:
+    """The startup sweep is the last chance to keep a dead task's tree at
+    all: it bypasses worktree_snapshot (like it ignores worktree_removal)
+    and anchors the dirty tree before the directory goes."""
+    env = TaskEnvironment(
+        git_root,
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_snapshot=WorktreeSnapshot.NEVER,
+        ),
+    )
+    dead = manager.create("dead", "x")
+    root, _ = env.ensure_root(dead.id)
+    (root / "orphan.txt").write_text("dead task's work")
+    manager.tasks.pop(dead.id)
+    manager.storage.delete(dead.id)
+    removed = env.cleanup_orphans(set(manager.tasks))
+    assert dead.id in removed
+    assert not env.worktree_path(dead.id).exists()
+    assert branch_exists(git_root, f"drcode/{dead.id}")
+    assert last_commit_subject(git_root, f"drcode/{dead.id}") == (
+        f"drcode: snapshot of {dead.id} (before orphan cleanup)"
+    )
+
+
+def test_snapshot_skip_base_resets_on_fresh_worktree(env: TaskEnvironment) -> None:
+    """The stamp is taken when the worktree is (re)created, not when an
+    existing directory is reused: after a removal + re-activation
+    (worktree recreated from the surviving branch) the new run starts
+    from the branch tip and its own commits are detected again — while a
+    mere tester-round reuse of an existing worktree does NOT re-base the
+    gate."""
+    root, _ = env.ensure_root("t1")
+    (root / "one.txt").write_text("run one")
+    _run_commit(root, "feat: run one")
+    (root / "wip.txt").write_text("the dirty tail the gate judges")
+    first = env.snapshot("t1", "verdict")
+    assert first is not None and first.startswith("auto-snapshot skipped:")
+    # The tester round reuses the worktree: no re-stamp, the gate still
+    # sees run-one's commits.
+    env.ensure_root("t1")
+    second = env.snapshot("t1", "verdict")
+    assert second is not None and second.startswith("auto-snapshot skipped:")
+    # A fresh worktree (after removal) re-stamps at the branch tip: the
+    # new run has made no commits yet → the snapshot runs.
+    env.remove("t1")
+    assert env.worktree_path("t1").exists()  # kept: the tail is dirty
+    # Simulate the user cleaning up: commit the tail by hand, remove by
+    # hand, re-activate.
+    root2 = env.worktree_path("t1")
+    _run_commit(root2, "chore: tail anchored by hand")
+    shutil.rmtree(root2)
+    env._git("worktree", "prune")
+    root3, _ = env.ensure_root("t1")
+    assert root3.is_dir()
+    assert env.snapshot("t1", "verdict") == "worktree clean, nothing to snapshot"
 
 
 # -- removal (cancel / delete) --------------------------------------------------------

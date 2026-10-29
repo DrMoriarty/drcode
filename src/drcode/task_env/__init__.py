@@ -66,7 +66,17 @@ here may change its behavior):
 1. A verdict never leaves the task with a dirty tree: `snapshot()`
    commits the worktree's changes onto `drcode/<task-id>` whenever the
    task transitions out of active work (tester verdict, cancel) and
-   before any removal.
+   before any removal. Governed by the `worktree_snapshot` project
+   setting (`drcode.settings`): `always` = unconditional (the historic
+   behavior); `only-if-no-commits` (the default) = skipped when the run
+   made its own commits since the worktree was created — a remaining
+   dirty tail is presumed deliberate, the skip is logged as a service
+   event and every removal path then KEEPS the worktree directory (the
+   unanchored tail must never be destroyed automatically); `never` = off
+   except before an actual destruction of a dead task's leftover
+   directory (the orphan sweep forces it — the last chance to keep the
+   work). The setting never touches the agents' own commit tools
+   (`git_policy` governs those).
 2. A branch with unique commits is never deleted automatically: before
    every `branch -D`, the commits not reachable from the main checkout's
    current branch are counted; if there are any, the branch survives
@@ -205,6 +215,14 @@ class TaskEnvironment(_WorktreeLifecycleMixin, _BranchStateMixin):
         self._removal_locks_guard = threading.Lock()
         self._removal_cond = threading.Condition()
         self._removal_pending: set[str] = set()
+        # The branch tip each task's worktree was (re)created from this
+        # session (`_remember_activation_tip`, stamped on a fresh
+        # `worktree add` only): the baseline the smart snapshot gate
+        # (`worktree_snapshot: only-if-no-commits`) measures the run's own
+        # commits against. Session-scoped by design — a restart loses the
+        # stamps and the gate falls back to the unconditional snapshot
+        # (the insurance never gets pickier than the evidence allows).
+        self._activation_tips: dict[str, str] = {}
 
     # -- state ---------------------------------------------------------------
 

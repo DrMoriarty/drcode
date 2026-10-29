@@ -1616,7 +1616,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         content lines stay aligned (a row-based extraction here drifts by
         every padding/wrapped row above the selection).
         """
-        return self.screen.get_selected_text()
+        try:
+            return self.screen.get_selected_text()
+        except (IndexError, ValueError):
+            # Stale selection: the widget re-rendered since the selection was
+            # captured (streaming flush, resize — markdown re-wraps and the
+            # line count changes), and Selection.extract indexes the captured
+            # offsets against the SHORTER text (upstream clamps only the end
+            # line, not the start). The selection points past the content —
+            # nothing sensible to copy.
+            return None
 
     def _copy_with_fallback(self, text: str) -> None:
         # copy_to_clipboard uses OSC52, which macOS Terminal.app ignores;

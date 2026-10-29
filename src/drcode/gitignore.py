@@ -22,12 +22,14 @@ from __future__ import annotations
 from pathlib import Path
 
 # The private subset: per-task transcripts (may contain proprietary code
-# and conversation), settings (tokens) and sync bookkeeping (machine state).
+# and conversation), settings (tokens), sync bookkeeping (machine state),
+# merge-conflict triage reports and pending push notifications.
 GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/tasks/",
     ".drcode/settings.json",
     ".drcode/github_state.json",
     ".drcode/worktrees/",
+    ".drcode/merge_reports/",
 )
 
 # Spellings of the legacy whole-directory entry older drcode versions

@@ -14,7 +14,14 @@ from textual.css.query import NoMatches
 from textual.widgets import Static
 
 from ..agent import last_context_tokens, subagent_limit_for
-from ..context_layout import task_reports
+from ..context_layout import (
+    AGENT_DEV,
+    AGENT_RESOLVER,
+    AGENT_TESTER,
+    agent_transcript,
+    last_agent,
+    task_reports,
+)
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from ..providers import AgentRole
 from .ctx_dialog import ContextDialog
@@ -160,30 +167,59 @@ class TaskStatusLayer(DrCodeState):
             return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
         return str(n)
 
+    def _agent_ctx(self, task: Task) -> tuple[str, int]:
+        """Which agent's context the task's counter must show and its token
+        reading: an agent with a run in flight (per-agent live maps) wins,
+        otherwise the agent that ran LAST (the shared `last_agent`
+        heuristic) measured over its persisted transcript. Shared by the
+        status-bar counter and the context dialog — the single definition
+        of "active/last agent"."""
+        tester_live = self._live_ctx_tester.get(task.id)
+        if tester_live is not None:
+            return AGENT_TESTER, tester_live
+        resolver_live = self._live_ctx_resolver.get(task.id)
+        if resolver_live is not None:
+            return AGENT_RESOLVER, resolver_live
+        dev_live = self._live_ctx_tokens.get(task.id)
+        if dev_live is not None:
+            return AGENT_DEV, dev_live
+        agent = last_agent(task)
+        return agent, last_context_tokens(agent_transcript(task, agent)) or 0
+
+    def _agent_ctx_role(self, task: Task, agent: str) -> AgentRole:
+        """The role whose resolved config (window / compaction threshold)
+        the given agent's figures are measured against."""
+        if agent == AGENT_TESTER:
+            return AgentRole.TESTER
+        if agent == AGENT_RESOLVER:
+            return AgentRole.RESOLVER
+        return self._task_role(task)
+
     def _update_ctx_counter(self, right: Static, task: Task) -> None:
         """Right corner of the task status bar: current context fill in
-        tokens and percent of the allowed maximum.
+        tokens and percent of the allowed maximum — of the agent that is
+        active on the task right now (dev run, testing round, resolver
+        round), or of the one that worked last.
 
         Source of truth: the latest model request usage. For a run in
-        progress — the live value; otherwise (finished task, history view)
-        — the value computed from the persisted transcript, i.e. the final
-        value is saved in the task history together with the per-response
-        usage and survives restarts.
+        progress — the per-agent live value; otherwise (finished task,
+        history view) — the value computed from the persisted transcript,
+        i.e. the final value is saved in the task history together with
+        the per-response usage and survives restarts.
 
         The counter is clickable: it opens the modal context-layout dialog
         (action_show_ctx_dialog) — the 🧠 figure itself is wrapped in the
         same [@click] markup the task-id mention links use.
         """
         right.remove_class("ctx-warn", "ctx-crit")
-        tokens = self._live_ctx_tokens.get(task.id)
-        if tokens is None:
-            tokens = last_context_tokens(task.messages)
+        agent, tokens = self._agent_ctx(task)
         if not tokens:
             right.update("")
             right.tooltip = None
             return
         right.tooltip = "Click: context layout (≈ breakdown + exact usage)"
-        max_tokens = self.resolved_config(self._task_role(task)).max_context_tokens
+        role_config = self.resolved_config(self._agent_ctx_role(task, agent))
+        max_tokens = role_config.max_context_tokens
         if max_tokens > 0:
             pct = round(tokens * 100 / max_tokens)
             text = (
@@ -193,10 +229,11 @@ class TaskStatusLayer(DrCodeState):
             # Red from the compaction threshold, yellow when the remaining
             # headroom is twice the red-zone headroom: threshold 80 →
             # yellow from 60, threshold 90 → yellow from 80. The threshold
-            # follows the task's serving role's resolved config (research
-            # tasks use the research model), so a per-model compaction
-            # limit from the catalog is reflected here too.
-            role_config = self.resolved_config(self._task_role(task))
+            # follows the shown agent's role's resolved config (a research
+            # task's dev transcript uses the research model, a testing
+            # round the tester's, a resolver round the resolver's), so a
+            # per-model compaction limit from the catalog is reflected
+            # here too.
             threshold = min(max(role_config.compaction_threshold, 1), 100)
             warn_pct = 2 * threshold - 100
             if pct >= threshold:
@@ -209,28 +246,48 @@ class TaskStatusLayer(DrCodeState):
 
     def action_show_ctx_dialog(self) -> None:
         """Click on the context counter: open the modal dialog with the
-        ≈ context layout of the viewed task (development transcript on the
-        serving role's model, the latest testing round on the tester's,
-        plus the exact API figures and the whole-task cumulative usage)."""
+        ≈ context layout of the viewed task's agents (the development
+        transcript on the serving role's model, the latest testing round
+        on the tester's, the latest resolver round on the resolver's —
+        tabbed), plus the exact API figures and the whole-task cumulative
+        usage. The tab of the active/last agent is selected (the same
+        selector the counter uses)."""
         task = self.viewed
         if task is None or self._new_task_mode:
             return
-        if not task.messages and not task.tester_messages:
+        if (
+            not task.messages
+            and not task.tester_messages
+            and not task.resolver_messages
+        ):
             self.notify("Task has no context yet — no model request was made.")
             return
         role = self._task_role(task)
-        dev, tester, usage, requests = task_reports(
+        dev, tester, resolver, usage, requests = task_reports(
             task,
             self.resolved_config(role),
             self.resolved_config(AgentRole.TESTER),
+            self.resolved_config(AgentRole.RESOLVER),
             role.value.upper(),
             self.project_root,
             live_tokens=self._live_ctx_tokens.get(task.id),
+            tester_live_tokens=self._live_ctx_tester.get(task.id),
+            resolver_live_tokens=self._live_ctx_resolver.get(task.id),
             tester_allow_commit=self.settings.git_policy.tester.commits,
             tester_allow_push=self.settings.git_policy.tester.pushes,
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit_for(self.settings, role),
         )
+        agent, _ = self._agent_ctx(task)
         self.push_screen(
-            ContextDialog([r for r in (dev, tester) if r is not None], usage, requests)
+            ContextDialog(
+                [
+                    (AGENT_DEV, dev),
+                    (AGENT_TESTER, tester),
+                    (AGENT_RESOLVER, resolver),
+                ],
+                usage,
+                requests,
+                default_agent=agent,
+            )
         )

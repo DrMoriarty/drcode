@@ -33,10 +33,16 @@ from typing import Any
 
 from pydantic_ai.usage import RunUsage
 
-from .agent import build_agent, build_tester_agent, load_agents_md
+from .agent import (
+    build_agent,
+    build_resolver_agent,
+    build_tester_agent,
+    load_agents_md,
+)
 from .config import Config
 from .models import Task, TaskKind
 from .prompts import (
+    load_resolver_prompt,
     load_system_prompt_components,
     load_tester_prompt_components,
 )
@@ -44,6 +50,7 @@ from .settings import GitPolicy
 from .transcript import (  # noqa: F401 - CHARS_PER_TOKEN is re-exported
     CHARS_PER_TOKEN,
     COMPACTION_SUMMARY_PREFIX,
+    _message_time,
     estimate_tokens,
     last_context_tokens,
 )
@@ -184,6 +191,83 @@ def tester_tool_schemas(
             config, allow_commit=allow_commit, allow_push=allow_push, root=root
         )
     )
+
+
+def system_components_resolver(
+    project_root: Path | None,
+) -> list[tuple[str, str | None]]:
+    """Labeled system-prompt pieces of the merge-conflict resolver run: the
+    base template (project override honored) and the project's AGENTS.md —
+    exactly what `build_resolver_agent` assembles into the instructions
+    (the resolver has no git-workflow fragment; see its builder)."""
+    base = load_resolver_prompt(project_root)
+    agents_md = load_agents_md(project_root) if project_root is not None else ""
+    return [
+        ("base template", base),
+        ("AGENTS.md", agents_md.strip() or None),
+    ]
+
+
+def resolver_tool_schemas(
+    config: Config,
+    *,
+    root: Path | None = None,
+) -> list[tuple[str, str]]:
+    """Tool wire-texts of the resolver agent (read/inspect tools + the
+    edit pair + set_resolution — whatever `build_resolver_agent`
+    registers; no network, pure wiring)."""
+    return tool_schemas(build_resolver_agent(config, root=root))
+
+
+# -- per-agent selection (shared by the status-bar counter and the dialog) ----
+
+# The three transcripts/agents of a task: development (task.messages, served
+# by the task's role), a testing round (task.tester_messages) and a
+# conflict-resolution round (task.resolver_messages).
+AGENT_DEV = "dev"
+AGENT_TESTER = "tester"
+AGENT_RESOLVER = "resolver"
+
+
+def agent_transcript(task: Task, agent: str) -> list[dict[str, Any]]:
+    """The transcript whose context the given agent's figures describe: the
+    development transcript, the LAST testing round or the LAST resolver
+    round (each round is a separate context). Empty when the agent never
+    ran."""
+    if agent == AGENT_DEV:
+        return task.messages
+    if agent == AGENT_TESTER:
+        return task.tester_messages[-1] if task.tester_messages else []
+    if agent == AGENT_RESOLVER:
+        return task.resolver_messages[-1] if task.resolver_messages else []
+    raise ValueError(f"unknown agent: {agent}")
+
+
+def last_agent(task: Task) -> str:
+    """Which agent worked on `task` LAST (heuristic over the persisted
+    rounds, no Task model changes).
+
+    The resolver counts as last when it has rounds and no NEW testing
+    round followed its last one (round order decided by the message
+    timestamps pydantic-ai already serializes into the parts); otherwise
+    the tester when it has rounds; otherwise the developer. Missing
+    timestamps read as "no tester round after" — the resolver is the
+    conservative pick (its rounds are the rarest and the most recent by
+    construction). Interrupted development after a tester round is a
+    known, accepted imprecision of the heuristic."""
+    if task.resolver_messages and task.resolver_messages[-1]:
+        tester_time = (
+            _message_time(task.tester_messages[-1][-1])
+            if task.tester_messages and task.tester_messages[-1]
+            else None
+        )
+        resolver_time = _message_time(task.resolver_messages[-1][-1])
+        if tester_time is None or resolver_time is None or tester_time <= resolver_time:
+            return AGENT_RESOLVER
+        return AGENT_TESTER
+    if task.tester_messages and task.tester_messages[-1]:
+        return AGENT_TESTER
+    return AGENT_DEV
 
 
 # -- transcript analysis ------------------------------------------------------
@@ -529,25 +613,32 @@ def task_reports(
     task: Task,
     dev_config: Config,
     tester_config: Config,
+    resolver_config: Config,
     dev_role_label: str,
     project_root: Path,
     *,
     live_tokens: int | None = None,
+    tester_live_tokens: int | None = None,
+    resolver_live_tokens: int | None = None,
     tester_allow_commit: bool = True,
     tester_allow_push: bool = True,
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
-) -> tuple[CtxReport | None, CtxReport | None, RunUsage, int]:
-    """The two transcript reports of one task plus its whole-task cumulative
-    exact usage.
+) -> tuple[CtxReport | None, CtxReport | None, CtxReport | None, RunUsage, int]:
+    """The per-agent transcript reports of one task plus its whole-task
+    cumulative exact usage.
 
     Development: `task.messages` measured against `dev_config` — the resolved
     config of the role serving the task (`_task_role`: research tasks run on
     the research model, everything else on coding); `research_git` mirrors
     the project's research git policy so prompt and tool set match the real
     wiring. Testing: the latest round
-    of `task.tester_messages` against `tester_config` (the rounds are
-    separate contexts — the tester never sees the development transcript).
+    of `task.tester_messages` against `tester_config`; Resolver: the latest
+    round of `task.resolver_messages` against `resolver_config` (the rounds
+    are separate contexts — neither the tester nor the resolver ever sees
+    the development transcript). `*_live_tokens` carry the live in-run
+    readings of the respective agents where one is running (they win over
+    the persisted transcript, like the dev counter does).
     """
     dev: CtxReport | None = None
     if task.messages:
@@ -583,6 +674,20 @@ def task_reports(
                 allow_push=tester_allow_push,
                 root=project_root,
             ),
+            exact_tokens=tester_live_tokens,
         )
-    usage, requests = cumulative_usage([task.messages, *task.tester_messages])
-    return dev, tester, usage, requests
+    resolver: CtxReport | None = None
+    resolver_messages = task.resolver_messages[-1] if task.resolver_messages else []
+    if resolver_messages:
+        resolver = build_report(
+            f"Resolver (conflict resolution, round {len(task.resolver_messages)})",
+            resolver_messages,
+            resolver_config,
+            system_components=system_components_resolver(project_root),
+            tools=resolver_tool_schemas(resolver_config, root=project_root),
+            exact_tokens=resolver_live_tokens,
+        )
+    usage, requests = cumulative_usage(
+        [task.messages, *task.tester_messages, *task.resolver_messages]
+    )
+    return dev, tester, resolver, usage, requests

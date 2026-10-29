@@ -268,6 +268,10 @@ class PipelineResolverLayer(DrCodeState):
                                     view.feed(event)
                             view.finish_node()
                             live_tokens = run_context_tokens(run)
+                            if live_tokens is not None:
+                                self._live_ctx_resolver[task_id] = live_tokens
+                                if self.viewed_id == task_id:
+                                    self.refresh_task_status()
                             self._record_session_usage(last_response_usage(run))
                             self._note_network_recovered(task, self._resolver_net_count)
                             self._resolver_net_count.pop(task_id, None)
@@ -407,6 +411,7 @@ class PipelineResolverLayer(DrCodeState):
             self._stop_run_tools(run_key)
             self._resolver_running = False
             self._resolver_task_id = None
+            self._live_ctx_resolver.pop(task_id, None)
             self.refresh_status()
             self.refresh_sidebar()
             if not cancelled:

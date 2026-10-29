@@ -211,7 +211,8 @@ class PipelineTesterLayer(DrCodeState):
                     and task.tester_messages[-1]
                     else prompt
                 )
-                # Live context reading of the current round; the shared
+                # Live context reading of the current round; it goes into
+                # the tester's own map (`_live_ctx_tester`) — the shared
                 # _live_ctx_tokens map belongs to the agent transcript and
                 # must not be polluted with the tester's.
                 live_tokens: int | None = None
@@ -269,6 +270,10 @@ class PipelineTesterLayer(DrCodeState):
                                         view.feed(event)
                                 view.finish_node()
                                 live_tokens = run_context_tokens(run)
+                                if live_tokens is not None:
+                                    self._live_ctx_tester[task_id] = live_tokens
+                                    if self.viewed_id == task_id:
+                                        self.refresh_task_status()
                                 # Exact per-request usage of the completed
                                 # model call, into the session totals.
                                 self._record_session_usage(last_response_usage(run))
@@ -501,6 +506,7 @@ class PipelineTesterLayer(DrCodeState):
             self._stop_run_tools(run_key)
             self.tester_running = False
             self._tester_task_id = None
+            self._live_ctx_tester.pop(task_id, None)
             self.refresh_status()
             self.refresh_sidebar()
             if task.status is TaskStatus.COMPLETED:

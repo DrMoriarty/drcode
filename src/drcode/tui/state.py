@@ -774,6 +774,13 @@ class DrCodeState(App[None]):
 
     # -- context fill / compaction ------------------------------------------
     _live_ctx_tokens: dict[str, int]
+    # The same live readings for the two round-running agents: tester
+    # rounds (the shared map above belongs to the dev transcript and must
+    # not be polluted with the tester's) and resolver rounds. Presence of
+    # an entry = that agent is running for the task; popped in the run's
+    # finally-block.
+    _live_ctx_tester: dict[str, int]
+    _live_ctx_resolver: dict[str, int]
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
     # Livelock guard: consecutive hard-limit compactions per task that never

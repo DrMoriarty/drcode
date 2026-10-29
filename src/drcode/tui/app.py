@@ -671,6 +671,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # value of a finished task — it stays in the history via the saved
         # per-response usage).
         self._live_ctx_tokens: dict[str, int] = {}
+        # Per-agent live readings for the tester and resolver rounds (see
+        # state.py): filled from the respective run's model-request nodes,
+        # popped in the run's finally-block.
+        self._live_ctx_tester: dict[str, int] = {}
+        self._live_ctx_resolver: dict[str, int] = {}
         # Tasks whose latest compaction attempt failed: the mid-run
         # compaction gate must not stop the run for them at the THRESHOLD
         # level (a persistently failing summarizer would otherwise loop

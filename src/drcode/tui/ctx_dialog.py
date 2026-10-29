@@ -1,12 +1,14 @@
 """Modal dialog: the ≈ context layout of the viewed task.
 
 Opened by clicking the context counter in the task status bar (the 🧠
-token figure at its right corner). Shows, for BOTH transcripts of the task
-— development (`task.messages`) and the latest testing round
-(`task.tester_messages[-1]`) — the estimated breakdown by section
+token figure at its right corner). Shows, per agent of the task — the
+development transcript (`task.messages`), the latest testing round
+(`task.tester_messages[-1]`) and the latest conflict-resolution round
+(`task.resolver_messages[-1]`) — the estimated breakdown by section
 (system prompt parts, tool descriptions, transcript parts) plus the exact
 figures the API reported (last context fill, cache split, whole-task
-cumulative usage).
+cumulative usage). The agents are presented as tabs; the tab of the
+active/last agent is selected on open.
 
 Every estimated figure carries "≈": there is no tokenizer (the model is any
 OpenAI-compatible endpoint), the estimate is chars/4 — and its sum is NOT
@@ -22,10 +24,24 @@ from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Static, Tab, Tabs
 
-from ..context_layout import CHARS_PER_TOKEN, CtxReport, format_tokens
+from ..context_layout import (
+    AGENT_DEV,
+    AGENT_RESOLVER,
+    AGENT_TESTER,
+    CHARS_PER_TOKEN,
+    CtxReport,
+    format_tokens,
+)
+
+_TAB_LABELS = {
+    AGENT_DEV: "Development",
+    AGENT_TESTER: "Testing",
+    AGENT_RESOLVER: "Resolver",
+}
 
 
 def _pct(tokens: int | None, max_tokens: int) -> str:
@@ -105,8 +121,9 @@ def _report_lines(report: CtxReport) -> list[str]:
 
 
 class ContextDialog(ModalScreen[None]):
-    """Read-only modal: the ≈ context layout of the viewed task. ESC or the
-    Close button dismisses; nothing in it is interactive beyond that."""
+    """Read-only modal: the ≈ context layout of the viewed task, tabbed per
+    agent. ESC dismisses; nothing else in it is interactive beyond the
+    tab switching."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "close", "Close", priority=True),
@@ -125,6 +142,7 @@ class ContextDialog(ModalScreen[None]):
         background: $panel;
         border: thick $accent;
     }
+    #ctx-tabs { height: auto; }
     #ctx-scroll { height: 1fr; }
     #ctx-body { width: 1fr; }
     #ctx-close-row {
@@ -136,22 +154,53 @@ class ContextDialog(ModalScreen[None]):
 
     def __init__(
         self,
-        reports: list[CtxReport],
+        reports: list[tuple[str, CtxReport | None]],
         cumulative: RunUsage,
         requests: int,
+        default_agent: str = AGENT_DEV,
     ) -> None:
         super().__init__()
-        self._reports = reports
+        # Only the agents that have a report get a tab, in the fixed
+        # dev → tester → resolver order.
+        self._reports: dict[str, CtxReport] = {
+            agent: report for agent, report in reports if report is not None
+        }
         self._cumulative = cumulative
         self._requests = requests
+        self._agent = default_agent if default_agent in self._reports else AGENT_DEV
+        if self._agent not in self._reports and self._reports:
+            self._agent = next(iter(self._reports))
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ctx-dialog"):
+            if len(self._reports) > 1:
+                yield Tabs(
+                    *[
+                        Tab(_TAB_LABELS.get(agent, agent), id=agent)
+                        for agent in self._reports
+                    ],
+                    id="ctx-tabs",
+                )
             yield VerticalScroll(
                 Static(self._body_text(), id="ctx-body"), id="ctx-scroll"
             )
             with Vertical(id="ctx-close-row"):
                 yield Static("[dim]esc — close[/]")
+
+    def on_mount(self) -> None:
+        try:
+            tabs = self.query_one("#ctx-tabs", Tabs)
+        except NoMatches:
+            return
+        tabs.active = self._agent
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        event.stop()
+        agent = str(event.tab.id or AGENT_DEV)
+        if agent in self._reports:
+            self._agent = agent
+            body = self.query_one("#ctx-body", Static)
+            body.update(self._body_text())
 
     def _body_text(self) -> str:
         lines: list[str] = [
@@ -161,7 +210,8 @@ class ContextDialog(ModalScreen[None]):
                 "arbitrary OpenAI-compatible model)[/]"
             )
         ]
-        for report in self._reports:
+        report = self._reports.get(self._agent)
+        if report is not None:
             lines.append("")
             lines.extend(_report_lines(report))
         if self._requests:

@@ -467,6 +467,12 @@ class SettingsLayer(DrCodeState):
         """
         self.settings.task_isolation = isolation
         self.settings_store.save(self.settings)
+        if self.task_env.active:
+            # Isolation is live from the next activation on — make the
+            # header's unmerged-work counter work without a restart: at
+            # mount it may still have been off, so on_mount skipped the
+            # registration (idempotent, see _ensure_unmerged_tracking).
+            self._ensure_unmerged_tracking()
         if isolation is TaskIsolation.WORKTREE and not self.task_env.available:
             self.notify(
                 "Task isolation: worktree — saved, but this project has no "

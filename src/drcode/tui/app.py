@@ -362,6 +362,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # setting in the dialog applies from the next activation. Removal
         # of a task (cancel/delete/purge) tears its worktree down here.
         self.task_env = TaskEnvironment(project_root, self.settings)
+        # Idempotence guard for _ensure_unmerged_tracking (below): the
+        # git-indicator poll / startup reminder must be registered once,
+        # either at mount (isolation already active) or on the first
+        # mid-session toggle that activates isolation.
+        self._unmerged_tracking_registered = False
         # Worktree service events (snapshot commits, kept-branch notices)
         # surface through the task's event history — or a toast when the
         # task is already gone (delete / retention purge).
@@ -1141,22 +1146,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if self.task_env.active:
             # Remind about completed tasks whose work never reached the
             # current branch (old "stuck" fixes on drcode/* branches —
-            # see _unmerged_work_startup_scan).
-            self.run_worker(
-                self._unmerged_work_startup_scan,
-                exclusive=True,
-                group="unmerged-scan",
-            )
-            # Header's unmerged-work counter (`⎇ N` left of the clock):
-            # an immediate first fill plus a 10 s poll — a manual
+            # see _unmerged_work_startup_scan) plus the header's
+            # unmerged-work counter (`⎇ N` left of the clock): an
+            # immediate first fill plus a 10 s poll — a manual
             # `git merge drcode/<id>` clears it without a restart (see
-            # _poll_git_indicator / _unmerged_completed_ids).
-            self.run_worker(
-                self._poll_git_indicator,
-                exclusive=True,
-                group="git-indicator",
-            )
-            self.set_interval(10, self._poll_git_indicator)
+            # _poll_git_indicator / _unmerged_completed_ids). When
+            # isolation is switched ON mid-session (Settings), the same
+            # registration happens there — the poll would otherwise only
+            # appear after a restart.
+            self._ensure_unmerged_tracking()
         # Deferred installs (on_tester_passed skipped over a half-done
         # merge — task.install_pending): poll for the resolution
         # UNCONDITIONALLY. The guard applies with and without isolation,
@@ -1445,6 +1443,33 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # shot (no-op without isolation / without a resolver model).
             self._maybe_start_resolver(task.id)
         return False
+
+    def _ensure_unmerged_tracking(self) -> None:
+        """Register the unmerged-work tracking exactly once: the one-shot
+        startup reminder (_unmerged_work_startup_scan) plus the header
+        counter's poll (_poll_git_indicator — an immediate first fill and
+        a 10 s interval). Called from on_mount when isolation is already
+        active and from action_set_task_isolation when the user switches
+        isolation ON mid-session — at mount the setting may still have
+        been off, `task_env.active` False, and without this the poll was
+        only registered after a restart. The flag guard keeps repeated
+        calls (mount + toggle, or several toggles) from stacking duplicate
+        intervals; the poll itself no-ops while isolation is inactive
+        (see _unmerged_completed_ids)."""
+        if self._unmerged_tracking_registered:
+            return
+        self._unmerged_tracking_registered = True
+        self.run_worker(
+            self._unmerged_work_startup_scan,
+            exclusive=True,
+            group="unmerged-scan",
+        )
+        self.run_worker(
+            self._poll_git_indicator,
+            exclusive=True,
+            group="git-indicator",
+        )
+        self.set_interval(10, self._poll_git_indicator)
 
     async def _unmerged_work_startup_scan(self) -> None:
         """Startup reminder for old "stuck" fixes: completed tasks whose

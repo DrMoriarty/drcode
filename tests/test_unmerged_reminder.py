@@ -27,6 +27,7 @@ from drcode.settings import (
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
+from drcode.tui.header import HeaderGitIndicator
 from drcode.workflow import load_hooks
 from tests.network_mocks import event_texts, wait_until
 
@@ -846,6 +847,78 @@ async def test_sidebar_row_marker_follows_merge_state(app_env: DrCodeApp) -> Non
         plain = app._task_row_text(task)
         assert "✓" in plain
         assert "[orange]" not in plain and "[green]✓" not in plain
+        await pilot.pause()
+
+
+# -- mid-session isolation toggle: the tracking must not wait for a restart ----------
+
+
+async def test_mid_session_isolation_toggle_registers_git_indicator(
+    git_root: Path, configured_env: None
+) -> None:
+    """First session with isolation OFF at mount: on_mount skips the
+    unmerged-tracking registration. Switching `Task isolation: worktree`
+    in Settings mid-session activates `task_env` immediately (the LIVE
+    settings instance is shared) — the toggle must register the poll too,
+    or the header's `⎇ N` counter only appeared after a restart (while
+    Ctrl+M, computing the candidates on every press, already offered the
+    very same ff-merge)."""
+    app = DrCodeApp(git_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not app.task_env.active
+        assert not app._unmerged_tracking_registered
+        # A completed task with an unmerged branch — as a task run under
+        # isolation (now active) would leave behind.
+        task = finished_task(app)
+        env = TaskEnvironment(
+            git_root, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        commit_on_branch(env, task.id)
+        assert env.unmerged_commits(task.id) == 1
+        # Before the toggle: the poll runs but no-ops (env inactive — see
+        # _unmerged_completed_ids), the widget stays plain and nothing is
+        # registered.
+        await app._poll_git_indicator()
+        await pilot.pause()
+        widget = app.query_one("#header-git", HeaderGitIndicator)
+        assert not widget.has_class("-unmerged")
+        # The toggle (Settings) — before the fix this left the poll
+        # unregistered: no timer, no widget class, ever.
+        app.action_set_task_isolation(TaskIsolation.WORKTREE)
+        assert app.task_env.active
+        assert app._unmerged_tracking_registered
+        # Drive one poll tick like the registered 10 s interval would.
+        await app._poll_git_indicator()
+        await pilot.pause()
+        widget = app.query_one("#header-git", HeaderGitIndicator)
+        assert widget.has_class("-unmerged")
+
+
+async def test_ensure_unmerged_tracking_is_idempotent(
+    git_root: Path, configured_env: None
+) -> None:
+    """Mount with isolation already active, then a redundant toggle: the
+    registration happens exactly once — no duplicate 10 s interval stacked
+    on top of the mount-time one (each copy would run its own git pass)."""
+    ProjectSettingsStore(git_root).save(
+        ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    app = DrCodeApp(git_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.task_env.active
+        assert app._unmerged_tracking_registered
+        app.action_set_task_isolation(TaskIsolation.WORKTREE)
+        assert app._unmerged_tracking_registered
+        # The registered interval: exactly one 10 s timer targets the poll.
+        timers = [
+            timer
+            for timer in app._timers
+            if timer._interval == 10
+            and getattr(timer._callback, "__name__", "") == "_poll_git_indicator"
+        ]
+        assert len(timers) == 1
         await pilot.pause()
 
 

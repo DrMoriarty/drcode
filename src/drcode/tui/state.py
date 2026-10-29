@@ -172,6 +172,8 @@ class DrCodeState(App[None]):
 
     async def _poll_git_indicator(self) -> None: ...
 
+    def _ensure_unmerged_tracking(self) -> None: ...
+
     def _poll_stall(self) -> None: ...
 
     def _nudge_run(self, task: Task) -> None: ...
@@ -588,6 +590,8 @@ class DrCodeState(App[None]):
     # Per-task worktree isolation (project setting `task_isolation`); the
     # optional root the agent/tester runs in comes from here.
     task_env: TaskEnvironment
+    # Idempotence guard for _ensure_unmerged_tracking (assigned in __init__).
+    _unmerged_tracking_registered: bool
     # In-flight worktree snapshot jobs (see _snapshot_in_background) — the
     # research finalization awaits them before running its hook.
     _snapshot_jobs: set[asyncio.Task[None]]

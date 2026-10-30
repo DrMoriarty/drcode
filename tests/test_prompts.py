@@ -26,6 +26,45 @@ def test_compaction_prompts_are_distinct() -> None:
     assert system != template
 
 
+def test_load_compaction_prompts_tester_template() -> None:
+    """The tester variant shares the system prompt but ships its own output
+    template with the "Verification evidence" section: the summary replaces
+    the dropped tool results for a resumed testing round, so the checks
+    already run (commands + exact outcomes) and the reviewed files/diffs
+    (with verdicts) must be preserved verbatim."""
+    dev_system, dev_template = load_compaction_prompts()
+    system, template = load_compaction_prompts(tester=True)
+    assert system == dev_system
+    assert template.strip()
+    assert template != dev_template
+    assert "## Verification evidence" in template
+    assert "### Reviewed files and diffs" in template
+    assert "run_check" in template
+    # The section is tester-only: the dev template stays free of it.
+    assert "Verification evidence" not in dev_template
+
+
+def test_tester_system_prompts_mention_compaction() -> None:
+    """All three tester policy variants describe the mid-round compaction
+    and scope step 2 to the checks without a recorded outcome."""
+    from drcode.prompts import (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+    )
+
+    for prompt in (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+    ):
+        assert "Mid-round compaction" in prompt
+        assert (
+            "not already have a recorded outcome in the\nround's compaction "
+            "summary" in prompt
+        )
+
+
 def test_init_repo_prompt_substitutes_project_path(tmp_path: Path) -> None:
     prompt = load_init_repo_prompt(tmp_path / "my repo")
     assert str((tmp_path / "my repo").resolve()) in prompt
@@ -250,5 +289,10 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
 def test_templates_exist_in_package() -> None:
     from drcode.prompts import _PROMPTS_DIR
 
-    for name in ("compaction.txt", "compaction.md", "init_repo.md"):
+    for name in (
+        "compaction.txt",
+        "compaction.md",
+        "compaction_tester.md",
+        "init_repo.md",
+    ):
         assert (_PROMPTS_DIR / name).is_file()

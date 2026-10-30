@@ -2896,3 +2896,201 @@ async def test_tester_round_second_overflow_gives_up(
     # No retry scheduled: the deterministic error must not loop.
     assert task.id not in net_app._tester_retry_at
     assert task.id not in net_app._tester_fail_count
+
+
+# -- mid-round compaction: the continuation note -----------------------------------
+
+
+async def test_compact_transcript_selects_template_by_summary_role(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+) -> None:
+    """The tester round's summary is built with the tester template (the
+    "Verification evidence" section: checks + exact outcomes, reviewed
+    files/diffs with verdicts); the main-agent transcript keeps the
+    developer template without it. The reduce step receives the same
+    role-specific template (its prompt is built from the same variable)."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    messages = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="long task " * 200)]),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="[tool result for run_bash]\n" + "x" * 4000)
+                ]
+            ),
+        ]
+    )
+    scripted.steps = [text_response("SUMMARY BODY") for _ in range(2)]
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        _, _event_tester, failed_tester = await net_app_small_ctx._compact_transcript(
+            messages, AgentRole.TESTER, task, "testing round"
+        )
+        _, _event_dev, failed_dev = await net_app_small_ctx._compact_transcript(
+            messages, AgentRole.CODING, task, "history"
+        )
+    assert not failed_tester and not failed_dev
+    assert "Verification evidence" in scripted.calls[0]
+    assert "Verification evidence" not in scripted.calls[1]
+
+
+def _prompt_texts(round_messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        p["content"]
+        for m in round_messages
+        if m.get("kind") == "request" or m.get("role") == "request"
+        for p in m.get("parts", [])
+        if p.get("part_kind") == "user-prompt" and isinstance(p.get("content"), str)
+    ]
+
+
+def _fake_tester_live_tokens(
+    monkeypatch: pytest.MonkeyPatch, threshold_tokens: int
+) -> None:
+    """Make the tester's live context reading report `threshold_tokens`
+    (of the 1000-token small-ctx window) while the round transcript is
+    still uncompacted. The streamed FunctionModel carries no usage, so the
+    real run_context_tokens returns None and the mid-round gate would never
+    fire; the fake mirrors the real semantics — the reading exists only
+    while the transcript it belongs to is on screen (a compacted round
+    reads None, like the stale-reading drop in run_tester)."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from drcode.agent import COMPACTION_SUMMARY_PREFIX
+
+    def fake(run: Any) -> int | None:
+        try:
+            msgs = run.all_messages()
+        except Exception:
+            return None
+        texts = [
+            p.content
+            for m in msgs
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, UserPromptPart) and isinstance(p.content, str)
+        ]
+        if not any(t.startswith("Verify completed task") for t in texts):
+            return None
+        if any(t.startswith(COMPACTION_SUMMARY_PREFIX) for t in texts):
+            return None
+        return threshold_tokens
+
+    monkeypatch.setattr(pipeline_tester, "run_context_tokens", fake)
+
+
+async def test_tester_round_compaction_resumes_with_continuation_note(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful mid-round compaction resumes the round with the
+    continuation note (the summary records the checks already run and their
+    outcomes — the model must continue, not restart the verification). The
+    note lands in the round transcript after the summary carrier, and the
+    summarizer call used the tester template."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.usage import RequestUsage
+
+    from drcode.agent import COMPACTION_RESUME_PREFIX, COMPACTION_SUMMARY_PREFIX
+
+    _fake_tester_live_tokens(monkeypatch, 950)
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted.steps = [
+        text_response("work done"),  # development run
+        ModelResponse(  # tester: a check to run, fill above the threshold
+            parts=[
+                ToolCallPart(
+                    tool_name="run_bash", args={"command": "echo hi"}, tool_call_id="c1"
+                )
+            ],
+            usage=RequestUsage(input_tokens=950, output_tokens=8),
+        ),
+        text_response("THE SUMMARY BODY"),  # the summarizer
+        tool_response("set_verification", {"success": True}),  # resumed round
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="testing round completed after the mid-round compaction",
+        )
+        await wait_until(
+            lambda: not net_app_small_ctx.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    # One round, compacted in place: original prompt + summary carrier +
+    # the continuation note.
+    assert len(task.tester_messages) == 1
+    texts = _prompt_texts(task.tester_messages[0])
+    assert any(t.startswith(COMPACTION_SUMMARY_PREFIX) for t in texts)
+    notes = [t for t in texts if t.startswith(COMPACTION_RESUME_PREFIX)]
+    assert len(notes) == 1
+    # The summarizer saw the tester template with the evidence section.
+    assert any("Verification evidence" in c for c in scripted.calls)
+    # The developer transcript is untouched.
+    assert not any(is_summary_message(m) for m in task.messages)
+
+
+async def test_tester_round_failed_compaction_resumes_without_note(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the summarizer fails (the gate disarms for the task), the round
+    resumes as a plain continuation: no continuation note is sent."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.usage import RequestUsage
+
+    from drcode.agent import COMPACTION_RESUME_PREFIX
+
+    _fake_tester_live_tokens(monkeypatch, 950)
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    scripted.steps = [
+        text_response("work done"),  # development run
+        ModelResponse(  # tester: a check to run, fill above the threshold
+            parts=[
+                ToolCallPart(
+                    tool_name="run_bash", args={"command": "echo hi"}, tool_call_id="c1"
+                )
+            ],
+            usage=RequestUsage(input_tokens=950, output_tokens=8),
+        ),
+        api_error("Connection error."),  # the summarizer fails
+        tool_response("set_verification", {"success": True}),  # plain resume
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="testing round completed after the failed compaction",
+        )
+        await wait_until(
+            lambda: not net_app_small_ctx.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    assert task.id in net_app_small_ctx._compaction_failed
+    assert len(task.tester_messages) == 1
+    assert not any(
+        t.startswith(COMPACTION_RESUME_PREFIX)
+        for t in _prompt_texts(task.tester_messages[0])
+    )

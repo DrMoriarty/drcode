@@ -741,6 +741,9 @@ class DrCodeState(App[None]):
     # recovery of a deterministic context-overflow rejection (see
     # run_tester's overflow branch): a second overflow gives the round up.
     _tester_overflow_retried: set[str]
+    # Tasks whose pending round-resume follows a SUCCESSFUL compaction (see
+    # run_tester): the continuation turn carries the resume note.
+    _tester_compaction_resumed: set[str]
 
     # -- merge-conflict resolver bookkeeping (single-slot worker) -----------
     _resolver_running: bool

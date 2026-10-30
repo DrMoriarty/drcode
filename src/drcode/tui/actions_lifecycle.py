@@ -101,6 +101,7 @@ class TaskLifecycleLayer(DrCodeState):
         self._flush_in_flight_prompt(task)
         self.manager.cancel(task.id)
         self._tester_resume_round.discard(task.id)
+        self._tester_compaction_resumed.discard(task.id)
         # The task was possibly in TESTING: drop its tester pipeline state.
         # With a live tester run this is done by the cancelled worker's
         # `finally` (idempotent); without one (retry backoff, failed round)

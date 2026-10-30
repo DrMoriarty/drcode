@@ -21,6 +21,7 @@ from .agent_model import EXTRA_HEADERS
 from .config import Config
 from .prompts import load_compaction_prompts
 from .transcript import (
+    COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
     estimate_tokens,
     sanitized_messages,
@@ -114,6 +115,14 @@ def _is_summary_part(part: dict[str, Any]) -> bool:
     return isinstance(content, str) and content.startswith(COMPACTION_SUMMARY_PREFIX)
 
 
+def _is_resume_part(part: dict[str, Any]) -> bool:
+    """Compaction-continuation note (a round resumed after a successful
+    compaction was nudged with this instruction, see
+    drcode.tui.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT)."""
+    content = part.get("content")
+    return isinstance(content, str) and content.startswith(COMPACTION_RESUME_PREFIX)
+
+
 def _user_prompt_content(msg: dict[str, Any]) -> str | None:
     """First string user-prompt content of a serialized request, if any."""
     parts = _user_prompt_parts(msg)
@@ -134,15 +143,16 @@ def is_summary_message(msg: dict[str, Any]) -> bool:
 
 
 def _without_summary_parts(msg: dict[str, Any]) -> dict[str, Any] | None:
-    """Copy of a serialized request with its summary user-prompt parts
-    dropped; None when nothing but summary parts remains."""
+    """Copy of a serialized request with its summary AND continuation-note
+    user-prompt parts dropped; None when nothing but compaction-machinery
+    parts remains."""
     parts = [
         p
         for p in msg.get("parts", [])
         if not (
             isinstance(p, dict)
             and p.get("part_kind") == "user-prompt"
-            and _is_summary_part(p)
+            and (_is_summary_part(p) or _is_resume_part(p))
         )
     ]
     if len(parts) == len(msg.get("parts", [])):
@@ -164,6 +174,12 @@ def split_original_prompts(
     (adjacent user-prompt parts after a resume) contributes only its
     non-summary parts to `preserved` — stale summaries must not survive
     into the next compaction, or the transcript grows on every cycle.
+    Compaction-continuation notes (COMPACTION_RESUME_PREFIX, the message a
+    resumed round was nudged with) are compaction machinery too: when such
+    a note is merged into the leading request, it is dropped from
+    `preserved` and stays in `rest`, where the summarizer sees it as part
+    of the conversation history — it must not be re-preserved verbatim on
+    every compaction cycle.
     """
     i = 0
     preserved: list[dict[str, Any]] = []
@@ -172,7 +188,7 @@ def split_original_prompts(
         parts = _user_prompt_parts(msg) if _is_request(msg) else []
         if not parts:
             break
-        if any(_is_summary_part(p) for p in parts):
+        if any(_is_summary_part(p) or _is_resume_part(p) for p in parts):
             trimmed = _without_summary_parts(msg)
             if trimmed is not None:
                 preserved.append(trimmed)
@@ -381,12 +397,19 @@ def slice_budget_tokens(
     config: Config,
     anchor: str | None = None,
     checklist: str | None = None,
+    *,
+    system_prompt: str | None = None,
+    template: str | None = None,
 ) -> int:
     """Token budget for one history slice (or one reduce partials payload):
     the COMPACTION role's context window minus headroom for the system
     prompt, the output template, the anchors riding along on every call,
-    the model's own output and the chars/4 heuristic's slack."""
-    system_prompt, template = load_compaction_prompts()
+    the model's own output and the chars/4 heuristic's slack. The system
+    prompt/template overrides let a role-specific compaction template (the
+    tester variant) be accounted for instead of the default one."""
+    default_system, default_template = load_compaction_prompts()
+    system_prompt = system_prompt if system_prompt is not None else default_system
+    template = template if template is not None else default_template
     reserve = (
         _estimate_tokens(system_prompt)
         + _estimate_tokens(template)

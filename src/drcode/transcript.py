@@ -34,6 +34,14 @@ from pydantic_ai.usage import RunUsage
 # regular user message.
 COMPACTION_SUMMARY_PREFIX = "[context summary]"
 
+# Marker prefix of the synthetic user message a paused round is resumed
+# with after a SUCCESSFUL compaction ("the summary above replaces the
+# dropped tool results — continue from the remaining steps"). Marks the
+# message as compaction machinery, like COMPACTION_SUMMARY_PREFIX: it is
+# never preserved verbatim across compactions (it rides in `rest` and is
+# summarized) and is not a user prompt for any user-side extraction.
+COMPACTION_RESUME_PREFIX = "[compaction note]"
+
 # Conventional token-size assumption of the chars/4 estimate: ~4 characters
 # per token. Used by `estimate_tokens` here and re-exported by
 # `context_layout` (which labels every figure built from it with "≈").
@@ -294,7 +302,8 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
     while the task was being worked on. Used to hand the tester the full
     user-side context (the first prompt alone can be stale once the task
     was refined mid-flight). Synthetic compaction-summary requests are not
-    user prompts and are skipped.
+    user prompts and are skipped — nor are compaction-continuation notes
+    (COMPACTION_RESUME_PREFIX): they are pipeline machinery, not user input.
     """
     prompts: list[str] = []
     for msg in messages:
@@ -305,7 +314,9 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
                 content = part.get("content")
                 if isinstance(content, str) and content.strip():
                     text = content.strip()
-                    if text.startswith(COMPACTION_SUMMARY_PREFIX):
+                    if text.startswith(
+                        (COMPACTION_SUMMARY_PREFIX, COMPACTION_RESUME_PREFIX)
+                    ):
                         continue
                     prompts.append(text)
     return prompts

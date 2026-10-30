@@ -580,6 +580,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # compaction recovery of a deterministic context-overflow rejection
         # (the #f425b421 class): a second overflow gives the round up.
         self._tester_overflow_retried: set[str] = set()
+        # Tasks whose pending round-resume follows a SUCCESSFUL compaction
+        # (mid-round pause, or the forced context-overflow recovery): the
+        # resumed continuation turn must carry the compaction-resume note
+        # (TESTER_COMPACTION_RESUME_PROMPT, see run_tester).
+        self._tester_compaction_resumed: set[str] = set()
         # Merge-conflict resolver (single-slot worker, mirrors the tester's
         # bookkeeping): singular running flag, per-round generation, failure
         # counters (model errors vs transient network errors) and the

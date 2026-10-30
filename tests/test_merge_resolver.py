@@ -419,6 +419,117 @@ def test_pyright_check_leaves_uv_run_env_alone(
     assert "VIRTUAL_ENV" not in env or env["VIRTUAL_ENV"] != str(repo / ".venv")
 
 
+# -- isolated worktree: fallback to the MAIN checkout's .venv -----------------------
+# The 005c564a case: the task worktree's own .venv is a useless skeleton, `uv run`
+# cannot sync it (no pypi), and drcode's own interpreter carries no pytest/ruff —
+# the project's native venv in the main checkout does. The worktree's code must
+# still be what the checks import (PYTHONPATH fix), never the main checkout's
+# editable install.
+
+
+def test_project_python_falls_back_to_main_checkout_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _task_worktree(repo, "t1")
+    log = _fake_worktree_venv(repo)  # the MAIN checkout's .venv; the wt has none
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)  # no uv on PATH
+    plan = mr._project_python(wt, "pytest")
+    assert plan == ([str(repo / ".venv" / "bin" / "python")], True)
+    # The probe really went through the main checkout's venv python…
+    assert log.read_text().splitlines() == ["-c", "import pytest"]
+    # …from inside the worktree.
+    assert mr._main_checkout_root(wt) == repo.resolve()
+
+
+def test_main_checkout_root_is_none_outside_an_isolated_worktree(
+    repo: Path, tmp_path: Path
+) -> None:
+    # From the main checkout itself the common git dir resolves to its
+    # own .git — there is no separate environment one level up. And a
+    # non-git directory has none to find at all.
+    assert mr._main_checkout_root(repo) is None
+    assert mr._main_checkout_root(tmp_path) is None
+
+
+def test_run_test_suite_in_worktree_uses_main_checkout_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _task_worktree(repo, "t1")
+    log = _fake_worktree_venv(repo)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    _no_xdist(monkeypatch)
+    (wt / "tests").mkdir()
+    (wt / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    result = mr.run_test_suite(wt)
+    assert result.ok and not result.skipped
+    lines = log.read_text().splitlines()
+    # The pytest probe ran through the main checkout's venv python, and
+    # the suite itself too (`-m pytest`, never a PATH binary).
+    assert ["-c", "import pytest"] == lines[:2]
+    assert lines[-3:] == ["-m", "pytest", "-q"]
+
+
+def test_run_test_suite_in_worktree_pins_worktree_pythonpath(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fix_path=True: the WORKTREE's code leads PYTHONPATH, so the main
+    # checkout's editable install cannot shadow the resolved tree.
+    wt = _task_worktree(repo, "t1")
+    _fake_worktree_venv(repo)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    _no_xdist(monkeypatch)
+    (wt / "src").mkdir()
+    (wt / "tests").mkdir()
+    (wt / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    captured: dict[str, dict[str, str] | None] = {}
+
+    def spy(
+        name: str, cmd: list[str], *args: object, **kwargs: object
+    ) -> mr.CheckResult:
+        captured["env"] = cast("dict[str, str] | None", kwargs.get("env"))
+        return mr.CheckResult(name=name, ok=True)
+
+    monkeypatch.setattr(mr, "_run_checked", spy)
+    assert mr.run_test_suite(wt).ok
+    env = captured["env"]
+    assert env is not None
+    assert env["PYTHONPATH"].split(os.pathsep)[0] == str(wt / "src")
+
+
+def test_run_test_suite_in_worktree_falls_through_dead_main_venv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A main-checkout .venv that cannot import the module (a skeleton)
+    # falls through to the interpreter drcode runs under — same trust
+    # level, still no PATH binary.
+    wt = _task_worktree(repo, "t1")
+    shim = repo / ".venv" / "bin" / "python"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\nexit 1\n")  # every import probe fails
+    shim.chmod(0o755)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    _no_xdist(monkeypatch)
+    (wt / "tests").mkdir()
+    (wt / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    result = mr.run_test_suite(wt)
+    assert result.ok and not result.skipped
+
+
+def test_run_test_suite_in_worktree_skips_when_no_environment_at_all(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _task_worktree(repo, "t1")
+    shim = repo / ".venv" / "bin" / "python"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\nexit 1\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr(mr.shutil, "which", lambda name: None)
+    monkeypatch.setattr(mr, "_pytest_importable", lambda: False)
+    (wt / "tests").mkdir()
+    result = mr.run_test_suite(wt)
+    assert result.skipped and result.ok
+
+
 # -- conflict-marker scan (the a6a6df25 prose-only resolution class) ---------------
 
 

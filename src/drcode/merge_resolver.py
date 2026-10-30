@@ -356,6 +356,25 @@ def _venv_python(worktree: Path) -> Path | None:
     return None
 
 
+def _main_checkout_root(worktree: Path) -> Path | None:
+    """The main checkout's root when `worktree` is an ISOLATED task
+    worktree of that checkout — identified as the working tree owning
+    the common git dir (`git rev-parse --git-common-dir` resolves to
+    `<main>/.git` from a linked worktree). None when the tree IS the
+    main checkout, is not a git repository, or git cannot tell — the
+    caller then simply has no separate environment to fall back to."""
+    code, out = _git("rev-parse", "--git-common-dir", cwd=worktree)
+    if code != 0 or not out:
+        return None
+    common = Path(out.splitlines()[-1])
+    if not common.is_absolute():
+        common = (worktree / common).resolve()
+    root = common.parent
+    if root == worktree.resolve() or not (root / ".git").exists():
+        return None
+    return root
+
+
 def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
     """True when `module` imports in the environment the given python
     command resolves to — probed with the SAME launcher the check would
@@ -386,9 +405,15 @@ def _project_python(worktree: Path, module: str) -> tuple[list[str], bool] | Non
     ALLOWED — a fresh worktree has no .venv, and `--no-sync` would create
     an empty skeleton from which uv silently falls back to whatever
     pytest/ruff sits on PATH, reporting environment artifacts as merge
-    regressions), then the interpreter drcode itself runs under. The
-    probed `module` (pytest, ruff, …) must really import there — a
-    skeleton or partially synced venv falls through to the next option."""
+    regressions), then the MAIN CHECKOUT's .venv for an isolated task
+    worktree (the 005c564a case: the worktree's own .venv is a useless
+    skeleton, `uv run` cannot reach pypi to sync it, and drcode's own
+    interpreter carries no pytest/ruff — the project's native venv one
+    level up does; the worktree's code is put on PYTHONPATH explicitly,
+    so the main checkout's editable install cannot shadow the resolved
+    tree), then the interpreter drcode itself runs under. The probed
+    `module` (pytest, ruff, …) must really import there — a skeleton or
+    partially synced venv falls through to the next option."""
     venv_python = _venv_python(worktree)
     if venv_python is not None and _module_importable(
         [str(venv_python)], module, worktree
@@ -400,6 +425,12 @@ def _project_python(worktree: Path, module: str) -> tuple[list[str], bool] | Non
         and _module_importable(["uv", "run", "python"], module, worktree)
     ):
         return ["uv", "run", "python"], False
+    if (main_root := _main_checkout_root(worktree)) is not None:
+        main_python = _venv_python(main_root)
+        if main_python is not None and _module_importable(
+            [str(main_python)], module, worktree
+        ):
+            return [str(main_python)], True
     if _pytest_importable() and _module_importable([sys.executable], module, worktree):
         return [sys.executable], True
     return None

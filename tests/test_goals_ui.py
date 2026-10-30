@@ -4,7 +4,8 @@ GoalScreen and the app-level goal actions.
 Covers: the sidebar's ◆ title n/m rows (top-level counters survive a
 collapsed section, a milestone sums its subtree, the + add goal row),
 the ◆<goal-id> link marker on task rows, the GoalScreen tree (filter,
-Enter-expandable details, link marker of the viewed task) and its R/T
+Enter-expandable details, link marker of the viewed task, the ←/→
+subtree-collapse and cursor-to-parent controls) and its R/T
 actions, the Ctrl+Y capture context (parent preset + task link), the
 palette command set and the GoalStore ordering primitives (move/reparent).
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from textual.widgets import Checkbox, Input, ListView, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
 from drcode.models import GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
@@ -213,6 +214,88 @@ async def test_goal_screen_filter_cycle(app: DrCodeApp) -> None:
         assert shown() == {active.id, done.id, archived.id}
         await pilot.press("f")  # all → active (cycle wraps)
         assert shown() == {active.id}
+
+
+async def test_goal_screen_subtree_toggle(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        parent = app.manager.goals.create("Release 1.0")
+        child = app.manager.goals.create("Async core", parent_id=parent.id)
+        grandchild = app.manager.goals.create("Transport", parent_id=child.id)
+        leaf = app.manager.goals.create("loose idea")
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+
+        def shown() -> set[str]:
+            return {
+                w.goal_id
+                for w in listing.children
+                if isinstance(w, TaskItem) and w.goal_id
+            }
+
+        assert shown() == {parent.id, child.id, grandchild.id, leaf.id}
+        # Cursor on the parent, Right collapses its whole subtree.
+        listing.index = 0
+        await pilot.press("right")
+        await pilot.pause()
+        assert shown() == {parent.id, leaf.id}
+        # Right again expands it back.
+        await pilot.press("right")
+        await pilot.pause()
+        assert shown() == {parent.id, child.id, grandchild.id, leaf.id}
+        # A leaf goal has nothing to toggle.
+        listing.index = next(
+            i
+            for i, w in enumerate(listing.children)
+            if isinstance(w, TaskItem) and w.goal_id == leaf.id
+        )
+        await pilot.press("right")
+        await pilot.pause()
+        assert shown() == {parent.id, child.id, grandchild.id, leaf.id}
+        # The → button does the same as the key.
+        listing.index = 0
+        screen.query_one("#goal-tree-expand", Button).press()
+        await pilot.pause()
+        assert shown() == {parent.id, leaf.id}
+        # Focus (and thus the arrow keys) returns to the tree.
+        assert app.focused is listing
+
+
+async def test_goal_screen_cursor_parent(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        parent = app.manager.goals.create("Release 1.0")
+        child = app.manager.goals.create("Async core", parent_id=parent.id)
+        app.manager.goals.create("Transport", parent_id=child.id)
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+
+        def cursor_goal() -> str | None:
+            item = listing.highlighted_child
+            return item.goal_id if isinstance(item, TaskItem) else None
+
+        assert cursor_goal() == parent.id  # first open lands on row 0
+        # Cursor on the grandchild, Left lifts it to the child, again to
+        # the top-level parent.
+        listing.index = 2
+        await pilot.press("left")
+        await pilot.pause()
+        assert cursor_goal() == child.id
+        await pilot.press("left")
+        await pilot.pause()
+        assert cursor_goal() == parent.id
+        # Left on a top-level goal stays put.
+        await pilot.press("left")
+        await pilot.pause()
+        assert cursor_goal() == parent.id
+        # The ← button lifts from the grandchild too.
+        listing.index = 2
+        screen.query_one("#goal-tree-parent", Button).press()
+        await pilot.pause()
+        assert cursor_goal() == child.id
+        assert app.focused is listing
 
 
 async def test_goal_screen_research_task(app: DrCodeApp) -> None:

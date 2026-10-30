@@ -13,7 +13,9 @@
 - ``GoalScreen`` — the full-screen roadmap view: milestone → sub-goal
   tree with n/m progress counters, a status filter, Enter-expandable
   description/notes details and the keyboard action set
-  (N/R/T/E/M/A/Ctrl+Up/Down/Esc). The screen is a viewer + decision pad:
+  (N/R/T/E/M/A/Ctrl+Up/Down/Esc). The tree itself is collapsible:
+  → (a button and the Right key) toggles the cursor goal's subtree,
+  ← (a button and the Left key) lifts the cursor to the parent goal. The screen is a viewer + decision pad:
   every mutation goes through the app's goal actions layer
   (``tui.actions_goals``), which owns persistence and sidebar refresh.
 """
@@ -448,10 +450,13 @@ class GoalScreen(ModalScreen[None]):
     from the goal (the standard Ctrl+N form with the link preset) · E
     edit description/notes · M reparent (picker or Make top-level) · A
     archive/unarchive · Ctrl+Up/Down reorder among siblings · F cycle
-    the status filter · Esc close."""
+    the status filter · → expand/collapse the cursor goal's subtree ·
+    ← lift the cursor to the parent goal · Esc close."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "close", "Close", priority=True),
+        Binding("right", "toggle_subtree", "Subtree", show=False),
+        Binding("left", "cursor_parent", "Up hierarchy", show=False),
         Binding("f", "cycle_filter", "Filter"),
         Binding("n", "new_goal", "New goal"),
         Binding("r", "research_task", "Research task"),
@@ -479,10 +484,25 @@ class GoalScreen(ModalScreen[None]):
         border: thick $accent;
     }
     #goal-screen-top {
-        height: 1;
+        height: auto;
         padding: 0 1;
+    }
+    #goal-screen-top-label {
+        width: 1fr;
+        height: 1;
+        padding: 0 1 0 0;
         color: $text;
         text-style: bold;
+    }
+    /* Compact one-line tree controls (→ subtree toggle, ← cursor to the
+    parent): the default Button is a 3-row block — too heavy for the
+    tree's header line. */
+    #goal-screen-top Button {
+        height: 1;
+        min-width: 3;
+        border: none;
+        padding: 0;
+        margin-left: 1;
     }
     #goal-tree {
         height: 1fr;
@@ -504,6 +524,10 @@ class GoalScreen(ModalScreen[None]):
         # Goal ids whose description/notes detail rows are expanded
         # (Enter toggles; session state, not persisted).
         self._expanded: set[str] = set()
+        # Goal ids whose sub-goal subtrees are hidden (the → button /
+        # Right key toggles; session state, not persisted). A collapsed
+        # goal still shows its own row, its descendants don't render.
+        self._collapsed: set[str] = set()
         # The goal a refresh must put the cursor back onto (the ListView
         # index is position-based, a rebuild would drop it).
         self._focus_goal_id = focus_goal_id
@@ -538,7 +562,9 @@ class GoalScreen(ModalScreen[None]):
         """(goal, depth) pairs of the filtered tree. A goal whose own
         status does not match still shows when a descendant matches (a
         matching sub-goal must not orphan under a hidden parent); the
-        non-matching intermediate parents render as plain rows."""
+        non-matching intermediate parents render as plain rows. A goal
+        in `self._collapsed` shows its own row but its subtree is not
+        walked (the → button / Right key toggles it)."""
         goals = self._app().manager.goals
         rows: list[tuple[Goal, int]] = []
 
@@ -559,7 +585,8 @@ class GoalScreen(ModalScreen[None]):
                 if matched or subtree_matches(goal.id):
                     if matched:
                         rows.append((goal, depth))
-                    walk(goal.id, depth + 1)
+                    if goal.id not in self._collapsed:
+                        walk(goal.id, depth + 1)
 
         walk(None, 0)
         return rows
@@ -580,12 +607,23 @@ class GoalScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="goal-screen-dialog"):
-            yield Static("", id="goal-screen-top", markup=False)
+            with Horizontal(id="goal-screen-top"):
+                yield Static("", id="goal-screen-top-label", markup=False)
+                yield Button(
+                    "→",
+                    id="goal-tree-expand",
+                    tooltip="expand/collapse the cursor goal's subtree (Right)",
+                )
+                yield Button(
+                    "←",
+                    id="goal-tree-parent",
+                    tooltip="move the cursor to the parent goal (Left)",
+                )
             yield ListView(id="goal-tree")
             yield Static(
                 "n new · r research task · t task · e edit · m move · "
                 "a archive/unarchive · f filter · ctrl+↑/↓ reorder · "
-                "enter details · esc close",
+                "enter details · ←/→ tree · esc close",
                 id="goal-screen-footer",
             )
 
@@ -606,7 +644,7 @@ class GoalScreen(ModalScreen[None]):
     def _update_top(self) -> None:
         rows = self._visible_rows()
         total = len(self._app().manager.goals.goals)
-        self.query_one("#goal-screen-top", Static).update(
+        self.query_one("#goal-screen-top-label", Static).update(
             f"filter: {self._filter} — {len(rows)} shown of {total} goal(s) "
             "(f cycles the filter)"
         )
@@ -707,6 +745,18 @@ class GoalScreen(ModalScreen[None]):
             event.stop()
             self._rebuild()
 
+    @on(Button.Pressed, "#goal-tree-expand")
+    def _expand_pressed(self) -> None:
+        self.action_toggle_subtree()
+        # A click focuses the button, stealing the arrow keys from the
+        # tree — put the cursor (and focus) back into the list.
+        self.query_one("#goal-tree", ListView).focus()
+
+    @on(Button.Pressed, "#goal-tree-parent")
+    def _parent_pressed(self) -> None:
+        self.action_cursor_parent()
+        self.query_one("#goal-tree", ListView).focus()
+
     # -- actions ------------------------------------------------------------------
 
     def action_close(self) -> None:
@@ -715,6 +765,41 @@ class GoalScreen(ModalScreen[None]):
     def action_cycle_filter(self) -> None:
         self._filter = FILTERS[(FILTERS.index(self._filter) + 1) % len(FILTERS)]
         self._rebuild()
+
+    def action_toggle_subtree(self) -> None:
+        """→ (the button / Right key): collapse the cursor goal's subtree
+        or expand it back. A leaf goal has nothing to toggle."""
+        goal = self._cursor_goal()
+        if goal is None:
+            return
+        if not self._app().manager.goals.children(goal.id):
+            self.notify(f"#{goal.id} has no sub-goals", title="Goals", timeout=4)
+            return
+        if goal.id in self._collapsed:
+            self._collapsed.discard(goal.id)
+        else:
+            self._collapsed.add(goal.id)
+        self._rebuild()
+
+    def action_cursor_parent(self) -> None:
+        """← (the button / Left key): lift the cursor one level up the
+        hierarchy — onto the parent goal's row. A no-op on a top-level
+        goal; the parent may be hidden by the status filter (its row
+        still renders as an intermediate when a descendant matches, but
+        a fully hidden branch leaves nothing to land on)."""
+        goal = self._cursor_goal()
+        if goal is None or not goal.parent_id:
+            return
+        listing = self.query_one("#goal-tree", ListView)
+        for index, child in enumerate(listing.children):
+            if isinstance(child, TaskItem) and child.goal_id == goal.parent_id:
+                listing.index = index
+                return
+        self.notify(
+            f"parent #{goal.parent_id} is hidden by the filter",
+            title="Goals",
+            timeout=4,
+        )
 
     def _require_cursor(self) -> Goal | None:
         goal = self._cursor_goal()

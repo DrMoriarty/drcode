@@ -7,7 +7,8 @@ the ◆<goal-id> link marker on task rows, the GoalScreen tree (filter,
 Enter-expandable details, link marker of the viewed task, the ←/→
 subtree-collapse and cursor-to-parent controls) and its R/T
 actions, the Ctrl+Y capture context (parent preset + task link), the
-palette command set and the GoalStore ordering primitives (move/reparent).
+"Create goal…" palette entry, the header assign/change/unlink links and
+the GoalStore ordering primitives (move/reparent).
 """
 
 from __future__ import annotations
@@ -376,25 +377,36 @@ async def test_goal_capture_with_parent_and_link(app: DrCodeApp) -> None:
         assert goal.type.value == "goal"
 
 
-async def test_goal_palette_commands(app: DrCodeApp) -> None:
+async def test_goal_provider_create_only_and_header_links(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
         goal = app.manager.goals.create("Async core")
         task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
         app.view_task(task.id)
+        await pilot.pause()
+        # The provider yields only the capture entry — the task↔goal
+        # link/unlink commands moved into the task header.
         commands = GoalCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         names = [c.name for c in commands]
-        assert any(name.startswith("Link goal:") for name in names)
-        assert not any(name.startswith("Unlink goal") for name in names)
-        assert "Create goal…" in names and "New goal" not in names
+        assert names == ["Create goal…"]
+        # Unlinked task: the header extra row shows only "+ assign".
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "+ assign" in extra
+        assert "unlink" not in extra
         app.link_viewed_goal(goal.id)
-        commands = GoalCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        names = [c.name for c in commands]
-        assert any(name.startswith("Unlink goal") for name in names)
-        assert not any(name.startswith("Link goal:") for name in names)
-        # Fire the unlink command.
-        next(c for c in commands if c.name.startswith("Unlink goal")).callback()
+        await pilot.pause()
+        # Linked: the goal fragment gains the change/unlink fragments.
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "goal:" in extra
+        assert "change" in extra
+        assert "unlink" in extra
+        # Fire the unlink header link.
+        app.unlink_viewed_goal()
+        await pilot.pause()
         assert task.goal_id is None
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "+ assign" in extra
+        assert "unlink" not in extra
 
 
 # -- the unified GoalEditScreen (create mode: the dialog itself) ------------------

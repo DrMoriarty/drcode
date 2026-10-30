@@ -2,10 +2,10 @@
 
 Everything the UI does with product goals beyond the agent's own tools:
 the Ctrl+Y capture dialog (optionally preset with a parent goal and/or a
-task to link), the Link/Unlink palette commands over the viewed task,
-the research/dev task creation FROM a goal (R/T on the GoalScreen) and
-opening the full-screen roadmap view (``tui.goal_screen.GoalScreen``)
-from the sidebar's GOALS section.
+task to link), the header assign/change/unlink links over the viewed
+task, the research/dev task creation FROM a goal (R/T on the
+GoalScreen) and opening the full-screen roadmap view
+(``tui.goal_screen.GoalScreen``) from the sidebar's GOALS section.
 
 Split out of :mod:`drcode.tui.actions_forms` (which owned the original
 capture-only dialog) — see the composition in ``ActionsLayer``.
@@ -114,7 +114,7 @@ class GoalsActionsLayer(DrCodeState):
     # -- linking the viewed task to a goal (the Settings palette) -------------
 
     def link_viewed_goal(self, goal_id: str) -> None:
-        """The "Link goal: <title>" palette command over the viewed task:
+        """The "+ assign"/"change" header link over the viewed task:
         attaches it to the goal (a previous link is replaced). The
         counters and the ◆ marker follow on the next sidebar refresh."""
         task = self.viewed
@@ -166,7 +166,11 @@ class GoalsActionsLayer(DrCodeState):
         self.link_viewed_goal(goal_id)
 
     def unlink_viewed_goal(self) -> None:
-        """The "Unlink goal" palette command over the viewed task."""
+        """The "unlink" header fragment over the viewed task (also a
+        click target — a drag-selection ending on it is copying text,
+        not navigating, same guard as the other header links)."""
+        if self.screen.selections:
+            return
         task = self.viewed
         if task is None or not task.goal_id:
             return

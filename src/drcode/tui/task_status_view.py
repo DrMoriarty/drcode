@@ -195,10 +195,11 @@ class TaskStatusLayer(DrCodeState):
 
     def _task_status_extra(self, task: Task) -> str:
         """The second header row (under the kind/id/date/status line):
-        the full dependency list with its gate colors, the goal link (or
-        the "+ assign" picker link), the GitHub issue number, the
-        worktree branch (clickable — copies the branch name) and the
-        warning markers that the sidebar also carries (needs_human,
+        the full dependency list with its gate colors, the goal link
+        with its re-assign/unlink fragments (or the "+ assign" picker
+        link when unattached), the GitHub issue number, the worktree
+        branch (clickable — copies the branch name) and the warning
+        markers that the sidebar also carries (needs_human,
         unfinished). Fragments the task has none of are omitted; an
         entirely empty result hides the row (`_set_extra_row`)."""
         bits: list[str] = []
@@ -206,8 +207,10 @@ class TaskStatusLayer(DrCodeState):
         if deps:
             bits.append(deps)
         # Goal link — a task attached to a product goal opens the
-        # GoalScreen focused on it; a dangling id (the goal was deleted)
-        # is shown dim and keeps the assign link so the user can re-link.
+        # GoalScreen focused on it, with "change" (re-assign to another
+        # goal via the picker) and "unlink" right beside it; a dangling
+        # id (the goal was deleted) is shown dim and keeps the assign
+        # link so the user can re-link.
         goal = (
             self.manager.goals.get(task.goal_id)
             if task.goal_id and task.goal_id in self.manager.goals
@@ -218,6 +221,8 @@ class TaskStatusLayer(DrCodeState):
                 f"[@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
                 f"[magenta]◆[/] {escape(goal.title_display)}[/]"
             )
+            bits.append("[@click=app.assign_goal][blue]change[/][/]")
+            bits.append("[@click=app.unlink_viewed_goal][red]unlink[/][/]")
         elif task.goal_id:
             bits.append(f"[dim]goal: #{task.goal_id} ?[/]")
         if goal is None:

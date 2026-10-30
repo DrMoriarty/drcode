@@ -216,8 +216,6 @@ class SettingsPalette(CommandPalette):
         "Screenshot",
         "Theme",
         "Find task…",
-        "Link goal:",
-        "Unlink goal",
         "Create goal…",
         "New goal",
         "Update/create AGENTS.md",

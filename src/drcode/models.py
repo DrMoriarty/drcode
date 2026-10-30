@@ -345,7 +345,7 @@ class Task(BaseModel):
     # without a goal reference (old task files load with the plain default,
     # no migration). Written at creation (TaskManager.create goal_id / the
     # agent's create_* goal_id parameter) or by the user's explicit
-    # Link/Unlink goal palette commands (TaskManager.link_goal/unlink_goal)
+    # header assign/unlink links (TaskManager.link_goal/unlink_goal)
     # — nothing else moves a task between goals. The goal's completion
     # service event ("цель Y: n/m задач завершено") counts over the goal's
     # linked_task_ids, which this field mirrors; a deleted goal id is

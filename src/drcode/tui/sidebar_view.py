@@ -553,14 +553,17 @@ class SidebarLayer(DrCodeState):
                     goal_id=goal.id,
                 )
             )
-        keys.add(("goal-add", ""))
-        items.append(
-            self._sidebar_row(
-                ("goal-add", ""),
-                "[dim]+ add goal[/]",
-                goal_add=True,
+        # The "+ add goal" capture row belongs to the expanded section only:
+        # a collapsed GOALS shows just its header and the top-level rows.
+        if not top_level_only:
+            keys.add(("goal-add", ""))
+            items.append(
+                self._sidebar_row(
+                    ("goal-add", ""),
+                    "[dim]+ add goal[/]",
+                    goal_add=True,
+                )
             )
-        )
 
         for name, tasks in self._sidebar_sections():
             keys.add(("header", name))

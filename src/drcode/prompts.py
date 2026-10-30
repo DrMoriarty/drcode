@@ -267,16 +267,22 @@ def load_subagent_prompt(project_root: Path) -> str:
     return _substitute_project_path(template, project_root)
 
 
-def load_compaction_prompts() -> tuple[str, str]:
+def load_compaction_prompts(tester: bool = False) -> tuple[str, str]:
     """(system prompt, output template) for the context-compaction agent.
 
     The system prompt (compaction.txt) instructs an anchored summarizer: it
     updates the current summary instead of writing a new one from scratch.
-    The template (compaction.md) is the exact output structure the
-    summarizer must follow.
+    The template is the exact output structure the summarizer must follow:
+    ``compaction.md`` for the coding agent, ``compaction_tester.md`` for a
+    testing round (``tester=True``) — the tester variant adds the
+    "Verification evidence" section, which requires the checks already run
+    and their exact outcomes (and the reviewed files/diffs with verdicts)
+    to be preserved verbatim: the summary replaces the dropped tool results
+    for the resumed round, so the evidence must survive compaction.
     """
     system = (_PROMPTS_DIR / "compaction.txt").read_text(encoding="utf-8")
-    template = (_PROMPTS_DIR / "compaction.md").read_text(encoding="utf-8")
+    name = "compaction_tester.md" if tester else "compaction.md"
+    template = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
     return system, template
 
 

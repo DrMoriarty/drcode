@@ -25,6 +25,7 @@ from pydantic_ai.usage import UsageLimits
 from textual import work
 
 from ..agent import (
+    COMPACTION_RESUME_PREFIX,
     TesterDeps,
     all_user_prompts,
     build_tester_agent,
@@ -45,6 +46,25 @@ from .usage import (
     _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
+)
+
+# The user message a paused testing round is resumed with after a SUCCESSFUL
+# mid-round compaction. Without it the model sees only the original prompt
+# plus the summary and — nudged by the system prompt's "run each detected
+# check" — starts the whole verification cycle from scratch (re-running
+# every check, re-collecting every diff: the 8eebbdb8 carousel). The note
+# tells the model the summary is a trustworthy replacement for the dropped
+# tool results. It rides behind COMPACTION_RESUME_PREFIX so the compaction
+# machinery recognizes it: split_original_prompts keeps it OUT of the
+# preserved verbatim prefix (the next compaction summarizes it into `rest`),
+# and the user-prompt/skeleton extractors skip it.
+TESTER_COMPACTION_RESUME_PROMPT = (
+    f"{COMPACTION_RESUME_PREFIX} The round history was compacted into the "
+    "summary above. The summary records the checks already run and their "
+    "exact outcomes, and the files/diffs already reviewed with their "
+    "verdicts. Do NOT re-run checks or re-collect evidence that is already "
+    "recorded there — continue the verification from the remaining steps "
+    "only."
 )
 
 # -- start-prompt pre-flight gate (the #f425b421 class) ------------------------
@@ -206,6 +226,7 @@ class PipelineTesterLayer(DrCodeState):
         self._tester_retry_at.pop(task.id, None)
         self._tester_resume_round.discard(task.id)
         self._tester_overflow_retried.discard(task.id)
+        self._tester_compaction_resumed.discard(task.id)
         self.manager.set_verification(task.id, success=False)
 
     @work(exclusive=True, group="tester")
@@ -382,15 +403,25 @@ class PipelineTesterLayer(DrCodeState):
                 # ever calls set_verification, looping the round in
                 # fruitless retries.
                 # A resumed round continues from the persisted round
-                # transcript (no new prompt — the while-loop below builds
-                # the continuation history from it); an empty round (the
-                # failed request was never recorded) re-sends the
-                # prompt as usual.
+                # transcript; when the resume follows a SUCCESSFUL
+                # compaction (mid-round pause, or the forced recovery of a
+                # context-overflow death), the continuation turn also
+                # carries TESTER_COMPACTION_RESUME_PROMPT — the summary
+                # must be treated as evidence already collected. An empty
+                # round (the failed request was never recorded) re-sends
+                # the prompt as usual.
+                resume_from_round = bool(
+                    resume_round and task.tester_messages and task.tester_messages[-1]
+                )
+                resumed_compacted = resume_from_round and (
+                    task_id in self._tester_compaction_resumed
+                )
+                self._tester_compaction_resumed.discard(task_id)
                 text: str | None = (
-                    None
-                    if resume_round
-                    and task.tester_messages
-                    and task.tester_messages[-1]
+                    TESTER_COMPACTION_RESUME_PROMPT
+                    if resumed_compacted
+                    else None
+                    if resume_from_round
                     else prompt
                 )
                 # Live context reading of the current round; it goes into
@@ -416,11 +447,13 @@ class PipelineTesterLayer(DrCodeState):
                     # (possibly compacted) round.
                     run = None
                     history: list[Any] | None = None
-                    if text is None:
+                    if resume_from_round:
                         # Continuation of a paused round: resume from the
                         # stored round transcript (compacted, or — when the
                         # summarizer failed — the original one with its
-                        # invalid tail trimmed).
+                        # invalid tail trimmed). The continuation text (a
+                        # resume note, or None for a plain continuation)
+                        # rides ON TOP of this history.
                         history = resumable_history(task.tester_messages[-1])
                     paused = False
                     async with tester.iter(
@@ -583,6 +616,7 @@ class PipelineTesterLayer(DrCodeState):
                             # tester's work done so far.
                             self._persist_tester_messages(task, run)
                     if paused:
+                        resume_from_round = True
                         if await self._maybe_compact_tester_round(task, live_tokens):
                             # The round transcript was replaced by the
                             # original prompt plus the summary: the live
@@ -590,11 +624,18 @@ class PipelineTesterLayer(DrCodeState):
                             # drop it so the counter falls back to the
                             # compacted one (mirrors _maybe_compact).
                             live_tokens = None
-                        # Either way (compacted, or the summarizer failed
-                        # and the gate is now disabled for this task) the
-                        # round resumes as a continuation turn: no new
-                        # text, history from the round transcript.
-                        text = None
+                            # Nudge the model: the summary records the
+                            # checks already run and their outcomes — the
+                            # round must continue from the remaining steps,
+                            # not restart the whole verification cycle (the
+                            # 8eebbdb8 carousel).
+                            text = TESTER_COMPACTION_RESUME_PROMPT
+                        else:
+                            # The summarizer failed and the gate is now
+                            # disabled for this task: resume as a plain
+                            # continuation turn — no new text, history from
+                            # the round transcript.
+                            text = None
                         continue
                     if run.result is not None and self.viewed_id == task_id:
                         # Re-render from the persisted transcript: everything
@@ -693,6 +734,11 @@ class PipelineTesterLayer(DrCodeState):
                     ):
                         self._tester_overflow_retried.add(task_id)
                         self._tester_resume_round.add(task_id)
+                        # The forced compaction succeeded: the round resumes
+                        # (after the retry timer) as a continuation turn that
+                        # must carry the resume note (same rationale as the
+                        # mid-round pause path above).
+                        self._tester_compaction_resumed.add(task_id)
                         self._tester_fail_count.pop(task_id, None)
                         self._tester_retry_at[task_id] = time.monotonic() + 5
                         self._schedule_pipeline_timer(5, self._advance)
@@ -705,6 +751,7 @@ class PipelineTesterLayer(DrCodeState):
                     return
                 self._persist_tester_messages(task, run)
                 self._tester_resume_round.discard(task_id)
+                self._tester_compaction_resumed.discard(task_id)
                 self._tester_fail_count[task_id] = (
                     self._tester_fail_count.get(task_id, 0) + 1
                 )
@@ -725,6 +772,7 @@ class PipelineTesterLayer(DrCodeState):
                 # = the round was in outage mode: announce the recovery.
                 self._tester_fail_count.pop(task_id, None)
                 self._tester_overflow_retried.discard(task_id)
+                self._tester_compaction_resumed.discard(task_id)
                 self._note_network_recovered(task, self._tester_net_count)
                 self._tester_net_count.pop(task_id, None)
                 self._tester_resume_round.discard(task_id)

@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
 
 from drcode import agent as agent_mod
 from drcode.agent import (
+    COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
     AgentDeps,
     all_user_prompts,
@@ -197,6 +198,18 @@ def test_all_user_prompts_skips_compaction_summary() -> None:
     assert all_user_prompts(data) == ["the task"]
 
 
+def test_all_user_prompts_skips_compaction_resume_note() -> None:
+    """The continuation note a round is resumed with after a successful
+    compaction is pipeline machinery, not user input."""
+    data = serialize_messages(
+        [
+            user_msg("the task"),
+            user_msg(f"{COMPACTION_RESUME_PREFIX} continue the verification"),
+        ]
+    )
+    assert all_user_prompts(data) == ["the task"]
+
+
 # -- context tokens --------------------------------------------------------------
 
 
@@ -337,6 +350,81 @@ def test_split_original_prompts_summary_first() -> None:
     preserved, rest = split_original_prompts(data)
     assert preserved == []
     assert rest == data
+
+
+def test_split_original_prompts_original_merged_with_summary() -> None:
+    """pydantic-ai merges the summary request with the adjacent original
+    prompt on resume (_merge_consecutive_messages): the original prompt
+    parts of the merged carrier stay in `preserved` (verbatim prefix)."""
+    merged = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="original task"),
+                    UserPromptPart(content=f"{COMPACTION_SUMMARY_PREFIX}\n\nbody"),
+                ]
+            )
+        ]
+    )
+    preserved, rest = split_original_prompts(merged)
+    assert [[p["content"] for p in m["parts"]] for m in preserved] == [
+        ["original task"]
+    ]
+    assert rest == merged
+
+
+def test_split_original_prompts_resume_note_merged_with_summary() -> None:
+    """A continuation note merged into the summary carrier is compaction
+    machinery: it must NOT join the preserved verbatim prefix (it would be
+    re-preserved on every compaction cycle) — it stays in `rest`, where the
+    summarizer sees it as part of the conversation history."""
+    merged = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content=f"{COMPACTION_SUMMARY_PREFIX}\n\nbody"),
+                    UserPromptPart(
+                        content=f"{COMPACTION_RESUME_PREFIX} continue the checks"
+                    ),
+                ]
+            )
+        ]
+    )
+    preserved, rest = split_original_prompts(merged)
+    assert preserved == []
+    assert rest == merged
+
+
+def test_split_original_prompts_original_summary_and_note_merged() -> None:
+    """The three-way merge (original + summary + note in one carrier):
+    only the original prompt is preserved; the note rides in `rest`."""
+    merged = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="original task"),
+                    UserPromptPart(content=f"{COMPACTION_SUMMARY_PREFIX}\n\nbody"),
+                    UserPromptPart(
+                        content=f"{COMPACTION_RESUME_PREFIX} continue the checks"
+                    ),
+                ]
+            )
+        ]
+    )
+    preserved, rest = split_original_prompts(merged)
+    assert [[p["content"] for p in m["parts"]] for m in preserved] == [
+        ["original task"]
+    ]
+    assert rest == merged
+
+
+def test_render_history_includes_resume_note() -> None:
+    """The resume note is summarized with the rest of the history (only the
+    COMPACTION_SUMMARY_PREFIX parts are skipped as the separate anchor)."""
+    data = serialize_messages(
+        [user_msg(f"{COMPACTION_RESUME_PREFIX} continue the checks")]
+    )
+    assert COMPACTION_RESUME_PREFIX in render_history_for_summary(data)
 
 
 def test_extract_previous_summary() -> None:

@@ -98,6 +98,7 @@ from .tool_runtime import (
     _run_tool_logged,
 )
 from .transcript import (
+    COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
     _context_status,
     all_user_prompts,
@@ -117,6 +118,7 @@ from .transcript import (
 
 __all__ = [
     "BUG_SYSTEM_PROMPT",
+    "COMPACTION_RESUME_PREFIX",
     "COMPACTION_SUMMARY_PREFIX",
     "FEATURE_SYSTEM_PROMPT",
     "MECHANICAL_HEADROOM_TOKENS",

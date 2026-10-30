@@ -505,7 +505,12 @@ class PipelineCompactionLayer(DrCodeState):
         unavailable", never "growth past the limit is allowed".
         """
         try:
-            summary = await self._summarize_history(task, messages, checklist=checklist)
+            summary = await self._summarize_history(
+                task,
+                messages,
+                checklist=checklist,
+                tester=summary_role is AgentRole.TESTER,
+            )
         except asyncio.CancelledError:
             raise
         except _ChunkingImpossible:
@@ -586,7 +591,9 @@ class PipelineCompactionLayer(DrCodeState):
             )
         # Hierarchical reduce: batch the partials so each batch's prompt
         # fits, reduce every batch, then merge the intermediates.
-        batch_budget = slice_budget_tokens(compaction_cfg, checklist=checklist)
+        batch_budget = slice_budget_tokens(
+            compaction_cfg, checklist=checklist, template=template
+        )
         batches: list[list[str]] = []
         current: list[str] = []
         current_tokens = 0
@@ -642,9 +649,14 @@ class PipelineCompactionLayer(DrCodeState):
         messages: list[dict[str, Any]],
         *,
         checklist: str | None = None,
+        tester: bool = False,
     ) -> str:
         """LLM summarization of `messages` for compaction, shared by the
         main-agent and tester-round gates (both via _compact_transcript).
+        ``tester=True`` selects the tester output template
+        (compaction_tester.md, with the "Verification evidence" section the
+        resumed round relies on) for the single-shot, map and reduce calls
+        alike.
 
         Single-shot when the rendered history fits the COMPACTION role's
         window (the chars/4 pre-flight, `prompt_fits_context`); otherwise a
@@ -667,7 +679,7 @@ class PipelineCompactionLayer(DrCodeState):
         caller (_compact_transcript), which keeps the mechanical-floor /
         retry-later / hard-limit-escalation semantics (compaction must not
         kill the run)."""
-        system_prompt, template = load_compaction_prompts()
+        system_prompt, template = load_compaction_prompts(tester)
         anchor = extract_previous_summary(messages)
         prompt = build_compaction_prompt(
             anchor,
@@ -678,7 +690,13 @@ class PipelineCompactionLayer(DrCodeState):
         compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
         if prompt_fits_context(prompt, system_prompt, compaction_cfg):
             return await self._run_summarizer(prompt)
-        budget = slice_budget_tokens(compaction_cfg, anchor, checklist)
+        budget = slice_budget_tokens(
+            compaction_cfg,
+            anchor,
+            checklist,
+            system_prompt=system_prompt,
+            template=template,
+        )
         if budget > compaction_cfg.max_context_tokens:
             raise _ChunkingImpossible(
                 f"the {compaction_cfg.max_context_tokens}-token window is "

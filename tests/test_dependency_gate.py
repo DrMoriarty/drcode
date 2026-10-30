@@ -425,7 +425,7 @@ def test_set_task_dependencies_replaces_and_restricts(
 
     # The agent's own (active) task and completed tasks are not editable.
     app.manager.mark_done(a.id)
-    with pytest.raises(ValueError, match="queued or held"):
+    with pytest.raises(ValueError, match="queued, held or draft"):
         _set_task_dependencies(deps, a.id, [b.id])
     assert app.manager.get(a.id).depends_on == []
 

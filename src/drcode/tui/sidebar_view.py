@@ -305,8 +305,17 @@ class SidebarLayer(DrCodeState):
             reverse=True,
         )
         hold = by_status.get(TaskStatus.HOLD, [])
+        # Agent-created drafts (project setting "agent creates drafts"):
+        # they demand the user's attention (finish them in the editor) —
+        # the section sits on top, newest first.
+        drafts = sorted(
+            by_status.get(TaskStatus.DRAFT, []),
+            key=lambda t: t.created_at,
+            reverse=True,
+        )
 
         sections: list[tuple[str, list[Task]]] = [
+            ("DRAFTS", drafts),
             ("QUEUE", queue),
             ("NEEDS CLARIFICATION", clarification),
             ("ACTIVE", active),
@@ -316,10 +325,19 @@ class SidebarLayer(DrCodeState):
         ]
         return [(name, tasks) for name, tasks in sections if tasks]
 
-    def _sidebar_top_task(self) -> Task | None:
+    def _sidebar_top_task(self, *, skip_drafts: bool = False) -> Task | None:
         """First task of the first non-empty sidebar section — what the
-        chat pane opens on startup."""
+        chat pane opens on startup. `skip_drafts` (the form-cancel path)
+        jumps over DRAFTS: viewing a draft re-opens its editor, which
+        would trap the ESC that closed the form."""
         for _name, tasks in self._sidebar_sections():
+            if skip_drafts:
+                non_draft = next(
+                    (t for t in tasks if t.status is not TaskStatus.DRAFT), None
+                )
+                if non_draft is not None:
+                    return non_draft
+                continue
             return tasks[0]
         return None
 
@@ -342,6 +360,7 @@ class SidebarLayer(DrCodeState):
         else:
             marker = {
                 "queued": "⏳",
+                "draft": "✎",
                 "hold": "⏸",
                 "active": "▶",
                 "testing": "🧪",

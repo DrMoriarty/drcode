@@ -1635,3 +1635,131 @@ def test_system_prompts_distinct() -> None:
 def test_serialize_dump_is_json_safe() -> None:
     data = serialize_messages([user_msg("hi")])
     json.dumps(data)  # must not raise
+
+
+# -- agent-created drafts (project setting agent_creates_drafts) ------------------
+
+
+def test_create_report_task_full_by_default(project_root: Path) -> None:
+    """Without the drafts setting the tools' shared body creates a full
+    queued bug report with the historical tool-result text."""
+    from drcode.agent_build import _create_report_task
+    from drcode.models import TaskKind, TaskStatus
+
+    manager = TaskManager(project_root)
+    task = manager.create("t", "x")
+    deps = agent_mod.AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+    created, text = _create_report_task(
+        deps, "Broken thing", "it fails", kind=TaskKind.BUG, creator="tester"
+    )
+    assert created.status is TaskStatus.QUEUED
+    assert created in manager.queued()
+    assert created.events == []
+    assert (
+        f"Bug report #{created.id} '{created.title}' created at the head of the queue."
+        == (text)
+    )
+
+
+def test_create_report_task_draft_with_setting(project_root: Path) -> None:
+    """With agent_creates_drafts on, the shared creation body makes a
+    DRAFT task: not in the queue, a service event tells the user to
+    finish it, and the tool text says so."""
+    from drcode.agent_build import _create_report_task
+    from drcode.models import TaskKind, TaskStatus
+
+    manager = TaskManager(project_root)
+    task = manager.create("t", "x")
+    deps = agent_mod.AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+        agent_creates_drafts=True,
+    )
+    created, text = _create_report_task(
+        deps, "Broken thing", "it fails", kind=TaskKind.BUG, creator="tester"
+    )
+    assert created.status is TaskStatus.DRAFT
+    assert created not in manager.queued()
+    promoted = manager.promote_next()
+    assert promoted is not created
+    assert created.status is TaskStatus.DRAFT
+    assert [e.text for e in created.pending_input] == ["it fails"]
+    # The draft carries a human-facing service event (never fed to the
+    # model) and is persisted.
+    assert any("draft" in e.text for e in created.events)
+    stored = TaskManager(project_root).get(created.id)
+    assert stored.status is TaskStatus.DRAFT
+    assert stored.events
+    assert "created as a draft" in text
+    # The feature variant drafts the same way.
+    feat, ftext = _create_report_task(
+        deps, "New thing", "do it", kind=TaskKind.FEATURE, creator="research agent"
+    )
+    assert feat.status is TaskStatus.DRAFT
+    assert "created as a draft" in ftext
+
+
+def test_tester_deps_draft_flag(project_root: Path) -> None:
+    """The tester deps carry the setting too (its create_bug_report uses
+    the same shared body, including the fix-loop-end bug report)."""
+    from drcode.agent_build import _create_report_task
+    from drcode.models import TaskKind, TaskStatus
+
+    manager = TaskManager(project_root)
+    task = manager.create("t", "x")
+    deps = agent_mod.TesterDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+        agent_creates_drafts=True,
+    )
+    created, text = _create_report_task(
+        deps, "Env broken", "details", kind=TaskKind.BUG, creator="tester"
+    )
+    assert created.status is TaskStatus.DRAFT
+    assert "created as a draft" in text
+
+
+def test_cli_and_github_create_full_tasks(project_root: Path) -> None:
+    """Regression: the headless CLI and the GitHub Issues import never
+    create drafts — the drafts setting only governs the agents' tools."""
+    from drcode.models import TaskKind, TaskStatus
+
+    # The CLI path (manager.create without draft=).
+    cli_manager = TaskManager(project_root)
+    task = cli_manager.create("", "requested feature", kind=TaskKind.FEATURE)
+    assert task.status is TaskStatus.QUEUED
+    # The drafts setting itself defaults to off (and the CLI ignores it
+    # even when on — the call site passes no draft flag at all).
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+
+    settings = ProjectSettingsStore(project_root)
+    stored = ProjectSettings(agent_creates_drafts=True)
+    settings.save(stored)
+    assert settings.load().agent_creates_drafts is True
+    task2 = cli_manager.create("", "another feature", kind=TaskKind.FEATURE)
+    assert task2.status is TaskStatus.QUEUED
+
+
+def test_set_task_dependencies_accepts_draft(project_root: Path) -> None:
+    """A draft's dependency list stays editable (the same rule as for
+    queued/held tasks): the guard in _set_task_dependencies allows it."""
+    manager = TaskManager(project_root)
+    dep = manager.create("dep task", "x")
+    draft = manager.create("draft", "x", draft=True)
+    deps = agent_mod.AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=draft.id,
+        scratch=agent_mod.tools.scratch_dir(draft.id),
+    )
+    agent_mod._set_task_dependencies(deps, draft.id, [dep.id])
+    assert draft.depends_on == [dep.id]

@@ -98,6 +98,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.parallel_tasks = src.parallel_tasks
     dst.subagents_coder = src.subagents_coder
     dst.subagents_researcher = src.subagents_researcher
+    dst.agent_creates_drafts = src.agent_creates_drafts
     dst.worktree_removal = src.worktree_removal
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
@@ -337,6 +338,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-subagents-researcher",
                         )
+                yield Label(
+                    "Agent creates drafts — the agents' task-creation tools "
+                    "(research: bug/feature, tester: bug) create DRAFT tasks; "
+                    "a draft does not enter the queue until you open and "
+                    "finish it",
+                    classes="ts-label",
+                )
+                yield Switch(value=d.agent_creates_drafts, id="ts-agent-drafts")
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -483,6 +492,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if switch.value != d.keep_awake:
             with self.prevent(Switch.Changed):  # same staleness rule
                 switch.value = d.keep_awake
+        drafts_switch = self.query_one("#ts-agent-drafts", Switch)
+        if drafts_switch.value != d.agent_creates_drafts:
+            with self.prevent(Switch.Changed):  # same staleness rule
+                drafts_switch.value = d.agent_creates_drafts
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -500,6 +513,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-git-research": d.git_policy.research is not o.git_policy.research,
             "#ts-retention": d.completed_retention is not o.completed_retention,
             "#ts-keep-awake": d.keep_awake != o.keep_awake,
+            "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
@@ -696,6 +710,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _keep_awake_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.keep_awake:
             self._draft.keep_awake = event.value
+            self._refresh()
+
+    @on(Switch.Changed, "#ts-agent-drafts")
+    def _agent_drafts_changed(self, event: Switch.Changed) -> None:
+        if event.value != self._draft.agent_creates_drafts:
+            self._draft.agent_creates_drafts = event.value
             self._refresh()
 
     @on(Button.Pressed, ".ts-fix")

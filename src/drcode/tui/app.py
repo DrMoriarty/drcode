@@ -1652,9 +1652,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 return False
             return (order[j].kind is TaskKind.BUG) == (task.kind is TaskKind.BUG)
         if action == "edit_task":
-            # Only a held task can be edited: the editor merges its text and
-            # comments; nothing is running for a parked task.
-            return task is not None and task.status is TaskStatus.HOLD
+            # Only a held task or a draft can be edited: the editor merges
+            # the held task's text and comments (a draft's composition is
+            # finished in the same form); nothing is running for either.
+            return task is not None and task.status in (
+                TaskStatus.HOLD,
+                TaskStatus.DRAFT,
+            )
         if action == "open_merge":
             # Contextual visibility, same semantics as action_open_merge /
             # the command palette's merge provider — but SYNCHRONOUS:
@@ -1699,12 +1703,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if action == "resume_task":
             return task is not None and task.status is TaskStatus.HOLD
         if action == "delete_task":
-            # Same rules as action_delete_task: HOLD and COMPLETED are
-            # deletable, but a COMPLETED task still awaiting its external
-            # review verdict (open PR) is not.
+            # Same rules as action_delete_task: HOLD, DRAFT and COMPLETED
+            # are deletable, but a COMPLETED task still awaiting its
+            # external review verdict (open PR) is not.
             if task is None:
                 return False
-            if task.status is TaskStatus.HOLD:
+            if task.status in (TaskStatus.HOLD, TaskStatus.DRAFT):
                 return True
             if task.status is TaskStatus.COMPLETED:
                 return not task.review_pending

@@ -434,6 +434,7 @@ class TaskManager:
         kind: TaskKind = TaskKind.FEATURE,
         *,
         hold: bool = False,
+        draft: bool = False,
         origin: str = "user",
         depends_on: list[str] | None = None,
         goal_id: str | None = None,
@@ -468,7 +469,15 @@ class TaskManager:
             self.goals.save(goal)
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
-        if hold:
+        if draft:
+            # An agent-created draft (project setting "agent creates
+            # drafts"): the prompt stays in pending_input exactly like on
+            # a queued task, but the pipeline never promotes the task —
+            # the user opens it in the new-task editor and finishes it
+            # (finish_draft → QUEUED/HOLD). Assigned directly, like the
+            # hold branch: no observers yet.
+            task.status = TaskStatus.DRAFT
+        elif hold:
             # Parked right away: the prompt stays in pending_input (the same
             # state a queued-then-held task is in) and the pipeline never
             # picks the task up until it is resumed. The status is assigned
@@ -499,7 +508,7 @@ class TaskManager:
         return "\n\n".join(entry.text for entry in task.pending_input).strip()
 
     def edit_task(self, task_id: str, text: str, kind: TaskKind | None = None) -> Task:
-        """Rewrite the condition of a held task.
+        """Rewrite the condition of a held task or a draft.
 
         The merged editable text (see editable_condition) is replaced by a
         single new pending input — the previously separate additional
@@ -510,6 +519,8 @@ class TaskManager:
         to: the rewritten condition supersedes it.
 
         Empty text is a no-op (the caller keeps the form open instead).
+        The status is not touched here: a held task stays held; a draft
+        stays a draft until the caller finishes it (finish_draft).
         """
         task = self.get(task_id)
         stripped = text.strip()
@@ -525,6 +536,22 @@ class TaskManager:
             self.set_kind(task_id, kind)
         task.touch()
         self.storage.save(task)
+        return task
+
+    def finish_draft(self, task_id: str, *, hold: bool = False) -> Task:
+        """The user finished an agent-created draft: the new-task editor
+        was submitted, the condition has already been rewritten by
+        edit_task — this moves the task out of DRAFT into the pipeline
+        (QUEUED, picked up on the next _advance()) or parks it on hold
+        (the "create on hold" key of the editor). A no-op for a task that
+        is no longer a draft (cancelled/deleted while the form was open)."""
+        task = self.get(task_id)
+        if task.status is not TaskStatus.DRAFT:
+            return task
+        old = task.status
+        task.status = TaskStatus.HOLD if hold else TaskStatus.QUEUED
+        task.touch()
+        self._save_changed(task, old, "user")
         return task
 
     def send(self, task_id: str, text: str) -> Task:
@@ -584,10 +611,11 @@ class TaskManager:
         return task
 
     def set_kind(self, task_id: str, kind: TaskKind) -> Task:
-        """Change the kind of a not-yet-started (QUEUED or HOLD) task and
-        re-position it in the queue: bug → head of the queue, feature →
-        tail. Other kinds (research) keep the current position. The caller
-        is responsible for only calling this on queued/held tasks."""
+        """Change the kind of a not-yet-started (QUEUED, HOLD or DRAFT)
+        task and re-position it in the queue: bug → head of the queue,
+        feature → tail. Other kinds (research) keep the current position.
+        The caller is responsible for only calling this on tasks that have
+        not started yet."""
         task = self.get(task_id)
         if task.kind is kind:
             return task

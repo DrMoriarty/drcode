@@ -294,6 +294,19 @@ class ChatTimelineLayer(DrCodeState):
             self.manager.storage.save(task)
 
     def view_task(self, task_id: str) -> None:
+        # A DRAFT task has no chat view: every selection path (sidebar
+        # click, mention, startup pick) opens the new-task editor on it
+        # instead — the user must finish the draft before it enters the
+        # queue. The exception is the form already editing THIS draft
+        # (re-clicks in the sidebar while composing must not reset it).
+        target = self.manager.tasks.get(task_id)
+        if (
+            target is not None
+            and target.status is TaskStatus.DRAFT
+            and not (self._new_task_mode and self._editing_task_id == task_id)
+        ):
+            self.action_open_draft(task_id)
+            return
         # Opening a task cancels a pending new-task creation: the click on a
         # sidebar item is an explicit "leave the form" from the user.
         if self._new_task_mode:

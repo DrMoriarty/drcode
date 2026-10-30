@@ -117,6 +117,7 @@ class TaskStatusLayer(DrCodeState):
             TaskKind.RESEARCH: "[bold yellow]research[/]",
         }.get(task.kind, "[bold green]feature[/]")
         status_colors = {
+            TaskStatus.DRAFT: "bright_black",
             TaskStatus.QUEUED: "yellow",
             TaskStatus.HOLD: "blue",
             TaskStatus.ACTIVE: "cyan",

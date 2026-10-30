@@ -80,6 +80,10 @@ def effective_voice_language(settings: ProjectSettings) -> str:
 VOICE_PHRASES: dict[str, dict[str, str]] = {
     VOICE_LANGUAGE_RU: {
         "bug_report": "Заведён баг-репорт: {title}",
+        "bug_report_draft": (
+            "Заведён черновик баг-репорта: {title}. Завершите его, чтобы "
+            "поставить в очередь"
+        ),
         "completed": "Задача «{title}» завершена",
         "completed_failed": "Задача «{title}» завершена с ошибкой",
         "requeued": (
@@ -89,6 +93,9 @@ VOICE_PHRASES: dict[str, dict[str, str]] = {
     },
     VOICE_LANGUAGE_EN: {
         "bug_report": "Bug report created: {title}",
+        "bug_report_draft": (
+            "Bug report draft created: {title}. Finish it to queue it"
+        ),
         "completed": 'Task "{title}" completed',
         "completed_failed": 'Task "{title}" completed with an error',
         "requeued": 'Testing failed — task "{title}" returned to development',

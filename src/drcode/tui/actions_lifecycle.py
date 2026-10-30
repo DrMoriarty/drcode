@@ -43,7 +43,12 @@ class TaskLifecycleLayer(DrCodeState):
 
     def action_done_task(self) -> None:
         task = self.viewed
-        if task is None or task.status is TaskStatus.COMPLETED:
+        if task is None or task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.DRAFT,
+        ):
+            # A draft cannot be "done": its composition is finished in the
+            # editor (Ctrl+E / a click), not sent to the tester from here.
             return
         # Stop only the VIEWED task's agent run (parallel slots: other
         # tasks' runs must keep going).
@@ -457,17 +462,19 @@ class TaskLifecycleLayer(DrCodeState):
 
     def action_delete_task(self) -> None:
         """Fully remove the viewed task — from the sidebar and from disk
-        (.drcode/tasks/<id>.json). Deletable statuses: HOLD (nothing is
-        running for a parked task, so no worker state is left behind) and
-        COMPLETED (the work is done; deletion only takes effect earlier
-        than the retention purge would). A COMPLETED task still awaiting
-        its external review verdict (`review_pending` — an open PR) is
-        NOT deletable: a verdict arriving later must not find the task
-        gone. Everything else (QUEUED/ACTIVE/TESTING/AWAITING_CLARIFICATION)
-        is refused. Resume from hold is Ctrl+H; deletion is Ctrl+Delete."""
+        (.drcode/tasks/<id>.json). Deletable statuses: HOLD and DRAFT
+        (nothing is running for a parked task or an unfinished draft, so
+        no worker state is left behind) and COMPLETED (the work is done;
+        deletion only takes effect earlier than the retention purge
+        would). A COMPLETED task still awaiting its external review
+        verdict (`review_pending` — an open PR) is NOT deletable: a
+        verdict arriving later must not find the task gone. Everything
+        else (QUEUED/ACTIVE/TESTING/AWAITING_CLARIFICATION) is refused.
+        Resume from hold is Ctrl+H; deletion is Ctrl+Delete."""
         task = self.viewed
         if task is None or task.status not in (
             TaskStatus.HOLD,
+            TaskStatus.DRAFT,
             TaskStatus.COMPLETED,
         ):
             return
@@ -554,6 +561,12 @@ class TaskLifecycleLayer(DrCodeState):
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
+        if task.status is TaskStatus.DRAFT:
+            # A draft never takes chat input: its text is composed in the
+            # new-task editor (belt-and-braces — view_task never opens the
+            # chat pane for a draft).
+            self.action_open_draft(task.id)
+            return
         # A re-send of a text that is still queued (an identical entry sits
         # in pending_input) or already in flight (the transcript holds it as
         # the prompt of the unfinished attempt) is a no-op: send() ignores

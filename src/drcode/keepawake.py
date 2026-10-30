@@ -56,8 +56,9 @@ ES_SYSTEM_REQUIRED = 0x00000001
 # resume them at any moment (dependency-blocked QUEUED tasks included — a
 # manual `git merge drcode/<dep>` can unblock them at any time, which the
 # 30 s _poll_dependency_unblock tick exists for). HOLD (parked by the
-# user), AWAITING_CLARIFICATION (paused for a human answer) and COMPLETED
-# do NOT keep the machine awake.
+# user), DRAFT (an agent-created draft waiting for the user to finish it
+# in the editor — nothing will run until they do), AWAITING_CLARIFICATION
+# (paused for a human answer) and COMPLETED do NOT keep the machine awake.
 BUSY_STATUSES: frozenset[TaskStatus] = frozenset(
     {
         TaskStatus.QUEUED,

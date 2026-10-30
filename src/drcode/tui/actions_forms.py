@@ -187,14 +187,30 @@ class TaskFormLayer(DrCodeState):
         self.query_one("#chat-hint", Static).update(text)
 
     def _new_task_chrome(self) -> None:
-        """Note + hint line of the new-task form, per mode: fresh creation
-        vs editing a held task (the same editor, different wording)."""
+        """Note + hint line of the new-task form, per mode: fresh creation,
+        editing a held task or finishing an agent-created draft (the same
+        editor, different wording)."""
         note = self.query_one("#nt-note", Static)
         hint = self.query_one("#nt-hint", Static)
         # Push-to-talk is bound in the form's editor too; advertised only
         # while it can actually record (see _render_chat_hint).
         voice = "   ctrl+b — voice" if self.voice_dictation_configured else ""
-        if self._editing_task_id is not None:
+        editing = (
+            self.manager.tasks.get(self._editing_task_id)
+            if self._editing_task_id
+            else None
+        )
+        if editing is not None and editing.status is TaskStatus.DRAFT:
+            note.update(
+                "Finishing an agent-created draft — its text is loaded below; "
+                "send it into the queue or park it on hold. Esc keeps the draft."
+            )
+            hint.update(
+                "tab — switch type   ctrl+g — depends on   "
+                "ctrl+enter — finish & queue   ctrl+h — finish on hold   "
+                "esc — keep draft" + voice
+            )
+        elif self._editing_task_id is not None:
             note.update(
                 "Editing a held task — its original text and queued comments "
                 "are merged below; save it back on hold or into the queue."
@@ -258,6 +274,53 @@ class TaskFormLayer(DrCodeState):
         # row — nothing is viewed while the editor is open.
         self._sync_sidebar_cursor(None)
 
+    def action_open_draft(self, task_id: str | None = None) -> None:
+        """Open an agent-created DRAFT task in the new-task editor (the
+        same form action_edit_task reuses) instead of the chat view: a
+        draft has no conversation yet — the user is meant to finish its
+        composition here. On save the draft enters the queue (Ctrl+Enter)
+        or is parked on hold (Ctrl+H); ESC leaves it a draft.
+
+        Called by view_task's draft redirect (sidebar clicks, mentions,
+        the startup view pick) and the Ctrl+E binding."""
+        task = self.manager.tasks.get(task_id) if task_id else self.viewed
+        if task is None or task.status is not TaskStatus.DRAFT:
+            return
+        # Opening the editor is a context change: drop any dictation
+        # started in the chat input (the editor reuses the new-task form).
+        self.voice_input.cancel(silent=True)
+        self._editing_task_id = task.id
+        self.new_task_input.load_text(self.manager.editable_condition(task.id))
+        self._load_deps_field(task.depends_on)
+        # The draft path never re-links the task: show its current goal as
+        # read-only info (the Link/Unlink palette commands own the link).
+        self._new_task_goal_id = None
+        goal_label = self.query_one("#nt-goal", Static)
+        if task.goal_id and task.goal_id in self.manager.goals:
+            goal = self.manager.goals.get(task.goal_id)
+            goal_label.update(
+                f"goal: [magenta]◆[/] {escape(goal.title_display)} (kept)"
+            )
+        else:
+            goal_label.update("")
+        self.new_task_kind = task.kind
+        self._new_task_mode = True
+        self._new_task_prev_id = self.viewed_id
+        self.viewed_id = None
+        self.refresh_sidebar()
+        self._clear_stream_label()
+        self.chat_log.add_class("hidden")
+        self.chat_input.add_class("hidden")
+        self.query_one("#new-task", Vertical).remove_class("hidden")
+        self._new_task_chrome()
+        self._update_kind_label()
+        self.refresh_task_status()
+        self.refresh_todo_panel()
+        self.new_task_input.focus()
+        # See action_new_task: drop the cursor parked on the draft's row —
+        # nothing is viewed while the editor is open.
+        self._sync_sidebar_cursor(None)
+
     def _leave_new_task_mode(self) -> None:
         # Leaving the form (cancel, submit, sidebar click) is a context
         # change: a dictation started in the form's editors is discarded.
@@ -285,8 +348,13 @@ class TaskFormLayer(DrCodeState):
         if self.viewed_id is None:
             prev = self._new_task_prev_id
             task = self.manager.tasks.get(prev) if prev else None
+            if task is not None and task.status is TaskStatus.DRAFT:
+                # A draft re-opens its editor (view_task's redirect) — ESC
+                # would trap the user in the form forever. Never restore
+                # to a draft; prefer a non-draft task or an empty pane.
+                task = None
             if task is None:
-                task = self._sidebar_top_task()
+                task = self._sidebar_top_task(skip_drafts=True)
             if task is not None:
                 self.view_task(task.id)
             else:
@@ -439,11 +507,19 @@ class TaskFormLayer(DrCodeState):
         deps = self._deps_from_form()
         if deps is None:
             return
+        was_draft = task.status is TaskStatus.DRAFT
         self.manager.edit_task(task.id, text, kind=self.new_task_kind)
         self.manager.set_dependencies(task.id, deps)
         self._editing_task_id = None
         self._leave_new_task_mode()
-        if queue:
+        if was_draft:
+            # An agent-created draft: the edit finished its composition —
+            # Ctrl+Enter sends it into the queue, Ctrl+H parks it on hold
+            # (ESC never reaches here: it cancels and keeps the draft).
+            self.manager.finish_draft(task.id, hold=not queue)
+            if queue:
+                self._advance()
+        elif queue:
             # Back to where the task was parked from (its clarification, if
             # any, was dropped by edit_task — so this lands in the queue).
             self.manager.set_hold(task.id, on=False)

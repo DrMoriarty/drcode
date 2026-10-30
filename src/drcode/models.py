@@ -19,6 +19,13 @@ def _short_id() -> str:
 
 class TaskStatus(str, enum.Enum):
     QUEUED = "queued"
+    # Created by an AGENT as a draft (project setting "agent creates
+    # drafts"): the prompt sits in pending_input like on any queued task,
+    # but the pipeline never touches the status — the user must open the
+    # task in the new-task editor and finish it first (finish_draft sends
+    # it to the queue or parks it on hold). ESC in the editor keeps it a
+    # draft; delete/cancel work like on a held task.
+    DRAFT = "draft"
     # Parked by the user out of the backlog: never promoted while held
     # (input keeps accumulating; Ctrl+P resumes it back into the queue, or
     # into NEEDS CLARIFICATION if its question is still unanswered).

@@ -1326,3 +1326,129 @@ def test_lru_never_evicts_pipeline_tasks(project_root: Path) -> None:
     # stops: nothing is dropped mid-pipeline.
     assert q.transcripts_loaded is True
     assert c.transcripts_loaded is True
+
+
+# -- drafts (agent-created, DRAFT status) ---------------------------------------
+
+
+def test_create_draft(manager: TaskManager) -> None:
+    task = manager.create("draft report", "the prompt", draft=True)
+    assert task.status is TaskStatus.DRAFT
+    # The prompt stays queued in pending_input, exactly like on an
+    # ordinary task — the editor loads it for finishing.
+    assert [e.text for e in task.pending_input] == ["the prompt"]
+
+
+def test_draft_never_in_queue_or_promoted(manager: TaskManager) -> None:
+    draft = manager.create("draft", "the prompt", draft=True)
+    assert draft not in manager.queued()
+    assert manager.promote_next() is None
+    assert draft.status is TaskStatus.DRAFT
+    # Even with nothing else in the backlog the draft is not picked up.
+    assert manager.queued() == []
+    # And it never holds the machine awake (not in BUSY_STATUSES).
+    from drcode.keepawake import statuses_hold_awake
+
+    assert statuses_hold_awake([draft.status]) is False
+
+
+def test_finish_draft_queues(manager: TaskManager) -> None:
+    draft = manager.create("draft", "the prompt", draft=True)
+    manager.finish_draft(draft.id)
+    assert draft.status is TaskStatus.QUEUED
+    assert manager.queued() == [draft]
+    assert manager.promote_next() is draft
+    assert draft.status is TaskStatus.ACTIVE
+
+
+def test_finish_draft_on_hold(manager: TaskManager) -> None:
+    draft = manager.create("draft", "the prompt", draft=True)
+    manager.finish_draft(draft.id, hold=True)
+    assert draft.status is TaskStatus.HOLD
+    assert draft not in manager.queued()
+    assert manager.promote_next() is None
+    # Resuming a finished-and-held draft behaves like any held task.
+    manager.set_hold(draft.id, on=False)
+    assert draft.status is TaskStatus.QUEUED
+
+
+def test_finish_draft_non_draft_is_noop(manager: TaskManager) -> None:
+    task = manager.create("t", "x")
+    manager.finish_draft(task.id)
+    assert task.status is TaskStatus.QUEUED
+    # A draft deleted while the editor was open is gone like any other
+    # task: finish_draft raises the same KeyError as get() everywhere.
+    gone = manager.create("g", "x", draft=True)
+    manager.delete(gone.id)
+    with pytest.raises(KeyError):
+        manager.finish_draft(gone.id)
+
+
+def test_edit_draft_replaces_condition(manager: TaskManager) -> None:
+    draft = manager.create("draft", "agent text", draft=True)
+    manager.edit_task(draft.id, "rewritten condition")
+    assert [e.text for e in draft.pending_input] == ["rewritten condition"]
+    assert draft.title == "rewritten condition"
+    # The status is untouched by the edit: still a draft until finish.
+    assert draft.status is TaskStatus.DRAFT
+
+
+def test_edit_draft_changes_kind(manager: TaskManager) -> None:
+    draft = manager.create("draft feature", "x", draft=True)
+    manager.edit_task(draft.id, "x", kind=TaskKind.BUG)
+    assert draft.kind is TaskKind.BUG
+    manager.edit_task(draft.id, "x", kind=TaskKind.FEATURE)
+    assert draft.kind is TaskKind.FEATURE
+
+
+def test_send_to_draft_accumulates(manager: TaskManager) -> None:
+    """send() never promotes a draft — input only accumulates (the chat
+    pane is not even reachable for a draft, but the manager must stay
+    safe if it is ever called)."""
+    draft = manager.create("draft", "the prompt", draft=True)
+    manager.send(draft.id, "extra comment")
+    assert [e.text for e in draft.pending_input] == ["the prompt", "extra comment"]
+    assert draft.status is TaskStatus.DRAFT
+
+
+def test_set_kind_on_draft(manager: TaskManager) -> None:
+    draft = manager.create("draft", "x", draft=True)
+    manager.set_kind(draft.id, TaskKind.BUG)
+    assert draft.kind is TaskKind.BUG
+    assert draft.status is TaskStatus.DRAFT
+
+
+def test_reload_keeps_external_draft(manager: TaskManager, project_root: Path) -> None:
+    """An externally created draft file loads as a draft: neither demoted
+    to queued nor promoted by the pickup scan."""
+    external = TaskManager(project_root).create("ext draft", "body", draft=True)
+    (added,) = manager.reload_new_tasks()
+    assert added.id == external.id
+    picked = manager.get(external.id)
+    assert picked.status is TaskStatus.DRAFT
+    assert picked not in manager.queued()
+    assert manager.promote_next() is None
+
+
+def test_startup_keeps_draft(project_root: Path) -> None:
+    """A draft persisted on disk survives a restart untouched (the
+    startup scan only demotes stale ACTIVE tasks)."""
+    TaskManager(project_root).create("kept", "x", draft=True)
+    reloaded = TaskManager(project_root)
+    (draft,) = reloaded.tasks.values()
+    assert draft.status is TaskStatus.DRAFT
+    assert reloaded.promote_next() is None
+
+
+def test_delete_draft(manager: TaskManager, project_root: Path) -> None:
+    draft = manager.create("draft", "x", draft=True)
+    manager.delete(draft.id)
+    assert draft.id not in manager.tasks
+    assert not (project_root / ".drcode" / "tasks" / f"{draft.id}.json").exists()
+
+
+def test_cancel_draft_completes(manager: TaskManager) -> None:
+    draft = manager.create("draft", "x", draft=True)
+    manager.cancel(draft.id)
+    assert draft.status is TaskStatus.COMPLETED
+    assert list(draft.pending_input) == []

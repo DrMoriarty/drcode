@@ -60,10 +60,10 @@ from typing import TYPE_CHECKING
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from .models import VerificationStatus
+from .models import TaskStatus, VerificationStatus
 
 if TYPE_CHECKING:
-    from .models import Task, TaskStatus
+    from .models import Task
     from .settings import ProjectSettings
 
 NTFY_BASE = "https://ntfy.sh"
@@ -459,11 +459,16 @@ class Notifier:
         Voiced under the "tester failure" checkbox — together with the
         re-queue phrase it covers both halves of the tester-failure event.
         Only agent-created reports (origin "system") are voiced: a bug the
-        user typed by hand is something they just watched happen."""
+        user typed by hand is something they just watched happen. A draft
+        (the "agent creates drafts" setting) gets its own phrase — it is
+        not in the queue and waits for the user to finish it."""
         if origin != "user" and task.kind.value == "bug":
+            key = (
+                "bug_report_draft" if task.status is TaskStatus.DRAFT else "bug_report"
+            )
             self._speak(
                 self._settings_getter().voice_tts_tester_failed,
-                self._phrase("bug_report", title=task.title),
+                self._phrase(key, title=task.title),
             )
 
     # -- pipeline events --------------------------------------------------------

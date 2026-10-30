@@ -527,3 +527,29 @@ def test_broken_listener_never_breaks_the_manager(manager: TaskManager) -> None:
     task = manager.create("", "build it")
     manager.mark_done(task.id)  # must not raise
     assert manager.get(task.id).status is TaskStatus.TESTING
+
+
+# -- TTS bug-report phrase (draft variant) --------------------------------------
+
+
+def test_bug_report_created_voices_draft_phrase() -> None:
+    """An agent-created DRAFT bug report is voiced with the draft phrase
+    (it is not in the queue — the user must finish it); an ordinary one
+    keeps the historical phrase."""
+    spoken: list[str] = []
+    settings = ProjectSettings(voice_tts_tester_failed=True, voice_language="en")
+    notifier = Notifier(lambda: settings, speaker=spoken.append)
+
+    from drcode.models import TaskStatus
+
+    draft = Task(title="Fix the thing", kind=TaskKind.BUG, status=TaskStatus.DRAFT)
+    notifier.bug_report_created(draft, "system")
+    assert spoken == ["Bug report draft created: Fix the thing. Finish it to queue it"]
+
+    queued = Task(title="Fix the thing", kind=TaskKind.BUG)
+    notifier.bug_report_created(queued, "system")
+    assert spoken[-1] == "Bug report created: Fix the thing"
+
+    # Hand-typed reports (origin "user") are never voiced.
+    notifier.bug_report_created(queued, "user")
+    assert len(spoken) == 2

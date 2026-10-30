@@ -449,6 +449,18 @@ class ProjectSettings(BaseModel):
     # The same cap for the RESEARCH agent's runs (its resolved model
     # serves the subagents; the counter is per parent run/generation).
     subagents_researcher: int = 0
+    # Agent-created task drafts: when on, the agents' task-creation tools
+    # (research: create_bug_report / create_feature_request, tester:
+    # create_bug_report) do NOT queue the new task — it is created in the
+    # DRAFT status and waits until the user opens it in the new-task
+    # editor and finishes it (into the queue or on hold). The headless
+    # CLI (drcode --bug-report/--feature-request) and the GitHub Issues
+    # import are deliberately NOT affected: they are already driven by an
+    # explicit human request. The tester's fix-loop end (a FAILED task
+    # after max_dev_rounds) also runs through the same tool — its bug
+    # report becomes a draft too, which does not disturb the loop itself
+    # (the failed task has already completed by then).
+    agent_creates_drafts: bool = False
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

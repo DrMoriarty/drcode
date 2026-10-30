@@ -141,16 +141,17 @@ def _set_task_dependencies(deps: AgentDeps, task_id: str, dep_ids: list[str]) ->
     """Replace a task's depends_on list (research agent only).
 
     Raises ValueError (→ ModelRetry via _run_tool) when the task does not
-    exist, is already under way (only QUEUED/HOLD tasks are editable —
-    the same rule as the command palette) or a dependency id is unknown /
+    exist, is already under way (only QUEUED/HOLD/DRAFT tasks are editable —
+    the same rule as the command palette; a draft is not started either, the
+    user is still composing it) or a dependency id is unknown /
     would form a cycle."""
     if task_id not in deps.manager.tasks:
         raise ValueError(f"unknown task id: {task_id}")
     task = deps.manager.get(task_id)
-    if task.status not in (TaskStatus.QUEUED, TaskStatus.HOLD):
+    if task.status not in (TaskStatus.QUEUED, TaskStatus.HOLD, TaskStatus.DRAFT):
         raise ValueError(
             f"task #{task_id} is {task.status.value} — dependencies can only "
-            "be set on queued or held tasks (before development starts)."
+            "be set on queued, held or draft tasks (before development starts)."
         )
     deps.manager.set_dependencies(task_id, dep_ids)
     if task.depends_on:

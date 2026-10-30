@@ -308,6 +308,9 @@ class PipelineTesterLayer(DrCodeState):
                 # failure completes it as FAILED (and the tester creates
                 # the bug report).
                 max_dev_rounds=self.settings.max_dev_rounds,
+                # create_bug_report creates a DRAFT task when the setting
+                # is on (the user finishes it in the editor).
+                agent_creates_drafts=self.settings.agent_creates_drafts,
             )
             try:
                 # The tester needs the original assignment (to paraphrase it

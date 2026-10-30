@@ -42,7 +42,7 @@ from .agent_tools import (
 )
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
-from .models import Clarification, TaskKind, TaskStatus
+from .models import Clarification, TaskEvent, TaskKind, TaskStatus
 from .prompts import (
     load_resolver_prompt,
     load_resolver_reviewer_prompt,
@@ -91,7 +91,11 @@ class AgentDeps:
     (None = delegation not configured — the tool is not even registered
     when the limit is 0); `activity`, when set, is called by the nested
     subagent run to keep the parent's stall-watchdog fed while the
-    parent itself emits nothing during the delegation."""
+    parent itself emits nothing during the delegation.
+
+    `agent_creates_drafts` mirrors the project setting: the research
+    agent's create_bug_report/create_feature_request tools then create
+    DRAFT tasks the user must finish before they enter the queue."""
 
     root: Path
     manager: TaskManager
@@ -99,6 +103,7 @@ class AgentDeps:
     scratch: Path
     subagent_gate: SubagentGate | None = None
     activity: Callable[[], None] | None = None
+    agent_creates_drafts: bool = False
 
 
 @dataclass
@@ -131,7 +136,12 @@ class TesterDeps:
     consecutive development rounds the tester may fail with a
     "the bug is this task's own change" verdict (retry_here=True) before
     the failure completes the task as FAILED (see
-    TaskManager.requeue_failed_fix)."""
+    TaskManager.requeue_failed_fix).
+
+    `agent_creates_drafts` mirrors the project setting: the tester's
+    create_bug_report tool (including the fix-loop-end bug report) then
+    creates a DRAFT task the user must finish before it enters the
+    queue."""
 
     root: Path
     manager: TaskManager
@@ -139,6 +149,7 @@ class TesterDeps:
     scratch: Path
     review_gate: bool = False
     max_dev_rounds: int = 3
+    agent_creates_drafts: bool = False
 
 
 @dataclass
@@ -187,6 +198,67 @@ def _goal_suffix(ctx: RunContext[AgentDeps], task: Any) -> str:
     goal = ctx.deps.manager.goals.goals.get(task.goal_id)
     label = goal.title_display if goal else task.goal_id
     return f" Linked to goal '{label}' ({task.goal_id})."
+
+
+def _create_report_task(
+    deps: AgentDeps | TesterDeps,
+    title: str,
+    description: str,
+    *,
+    kind: TaskKind,
+    creator: str,
+    depends_on: list[str] | None = None,
+    goal_id: str | None = None,
+) -> tuple[Any, str]:
+    """Shared body of the agents' task-creation tools (research:
+    create_bug_report / create_feature_request; tester: create_bug_report).
+
+    Honors `deps.agent_creates_drafts`: the new task is then created in
+    the DRAFT status — it never enters the queue by itself, the user must
+    open it in the new-task editor and finish it (a service event on the
+    draft tells them so). The headless CLI and the GitHub Issues import
+    do not run through here: they create full tasks unconditionally.
+    origin="system" — the tool (not the user) created the task, so
+    creation listeners (e.g. the voice announcements) can tell
+    agent-created reports from hand-typed ones. Returns the created task
+    and the leading part of the tool-result text (the callers append
+    their dependency/goal suffixes)."""
+    draft = deps.agent_creates_drafts
+    task = deps.manager.create(
+        title,
+        description,
+        kind=kind,
+        origin="system",
+        draft=draft,
+        depends_on=depends_on,
+        goal_id=goal_id,
+    )
+    label = "Bug report" if kind is TaskKind.BUG else "Feature request"
+    if draft:
+        task.events.append(
+            TaskEvent(
+                kind="system",
+                text=(
+                    f"Created as a draft by the {creator} — open the task "
+                    "and finish it to put it into the queue."
+                ),
+            )
+        )
+        task.touch()
+        deps.manager.storage.save(task)
+        return (
+            task,
+            (
+                f"{label} #{task.id} '{task.title}' created as a draft — the "
+                "user must finish it before it enters the queue."
+            ),
+        )
+    placement = (
+        "at the head of the queue"
+        if kind is TaskKind.BUG
+        else "at the tail of the queue"
+    )
+    return task, f"{label} #{task.id} '{task.title}' created {placement}."
 
 
 def build_agent(
@@ -459,19 +531,16 @@ def build_agent(
             # origin="system": the tool (not the user) created the task —
             # creation listeners (e.g. the voice announcements) can tell
             # agent-created bug reports from hand-typed ones.
-            bug = ctx.deps.manager.create(
+            bug, text = _create_report_task(
+                ctx.deps,
                 title,
                 description,
                 kind=TaskKind.BUG,
-                origin="system",
+                creator="research agent",
                 depends_on=depends_on,
                 goal_id=_validated_goal_id(ctx, goal_id),
             )
-            return (
-                f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
-                + _deps_suffix(bug)
-                + _goal_suffix(ctx, bug)
-            )
+            return text + _deps_suffix(bug) + _goal_suffix(ctx, bug)
 
         @agent.tool
         def create_feature_request(
@@ -493,25 +562,23 @@ def build_agent(
             Optional `goal_id`: the id of a product goal (see the goals block)
             this feature serves — the task joins that goal's progress count.
             The returned id lets you chain subsequent creations on it."""
-            feature = ctx.deps.manager.create(
+            feature, text = _create_report_task(
+                ctx.deps,
                 title,
                 description,
                 kind=TaskKind.FEATURE,
+                creator="research agent",
                 depends_on=depends_on,
                 goal_id=_validated_goal_id(ctx, goal_id),
             )
-            return (
-                f"Feature request #{feature.id} '{feature.title}' created at "
-                "the tail of the queue."
-                + _deps_suffix(feature)
-                + _goal_suffix(ctx, feature)
-            )
+            return text + _deps_suffix(feature) + _goal_suffix(ctx, feature)
 
         @agent.tool(sequential=True)
         async def set_task_dependencies(
             ctx: RunContext[AgentDeps], task_id: str, deps: list[str]
         ) -> str:
-            """Replace the dependency list of an existing QUEUED or HOLD task
+            """Replace the dependency list of an existing QUEUED, HOLD or
+            DRAFT task
             (only those can still be edited — a task under way or finished
             cannot). `task_id` is the short task id; `deps` is the FULL new
             list of short task ids it must wait for (pass [] to clear —
@@ -928,10 +995,14 @@ def build_tester_agent(
         environment or infrastructure issues) — the verified task itself then
         passes (set_verification(success=True)); see set_verification."""
         # origin="system" — see the research variant of this tool above.
-        bug = ctx.deps.manager.create(
-            title, description, kind=TaskKind.BUG, origin="system"
+        _, text = _create_report_task(
+            ctx.deps,
+            title,
+            description,
+            kind=TaskKind.BUG,
+            creator="tester",
         )
-        return f"Bug report #{bug.id} '{bug.title}' created at the head of the queue."
+        return text
 
     # The commit tool exists only when the project's tester git policy
     # allows it: with policy off the model cannot commit even if it

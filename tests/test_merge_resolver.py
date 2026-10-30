@@ -192,6 +192,28 @@ def _no_xdist(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_module_importable_runs_uv_offline(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The 005c564a failure class: on a host without a direct route to the
+    # package index a plain `uv run` probe burns minutes on fetch retries
+    # (and leaves a skeleton .venv behind). The probe must pin uv to its
+    # cache with UV_OFFLINE=1 in the child env; non-uv probes stay as-is.
+    shim = repo / "uv"
+    log = repo / "uv_env.log"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"${{UV_OFFLINE:-}}\" >> {shlex.quote(str(log))}\n"
+        'if [ "$UV_OFFLINE" = "1" ]; then exit 0; else exit 1; fi\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.delenv("UV_OFFLINE", raising=False)
+    monkeypatch.setenv("PATH", f"{repo}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert mr._module_importable(["uv", "run", "python"], "ruff", repo)
+    assert not mr._module_importable([str(shim)], "ruff", repo)
+    assert log.read_text().splitlines() == ["1", ""]
+
+
 def test_run_test_suite_uses_worktree_venv(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

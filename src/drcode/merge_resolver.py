@@ -360,7 +360,15 @@ def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
     """True when `module` imports in the environment the given python
     command resolves to — probed with the SAME launcher the check would
     use, never a PATH lookup. Generous timeout: for `uv run` the probe
-    doubles as the one-time sync of a fresh worktree's environment."""
+    doubles as the one-time sync of a fresh worktree's environment.
+    That sync runs OFFLINE (`UV_OFFLINE=1`): on a machine without a
+    direct route to the package index uv would otherwise burn minutes
+    on fetch retries before failing — and still leave a skeleton .venv
+    behind. The uv cache is usually enough; when it is not, the offline
+    failure honestly falls through to the next `_project_python` option."""
+    env: dict[str, str] | None = None
+    if python_cmd and python_cmd[0] == "uv":
+        env = {**os.environ, "UV_OFFLINE": "1"}
     try:
         proc = subprocess.run(
             [*python_cmd, "-c", f"import {module}"],
@@ -369,6 +377,7 @@ def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
             text=True,
             timeout=600,
             check=False,
+            env=env,
             **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -383,7 +392,8 @@ def _project_python(worktree: Path, module: str) -> tuple[list[str], bool] | Non
     explicitly. None when no usable environment exists.
 
     Preference order: the worktree's synced .venv, then `uv run` (sync
-    ALLOWED — a fresh worktree has no .venv, and `--no-sync` would create
+    ALLOWED, but OFFLINE — see `_module_importable`: a fresh worktree
+    has no .venv, and `--no-sync` would create
     an empty skeleton from which uv silently falls back to whatever
     pytest/ruff sits on PATH, reporting environment artifacts as merge
     regressions), then the interpreter drcode itself runs under. The

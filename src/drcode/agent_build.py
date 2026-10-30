@@ -598,11 +598,12 @@ def build_agent(
             results (a longer hit list is truncated with a "refine the
             query" tail). Use it to assess the state of development around
             a topic — including "was it done AND merged?" — or find past
-            decisions/bug reports without reading raw task JSONs; for a
-            specific task's details, read_file its file
-            <project>/.drcode/tasks/<id>.json. Your own task is excluded
-            from the results, but the output tells you when it matches too
-            — its transcript is often exactly what you are looking for."""
+            decisions/bug reports without reading raw task files; for a
+            specific task's details, read_file its transcript
+            <project>/.drcode/tasks/<id>.transcript.json. Your own task is
+            excluded from the results, but the output tells you when it
+            matches too — its transcript is often exactly what you are
+            looking for."""
             # The archive lives in the MAIN checkout's .drcode/tasks/ — under
             # worktree isolation ctx.deps.root is the task's worktree, whose
             # .drcode/ has no task files. The manager's storage root always

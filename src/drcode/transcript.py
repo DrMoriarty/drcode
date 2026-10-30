@@ -419,3 +419,93 @@ def extract_display(
             out.append((at, "assistant", "\n".join(chunks)))
             chunks = []
     return out
+
+
+# -- search skeleton -----------------------------------------------------------
+#
+# The metadata file of a task (`<id>.json`) carries a cheap projection of the
+# dev transcript — every user prompt verbatim plus the agent's final text
+# response — that the archive search (drcode.task_search) indexes WITHOUT
+# reading the megabyte sidecar (`<id>.transcript.json`). Built by Storage on
+# every transcript flush; the bulk of model responses and tool results stays
+# out of it (noise and volume, not signal).
+
+# Cap of the final agent response kept in the skeleton (and indexed by the
+# archive search): the closing summary is often bilingual, bridging a
+# Russian prompt and an English title, but it must stay bounded.
+SKELETON_FINAL_RESPONSE_CAP = 4000
+
+
+def user_prompt_texts(messages: list[dict[str, Any]]) -> list[str]:
+    """The user-authored texts of a serialized transcript.
+
+    Serialized `ModelRequest`s carry `parts`, and only the parts with
+    `part_kind == "user-prompt"` are taken. Content is usually a plain
+    string; multimodal requests carry a list of content items (strings or
+    {"text": ...} dicts) — their text is joined. Model responses, tool
+    calls and tool results are ignored. Used by the archive search and the
+    skeleton builder.
+    """
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in message.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("part_kind") != "user-prompt":
+                continue
+            content = part.get("content")
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        texts.append(item)
+                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                        texts.append(item["text"])
+    return texts
+
+
+def final_response_text(
+    messages: list[dict[str, Any]],
+    cap: int = SKELETON_FINAL_RESPONSE_CAP,
+) -> str:
+    """The agent's closing summary: the LAST text part of the LAST model
+    response in the transcript (the final answer, not the tool chatter).
+
+    Serialized `ModelResponse`s carry `parts` with `part_kind == "text"`;
+    tool calls / tool returns use other part kinds and are skipped. Returns
+    "" when the transcript has no response text at all.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        text_parts = [
+            part.get("content")
+            for part in message.get("parts") or []
+            if isinstance(part, dict) and part.get("part_kind") == "text"
+        ]
+        if not text_parts:
+            continue
+        content = text_parts[-1]
+        if isinstance(content, str):
+            return content[:cap]
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    chunks.append(item["text"])
+            if chunks:
+                return " ".join(chunks)[:cap]
+    return ""
+
+
+def build_skeleton(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """The search skeleton of a dev transcript (see the section comment):
+    `{"prompts": [...], "final_response": "..."}`. Cheap enough to rebuild
+    on every transcript flush."""
+    return {
+        "prompts": user_prompt_texts(messages),
+        "final_response": final_response_text(messages),
+    }

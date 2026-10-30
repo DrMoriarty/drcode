@@ -7,7 +7,7 @@ import shutil
 from datetime import timedelta
 from pathlib import Path
 
-from drcode.models import PendingInput, Task, VerificationStatus, _now
+from drcode.models import PendingInput, Task, TaskStatus, VerificationStatus, _now
 from drcode.storage import Storage
 
 
@@ -169,3 +169,229 @@ def test_gitignore_respects_comment_lines(project_root: Path) -> None:
     Storage(project_root)
     # The commented mention doesn't count: the real entries are added.
     assert ".drcode/tasks/" in (project_root / ".gitignore").read_text()
+    first = (project_root / ".gitignore").read_text()
+    Storage(project_root)  # second pass must change nothing
+    assert (project_root / ".gitignore").read_text() == first
+    assert first.count(".drcode/tasks/") == 1
+
+
+# -- split storage: metadata + sidecar transcript ---------------------------------
+
+
+def _user_msg(text: str) -> dict:
+    return {
+        "kind": "request",
+        "parts": [{"part_kind": "user-prompt", "content": text}],
+    }
+
+
+def _assistant_msg(text: str) -> dict:
+    return {"kind": "response", "parts": [{"part_kind": "text", "content": text}]}
+
+
+def test_transcripts_split_into_sidecar(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("split")
+    task.messages = [_user_msg("hello"), _assistant_msg("final answer")]
+    task.tester_messages = [[_user_msg("verify")]]
+    task.resolver_messages = []
+    storage.save(task)
+
+    metadata_path = storage.tasks_dir / f"{task.id}.json"
+    sidecar_path = storage.tasks_dir / f"{task.id}.transcript.json"
+    assert metadata_path.is_file() and sidecar_path.is_file()
+    metadata = json.loads(metadata_path.read_text())
+    # The metadata file carries the skeleton, never the bulky transcripts.
+    assert "messages" not in metadata
+    assert "tester_messages" not in metadata
+    assert metadata["skeleton"]["prompts"] == ["hello"]
+    assert metadata["skeleton"]["final_response"] == "final answer"
+    sidecar = json.loads(sidecar_path.read_text())
+    assert sidecar["messages"] == task.messages
+    assert sidecar["tester_messages"] == task.tester_messages
+    assert sidecar["resolver_messages"] == []
+
+
+def test_transcripts_load_lazily_on_first_access(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("lazy")
+    task.messages = [_user_msg("hello")]
+    task.tester_messages = [[_user_msg("verify")]]
+    storage.save(task)
+
+    loaded = Storage(project_root).load_all()[0]
+    # Startup parsed metadata only: the sidecar is untouched in memory.
+    assert loaded.transcripts_loaded is False
+    assert loaded.messages == task.messages
+    # One access loads the whole sidecar — all three lists at once.
+    assert loaded.transcripts_loaded is True
+    assert loaded.tester_messages == task.tester_messages
+    assert loaded.resolver_messages == []
+
+
+def test_unloaded_save_never_rewrites_sidecar(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("quiet")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    sidecar_path = storage.tasks_dir / f"{task.id}.transcript.json"
+    sidecar_before = sidecar_path.read_text()
+
+    # A fresh storage (startup shape: transcripts on disk, not in memory):
+    # a metadata-only save (status change etc.) must not rewrite megabytes.
+    reloaded = Storage(project_root).load_all()[0]
+    assert reloaded.transcripts_loaded is False
+    reloaded.status = TaskStatus.COMPLETED
+    Storage(project_root).save(reloaded)
+    assert sidecar_path.read_text() == sidecar_before
+
+
+def test_loaded_save_flushes_sidecar(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("flush")
+    task.messages = [_user_msg("first")]
+    storage.save(task)
+
+    reloaded = Storage(project_root).load_all()[0]
+    reloaded.messages = [*reloaded.messages, _assistant_msg("second")]
+    reloaded.skeleton = {}
+    Storage(project_root).save(reloaded)
+    # The mutation is durable: a new storage sees it, and the skeleton was
+    # rebuilt from the live transcript on flush.
+    again = Storage(project_root).load_all()[0]
+    assert again.messages == task.messages + [_assistant_msg("second")]
+    metadata = json.loads((storage.tasks_dir / f"{task.id}.json").read_text())
+    assert metadata["skeleton"]["prompts"] == ["first"]
+
+
+def test_missing_sidecar_degrades_to_empty(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("orphan")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    storage.transcript_path(task.id).unlink()
+
+    loaded = Storage(project_root).load_all()[0]
+    assert loaded.messages == []  # no crash — metadata is the source of truth
+
+
+def test_corrupted_sidecar_degrades_to_empty(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("broken sidecar")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    storage.transcript_path(task.id).write_text("{not json")
+
+    loaded = Storage(project_root).load_all()[0]
+    assert loaded.messages == []
+
+
+def test_load_all_skips_transcript_files(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("real")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    # A sidecar in the tasks dir must never be parsed as task metadata.
+    (storage.tasks_dir / f"{task.id}.transcript.json").write_text('{"messages": []}')
+
+    loaded = storage.load_all()
+    assert [t.id for t in loaded] == [task.id]
+    assert storage.load_one(storage.transcript_path(task.id)) is None
+
+
+def test_save_recreates_vanished_dir_with_sidecar(project_root: Path) -> None:
+    # Same contract as the metadata test above, for the sidecar: a save of
+    # a LOADED task recreates both files after an external rm -rf.
+    storage = Storage(project_root)
+    task = make_task("survivor")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    shutil.rmtree(project_root / ".drcode")
+    storage.save(task)
+    assert storage.task_path(task.id).is_file()
+    assert storage.transcript_path(task.id).is_file()
+    assert Storage(project_root).load_all()[0].messages == task.messages
+
+
+def test_delete_removes_sidecar_too(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("doomed")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    storage.delete(task.id)
+    assert not storage.task_path(task.id).exists()
+    assert not storage.transcript_path(task.id).exists()
+
+
+# -- legacy monolithic migration --------------------------------------------------
+
+
+def test_legacy_monolithic_file_migrated_on_load(project_root: Path) -> None:
+    """Pre-split archives carry the full transcripts inside <id>.json;
+    loading splits them into the pair, derives the skeleton and rewrites
+    the metadata file."""
+    storage = Storage(project_root)
+    legacy = {
+        "id": "old1",
+        "title": "old format",
+        "messages": [_user_msg("legacy prompt"), _assistant_msg("legacy answer")],
+        "tester_messages": [[_user_msg("legacy verify")]],
+        "resolver_messages": [],
+    }
+    path = storage.tasks_dir / "old1.json"
+    path.write_text(json.dumps(legacy))
+
+    task = storage.load_one(path)
+    assert task is not None and task.title == "old format"
+    # The pair is on disk; the metadata file no longer carries transcripts.
+    sidecar = json.loads(storage.transcript_path("old1").read_text())
+    assert sidecar["messages"] == legacy["messages"]
+    metadata = json.loads(path.read_text())
+    assert "messages" not in metadata
+    assert metadata["skeleton"]["prompts"] == ["legacy prompt"]
+    assert metadata["skeleton"]["final_response"] == "legacy answer"
+    # The returned task is disk-backed: the transcripts reload lazily.
+    assert task.transcripts_loaded is False
+    assert task.messages == legacy["messages"]
+    assert task.tester_messages == legacy["tester_messages"]
+
+
+def test_legacy_migration_survives_crash_between_replaces(
+    project_root: Path,
+) -> None:
+    """Crash mid-migration (sidecar replaced, legacy metadata not): the
+    next load sees the legacy file again and reruns the migration — the
+    result is the same pair, no data loss, no duplication."""
+    storage = Storage(project_root)
+    legacy = {
+        "id": "old2",
+        "title": "crash test",
+        "messages": [_user_msg("crash prompt")],
+    }
+    path = storage.tasks_dir / "old2.json"
+    path.write_text(json.dumps(legacy))
+    first = storage.load_one(path)
+    assert first is not None
+    sidecar_after_first = storage.transcript_path("old2").read_text()
+
+    # Simulate the crash state: legacy metadata back, sidecar present.
+    path.write_text(json.dumps(legacy))
+    second = storage.load_one(path)
+    assert second is not None
+    assert second.messages == legacy["messages"]
+    assert storage.transcript_path("old2").read_text() == sidecar_after_first
+    assert "messages" not in json.loads(path.read_text())
+    # And an already-migrated archive reloads idempotently.
+    third = storage.load_one(path)
+    assert third is not None
+    assert third.messages == legacy["messages"]
+
+
+def test_legacy_migration_invalid_metadata_backed_up(project_root: Path) -> None:
+    storage = Storage(project_root)
+    path = storage.tasks_dir / "bad_legacy.json"
+    path.write_text(json.dumps({"id": "bad", "title": 42, "messages": []}))
+
+    assert storage.load_one(path) is None
+    assert path.with_suffix(".json.bak").is_file()
+    assert not path.exists()

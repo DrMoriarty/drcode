@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import enum
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 
 def _now() -> datetime:
@@ -120,6 +121,65 @@ class PendingInput(BaseModel):
     at: datetime = Field(default_factory=_now)
 
 
+# The three serialized transcripts a task carries (the coding agent's full
+# history and the isolated tester / conflict-resolver round lists). They are
+# NOT pydantic fields: they live in a per-task sidecar file
+# (`<id>.transcript.json`, see drcode.storage) and are loaded lazily through
+# the properties below, so `load_all` over a large archive never parses the
+# bulky transcripts at startup.
+TRANSCRIPT_KEYS = ("messages", "tester_messages", "resolver_messages")
+
+
+class TranscriptState:
+    """Mutable per-task transcript holder behind Task's lazy properties.
+
+    A task loaded from disk starts UNLOADED (`loaded=False`, empty lists,
+    `loader` installed by Storage): the first attribute access on any of
+    the three transcripts reads the sidecar file once and flips to loaded.
+    A task constructed in memory (fresh or in tests) starts loaded with
+    empty lists. `loader` stays installed for the whole lifetime —
+    `unload_transcripts()` (LRU eviction of idle tasks' transcripts) just
+    flips back to unloaded, and the next access re-reads the (already
+    flushed) sidecar file.
+    """
+
+    __slots__ = (
+        "loaded",
+        "loader",
+        "messages",
+        "resolver_messages",
+        "tester_messages",
+    )
+
+    def __init__(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        tester_messages: list[list[dict[str, Any]]] | None = None,
+        resolver_messages: list[list[dict[str, Any]]] | None = None,
+    ) -> None:
+        self.loaded: bool = True
+        self.messages: list[dict[str, Any]] = (
+            list(messages) if messages is not None else []
+        )
+        self.tester_messages: list[list[dict[str, Any]]] = (
+            list(tester_messages) if tester_messages is not None else []
+        )
+        self.resolver_messages: list[list[dict[str, Any]]] = (
+            list(resolver_messages) if resolver_messages is not None else []
+        )
+        # Callable returning {"messages": [...], "tester_messages": [...],
+        # "resolver_messages": [...]} — installed by Storage for disk-backed
+        # tasks; None for tasks that have never been persisted.
+        self.loader: Callable[[], dict[str, Any]] | None = None
+
+    def __eq__(self, other: object) -> bool:
+        # Transient state is deliberately NOT part of Task equality: two
+        # tasks are equal when their persisted (metadata) fields match,
+        # no matter whether the bulky transcripts happen to sit in memory
+        # or on disk right now.
+        return isinstance(other, TranscriptState)
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=_short_id)
     title: str
@@ -136,19 +196,16 @@ class Task(BaseModel):
 
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
-    # Serialized pydantic-ai ModelMessages (full transcript incl. tool calls).
-    messages: list[dict[str, Any]] = Field(default_factory=list)
-    # Serialized transcripts of the tester runs, one entry per testing round.
-    # Kept separate from `messages` so the coding agent never resumes with
-    # tester-only tool calls (set_verification, create_bug_report) in its
-    # model history.
-    tester_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
-    # Serialized transcripts of the automatic merge-conflict resolver
-    # rounds (one entry per round), isolated from `messages` and
-    # `tester_messages` for the same reason: the resolver's tool calls
-    # (set_resolution, git plumbing) must never leak into the coding
-    # agent's or the tester's model history.
-    resolver_messages: list[list[dict[str, Any]]] = Field(default_factory=list)
+    # The three full transcripts (dev / tester rounds / resolver rounds) do
+    # NOT live here: they are persisted in a sidecar file
+    # (`<id>.transcript.json`) and exposed through the `messages`,
+    # `tester_messages` and `resolver_messages` properties below, loading
+    # lazily from disk on first access. This metadata file carries only
+    # the skeleton: the cheap, high-signal projection of the dev transcript
+    # (user prompts + final response) the archive search indexes.
+    skeleton: dict[str, Any] = Field(default_factory=dict)
+    # Private lazy-transcript holder (see TranscriptState).
+    _transcripts: TranscriptState = PrivateAttr(default_factory=TranscriptState)
     # True when an automatic conflict-resolution attempt FAILED its
     # verification (mechanics/tests/intent review, or the resolver gave
     # up): the conflicted merge is left untouched in the task's worktree
@@ -301,6 +358,115 @@ class Task(BaseModel):
         """Checklist items not marked done yet (the completion soft gate
         in the pipeline warns about these at mark_done time)."""
         return [t for t in self.todos if not t.done]
+
+    # -- lazy transcripts (messages / tester_messages / resolver_messages) ----
+
+    def _ensure_transcripts(self, key: str) -> Any:
+        """Transcript accessor: loads the sidecar file once, on the first
+        access of any of the three transcripts (a disk-backed task starts
+        unloaded so `load_all` over hundreds of tasks never parses the
+        bulky histories). The load populates ALL three lists — they share
+        one sidecar file."""
+        ts = self._transcripts
+        if not ts.loaded:
+            data = ts.loader() if ts.loader is not None else {}
+            ts.messages = list(data.get("messages") or [])
+            ts.tester_messages = list(data.get("tester_messages") or [])
+            ts.resolver_messages = list(data.get("resolver_messages") or [])
+            ts.loaded = True
+        return getattr(ts, key)
+
+    def _set_transcript(self, key: str, value: Any) -> None:
+        """Transcript assignment: the given list becomes the authoritative
+        in-memory state (a task built or mutated in code is loaded by
+        definition; Storage.save flushes it to the sidecar file)."""
+        ts = self._transcripts
+        ts.loaded = True
+        setattr(ts, key, value if isinstance(value, list) else [])
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        """Serialized pydantic-ai ModelMessages (full transcript incl. tool
+        calls). Lazy: the first access loads `<id>.transcript.json` from
+        disk when the task came from storage and its transcript is not in
+        memory yet."""
+        return self._ensure_transcripts("messages")
+
+    @messages.setter
+    def messages(self, value: list[dict[str, Any]]) -> None:
+        self._set_transcript("messages", value)
+
+    @property
+    def tester_messages(self) -> list[list[dict[str, Any]]]:
+        """Serialized transcripts of the tester runs, one entry per testing
+        round. Kept separate from `messages` so the coding agent never
+        resumes with tester-only tool calls (set_verification,
+        create_bug_report) in its model history. Same lazy sidecar load."""
+        return self._ensure_transcripts("tester_messages")
+
+    @tester_messages.setter
+    def tester_messages(self, value: list[list[dict[str, Any]]]) -> None:
+        self._set_transcript("tester_messages", value)
+
+    @property
+    def resolver_messages(self) -> list[list[dict[str, Any]]]:
+        """Serialized transcripts of the automatic merge-conflict resolver
+        rounds (one entry per round), isolated from `messages` and
+        `tester_messages` for the same reason: the resolver's tool calls
+        (set_resolution, git plumbing) must never leak into the coding
+        agent's or the tester's model history. Same lazy sidecar load."""
+        return self._ensure_transcripts("resolver_messages")
+
+    @resolver_messages.setter
+    def resolver_messages(self, value: list[list[dict[str, Any]]]) -> None:
+        self._set_transcript("resolver_messages", value)
+
+    @property
+    def transcripts_loaded(self) -> bool:
+        """True while the full transcripts sit in memory (a task constructed
+        in code, or one whose sidecar has already been read this
+        session). False for disk-backed tasks not touched yet — Storage.save
+        then writes metadata only and never rewrites the sidecar file."""
+        return self._transcripts.loaded
+
+    def unload_transcripts(self) -> None:
+        """Drop the in-memory transcripts (LRU eviction of idle tasks).
+
+        The sidecar file MUST be current when this runs (Storage.save
+        flushed it); the next attribute access lazily re-reads it through
+        the loader installed at load time. A task without a loader
+        (never persisted) keeps an empty transcript after this — callers
+        only unload persisted tasks."""
+        self._transcripts.loaded = False
+        self._transcripts.messages = []
+        self._transcripts.tester_messages = []
+        self._transcripts.resolver_messages = []
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _capture_transcript_kwargs(cls, values: Any, handler: Any) -> Task:
+        """Route `Task(messages=..., tester_messages=..., ...)` constructor
+        and `model_validate` kwargs into the private transcript state.
+
+        The three transcripts are NOT fields (they are persisted in the
+        sidecar file, not in the metadata dict), so pydantic would silently
+        IGNORE them as unknown keys (extra="ignore" keeps legacy task files
+        loadable). This wrap validator pops them out of the raw input and
+        attaches them as the in-memory (loaded) transcript state after the
+        model is built — the pre-split behaviour of constructing a Task
+        with its transcripts keeps working."""
+        transcripts: dict[str, Any] = {}
+        if isinstance(values, dict):
+            for key in TRANSCRIPT_KEYS:
+                if key in values:
+                    transcripts[key] = values.pop(key)
+        instance = handler(values)
+        if transcripts:
+            state = TranscriptState(
+                **transcripts  # type: ignore[arg-type]
+            )
+            instance._transcripts = state
+        return instance
 
     @model_validator(mode="before")
     @classmethod

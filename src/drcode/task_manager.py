@@ -128,6 +128,10 @@ def validate_dependencies(
 class TaskManager:
     def __init__(self, project_root: Path) -> None:
         self.storage = Storage(project_root)
+        # Sidecar-transcript LRU eviction (see Storage.transcript_cache_limit):
+        # the storage detects the overage, the manager owns the Task objects
+        # and only an idle COMPLETED task's transcripts may be dropped.
+        self.storage.set_evict_hook(self._evict_transcript)
         # Long-lived product goals (<project>/.drcode/goals/<id>.json): the
         # passive roadmap registry the research agent plans against. Lives
         # on the manager so both the agent tools and the TUI reach the same
@@ -181,6 +185,24 @@ class TaskManager:
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
         return self._queue_seq
+
+    def _evict_transcript(self, task_id: str) -> bool:
+        """Storage sidecar-LRU callback (see Storage.transcript_cache_limit):
+        flush + drop the in-memory transcripts of an idle COMPLETED task so
+        a long session does not accumulate every transcript it ever viewed.
+        Returns True when the id may be forgotten (evicted / unknown task),
+        False when the task must keep its transcripts (still in the
+        pipeline — the LRU limit is then soft)."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return True
+        if task.status is not TaskStatus.COMPLETED:
+            return False
+        if not task.transcripts_loaded:
+            return True
+        self.storage.save(task)
+        task.unload_transcripts()
+        return True
 
     # -- status-change observers ---------------------------------------------
 
@@ -381,7 +403,7 @@ class TaskManager:
         with self._disk_lock:
             known = set(self.tasks)
             new: list[Task] = []
-            for path in sorted(self.storage.tasks_dir.glob("*.json")):
+            for path in self.storage.task_file_paths():
                 if path.stem in known:
                     continue
                 task = self.storage.load_one(path)

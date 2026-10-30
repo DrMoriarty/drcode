@@ -2,10 +2,10 @@
 
 The research agent needs to assess the state of development around a topic —
 across ALL statuses (queued, hold, active, testing, completed, clarification)
-— without reading the raw task JSONs: a task file is `Task.model_dump_json`
-with the full transcript (`messages`, `tester_messages`, `events`), and
-reading several of those burns tens of thousands of tokens. The plain file
-tools cannot help either: `.drcode/` is in `tools.IGNORED_DIRS`, so
+— without reading the raw task files: the metadata file is cheap, but the
+full transcripts live in megabyte sidecar files (`<id>.transcript.json`),
+and reading several of those burns tens of thousands of tokens. The plain
+file tools cannot help either: `.drcode/` is in `tools.IGNORED_DIRS`, so
 grep/glob never see it, and `run_bash` + `grep`/`jq` is a fragile workaround
 (jq may be absent, the JSON is multi-line).
 
@@ -46,15 +46,21 @@ This module gives the model a deliberately COMPACT view instead:
   no handling — `Storage.save` is atomic (`os.replace`), the worst case is
   missing one task created mid-scan;
 - the archive is read through a module-level INCREMENTAL CACHE keyed by the
-  project root (one per process, `threading.Lock`-guarded): each task file
+  project root (one per process, `threading.Lock`-guarded), BACKED BY an
+  on-disk persistent index (`.drcode/search_index.json`): each task file
   is re-read and re-parsed only when its `(mtime_ns, size)` stat pair
-  changed, and the cached entry is a REDUCED record — the raw transcript
-  (`messages`, `tester_messages`, …) is parsed only to extract the search
-  index and immediately dropped, so a 300+ MB archive costs milliseconds
-  on a warm search and a few MB of memory instead of gigabytes. A broken
-  cache entry is quietly rebuilt from disk, never fatal (deliberately
-  in-memory only: no on-disk persistence, no invalidation contract beyond
-  the stat keys).
+  changed — and since the stat keys are persisted, a RESTARTED TUI does not
+  re-parse the archive either: the first Ctrl+F after a restart reuses the
+  disk index and costs milliseconds. (Since the storage split, task
+  metadata files no longer carry the transcripts at all — the indexed
+  fields come from the per-task `skeleton`, see drcode.transcript — so a
+  cold parse is cheap too.) A broken cache or index entry is quietly
+  rebuilt from disk, never fatal; the index write is atomic
+  (tmp + os.replace) and keyed by stat pairs, so concurrent processes
+  (the agent tool runs in another process than the TUI) self-heal: a stale
+  entry simply mismatches its stat key on the next load and is re-parsed.
+  The cached entry is a REDUCED record — the raw transcript is never kept,
+  so memory stays in the MBs regardless of archive size.
 
 Worktree isolation note: under `task_isolation: worktree` the task files
 live in the MAIN checkout's `.drcode/tasks/`, not in the task's worktree —
@@ -65,6 +71,7 @@ never the agent's cwd/worktree root.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from collections.abc import Callable
@@ -75,6 +82,12 @@ from typing import Any
 
 from .config import PROJECT_STATE_DIRNAME
 from .models import TaskKind, TaskStatus, VerificationStatus
+from .storage import is_transcript_path
+from .transcript import (
+    SKELETON_FINAL_RESPONSE_CAP,
+    final_response_text,
+    user_prompt_texts,
+)
 
 # Output budget: the tool exists to SAVE context, so the result is hard-capped.
 # No more than MAX_RESULTS lines per call; when the archive holds more
@@ -91,8 +104,15 @@ SNIPPET_MAX = 120
 MERGEDNESS_MAX_IDS = 10
 # Indexing caps for the extended fields: they keep the in-memory haystack
 # (and the occurrence scoring) bounded no matter how chatty the agent was.
-FINAL_RESPONSE_CAP = 4000
+FINAL_RESPONSE_CAP = SKELETON_FINAL_RESPONSE_CAP
 EVENT_TEXT_CAP = 500
+
+# The persistent on-disk index: one JSON file under `.drcode/`, mapping the
+# task FILENAME to its stat key and prebuilt search record. Written
+# atomically on every load that re-parsed at least one file; a concurrent
+# writer cannot corrupt it (os.replace), and a lost update self-heals via
+# the stat keys (the next load re-parses the mismatching file).
+SEARCH_INDEX_FILENAME = "search_index.json"
 
 # Light stemming: ONE common trailing ending is stripped from a keyword to
 # produce an extra match variant (the full keyword is always tried too).
@@ -179,65 +199,9 @@ def _validate_choice(value: str | None, choices: type, name: str) -> str | None:
 
 
 def _prompt_texts(messages: list[dict[str, Any]]) -> list[str]:
-    """The user-authored texts of a serialized transcript.
-
-    Serialized `ModelRequest`s carry `parts`, and only the parts with
-    `part_kind == "user-prompt"` are indexed. Content is usually a plain
-    string; multimodal requests carry a list of content items (strings or
-    {"text": ...} dicts) — their text is joined. Model responses, tool calls
-    and tool results are deliberately ignored (the agent's FINAL response is
-    indexed separately — see `_final_response_text`).
-    """
-    texts: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        for part in message.get("parts") or []:
-            if not isinstance(part, dict):
-                continue
-            if part.get("part_kind") != "user-prompt":
-                continue
-            content = part.get("content")
-            if isinstance(content, str):
-                texts.append(content)
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        texts.append(item)
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                        texts.append(item["text"])
-    return texts
-
-
-def _final_response_text(messages: list[dict[str, Any]]) -> str:
-    """The agent's closing summary: the LAST text part of the LAST model
-    response in the transcript (the final answer, not the tool chatter).
-
-    Serialized `ModelResponse`s carry `parts` with `part_kind == "text"`;
-    tool calls / tool returns use other part kinds and are skipped. Returns
-    "" when the transcript has no response text at all.
-    """
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-        text_parts = [
-            part.get("content")
-            for part in message.get("parts") or []
-            if isinstance(part, dict) and part.get("part_kind") == "text"
-        ]
-        if not text_parts:
-            continue
-        content = text_parts[-1]
-        if isinstance(content, str):
-            return content[:FINAL_RESPONSE_CAP]
-        if isinstance(content, list):
-            chunks = []
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(item["text"])
-            if chunks:
-                return " ".join(chunks)[:FINAL_RESPONSE_CAP]
-    return ""
+    """Deprecated alias — the transcript helpers moved to drcode.transcript
+    (shared with the Storage skeleton builder)."""
+    return user_prompt_texts(messages)
 
 
 def _pending_texts(pending_input: list[Any]) -> list[str]:
@@ -255,7 +219,12 @@ def _pending_texts(pending_input: list[Any]) -> list[str]:
     return texts
 
 
-def _indexed_fields(task_id: str, data: dict[str, Any]) -> list[tuple[str, str]]:
+def _indexed_fields(
+    task_id: str,
+    data: dict[str, Any],
+    prompts: list[str],
+    final: str,
+) -> list[tuple[str, str]]:
     """The (label, text) pairs that make up a task's search index.
 
     Labels are cheap provenance tags used to decorate snippets ("files:",
@@ -264,19 +233,22 @@ def _indexed_fields(task_id: str, data: dict[str, Any]) -> list[tuple[str, str]]
     its short id alone — a never-run task without events would otherwise
     be reachable only by accident. It is deliberately NOT snippet-decorated
     (the id is already shown in `#{task_id}` on every result line).
+
+    `prompts` / `final` were extracted by the caller from the task's
+    skeleton (the metadata file's cheap transcript projection) — the full
+    sidecar transcript is never read here.
     """
     fields: list[tuple[str, str]] = [
         ("id", task_id),
         ("title", str(data.get("title") or "")),
     ]
-    for text in _prompt_texts(data.get("messages") or []):
+    for text in prompts:
         fields.append(("prompt", text))
     for text in _pending_texts(data.get("pending_input") or []):
         fields.append(("prompt", text))
     for path in data.get("edited_files") or []:
         if isinstance(path, str):
             fields.append(("files", path))
-    final = _final_response_text(data.get("messages") or [])
     if final:
         fields.append(("summary", final))
     for event in data.get("events") or []:
@@ -532,20 +504,31 @@ _REDUCED_KEYS = (
 
 
 def _extract_record(task_id: str, data: dict[str, Any]) -> ArchiveRecord:
-    """Reduce a freshly parsed task dict to its search-relevant form.
+    """Reduce a freshly parsed task METADATA dict to its search-relevant form.
 
-    Runs ONCE per (re)loaded file: the raw transcript is scanned for the
-    user prompts (kept verbatim — usually small) and the indexed fields,
-    then thrown away. `prompts` is what `_first_prompt` reads on the
-    reduced record; `events` keeps only dict entries (the shape
-    `_last_error_event` tolerates anyway).
+    Runs ONCE per (re)loaded file. The prompts and the final response come
+    from the metadata file's `skeleton` (the cheap transcript projection
+    Storage maintains on every save — see drcode.transcript); a dict
+    without a skeleton (a legacy monolithic file not yet migrated, or a
+    foreign writer) falls back to parsing the raw `messages` it carries.
+    The raw transcript is never kept. `prompts` is what `_first_prompt`
+    reads on the reduced record; `events` keeps only dict entries (the
+    shape `_last_error_event` tolerates anyway).
     """
     reduced: dict[str, Any] = {key: data.get(key) for key in _REDUCED_KEYS}
-    reduced["prompts"] = _prompt_texts(data.get("messages") or [])
+    skeleton = data.get("skeleton")
+    if isinstance(skeleton, dict):
+        prompts = [str(p) for p in skeleton.get("prompts") or []]
+        final = str(skeleton.get("final_response") or "")
+    else:
+        messages = data.get("messages") or []
+        prompts = user_prompt_texts(messages if isinstance(messages, list) else [])
+        final = final_response_text(messages if isinstance(messages, list) else [])
+    reduced["prompts"] = prompts
     reduced["events"] = [
         event for event in reduced["events"] or [] if isinstance(event, dict)
     ]
-    return task_id, reduced, _indexed_fields(task_id, data)
+    return task_id, reduced, _indexed_fields(task_id, data, prompts, final)
 
 
 @dataclass
@@ -554,8 +537,8 @@ class _CachedArchive:
 
     # Records in filename order, as returned by load_archive.
     records: list[ArchiveRecord]
-    # Reduced record by absolute file path (for per-file reuse).
-    by_path: dict[str, ArchiveRecord]
+    # Reduced record by task FILENAME (for per-file reuse).
+    by_name: dict[str, ArchiveRecord]
     # The (mtime_ns, size) stat pair each cached record was built from.
     file_keys: dict[str, tuple[int, int]]
 
@@ -569,11 +552,64 @@ _ARCHIVE_LOCK = threading.Lock()
 _ARCHIVE_CACHES: dict[str, _CachedArchive] = {}
 
 
+def _index_path(project_root: Path) -> Path:
+    return Path(project_root) / PROJECT_STATE_DIRNAME / SEARCH_INDEX_FILENAME
+
+
+def _record_from_disk(raw: Any) -> ArchiveRecord | None:
+    """Validate one disk-index entry into an ArchiveRecord (None when the
+    shape is foreign/broken — a quietly rebuilt entry, never fatal)."""
+    if not (isinstance(raw, list) and len(raw) == 3):
+        return None
+    task_id, reduced, fields = raw
+    if not isinstance(task_id, str) or not isinstance(reduced, dict):
+        return None
+    if not isinstance(fields, list):
+        return None
+    clean: list[tuple[str, str]] = []
+    for item in fields:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            clean.append((item[0], item[1]))
+    return task_id, reduced, clean
+
+
+def _load_disk_index(project_root: Path) -> dict[str, list[Any]]:
+    """The persisted index as a raw {filename: [key, record]} dict, or {}
+    on any problem (missing, corrupted, unexpected shape) — the caller
+    then re-parses the archive and rewrites the file."""
+    try:
+        data = json.loads(_index_path(project_root).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return {}
+    return data["entries"]
+
+
+def _write_disk_index(project_root: Path, entries: dict[str, list[Any]]) -> None:
+    """Persist the index atomically; any failure is swallowed — the
+    in-memory cache still serves this process, and the next successful
+    write catches up."""
+    try:
+        text = json.dumps({"version": 1, "entries": entries}, ensure_ascii=False)
+        tmp = _index_path(project_root).with_suffix(".json.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, _index_path(project_root))
+    except OSError:
+        pass
+
+
 def clear_archive_cache(project_root: Path | None = None) -> None:
     """Drop the archive cache (one project, or all when root is None).
 
     Purely an operational/testing hook — the cache rebuilds on the next
-    `load_archive` call.
+    `load_archive` call. The ON-DISK index is kept: it is keyed by stat
+    pairs and stays valid (a full-index rebuild test deletes it itself).
     """
     with _ARCHIVE_LOCK:
         if project_root is None:
@@ -601,12 +637,17 @@ def load_archive(
 
     Incrementality: every task file is stat'ed (cheap — hundreds of stats
     cost a few ms) and re-read/re-parsed ONLY when its `(mtime_ns, size)`
-    changed; unchanged records are reused from the cache, so a repeat search
-    is milliseconds and only the files the pipeline actually touched pay the
-    JSON price. A broken/unexpected cache entry is quietly rebuilt from
-    disk, never fatal. The cache is deliberately in-memory only (one per
-    process, keyed by the project root, `threading.Lock`-guarded — the agent
-    tool runs in a worker thread, the TUI dialog in another).
+    changed; unchanged records are reused from the in-memory cache and —
+    after a restart — from the PERSISTENT on-disk index
+    (`.drcode/search_index.json`, see SEARCH_INDEX_FILENAME), so a repeat
+    search AND the first search of a fresh process are milliseconds and
+    only the files the pipeline actually touched pay the JSON price.
+    A broken/unexpected cache or index entry is quietly rebuilt from
+    disk, never fatal. The in-memory cache is one per process, keyed by
+    the project root, `threading.Lock`-guarded — the agent tool runs in a
+    worker thread, the TUI dialog in another; cross-process safety comes
+    from the atomic index write plus the stat keys (a lost update to the
+    index file just makes the next load re-parse the file).
 
     BLOCKING file I/O: callers on an event loop must run this in a worker
     thread (the TUI dialog reads it once per session and filters in memory).
@@ -618,7 +659,9 @@ def load_archive(
     root = Path(project_root)
     tasks_dir = root / PROJECT_STATE_DIRNAME / "tasks"
     try:
-        paths = sorted(tasks_dir.glob("*.json"))
+        paths = [
+            p for p in sorted(tasks_dir.glob("*.json")) if not is_transcript_path(p)
+        ]
     except OSError:
         return []
     # Fast path outside the lock: stat everything once (all callers need
@@ -637,15 +680,28 @@ def load_archive(
         if not isinstance(cached, _CachedArchive):
             cached = None  # Broken/foreign entry: rebuild from scratch.
         old_keys = cached.file_keys if cached else {}
+        # The persistent index: stat-keyed records that survive a restart.
+        disk = _load_disk_index(root)
         records: list[ArchiveRecord] = []
-        by_path: dict[str, ArchiveRecord] = {}
+        by_name: dict[str, ArchiveRecord] = {}
         file_keys: dict[str, tuple[int, int]] = {}
+        disk_dirty = False
         for done, (path, mtime_ns, size) in enumerate(entries, 1):
-            path_key = str(path)
+            name = path.name
             key = (mtime_ns, size)
             record: ArchiveRecord | None = None
-            if old_keys.get(path_key) == key and cached is not None:
-                record = cached.by_path.get(path_key)
+            if old_keys.get(name) == key and cached is not None:
+                record = cached.by_name.get(name)
+            if record is None:
+                raw = disk.get(name)
+                if (
+                    isinstance(raw, list)
+                    and len(raw) == 2
+                    and isinstance(raw[0], list)
+                    and tuple(raw[0]) == key
+                ):
+                    record = _record_from_disk(raw[1])
+                    disk_dirty = disk_dirty or record is None
             if record is None:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
@@ -654,13 +710,33 @@ def load_archive(
                 if not isinstance(data, dict):
                     continue
                 record = _extract_record(path.stem, data)
+                disk_dirty = True
             records.append(record)
-            by_path[path_key] = record
-            file_keys[path_key] = key
+            by_name[name] = record
+            file_keys[name] = key
             if progress is not None:
                 progress(done, total)
-        fresh = _CachedArchive(records=records, by_path=by_path, file_keys=file_keys)
+        fresh = _CachedArchive(records=records, by_name=by_name, file_keys=file_keys)
         _ARCHIVE_CACHES[cache_key] = fresh
+        # Rewrite the persistent index only when something actually
+        # changed (a file was re-parsed, or an index entry was broken):
+        # the common post-restart load is a pure read.
+        if disk_dirty or any(
+            name not in disk
+            or not isinstance(disk[name], list)
+            or len(disk[name]) != 2
+            or not isinstance(disk[name][0], list)
+            or tuple(disk[name][0]) != key
+            for name, key in file_keys.items()
+        ):
+            serialized: dict[str, list[Any]] = {}
+            for name, key in file_keys.items():
+                task_id, reduced, fields = by_name[name]
+                serialized[name] = [
+                    list(key),
+                    [task_id, reduced, [list(f) for f in fields]],
+                ]
+            _write_disk_index(root, serialized)
         return list(records)
 
 
@@ -920,6 +996,6 @@ def search(
         lines.append(
             f"Note: the current task {exclude_task_id} also matches these "
             "keywords — read its transcript directly "
-            f"(.drcode/tasks/{exclude_task_id}.json)."
+            f"(.drcode/tasks/{exclude_task_id}.transcript.json)."
         )
     return "\n".join(lines)

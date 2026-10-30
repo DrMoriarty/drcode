@@ -83,7 +83,7 @@ def _trim_oversized_text(text: str, keep_chars: int, task_id: str) -> str:
     note = (
         "\n\n[… The text was shortened to fit the verifier model's context "
         f"window: {len(text)} characters total, the full text is in "
-        f".drcode/tasks/{task_id}.json …]\n\n"
+        f".drcode/tasks/{task_id}.transcript.json …]\n\n"
     )
     return text[:head] + note + (text[-tail:] if tail > 0 else "")
 

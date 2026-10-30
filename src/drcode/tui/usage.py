@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import urllib.parse
 from dataclasses import dataclass
 
@@ -74,11 +75,23 @@ def _is_context_overflow_error(e: BaseException) -> bool:
     """Deterministic model failure: HTTP 400 whose body says the request
     exceeds the model's context window. Unlike transport errors and 429s
     this cannot succeed on retry — the transcript must shrink (mechanical
-    compaction) or the task must be handled manually."""
-    if not isinstance(e, ModelHTTPError) or e.status_code != 400:
+    compaction) or the task must be handled manually.
+
+    The 400 is matched duck-typed on the exception's ``status_code``
+    attribute (with the "status_code: N" prefix of the rendered message as
+    the fallback) instead of ``isinstance(e, ModelHTTPError)``: pydantic-ai
+    releases surface the same gateway 400 under differently named classes
+    (e.g. ``ModelRequestRejectedError`` — the #f425b421 carousel slipped
+    past the isinstance check for exactly that reason), all of them
+    carrying ``status_code``. The overflow markers decide the rest."""
+    text = str(e)
+    if not any(marker in text.lower() for marker in _CONTEXT_OVERFLOW_MARKERS):
         return False
-    text = str(e).lower()
-    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+    status = getattr(e, "status_code", None)
+    if status is None:
+        match = re.search(r"status_code:\s*(\d+)", text)
+        status = int(match.group(1)) if match else None
+    return status == 400
 
 
 def _in_outage(attempt: int) -> bool:

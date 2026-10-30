@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 
@@ -32,7 +33,7 @@ from ..agent import (
     run_context_tokens,
 )
 from ..github import issue_commit_hint
-from ..models import TaskStatus, VerificationStatus
+from ..models import Task, TaskStatus, VerificationStatus
 from ..providers import AgentRole
 from ..tools import scratch_dir
 from .blocks import ToolCallBlock
@@ -41,9 +42,50 @@ from .state import DrCodeState
 from .usage import (
     NETWORK_RETRIES,
     _in_outage,
+    _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
 )
+
+# -- start-prompt pre-flight gate (the #f425b421 class) ------------------------
+#
+# The testing round's start prompt embeds the original assignment verbatim;
+# a huge assignment can alone exceed the serving model's window, and the
+# round then dies on its FIRST request — no mid-round compaction gate ever
+# fires (they all wait for a tool boundary the round never reaches) and the
+# ordinary failure path loops the same oversized prompt on backoff forever.
+# The pre-flight measures the prompt against the tester role's resolved
+# config before the first request: trim the embedded texts to head+tail, or
+# never send the request at all.
+
+# Conservative chars/token conversion for the pre-flight: the conventional
+# len/4 estimate under-counts Cyrillic- and pseudographics-heavy text (≈2.5–3
+# real characters per token), and it is the GATEWAY's count the 400 checks —
+# the #f425b421 prompt estimated ≈137k at len/4 while the real count crossed
+# 65537. The gate assumes 3 chars per token instead.
+_PREFLIGHT_CHARS_PER_TOKEN = 3
+# The start prompt may take this percent of the threshold-scaled window (the
+# rest goes to the measured framing and the round's own growth before the
+# mid-round compaction gates take over).
+_PREFLIGHT_SLACK_PCT = 90
+# Below this a trimmed prompt is useless anyway: give up without a request.
+_PREFLIGHT_MIN_PROMPT_TOKENS = 1_000
+# Embedded texts shorter than this stay verbatim (trimming them saves
+# nothing and mangles the intent).
+_PREFLIGHT_BLOCK_FLOOR_CHARS = 2_000
+
+
+def _trim_oversized_text(text: str, keep_chars: int, task_id: str) -> str:
+    """Head+tail of an oversized embedded text around an explicit note
+    pointing at the full text in the task's storage file."""
+    head = max(keep_chars * 2 // 3, 0)
+    tail = max(keep_chars - head, 0)
+    note = (
+        "\n\n[… The text was shortened to fit the verifier model's context "
+        f"window: {len(text)} characters total, the full text is in "
+        f".drcode/tasks/{task_id}.json …]\n\n"
+    )
+    return text[:head] + note + (text[-tail:] if tail > 0 else "")
 
 
 class PipelineTesterLayer(DrCodeState):
@@ -60,6 +102,111 @@ class PipelineTesterLayer(DrCodeState):
         delay = min(5 * 2 ** (count - 1), 300)
         self._tester_retry_at[task_id] = time.monotonic() + delay
         self._schedule_pipeline_timer(delay, self._advance)
+
+    def _preflight_tester_prompt(
+        self,
+        task: Task,
+        prompt: str,
+        render: Callable[[str | None, list[str]], str],
+        original: str | None,
+        clarifications: list[str],
+    ) -> str | None:
+        """Pre-flight gate of the testing round's FIRST request: the start
+        prompt must fit the tester model's window before it is sent — the
+        mid-round compaction gates all fire at tool boundaries, and a round
+        whose first request is rejected never reaches one (the #f425b421
+        carousel: six identical 400s on exponential backoff, never a single
+        tool call).
+
+        The fill is measured conservatively (`_PREFLIGHT_CHARS_PER_TOKEN`
+        instead of the len/4 convention — the heuristic under-counts
+        Cyrillic/pseudographics, and it is the gateway's count the 400
+        checks) from the MEASURED request framing of the tester role
+        (`_mechanical_framing`: system prompt, AGENTS.md, tool schemas) plus
+        the output reserve, against the window.
+
+        Returns the prompt to send — the original one when it fits, otherwise
+        a rebuilt one with the oversized embedded texts (the assignment, the
+        clarifications) trimmed to head+tail around an explicit note — or
+        None when even a trimmed prompt cannot fit: the caller must not send
+        the request (it is guaranteed the same 400) and gives the round up.
+        An unmeasurable wiring or an unknown window (≤ 0) skips the gate:
+        without figures there is nothing to decide on."""
+        measured = self._mechanical_framing(task, AgentRole.TESTER)
+        if measured is None:
+            return prompt
+        window, framing, output = measured
+        reserve = framing + output
+        prompt_tokens = len(prompt) // _PREFLIGHT_CHARS_PER_TOKEN + 1
+        if reserve >= window or prompt_tokens + reserve <= window:
+            # Fits the window (conservatively estimated) — or the framing
+            # alone already overflows it, which no trim of the prompt can
+            # fix (a config problem the overflow handling owns, not this
+            # gate). Send as-is: the mid-round gates compact from there.
+            return prompt
+        config = self.resolved_config(AgentRole.TESTER)
+        threshold = min(max(config.compaction_threshold, 1), 100)
+        limit = window * threshold // 100 * _PREFLIGHT_SLACK_PCT // 100
+        budget = max(limit - reserve, 0)
+        if budget < _PREFLIGHT_MIN_PROMPT_TOKENS:
+            # The threshold-scaled target is unreachable: fall back to the
+            # window itself (with a 10% margin) — fitting at all beats
+            # giving up when the threshold headroom cannot be met.
+            budget = max(int(window * 0.9) - reserve, 0)
+        blocks = ([original] if original is not None else []) + list(clarifications)
+        big_total = sum(len(b) for b in blocks if len(b) > _PREFLIGHT_BLOCK_FLOOR_CHARS)
+        excess = len(prompt) - budget * _PREFLIGHT_CHARS_PER_TOKEN
+        if budget < _PREFLIGHT_MIN_PROMPT_TOKENS or not blocks or big_total <= excess:
+            # Nothing trimmable (or the trimmable part alone overflows):
+            # the request would be rejected deterministically.
+            return None
+        scale = (big_total - excess) / big_total
+        trimmed = [
+            b
+            if len(b) <= _PREFLIGHT_BLOCK_FLOOR_CHARS
+            else _trim_oversized_text(b, int(len(b) * scale), task.id)
+            for b in blocks
+        ]
+        new_prompt = render(
+            trimmed[0] if original is not None else None,
+            trimmed[1:] if original is not None else trimmed,
+        )
+        new_tokens = len(new_prompt) // _PREFLIGHT_CHARS_PER_TOKEN + 1
+        if new_tokens + reserve > window:
+            return None
+        self._show_event(
+            task,
+            f"The original assignment is too large for the tester model's "
+            f"{window}-token window — the start prompt was trimmed "
+            f"({len(prompt) - len(new_prompt)} characters cut, head and "
+            "tail kept, the full text is in this task's storage file).",
+        )
+        return new_prompt
+
+    def _tester_overflow_give_up(self, task: Task, reason: str) -> None:
+        """Deterministic death of a testing round: the model rejects the
+        requests with a context overflow and nothing can shrink the round
+        below the window. Retrying the same prompt is guaranteed the same
+        400 (the #f425b421 carousel), so the task completes with the FAILED
+        label instead — the work stays on the branch, and sending input to
+        the task re-queues it (a fresh round then passes the pre-flight
+        gate against the model the user picked meanwhile)."""
+        window = self.resolved_config(AgentRole.TESTER).max_context_tokens
+        self._show_event(
+            task,
+            f"The testing round is given up: the tester model's requests "
+            f"are deterministically rejected with a context overflow — "
+            f"{reason} (window {window} tokens). Retry loops cannot help. "
+            "Pick a larger-window model for the tester role (Settings / "
+            "drcode-models) or shorten the task, then send input to the "
+            "task to re-queue it.",
+        )
+        self.notifier.task_context_overflow(task.title)
+        self._tester_fail_count.pop(task.id, None)
+        self._tester_retry_at.pop(task.id, None)
+        self._tester_resume_round.discard(task.id)
+        self._tester_overflow_retried.discard(task.id)
+        self.manager.set_verification(task.id, success=False)
 
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
@@ -163,7 +310,6 @@ class PipelineTesterLayer(DrCodeState):
                 max_dev_rounds=self.settings.max_dev_rounds,
             )
             try:
-                prompt = f"Verify completed task #{task.id}: {task.title}"
                 # The tester needs the original assignment (to paraphrase it
                 # into a commit message — see the git_commit step in its
                 # prompt) plus every clarification the user sent while the
@@ -172,26 +318,55 @@ class PipelineTesterLayer(DrCodeState):
                 user_prompts = [
                     p for p in all_user_prompts(task.messages) if p != task.title
                 ]
-                if user_prompts:
-                    prompt += f"\n\nOriginal task:\n{user_prompts[0]}"
-                if len(user_prompts) > 1:
-                    prompt += (
-                        "\n\nUser clarifications sent during development "
-                        "(in order, latest last):\n"
-                        + "\n\n".join(f"- {c}" for c in user_prompts[1:])
-                    )
-                # A GitHub-imported task must link its commit back to the
-                # originating issue ("Fixes #N" keyword in the message).
-                if task.github_issue is not None:
-                    prompt += f"\n\n{issue_commit_hint(task.github_issue)}"
+                original = user_prompts[0] if user_prompts else None
+                clarifications = user_prompts[1:]
                 # Custom workflow: context returned by on_development_done
                 # (the opened PR, the pushed branch, CI links, …).
                 dev_note = self._dev_done_notes.pop(task_id, None)
-                if dev_note:
-                    prompt += (
-                        "\n\nProject workflow notes (from the on_development_done "
-                        f"step):\n{dev_note}"
+
+                def render_prompt(
+                    original_text: str | None, clar_texts: list[str]
+                ) -> str:
+                    prompt = f"Verify completed task #{task.id}: {task.title}"
+                    if original_text is not None:
+                        prompt += f"\n\nOriginal task:\n{original_text}"
+                    if clar_texts:
+                        prompt += (
+                            "\n\nUser clarifications sent during development "
+                            "(in order, latest last):\n"
+                            + "\n\n".join(f"- {c}" for c in clar_texts)
+                        )
+                    # A GitHub-imported task must link its commit back to the
+                    # originating issue ("Fixes #N" keyword in the message).
+                    if task.github_issue is not None:
+                        prompt += f"\n\n{issue_commit_hint(task.github_issue)}"
+                    if dev_note:
+                        prompt += (
+                            "\n\nProject workflow notes (from the "
+                            "on_development_done step):\n"
+                            f"{dev_note}"
+                        )
+                    return prompt
+
+                # Pre-flight gate: the start prompt must fit the tester
+                # model's window BEFORE the first request (see the
+                # _PREFLIGHT_* notes above) — an oversized one is trimmed
+                # here, or the round is given up without a doomed request.
+                prompt = self._preflight_tester_prompt(
+                    task,
+                    render_prompt(original, clarifications),
+                    render_prompt,
+                    original,
+                    clarifications,
+                )
+                if prompt is None:
+                    self._tester_overflow_give_up(
+                        task,
+                        "the start prompt (the original assignment alone) "
+                        "does not fit the tester model's context window even "
+                        "after trimming the embedded task text",
                     )
+                    return
                 # Round continuation loop: a testing round is a single
                 # `tester.iter()` run, but it can make many model requests
                 # (each `read_file`/`run_bash` result grows the context).
@@ -453,7 +628,7 @@ class PipelineTesterLayer(DrCodeState):
                 # the long outage backoff until the connection returns;
                 # only NON-network errors reach the ordinary failure path
                 # below.
-                if _is_retryable_network_error(e):
+                if not _is_context_overflow_error(e) and _is_retryable_network_error(e):
                     attempt = self._tester_net_count.get(task_id, 0) + 1
                     self._tester_net_count[task_id] = attempt
                     self._net_retries_total += 1
@@ -497,6 +672,34 @@ class PipelineTesterLayer(DrCodeState):
                     else:
                         self._schedule_pipeline_timer(delay, self._advance)
                     return
+                if _is_context_overflow_error(e):
+                    # Deterministic rejection (HTTP 400 "context length
+                    # exceeded"): the same transcript is refused on every
+                    # retry — the ordinary backoff path below would loop it
+                    # forever (the #f425b421 carousel). Shrink the round
+                    # once (forced compaction — the round never reached the
+                    # tool boundary the ordinary gate waits at) and retry
+                    # it as a continuation; a second overflow (or nothing
+                    # left to shrink) gives the round up.
+                    self._persist_tester_messages(task, run)
+                    if (
+                        task_id not in self._tester_overflow_retried
+                        and await self._maybe_compact_tester_round(
+                            task, None, force=True
+                        )
+                    ):
+                        self._tester_overflow_retried.add(task_id)
+                        self._tester_resume_round.add(task_id)
+                        self._tester_fail_count.pop(task_id, None)
+                        self._tester_retry_at[task_id] = time.monotonic() + 5
+                        self._schedule_pipeline_timer(5, self._advance)
+                        return
+                    self._tester_overflow_give_up(
+                        task,
+                        "compaction cannot shrink the round below the "
+                        f"model's window ({type(e).__name__})",
+                    )
+                    return
                 self._persist_tester_messages(task, run)
                 self._tester_resume_round.discard(task_id)
                 self._tester_fail_count[task_id] = (
@@ -518,6 +721,7 @@ class PipelineTesterLayer(DrCodeState):
                 # backoff and network-retry budget. A count past the budget
                 # = the round was in outage mode: announce the recovery.
                 self._tester_fail_count.pop(task_id, None)
+                self._tester_overflow_retried.discard(task_id)
                 self._note_network_recovered(task, self._tester_net_count)
                 self._tester_net_count.pop(task_id, None)
                 self._tester_resume_round.discard(task_id)

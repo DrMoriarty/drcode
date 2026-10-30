@@ -566,6 +566,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # new one.
         self._tester_net_count: dict[str, int] = {}
         self._tester_resume_round: set[str] = set()
+        # Tasks whose testing round already used its single forced-
+        # compaction recovery of a deterministic context-overflow rejection
+        # (the #f425b421 class): a second overflow gives the round up.
+        self._tester_overflow_retried: set[str] = set()
         # Merge-conflict resolver (single-slot worker, mirrors the tester's
         # bookkeeping): singular running flag, per-round generation, failure
         # counters (model errors vs transient network errors) and the

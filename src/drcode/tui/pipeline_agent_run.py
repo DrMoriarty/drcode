@@ -238,7 +238,9 @@ class PipelineAgentRunLayer(DrCodeState):
                     # connection refused/timeout, or HTTP 429 rate limiting)
                     # retries the run in place after a backoff (see the
                     # helper); anything else demotes the task to the queue.
-                    if _is_retryable_network_error(e):
+                    if not _is_context_overflow_error(
+                        e
+                    ) and _is_retryable_network_error(e):
                         self._agent_turn_network_error(
                             task, task_id, run, consumed, generation, role, e
                         )

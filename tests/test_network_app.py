@@ -2655,3 +2655,244 @@ async def test_context_overflow_failure_is_never_rescued(
     texts = event_texts(task)
     assert any("exceeds the model's context window" in t for t in texts)
     assert any("manual intervention" in t for t in texts)
+
+
+def test_context_overflow_classifier_matches_rejected_error_alias() -> None:
+    """pydantic-ai releases surface the gateway's context-overflow 400
+    under differently named exception classes (the #f425b421 log shows
+    `ModelRequestRejectedError`, unknown to the isinstance-on-
+    ModelHTTPError check): the classifier matches duck-typed on the
+    `status_code` attribute — or the rendered "status_code: 400" message
+    prefix when even the attribute is missing."""
+    from drcode.tui.usage import _is_context_overflow_error
+
+    overflow = (
+        "This model's maximum context length is 65536 tokens. However, "
+        "your prompt contains at least 65537 input tokens, which exceeds "
+        "this limit even without any output tokens."
+    )
+
+    class ModelRequestRejectedError(Exception):
+        def __init__(self, status_code: int, body: str) -> None:
+            super().__init__(body)
+            self.status_code = status_code
+            self.body = body
+
+        def __str__(self) -> str:
+            return f"status_code: {self.status_code}, body: {self.body}"
+
+    class BareRejectedError(Exception):
+        def __str__(self) -> str:
+            return f"status_code: 400, body: {overflow}"
+
+    assert _is_context_overflow_error(ModelRequestRejectedError(400, overflow))
+    assert _is_context_overflow_error(BareRejectedError())
+    # Other 400s and other statuses stay non-overflow under the alias too.
+    assert not _is_context_overflow_error(
+        ModelRequestRejectedError(400, "invalid tool schema")
+    )
+    assert not _is_context_overflow_error(ModelRequestRejectedError(500, overflow))
+
+
+def _tester_window_app(project_root: Path, window: int) -> DrCodeApp:
+    """An app whose TESTER role resolves to a custom model with `window`
+    context tokens (the coding role keeps the env default): the pre-flight
+    and overflow handling of the tester rounds run against a known,
+    small window while the development run is unaffected."""
+    from drcode.providers import AgentRole, CustomModelEntry, set_project_custom_model
+
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(
+            model="tester-m",
+            base_url="http://tester/v1",
+            max_context_tokens=window,
+        ),
+    )
+    return DrCodeApp(project_root)
+
+
+async def test_tester_start_prompt_preflight_trims_oversized_assignment(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original assignment alone exceeds the tester model's window:
+    the start prompt is trimmed to head+tail (with an explicit note
+    pointing at the full text) BEFORE the first request — the #f425b421
+    class, where the round used to die on request one and loop the same
+    oversized prompt on backoff forever."""
+    net_app = _tester_window_app(project_root, window=30_000)
+    # Deterministic framing (system prompt + tool schemas + output reserve):
+    # reserve 3000 of the 30000-token window.
+    monkeypatch.setattr(
+        net_app, "_mechanical_framing", lambda task, role: (30_000, 2_000, 1_000)
+    )
+    task = net_app.manager.create("huge", "x" * 200_000, kind=TaskKind.FEATURE)
+    scripted.steps = [
+        text_response("work done"),  # development run
+        tool_response("set_verification", {"success": True}),
+        text_response("all checks passed"),
+    ]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="tester round completed on the trimmed prompt",
+        )
+        await wait_until(
+            lambda: not net_app.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    texts = event_texts(task)
+    assert any("start prompt was trimmed" in t for t in texts)
+    # The round's user prompt carries the trim note and is far below the
+    # (conservatively estimated) window.
+    round_prompt = task.tester_messages[0][0]["parts"][0]["content"]
+    assert "shortened to fit" in round_prompt
+    assert len(round_prompt) < 30_000 * 3  # window * chars-per-token
+    # No failure bookkeeping left behind.
+    assert task.id not in net_app._tester_fail_count
+    assert task.id not in net_app._tester_retry_at
+
+
+async def test_tester_start_prompt_hopeless_gives_up_without_request(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a trimmed start prompt cannot fit the tester model's window
+    (the framing alone leaves no usable budget): the request is never
+    sent, the task completes FAILED with an actionable service event — no
+    backoff carousel."""
+    net_app = _tester_window_app(project_root, window=5_000)
+    # Deterministic framing: reserve 4600 of the 5000-token window — less
+    # than the minimum usable prompt budget remains, nothing fits.
+    monkeypatch.setattr(
+        net_app, "_mechanical_framing", lambda task, role: (5_000, 4_200, 400)
+    )
+    task = net_app.manager.create("huge", "y" * 100_000, kind=TaskKind.FEATURE)
+    scripted.steps = [text_response("work done")]  # development run only
+    notified: list[str] = []
+    net_app.notifier.task_context_overflow = notified.append  # type: ignore[method-assign]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and task.verification is VerificationStatus.FAILED
+            ),
+            pilot,
+            what="tester round given up without a request",
+        )
+        await pilot.pause()
+
+    # Exactly one model call — the development run. The tester was never
+    # invoked.
+    assert len(scripted.calls) == 1
+    texts = event_texts(task)
+    assert any("testing round is given up" in t for t in texts)
+    assert any("re-queue" in t for t in texts)
+    assert notified == [task.title]
+    assert task.id not in net_app._tester_retry_at
+
+
+async def test_tester_round_overflow_compacts_once_then_passes(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+) -> None:
+    """A context-overflow 400 mid-round is NOT a transient error: the round
+    is compacted in place regardless of the threshold (forced — the round
+    died before any tool boundary) and retried once as a continuation."""
+    net_app = _tester_window_app(project_root, window=200_000)
+    task = net_app.manager.create("feature", "implement x", kind=TaskKind.FEATURE)
+    overflow_400 = (
+        "This model's maximum context length is 65536 tokens. However, "
+        "your prompt contains at least 65537 input tokens."
+    )
+    scripted.steps = [
+        text_response("work done"),  # development run
+        http_error(400, overflow_400),  # tester request 1 — overflow
+        text_response("ROUND SUMMARY"),  # the forced compaction's summarizer
+        tool_response("set_verification", {"success": True}),  # resumed round
+        text_response("all checks passed"),
+    ]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="forced compaction recovered the round",
+        )
+        await wait_until(
+            lambda: not net_app.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    texts = event_texts(task)
+    assert any("compacting the testing round" in t for t in texts)
+    assert not any("testing round is given up" in t for t in texts)
+    # One testing round total (the retry continued it, no restart).
+    assert len(task.tester_messages) == 1
+    # The single retry budget was consumed and cleared on completion.
+    assert task.id not in net_app._tester_overflow_retried
+    assert task.id not in net_app._tester_fail_count
+
+
+async def test_tester_round_second_overflow_gives_up(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+) -> None:
+    """The forced-compaction recovery is a ONE-shot: a context overflow on
+    the resumed round gives the testing round up — the task completes
+    FAILED with an actionable event instead of looping 400s forever."""
+    net_app = _tester_window_app(project_root, window=200_000)
+    task = net_app.manager.create("feature", "implement x", kind=TaskKind.FEATURE)
+    overflow_400 = (
+        "This model's maximum context length is 65536 tokens. However, "
+        "your prompt contains at least 65537 input tokens."
+    )
+    scripted.steps = [
+        text_response("work done"),  # development run
+        http_error(400, overflow_400),  # tester request 1 — first overflow
+        text_response("ROUND SUMMARY"),  # forced compaction
+        http_error(400, overflow_400),  # resumed round — second overflow
+    ]
+    notified: list[str] = []
+    net_app.notifier.task_context_overflow = notified.append  # type: ignore[method-assign]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.COMPLETED
+                and task.verification is VerificationStatus.FAILED
+            ),
+            pilot,
+            what="second overflow gave the round up",
+        )
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("testing round is given up" in t for t in texts)
+    assert any("Pick a larger-window model" in t for t in texts)
+    assert notified == [task.title]
+    # No retry scheduled: the deterministic error must not loop.
+    assert task.id not in net_app._tester_retry_at
+    assert task.id not in net_app._tester_fail_count

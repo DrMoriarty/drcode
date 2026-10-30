@@ -667,7 +667,7 @@ async def run_bash(
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=effective)
     except TimeoutError:
-        proc.kill()
+        _kill_proc(proc)
         await proc.wait()
         return f"exit=-1\n(command timed out after {effective}s)"
     except asyncio.CancelledError:
@@ -676,7 +676,7 @@ async def run_bash(
         # and close its transport — otherwise the transport's __del__ later
         # tries to close pipes on an already-closed loop and prints
         # "RuntimeError: Event loop is closed" to the console.
-        proc.kill()
+        _kill_proc(proc)
         try:
             await asyncio.shield(proc.wait())
         except asyncio.CancelledError:
@@ -686,6 +686,20 @@ async def run_bash(
         :MAX_TOOL_OUTPUT
     ]
     return f"exit={proc.returncode}\n{out or '(no output)'}"
+
+
+def _kill_proc(proc: asyncio.subprocess.Process) -> None:
+    """Kill the child if it is still alive.
+
+    The kill races the child's own exit: a cancellation can land after
+    communicate() has already reaped the process and closed its transport,
+    and then send_signal raises ProcessLookupError — which is exactly the
+    "already dead" outcome the kill was aiming for, never a real failure.
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 # -- scratch lifecycle ---------------------------------------------------------

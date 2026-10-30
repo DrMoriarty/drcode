@@ -849,6 +849,18 @@ async def _cancel_run_bash(project_root: Path, marker: str) -> None:
         await task
 
 
+def test_run_bash_kill_tolerates_already_reaped_process() -> None:
+    # The kill can race the child's own exit: communicate() has reaped the
+    # process and closed the transport, and a late kill() (timeout/cancel
+    # path) used to raise ProcessLookupError and crash the caller.
+    async def _scenario() -> None:
+        proc = await asyncio.create_subprocess_shell("true")
+        await proc.communicate()
+        tools._kill_proc(proc)  # must not raise
+
+    asyncio.run(_scenario())
+
+
 def test_run_bash_output_truncated(project_root: Path, monkeypatch) -> None:
     monkeypatch.setattr(tools, "MAX_TOOL_OUTPUT", 100)
     out = asyncio.run(run_bash(project_root, "echo " + "x" * 500))

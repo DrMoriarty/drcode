@@ -23,7 +23,7 @@ from .header import (
     HeaderSessionInfo,
     ModelStatusHeader,
 )
-from .state import DrCodeState
+from .state import DrCodeState, update_static_if_changed
 from .usage import NETWORK_RETRIES
 
 
@@ -100,17 +100,19 @@ class HeaderLayer(DrCodeState):
             # The dictation indicator outranks the model-activity suffix:
             # a recording that loses its only persistent cue looks broken
             # to the user (the toast auto-dismisses after a few seconds).
-            label.update(f"{self._conn_label} · {voice}")
+            update_static_if_changed(label, f"{self._conn_label} · {voice}")
             return
         tps = self._tokens_per_second()
         if tps is not None:
-            label.update(f"{self._conn_label} · {tps:.0f} tok/s{awake}")
+            update_static_if_changed(
+                label, f"{self._conn_label} · {tps:.0f} tok/s{awake}"
+            )
         elif self.agent_running:
-            label.update(f"{self._conn_label} · waiting{awake}")
+            update_static_if_changed(label, f"{self._conn_label} · waiting{awake}")
         elif self.tester_running:
-            label.update(f"{self._conn_label} · testing{awake}")
+            update_static_if_changed(label, f"{self._conn_label} · testing{awake}")
         else:
-            label.update(f"{self._conn_label}{awake}")
+            update_static_if_changed(label, f"{self._conn_label}{awake}")
 
     # -- expanded (tall) header: connection details + session statistics ----
 
@@ -129,10 +131,10 @@ class HeaderLayer(DrCodeState):
         text = self.voice_input.corner_indicator
         if text is None:
             widget.add_class("hidden")
-            widget.update("")
+            update_static_if_changed(widget, "")
         else:
             widget.remove_class("hidden")
-            widget.update(text)
+            update_static_if_changed(widget, text)
             # Pin the shrink-to-fit strip to the right edge: a docked
             # widget always lands at x=0, and the offset must track the
             # current text length (it differs between recording and

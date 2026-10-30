@@ -83,6 +83,26 @@ if TYPE_CHECKING:
 LiveTailEntry = tuple[str, str, ReasoningBlock | AssistantBlock | None]
 
 
+def update_static_if_changed(widget: Static, markup: str) -> bool:
+    """Update a :class:`~textual.widgets.Static` only when its content changes.
+
+    The 1 s pollers re-render the status lines every tick; an update with
+    identical content is NOT free: ``Static.update`` re-visualizes the
+    markup and refreshes the widget with ``layout=True``, and a layout
+    pass re-measures every auto-height block in the DOM — over a heavy
+    chat history (hundreds of blocks, megabyte transcripts) that is a
+    full rich re-render of the screen once per poll tick, forever. The
+    pollers call this instead, so an idle UI stays clean and the event
+    loop goes back to sleep.
+
+    Returns True when the widget was actually updated.
+    """
+    if widget.content == markup:
+        return False
+    widget.update(markup)
+    return True
+
+
 class DrCodeState(App[None]):
     def run_agent(self, task_id: str) -> None: ...
 
@@ -896,6 +916,14 @@ class DrCodeState(App[None]):
     _rendered_count: int | None
     _rendered_prefix: tuple[tuple[str, ...], ...]
     _live_tail: list[LiveTailEntry]
+
+    # Fingerprint of the screen's active bindings at the last footer refresh
+    # (see refresh_task_status): the 1 s poll must not publish
+    # bindings_updated when nothing changed — every publish makes textual's
+    # Footer recompose from scratch (a remount of every FooterKey plus a
+    # stylesheet pass and a full screen relayout), which on a fat archive
+    # burns continuous CPU while idle.
+    _footer_bindings_fp: tuple | None
 
     # -- widget getters (defined in the DrCodeApp skeleton) -----------------
     @property

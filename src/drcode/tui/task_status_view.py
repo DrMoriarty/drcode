@@ -25,7 +25,7 @@ from ..context_layout import (
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from ..providers import AgentRole
 from .ctx_dialog import ContextDialog
-from .state import DrCodeState
+from .state import DrCodeState, update_static_if_changed
 
 
 class TaskStatusLayer(DrCodeState):
@@ -65,10 +65,33 @@ class TaskStatusLayer(DrCodeState):
 
     def refresh_task_status(self) -> None:
         # The footer mirrors the state check_action() gates on (viewed task,
-        # its status, running flags): re-evaluate the visible bindings.
-        # Guarded like refresh_status: worker finally-blocks can call this
-        # while the screen is already dismantled.
-        self.refresh_bindings()
+        # its status, running flags): re-evaluate the visible bindings —
+        # but only when they actually changed. This also runs on the 1 s
+        # activity poll, and a bindings publish that changes nothing is NOT
+        # free: textual's Footer recomposes from scratch on every publish
+        # (every FooterKey remounted, styles re-applied, screen relaid out)
+        # — on a fat archive that used to burn continuous idle CPU.
+        # active_bindings is the exact input Footer.compose() renders.
+        try:
+            fp = tuple(
+                (
+                    key,
+                    binding.key,
+                    binding.description,
+                    binding.show,
+                    enabled,
+                    tooltip,
+                )
+                for key, (_, binding, enabled, tooltip) in sorted(
+                    self.screen.active_bindings.items()
+                )
+            )
+        except Exception:  # noqa: BLE001 - teardown race: keep the old behavior
+            self.refresh_bindings()
+        else:
+            if fp != self._footer_bindings_fp:
+                self._footer_bindings_fp = fp
+                self.refresh_bindings()
         try:
             left = self.query_one("#task-status-left", Static)
             right = self.query_one("#task-status-right", Static)
@@ -77,13 +100,13 @@ class TaskStatusLayer(DrCodeState):
         # The new-task form is not tied to any task: keep the bar empty so
         # the previously viewed task doesn't keep updating behind the form.
         if self._new_task_mode:
-            left.update("")
-            right.update("")
+            update_static_if_changed(left, "")
+            update_static_if_changed(right, "")
             return
         task = self.viewed
         if task is None:
-            left.update("")
-            right.update("")
+            update_static_if_changed(left, "")
+            update_static_if_changed(right, "")
             return
         created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
         kind = {
@@ -126,7 +149,7 @@ class TaskStatusLayer(DrCodeState):
             parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:
             parts.append("[red]✗ testing[/]")
-        left.update("   ".join(parts))
+        update_static_if_changed(left, "   ".join(parts))
         self._update_ctx_counter(right, task)
 
     def _dependency_status_part(self, task: Task) -> str:
@@ -214,7 +237,7 @@ class TaskStatusLayer(DrCodeState):
         right.remove_class("ctx-warn", "ctx-crit")
         agent, tokens = self._agent_ctx(task)
         if not tokens:
-            right.update("")
+            update_static_if_changed(right, "")
             right.tooltip = None
             return
         right.tooltip = "Click: context layout (≈ breakdown + exact usage)"
@@ -242,7 +265,7 @@ class TaskStatusLayer(DrCodeState):
                 right.add_class("ctx-warn")
         else:
             text = f"🧠 {self._fmt_ctx_tokens(tokens)}"
-        right.update(f"[@click=app.show_ctx_dialog]{text}[/]")
+        update_static_if_changed(right, f"[@click=app.show_ctx_dialog]{text}[/]")
 
     def action_show_ctx_dialog(self) -> None:
         """Click on the context counter: open the modal dialog with the

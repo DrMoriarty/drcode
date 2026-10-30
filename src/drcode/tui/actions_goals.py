@@ -16,8 +16,8 @@ from __future__ import annotations
 from rich.markup import escape
 from textual.widgets import Static
 
-from ..models import Goal, GoalType, TaskKind
-from .goal_screen import GoalCaptureScreen, GoalScreen
+from ..models import Goal, TaskKind
+from .goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
 from .state import DrCodeState
 
 
@@ -45,7 +45,12 @@ class GoalsActionsLayer(DrCodeState):
         The plain Ctrl+Y passes nothing."""
         self._goal_capture_context = (parent_id, link_task_id)
         self.push_screen(
-            GoalCaptureScreen(parent_id, parent_label), self._goal_captured
+            GoalEditScreen(
+                parent_id=parent_id,
+                parent_label=parent_label,
+                link_task_id=link_task_id,
+            ),
+            self._goal_captured,
         )
 
     def action_new_goal(self) -> None:
@@ -56,9 +61,13 @@ class GoalsActionsLayer(DrCodeState):
         per request."""
         self.open_new_goal_dialog()
 
-    def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None:
-        # None — ESC/Cancel: nothing to do, the pipeline is untouched.
-        if result is None:
+    def _goal_captured(
+        self, result: GoalCaptureResult | tuple[str, str] | None
+    ) -> None:
+        # The screen's create mode dismisses a GoalCaptureResult; the
+        # edit-tuple and None (ESC/Cancel — nothing to do, the pipeline
+        # is untouched) are not capture results.
+        if not isinstance(result, GoalCaptureResult):
             return
         parent_id, link_task_id = self._goal_capture_context
         self.create_goal_from_capture(
@@ -67,7 +76,7 @@ class GoalsActionsLayer(DrCodeState):
 
     def create_goal_from_capture(
         self,
-        result: tuple[str, str, GoalType],
+        result: GoalCaptureResult,
         *,
         parent_id: str | None = None,
         link_task_id: str | None = None,
@@ -75,17 +84,18 @@ class GoalsActionsLayer(DrCodeState):
         """Shared body of every capture path (Ctrl+Y, the sidebar's
         "+ add goal", the palette's "Create goal…", the GoalScreen's N):
         create the goal with its optional parent, apply the dialog's type
-        classification and optionally link it to a task. Returns the
-        goal; persistence and the sidebar refresh are this method's job."""
-        title, description, goal_type = result
+        classification and notes, and optionally link it to a task (only
+        when the dialog's link checkbox was on AND a task id was preset).
+        Returns the goal; persistence and the sidebar refresh are this
+        method's job."""
         goal = self.manager.goals.create(
-            title, description=description, parent_id=parent_id
+            result.title, description=result.description, parent_id=parent_id
         )
         # The captured item starts as an IDEA unless the user explicitly
         # classified it in the dialog (the agent refines it later too).
-        self.manager.goals.update(goal.id, type=goal_type)
+        self.manager.goals.update(goal.id, type=result.goal_type, notes=result.notes)
         goal = self.manager.goals.get(goal.id)
-        if link_task_id and link_task_id in self.manager.tasks:
+        if result.link_task and link_task_id and link_task_id in self.manager.tasks:
             self.manager.link_goal(link_task_id, goal.id)
         self.refresh_sidebar()
         self.notify(

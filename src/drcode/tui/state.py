@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.usage import RunUsage
@@ -40,7 +40,6 @@ from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
 from ..models import (
     Clarification,
-    GoalType,
     PendingInput,
     Task,
     TaskEvent,
@@ -72,6 +71,9 @@ from .sidebar import Sidebar, TaskItem
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
+
+if TYPE_CHECKING:
+    from .goal_screen import GoalCaptureResult
 
 # A live-tail ledger entry (see chat_view._write_chat's `note`): (role,
 # text, block). `block` is set only for streamed ReasoningBlock/
@@ -321,11 +323,11 @@ class DrCodeState(App[None]):
 
     def action_new_goal(self) -> None: ...
 
-    def _goal_captured(self, result: tuple[str, str, GoalType] | None) -> None: ...
+    def _goal_captured(self, result: GoalCaptureResult | None) -> None: ...
 
     def create_goal_from_capture(
         self,
-        result: tuple[str, str, GoalType],
+        result: GoalCaptureResult,
         *,
         parent_id: str | None = None,
         link_task_id: str | None = None,

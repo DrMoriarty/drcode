@@ -24,9 +24,10 @@ class GoalCommandsProvider(CommandListProvider):
     For the VIEWED task: one "Link goal: <title>" entry per attachable
     goal (not already linked, not archived — archived goals are out of
     the roadmap's active surface) and one "Unlink goal" entry when the
-    task carries a link. Plus the always-available capture entries:
-    "Create goal…" (links the created goal to the viewed task when one
-    is open) and the plain "New goal" (the same dialog as Ctrl+Y)."""
+    task carries a link. Plus the single always-available capture entry:
+    "Create goal…" — the unified edit-form dialog in create mode, with a
+    pre-enabled checkbox to link the created goal to the viewed task
+    when one is open (plain create without the checkbox when not)."""
 
     def _commands(self) -> list[CommandEntry]:
         from ...models import GoalStatus
@@ -64,16 +65,9 @@ class GoalCommandsProvider(CommandListProvider):
                     app.open_new_goal_dialog,
                     link_task_id=task.id if task is not None else None,
                 ),
-                "New product goal (title + optional type) — when a task "
-                "is open it is linked to the created goal right away",
-            )
-        )
-        commands.append(
-            CommandEntry(
-                "New goal",
-                app.action_new_goal,
-                "Ctrl+Y — capture a product goal the research agent "
-                "plans against (no task link)",
+                "New product goal (title, type, description, notes) — "
+                "when a task is open a pre-enabled checkbox links it "
+                "to the created goal right away",
             )
         )
         return commands

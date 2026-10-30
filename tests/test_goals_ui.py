@@ -14,12 +14,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from textual.widgets import ListView, Static
+from textual.widgets import Checkbox, Input, ListView, Static, TextArea
 
 from drcode.models import GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
 from drcode.tui.command_providers import GoalCommandsProvider
-from drcode.tui.goal_screen import GoalScreen
+from drcode.tui.goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
 from drcode.tui.sidebar import TaskItem
 
 
@@ -275,7 +275,15 @@ async def test_goal_capture_with_parent_and_link(app: DrCodeApp) -> None:
         app.open_new_goal_dialog(parent_id=parent.id, link_task_id=task.id)
         # Simulate the dialog result (the form itself is covered by the
         # capture tests of the plain path).
-        app._goal_captured(("Async core", "short", GoalType.GOAL))
+        app._goal_captured(
+            GoalCaptureResult(
+                title="Async core",
+                description="short",
+                notes="",
+                goal_type=GoalType.GOAL,
+                link_task=True,
+            )
+        )
         await pilot.pause()
         goal = next(
             g for g in app.manager.goals.goals.values() if g.title == "Async core"
@@ -295,7 +303,7 @@ async def test_goal_palette_commands(app: DrCodeApp) -> None:
         names = [c.name for c in commands]
         assert any(name.startswith("Link goal:") for name in names)
         assert not any(name.startswith("Unlink goal") for name in names)
-        assert "Create goal…" in names and "New goal" in names
+        assert "Create goal…" in names and "New goal" not in names
         app.link_viewed_goal(goal.id)
         commands = GoalCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         names = [c.name for c in commands]
@@ -304,6 +312,120 @@ async def test_goal_palette_commands(app: DrCodeApp) -> None:
         # Fire the unlink command.
         next(c for c in commands if c.name.startswith("Unlink goal")).callback()
         assert task.goal_id is None
+
+
+# -- the unified GoalEditScreen (create mode: the dialog itself) ------------------
+
+
+def _find_goal(app: DrCodeApp, title: str):
+    return next(g for g in app.manager.goals.goals.values() if g.title == title)
+
+
+async def test_goal_create_dialog_links_viewed_task(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
+        app.view_task(task.id)
+        app.open_new_goal_dialog(link_task_id=task.id)
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalEditScreen)
+        # The link checkbox exists over an open task and is pre-enabled.
+        checkbox = screen.query_one("#goal-link-task", Checkbox)
+        assert checkbox.value is True
+        screen.query_one("#goal-title", Input).value = "Async core"
+        screen.query_one("#goal-edit-desc", TextArea).text = "short"
+        screen.query_one("#goal-edit-notes", TextArea).text = "n1"
+        screen._save()
+        await pilot.pause()
+        goal = _find_goal(app, "Async core")
+        assert task.goal_id == goal.id
+        assert goal.description == "short"
+        assert goal.notes == "n1"
+        assert goal.type.value == "idea"  # the create-mode default
+
+
+async def test_goal_create_dialog_link_can_be_declined(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
+        app.view_task(task.id)
+        app.open_new_goal_dialog(link_task_id=task.id)
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalEditScreen)
+        screen.query_one("#goal-link-task", Checkbox).value = False
+        screen.query_one("#goal-title", Input).value = "Loose goal"
+        screen._save()
+        await pilot.pause()
+        assert _find_goal(app, "Loose goal") is not None
+        assert task.goal_id is None
+        # The plain Ctrl+Y path carries no task id: no checkbox at all.
+        app.action_new_goal()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalEditScreen)
+        assert not screen.query("#goal-link-task")
+        screen.action_cancel()
+        await pilot.pause()
+
+
+async def test_goal_create_dialog_requires_title(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        app.action_new_goal()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalEditScreen)
+        screen._save()
+        await pilot.pause()
+        # Still open: the empty title was rejected with the error line.
+        assert isinstance(app.screen, GoalEditScreen)
+        assert "required" in str(screen.query_one("#goal-error", Static).content)
+        screen.action_cancel()
+
+
+async def test_goal_screen_subgoal_capture(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        parent = app.manager.goals.create("Release 1.0")
+        screen = _open_screen(app)
+        await pilot.pause()
+        screen.action_new_goal()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, GoalEditScreen)
+        dialog.query_one("#goal-title", Input).value = "Async core"
+        dialog._save()
+        await pilot.pause()
+        child = _find_goal(app, "Async core")
+        assert child.parent_id == parent.id
+
+
+async def test_goal_edit_dialog_description_and_notes(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        goal = app.manager.goals.create("Async core", description="old desc")
+        app.manager.goals.update(goal.id, notes="old notes")
+        screen = _open_screen(app)
+        await pilot.pause()
+        screen.action_edit_goal()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, GoalEditScreen)
+        # Edit mode: the title is a fixed line — no title input, no
+        # type line, no link checkbox.
+        assert not dialog.query("#goal-title")
+        assert not dialog.query("#goal-type-line")
+        assert not dialog.query("#goal-link-task")
+        dialog.query_one("#goal-edit-desc", TextArea).text = "new desc"
+        dialog.query_one("#goal-edit-notes", TextArea).text = "new notes"
+        dialog._save()
+        await pilot.pause()
+        refreshed = app.manager.goals.get(goal.id)
+        assert refreshed.title == "Async core"
+        assert refreshed.description == "new desc"
+        assert refreshed.notes == "new notes"
 
 
 # -- GoalStore ordering (the GoalScreen's Ctrl+Up/Down and M) ---------------------

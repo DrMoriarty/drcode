@@ -1,12 +1,13 @@
 """User-facing goal UI: capture, edit, reparent and the full-screen tree.
 
-- ``GoalCaptureScreen`` — the minimal "New goal" modal (the title is the
-  only required field; type and description optional, refined later by
-  the user or the research agent). Optionally presets a parent goal (the
-  GoalScreen's ``N`` creates a sub-goal).
-- ``GoalEditScreen`` — description/notes editing (two TextArea fields;
+- ``GoalEditScreen`` — the single goal modal with two modes: CREATE (the
+  capture form: title required, description/notes TextAreas, type cycled
+  with ctrl+t, an optional parent preset — the GoalScreen's ``N`` creates
+  a sub-goal — and an optional pre-enabled "link viewed task" checkbox
+  when the palette's "Create goal…" runs over an open task) and EDIT
+  (the GoalScreen's E: description/notes only, the title is fixed).
   `notes` is the long free-form markdown the AGENT reads only via its
-  read_goal tool — it is never injected into a system prompt).
+  read_goal tool — it is never injected into a system prompt.
 - ``GoalParentPicker`` — the "M" reparent picker (SearchDialog pattern):
   a filter input over the candidate goals plus a "Make top-level" entry.
 - ``GoalScreen`` — the full-screen roadmap view: milestone → sub-goal
@@ -19,6 +20,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 from rich.markup import escape
@@ -27,7 +29,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, ListView, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
 from ..models import Goal, GoalStatus, GoalType
 from .sidebar import TaskItem
@@ -69,153 +71,42 @@ def _goal_progress_label(goal: Goal, progress: tuple[int, int]) -> str:
     return "—" if total == 0 else f"{done}/{total}"
 
 
-class GoalCaptureScreen(ModalScreen[tuple[str, str, GoalType] | None]):
-    """Modal "New goal" form: title (required), description (optional),
-    type cycled with ctrl+t. Dismisses with
-    (title, description, type) on create, None on ESC/Cancel. When a
-    parent goal is preset (the GoalScreen's N), the dialog says so and
-    the created goal becomes its sub-goal."""
+@dataclass
+class GoalCaptureResult:
+    """What the create mode of :class:`GoalEditScreen` dismisses with:
+    the captured title, the description/notes texts, the dialog's type
+    classification and whether the user asked to link the viewed task."""
 
-    BINDINGS: ClassVar = [
-        Binding("escape", "cancel", "Cancel", priority=True),
-        Binding("ctrl+t", "cycle_type", "Change type", priority=True),
-    ]
-
-    DEFAULT_CSS = """
-    GoalCaptureScreen {
-        align: center middle;
-    }
-    #goal-dialog {
-        width: 72;
-        max-width: 95%;
-        height: auto;
-        padding: 1 2;
-        background: $panel;
-        border: thick $accent;
-    }
-    #goal-title { margin-bottom: 1; }
-    #goal-desc { margin-bottom: 1; }
-    #goal-note { color: $text; margin-bottom: 1; }
-    #goal-parent { color: $text-muted; margin-bottom: 1; }
-    #goal-error { color: $error; height: auto; }
-    #goal-type-label {
-        width: auto;
-        margin-right: 1;
-        text-style: bold;
-        color: yellow;
-    }
-    #goal-type-hint { color: $text-disabled; }
-    #goal-buttons {
-        height: auto;
-        margin-top: 1;
-    }
-    #goal-buttons Button { width: auto; margin-right: 1; }
-    """
-
-    def __init__(
-        self,
-        parent_id: str | None = None,
-        parent_label: str | None = None,
-    ) -> None:
-        super().__init__()
-        self._goal_type = GoalType.IDEA
-        # Preset parent (sub-goal creation from the GoalScreen): shown as
-        # a read-only line — the picker for re-parenting is the GoalScreen's M.
-        self._parent_id = parent_id
-        self._parent_label = parent_label
-
-    # -- composition ------------------------------------------------------------
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="goal-dialog"):
-            yield Static(
-                "New product goal — the roadmap item the research agent "
-                "plans against. The title is enough to start; classification "
-                "and description can be refined later.",
-                id="goal-note",
-            )
-            if self._parent_id:
-                yield Static(
-                    f"sub-goal of #{self._parent_id} "
-                    f"{escape(self._parent_label or '')}",
-                    id="goal-parent",
-                )
-            yield Input(placeholder="Goal title (required)", id="goal-title")
-            yield Input(placeholder="Description (optional)", id="goal-desc")
-            yield Horizontal(
-                Static("", id="goal-type-label"),
-                Static("", id="goal-type-hint"),
-                id="goal-type-line",
-            )
-            yield Static("", id="goal-error")
-            with Horizontal(id="goal-buttons"):
-                yield Button("Create goal", variant="primary", id="goal-create")
-                yield Button("Cancel", id="goal-cancel")
-        self._update_type_label()
-
-    def on_mount(self) -> None:
-        self.query_one("#goal-title", Input).focus()
-
-    @property
-    def type_label(self) -> Static:
-        return self.query_one("#goal-type-label", Static)
-
-    def _update_type_label(self) -> None:
-        if not self.is_mounted:
-            return
-        self.type_label.update(f"type: {self._goal_type.value}")
-        self.query_one("#goal-type-hint", Static).update(_TYPE_HINTS[self._goal_type])
-
-    # -- actions ------------------------------------------------------------------
-
-    def action_cycle_type(self) -> None:
-        index = _TYPE_CYCLE.index(self._goal_type)
-        self._goal_type = _TYPE_CYCLE[(index + 1) % len(_TYPE_CYCLE)]
-        self._update_type_label()
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    @on(Button.Pressed, "#goal-cancel")
-    def _cancel(self) -> None:
-        self.dismiss(None)
-
-    @on(Button.Pressed, "#goal-create")
-    def _create(self) -> None:
-        self._submit()
-
-    @on(Input.Submitted, "#goal-title")
-    def _title_submitted(self) -> None:
-        self._submit()
-
-    @on(Input.Submitted, "#goal-desc")
-    def _desc_submitted(self) -> None:
-        self._submit()
-
-    def _submit(self) -> None:
-        title = self.query_one("#goal-title", Input).value.strip()
-        if not title:
-            self.query_one("#goal-error", Static).update(
-                "The title is required — one line naming the goal."
-            )
-            self.query_one("#goal-title", Input).focus()
-            return
-        description = self.query_one("#goal-desc", Input).value.strip()
-        self.dismiss((title, description, self._goal_type))
+    title: str
+    description: str
+    notes: str
+    goal_type: GoalType
+    link_task: bool
 
 
-class GoalEditScreen(ModalScreen[tuple[str, str] | None]):
-    """Edit a goal's `description` and `notes` (the GoalScreen's E).
+class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
+    """The single goal modal, both modes in one class.
 
-    Two TextArea fields: the description is the short line the research
-    agent's prompt injection carries (and the tree shows), the notes are
-    the long free-form markdown the agent reads ONLY via its read_goal
-    tool — they never enter a system prompt. Dismisses with
-    (description, notes) on save, None on ESC/Cancel."""
+    CREATE (``goal is None``): title (Input, required), description and
+    notes (TextAreas), the type cycled with ctrl+t, an optional preset
+    parent (the GoalScreen's N — a read-only line, re-parenting is the
+    GoalScreen's M) and — only when the caller passes `link_task_id` (the
+    palette's "Create goal…" over a viewed task) — a pre-enabled checkbox
+    to link that task to the created goal right away. Dismisses with a
+    :class:`GoalCaptureResult`.
+
+    EDIT (``goal`` given, the GoalScreen's E): the title is a fixed line,
+    only description and notes are editable. Dismisses with
+    (description, notes).
+
+    Both dismiss None on ESC/Cancel. `notes` is the long free-form
+    markdown the agent reads ONLY via its read_goal tool — it never
+    enters a system prompt."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("ctrl+enter", "save", "Save", priority=True),
+        Binding("ctrl+t", "cycle_type", "Change type", priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -232,45 +123,143 @@ class GoalEditScreen(ModalScreen[tuple[str, str] | None]):
         border: thick $accent;
     }
     #goal-edit-title { text-style: bold; margin-bottom: 1; }
+    #goal-note { color: $text; margin-bottom: 1; }
+    #goal-parent { color: $text-muted; margin-bottom: 1; }
+    #goal-title { margin-bottom: 1; }
     #goal-edit-desc-label, #goal-edit-notes-label {
         color: $text-muted;
         margin-top: 1;
     }
     #goal-edit-desc { height: 4; border: solid $primary; }
     #goal-edit-notes { height: 12; border: solid $primary; }
+    #goal-link-task { margin-top: 1; height: auto; }
+    #goal-error { color: $error; height: auto; }
+    #goal-type-label {
+        width: auto;
+        margin-right: 1;
+        text-style: bold;
+        color: yellow;
+    }
+    #goal-type-hint { color: $text-disabled; }
+    #goal-type-line { margin-top: 1; }
     #goal-edit-buttons { height: auto; margin-top: 1; }
     #goal-edit-buttons Button { width: auto; margin-right: 1; }
+    #goal-edit-hint { color: $text-disabled; }
     """
 
-    def __init__(self, goal: Goal) -> None:
+    def __init__(
+        self,
+        goal: Goal | None = None,
+        *,
+        parent_id: str | None = None,
+        parent_label: str | None = None,
+        link_task_id: str | None = None,
+    ) -> None:
         super().__init__()
         self._goal = goal
+        self._goal_type = goal.type if goal is not None else GoalType.IDEA
+        # Preset parent (sub-goal creation from the GoalScreen): shown as
+        # a read-only line — the picker for re-parenting is the GoalScreen's M.
+        self._parent_id = parent_id
+        self._parent_label = parent_label
+        # The viewed task offered for linking (create mode only, the
+        # palette's "Create goal…"); None — no checkbox at all.
+        self._link_task_id = link_task_id
+
+    @property
+    def _creating(self) -> bool:
+        return self._goal is None
+
+    # -- composition ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         with Vertical(id="goal-edit-dialog"):
-            yield Static(
-                f"Edit goal #{self._goal.id} — {escape(self._goal.title_display)}",
-                id="goal-edit-title",
-            )
+            if self._creating:
+                yield Static(
+                    "New product goal — the roadmap item the research agent "
+                    "plans against. The title is enough to start; classification "
+                    "and description can be refined later.",
+                    id="goal-note",
+                )
+                if self._parent_id:
+                    yield Static(
+                        f"sub-goal of #{self._parent_id} "
+                        f"{escape(self._parent_label or '')}",
+                        id="goal-parent",
+                    )
+                yield Input(placeholder="Goal title (required)", id="goal-title")
+            else:
+                assert self._goal is not None
+                yield Static(
+                    f"Edit goal #{self._goal.id} — {escape(self._goal.title_display)}",
+                    id="goal-edit-title",
+                )
             yield Static(
                 "description — one short paragraph; it rides along in the "
                 "research agent's prompt injection",
                 id="goal-edit-desc-label",
             )
-            yield TextArea(self._goal.description, id="goal-edit-desc")
+            yield TextArea(
+                self._goal.description if self._goal else "",
+                id="goal-edit-desc",
+            )
             yield Static(
                 "notes — free-form markdown; the agent reads it only via "
                 "read_goal on demand (never injected into the prompt)",
                 id="goal-edit-notes-label",
             )
-            yield TextArea(self._goal.notes, id="goal-edit-notes")
+            yield TextArea(
+                self._goal.notes if self._goal else "",
+                id="goal-edit-notes",
+            )
+            if self._creating:
+                yield Horizontal(
+                    Static("", id="goal-type-label"),
+                    Static("", id="goal-type-hint"),
+                    id="goal-type-line",
+                )
+                if self._link_task_id:
+                    yield Checkbox(
+                        f"link viewed task #{self._link_task_id}",
+                        True,
+                        id="goal-link-task",
+                    )
+                yield Static("", id="goal-error")
             with Horizontal(id="goal-edit-buttons"):
-                yield Button("Save", variant="primary", id="goal-edit-save")
-                yield Button("Cancel", id="goal-edit-cancel")
+                yield Button(
+                    "Create goal" if self._creating else "Save",
+                    variant="primary",
+                    id="goal-save",
+                )
+                yield Button("Cancel", id="goal-cancel")
             yield Static("ctrl+enter — save   esc — cancel", id="goal-edit-hint")
+        if self._creating:
+            self._update_type_label()
 
     def on_mount(self) -> None:
-        self.query_one("#goal-edit-desc", TextArea).focus()
+        if self._creating:
+            self.query_one("#goal-title", Input).focus()
+        else:
+            self.query_one("#goal-edit-desc", TextArea).focus()
+
+    @property
+    def type_label(self) -> Static:
+        return self.query_one("#goal-type-label", Static)
+
+    def _update_type_label(self) -> None:
+        if not self.is_mounted:
+            return
+        self.type_label.update(f"type: {self._goal_type.value}")
+        self.query_one("#goal-type-hint", Static).update(_TYPE_HINTS[self._goal_type])
+
+    # -- actions ------------------------------------------------------------------
+
+    def action_cycle_type(self) -> None:
+        if not self._creating:
+            return  # ctrl+t is a create-mode control; the edit mode ignores it
+        index = _TYPE_CYCLE.index(self._goal_type)
+        self._goal_type = _TYPE_CYCLE[(index + 1) % len(_TYPE_CYCLE)]
+        self._update_type_label()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -278,18 +267,47 @@ class GoalEditScreen(ModalScreen[tuple[str, str] | None]):
     def action_save(self) -> None:
         self._save()
 
-    @on(Button.Pressed, "#goal-edit-save")
+    @on(Button.Pressed, "#goal-save")
     def _save_pressed(self) -> None:
         self._save()
 
-    @on(Button.Pressed, "#goal-edit-cancel")
+    @on(Button.Pressed, "#goal-cancel")
     def _cancel_pressed(self) -> None:
         self.dismiss(None)
 
+    @on(Input.Submitted, "#goal-title")
+    def _title_submitted(self) -> None:
+        self._save()
+
     def _save(self) -> None:
-        description = self.query_one("#goal-edit-desc", TextArea).text.strip()
-        notes = self.query_one("#goal-edit-notes", TextArea).text
-        self.dismiss((description, notes.strip()))
+        if self._creating:
+            title = self.query_one("#goal-title", Input).value.strip()
+            if not title:
+                self.query_one("#goal-error", Static).update(
+                    "The title is required — one line naming the goal."
+                )
+                self.query_one("#goal-title", Input).focus()
+                return
+            description = self.query_one("#goal-edit-desc", TextArea).text.strip()
+            notes = self.query_one("#goal-edit-notes", TextArea).text.strip()
+            link = (
+                self.query_one("#goal-link-task", Checkbox).value
+                if self._link_task_id
+                else False
+            )
+            self.dismiss(
+                GoalCaptureResult(
+                    title=title,
+                    description=description,
+                    notes=notes,
+                    goal_type=self._goal_type,
+                    link_task=link,
+                )
+            )
+        else:
+            description = self.query_one("#goal-edit-desc", TextArea).text.strip()
+            notes = self.query_one("#goal-edit-notes", TextArea).text
+            self.dismiss((description, notes.strip()))
 
 
 class GoalParentPicker(ModalScreen[str | None]):
@@ -673,12 +691,17 @@ class GoalScreen(ModalScreen[None]):
         self._pending_parent = cursor.id if cursor else None
         self._pending_parent_label = cursor.title_display if cursor else None
         self.app.push_screen(
-            GoalCaptureScreen(self._pending_parent, self._pending_parent_label),
+            GoalEditScreen(
+                parent_id=self._pending_parent,
+                parent_label=self._pending_parent_label,
+            ),
             self._captured,
         )
 
-    def _captured(self, result: tuple[str, str, GoalType] | None) -> None:
-        if result is None:
+    def _captured(self, result: GoalCaptureResult | tuple[str, str] | None) -> None:
+        # The create mode dismisses a GoalCaptureResult (the edit-tuple
+        # and None — ESC/Cancel — are not capture results).
+        if not isinstance(result, GoalCaptureResult):
             return
         self._app().create_goal_from_capture(result, parent_id=self._pending_parent)
         self._refresh_all()
@@ -710,8 +733,10 @@ class GoalScreen(ModalScreen[None]):
             return
         self.app.push_screen(GoalEditScreen(goal), self._edited)
 
-    def _edited(self, result: tuple[str, str] | None) -> None:
-        if result is None:
+    def _edited(self, result: GoalCaptureResult | tuple[str, str] | None) -> None:
+        # The edit mode dismisses (description, notes); a capture result
+        # or None (ESC/Cancel) is not an edit.
+        if result is None or isinstance(result, GoalCaptureResult):
             return
         goal_id = self._cursor_goal_id()
         if goal_id is None:

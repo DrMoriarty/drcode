@@ -47,6 +47,8 @@ _CHAT_MOUNT_CHUNK = 16
 # A history drain chunk that has not progressed for this long while blocks
 # are still pending is considered dead (see _poll_chat_drain).
 _CHAT_DRAIN_STUCK = 2.0
+# Minimum gap between stuck-drain diagnostic events (see _report_drain_stall).
+_CHAT_DRAIN_DIAG_GAP = 10.0
 # Live writes (tool results, tester output) longer than this are NOT mounted
 # as one Static: one fat block is a single long render pass on the event loop
 # (textual also re-applies styles over all mounted widgets per mount) and the
@@ -827,8 +829,8 @@ class ChatTimelineLayer(DrCodeState):
                 # reader who is no longer at the tail; the next rebuild
                 # (_flush_chat_batch) turns it off explicitly.
         except NoMatches:
-            # Teardown race: the drain chain (call_after_refresh / the 0.1s
-            # timer fallback) can fire into an already-parsed-away DOM —
+            # Teardown race: the drain chain (call_later / the timer
+            # fallback) can fire into an already-parsed-away DOM —
             # nothing left to render into. Drop the batch (same pattern as
             # _poll_activity's NoMatches catch).
             self._chat_batching = False
@@ -843,37 +845,96 @@ class ChatTimelineLayer(DrCodeState):
             raise
 
     def _schedule_drain(self, epoch: int) -> None:
-        """Schedule the next drain chunk. `call_after_refresh` may silently
-        NOT schedule its callback (it returns False when the message pump is
-        closed/closing) — its InvokeLater message also only ever runs on a
-        clean screen idle, so under a busy terminal (streaming deltas,
-        spinners, tickers keeping widgets dirty) the chain can starve.
-        The fallbacks here plus the _poll_chat_drain watchdog keep the drain
-        self-healing: a dropped or starved schedule must never leave a
-        permanently truncated history with batching stuck on."""
-        if self.call_after_refresh(self._drain_chat_batch, epoch):
+        """Schedule the next drain chunk.
+
+        The primary path is `call_later`: a plain Callback message in this
+        pump's own queue, processed between the other pending messages and
+        NOT gated on screen idle. `call_after_refresh` is deliberately not
+        used: its InvokeLater callback only ever runs on a fully clean
+        screen (Screen._on_idle defers it while any widget/layout flag is
+        dirty), so a continuously dirty screen starves the chain — measured
+        on a ~12 h session: the drain advanced solely via the 1 s watchdog
+        (~2 s per chunk, a 123-block history took ~17 s to appear).
+
+        `call_later` returns False only when the message pump is
+        closed/closing; the timer fallback covers that (if the app is
+        really shutting down it never fires — nothing left to render into
+        anyway). The _poll_chat_drain watchdog remains the self-healing
+        backstop: a dropped schedule must never leave a permanently
+        truncated history with batching stuck on."""
+        if self.call_later(self._drain_chat_batch, epoch):
             return
-        # InvokeLater could not be queued — try a plain Callback message
-        # (processed in this pump's own queue, not gated on screen idle).
-        if not self.call_later(self._drain_chat_batch, epoch):
-            # Last resort while the app is still alive: a timer. If the app
-            # is really shutting down this never fires — nothing left to
-            # render into anyway.
-            self.set_timer(0.1, partial(self._drain_chat_batch, epoch))
+        self.set_timer(0.05, partial(self._drain_chat_batch, epoch))
 
     def _poll_chat_drain(self) -> None:
         """Watchdog for the chunked history drain (1 s poll): if a drain is
         pending but no chunk has progressed for a while, the reschedule
-        chain died (a dropped `call_after_refresh` schedule, or InvokeLater
-        callbacks starved by a continuously dirty screen — both invisible
-        to headless run_test() repros). Re-kick it; _drain_chat_batch's
-        epoch guard drops the tail if the view moved on in the meantime."""
-        if (
-            self._chat_batching
-            and self._chat_batch
-            and time.monotonic() - self._chat_drain_at > _CHAT_DRAIN_STUCK
-        ):
-            self._drain_chat_batch()
+        chain died (a dropped schedule, or the pump wedged on something
+        else — invisible to headless run_test() repros). Re-kick it;
+        _drain_chat_batch's epoch guard drops the tail if the view moved on
+        in the meantime. Every re-kick reports the stall (throttled) so a
+        recurring stall pattern is diagnosable in the task's chat."""
+        if not (self._chat_batching and self._chat_batch):
+            # No drain in flight: reset the re-kick streak so the next
+            # stall episode starts its count and its diagnostics fresh.
+            self._chat_drain_rekicks = 0
+            return
+        stuck = time.monotonic() - self._chat_drain_at
+        if stuck <= _CHAT_DRAIN_STUCK:
+            return
+        self._chat_drain_rekicks += 1
+        try:
+            self._report_drain_stall(stuck)
+        except Exception:  # noqa: BLE001, S110 - diagnostics must never break the re-kick
+            pass
+        self._drain_chat_batch()
+
+    def _report_drain_stall(self, stuck: float) -> None:
+        """Emit a diagnostic for a stalled drain (throttled to one event per
+        _CHAT_DRAIN_DIAG_GAP seconds — a permanently dead chain is advanced
+        by this watchdog alone, so a per-re-kick event would spam one line
+        per chunk). The point is to capture WHY the chain stalled while it
+        is happening: the pending block count and the screen's dirt state
+        (dirty-widget count, layout/repaint/recompose flags, is_current,
+        textual's frame-batch counter) distinguish a wedged pump from the
+        historic "screen forever dirty, InvokeLater starved" class and a
+        widget that keeps itself dirty forever (e.g. an orphaned spinner)."""
+        now = time.monotonic()
+        if now - self._chat_drain_diag_at < _CHAT_DRAIN_DIAG_GAP:
+            return
+        self._chat_drain_diag_at = now
+        try:
+            screen = self.screen
+            flags = (
+                "+".join(
+                    name
+                    for name, on in (
+                        ("layout", screen._layout_required),
+                        ("repaint", screen._repaint_required),
+                        ("recompose", screen._recompose_required),
+                    )
+                    if on
+                )
+                or "clean"
+            )
+            detail = (
+                f"{len(screen._dirty_widgets)} dirty widgets, flags {flags}, "
+                f"is_current={screen.is_current}"
+            )
+            batch_count = getattr(self, "_batch_count", None)
+            if batch_count is not None:
+                detail += f", app._batch_count={batch_count}"
+        except Exception:  # noqa: BLE001 - a probe miss must not kill the poller
+            detail = "screen state unavailable"
+        text = (
+            f"Chat drain stalled {stuck:.1f} s (watchdog re-kick "
+            f"#{self._chat_drain_rekicks}, {len(self._chat_batch)} blocks "
+            f"pending; screen: {detail})."
+        )
+        self.log.warning(text)
+        task = self.viewed
+        if task is not None:
+            self._show_event(task, text)
 
     def _write_history_line(
         self, role: str, text: str, at: datetime | None = None

@@ -188,28 +188,28 @@ async def test_view_task_drains_fat_history_in_chunks(app: DrCodeApp) -> None:
         assert "answer 79" in rendered
 
 
-async def test_drain_survives_dropped_call_after_refresh(app: DrCodeApp) -> None:
-    """Regression (task #79099479): a dropped `call_after_refresh` schedule
-    (it returns False when the message pump is closed/closing and never
-    queues the InvokeLater) used to kill the drain chain after the first
-    chunk — the history stayed truncated at the chunk boundary with
-    batching stuck on, swallowing every later live write (the whole tester
-    round). The fallback schedule must still drain everything."""
+async def test_drain_survives_dropped_call_later(app: DrCodeApp) -> None:
+    """Regression (task #79099479): a dropped schedule (`call_later`, the
+    drain's primary path, returns False when the message pump is
+    closed/closing and never queues the Callback) used to kill the drain
+    chain after the first chunk — the history stayed truncated at the chunk
+    boundary with batching stuck on, swallowing every later live write (the
+    whole tester round). The timer fallback must still drain everything."""
     task = app.manager.create("fat task", "prompt")
     task.messages = _fat_transcript(80)
     task.status = TaskStatus.COMPLETED
     async with app.run_test() as pilot:
         await pilot.pause()
         calls = {"n": 0}
-        original = app.call_after_refresh
+        original = app.call_later
 
         def drop_first_schedule(callback, *args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                return False  # pump "closed": InvokeLater never queued
+                return False  # pump "closed": Callback never queued
             return original(callback, *args, **kwargs)
 
-        app.call_after_refresh = drop_first_schedule  # type: ignore[method-assign]
+        app.call_later = drop_first_schedule  # type: ignore[method-assign]
         # The queued prompt left the pending input (the delta re-render
         # would otherwise be a no-op): the view_task below must rebuild.
         task.pending_input.clear()

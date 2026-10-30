@@ -150,9 +150,6 @@ class TaskStatusLayer(DrCodeState):
             f"[dim]{created}[/]",
             status,
         ]
-        deps_part = self._dependency_status_part(task)
-        if deps_part:
-            parts.append(deps_part)
         if task.verification is VerificationStatus.PASSED:
             parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,12 +10,14 @@ import pytest
 
 from drcode import task_search
 from drcode.models import Task, TaskKind, TaskStatus, VerificationStatus
+from drcode.storage import Storage
 
 
 def _write_task(root: Path, task: Task) -> None:
-    path = root / ".drcode" / "tasks" / f"{task.id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(task.model_dump_json(indent=2))
+    """Persist a task the way the app does: a metadata + sidecar pair via
+    Storage (the `skeleton` the search indexes is derived there from the
+    in-memory transcripts)."""
+    Storage(root).save(task)
 
 
 def _task(**kwargs) -> Task:
@@ -757,3 +760,123 @@ def test_load_archive_skips_corrupted_files(project_root: Path) -> None:
     )
     records = task_search.load_archive(project_root)
     assert sorted(task_id for task_id, _, _ in records) == sorted([good.id, "badjob"])
+
+
+# -- persistent on-disk index -------------------------------------------------------
+
+
+def _prompt_msg(text: str) -> dict:
+    return {
+        "parts": [{"part_kind": "user-prompt", "content": text}],
+    }
+
+
+def test_index_persisted_and_reused_after_restart(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first Ctrl+F of a RESTARTED TUI must not re-parse the archive:
+    the stat-keyed records are persisted in .drcode/search_index.json and
+    reused as-is."""
+    task = _task(
+        title="persisted needle",
+        messages=[_prompt_msg("index me once")],
+    )
+    _write_task(project_root, task)
+    task_search.load_archive(project_root)
+    index_path = project_root / ".drcode" / "search_index.json"
+    assert index_path.is_file()
+
+    # Simulate a restart: the in-memory cache is gone.
+    task_search.clear_archive_cache(project_root)
+    calls: list[str] = []
+    real = task_search._extract_record
+
+    def spy(task_id: str, data: dict) -> object:
+        calls.append(task_id)
+        return real(task_id, data)
+
+    monkeypatch.setattr(task_search, "_extract_record", spy)
+    records = task_search.load_archive(project_root)
+    assert calls == []  # nothing was re-parsed — the disk index served
+    assert any(task_id == task.id for task_id, _, _ in records)
+    # And the search itself works off the restored records.
+    assert f"#{task.id}" in task_search.search(project_root, ["needle"])
+
+
+def test_index_reparses_only_changed_files(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save touched ONE task file: the incremental reload re-parses
+    exactly that file and picks up its new content."""
+    first = _task(title="unchanged task")
+    second = _task(title="soon renamed")
+    for t in (first, second):
+        _write_task(project_root, t)
+    task_search.load_archive(project_root)
+    task_search.clear_archive_cache(project_root)
+
+    second.title = "renamed after save"
+    Storage(project_root).save(second)
+
+    calls: list[str] = []
+    real = task_search._extract_record
+
+    def spy(task_id: str, data: dict) -> object:
+        calls.append(task_id)
+        return real(task_id, data)
+
+    monkeypatch.setattr(task_search, "_extract_record", spy)
+    records = task_search.load_archive(project_root)
+    assert calls == [second.id]
+    by_id = {task_id: data for task_id, data, _ in records}
+    assert by_id[second.id]["title"] == "renamed after save"
+    assert f"#{second.id}" in task_search.search(project_root, ["renamed after"])
+
+
+def test_corrupted_index_is_rebuilt(project_root: Path) -> None:
+    """A broken index file never breaks the search: it is ignored, the
+    archive is re-parsed and a valid index is written back."""
+    task = _task(title="rebuild me", messages=[_prompt_msg("rebuild prompt")])
+    _write_task(project_root, task)
+    task_search.load_archive(project_root)
+    index_path = project_root / ".drcode" / "search_index.json"
+    index_path.write_text("{corrupted index")
+
+    task_search.clear_archive_cache(project_root)
+    records = task_search.load_archive(project_root)
+    assert any(task_id == task.id for task_id, _, _ in records)
+    data = json.loads(index_path.read_text())
+    assert task.id in {entry[1][0] for entry in data["entries"].values()}
+
+
+def test_stale_index_entry_self_heals(project_root: Path) -> None:
+    """A lost update (an index entry whose stat key no longer matches the
+    file) makes the next load re-parse that file and rewrite the index —
+    concurrent writers converge instead of poisoning the cache."""
+    task = _task(title="self healing", messages=[_prompt_msg("heal prompt")])
+    _write_task(project_root, task)
+    task_search.load_archive(project_root)
+    index_path = project_root / ".drcode" / "search_index.json"
+    data = json.loads(index_path.read_text())
+    # Corrupt the stat key of the entry (keep the record).
+    entry_name = next(iter(data["entries"]))
+    data["entries"][entry_name][0] = [1, 1]
+    index_path.write_text(json.dumps(data))
+    task_search.clear_archive_cache(project_root)
+
+    records = task_search.load_archive(project_root)
+    assert any(task_id == task.id for task_id, _, _ in records)
+    fixed = json.loads(index_path.read_text())
+    stat = (index_path.parent / "tasks" / entry_name).stat()
+    assert fixed["entries"][entry_name][0] == [stat.st_mtime_ns, stat.st_size]
+
+
+def test_load_archive_ignores_transcript_files(project_root: Path) -> None:
+    task = _task(title="indexed task")
+    _write_task(project_root, task)
+    tasks_dir = project_root / ".drcode" / "tasks"
+    (tasks_dir / f"{task.id}.transcript.json").write_text(
+        json.dumps({"messages": [{"parts": []}]})
+    )
+    records = task_search.load_archive(project_root)
+    assert [task_id for task_id, _, _ in records] == [task.id]

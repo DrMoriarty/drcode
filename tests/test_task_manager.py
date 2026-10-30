@@ -1220,3 +1220,109 @@ def test_status_changed_at_survives_round_trip(project_root: Path) -> None:
     loaded = reloaded.get(task.id)
     assert loaded.status is TaskStatus.TESTING  # not demoted on startup
     assert loaded.status_changed_at == stamp
+
+
+# -- split storage: lazy transcripts ------------------------------------------------
+
+
+def _user_msg(text: str) -> dict:
+    return {
+        "kind": "request",
+        "parts": [{"part_kind": "user-prompt", "content": text}],
+    }
+
+
+def test_startup_loads_metadata_only(project_root: Path) -> None:
+    """A restart parses metadata only: the completed archive's transcripts
+    stay on disk until a task is actually touched."""
+    manager = TaskManager(project_root)
+    task = manager.create("t", "first")
+    task.messages = [_user_msg("hello")]
+    manager.storage.save(task)
+
+    reloaded = TaskManager(project_root)
+    loaded = reloaded.get(task.id)
+    assert loaded.transcripts_loaded is False
+    # First touch restores the history.
+    assert loaded.messages == task.messages
+    assert loaded.transcripts_loaded is True
+
+
+def test_reopen_completed_task_lazy_resume(project_root: Path) -> None:
+    """Re-queueing a COMPLETED task after a restart: the old transcript is
+    lazily loaded BEFORE the run resumes — the resume history keeps the
+    original prompt at its chronological position, and the new input sits
+    in pending_input (never duplicated into the transcript by send())."""
+    manager = TaskManager(project_root)
+    task = manager.create("t", "first")
+    # The run consumed the prompt: it lives in the transcript only (a real
+    # transcript would carry the model's answer too — one user prompt is
+    # enough for the invariant checked here).
+    task.pending_input.clear()
+    task.messages = [_user_msg("first")]
+    task.status = TaskStatus.COMPLETED
+    task.completed_at = _now()
+    manager.storage.save(task)
+
+    reloaded = TaskManager(project_root)
+    assert reloaded.get(task.id).transcripts_loaded is False
+    reloaded.send(task.id, "follow-up")
+    reopened = reloaded.get(task.id)
+    assert reopened.status is TaskStatus.QUEUED
+    # The lazy load (send() checks is_pending_retry against the transcript)
+    # preserved the old history ...
+    from drcode.transcript import all_user_prompts
+
+    assert all_user_prompts(reopened.messages) == ["first"]
+    # ... and the new input is queued, not yet consumed.
+    assert [e.text for e in reopened.pending_input] == ["follow-up"]
+
+
+def test_lru_evicts_idle_completed_transcripts(project_root: Path) -> None:
+    """The sidecar LRU: loading one transcript too many evicts the oldest
+    idle COMPLETED one — after flushing it, so a reload from disk is
+    lossless."""
+    manager = TaskManager(project_root)
+    ids = []
+    for name in ("a", "b"):
+        task = manager.create(name, "x")
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = _now()
+        task.messages = [_user_msg(f"prompt {name}")]
+        manager.storage.save(task)
+        ids.append(task.id)
+
+    reloaded = TaskManager(project_root)
+    reloaded.storage.transcript_cache_limit = 1
+    a, b = (reloaded.get(tid) for tid in ids)
+    assert a.transcripts_loaded is False
+    assert a.messages[0]["parts"][0]["content"] == "prompt a"
+    # Loading b pushes a out (limit 1) — but only after a flush, so the
+    # eviction is lossless.
+    assert b.messages[0]["parts"][0]["content"] == "prompt b"
+    assert a.transcripts_loaded is False
+    assert a.messages[0]["parts"][0]["content"] == "prompt a"
+
+
+def test_lru_never_evicts_pipeline_tasks(project_root: Path) -> None:
+    """Not-yet-completed tasks keep their transcripts in memory (the limit
+    is soft for them): a queued task is skipped by the eviction walk."""
+    manager = TaskManager(project_root)
+    queued = manager.create("queued", "x")
+    queued.messages = [_user_msg("queued prompt")]
+    manager.storage.save(queued)
+    completed = manager.create("done", "x")
+    completed.status = TaskStatus.COMPLETED
+    completed.completed_at = _now()
+    completed.messages = [_user_msg("done prompt")]
+    manager.storage.save(completed)
+
+    reloaded = TaskManager(project_root)
+    reloaded.storage.transcript_cache_limit = 1
+    q = reloaded.get(queued.id)
+    c = reloaded.get(completed.id)
+    assert q.messages and c.messages  # both touched → over the limit
+    # The queued task is the oldest, the eviction walk refuses it and
+    # stops: nothing is dropped mid-pipeline.
+    assert q.transcripts_loaded is True
+    assert c.transcripts_loaded is True

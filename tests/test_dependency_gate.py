@@ -26,7 +26,9 @@ from drcode.tui.inputs import DepsInput
 from drcode.tui.sidebar import TaskItem
 
 
-async def _settle(pilot, app: DrCodeApp, predicate, timeout_s: float | None = None) -> bool:
+async def _settle(
+    pilot, app: DrCodeApp, predicate, timeout_s: float | None = None
+) -> bool:
     """Pump the event loop until `predicate()` holds (the promote worker
     runs its git check via asyncio.to_thread and resumes asynchronously).
 

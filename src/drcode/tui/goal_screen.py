@@ -27,7 +27,7 @@ from rich.markup import escape
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
@@ -122,6 +122,17 @@ class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
         background: $panel;
         border: thick $accent;
     }
+    /* The middle fields scroll so the buttons row and the hint always
+    stay visible (the ts-body pattern from task_settings_dialog). CSS
+    alone can't adapt the cap to the terminal: an fr under the
+    auto-height dialog does not clamp, so the floor here keeps a small
+    terminal safe and _fit_fields raises the cap on mount/resize when
+    the terminal has room. */
+    #goal-edit-fields {
+        height: auto;
+        max-height: 12;
+        overflow-y: auto;
+    }
     #goal-edit-title { text-style: bold; margin-bottom: 1; }
     #goal-note { color: $text; margin-bottom: 1; }
     #goal-parent { color: $text-muted; margin-bottom: 1; }
@@ -194,37 +205,38 @@ class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
                     f"Edit goal #{self._goal.id} — {escape(self._goal.title_display)}",
                     id="goal-edit-title",
                 )
-            yield Static(
-                "description — one short paragraph; it rides along in the "
-                "research agent's prompt injection",
-                id="goal-edit-desc-label",
-            )
-            yield TextArea(
-                self._goal.description if self._goal else "",
-                id="goal-edit-desc",
-            )
-            yield Static(
-                "notes — free-form markdown; the agent reads it only via "
-                "read_goal on demand (never injected into the prompt)",
-                id="goal-edit-notes-label",
-            )
-            yield TextArea(
-                self._goal.notes if self._goal else "",
-                id="goal-edit-notes",
-            )
-            if self._creating:
-                yield Horizontal(
-                    Static("", id="goal-type-label"),
-                    Static("", id="goal-type-hint"),
-                    id="goal-type-line",
+            with VerticalScroll(id="goal-edit-fields"):
+                yield Static(
+                    "description — one short paragraph; it rides along in the "
+                    "research agent's prompt injection",
+                    id="goal-edit-desc-label",
                 )
-                if self._link_task_id:
-                    yield Checkbox(
-                        f"link viewed task #{self._link_task_id}",
-                        True,
-                        id="goal-link-task",
+                yield TextArea(
+                    self._goal.description if self._goal else "",
+                    id="goal-edit-desc",
+                )
+                yield Static(
+                    "notes — free-form markdown; the agent reads it only via "
+                    "read_goal on demand (never injected into the prompt)",
+                    id="goal-edit-notes-label",
+                )
+                yield TextArea(
+                    self._goal.notes if self._goal else "",
+                    id="goal-edit-notes",
+                )
+                if self._creating:
+                    yield Horizontal(
+                        Static("", id="goal-type-label"),
+                        Static("", id="goal-type-hint"),
+                        id="goal-type-line",
                     )
-                yield Static("", id="goal-error")
+                    if self._link_task_id:
+                        yield Checkbox(
+                            f"link viewed task #{self._link_task_id}",
+                            True,
+                            id="goal-link-task",
+                        )
+                    yield Static("", id="goal-error")
             with Horizontal(id="goal-edit-buttons"):
                 yield Button(
                     "Create goal" if self._creating else "Save",
@@ -237,10 +249,37 @@ class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
             self._update_type_label()
 
     def on_mount(self) -> None:
+        self.call_after_refresh(self._fit_fields)
         if self._creating:
             self.query_one("#goal-title", Input).focus()
         else:
             self.query_one("#goal-edit-desc", TextArea).focus()
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._fit_fields)
+
+    def _fit_fields(self) -> None:
+        """Cap #goal-edit-fields so the buttons row and the hint always
+        fit inside the dialog's max-height: 90% — CSS fr can't do it
+        under the auto-height dialog (it doesn't clamp, the dialog just
+        clips its bottom). Sums the natural heights of everything around
+        the field area (measured post-layout, so wrapped Statics count
+        exactly) and gives the rest to the scrollable fields; the floor
+        of 6 rows keeps the field area usable on tiny terminals (the
+        CSS floor of 12 stands until this runs)."""
+        fields = self.query_one("#goal-edit-fields", VerticalScroll)
+        dialog = self.query_one("#goal-edit-dialog", Vertical)
+        fixed = dialog.styles.gutter.height
+        for child in dialog.children:
+            if child is fields:
+                continue
+            fixed += (
+                child.region.height
+                + child.styles.margin.top
+                + child.styles.margin.bottom
+            )
+        budget = int(self.size.height * 0.9) - fixed
+        fields.styles.max_height = max(6, budget)
 
     @property
     def type_label(self) -> Static:

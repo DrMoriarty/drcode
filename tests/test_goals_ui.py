@@ -428,6 +428,65 @@ async def test_goal_edit_dialog_description_and_notes(app: DrCodeApp) -> None:
         assert refreshed.notes == "new notes"
 
 
+# -- the dialog fits the terminal (regression: clipped buttons) --------------------
+
+
+async def test_goal_create_dialog_buttons_visible_on_small_terminal(
+    app: DrCodeApp,
+) -> None:
+    """Regression: the unified create dialog grew taller than its
+    max-height 90% and the plain container clipped the bottom — the
+    buttons row and the hint vanished. The field area scrolls instead;
+    the buttons and the hint must stay fully on screen even at ~30 rows."""
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _started(app, pilot)
+        app.action_new_goal()
+        await pilot.pause()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalEditScreen)
+        dialog = screen.query_one("#goal-edit-dialog").region
+        fields = screen.query_one("#goal-edit-fields").region
+        buttons = screen.query_one("#goal-edit-buttons").region
+        hint = screen.query_one("#goal-edit-hint").region
+        # Everything fits the terminal and the dialog's own bottom edge.
+        assert buttons.y + buttons.height <= 30
+        assert hint.y + hint.height <= 30
+        assert buttons.y + buttons.height <= dialog.y + dialog.height
+        assert hint.y + hint.height <= dialog.y + dialog.height
+        # The field area is the squeezed, scrollable middle.
+        assert fields.y + fields.height <= buttons.y
+        # Saving still works from the clipped-away-but-visible controls.
+        screen.query_one("#goal-title", Input).value = "Fits"
+        screen._save()
+        await pilot.pause()
+        assert _find_goal(app, "Fits") is not None
+
+
+async def test_goal_edit_dialog_buttons_visible_on_small_terminal(
+    app: DrCodeApp,
+) -> None:
+    """Same regression for the edit mode (shorter, but still clipped on
+    a small terminal before the scrollable field area)."""
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _started(app, pilot)
+        app.manager.goals.create("Async core", description="d")
+        screen = _open_screen(app)
+        await pilot.pause()
+        screen.action_edit_goal()
+        await pilot.pause()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, GoalEditScreen)
+        dlg = dialog.query_one("#goal-edit-dialog").region
+        buttons = dialog.query_one("#goal-edit-buttons").region
+        hint = dialog.query_one("#goal-edit-hint").region
+        assert buttons.y + buttons.height <= 30
+        assert hint.y + hint.height <= 30
+        assert buttons.y + buttons.height <= dlg.y + dlg.height
+        assert hint.y + hint.height <= dlg.y + dlg.height
+
+
 # -- GoalStore ordering (the GoalScreen's Ctrl+Up/Down and M) ---------------------
 
 

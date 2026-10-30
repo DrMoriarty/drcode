@@ -335,6 +335,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+t", "cycle_task_kind", "Change type"),
         ("ctrl+up", "move_task_up", "Move up"),
         ("ctrl+down", "move_task_down", "Move down"),
+        # Alt+Up/Down duplicates for macOS, where the system intercepts
+        # ctrl+arrows (Mission Control / App Exposé) before the terminal;
+        # show=False so the footer is not cluttered with duplicates.
+        Binding("alt+up", "move_task_up", "Move up", show=False),
+        Binding("alt+down", "move_task_down", "Move down", show=False),
         ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+f", "search_tasks", "Find task"),
         ("ctrl+m", "open_merge", "Merge…"),

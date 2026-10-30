@@ -461,6 +461,9 @@ class GoalScreen(ModalScreen[None]):
         Binding("a", "archive", "Archive"),
         Binding("ctrl+up", "move_up", "Move up", show=False),
         Binding("ctrl+down", "move_down", "Move down", show=False),
+        # Alt duplicates: macOS intercepts ctrl+arrows system-wide.
+        Binding("alt+up", "move_up", "Move up", show=False),
+        Binding("alt+down", "move_down", "Move down", show=False),
     ]
 
     DEFAULT_CSS = """

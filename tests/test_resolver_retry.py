@@ -116,7 +116,9 @@ async def test_retry_survives_stale_needs_human(
     state = ScriptedState()
     state.steps = [api_error(), api_error()]
 
-    def fake_build_agent(config: Any, root: Path | None = None) -> Agent[Any, str]:
+    def fake_build_agent(
+        config: Any, root: Path | None = None, task_id: str | None = None
+    ) -> Agent[Any, str]:
         return Agent(state.model())
 
     import drcode.tui.pipeline_resolver as pr

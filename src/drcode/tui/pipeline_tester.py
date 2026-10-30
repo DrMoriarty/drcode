@@ -143,6 +143,10 @@ class PipelineTesterLayer(DrCodeState):
                 review_gate=(
                     self.workflow is not None and self.workflow.has("on_review")
                 ),
+                # The real scratch path is baked into run_bash's description
+                # (no literal <task-id> placeholder for the model to copy
+                # verbatim into a path argument).
+                task_id=task_id,
             )
             deps = TesterDeps(
                 root=root,

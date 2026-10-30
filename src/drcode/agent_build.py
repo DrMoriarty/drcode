@@ -67,6 +67,18 @@ __all__ = [
 ]
 
 
+def _scratch_desc(task_id: str | None) -> str:
+    """The scratch path baked into the write-tool descriptions: the task's
+    real directory when the builder knows the task id, the literal
+    `/tmp/drcode/<task-id>` placeholder otherwise (schema-size estimation in
+    context_layout builds the agents taskless — the placeholder must
+    survive there). The literal placeholder in a shipped tool description
+    made models write into /tmp/drcode/<task-id>/... verbatim and burn a
+    ModelRetry round on the real path; baking the real path in at build
+    time removes that miss entirely."""
+    return str(tools.scratch_dir(task_id)) if task_id else "/tmp/drcode/<task-id>"
+
+
 @dataclass
 class AgentDeps:
     """Dependencies for the coding agent: project root, task manager, task id.
@@ -183,6 +195,7 @@ def build_agent(
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
+    task_id: str | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -204,7 +217,12 @@ def build_agent(
     delegate_research tool when above 0; at 0 (the default) the tool is
     not registered at all — the agent never sees it. The limit is baked
     into the tool description so the model knows its actual budget.
+
+    `task_id` (the task being served, known at activation) bakes the real
+    scratch-directory path into the write tools' descriptions; without it
+    the descriptions keep the literal `<task-id>` placeholder.
     """
+    scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config)
     instructions = load_system_prompt(
         kind, project_root=root, research_git=research_git
@@ -283,11 +301,19 @@ def build_agent(
     # would both read the original snapshot and the later write would
     # silently overwrite the earlier edit (lost update). `sequential=True`
     # makes each of these run alone, never overlapping other tool calls.
-    @agent.tool(sequential=True)
+    # The write-path tools carry a build-time `description=` (it overrides
+    # the docstring in pydantic-ai) so the scratch path can be interpolated:
+    # a docstring is static text and cannot carry the per-task path.
+    @agent.tool(
+        sequential=True,
+        description=(
+            "Create or overwrite a file. Only the project root (with all "
+            "subdirectories) and your scratch directory "
+            f"{scratch} are writable; use the scratch directory to test "
+            "hypotheses."
+        ),
+    )
     async def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
-        """Create or overwrite a file. Only the project root (with all subdirectories)
-        and your scratch directory /tmp/drcode/<task-id> are writable; use the scratch
-        directory to test hypotheses."""
         result = await _run_tool_logged(
             ctx.deps,
             "write_file",
@@ -308,13 +334,19 @@ def build_agent(
         )
         return result
 
-    @agent.tool(sequential=True)
+    @agent.tool(
+        sequential=True,
+        description=(
+            "Replace an exact unique substring in a file. old_string must "
+            "match exactly once. Only the project root (with all "
+            "subdirectories) and your scratch directory "
+            f"{scratch} are writable; use the scratch directory to test "
+            "hypotheses."
+        ),
+    )
     async def edit_file(
         ctx: RunContext[AgentDeps], path: str, old_string: str, new_string: str
     ) -> str:
-        """Replace an exact unique substring in a file. old_string must match exactly once.
-        Only the project root (with all subdirectories) and your scratch directory
-        /tmp/drcode/<task-id> are writable; use the scratch directory to test hypotheses."""
         result = await _run_tool_logged(
             ctx.deps,
             "edit_file",
@@ -346,16 +378,19 @@ def build_agent(
         filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
-    @agent.tool
+    @agent.tool(
+        description=(
+            "Run a shell command in the project root and return its output.\n"
+            "The command is killed after `timeout` seconds (default 120); "
+            "pass a\nlarger timeout for long-running commands (builds, test "
+            "suites) —\nvalues above 3600 (60 minutes) are clamped to 3600.\n"
+            "rm/mv/cp are only allowed with paths inside the project root or "
+            f"your\nscratch directory {scratch}."
+        )
+    )
     async def run_bash(
         ctx: RunContext[AgentDeps], command: str, timeout: int | None = None
     ) -> str:
-        """Run a shell command in the project root and return its output.
-        The command is killed after `timeout` seconds (default 120); pass a
-        larger timeout for long-running commands (builds, test suites) —
-        values above 3600 (60 minutes) are clamped to 3600.
-        rm/mv/cp are only allowed with paths inside the project root or your
-        scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     # Self-managed todo checklist: registered for FEATURE agents only.
@@ -752,6 +787,7 @@ def build_tester_agent(
     allow_push: bool = True,
     root: Path | None = None,
     review_gate: bool = False,
+    task_id: str | None = None,
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
@@ -770,7 +806,12 @@ def build_tester_agent(
     external review is defined in `.drcode/workflow.py`) a successful
     verdict only labels the task PASSED and leaves it TESTING — the
     external review decides the final completion.
+
+    `task_id` (the verified task, known at activation) bakes the real
+    scratch-directory path into run_bash's description; without it the
+    description keeps the literal `<task-id>` placeholder.
     """
+    scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config)
     instructions = load_tester_prompt(
         allow_commit, project_root=root, allow_push=allow_push
@@ -841,16 +882,19 @@ def build_tester_agent(
         filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
 
-    @agent.tool
+    @agent.tool(
+        description=(
+            "Run a shell command in the project root and return its output.\n"
+            "The command is killed after `timeout` seconds (default 120); "
+            "pass a\nlarger timeout for long-running checks (full test "
+            "suites, builds) —\nvalues above 3600 (60 minutes) are clamped "
+            "to 3600.\nrm/mv/cp are only allowed with paths inside the "
+            f"project root or your\nscratch directory {scratch}."
+        )
+    )
     async def run_bash(
         ctx: RunContext[TesterDeps], command: str, timeout: int | None = None
     ) -> str:
-        """Run a shell command in the project root and return its output.
-        The command is killed after `timeout` seconds (default 120); pass a
-        larger timeout for long-running checks (full test suites, builds) —
-        values above 3600 (60 minutes) are clamped to 3600.
-        rm/mv/cp are only allowed with paths inside the project root or your
-        scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     @agent.tool
@@ -1080,6 +1124,7 @@ def build_resolver_agent(
     config: Config,
     *,
     root: Path | None = None,
+    task_id: str | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the merge-conflict resolver agent.
 
@@ -1091,7 +1136,12 @@ def build_resolver_agent(
     after the mandatory verification funnel (mechanics + tests +
     intent-preservation review) passes — the resolver's verdict alone can
     never finalize anything.
+
+    `task_id` (the conflicted task, known at activation) bakes the real
+    scratch-directory path into the write tools' descriptions; without it
+    the descriptions keep the literal `<task-id>` placeholder.
     """
+    scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config)
     instructions = load_resolver_prompt(root)
     if root is not None:
@@ -1112,11 +1162,15 @@ def build_resolver_agent(
     )
     _resolver_shared_tools(agent, config)
 
-    @agent.tool(sequential=True)
+    @agent.tool(
+        sequential=True,
+        description=(
+            "Create or overwrite a file. Only the resolved worktree (with "
+            f"all subdirectories) and your scratch directory {scratch} are "
+            "writable; use the scratch directory to test hypotheses."
+        ),
+    )
     async def write_file(ctx: RunContext[ResolverDeps], path: str, content: str) -> str:
-        """Create or overwrite a file. Only the resolved worktree (with all
-        subdirectories) and your scratch directory /tmp/drcode/<task-id> are
-        writable; use the scratch directory to test hypotheses."""
         return await _run_tool_logged(
             ctx.deps,
             "write_file",
@@ -1127,14 +1181,18 @@ def build_resolver_agent(
             extra_writable=ctx.deps.scratch,
         )
 
-    @agent.tool(sequential=True)
+    @agent.tool(
+        sequential=True,
+        description=(
+            "Replace an exact unique substring in a file. old_string must "
+            "match exactly once. Only the resolved worktree (with all "
+            f"subdirectories) and your scratch directory {scratch} are "
+            "writable; use the scratch directory to test hypotheses."
+        ),
+    )
     async def edit_file(
         ctx: RunContext[ResolverDeps], path: str, old_string: str, new_string: str
     ) -> str:
-        """Replace an exact unique substring in a file. old_string must match exactly once.
-        Only the resolved worktree (with all subdirectories) and your scratch
-        directory /tmp/drcode/<task-id> are writable; use the scratch directory
-        to test hypotheses."""
         return await _run_tool_logged(
             ctx.deps,
             "edit_file",
@@ -1146,19 +1204,22 @@ def build_resolver_agent(
             extra_writable=ctx.deps.scratch,
         )
 
-    @agent.tool
+    @agent.tool(
+        description=(
+            "Run a shell command in the resolved worktree and return its "
+            "output.\nThe command is killed after `timeout` seconds "
+            "(default 120); pass a\nlarger timeout for long-running "
+            "commands — values above 3600 (60\nminutes) are clamped to "
+            "3600. Use it for quick read-only inspection\n(git log/diff, "
+            "compiling a module) — NOT for committing, merging or\nthe full "
+            "verification suite (the pipeline runs those checks itself\nand "
+            "its verdict decides).\nrm/mv/cp are only allowed with paths "
+            f"inside the worktree or your\nscratch directory {scratch}."
+        )
+    )
     async def run_bash(
         ctx: RunContext[ResolverDeps], command: str, timeout: int | None = None
     ) -> str:
-        """Run a shell command in the resolved worktree and return its output.
-        The command is killed after `timeout` seconds (default 120); pass a
-        larger timeout for long-running commands — values above 3600 (60
-        minutes) are clamped to 3600. Use it for quick read-only inspection
-        (git log/diff, compiling a module) — NOT for committing, merging or
-        the full verification suite (the pipeline runs those checks itself
-        and its verdict decides).
-        rm/mv/cp are only allowed with paths inside the worktree or your
-        scratch directory /tmp/drcode/<task-id>."""
         return await _run_bash_logged(ctx.deps, ctx.deps.root, command, timeout)
 
     @agent.tool

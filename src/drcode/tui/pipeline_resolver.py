@@ -221,7 +221,12 @@ class PipelineResolverLayer(DrCodeState):
                 if self.viewed_id == task_id:
                     self._write_history_line("resolving-sep", "")
             agent = build_resolver_agent(
-                self.resolved_config(AgentRole.RESOLVER), root=root
+                self.resolved_config(AgentRole.RESOLVER),
+                root=root,
+                # The real scratch path is baked into the write tools'
+                # descriptions (no literal <task-id> placeholder for the
+                # model to copy verbatim into a path argument).
+                task_id=task_id,
             )
             deps = ResolverDeps(
                 root=root,

@@ -347,6 +347,10 @@ class PipelineAgentRunLayer(DrCodeState):
             root=root,
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit,
+            # The real scratch path is baked into the write tools'
+            # descriptions (no literal <task-id> placeholder for the model
+            # to copy verbatim into a path argument).
+            task_id=task_id,
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         return root, agent, workflow_instructions, subagent_gate

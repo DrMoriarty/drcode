@@ -150,9 +150,6 @@ class TaskStatusLayer(DrCodeState):
             f"[dim]{created}[/]",
             status,
         ]
-        deps_part = self._dependency_status_part(task)
-        if deps_part:
-            parts.append(deps_part)
         if task.verification is VerificationStatus.PASSED:
             parts.append("[green]✓ testing[/]")
         elif task.verification is VerificationStatus.FAILED:
@@ -175,7 +172,8 @@ class TaskStatusLayer(DrCodeState):
 
         Each id is a link that opens the dependency task. Empty string
         when the task has no dependencies; `label` prefixes the list
-        ("deps: " on the first header row, "depends on: " on the second)."""
+        ("depends on: " on the second header row — the dependency list
+        lives only there, never on the first row)."""
         if not task.depends_on:
             return ""
         gate = self._dep_gate.get(task.id, {})

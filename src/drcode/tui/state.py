@@ -862,6 +862,11 @@ class DrCodeState(App[None]):
     _chat_batching: bool
     _chat_batch: list[Widget]
     _chat_drain_at: float
+    # Watchdog diagnostics for the drain (see _poll_chat_drain /
+    # _report_drain_stall): re-kicks within the current drain episode and
+    # the monotonic stamp of the last emitted stall event (throttle).
+    _chat_drain_rekicks: int
+    _chat_drain_diag_at: float
     # Scroll policy of the running drain: a history rebuild always lands on
     # the latest entry (True); a drain seeded by a split fat live write
     # follows the tail only while the reader is already at the bottom

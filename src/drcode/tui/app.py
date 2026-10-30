@@ -783,6 +783,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
         # chain died or starved (see chat_view._schedule_drain).
         self._chat_drain_at = 0.0
+        # Watchdog diagnostics for the drain: the re-kick count within the
+        # current drain episode and the last stall event's stamp (the
+        # diagnostics are throttled, see _report_drain_stall).
+        self._chat_drain_rekicks = 0
+        self._chat_drain_diag_at = 0.0
         # Delta re-render bookkeeping (see _try_delta_view): None/() until
         # the first full history render; live writes that mirror the next
         # timeline entries are recorded in _live_tail instead of

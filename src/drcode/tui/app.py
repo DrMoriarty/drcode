@@ -812,6 +812,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # that a view_task() re-render has already put on screen (which
         # used to show the question twice while the dialog stayed open).
         self._rendered_clarification: Clarification | None = None
+        # Fingerprint of the screen's active bindings at the last footer
+        # refresh (refresh_task_status): a bindings publish that changes
+        # nothing still recomposes the whole Footer (see the annotation).
+        self._footer_bindings_fp: tuple | None = None
         # Per-role resolved model connections (see drcode.providers.resolve),
         # cached: resolution reads the project config + the user-level
         # catalog from disk. Invalidated whenever the flat config, the

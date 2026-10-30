@@ -19,7 +19,7 @@ from textual.css.query import NoMatches
 from ..models import Task, TaskStatus
 from ..version import APP_VERSION
 from .header import HeaderGitIndicator
-from .state import DrCodeState
+from .state import DrCodeState, update_static_if_changed
 from .usage import NETWORK_RETRIES
 
 
@@ -252,9 +252,10 @@ class ActivityLayer(DrCodeState):
         # back to the composed sidebar width minus padding.
         width = label.container_size.width or 34
         pad = max(1, width - cell_len(status) - cell_len(version))
-        label.update(
+        update_static_if_changed(
+            label,
             f"{status}{' ' * pad}[bold $accent]DrCode[/] [white]{APP_VERSION}[/]\n"
-            f"{detail}"
+            f"{detail}",
         )
 
     # -- stall watchdog ---------------------------------------------------------

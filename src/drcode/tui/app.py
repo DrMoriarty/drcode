@@ -156,9 +156,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #activity-status.fresh { color: $success; }
     #activity-status.stale { color: $warning; }
     #chat-col { height: 1fr; }
-    #task-statusbar { dock: top; height: 1; background: $panel; padding: 0 1; }
+    #task-statusbar { dock: top; height: auto; background: $panel; padding: 0 1; }
+    #task-status-row { height: 1; }
     #task-status-left { width: 1fr; color: $text; }
     #task-status-right { width: auto; color: $text; }
+    # Second header row (deps/goal/issue/branch + warning markers); the
+    # .hidden toggle keeps it at zero height when there is nothing to show.
+    #task-status-extra { width: 1fr; color: $text; }
+    #task-status-extra.hidden { display: none; }
     # Context counter: red from the compaction threshold, yellow from
     # twice the remaining headroom (threshold 80 → yellow from 60%).
     #task-status-right.ctx-warn { color: $warning; }
@@ -864,9 +869,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 yield Static("", id="project-info")
                 yield Static("", id="activity-status")
             with Vertical(id="chat-col"):
-                with Horizontal(id="task-statusbar"):
-                    yield Static("", id="task-status-left")
-                    yield Static("", id="task-status-right")
+                with Vertical(id="task-statusbar"):
+                    with Horizontal(id="task-status-row"):
+                        yield Static("", id="task-status-left")
+                        yield Static("", id="task-status-right")
+                    # Second header row: depends on / goal / issue / branch
+                    # + warning markers; hidden when all of them are empty.
+                    yield Static("", id="task-status-extra", classes="hidden")
                 yield ChatLog(id="chat-log")
                 yield TodoPanel("", id="todo-panel", classes="hidden")
                 yield ChatInput(placeholder="Type a message…", id="chat-input")

@@ -16,8 +16,13 @@ from __future__ import annotations
 from rich.markup import escape
 from textual.widgets import Static
 
-from ..models import Goal, TaskKind
-from .goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
+from ..models import Goal, GoalStatus, TaskKind
+from .goal_screen import (
+    GoalAssignPicker,
+    GoalCaptureResult,
+    GoalEditScreen,
+    GoalScreen,
+)
 from .state import DrCodeState
 
 
@@ -127,6 +132,38 @@ class GoalsActionsLayer(DrCodeState):
             timeout=5,
         )
         self.refresh_sidebar()
+        self.refresh_task_status()
+
+    def action_assign_goal(self) -> None:
+        """Click on the task statusbar's "+ assign" fragment (the viewed
+        task has no goal): open the goal picker and attach the picked
+        goal. A drag-selection ending on the link is copying text, not
+        navigating (same guard as action_open_task)."""
+        if self.screen.selections:
+            return
+        task = self.viewed
+        if task is None:
+            return
+        candidates = [
+            goal
+            for goal in self.manager.goals.goals.values()
+            if goal.status is not GoalStatus.ARCHIVED and goal.id != task.goal_id
+        ]
+        if not candidates:
+            self.notify(
+                "No goals to assign — capture one with Ctrl+Y first.",
+                title="Goals",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        self.push_screen(GoalAssignPicker(candidates), self._goal_assigned)
+
+    def _goal_assigned(self, goal_id: str | None) -> None:
+        # None = ESC / no pick: nothing to do.
+        if goal_id is None:
+            return
+        self.link_viewed_goal(goal_id)
 
     def unlink_viewed_goal(self) -> None:
         """The "Unlink goal" palette command over the viewed task."""
@@ -140,6 +177,7 @@ class GoalsActionsLayer(DrCodeState):
             timeout=5,
         )
         self.refresh_sidebar()
+        self.refresh_task_status()
 
     # -- creating tasks FROM a goal (the GoalScreen's R / T) -------------------
 

@@ -10,6 +10,8 @@
   read_goal tool — it is never injected into a system prompt.
 - ``GoalParentPicker`` — the "M" reparent picker (SearchDialog pattern):
   a filter input over the candidate goals plus a "Make top-level" entry.
+- ``GoalAssignPicker`` — the same pattern minus "Make top-level": the
+  task statusbar's "+ assign" link assigns a goal to the viewed task.
 - ``GoalScreen`` — the full-screen roadmap view: milestone → sub-goal
   tree with n/m progress counters, a status filter, Enter-expandable
   description/notes details and the keyboard action set
@@ -434,6 +436,86 @@ class GoalParentPicker(ModalScreen[str | None]):
         self.dismiss(None)
 
     @on(ListView.Selected, "#goal-parent-list")
+    def _picked(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, TaskItem) and item.goal_id:
+            self.dismiss(item.goal_id)
+
+
+class GoalAssignPicker(ModalScreen[str | None]):
+    """The "assign a goal to the viewed task" picker (the task
+    statusbar's "+ assign" link): the GoalParentPicker pattern minus the
+    "Make top-level" entry — a filter input over the candidate goals
+    (the caller pre-filters: non-archived, not already linked). Dismisses
+    with the picked goal's id, None on ESC."""
+
+    BINDINGS: ClassVar = [
+        Binding("escape", "cancel", "Close", priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    GoalAssignPicker {
+        align: center middle;
+    }
+    #goal-assign-dialog {
+        width: 72;
+        max-width: 95%;
+        height: 24;
+        max-height: 80%;
+        padding: 1 2;
+        background: $panel;
+        border: thick $accent;
+    }
+    #goal-assign-title { text-style: bold; margin-bottom: 1; }
+    #goal-assign-list {
+        height: 1fr;
+        margin-top: 1;
+        background: $surface-lighten-1;
+    }
+    #goal-assign-list > ListItem { padding: 0 1; }
+    #goal-assign-list ListItem Label { width: 1fr; }
+    #goal-assign-hint {
+        margin-top: 1;
+        color: $text-disabled;
+        text-align: right;
+    }
+    """
+
+    def __init__(self, candidates: list[Goal]) -> None:
+        super().__init__()
+        self._candidates = candidates
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="goal-assign-dialog"):
+            yield Static("Assign goal…", id="goal-assign-title")
+            yield Input(placeholder="filter goals…", id="goal-assign-input")
+            yield ListView(id="goal-assign-list")
+            yield Static("enter — assign it · esc — close", id="goal-assign-hint")
+
+    def on_mount(self) -> None:
+        self._rebuild("")
+        self.query_one("#goal-assign-input", Input).focus()
+
+    @on(Input.Changed, "#goal-assign-input")
+    def _input_changed(self, event: Input.Changed) -> None:
+        self._rebuild(event.value.strip().lower())
+
+    def _rebuild(self, query: str) -> None:
+        listing = self.query_one("#goal-assign-list", ListView)
+        listing.clear()
+        for goal in self._candidates:
+            text = f"{_goal_type_marker(goal)} {escape(goal.title_display)}"
+            if goal.status is GoalStatus.DONE:
+                text += " [green]done[/]"
+            hay = f"{goal.title} {goal.id}".lower()
+            if query and query not in hay:
+                continue
+            listing.append(TaskItem(text, None, goal_id=goal.id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(ListView.Selected, "#goal-assign-list")
     def _picked(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem) and item.goal_id:

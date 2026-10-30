@@ -95,16 +95,19 @@ class TaskStatusLayer(DrCodeState):
         try:
             left = self.query_one("#task-status-left", Static)
             right = self.query_one("#task-status-right", Static)
+            extra = self.query_one("#task-status-extra", Static)
         except NoMatches:
             return
         # The new-task form is not tied to any task: keep the bar empty so
         # the previously viewed task doesn't keep updating behind the form.
         if self._new_task_mode:
+            self._set_extra_row(extra, "")
             update_static_if_changed(left, "")
             update_static_if_changed(right, "")
             return
         task = self.viewed
         if task is None:
+            self._set_extra_row(extra, "")
             update_static_if_changed(left, "")
             update_static_if_changed(right, "")
             return
@@ -138,7 +141,12 @@ class TaskStatusLayer(DrCodeState):
             status += f" [{status_color}]⏱ {self._fmt_age(seconds)}[/]"
         parts = [
             kind,
-            f"#{task.id} {escape(task.title_display)}",
+            # The task's own id is a link too: clicking it copies the bare
+            # short id to the clipboard (action_copy_task_id).
+            (
+                f"[@click=app.copy_task_id('{task.id}')]#{task.id}[/] "
+                f"{escape(task.title_display)}"
+            ),
             f"[dim]{created}[/]",
             status,
         ]
@@ -151,8 +159,9 @@ class TaskStatusLayer(DrCodeState):
             parts.append("[red]✗ testing[/]")
         update_static_if_changed(left, "   ".join(parts))
         self._update_ctx_counter(right, task)
+        self._set_extra_row(extra, self._task_status_extra(task))
 
-    def _dependency_status_part(self, task: Task) -> str:
+    def _dependency_status_part(self, task: Task, label: str = "deps: ") -> str:
         """Task-statusbar fragment listing the task's dependencies with
         their per-dependency gate state:
 
@@ -164,7 +173,9 @@ class TaskStatusLayer(DrCodeState):
         - `#id ?` — an id that is not in the manager and has no branch
           (a stale entry; the gate treats it as satisfied).
 
-        Empty string when the task has no dependencies."""
+        Each id is a link that opens the dependency task. Empty string
+        when the task has no dependencies; `label` prefixes the list
+        ("deps: " on the first header row, "depends on: " on the second)."""
         if not task.depends_on:
             return ""
         gate = self._dep_gate.get(task.id, {})
@@ -182,7 +193,74 @@ class TaskStatusLayer(DrCodeState):
                 bits.append(f"[yellow]{link}…[/]")
             else:
                 bits.append(f"[dim]{link}?[/]")
-        return "deps: " + " ".join(bits)
+        return label + " ".join(bits)
+
+    def _task_status_extra(self, task: Task) -> str:
+        """The second header row (under the kind/id/date/status line):
+        the full dependency list with its gate colors, the goal link (or
+        the "+ assign" picker link), the GitHub issue number, the
+        worktree branch (clickable — copies the branch name) and the
+        warning markers that the sidebar also carries (needs_human,
+        unfinished). Fragments the task has none of are omitted; an
+        entirely empty result hides the row (`_set_extra_row`)."""
+        bits: list[str] = []
+        deps = self._dependency_status_part(task, label="depends on: ")
+        if deps:
+            bits.append(deps)
+        # Goal link — a task attached to a product goal opens the
+        # GoalScreen focused on it; a dangling id (the goal was deleted)
+        # is shown dim and keeps the assign link so the user can re-link.
+        goal = (
+            self.manager.goals.get(task.goal_id)
+            if task.goal_id and task.goal_id in self.manager.goals
+            else None
+        )
+        if goal is not None:
+            bits.append(
+                f"[@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
+                f"[magenta]◆[/] {escape(goal.title_display)}[/]"
+            )
+        elif task.goal_id:
+            bits.append(f"[dim]goal: #{task.goal_id} ?[/]")
+        if goal is None:
+            bits.append("[@click=app.assign_goal][blue]+ assign[/][/]")
+        if task.github_issue is not None:
+            bits.append(f"issue: [dim]#{task.github_issue}[/]")
+        if task.isolation_pinned:
+            branch = f"drcode/{task.id}"
+            bits.append(f"[@click=app.copy_task_branch('{branch}')]branch: {branch}[/]")
+        if task.needs_human:
+            bits.append("[bold red]✋ needs human[/]")
+        if task.unfinished:
+            bits.append("[yellow]⏸ unfinished[/]")
+        return "   ".join(bits)
+
+    @staticmethod
+    def _set_extra_row(widget: Static, markup: str) -> None:
+        """Redraw the second header row atomically with the first: the
+        same update-only-on-change pattern, plus the visibility toggle —
+        the row collapses entirely when the task has nothing to show."""
+        if widget.has_class("hidden") == bool(markup):
+            widget.set_class(not markup, "hidden")
+        update_static_if_changed(widget, markup)
+
+    def action_copy_task_id(self, task_id: str) -> None:
+        """Click on the viewed task's own #id in the header: copy the bare
+        short id to the clipboard. A drag-selection ending on the link is
+        copying text, not navigating (same guard as action_open_task)."""
+        if self.screen.selections:
+            return
+        task_id = task_id.lower()
+        self._copy_with_fallback(task_id)
+        self._show_copy_toast(f"#{task_id}")
+
+    def action_copy_task_branch(self, branch: str) -> None:
+        """Click on the `branch: drcode/<id>` fragment: copy the branch
+        name (for a manual merge / checkout)."""
+        if self.screen.selections:
+            return
+        self._copy_with_fallback(branch)
+        self._show_copy_toast(branch)
 
     @staticmethod
     def _fmt_ctx_tokens(n: int) -> str:

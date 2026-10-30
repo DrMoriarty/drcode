@@ -503,40 +503,15 @@ class SidebarLayer(DrCodeState):
         )
         items: list[TaskItem] = []
         keys: set[tuple[str, str]] = set()
-        for name, tasks in self._sidebar_sections():
-            keys.add(("header", name))
-            # A collapsed section keeps only its header line: the "+" shows
-            # there is content hidden underneath, "-" means fully expanded.
-            collapsed = name in self._collapsed_sections
-            marker = "+" if collapsed else "-"
-            items.append(
-                self._sidebar_row(
-                    ("header", name),
-                    f"{marker} {name} ({len(tasks)})",
-                    header=True,
-                    section=name,
-                )
-            )
-            if collapsed:
-                continue
-            for t in tasks:
-                keys.add(("task", t.id))
-                items.append(
-                    self._sidebar_row(
-                        ("task", t.id),
-                        self._task_row_text(t),
-                        task_id=t.id,
-                        viewed=t.id == self.viewed_id,
-                    )
-                )
 
         # -- GOALS section -----------------------------------------------------
-        # Unlike the pipeline sections above (which vanish when empty and
-        # hide their rows when collapsed), the goals block is never fully
-        # hidden: the counters stay visible even collapsed — a collapsed
-        # GOALS keeps its header plus the top-level rows (only the
-        # sub-goal tree is folded away). The trailing "+ add goal" row is
-        # the capture shortcut (the same dialog as Ctrl+Y).
+        # Built FIRST so the block sits at the very top of the sidebar,
+        # above the pipeline sections. Unlike those (which vanish when
+        # empty and hide their rows when collapsed), the goals block is
+        # never fully hidden: the counters stay visible even collapsed —
+        # a collapsed GOALS keeps its header plus the top-level rows
+        # (only the sub-goal tree is folded away). The trailing "+ add
+        # goal" row is the capture shortcut (the same dialog as Ctrl+Y).
         goals_rows = self._goals_section_rows()
         goals_header = self._sidebar_row(
             ("header", "GOALS"),
@@ -567,6 +542,34 @@ class SidebarLayer(DrCodeState):
                 goal_add=True,
             )
         )
+
+        for name, tasks in self._sidebar_sections():
+            keys.add(("header", name))
+            # A collapsed section keeps only its header line: the "+" shows
+            # there is content hidden underneath, "-" means fully expanded.
+            collapsed = name in self._collapsed_sections
+            marker = "+" if collapsed else "-"
+            items.append(
+                self._sidebar_row(
+                    ("header", name),
+                    f"{marker} {name} ({len(tasks)})",
+                    header=True,
+                    section=name,
+                )
+            )
+            if collapsed:
+                continue
+            for t in tasks:
+                keys.add(("task", t.id))
+                items.append(
+                    self._sidebar_row(
+                        ("task", t.id),
+                        self._task_row_text(t),
+                        task_id=t.id,
+                        viewed=t.id == self.viewed_id,
+                    )
+                )
+
         # Rows whose key disappeared: drop from the tracking dict and
         # remove. The removal is async (a Prune round-trip), so a row can
         # linger in the DOM for a moment — the sidebar's click handler

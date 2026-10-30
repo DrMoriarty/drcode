@@ -1526,11 +1526,19 @@ async def test_sidebar_header_enter_and_space_collapse_section(app: DrCodeApp) -
         sidebar = app.sidebar
         sidebar.focus()
         await pilot.pause()
-        await pilot.press("down")
-        header = sidebar.highlighted_child
-        assert isinstance(header, TaskItem)
-        assert header.section is not None
-        section = header.section
+        # The always-mounted GOALS block leads the sidebar; the test
+        # targets the first PIPELINE section below it.
+        section = next(
+            item.section
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.section not in (None, "GOALS")
+        )
+        header = next(
+            item
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.section == section
+        )
+        sidebar.index = sidebar._nodes.index(header)
         row_count = len(sidebar.children)
         assert row_count > 1
 
@@ -1566,13 +1574,13 @@ async def test_sidebar_header_click_toggles_section(app: DrCodeApp) -> None:
         section = next(
             item.section
             for item in sidebar.children
-            if isinstance(item, TaskItem) and item.section is not None
+            if isinstance(item, TaskItem) and item.section not in (None, "GOALS")
         )
         row_count = len(sidebar.children)
         header = next(
             item
             for item in sidebar.children
-            if isinstance(item, TaskItem) and item.section
+            if isinstance(item, TaskItem) and item.section == section
         )
         # Click the header row: collapses (only the header stays of the
         # section; the always-mounted GOALS header + add-row keep it at 3).
@@ -1580,8 +1588,13 @@ async def test_sidebar_header_click_toggles_section(app: DrCodeApp) -> None:
         await pilot.pause()
         assert section in app._collapsed_sections
         assert len(sidebar.children) == 3
-        # Click again: expands.
-        header = sidebar.children[0]
+        # Click again: expands. (The always-mounted GOALS block now leads
+        # the list; the clicked section's header sits after it.)
+        header = next(
+            item
+            for item in sidebar.children
+            if isinstance(item, TaskItem) and item.section == section
+        )
         await pilot.click(header)
         await pilot.pause()
         assert section not in app._collapsed_sections

@@ -161,10 +161,10 @@ async def test_promoted_tasks_land_below_their_section_header(
             for w in app.sidebar.children
             if isinstance(w, TaskItem) and not (w.goal_id or w.goal_add)
         ]
-        # The GOALS section (header + the "+ add goal" row) trails the
+        # The GOALS section (header + the "+ add goal" row) leads the
         # pipeline sections and always stays mounted; only its rows are
         # goal-bound and excluded above.
-        assert children == ["ACTIVE", a.id, b.id, "GOALS"]
+        assert children == ["GOALS", "ACTIVE", a.id, b.id]
 
 
 async def test_removed_task_drops_its_row(app: DrCodeApp, two_tasks) -> None:

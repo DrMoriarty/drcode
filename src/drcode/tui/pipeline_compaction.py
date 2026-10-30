@@ -845,7 +845,7 @@ class PipelineCompactionLayer(DrCodeState):
             self.view_task(task.id)
 
     async def _maybe_compact_tester_round(
-        self, task: Task, live_tokens: int | None
+        self, task: Task, live_tokens: int | None, *, force: bool = False
     ) -> bool:
         """Compaction gate for the current testing round, called after
         run_tester paused the round at a tool boundary.
@@ -859,6 +859,16 @@ class PipelineCompactionLayer(DrCodeState):
         mechanical-floor guarantees apply: when the summarizer cannot be
         run, the round is trimmed mechanically instead of looping through a
         guaranteed failure.
+
+        With ``force=True`` the threshold gate is bypassed: the call
+        recovers a round the model has ALREADY rejected with a
+        deterministic context overflow (the round died on its request, so
+        no tool boundary — the only point the ordinary gate fires at — was
+        ever reached; the #f425b421 class). A forced pass always compacts
+        at the hard-limit level (a failing summarizer escalates to the
+        mechanical trim), skips the livelock bookkeeping (the CALLER bounds
+        a forced recovery to a single retry) and measures the fill from the
+        persisted round when no live reading exists.
 
         Returns True when the round was compacted: run_tester must resume
         it as a continuation turn from the compacted transcript (and drop
@@ -888,14 +898,17 @@ class PipelineCompactionLayer(DrCodeState):
         tokens = self._fill_over_threshold(
             live_tokens, round_messages, AgentRole.TESTER
         )
-        # Under the threshold: credit progress toward the progress-gated
-        # reset of the threshold-livelock counter (a single observation
-        # proves nothing — see _threshold_observation); over it: break
-        # the streak.
-        self._threshold_observation(task, tokens, self._tester_threshold_compactions)
-        if tokens is None:
-            return False
-        hard = (
+        if not force:
+            # Under the threshold: credit progress toward the progress-gated
+            # reset of the threshold-livelock counter (a single observation
+            # proves nothing — see _threshold_observation); over it: break
+            # the streak.
+            self._threshold_observation(
+                task, tokens, self._tester_threshold_compactions
+            )
+            if tokens is None:
+                return False
+        hard = force or (
             self._fill_over_hard_limit(live_tokens, round_messages, AgentRole.TESTER)
             is not None
         )
@@ -904,6 +917,11 @@ class PipelineCompactionLayer(DrCodeState):
             # any) landed — the consecutive hard-compaction counter of the
             # livelock guard starts over.
             self._hard_limit_compactions.pop(task.id, None)
+        if tokens is None:
+            # Forced pass: the threshold gate did not fire (the live
+            # reading is stale or absent — the request died before it) —
+            # measure the fill from the persisted round itself.
+            tokens = self._messages_estimate(round_messages) or 1
         pct = round(
             tokens * 100 / self.resolved_config(AgentRole.TESTER).max_context_tokens
         )
@@ -919,7 +937,7 @@ class PipelineCompactionLayer(DrCodeState):
                 # gate bypass or pause→resume would loop forever.
                 self._hard_limit_exhausted.add(task.id)
             return False
-        if self._livelock_stop(
+        if not force and self._livelock_stop(
             task,
             self._hard_limit_compactions
             if hard

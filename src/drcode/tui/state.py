@@ -554,8 +554,12 @@ class DrCodeState(App[None]):
     async def _maybe_compact(self, task: Task) -> None: ...
 
     async def _maybe_compact_tester_round(
-        self, task: Task, live_tokens: int | None
+        self, task: Task, live_tokens: int | None, *, force: bool = False
     ) -> bool: ...
+
+    def _mechanical_framing(
+        self, task: Task, role: AgentRole
+    ) -> tuple[int, int, int] | None: ...
 
     def _schedule_tester_retry(self, task_id: str) -> None: ...
 
@@ -697,6 +701,10 @@ class DrCodeState(App[None]):
     _tester_retry_at: dict[str, float]
     _tester_net_count: dict[str, int]
     _tester_resume_round: set[str]
+    # Tasks whose testing round already burned its ONE forced-compaction
+    # recovery of a deterministic context-overflow rejection (see
+    # run_tester's overflow branch): a second overflow gives the round up.
+    _tester_overflow_retried: set[str]
 
     # -- merge-conflict resolver bookkeeping (single-slot worker) -----------
     _resolver_running: bool

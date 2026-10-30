@@ -70,7 +70,11 @@ from ..tools import scratch_dir
 from .blocks import ToolCallBlock
 from .pipeline_stream import NodeStreamView
 from .state import DrCodeState
-from .usage import NETWORK_RETRIES, _is_retryable_network_error
+from .usage import (
+    NETWORK_RETRIES,
+    _is_context_overflow_error,
+    _is_retryable_network_error,
+)
 
 # How many failed resolver attempts each error class gets before the
 # round gives up and a human takes over (the resolver is unattended by
@@ -380,6 +384,19 @@ class PipelineResolverLayer(DrCodeState):
             raise
         except Exception as e:  # noqa: BLE001 - resolver errors must be visible
             self._persist_resolver_messages(task, run)
+            if _is_context_overflow_error(e):
+                # Deterministic rejection (HTTP 400 "context length
+                # exceeded"): every replay of the same round is guaranteed
+                # the same 400, so the retry budget below would only delay
+                # the inevitable — hand the parked conflict to a human now.
+                self._show_event(
+                    task,
+                    f"The resolver model rejects the round with a context "
+                    f"overflow ({type(e).__name__}) — retrying cannot help, "
+                    "a human takes over.",
+                )
+                await self._give_up_to_human(task, root, base)
+                return
             network = _is_retryable_network_error(e)
             if network:
                 attempt = self._resolver_net_count.get(task_id, 0) + 1

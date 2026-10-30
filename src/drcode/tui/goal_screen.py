@@ -16,8 +16,9 @@
   tree with n/m progress counters, a status filter, Enter-expandable
   description/notes details and the keyboard action set
   (N/R/T/E/M/A/Ctrl+Up/Down/Esc). The tree itself is collapsible:
-  → (a button and the Right key) toggles the cursor goal's subtree,
-  ← (a button and the Left key) lifts the cursor to the parent goal. The screen is a viewer + decision pad:
+  → (a button and the Right key) toggles the cursor goal's sub-goals
+  and detail rows together, ← (a button and the Left key) lifts the
+  cursor to the parent goal. The screen is a viewer + decision pad:
   every mutation goes through the app's goal actions layer
   (``tui.actions_goals``), which owns persistence and sidebar refresh.
 """
@@ -532,7 +533,8 @@ class GoalScreen(ModalScreen[None]):
     from the goal (the standard Ctrl+N form with the link preset) · E
     edit description/notes · M reparent (picker or Make top-level) · A
     archive/unarchive · Ctrl+Up/Down reorder among siblings · F cycle
-    the status filter · → expand/collapse the cursor goal's subtree ·
+    the status filter · → expand/collapse the cursor goal's sub-goals
+    AND its detail rows together ·
     ← lift the cursor to the parent goal · Esc close."""
 
     BINDINGS: ClassVar = [
@@ -607,8 +609,9 @@ class GoalScreen(ModalScreen[None]):
         # (Enter toggles; session state, not persisted).
         self._expanded: set[str] = set()
         # Goal ids whose sub-goal subtrees are hidden (the → button /
-        # Right key toggles; session state, not persisted). A collapsed
-        # goal still shows its own row, its descendants don't render.
+        # Right key folds it together with the detail rows; session
+        # state, not persisted). A collapsed goal still shows its own
+        # row, its descendants don't render.
         self._collapsed: set[str] = set()
         # The goal a refresh must put the cursor back onto (the ListView
         # index is position-based, a rebuild would drop it).
@@ -694,7 +697,10 @@ class GoalScreen(ModalScreen[None]):
                 yield Button(
                     "→",
                     id="goal-tree-expand",
-                    tooltip="expand/collapse the cursor goal's subtree (Right)",
+                    tooltip=(
+                        "expand/collapse the cursor goal's sub-goals and "
+                        "details (Right)"
+                    ),
                 )
                 yield Button(
                     "←",
@@ -849,18 +855,26 @@ class GoalScreen(ModalScreen[None]):
         self._rebuild()
 
     def action_toggle_subtree(self) -> None:
-        """→ (the button / Right key): collapse the cursor goal's subtree
-        or expand it back. A leaf goal has nothing to toggle."""
+        """→ (the button / Right key): toggle the cursor goal's whole
+        expansion in one move — sub-goals AND the Enter-style detail
+        rows together. When anything is showing (the subtree is open or
+        the details are expanded) both are hidden; otherwise both are
+        expanded back."""
         goal = self._cursor_goal()
         if goal is None:
             return
-        if not self._app().manager.goals.children(goal.id):
-            self.notify(f"#{goal.id} has no sub-goals", title="Goals", timeout=4)
-            return
-        if goal.id in self._collapsed:
-            self._collapsed.discard(goal.id)
+        has_children = bool(self._app().manager.goals.children(goal.id))
+        showing_children = has_children and goal.id not in self._collapsed
+        if showing_children or goal.id in self._expanded:
+            # Hide both: fold the subtree and the detail rows.
+            self._expanded.discard(goal.id)
+            if has_children:
+                self._collapsed.add(goal.id)
         else:
-            self._collapsed.add(goal.id)
+            # Show both: open the subtree and the detail rows.
+            if has_children:
+                self._collapsed.discard(goal.id)
+            self._expanded.add(goal.id)
         self._rebuild()
 
     def action_cursor_parent(self) -> None:

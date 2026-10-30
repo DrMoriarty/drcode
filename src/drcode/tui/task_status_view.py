@@ -172,8 +172,12 @@ class TaskStatusLayer(DrCodeState):
 
         Each id is a link that opens the dependency task. Empty string
         when the task has no dependencies; `label` prefixes the list
-        ("depends on: " on the second header row — the dependency list
-        lives only there, never on the first row)."""
+        ("deps: " on the first header row, "depends on: " on the second).
+
+        The whole fragment is tinted cyan (the dependency-list color of
+        the second header row, distinct from the magenta goal and the
+        blue branch); the per-dependency state colors below override it
+        inside their own spans."""
         if not task.depends_on:
             return ""
         gate = self._dep_gate.get(task.id, {})
@@ -191,7 +195,7 @@ class TaskStatusLayer(DrCodeState):
                 bits.append(f"[yellow]{link}…[/]")
             else:
                 bits.append(f"[dim]{link}?[/]")
-        return label + " ".join(bits)
+        return f"[cyan]{label}{' '.join(bits)}[/]"
 
     def _task_status_extra(self, task: Task) -> str:
         """The second header row (under the kind/id/date/status line):
@@ -217,21 +221,28 @@ class TaskStatusLayer(DrCodeState):
             else None
         )
         if goal is not None:
+            # The goal fragment is magenta (the goal color of this row,
+            # distinct from the cyan deps and the blue branch).
             bits.append(
-                f"[@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
-                f"[magenta]◆[/] {escape(goal.title_display)}[/]"
+                f"[magenta][@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
+                f"◆ {escape(goal.title_display)}[/]"
             )
             bits.append("[@click=app.assign_goal][blue]change[/][/]")
             bits.append("[@click=app.unlink_viewed_goal][red]unlink[/][/]")
         elif task.goal_id:
             bits.append(f"[dim]goal: #{task.goal_id} ?[/]")
         if goal is None:
-            bits.append("[@click=app.assign_goal][blue]+ assign[/][/]")
+            # Same magenta family as the goal fragment it stands in for.
+            bits.append("[@click=app.assign_goal][magenta]+ assign[/][/]")
         if task.github_issue is not None:
             bits.append(f"issue: [dim]#{task.github_issue}[/]")
         if task.isolation_pinned:
+            # The branch fragment is blue (the branch color of this row,
+            # distinct from the cyan deps and the magenta goal).
             branch = f"drcode/{task.id}"
-            bits.append(f"[@click=app.copy_task_branch('{branch}')]branch: {branch}[/]")
+            bits.append(
+                f"[@click=app.copy_task_branch('{branch}')][blue]branch: {branch}[/]"
+            )
         if task.needs_human:
             bits.append("[bold red]✋ needs human[/]")
         if task.unfinished:

@@ -240,19 +240,32 @@ async def test_goal_screen_subtree_toggle(app: DrCodeApp) -> None:
         await pilot.press("right")
         await pilot.pause()
         assert shown() == {parent.id, leaf.id}
-        # Right again expands it back.
+        # Right again expands it back (sub-goals AND the detail rows).
         await pilot.press("right")
         await pilot.pause()
         assert shown() == {parent.id, child.id, grandchild.id, leaf.id}
-        # A leaf goal has nothing to toggle.
+        assert screen._expanded == {parent.id}
+        assert screen._collapsed == set()
+
+        def row_count() -> int:
+            return len(listing.children)
+
+        # A leaf goal toggles its detail rows only (no sub-goals).
         listing.index = next(
             i
             for i, w in enumerate(listing.children)
             if isinstance(w, TaskItem) and w.goal_id == leaf.id
         )
+        before = row_count()
         await pilot.press("right")
         await pilot.pause()
-        assert shown() == {parent.id, child.id, grandchild.id, leaf.id}
+        assert leaf.id in screen._expanded
+        assert row_count() > before
+        # Right hides the leaf's details again.
+        await pilot.press("right")
+        await pilot.pause()
+        assert leaf.id not in screen._expanded
+        assert row_count() == before
         # The → button does the same as the key.
         listing.index = 0
         screen.query_one("#goal-tree-expand", Button).press()

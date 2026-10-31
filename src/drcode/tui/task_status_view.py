@@ -213,7 +213,7 @@ class TaskStatusLayer(DrCodeState):
     def _task_status_extra(self, task: Task) -> str:
         """The second header row (under the kind/id/date/status line):
         the full dependency list with its gate colors, the goal link
-        with its re-assign/unlink fragments (or the "+ assign" picker
+        with its ✏/✕ icon fragments (or the "+ assign" picker
         link when unattached), the GitHub issue number, the worktree
         branch (clickable — copies the branch name) and the warning
         markers that the sidebar also carries (needs_human,
@@ -224,24 +224,28 @@ class TaskStatusLayer(DrCodeState):
         if deps:
             bits.append(deps)
         # Goal link — a task attached to a product goal opens the
-        # GoalScreen focused on it, with "change" (re-assign to another
-        # goal via the picker) and "unlink" right beside it; a dangling
-        # id (the goal was deleted) is shown dim and keeps the assign
-        # link so the user can re-link.
+        # GoalScreen focused on it, with the ✏ (re-assign to another
+        # goal via the picker) and ✕ (detach) icon buttons before the
+        # goal title — the leftmost fragments of the goal group; a
+        # dangling id (the goal was deleted) is shown dim and keeps the
+        # assign link so the user can re-link.
         goal = (
             self.manager.goals.get(task.goal_id)
             if task.goal_id and task.goal_id in self.manager.goals
             else None
         )
         if goal is not None:
+            # The two compact icon buttons come first (left of the goal
+            # fragment): ✏ opens the assign picker, ✕ detaches the task
+            # from the goal.
+            bits.append("[@click=app.assign_goal][blue]✏[/][/]")
+            bits.append("[@click=app.unlink_viewed_goal][red]✕[/][/]")
             # The goal fragment is magenta (the goal color of this row,
             # distinct from the cyan deps and the blue branch).
             bits.append(
                 f"[magenta][@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
                 f"◆ {escape(goal.title_display)}[/]"
             )
-            bits.append("[@click=app.assign_goal][blue]change[/][/]")
-            bits.append("[@click=app.unlink_viewed_goal][red]unlink[/][/]")
         elif task.goal_id:
             bits.append(f"[dim]goal: #{task.goal_id} ?[/]")
         if goal is None:

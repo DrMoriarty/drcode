@@ -30,11 +30,15 @@ from ..providers import (
 from .command_providers import (
     ModelCatalogCommandProvider,
     ModelSettingsPalette,
-    RoleModelsCommandsProvider,
+    ProjectModelSettingsCommandProvider,
     SettingsPalette,
     role_model_options_provider,
 )
 from .model_setup_app import ModelCatalogScreen
+from .project_model_settings_dialog import (
+    ProjectModelSettingsDialog,
+    ProjectModelSettingsResult,
+)
 from .setup_dialog import ModelSetup, ModelSetupDialog
 from .state import DrCodeState
 
@@ -55,19 +59,97 @@ def custom_entry_from_setup(setup: ModelSetup) -> CustomModelEntry:
 
 class ModelSelectionLayer(DrCodeState):
     def action_open_model_settings(self) -> None:
-        """Open the "Model settings…" sub-menu: the provider catalog editor
-        and one model picker per agent role, in one palette. Runs as the
-        callback of a palette entry — the palette has already dismissed
-        itself by the time this executes, so pushing the sub-palette is
-        safe."""
+        """Open the "Model settings…" sub-menu: the provider catalog
+        editor and the single "Project model settings…" entry (the
+        per-role model/max_tokens form). Runs as the callback of a
+        palette entry — the palette has already dismissed itself by the
+        time this executes, so pushing the sub-palette is safe."""
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(
             ModelSettingsPalette(
                 id="--model-settings-palette",
-                providers=[ModelCatalogCommandProvider, RoleModelsCommandsProvider],
+                providers=[
+                    ModelCatalogCommandProvider,
+                    ProjectModelSettingsCommandProvider,
+                ],
                 placeholder="Model settings…",
             )
+        )
+
+    # -- project model settings dialog ----------------------------------------
+
+    def action_open_project_model_settings(self) -> None:
+        """Open the per-role "Project model settings…" modal form: model
+        selection plus the max_tokens override for every agent role, in
+        one dialog with atomic Apply. Runs as the callback of a palette
+        entry — the palette has already dismissed itself by the time
+        this executes, so pushing the dialog is safe."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        resolved = {role: self.resolved_config(role) for role in AgentRole}
+        self.push_screen(
+            ProjectModelSettingsDialog(self.project_root, resolved),
+            self._project_model_settings_done,
+        )
+
+    def _project_model_settings_done(
+        self, result: ProjectModelSettingsResult | None
+    ) -> None:
+        if result is None:
+            return  # ESC / Cancel — nothing persisted.
+        try:
+            # New/changed free-form custom models first: set_project_custom_
+            # model stores the entry AND activates it ("custom" slot).
+            for role, entry in result.customs.items():
+                set_project_custom_model(self.project_root, role, entry)
+            current_slots = load_project_model_slots(self.project_root)
+            for role, slot in result.slots.items():
+                if role in result.customs or slot == current_slots.get(role):
+                    continue  # already activated / untouched
+                if isinstance(slot, ModelRef):
+                    set_project_model(self.project_root, role, slot)
+                elif slot == "custom":
+                    set_project_custom_active(self.project_root, role)
+                else:
+                    set_project_model(self.project_root, role, None)
+        except OSError as e:
+            self.notify(
+                f"Could not write the project config: {e}",
+                title="Project model settings",
+                severity="error",
+                timeout=8,
+            )
+            return
+        # The per-role max_tokens overrides live in the project settings
+        # (merged against the STORED file, not just the live object — the
+        # live one may predate an external edit).
+        stored = dict(self.settings_store.load().role_max_tokens)
+        merged = dict(stored)
+        for role in AgentRole:
+            merged.pop(role.value, None)
+        for role, value in result.role_max_tokens.items():
+            merged[role.value] = value
+        self.settings.role_max_tokens = merged
+        if merged != stored:
+            self.settings_store.save(self.settings)
+        self.invalidate_resolved_configs()
+        self.refresh_connection()
+        self.refresh_status()
+        self._advance()
+        overrides = (
+            ", ".join(
+                f"{role.value}={value}"
+                for role, value in sorted(
+                    result.role_max_tokens.items(), key=lambda kv: kv[0].value
+                )
+            )
+            or "no max_tokens overrides"
+        )
+        self.notify(
+            f"Project model settings applied ({overrides})",
+            title="Project model settings",
+            timeout=4,
         )
 
     # -- per-role model selection ---------------------------------------------

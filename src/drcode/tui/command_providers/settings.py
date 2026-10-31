@@ -207,8 +207,9 @@ class SettingsPalette(CommandPalette):
     # ("Quit"). Head block per the current UX convention: Keys, Screenshot,
     # Theme, then the "Find task…" action; Quit is pinned to the very end.
     # The model-related entries
-    # (provider catalog + per-role picks) live in the "Model settings…"
-    # sub-menu (ModelSettingsPalette), and the six task-management
+    # (provider catalog + the per-role project settings form) live in
+    # the "Model settings…" sub-menu (ModelSettingsPalette), and the six
+    # task-management
     # preferences live in the "Task settings…" sub-menu
     # (TaskSettingsPalette) — not here.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
@@ -284,21 +285,19 @@ class ModelSettingsPalette(SettingsPalette):
     """Sub-menu of the Settings palette with the model-related entries.
 
     Opened from the single "Model settings…" entry of the main Settings
-    menu: the user-level provider catalog editor plus one model picker per
-    agent role. Same narrowed layout and spaced list as the parent; the
-    entry order is its own (model entries only), so the shared prefix-sort
-    in `SettingsPalette._entry_rank` orders this menu independently.
+    menu: the user-level provider catalog editor plus the single
+    "Project model settings…" entry (the per-role model/max_tokens
+    form — it replaced the old one-picker-per-role entries). Same
+    narrowed layout and spaced list as the parent; the entry order is
+    its own (model entries only), so the shared prefix-sort in
+    `SettingsPalette._entry_rank` orders this menu independently.
     """
 
     # Same prefix-matching contract as SettingsPalette.ENTRY_ORDER, but
-    # scoped to this sub-menu: the provider-catalog entry first, then the
-    # four role pickers in pipeline order.
+    # scoped to this sub-menu.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Provider catalog…",
-        "Coding model:",
-        "Research model:",
-        "Tester model:",
-        "Compaction model:",
+        "Project model settings…",
     )
 
 
@@ -399,7 +398,7 @@ class ModelSettingsCommandProvider(CommandListProvider):
     """The single "Model settings…" entry in the main Settings palette.
 
     Opens the ModelSettingsPalette sub-menu with the provider catalog
-    editor and the per-role model pickers.
+    editor and the per-role project model settings form.
     """
 
     def _commands(self) -> list[CommandEntry]:

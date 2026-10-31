@@ -289,6 +289,53 @@ def test_store_git_policy_roundtrip(project_root: Path) -> None:
     assert "task_finalization" not in data
 
 
+# -- role_max_tokens -----------------------------------------------------------------
+
+
+def test_role_max_tokens_default_empty() -> None:
+    """No overrides by default: every role inherits (the catalog entry's
+    max_tokens or the flat-config default)."""
+    assert ProjectSettings().role_max_tokens == {}
+
+
+def test_store_role_max_tokens_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    settings = ProjectSettings(role_max_tokens={"tester": 32768, "resolver": 16384})
+    store.save(settings)
+    assert store.load() == settings
+    # Persisted as the raw string-keyed dict in settings.json.
+    data = json.loads(store.path.read_text())
+    assert data["role_max_tokens"] == {"tester": 32768, "resolver": 16384}
+
+
+def test_role_max_tokens_invalid_entries_dropped() -> None:
+    """Unknown role keys and non-positive values are dropped at load —
+    a stray entry must not invalidate the whole settings file."""
+    settings = ProjectSettings(
+        role_max_tokens={
+            "tester": 16384,
+            "bogus": 4096,  # not an AgentRole value
+            "coding": 0,  # not positive
+            "resolver": -1,  # not positive
+        }
+    )
+    assert settings.role_max_tokens == {"tester": 16384}
+
+
+def test_store_role_max_tokens_stale_entries_dropped(
+    project_root: Path,
+) -> None:
+    """The same filtering runs on the raw json layer (the persisted
+    file, not just the constructor): unknown keys and non-numeric or
+    non-positive values are dropped, valid ones survive."""
+    store = _write_raw_settings(
+        project_root,
+        {"role_max_tokens": {"tester": 16384, "bogus": 7, "coding": 0}},
+    )
+    loaded = store.load()
+    assert loaded.role_max_tokens == {"tester": 16384}
+
+
 # -- Legacy task_finalization migration ------------------------------------------
 
 

@@ -29,6 +29,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -601,7 +602,9 @@ def child_priority_kwargs() -> dict[str, Any]:
     Merge into every subprocess spawn of background work (both the sync
     `subprocess.run`/`Popen` and the async `asyncio.create_subprocess_*`,
     which forwards **kwds to `subprocess.Popen`). POSIX uses preexec_fn with
-    os.nice — deliberately NOT a `nice …` wrapper in a command string: the
+    os.nice plus start_new_session (own process group, detached from the
+    TUI's tty — see _kill_proc) — deliberately NOT a `nice …` wrapper in a
+    command string: the
     run_bash command line is inspected verbatim (COMMAND_WRAPPERS) and a
     wrapper would distort that inspection. Windows uses
     BELOW_NORMAL_PRIORITY_CLASS. Unknown platforms get no kwargs.
@@ -615,7 +618,13 @@ def child_priority_kwargs() -> dict[str, Any]:
             )
         }
     if os.name == "posix":  # Linux, macOS (darwin), the BSDs, ...
-        return {"preexec_fn": _nice_child}
+        # start_new_session (setsid) detaches the child from the TUI's
+        # controlling terminal and makes it a process-group leader of its
+        # own — that is what lets a timeout/cancel kill take down the whole
+        # child tree with one killpg (see _kill_proc): without it grandchildren
+        # survive the shell's death, reparent to init and keep the TUI's tty
+        # open as competing stdin readers (the input-stealing incident).
+        return {"preexec_fn": _nice_child, "start_new_session": True}
     return {}
 
 
@@ -728,6 +737,12 @@ async def run_bash(
         command,
         cwd=root,
         env=env,
+        # stdin is DEVNULL, never the inherited tty: run_bash offers no
+        # interactive input anyway, and a child that would block on a prompt
+        # (npm exec's "Ok to proceed? (y)") instead gets EOF and dies fast —
+        # it must not sit forever reading the TUI's keystrokes (the
+        # input-stealing incident).
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **child_priority_kwargs(),
@@ -757,13 +772,26 @@ async def run_bash(
 
 
 def _kill_proc(proc: asyncio.subprocess.Process) -> None:
-    """Kill the child if it is still alive.
+    """Kill the child — and its whole process group — if still alive.
+
+    run_bash spawns the child in its own session (start_new_session), so the
+    shell's pid is also its process-group id and one killpg takes down the
+    grandchildren (npm/node/…) that would otherwise survive the shell's
+    SIGKILL, reparent to init and keep the TUI's tty open as competing stdin
+    readers. The fallback to a plain kill covers a child that is not a group
+    leader (spawned elsewhere) or a group that has already gone away.
 
     The kill races the child's own exit: a cancellation can land after
     communicate() has already reaped the process and closed its transport,
-    and then send_signal raises ProcessLookupError — which is exactly the
+    and then the signal raises ProcessLookupError — which is exactly the
     "already dead" outcome the kill was aiming for, never a real failure.
     """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # not a group leader / already dead / partial permission
     try:
         proc.kill()
     except ProcessLookupError:

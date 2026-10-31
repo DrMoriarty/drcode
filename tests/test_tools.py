@@ -898,10 +898,13 @@ def test_clamp_bash_timeout() -> None:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX preexec_fn nice")
 def test_child_priority_kwargs_posix() -> None:
-    # POSIX: a preexec_fn that nices the child; no other platform kwargs.
+    # POSIX: a preexec_fn that nices the child plus start_new_session — the
+    # child gets its own process group (grandchildren die with it on
+    # timeout/cancel) and no controlling tty.
     kwargs = tools.child_priority_kwargs()
-    assert set(kwargs) == {"preexec_fn"}
+    assert set(kwargs) == {"preexec_fn", "start_new_session"}
     assert callable(kwargs["preexec_fn"])
+    assert kwargs["start_new_session"] is True
 
 
 def test_child_priority_kwargs_windows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -966,6 +969,45 @@ def test_run_bash_kill_tolerates_already_reaped_process() -> None:
         tools._kill_proc(proc)  # must not raise
 
     asyncio.run(_scenario())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_run_bash_timeout_kills_grandchildren(project_root: Path) -> None:
+    # The timeout kill must take down the WHOLE process group: a grandchild
+    # surviving the shell's SIGKILL reparents to init and keeps the TUI's
+    # controlling tty open as a competing stdin reader (the input-stealing
+    # incident). `sh -c 'sleep 30 …' & wait` leaves exactly such a grandchild.
+    marker = f"drcode-grandchild-{os.getpid()}"
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            f"sh -c 'sleep 30 # {marker}' & wait",
+            timeout=1,
+        )
+    )
+    assert "timed out" in out
+    leftover = subprocess.run(
+        ["pgrep", "-f", marker], check=False, capture_output=True, text=True
+    )
+    assert leftover.returncode != 0  # no surviving grandchild
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tty semantics")
+def test_run_bash_child_stdin_is_not_a_tty(project_root: Path) -> None:
+    # The child's stdin is DEVNULL, never the inherited tty: an interactive
+    # prompt (npm exec's "Ok to proceed? (y)") gets EOF instead of hanging
+    # forever with the TUI's keystrokes on the line.
+    out = asyncio.run(run_bash(project_root, "[ -t 0 ] && echo tty || echo notty"))
+    assert out == "exit=0\nnotty"
+
+
+def test_run_bash_child_stdin_reads_eof(project_root: Path) -> None:
+    # A stdin-reading child (cat) must exit immediately on EOF — with the
+    # inherited tty stdin it would hang until the timeout instead.
+    out = asyncio.run(
+        run_bash(project_root, f'"{sys.executable}" -c "import sys; sys.stdin.read()"')
+    )
+    assert out == "exit=0\n(no output)"
 
 
 def test_run_bash_output_truncated(project_root: Path, monkeypatch) -> None:

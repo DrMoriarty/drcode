@@ -418,8 +418,8 @@ async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         app._write_clarification(
-            Clarification(
-                question="Register the poll?",
+            Clarification.single(
+                "Register the poll?",
                 options=[
                     "Да, заведи багрепорт",
                     (
@@ -447,9 +447,7 @@ async def test_clarification_render_stars_agent_options(app: DrCodeApp) -> None:
         )
 
         # Without agent options: no star, no footnote.
-        app._write_clarification(
-            Clarification(question="Which one?", options=["a", "b"])
-        )
+        app._write_clarification(Clarification.single("Which one?", ["a", "b"]))
         await pilot.pause()
         tail = rendered().split("Which one?")[1]
         assert "★" not in tail
@@ -472,8 +470,8 @@ async def test_clarification_render_agent_proposals_block(app: DrCodeApp) -> Non
     async with app.run_test() as pilot:
         await pilot.pause()
         app._write_clarification(
-            Clarification(
-                question="Which fix?",
+            Clarification.single(
+                "Which fix?",
                 options=["Откатить миграцию", "Починить индекс"],
                 agent_proposals=["Заведи багрепорт: зависшие job_runs"],
             )
@@ -497,8 +495,8 @@ async def test_clarification_render_agent_proposals_block(app: DrCodeApp) -> Non
         )
 
         # Legacy stored clarification without the field: plain render.
-        legacy = Clarification(question="Which one?", options=["a", "b"])
-        assert legacy.agent_proposals == []
+        legacy = Clarification.single("Which one?", ["a", "b"])
+        assert legacy.questions[0].agent_proposals == []
         app._write_clarification(legacy)
         await pilot.pause()
         tail = rendered().split("Which one?")[1]
@@ -513,8 +511,8 @@ async def test_pick_option_accepts_agent_proposal_index(app: DrCodeApp) -> None:
     from drcode.models import Clarification
 
     task = app.manager.create("feature", "prompt")
-    task.clarification = Clarification(
-        question="Which fix?",
+    task.clarification = Clarification.single(
+        "Which fix?",
         options=["Откатить миграцию"],
         agent_proposals=["Заведи багрепорт: зависшие job_runs"],
     )
@@ -536,6 +534,113 @@ async def test_pick_option_accepts_agent_proposal_index(app: DrCodeApp) -> None:
         app.action_pick_option(-1)
         await pilot.pause()
         assert list(task.pending_input) == pending_before
+
+
+async def test_clarification_package_render_per_question(app: DrCodeApp) -> None:
+    """A batched package renders EVERY question with its own clickable
+    options; package options carry the question index in the click id
+    (app.pick_option(<q>, <i>)) and the questions are numbered."""
+    from drcode.models import Clarification, ClarificationItem
+
+    def rendered() -> str:
+        return "\n".join(
+            str(w.content)  # pyright: ignore[reportAttributeAccessIssue]
+            for w in app.query(".chat-block")
+        )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._write_clarification(
+            Clarification(
+                questions=[
+                    ClarificationItem(
+                        question="Какая БД?", options=["Postgres", "SQLite"]
+                    ),
+                    ClarificationItem(
+                        question="Завести задачу?",
+                        agent_proposals=["Да, заведи багрепорт"],
+                    ),
+                ]
+            )
+        )
+        await pilot.pause()
+        text = rendered()
+    # Both questions render, numbered in order.
+    assert "1. Какая БД?" in text
+    assert "2. Завести задачу?" in text
+    # Question 0's options: flat within the question but question-indexed.
+    assert "[@click=app.pick_option(0,0)][underline cyan]Postgres[/]" in text
+    assert "[@click=app.pick_option(0,1)][underline cyan]SQLite[/]" in text
+    # Question 1's proposal: starred, index 0 WITHIN its question.
+    assert (
+        "[bold yellow]★[/] [@click=app.pick_option(1,0)]"
+        "[underline cyan]Да, заведи багрепорт[/]" in text
+    )
+
+
+async def test_pick_option_in_package_collects_combined_answer(
+    app: DrCodeApp,
+) -> None:
+    """Clicking an option in a BATCHED package does not send alone: it fills
+    the question's line in the chat input, and submitting sends all the
+    lines as ONE pending_input (one line per question, newline-joined)."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(question="Какая БД?", options=["Postgres", "SQLite"]),
+            ClarificationItem(question="Завести задачу?", options=["Да", "Нет"]),
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Click q1's second option, then q2's first one.
+        app.action_pick_option(0, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "SQLite"
+        app.action_pick_option(1, 0)
+        await pilot.pause()
+        # The draft holds one line per question, in question order.
+        assert app.chat_input.text == "SQLite\nДа"
+        # Enter (submit) sends the combined answer as a single pending_input
+        # entry (after the creation prompt that is still queued).
+        app.submit_chat_input()
+        await pilot.pause()
+        assert [e.text for e in task.pending_input][-1] == "SQLite\nДа"
+        # The draft state is consumed: the input is empty again.
+        assert app.chat_input.text == ""
+        # Stale picks do not leak into a fresh package render.
+        task.clarification = Clarification.single("next round?")
+        app._write_clarification(task.clarification)
+        await pilot.pause()
+        assert app._clarification_picks == {}
+
+
+async def test_pick_option_package_keeps_typed_free_text(app: DrCodeApp) -> None:
+    """Free text typed into a question's line survives a later click: the
+    draft adopts the current input lines before adding the picked option."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(question="Какая БД?"),
+            ClarificationItem(question="Завести задачу?", options=["Да", "Нет"]),
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # The user typed a free-text answer for question 1...
+        app.chat_input.load_text("SQLite, но с миграцией")
+        # ...then clicked question 2's option.
+        app.action_pick_option(1, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "SQLite, но с миграцией\nНет"
 
 
 async def test_fat_live_write_mounts_through_drain(app: DrCodeApp) -> None:

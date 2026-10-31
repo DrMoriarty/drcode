@@ -827,6 +827,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # that a view_task() re-render has already put on screen (which
         # used to show the question twice while the dialog stayed open).
         self._rendered_clarification: Clarification | None = None
+        # Clicked options of the currently open clarification package
+        # (question index → option text), rendered into the chat input as
+        # one line per question and submitted together on Enter — see
+        # action_pick_option. Reset whenever a fresh Clarification is
+        # rendered (_write_clarification) or the input is sent.
+        self._clarification_picks: dict[int, str] = {}
         # Fingerprint of the screen's active bindings at the last footer
         # refresh (refresh_task_status): a bindings publish that changes
         # nothing still recomposes the whole Footer (see the annotation).

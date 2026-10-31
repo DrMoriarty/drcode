@@ -521,7 +521,7 @@ class DrCodeState(App[None]):
 
     def _submit_user_text(self, task: Task, text: str) -> None: ...
 
-    def action_pick_option(self, index: int) -> None: ...
+    def action_pick_option(self, question: int, option: int | None = None) -> None: ...
 
     def _record_stream_tokens(self, task_id: str, text: str) -> None: ...
 
@@ -926,6 +926,10 @@ class DrCodeState(App[None]):
     # (False — checked per chunk, see _drain_chat_batch).
     _chat_batch_follow: bool
     _rendered_clarification: Clarification | None
+    # Answers picked by CLICKING a package question's options (question
+    # index → option text): rendered into the chat input as one line per
+    # question and submitted together on Enter (see action_pick_option).
+    _clarification_picks: dict[int, str]
 
     # -- delta re-render bookkeeping ----------------------------------------
     # When the open chat is a canonical history render (no live/streamed

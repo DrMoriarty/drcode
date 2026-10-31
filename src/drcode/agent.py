@@ -17,6 +17,7 @@ from __future__ import annotations
 from . import agent_model, task_search, tools
 from .agent_build import (
     AgentDeps,
+    ClarifyQuestion,
     ResolutionVerdict,
     ResolverDeps,
     TesterDeps,
@@ -132,6 +133,7 @@ __all__ = [
     "TODO_MIN_ITEMS",
     "AgentDeps",
     "AsyncOpenAI",
+    "ClarifyQuestion",
     "ModelFetchError",
     "ResolutionVerdict",
     "ResolverDeps",

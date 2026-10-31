@@ -80,6 +80,7 @@ class ClarifyQuestion(BaseModel):
     question: str
     options: list[str] | None = None
     proposals: list[str] | None = None
+    multiple: bool = False
 
 
 def _scratch_desc(task_id: str | None) -> str:
@@ -783,35 +784,32 @@ def build_agent(
         questions: list[ClarifyQuestion],
     ) -> str:
         """Ask the user clarifying questions and pause the task until they answer.
-        Put ALL your open questions into ONE call: every item of the
-        `questions` list is an independent question the user answers
-        separately (one pause per run — a re-call while questions are
-        unanswered is refused). Use when the request is ambiguous or a
-        required detail is missing. ALSO use it whenever the user must
-        choose between continuations — including your own initiative
-        proposals ("I can file this as a feature request…"): present the
-        choice through THIS tool with clickable options, never as free-form
-        prose awaiting a reply. When in doubt whether options fit — pass
-        them; clickable options are always better than prose.
+        Put ALL your open questions into ONE call — one pause per run, a
+        re-call while questions are unanswered is refused. Use when the
+        request is ambiguous or a detail is missing, and whenever the user
+        must choose between continuations — including your own initiative
+        proposals ("I can file this as a feature request…"): present choices
+        through THIS tool with clickable options, never as free-form prose;
+        when in doubt whether options fit — pass them, clickable options are
+        always better than prose.
         Each item: `question` (required), optional `options`, optional
-        `proposals`.
-        `options` is an optional list of suggested answers covering ONLY what
-        directly follows from the user's request; omit it when no small set
-        of choices covers the reasonable answers. NEVER mix initiative into
-        `options` and do NOT bundle an initiative item into a package option
-        like "yes: do X + Y + Z, everything at once" — declining the bundle
-        would force declining the requested work too.
+        `proposals`, optional `multiple`.
+        `options` is a list of suggested answers covering ONLY what directly
+        follows from the user's request; NEVER mix initiative into `options`
+        and do NOT bundle an initiative item into a package option like
+        "yes: do X + Y + Z" — declining it would force declining the
+        requested work too.
         `proposals` is an optional list of options you propose on your OWN
-        initiative, beyond the original request (each an independent opt-in,
-        accepted or declined separately from the requested scope). Neither
-        `options` nor `proposals` may contain textual markers like
-        "(agent's suggestion, not from your request)": the separation is
-        structural (the proposals parameter), the UI marks proposals itself.
-        Format of both: lists of FLAT STRINGS — never a dict like
-        {"title": ...}: validation rejects it and the user gets nothing
-        clickable. BREVITY: each option/proposal is a SHORT imperative
-        label (~5-10 words) — reasoning and context go into the question
-        text BEFORE the list, never inside the options."""
+        initiative, beyond the request, each an independent opt-in; the
+        separation is structural, the UI marks proposals itself — no textual
+        markers like "(agent's suggestion, not from your request)" in either
+        list.
+        `multiple: true` = any SUBSET of the options is a valid answer:
+        clicks accumulate, nothing selected means "none of them"; never for
+        mutually exclusive choices.
+        Both lists: FLAT STRINGS, never {"title": ...} — keep each option a
+        SHORT imperative label (~5-10 words); reasoning goes into the
+        question text BEFORE the list, never inside the options."""
         task = ctx.deps.manager.get(ctx.deps.task_id)
         if task.clarification is not None:
             # Structural guard against the one-question-per-call relapse
@@ -836,6 +834,7 @@ def build_agent(
                 question=q.question.strip(),
                 options=[o.strip() for o in (q.options or []) if o.strip()],
                 agent_proposals=[p.strip() for p in (q.proposals or []) if p.strip()],
+                multiple=q.multiple,
             )
             for q in questions
             if q.question.strip()

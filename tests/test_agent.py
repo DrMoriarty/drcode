@@ -1609,6 +1609,30 @@ def test_ask_clarifying_question_batch_saves_all_questions(
     ]
 
 
+def test_ask_clarifying_question_proxies_multiple_flag(
+    fake_config: Config, project_root: Path
+) -> None:
+    """The `multiple` flag rides into the stored ClarificationItem; the
+    default is False (old calls stay single-choice)."""
+    from drcode.agent_build import ClarifyQuestion
+
+    deps = _clarify_deps(project_root)
+    ask = _clarify_tool(fake_config, deps)
+    ask(
+        cast("Any", SimpleNamespace(deps=deps)),
+        questions=[
+            ClarifyQuestion(question="q1?", options=["a", "b"]),
+            ClarifyQuestion(
+                question="q2?", options=["x", "y"], proposals=["z"], multiple=True
+            ),
+        ],
+    )
+    c = deps.manager.get(deps.task_id).clarification
+    assert c is not None and len(c.questions) == 2
+    assert c.questions[0].multiple is False
+    assert c.questions[1].multiple is True
+
+
 def test_ask_clarifying_question_refused_while_pending(
     fake_config: Config, project_root: Path
 ) -> None:

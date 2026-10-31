@@ -553,13 +553,23 @@ class TaskLifecycleLayer(DrCodeState):
     def submit_chat_input(self) -> None:
         """Send the chat editor's content (Enter in the chat input)."""
         text = self.chat_input.text.strip()
-        if not text:
-            return
         task = self.viewed
+        if not text:
+            # An empty Enter over an open MULTIPLE-choice clarification is a
+            # valid "nothing selected" answer (the tool docstring tells the
+            # agent so); without one an empty input stays a no-op.
+            if (
+                task is None
+                or task.clarification is None
+                or not any(q.multiple for q in task.clarification.questions)
+            ):
+                return
+            text = "(nothing)"
         if task is None:
             return
         self.chat_input.clear()
         self._clarification_picks = {}
+        self._clarification_multi = {}
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
@@ -616,16 +626,27 @@ class TaskLifecycleLayer(DrCodeState):
         renders after `options` with continuing indices), so a click on a
         proposal submits the proposal text itself.
 
-        A single-question package keeps the flat click id
-        (app.pick_option(<i>), `option` is None) and submits immediately —
-        the legacy one-question flow. A batched package's options carry the
-        question index (app.pick_option(<q>, <i>)): the click does NOT send
-        alone — it fills the question's line in the chat input (one line per
-        question, option text and/or the user's free text), and Enter
-        submits all the lines as ONE pending_input. Any typed lines in the
-        input are adopted into the draft (free-text answers survive a
-        click); lines beyond the question count are dropped on the next
-        click — finish typing and press Enter instead."""
+        A single-question package of a NON-multiple question keeps the flat
+        click id (app.pick_option(<i>), `option` is None) and submits
+        immediately — the legacy one-question flow. A batched package's
+        options carry the question index (app.pick_option(<q>, <i>)): the
+        click does NOT send alone — it fills the question's line in the
+        chat input (one line per question, option text and/or the user's
+        free text), and Enter submits all the lines as ONE pending_input.
+        Any typed lines in the input are adopted into the draft (free-text
+        answers survive a click); lines beyond the question count are
+        dropped on the next click — finish typing and press Enter instead.
+
+        A MULTIPLE-choice question (ClarificationItem.multiple) never
+        submits or replaces on click, even as a single question: the click
+        TOGGLES the option in the question's accumulated set
+        (_clarification_multi) and the set is re-rendered into the
+        question's draft line as "; "-joined texts. Free text typed into
+        that line overrides the click set until the question's options are
+        clicked again; Enter submits the draft as usual (an empty one means
+        "nothing selected"). Legacy flat click ids from old rendered
+        messages keep validating against the combined list and land on the
+        same accumulate path."""
         task = self.viewed
         if task is None or task.clarification is None:
             return
@@ -643,17 +664,49 @@ class TaskLifecycleLayer(DrCodeState):
         if not 0 <= oi < len(combined):
             return
         text = combined[oi]
-        if len(questions) == 1:
+        if len(questions) == 1 and not questions[qi].multiple:
             self._submit_user_text(task, text)
             return
-        # A package: merge the click into the input draft. Adopt the
-        # currently typed lines first (free-text answers already typed into
-        # question lines), then set the clicked question's line.
+
+        # A package or a multiple-choice question: merge the click into the
+        # input draft. Adopt the currently typed lines first (free-text
+        # answers already typed into question lines), then apply the click.
+        def _joined(i: int) -> str:
+            """The "; "-joined rendering of question i's accumulated set."""
+            opts = questions[i].combined_options
+            return "; ".join(
+                opts[j] for j in sorted(self._clarification_multi.get(i, set()))
+            )
+
         lines = self.chat_input.text.splitlines()
         for i in range(min(len(lines), len(questions))):
-            self._clarification_picks[i] = lines[i]
-        self._clarification_picks[qi] = text
-        draft = [self._clarification_picks.get(i, "") for i in range(len(questions))]
+            if questions[i].multiple:
+                if not lines[i].strip() or lines[i] == _joined(i):
+                    # The line is the click set's own rendering (or empty):
+                    # not a manual override.
+                    self._clarification_picks.pop(i, None)
+                else:
+                    self._clarification_picks[i] = lines[i]
+            else:
+                self._clarification_picks[i] = lines[i]
+        if questions[qi].multiple:
+            # A click on the question itself expresses "use the click set":
+            # drop any manual override for it, then toggle the option.
+            self._clarification_picks.pop(qi, None)
+            selected = self._clarification_multi.setdefault(qi, set())
+            if oi in selected:
+                selected.discard(oi)
+            else:
+                selected.add(oi)
+        else:
+            self._clarification_picks[qi] = text
+        draft: list[str] = []
+        for i, q in enumerate(questions):
+            if q.multiple:
+                manual = self._clarification_picks.get(i)
+                draft.append(manual if manual is not None else _joined(i))
+            else:
+                draft.append(self._clarification_picks.get(i, ""))
         while draft and not draft[-1].strip():
             draft.pop()
         self.chat_input.load_text("\n".join(draft))

@@ -98,11 +98,17 @@ class ClarificationItem(BaseModel):
     `agent_proposals` holds options the agent added on its OWN initiative,
     outside the user's request — kept structurally separate from `options`
     so no textual marker ("(agent's suggestion, …)") is needed. Rendered
-    after `options` with a ★; clickable indices continue after them."""
+    after `options` with a ★; clickable indices continue after them.
+
+    `multiple` marks a question where ANY SUBSET of the combined options is
+    a valid answer: the UI accumulates clicks into a set (toggle) instead
+    of submitting/replacing on the first click. Default False — old task
+    JSONs without the field load unchanged."""
 
     question: str
     options: list[str] = Field(default_factory=list)
     agent_proposals: list[str] = Field(default_factory=list)
+    multiple: bool = False
 
     @property
     def combined_options(self) -> list[str]:

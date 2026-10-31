@@ -5,7 +5,9 @@ Sources, from highest to lowest priority (a higher layer wins):
 1. process environment (`DRCODE_*` variables),
 2. project-level files: `<project>/.env` (dotenv) and
    `<project>/.drcode/drcode.json`,
-3. user-level file: `~/.config/drcode/drcode.json` (XDG_CONFIG_HOME-aware),
+3. user-level file: `~/.config/drcode/drcode.json` (XDG_CONFIG_HOME-aware,
+   relocatable as a whole via `DRCODE_USER_CONFIG_DIR` — run_bash uses that
+   to point task children at a per-task sandbox copy),
 4. built-in defaults.
 
 On first start `ensure_user_config_dir()` creates the user config directory
@@ -47,11 +49,27 @@ _REPO_ENV_FILES: tuple[Path | str, ...] = (
     else (".env",)
 )
 
-# User-level config directory/file. $XDG_CONFIG_HOME is honored so Linux
-# packagers/redirectors can move the config tree; defaults to ~/.config.
-_USER_CONFIG_DIR = (
-    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "drcode"
-)
+
+def _resolve_user_config_dir() -> Path:
+    """Resolve the user-level config directory at import time.
+
+    Priority: `DRCODE_USER_CONFIG_DIR` (a drcode-specific override, set by
+    run_bash for task children — see drcode.tools) > `$XDG_CONFIG_HOME`
+    (honored so Linux packagers/redirectors can move the config tree) >
+    `~/.config`. Only the drcode variable is redirected, never XDG as a
+    whole — a sandboxed child's git/gh and other XDG-reading tools must
+    keep seeing the real user config tree.
+    """
+    override = os.environ.get("DRCODE_USER_CONFIG_DIR")
+    if override:
+        return Path(override)
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "drcode"
+
+
+# User-level config directory/file, resolved once at import. Child processes
+# re-import the module with the sandboxing DRCODE_USER_CONFIG_DIR already in
+# their environment, so a per-task sandbox redirect needs no lazy lookup.
+_USER_CONFIG_DIR = _resolve_user_config_dir()
 USER_CONFIG_FILE = _USER_CONFIG_DIR / "drcode.json"
 USER_CONFIG_EXAMPLE_FILE = _USER_CONFIG_DIR / "drcode.json.example"
 

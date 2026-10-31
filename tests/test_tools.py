@@ -719,6 +719,113 @@ def test_run_bash_exports_task_env(project_root: Path) -> None:
     assert "[]" in out
 
 
+def test_run_bash_sandboxes_user_config(
+    project_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_bash(task_id=...) redirects the child's drcode user config into a
+    seeded per-task sandbox copy (DRCODE_USER_CONFIG_DIR): a diagnostic
+    snippet's default-constructed store reads/writes the copy, never the
+    real ~/.config/drcode (incident ebe6ba15). XDG itself stays untouched."""
+    real = tmp_path / "real-xdg" / "drcode"
+    real.mkdir(parents=True)
+    (real / "models.json").write_text('{"providers": ["real"]}')
+    monkeypatch.setattr(tools._config, "_USER_CONFIG_DIR", real)
+    scratch = tmp_path / "scratch"
+
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            'echo "$DRCODE_USER_CONFIG_DIR"; cat "$DRCODE_USER_CONFIG_DIR/models.json"',
+            extra_writable=scratch,
+            task_id="deadbeef",
+        )
+    )
+    sandbox = scratch / "user-config"
+    # The child sees the sandbox, seeded with a copy of the real config.
+    assert str(sandbox) in out
+    assert '{"providers": ["real"]}' in out
+    assert (sandbox / "models.json").read_text() == '{"providers": ["real"]}'
+
+    # Writes from the child land in the sandbox only.
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            'echo agent > "$DRCODE_USER_CONFIG_DIR/agent-wrote"',
+            extra_writable=scratch,
+            task_id="deadbeef",
+        )
+    )
+    assert out.startswith("exit=0")
+    assert (sandbox / "agent-wrote").read_text().strip() == "agent"
+    assert not (real / "agent-wrote").exists()
+    assert (real / "models.json").read_text() == '{"providers": ["real"]}'
+
+
+def test_run_bash_user_config_sandbox_without_extra_writable(
+    project_root: Path,
+    scratch_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a task id but no explicit extra_writable the sandbox lives under
+    the task's own scratch directory (SCRATCH_ROOT/<task-id>/user-config)."""
+    real = tmp_path / "real-xdg" / "drcode"
+    real.mkdir(parents=True)
+    monkeypatch.setattr(tools._config, "_USER_CONFIG_DIR", real)
+    out = asyncio.run(
+        run_bash(project_root, 'echo "$DRCODE_USER_CONFIG_DIR"', task_id="feedface")
+    )
+    sandbox = scratch_root / "feedface" / "user-config"
+    assert str(sandbox) in out
+    assert sandbox.is_dir()
+    # No real config to seed from → the sandbox exists but stays empty.
+    assert list(sandbox.iterdir()) == []
+
+
+def test_run_bash_user_config_sandbox_persisted_across_calls(
+    project_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox is seeded once, not on every run_bash call: the agent's
+    own writes persist for the task's lifetime (plausible-looking data)."""
+    real = tmp_path / "real-xdg" / "drcode"
+    real.mkdir(parents=True)
+    (real / "models.json").write_text("v1")
+    monkeypatch.setattr(tools._config, "_USER_CONFIG_DIR", real)
+    scratch = tmp_path / "scratch"
+    asyncio.run(
+        run_bash(
+            project_root,
+            'echo agent >> "$DRCODE_USER_CONFIG_DIR/notes"',
+            extra_writable=scratch,
+            task_id="deadbeef",
+        )
+    )
+    (real / "models.json").write_text("v2")
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            'cat "$DRCODE_USER_CONFIG_DIR/models.json"; '
+            'cat "$DRCODE_USER_CONFIG_DIR/notes"',
+            extra_writable=scratch,
+            task_id="deadbeef",
+        )
+    )
+    # Still the seeded v1 (not the changed real catalog), plus the note.
+    assert "v1" in out
+    assert "v2" not in out
+    assert "agent" in out
+
+
+def test_run_bash_without_task_id_leaves_user_config_unset(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task-less child (drcode's own git plumbing) never sees a config
+    redirect — not even one inherited from the parent environment."""
+    monkeypatch.setenv("DRCODE_USER_CONFIG_DIR", "/tmp/foreign-sandbox")
+    out = asyncio.run(run_bash(project_root, 'echo "[$DRCODE_USER_CONFIG_DIR]"'))
+    assert "[]" in out
+
+
 def test_run_bash_cwd_is_root(project_root: Path) -> None:
     (project_root / "marker.txt").write_text("here")
     out = asyncio.run(run_bash(project_root, "ls"))

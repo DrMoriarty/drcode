@@ -10,7 +10,12 @@ Permission model:
   escape that writable area, points the child process's TMPDIR at the
   task's scratch directory, and exports DRCODE_TASK_ID / DRCODE_WORKTREE
   so a parallel task's child processes can pick per-task resources
-  (ports, caches) — see the parallel development slots.
+  (ports, caches) — see the parallel development slots. It also redirects
+  the child's drcode user config into a per-task sandbox via
+  DRCODE_USER_CONFIG_DIR: diagnostic python snippets that construct
+  default-constructed stores (`UserModelsStore()`, `Config()`) then read
+  and write the sandbox copy, never the real `~/.config/drcode` (incident
+  ebe6ba15: such a snippet wiped the user's model catalog).
 
 Every refusal raises PathViolation with a model-friendly message; the agent
 layer logs it into the task's service-event history before returning it to
@@ -28,6 +33,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from . import config as _config
 from .config import PROJECT_STATE_DIRNAME
 
 MAX_TOOL_OUTPUT = 10_000
@@ -624,6 +630,63 @@ def clamp_bash_timeout(timeout: float | None) -> float:
     return min(timeout, BASH_MAX_TIMEOUT)
 
 
+# -- child-process user-config sandbox ----------------------------------------
+
+# Name of the per-task user-config sandbox inside the scratch directory,
+# exported to the child as DRCODE_USER_CONFIG_DIR (config._resolve_user_config_dir
+# gives it priority over XDG_CONFIG_HOME — XDG itself is NOT redirected, so the
+# child's git/gh and other XDG-reading tools keep working against the real
+# config tree).
+USER_CONFIG_SANDBOX_DIRNAME = "user-config"
+
+
+def _seed_user_config_sandbox(sandbox: Path) -> None:
+    """Fill a freshly created sandbox with a copy of the real user config.
+
+    Diagnostic snippets the agent runs should see plausible data (the user's
+    actual provider catalog etc.), so the first sandbox creation copies the
+    real `~/.config/drcode` contents in. Later run_bash calls reuse the
+    existing sandbox as-is — the agent's own writes persist for the task's
+    lifetime, and the real catalog is never touched again. Failures are
+    swallowed: an empty sandbox is still a safe sandbox.
+    """
+    real = _config._USER_CONFIG_DIR
+    try:
+        if real.is_dir():
+            shutil.copytree(
+                real,
+                sandbox,
+                dirs_exist_ok=True,
+                ignore_dangling_symlinks=True,
+            )
+    except OSError:
+        pass
+
+
+def _user_config_sandbox_env(
+    env: dict[str, str], task_id: str, extra_writable: Path | None
+) -> None:
+    """Point the child's drcode user config at the task's sandbox copy.
+
+    The sandbox lives inside the task's scratch directory (created lazily,
+    seeded once from the real config) and is removed with the scratch on
+    task completion/delete, so writes from agent-spawned drcode processes —
+    `UserModelsStore()` in a verification snippet, a nested `uv run drcode` —
+    physically cannot reach the real user catalog. Only set when the export
+    succeeds; on a failure to create the directory the variable stays unset
+    (degraded to the old behavior) rather than pointing at a missing path.
+    """
+    base = extra_writable if extra_writable is not None else scratch_dir(task_id)
+    sandbox = base / USER_CONFIG_SANDBOX_DIRNAME
+    try:
+        if not sandbox.is_dir():
+            sandbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _seed_user_config_sandbox(sandbox)
+    except OSError:
+        return
+    env["DRCODE_USER_CONFIG_DIR"] = str(sandbox)
+
+
 async def run_bash(
     root: Path,
     command: str,
@@ -650,12 +713,17 @@ async def run_bash(
         # root; a plain task still reports the project directory.
         env["DRCODE_TASK_ID"] = task_id
         env["DRCODE_WORKTREE"] = str(root)
+        # Sandbox the child's drcode user config: a diagnostic snippet's
+        # default-constructed store reads/writes the scratch copy, never
+        # the real ~/.config/drcode (incident ebe6ba15).
+        _user_config_sandbox_env(env, task_id, extra_writable)
     else:
         # Without a task id the variables stay unset (no empty-string noise):
         # strip any inherited values so a task-less child never sees a
-        # foreign task's identity.
+        # foreign task's identity — nor a foreign user-config sandbox.
         env.pop("DRCODE_TASK_ID", None)
         env.pop("DRCODE_WORKTREE", None)
+        env.pop("DRCODE_USER_CONFIG_DIR", None)
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=root,

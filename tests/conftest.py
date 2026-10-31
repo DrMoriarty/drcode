@@ -50,9 +50,13 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         "DRCODE_COMPACTION_THRESHOLD",
         # Task-identity variables exported by run_bash(task_id=...) when drcode
         # dogfoods itself (the agent runs `uv run pytest` via run_bash) — the
-        # child pytest must not inherit the parent task's id/worktree.
+        # child pytest must not inherit the parent task's id/worktree. The
+        # user-config redirect (run_bash points task children at the per-task
+        # sandbox) is stripped for the same reason: layering tests must see
+        # this suite's own sandboxed resolution, not the parent task's.
         "DRCODE_TASK_ID",
         "DRCODE_WORKTREE",
+        "DRCODE_USER_CONFIG_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 

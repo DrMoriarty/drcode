@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import drcode.config as config_module
-from drcode.config import Config, _parsable_or_none, ensure_user_config_dir
+from drcode.config import (
+    Config,
+    _parsable_or_none,
+    _resolve_user_config_dir,
+    ensure_user_config_dir,
+)
 
 
 @pytest.fixture
@@ -172,6 +180,65 @@ def test_parsable_or_none(tmp_path: Path) -> None:
     binary = tmp_path / "bin.json"
     binary.write_bytes(b"\xff\xfe\x00")
     assert _parsable_or_none(binary) is None
+
+
+# -- user config dir resolution (DRCODE_USER_CONFIG_DIR priority) ----------------------
+
+
+def test_resolve_user_config_dir_env_beats_xdg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drcode-specific override wins over XDG_CONFIG_HOME: run_bash uses
+    it to point task children at the per-task sandbox copy (incident
+    ebe6ba15) without touching XDG itself (git/gh must keep working)."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("DRCODE_USER_CONFIG_DIR", str(tmp_path / "sandbox"))
+    assert _resolve_user_config_dir() == tmp_path / "sandbox"
+
+
+def test_resolve_user_config_dir_xdg_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("DRCODE_USER_CONFIG_DIR", raising=False)
+    assert _resolve_user_config_dir() == tmp_path / "xdg" / "drcode"
+
+
+def test_resolve_user_config_dir_home_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DRCODE_USER_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert _resolve_user_config_dir() == Path.home() / ".config" / "drcode"
+
+
+def test_child_process_import_honors_env(tmp_path: Path) -> None:
+    """End-to-end: a freshly started python process (what an agent-spawned
+    child actually is — the module constant is computed at import time)
+    resolves its user config into DRCODE_USER_CONFIG_DIR when set."""
+    override = tmp_path / "sandbox"
+    env = os.environ.copy()
+    env["DRCODE_USER_CONFIG_DIR"] = str(override)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import drcode.config as c\n"
+                "print(c._USER_CONFIG_DIR)\n"
+                "print(c.USER_CONFIG_FILE)"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert lines[0] == str(override)
+    assert lines[1] == str(override / "drcode.json")
 
 
 # -- user config scaffolding -----------------------------------------------------------

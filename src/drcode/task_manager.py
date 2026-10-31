@@ -686,7 +686,7 @@ class TaskManager:
         return done, total
 
     def link_goal(self, task_id: str, goal_id: str) -> Task:
-        """Attach a task to a goal (the header's "+ assign"/"change"
+        """Attach a task to a goal (the header's "+ assign"/"✏"
         links). An unknown goal id raises ValueError (the caller
         surfaces it); a previous link is replaced (the old goal's list
         loses the id), an identical link is a no-op. The link is kept
@@ -712,7 +712,7 @@ class TaskManager:
         return task
 
     def unlink_goal(self, task_id: str) -> Task:
-        """Detach the task from its goal (the header's "unlink"
+        """Detach the task from its goal (the header's "✕"
         fragment): both sides of the link are cleared; unlinking a task
         without a goal is a no-op."""
         task = self.get(task_id)

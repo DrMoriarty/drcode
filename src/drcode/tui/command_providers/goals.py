@@ -18,8 +18,8 @@ class GoalCommandsProvider(CommandListProvider):
     unified edit-form dialog in create mode, with a pre-enabled checkbox
     to link the created goal to the viewed task when one is open (plain
     create without the checkbox when not). Linking and unlinking a
-    task's goal live in the task header ("+ assign" / "× unlink" /
-    "change"), not here."""
+    task's goal live in the task header ("+ assign" / "✏" / "✕"),
+    not here."""
 
     def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)

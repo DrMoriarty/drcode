@@ -408,11 +408,18 @@ async def test_goal_provider_create_only_and_header_links(app: DrCodeApp) -> Non
         assert "unlink" not in extra
         app.link_viewed_goal(goal.id)
         await pilot.pause()
-        # Linked: the goal fragment gains the change/unlink fragments.
+        # Linked: the goal group gains the ✏/✕ icon buttons and the
+        # goal fragment — the icons sit left of the goal title.
         extra = str(app.query_one("#task-status-extra", Static).content)
         assert "goal:" in extra
-        assert "change" in extra
-        assert "unlink" in extra
+        assert "✏" in extra
+        assert "✕" in extra
+        assert extra.index("✏") < extra.index("goal:")
+        assert extra.index("✕") < extra.index("goal:")
+        assert "[blue]change" not in extra
+        # "unlink" survives only inside the click-action tag
+        # (app.unlink_viewed_goal), never as the rendered label.
+        assert "[red]unlink" not in extra
         # Fire the unlink header link.
         app.action_unlink_viewed_goal()
         await pilot.pause()

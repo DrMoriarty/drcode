@@ -1029,35 +1029,63 @@ class ChatTimelineLayer(DrCodeState):
         return block
 
     def _write_clarification(self, clarification: Clarification) -> None:
-        lines = [
-            f"[bold blue]drcode ❓[/] {_mention_markup(escape(clarification.question))}"
-        ]
-        # Plain options first (a legacy agent-marker inside an old option's
-        # text still gets its ★ via _split_agent_marker), then the agent's
-        # own proposals with a ★ — indices CONTINUE after `options`, and
-        # action_pick_option validates against the combined list.
-        has_agent_option = False
+        if clarification is not self._rendered_clarification:
+            # A fresh question/package replaces the previous one: stale
+            # click picks from the old package must not leak into the new
+            # draft (see action_pick_option).
+            self._clarification_picks = {}
+        # A package holds one or more questions (the agent is prompted to
+        # batch ALL its open questions into one call). Each question renders
+        # separately with its own clickable options; a package question is
+        # numbered and its options carry the question index in the click id
+        # (app.pick_option(<q>, <i>)) so a click answers exactly that
+        # question — a single-question package keeps the legacy flat id
+        # (app.pick_option(<i>)) and the immediate-submit behaviour.
+        questions = clarification.questions
+        lines: list[str] = []
+        packaged = len(questions) > 1
+        for qi, item in enumerate(questions):
+            header = f"{qi + 1}. {item.question}" if packaged else item.question
+            lines.append(f"[bold blue]drcode ❓[/] {_mention_markup(escape(header))}")
+            # Plain options first (a legacy agent-marker inside an old
+            # option's text still gets its ★ via _split_agent_marker), then
+            # the agent's own proposals with a ★ — indices CONTINUE after
+            # `options`, and action_pick_option validates against the
+            # combined list.
+            has_agent_option = False
 
-        def _option_line(index: int, display: str, *, star: bool) -> str:
-            return (
-                f"  ▸ {'[bold yellow]★[/] ' if star else ''}"
-                f"[@click=app.pick_option({index})]"
-                f"[underline cyan]{escape(display)}[/][/]"
-            )
+            def _option_line(
+                index: int, display: str, *, star: bool, qi: int = qi
+            ) -> str:
+                click = (
+                    f"app.pick_option({qi},{index})"
+                    if packaged
+                    else f"app.pick_option({index})"
+                )
+                return (
+                    f"  ▸ {'[bold yellow]★[/] ' if star else ''}"
+                    f"[@click={click}]"
+                    f"[underline cyan]{escape(display)}[/][/]"
+                )
 
-        for i, option in enumerate(clarification.options):
-            is_agent, display = _split_agent_marker(option)
-            has_agent_option = has_agent_option or is_agent
-            lines.append(_option_line(i, display, star=is_agent))
-        for j, proposal in enumerate(
-            clarification.agent_proposals, start=len(clarification.options)
-        ):
-            has_agent_option = True
-            lines.append(_option_line(j, proposal, star=True))
-        if has_agent_option:
+            for i, option in enumerate(item.options):
+                is_agent, display = _split_agent_marker(option)
+                has_agent_option = has_agent_option or is_agent
+                lines.append(_option_line(i, display, star=is_agent))
+            for j, proposal in enumerate(item.agent_proposals, start=len(item.options)):
+                has_agent_option = True
+                lines.append(_option_line(j, proposal, star=True))
+            if has_agent_option:
+                lines.append(
+                    "[dim]★ — option proposed by the agent on its own "
+                    "initiative, not part of your request.[/]"
+                )
+        if len(questions) > 1:
             lines.append(
-                "[dim]★ — option proposed by the agent on its own initiative, "
-                "not part of your request.[/]"
+                "[dim]Click an option per question or type answers — one "
+                "line per question — then press Enter to send them all at "
+                "once.[/]"
             )
-        lines.append("[dim]Click an option or answer in the input below.[/]")
+        else:
+            lines.append("[dim]Click an option or answer in the input below.[/]")
         self._write_chat("\n".join(lines))

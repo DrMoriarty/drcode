@@ -74,7 +74,7 @@ def test_task_json_roundtrip() -> None:
         verification=VerificationStatus.FAILED,
         pending_input=[PendingInput(text="hello")],
         unfinished=True,
-        clarification=Clarification(question="Which one?", options=["a", "b"]),
+        clarification=Clarification.single("Which one?", ["a", "b"]),
         events=[TaskEvent(kind="permission", text="denied")],
         queue_head=True,
         queue_seq=7,
@@ -109,12 +109,50 @@ def test_task_event_defaults() -> None:
 
 
 def test_clarification_options_default_empty() -> None:
-    assert Clarification(question="q?").options == []
+    assert Clarification.single("q?").questions[0].options == []
 
 
 def test_clarification_agent_proposals_default_empty() -> None:
     """Old task JSONs without agent_proposals validate as an empty list —
     no migration needed."""
-    assert Clarification(question="q?").agent_proposals == []
+    assert Clarification.single("q?").questions[0].agent_proposals == []
     legacy = Clarification.model_validate({"question": "q?", "options": ["a"]})
-    assert legacy.agent_proposals == []
+    assert legacy.questions[0].agent_proposals == []
+
+
+def test_clarification_legacy_single_question_migrates_to_package() -> None:
+    """A pre-batch Clarification JSON (flat question/options/agent_proposals)
+    loads as a single-question package — the migration is the before-
+    validator, idempotent on already-migrated data."""
+    legacy = Clarification.model_validate(
+        {
+            "question": "Which one?",
+            "options": ["a", "b"],
+            "agent_proposals": ["p"],
+        }
+    )
+    assert len(legacy.questions) == 1
+    item = legacy.questions[0]
+    assert item.question == "Which one?"
+    assert item.options == ["a", "b"]
+    assert item.agent_proposals == ["p"]
+    # The migrated shape round-trips: model_dump_json → validate again.
+    reloaded = Clarification.model_validate_json(legacy.model_dump_json())
+    assert reloaded == legacy
+
+
+def test_clarification_batched_roundtrip() -> None:
+    """A batched package serializes with the questions list intact, and the
+    Task field keeps it through a full Task round-trip."""
+    from drcode.models import ClarificationItem
+
+    batched = Clarification(
+        questions=[
+            ClarificationItem(question="q1?", options=["a"]),
+            ClarificationItem(question="q2?", agent_proposals=["p1", "p2"]),
+        ]
+    )
+    data = json.loads(batched.model_dump_json())
+    assert [q["question"] for q in data["questions"]] == ["q1?", "q2?"]
+    assert data["questions"][1]["agent_proposals"] == ["p1", "p2"]
+    assert Clarification.model_validate(data) == batched

@@ -74,7 +74,7 @@ def test_answered_clarification_goes_before_regular(manager: TaskManager) -> Non
     b = manager.create("b", "x")
     # b asked a question and the user answers it → head of non-bug tasks.
     b.status = TaskStatus.AWAITING_CLARIFICATION
-    b.clarification = Clarification(question="q?")
+    b.clarification = Clarification.single("q?")
     manager.send(b.id, "the answer")
     assert manager.queued() == [b, a]
 
@@ -129,7 +129,7 @@ def test_send_to_awaiting_clarification_sets_queue_head(
     task.status = TaskStatus.AWAITING_CLARIFICATION
     from drcode.models import Clarification
 
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
 
     manager.send(task.id, "my answer")
     assert task.status is TaskStatus.QUEUED
@@ -314,13 +314,13 @@ def test_move_repositions_answered_clarification_marker(
     a = manager.create("a", "x")
     b = manager.create("b", "x")
     b.status = TaskStatus.AWAITING_CLARIFICATION
-    b.clarification = Clarification(question="q?")
+    b.clarification = Clarification.single("q?")
     manager.send(b.id, "answer")  # [b, a] — answered clarification at the head
     manager.move_in_queue(b.id, up=True)  # [a, b]
     assert manager.queued() == [a, b]
     # A later answered clarification still lands ahead of the non-bug block.
     a.status = TaskStatus.AWAITING_CLARIFICATION
-    a.clarification = Clarification(question="q2?")
+    a.clarification = Clarification.single("q2?")
     manager.send(a.id, "answer 2")
     assert manager.queued() == [a, b]
 
@@ -344,7 +344,7 @@ def test_hold_awaiting_clarification_and_resume_back(manager: TaskManager) -> No
 
     task = manager.create("t", "")  # no pending input: the question is still open
     task.status = TaskStatus.AWAITING_CLARIFICATION
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
 
     manager.set_hold(task.id, on=True)
     assert task.status is TaskStatus.HOLD
@@ -359,7 +359,7 @@ def test_resume_held_task_answered_while_held(manager: TaskManager) -> None:
 
     task = manager.create("t", "x")
     task.status = TaskStatus.AWAITING_CLARIFICATION
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
     manager.set_hold(task.id, on=True)
 
     # The user answers while the task is parked.
@@ -427,7 +427,7 @@ def test_edit_task_drops_answered_clarification(manager: TaskManager) -> None:
 
     task = manager.create("t", "condition")
     task.status = TaskStatus.AWAITING_CLARIFICATION
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
     manager.set_hold(task.id, on=True)
     manager.send(task.id, "partial answer")
 
@@ -565,7 +565,7 @@ def test_cancel_completes_and_drops_input(manager: TaskManager) -> None:
     task.unfinished = True
     from drcode.models import Clarification
 
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
     task.queue_head = True
 
     manager.cancel(task.id)
@@ -587,7 +587,7 @@ def test_requeue_answered_clarification(manager: TaskManager) -> None:
     # State the helper targets: awaiting clarification, but the answer has
     # already arrived in pending_input (typed while the run was finishing).
     task.status = TaskStatus.AWAITING_CLARIFICATION
-    task.clarification = Clarification(question="q?")
+    task.clarification = Clarification.single("q?")
     task.pending_input.append(PendingInput(text="late answer"))
     manager.requeue_answered_clarification(task.id)
     assert task.status is TaskStatus.QUEUED

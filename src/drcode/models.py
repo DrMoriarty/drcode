@@ -92,8 +92,8 @@ class TaskEvent(BaseModel):
     text: str
 
 
-class Clarification(BaseModel):
-    """A question the agent asked the user and is waiting an answer for.
+class ClarificationItem(BaseModel):
+    """One question inside a clarification package (see Clarification).
 
     `agent_proposals` holds options the agent added on its OWN initiative,
     outside the user's request — kept structurally separate from `options`
@@ -103,6 +103,60 @@ class Clarification(BaseModel):
     question: str
     options: list[str] = Field(default_factory=list)
     agent_proposals: list[str] = Field(default_factory=list)
+
+    @property
+    def combined_options(self) -> list[str]:
+        """options + agent_proposals — the clickable list in render order."""
+        return self.options + self.agent_proposals
+
+
+_LEGACY_CLARIFICATION_KEYS = ("question", "options", "agent_proposals")
+
+
+class Clarification(BaseModel):
+    """A package of questions the agent asked in ONE ask_clarifying_question
+    call and is waiting answers for.
+
+    Historically a clarification held exactly one question (flat
+    `question`/`options`/`agent_proposals` fields); those JSONs keep
+    loading — the before-validator wraps the legacy shape into a
+    single-item `questions` list (same idempotent-migration pattern as
+    storage.py's legacy monolithic files). The agent is prompted to ask
+    ALL its open questions in one batched call, and a re-call while a
+    package is pending is refused (ModelRetry) instead of overwriting it
+    — the old one-question-per-call flow silently lost every earlier
+    question but the last."""
+
+    questions: list[ClarificationItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_single_question(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "questions" not in data and "question" in data:
+            item = {k: data[k] for k in _LEGACY_CLARIFICATION_KEYS if k in data}
+            return {"questions": [item]}
+        return data
+
+    @classmethod
+    def single(
+        cls,
+        question: str,
+        options: list[str] | None = None,
+        agent_proposals: list[str] | None = None,
+    ) -> Clarification:
+        """Build a one-question package (tests, legacy callers)."""
+        return cls(
+            questions=[
+                ClarificationItem(
+                    question=question,
+                    options=options or [],
+                    agent_proposals=agent_proposals or [],
+                )
+            ]
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self.questions)
 
 
 class TodoItem(BaseModel):

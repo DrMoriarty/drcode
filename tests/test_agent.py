@@ -1556,6 +1556,103 @@ def test_ask_clarifying_question_options_discipline(fake_config: Config) -> None
         assert "always better than prose" in desc
 
 
+def _clarify_deps(project_root: Path) -> agent_mod.AgentDeps:
+    manager = TaskManager(project_root)
+    task = manager.create("research", "plan it", kind=TaskKind.RESEARCH)
+    return agent_mod.AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+
+
+def _clarify_tool(fake_config: Config, deps: agent_mod.AgentDeps):
+    from drcode.agent import build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.RESEARCH, root=deps.root)
+    return ag._function_toolset.tools["ask_clarifying_question"].function
+
+
+def test_ask_clarifying_question_batch_saves_all_questions(
+    fake_config: Config, project_root: Path
+) -> None:
+    """The batched call stores EVERY question in the task metadata — the
+    old one-call-per-question flow overwrote task.clarification and only
+    the last question survived."""
+    from drcode.agent_build import ClarifyQuestion
+
+    deps = _clarify_deps(project_root)
+    ask = _clarify_tool(fake_config, deps)
+    out = ask(
+        cast("Any", SimpleNamespace(deps=deps)),
+        questions=[
+            ClarifyQuestion(question="Какая БД?", options=["Postgres", "SQLite"]),
+            ClarifyQuestion(question="Завести задачу?", proposals=["Да", "Нет"]),
+        ],
+    )
+    assert "end your turn" in out
+    task = deps.manager.get(deps.task_id)
+    assert task.status is TaskStatus.AWAITING_CLARIFICATION
+    c = task.clarification
+    assert c is not None and len(c.questions) == 2
+    assert c.questions[0].question == "Какая БД?"
+    assert c.questions[0].options == ["Postgres", "SQLite"]
+    assert c.questions[1].agent_proposals == ["Да", "Нет"]
+    # Persisted in the metadata file, not only in memory.
+    raw = json.loads(
+        (project_root / ".drcode" / "tasks" / f"{task.id}.json").read_text()
+    )
+    assert [q["question"] for q in raw["clarification"]["questions"]] == [
+        "Какая БД?",
+        "Завести задачу?",
+    ]
+
+
+def test_ask_clarifying_question_refused_while_pending(
+    fake_config: Config, project_root: Path
+) -> None:
+    """A second call while a clarification is already pending raises
+    ModelRetry and leaves the pending package untouched (plus a service
+    event for the chat log)."""
+    from drcode.agent_build import ClarifyQuestion
+
+    deps = _clarify_deps(project_root)
+    ask = _clarify_tool(fake_config, deps)
+    ctx = cast("Any", SimpleNamespace(deps=deps))
+    ask(
+        ctx,
+        questions=[
+            ClarifyQuestion(question="q1?", options=["a"]),
+            ClarifyQuestion(question="q2?", proposals=["p"]),
+        ],
+    )
+    before = deps.manager.get(deps.task_id).clarification
+    with pytest.raises(ModelRetry, match="already pending"):
+        ask(ctx, questions=[ClarifyQuestion(question="late?")])
+    task = deps.manager.get(deps.task_id)
+    assert task.clarification is before
+    assert len(task.clarification.questions) == 2  # type: ignore[union-attr]
+    assert task.clarification.questions[0].question == "q1?"  # type: ignore[union-attr]
+    # The refusal is visible in the chat's service events.
+    assert any("refused" in e.text and "already pending" in e.text for e in task.events)
+
+
+def test_ask_clarifying_question_empty_questions_refused(
+    fake_config: Config, project_root: Path
+) -> None:
+    """A call whose every question is blank gets a retry prompt instead of
+    parking the task on an empty package."""
+    from drcode.agent_build import ClarifyQuestion
+
+    deps = _clarify_deps(project_root)
+    ask = _clarify_tool(fake_config, deps)
+    ctx = cast("Any", SimpleNamespace(deps=deps))
+    with pytest.raises(ModelRetry, match="no questions"):
+        ask(ctx, questions=[ClarifyQuestion(question="   ")])
+    assert deps.manager.get(deps.task_id).clarification is None
+
+
 def test_build_agent_appends_agents_md(fake_config: Config, project_root: Path) -> None:
     from drcode.agent import build_agent
     from drcode.prompts import load_system_prompt

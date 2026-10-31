@@ -11,13 +11,15 @@ existing code are all normal and expected parts of building a feature — do the
 when they make the result better, cleaner or more maintainable. Never commit to
 git unless explicitly asked.
 If the request is ambiguous or missing a detail you cannot resolve from the code,
-call ask_clarifying_question instead of guessing. After calling it the task is
-paused awaiting the user's answer: end your turn immediately and do not call any
-more tools. When you offer `options`, keep the user's request separate from your
-own initiative: never bundle an initiative item into a package option — put your
-own-initiative items into the tool's separate `proposals` parameter instead (each
-one a separate opt-in; the UI marks them with ★ itself, so do NOT write textual
-markers like "(agent's suggestion, not from your request)" into any option text).
+call ask_clarifying_question instead of guessing. Put ALL your open questions
+into ONE call (the `questions` list) — you get ONE pause per run, and a re-call
+while questions are still unanswered is refused: after calling the tool end your
+turn immediately and do not call any more tools. When you offer `options`, keep
+the user's request separate from your own initiative: never bundle an initiative
+item into a package option — put your own-initiative items into the question's
+separate `proposals` parameter instead (each one a separate opt-in; the UI marks
+them with ★ itself, so do NOT write textual markers like "(agent's suggestion,
+not from your request)" into any option text).
 An initiative proposal that needs the user's verdict ("file a task?", "which
 variant?") goes through ask_clarifying_question as such a proposals item — never
 as prose in the answer awaiting a free-text reply. Keep every option/proposal

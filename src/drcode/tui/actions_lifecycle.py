@@ -559,6 +559,7 @@ class TaskLifecycleLayer(DrCodeState):
         if task is None:
             return
         self.chat_input.clear()
+        self._clarification_picks = {}
         self._submit_user_text(task, text)
 
     def _submit_user_text(self, task: Task, text: str) -> None:
@@ -608,19 +609,55 @@ class TaskLifecycleLayer(DrCodeState):
         self.refresh_sidebar()
         self.refresh_status()
 
-    def action_pick_option(self, index: int) -> None:
-        """User clicked a clarifying-question option: submit it as their answer.
+    def action_pick_option(self, question: int, option: int | None = None) -> None:
+        """User clicked a clarifying-question option.
 
         The combined list is options + agent_proposals (the starred block
         renders after `options` with continuing indices), so a click on a
-        proposal submits the proposal text itself."""
+        proposal submits the proposal text itself.
+
+        A single-question package keeps the flat click id
+        (app.pick_option(<i>), `option` is None) and submits immediately —
+        the legacy one-question flow. A batched package's options carry the
+        question index (app.pick_option(<q>, <i>)): the click does NOT send
+        alone — it fills the question's line in the chat input (one line per
+        question, option text and/or the user's free text), and Enter
+        submits all the lines as ONE pending_input. Any typed lines in the
+        input are adopted into the draft (free-text answers survive a
+        click); lines beyond the question count are dropped on the next
+        click — finish typing and press Enter instead."""
         task = self.viewed
         if task is None or task.clarification is None:
             return
-        combined = task.clarification.options + task.clarification.agent_proposals
-        if not 0 <= index < len(combined):
+        questions = task.clarification.questions
+        if option is None:
+            # Flat single-question id: `question` is the option index.
+            if len(questions) != 1:
+                return
+            qi, oi = 0, question
+        else:
+            qi, oi = question, option
+        if not 0 <= qi < len(questions):
             return
-        self._submit_user_text(task, combined[index])
+        combined = questions[qi].combined_options
+        if not 0 <= oi < len(combined):
+            return
+        text = combined[oi]
+        if len(questions) == 1:
+            self._submit_user_text(task, text)
+            return
+        # A package: merge the click into the input draft. Adopt the
+        # currently typed lines first (free-text answers already typed into
+        # question lines), then set the clicked question's line.
+        lines = self.chat_input.text.splitlines()
+        for i in range(min(len(lines), len(questions))):
+            self._clarification_picks[i] = lines[i]
+        self._clarification_picks[qi] = text
+        draft = [self._clarification_picks.get(i, "") for i in range(len(questions))]
+        while draft and not draft[-1].strip():
+            draft.pop()
+        self.chat_input.load_text("\n".join(draft))
+        self.chat_input.focus()
 
     def action_open_task(self, task_id: str) -> None:
         """User clicked a task-id mention (#69c8bd30) in the chat or the

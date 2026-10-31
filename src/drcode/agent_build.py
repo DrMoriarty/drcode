@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 
@@ -42,13 +43,14 @@ from .agent_tools import (
 )
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
-from .models import Clarification, TaskEvent, TaskKind, TaskStatus
+from .models import Clarification, ClarificationItem, TaskEvent, TaskKind, TaskStatus
 from .prompts import (
     load_resolver_prompt,
     load_resolver_reviewer_prompt,
     load_system_prompt,
     load_tester_prompt,
 )
+from .service_events import log_service_event
 from .settings import GitPolicy
 from .subagents import SubagentGate, run_delegate_tool
 from .task_manager import TaskManager
@@ -57,6 +59,7 @@ from .transcript import _context_status, ctx_context_tokens
 
 __all__ = [
     "AgentDeps",
+    "ClarifyQuestion",
     "ResolutionVerdict",
     "ResolverDeps",
     "TesterDeps",
@@ -65,6 +68,18 @@ __all__ = [
     "build_resolver_reviewer_agent",
     "build_tester_agent",
 ]
+
+
+# Module-level on purpose: pydantic-ai derives the tool's JSON schema from
+# it, and a locally defined class would break that. Kept lean — the
+# docstring rides into the schema (and thus into every request's framing).
+class ClarifyQuestion(BaseModel):
+    """One item of ask_clarifying_question's `questions` list: `question`
+    plus optional `options` and `proposals`."""
+
+    question: str
+    options: list[str] | None = None
+    proposals: list[str] | None = None
 
 
 def _scratch_desc(task_id: str | None) -> str:
@@ -765,54 +780,78 @@ def build_agent(
     @agent.tool
     def ask_clarifying_question(
         ctx: RunContext[AgentDeps],
-        question: str,
-        options: list[str] | None = None,
-        proposals: list[str] | None = None,
+        questions: list[ClarifyQuestion],
     ) -> str:
-        """Ask the user a clarifying question and pause the task until they answer.
-        Use when the request is ambiguous or a required detail is missing.
-        ALSO use it whenever the user must choose between continuations —
-        including your own initiative proposals ("I can file this as a
-        feature request…", "I could also do X"): present the choice through
-        THIS tool with clickable options, never as free-form prose awaiting
-        a reply. When in doubt whether options fit — pass them; clickable
-        options are always better than prose.
+        """Ask the user clarifying questions and pause the task until they answer.
+        Put ALL your open questions into ONE call: every item of the
+        `questions` list is an independent question the user answers
+        separately (one pause per run — a re-call while questions are
+        unanswered is refused). Use when the request is ambiguous or a
+        required detail is missing. ALSO use it whenever the user must
+        choose between continuations — including your own initiative
+        proposals ("I can file this as a feature request…"): present the
+        choice through THIS tool with clickable options, never as free-form
+        prose awaiting a reply. When in doubt whether options fit — pass
+        them; clickable options are always better than prose.
+        Each item: `question` (required), optional `options`, optional
+        `proposals`.
         `options` is an optional list of suggested answers covering ONLY what
-        directly follows from the user's request; pass it when a small set of
-        choices covers the reasonable answers, otherwise omit it.
+        directly follows from the user's request; omit it when no small set
+        of choices covers the reasonable answers. NEVER mix initiative into
+        `options` and do NOT bundle an initiative item into a package option
+        like "yes: do X + Y + Z, everything at once" — declining the bundle
+        would force declining the requested work too.
         `proposals` is an optional list of options you propose on your OWN
-        initiative, beyond the original request (each one a separate opt-in,
-        so the user can accept or decline it independently of the requested
-        scope). NEVER mix initiative into `options` and do NOT bundle an
-        initiative item into a package option like "yes: do X + Y + Z,
-        everything at once" — declining the bundle would force declining the
-        requested work too. Neither `options` nor `proposals` may contain
-        textual markers like "(agent's suggestion, not from your request)":
-        the separation is structural (the proposals parameter), the UI marks
-        proposals itself.
-        Format of both: lists of FLAT STRINGS (list[str] | None) — never an
-        object or dict like {"title": ..., "description": ...}: such a call
-        is rejected by schema validation ("Input should be a valid string"),
-        the task still pauses with an EMPTY option list, and the user has
-        nothing clickable to answer with. Correct example:
-        options=["Да, заведи багрепорт", "Нет, просто ответ"],
-        proposals=["Заведи фичу про X — по твоему усмотрению"].
-        BREVITY: each option/proposal is a SHORT imperative label (~5-10
-        words, e.g. "Заведи багрепорт: зависшие job_runs в running") —
-        reasoning and context go into the question text BEFORE the list,
-        never inside the options."""
+        initiative, beyond the original request (each an independent opt-in,
+        accepted or declined separately from the requested scope). Neither
+        `options` nor `proposals` may contain textual markers like
+        "(agent's suggestion, not from your request)": the separation is
+        structural (the proposals parameter), the UI marks proposals itself.
+        Format of both: lists of FLAT STRINGS — never a dict like
+        {"title": ...}: validation rejects it and the user gets nothing
+        clickable. BREVITY: each option/proposal is a SHORT imperative
+        label (~5-10 words) — reasoning and context go into the question
+        text BEFORE the list, never inside the options."""
         task = ctx.deps.manager.get(ctx.deps.task_id)
-        task.clarification = Clarification(
-            question=question.strip(),
-            options=[o.strip() for o in (options or []) if o.strip()],
-            agent_proposals=[p.strip() for p in (proposals or []) if p.strip()],
-        )
+        if task.clarification is not None:
+            # Structural guard against the one-question-per-call relapse
+            # (apex-quant ae9b4759: four consecutive calls overwrote each
+            # other, only the last question survived). The tool result's
+            # "end your turn" advice is not enforceable by pydantic-ai, so
+            # the second call is answered with a retry prompt instead.
+            log_service_event(
+                ctx.deps,
+                "system",
+                "ask_clarifying_question refused: a clarification is already "
+                "pending (the tool was called twice in one run).",
+            )
+            raise ModelRetry(
+                "A clarification is already pending and will be overwritten. "
+                "If you still have unanswered questions, end your turn — do "
+                "NOT call this tool again; add missing questions to the next "
+                "activation after the user answers."
+            )
+        items = [
+            ClarificationItem(
+                question=q.question.strip(),
+                options=[o.strip() for o in (q.options or []) if o.strip()],
+                agent_proposals=[p.strip() for p in (q.proposals or []) if p.strip()],
+            )
+            for q in questions
+            if q.question.strip()
+        ]
+        if not items:
+            raise ModelRetry(
+                "ask_clarifying_question received no questions: every item "
+                "needs a non-empty `question`."
+            )
+        task.clarification = Clarification(questions=items)
         task.status = TaskStatus.AWAITING_CLARIFICATION
         task.touch()
         ctx.deps.manager.storage.save(task)
         return (
-            "Question sent to the user. The task is paused awaiting clarification; "
-            "end your turn now and do not call any more tools."
+            "Questions sent to the user. The task is paused awaiting "
+            "clarification; end your turn now and do not call any more tools."
         )
 
     # Read-only subagent delegation (project settings subagents_coder /

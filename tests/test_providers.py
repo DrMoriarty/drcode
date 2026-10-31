@@ -258,6 +258,104 @@ def test_resolve_threshold_none_inherits_flat_config(
     assert resolve(config, AgentRole.CODING).compaction_threshold == 90
 
 
+# -- per-role max_tokens override ------------------------------------------------
+
+
+def _set_role_max_tokens(project_root: Path, role: AgentRole, value: int) -> None:
+    from drcode.settings import ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    settings = store.load()
+    settings.role_max_tokens[role.value] = value
+    store.save(settings)
+
+
+def test_resolve_role_max_tokens_beats_entry_max_tokens(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The role override is the most specific layer: it beats the catalog
+    entry's max_tokens; other roles keep the entry's value."""
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m", max_tokens=1234)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 4096  # entry
+    _set_role_max_tokens(project_root, AgentRole.TESTER, 32768)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 32768
+    # Only the tester role is overridden.
+    assert resolve(config, AgentRole.COMPACTION).max_tokens == 1234
+
+
+def test_resolve_role_max_tokens_beats_config_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """With no entry-level max_tokens (None), the override still wins
+    over the flat config default (8192 / DRCODE_MAX_TOKENS)."""
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="small"),
+    )
+    config = make_config(project_root, model="flat-m")
+    assert resolve(config, AgentRole.TESTER).max_tokens == 8192
+    _set_role_max_tokens(project_root, AgentRole.TESTER, 24576)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 24576
+
+
+def test_resolve_role_max_tokens_on_custom_slot(
+    project_root: Path,
+) -> None:
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(model="custom-m", base_url="http://c/v1", max_tokens=1024),
+    )
+    config = make_config(project_root, model="flat-m")
+    assert resolve(config, AgentRole.TESTER).max_tokens == 1024
+    _set_role_max_tokens(project_root, AgentRole.TESTER, 16384)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 16384
+
+
+def test_resolve_role_max_tokens_applies_when_nothing_selected(
+    project_root: Path,
+) -> None:
+    """The override applies to every resolve outcome — including the env
+    shortcut and the "model not set" case (the flat config fields are
+    not a model fallback, but the cap still rides the config)."""
+    config = make_config(project_root, model="flat-m", max_tokens=1234)
+    _set_role_max_tokens(project_root, AgentRole.RESEARCH, 9000)
+    resolved = resolve(config, AgentRole.RESEARCH)
+    assert resolved.model == ""  # still "not set"
+    assert resolved.max_tokens == 9000
+
+
+def test_resolve_role_max_tokens_beats_env_layer(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DRCODE_MODEL", "env-model")
+    monkeypatch.setenv("DRCODE_MAX_TOKENS", "7000")
+    config = make_config(project_root)
+    assert config.max_tokens == 7000
+    _set_role_max_tokens(project_root, AgentRole.CODING, 28000)
+    assert resolve(config, AgentRole.CODING).max_tokens == 28000
+
+
+def test_resolve_role_max_tokens_does_not_mutate_original(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    _set_role_max_tokens(project_root, AgentRole.TESTER, 32768)
+    config = make_config(project_root, model="flat-m", max_tokens=1234)
+    resolve(config, AgentRole.TESTER)
+    assert config.max_tokens == 1234
+
+
 def test_resolve_does_not_mutate_original(
     project_root: Path, catalog: UserModelsConfig
 ) -> None:

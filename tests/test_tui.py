@@ -2407,24 +2407,306 @@ async def test_role_model_label_variants(app: DrCodeApp, project_root: Path) -> 
     assert app.role_model_label(AgentRole.TESTER) == "custom-m"
 
 
+# -- project model settings dialog -----------------------------------------------
+
+
+def _pms_select(dialog: Any, role: AgentRole) -> Any:
+    from textual.widgets import Select
+
+    return dialog.query_one(f"#pms-model-{role.value}", Select)
+
+
+def _pms_input(dialog: Any, role: AgentRole) -> Any:
+    from textual.widgets import Input
+
+    return dialog.query_one(f"#pms-tokens-{role.value}", Input)
+
+
+async def test_project_model_dialog_form_and_apply(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The dialog shows one section per role (model Select + max_tokens
+    Input with the effective placeholder); Apply persists the slot into
+    drcode.json and the override into settings.json once, and the live
+    resolution picks both up."""
+    from textual.widgets import Button
+
+    from drcode.providers import ModelRef, set_project_model
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+
+        # Five role sections, each with a model Select and a max_tokens
+        # Input whose placeholder is the role's effective cap.
+        for role in AgentRole:
+            select = _pms_select(dialog, role)
+            input_widget = _pms_input(dialog, role)
+            values = [str(v) for _, v in select._options]
+            prompts = [str(p) for p, _ in select._options]
+            assert "__custom__" in values
+            assert "__user_default__" in values
+            assert "Custom…" in prompts
+            assert any(p.startswith("User default") for p in prompts)
+            assert input_widget.placeholder == str(app.resolved_config(role).max_tokens)
+        # The tester's active slot is marked "(current)".
+        assert any(
+            "local-swap/small (current)" in str(prompt)
+            for prompt, _ in _pms_select(dialog, AgentRole.TESTER)._options
+        )
+
+        # Edit the tester: switch to the big catalog model and set an
+        # override. Nothing is persisted while editing.
+        _pms_select(dialog, AgentRole.TESTER).value = "local-swap/qwen3-coder-30b"
+        await pilot.pause()
+        _pms_input(dialog, AgentRole.TESTER).value = "24576"
+        await pilot.pause()
+        settings_store = ProjectSettingsStore(project_root)
+        assert ProjectSettingsStore(project_root).load().role_max_tokens == {}
+        assert app.resolved_config(AgentRole.TESTER).max_tokens == 8192
+
+        # Apply: both files updated, resolution invalidated.
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        assert app.resolved_config(AgentRole.TESTER).max_tokens == 24576
+        data = json.loads((project_root / ".drcode" / "drcode.json").read_text())
+        assert data["models"]["tester"] == "local-swap/qwen3-coder-30b"
+        assert settings_store.load().role_max_tokens == {"tester": 24576}
+
+
+async def test_project_model_dialog_reset_to_user_default(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """ "User default" is available for EVERY role: picking it and
+    applying drops the project slot (null = inherit the user catalog
+    default) and, for an overridden role, the max_tokens key too when
+    the field is emptied."""
+    from textual.widgets import Button
+
+    from drcode.providers import ModelRef, set_project_model
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import (
+        _USER_DEFAULT,
+        ProjectModelSettingsDialog,
+    )
+
+    _write_user_catalog()
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(role_max_tokens={"coding": 9999}))
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        # The saved override prefills the input.
+        assert _pms_input(dialog, AgentRole.CODING).value == "9999"
+
+        # Reset the model slot to the user default AND empty the
+        # override (= inherit).
+        _pms_select(dialog, AgentRole.CODING).value = _USER_DEFAULT
+        await pilot.pause()
+        _pms_input(dialog, AgentRole.CODING).value = ""
+        await pilot.pause()
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+
+        data = json.loads((project_root / ".drcode" / "drcode.json").read_text())
+        # The single slot went null: the "models" key is dropped entirely
+        # (absence == null, the no-non-null-slots invariant).
+        assert data.get("models", {}).get("coding") is None
+        assert store.load().role_max_tokens == {}
+        # The coding role now inherits the user catalog default; the
+        # override is gone.
+        assert app.resolved_config(AgentRole.CODING).model == "qwen3-coder-30b"
+        assert app.resolved_config(AgentRole.CODING).max_tokens == 8192
+
+
+async def test_project_model_dialog_esc_discards(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """ESC (and Cancel) persist nothing: slots, custom models and the
+    max_tokens overrides all stay as they were."""
+    from drcode.providers import ModelRef, set_project_model
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    store = ProjectSettingsStore(project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        _pms_select(dialog, AgentRole.TESTER).value = "local-swap/qwen3-coder-30b"
+        await pilot.pause()
+        _pms_input(dialog, AgentRole.TESTER).value = "24576"
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.resolved_config(AgentRole.TESTER).model == "small"
+        assert app.resolved_config(AgentRole.TESTER).max_tokens == 8192
+        assert store.load().role_max_tokens == {}
+        data = json.loads((project_root / ".drcode" / "drcode.json").read_text())
+        assert data["models"]["tester"] == "local-swap/small"
+        assert "custom_models" not in data
+
+
+async def test_project_model_dialog_custom_model_flow(
+    app: DrCodeApp,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ "Custom…" opens the existing ModelSetupDialog; the entered model
+    is held in the draft and persisted (stored + activated) only on
+    Apply of the outer dialog."""
+    from textual.widgets import Button, Input
+
+    from drcode.providers import load_project_custom_models
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import (
+        _CUSTOM_NEW,
+        ProjectModelSettingsDialog,
+    )
+    from drcode.tui.setup_dialog import ModelSetupDialog
+
+    # The setup dialog probes the endpoint before it dismisses — stub
+    # the probe so the flow completes offline.
+    async def _probe_ok(model, base_url, api_key, timeout=15.0):
+        return True, "ok", base_url + "/models"
+
+    monkeypatch.setattr("drcode.tui.setup_dialog.probe_model", _probe_ok)
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+
+        _pms_select(dialog, AgentRole.RESOLVER).value = _CUSTOM_NEW
+        await pilot.pause()
+        setup_dialog = app.screen
+        assert isinstance(setup_dialog, ModelSetupDialog)
+        setup_dialog.query_one("#sd-model", Input).value = "free-m"
+        setup_dialog.query_one("#sd-url", Input).value = "http://free/v1"
+        await pilot.pause()
+        setup_dialog.query_one("#sd-save", Button).press()
+        await pilot.pause()
+        # Back in the outer dialog: the custom entry is drafted, not saved.
+        assert isinstance(app.screen, ProjectModelSettingsDialog)
+        assert load_project_custom_models(project_root) == {}
+        assert _pms_select(dialog, AgentRole.RESOLVER).value == "custom"
+        assert "Custom: free-m (current)" in [
+            str(prompt)
+            for prompt, _ in _pms_select(dialog, AgentRole.RESOLVER)._options
+        ]
+
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        customs = load_project_custom_models(project_root)
+        assert customs[AgentRole.RESOLVER].model == "free-m"
+        data = json.loads((project_root / ".drcode" / "drcode.json").read_text())
+        assert data["models"]["resolver"] == "custom"
+        assert app.resolved_config(AgentRole.RESOLVER).model == "free-m"
+        assert ProjectSettingsStore(project_root).load().role_max_tokens == {}
+
+
+async def test_project_model_dialog_invalid_max_tokens_blocks_apply(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """A non-integer max_tokens shows an error hint and blocks Apply:
+    nothing is persisted."""
+    from textual.widgets import Button
+
+    from drcode.providers import ModelRef, set_project_model
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    store = ProjectSettingsStore(project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        _pms_input(dialog, AgentRole.TESTER).value = "abc"
+        await pilot.pause()
+        # The live hint flags the invalid value...
+        hint = dialog.query_one("#pms-hint-tester")
+        assert hint.has_class("error")
+        # ...and Apply keeps the dialog open, persisting nothing.
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        assert isinstance(app.screen, ProjectModelSettingsDialog)
+        assert store.load().role_max_tokens == {}
+
+        # Fixing the value unblocks Apply.
+        _pms_input(dialog, AgentRole.TESTER).value = "16384"
+        await pilot.pause()
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        assert store.load().role_max_tokens == {"tester": 16384}
+
+
 async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
     """The main Settings menu collapses all model-related entries into one
     "Model settings…" item, which opens the sub-menu with the provider
-    catalog editor and the per-role model pickers."""
+    catalog editor and the single "Project model settings…" entry (the
+    per-role model/max_tokens form — it replaced the per-role picker
+    entries)."""
     from textual.command import CommandList
 
     from drcode.tui.command_providers import (
         ModelCatalogCommandProvider,
         ModelSettingsCommandProvider,
         ModelSettingsPalette,
-        RoleModelsCommandsProvider,
+        ProjectModelSettingsCommandProvider,
         SettingsPalette,
     )
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
 
     # The main menu has no direct model entries anymore.
     assert "Model settings" in SettingsPalette.ENTRY_ORDER
     assert "Provider catalog…" not in SettingsPalette.ENTRY_ORDER
     assert "Coding model:" not in SettingsPalette.ENTRY_ORDER
+    # The sub-menu has the single form entry instead of the role pickers.
+    for prefix in (
+        "Coding model:",
+        "Research model:",
+        "Tester model:",
+        "Compaction model:",
+        "Resolver model:",
+    ):
+        assert prefix not in ModelSettingsPalette.ENTRY_ORDER
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
@@ -2450,21 +2732,24 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         ]
         assert names == [
             "Provider catalog…",
-            f"Coding model: {app.role_model_label(AgentRole.CODING)}",
-            f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
-            f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
-            f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
-            f"Resolver model: {app.role_model_label(AgentRole.RESOLVER)}",
+            "Project model settings…",
         ]
-        # Sub-menu providers: the catalog editor plus the role pickers,
+        # Sub-menu providers: the catalog editor plus the form entry,
         # nothing else (project preferences stay in the main menu).
-        commands = RoleModelsCommandsProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert (
-            commands[0].name
-            == f"Coding model: {app.role_model_label(AgentRole.CODING)}"
-        )
+        form = ProjectModelSettingsCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [(c.name, c.callback) for c in form] == [
+            ("Project model settings…", app.action_open_project_model_settings)
+        ]
         catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [c.name for c in catalog] == ["Provider catalog…"]
+        # The form entry opens the per-role modal dialog.
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        assert isinstance(app.screen, ProjectModelSettingsDialog)
+        await pilot.press("escape")
+        await pilot.pause()
 
 
 async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:

@@ -20,7 +20,7 @@ from .base import CommandEntry, CommandListProvider, SpacedCommandList
 from .deps import DependencyCommandsProvider
 from .goals import GoalCommandsProvider
 from .merge import MergeCommandsProvider
-from .models import RoleModelsCommandsProvider, role_model_options_provider
+from .models import ProjectModelSettingsCommandProvider, role_model_options_provider
 from .settings import (
     WORKFLOW_PRESETS,
     DevRoundsOptionsProvider,
@@ -69,9 +69,9 @@ __all__ = [
     "ModelSettingsCommandProvider",
     "ModelSettingsPalette",
     "ParallelTasksOptionsProvider",
+    "ProjectModelSettingsCommandProvider",
     "ProjectSettingsCommandsProvider",
     "RetentionOptionsProvider",
-    "RoleModelsCommandsProvider",
     "ServiceCommandsProvider",
     "SettingsPalette",
     "SpacedCommandList",

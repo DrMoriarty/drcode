@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
 class CompletedRetention(str, enum.Enum):
@@ -495,6 +495,17 @@ class ProjectSettings(BaseModel):
     # survive a full sleep. Does NOT stop the clamshell (lid closed on
     # battery) sleep mode.
     keep_awake: bool = True
+    # -- per-role max_tokens overrides ----------------------------------------
+    # Per-role output-budget overrides: keys are AgentRole values
+    # ("coding" / "research" / "tester" / "compaction" / "resolver"),
+    # values are positive ints (the role's per-response max_tokens).
+    # Absent / empty = inherit (the catalog entry's max_tokens, else the
+    # flat config default / DRCODE_MAX_TOKENS). The most specific layer —
+    # the role — beats the more general ones (providers.resolve applies
+    # it last): a thinking model burns the default 8192 budget on
+    # reasoning alone, so the tester/resolver roles commonly need 16–32k.
+    role_max_tokens: dict[str, int] = Field(default_factory=dict)
+
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
     # connection check fails): the sync simply logs an error each cycle
@@ -540,6 +551,32 @@ class ProjectSettings(BaseModel):
     # auto-derive from the terminal locale (LC_ALL/LC_MESSAGES/LANG, falling
     # back to the Python locale; anything non-Russian reads as English).
     voice_language: str = ""
+
+    @field_validator("role_max_tokens", mode="before")
+    @classmethod
+    def _clean_role_max_tokens(cls, value: object) -> object:
+        """Drop entries that are not a valid role key or not a positive
+        int (a stray key or a typo in settings.json must not invalidate
+        the WHOLE file — the wholesale default fallback of load() is
+        reserved for structural corruption)."""
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: int(v)
+            for key, v in value.items()
+            if key in _ROLE_MAX_TOKENS_KEYS
+            and isinstance(v, int | float)
+            and not isinstance(v, bool)
+            and int(v) > 0
+        }
+
+
+# Valid keys of ProjectSettings.role_max_tokens: the AgentRole values
+# (duplicated here as literals — settings.py must not import providers.py,
+# which reads this module).
+_ROLE_MAX_TOKENS_KEYS: frozenset[str] = frozenset(
+    {"coding", "research", "tester", "compaction", "resolver"}
+)
 
 
 @dataclass

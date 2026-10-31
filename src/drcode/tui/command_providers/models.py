@@ -18,55 +18,25 @@ if TYPE_CHECKING:
     from ..app import DrCodeApp
 
 
-class RoleModelsCommandsProvider(CommandListProvider):
-    """Per-role model pickers of the "Model settings…" sub-menu.
+class ProjectModelSettingsCommandProvider(CommandListProvider):
+    """The single "Project model settings…" entry of the "Model
+    settings…" sub-menu (replaces the old per-role picker entries).
 
-    One entry per agent role; its current effective model is shown after
-    the ":". Picking an entry opens the role's selection palette (same UX
-    as the option pickers); Escape dismisses it and keeps the current
-    model.
+    Opens the per-role modal form: for every agent role the model
+    selection (catalog / custom / user default) plus the per-role
+    max_tokens override — in one dialog with atomic Apply.
     """
 
     def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
             CommandEntry(
-                f"Coding model: {app.role_model_label(AgentRole.CODING)}",
-                app.action_change_coding_model,
-                "Model the development agent runs on; pick from the "
-                "user-level provider catalog (saved to the project's "
-                "drcode.json)",
-            ),
-            CommandEntry(
-                f"Research model: {app.role_model_label(AgentRole.RESEARCH)}",
-                app.action_change_research_model,
-                "Model research tasks run on (analysis/docs profile: "
-                "reads a lot, writes little — a cheap-input "
-                "large-context model works well); falls back to the "
-                "coding model when not set; pick from the user-level "
-                "provider catalog (saved to the project's drcode.json)",
-            ),
-            CommandEntry(
-                f"Tester model: {app.role_model_label(AgentRole.TESTER)}",
-                app.action_change_tester_model,
-                "Model the QA tester runs on; pick from the user-level "
-                "provider catalog (saved to the project's drcode.json)",
-            ),
-            CommandEntry(
-                f"Compaction model: {app.role_model_label(AgentRole.COMPACTION)}",
-                app.action_change_compaction_model,
-                "Model that summarizes the history when the context "
-                "fill hits the threshold; pick from the user-level "
-                "provider catalog (saved to the project's drcode.json)",
-            ),
-            CommandEntry(
-                f"Resolver model: {app.role_model_label(AgentRole.RESOLVER)}",
-                app.action_change_resolver_model,
-                "Model the automatic merge-conflict resolver runs on "
-                "(resolves conflicts parked in a task's worktree by "
-                "the merge engine); falls back to the coding model "
-                "when not set; pick from the user-level provider "
-                "catalog (saved to the project's drcode.json)",
+                "Project model settings…",
+                app.action_open_project_model_settings,
+                "Model and max_tokens override per agent role (coding / "
+                "research / tester / compaction / resolver) — the model "
+                "slots go to the project's drcode.json, the max_tokens "
+                "overrides to the project's settings.json",
             ),
         ]
 

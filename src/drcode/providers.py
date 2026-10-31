@@ -41,6 +41,13 @@ Resolution precedence for a role (`resolve`):
    `migrate_project_config` move any legacy flat keys into the catalog /
    project custom models and remove them from the json files.
 
+Independently of the model connection, a per-role OUTPUT cap is overlaid
+on the result of every path (including the env shortcut): the project
+setting `role_max_tokens[role]` (`.drcode/settings.json`, see
+`drcode.settings.ProjectSettings`) — the most specific layer, beating the
+catalog entry's `max_tokens` and the flat config default 8192 /
+DRCODE_MAX_TOKENS.
+
 The resolver returns a `config.model_copy(update={...})` so
 `agent_model.build_model(config)` keeps working unchanged — and so the
 network test-suite's `build_model` monkeypatching (signature `(config)`)
@@ -72,6 +79,7 @@ from .config import (
     Config,
 )
 from .gitignore import ensure_drcode_gitignored
+from .settings import ProjectSettingsStore
 
 # User-level catalog file, next to the user-level drcode.json. The
 # directory is read dynamically from the config module (not bound at
@@ -646,6 +654,18 @@ def load_seeded_catalog(
 # -- resolution ---------------------------------------------------------------
 
 
+def _apply_role_max_tokens(config: Config, role: AgentRole) -> Config:
+    """Overlay the project's per-role max_tokens override (the LAST
+    resolution layer: the role — the most specific scope — beats the
+    catalog entry's `max_tokens` and the flat config's default /
+    DRCODE_MAX_TOKENS). See `ProjectSettings.role_max_tokens`."""
+    settings = ProjectSettingsStore(config._project_root).load()
+    override = settings.role_max_tokens.get(role.value)
+    if override is None or override == config.max_tokens:
+        return config
+    return config.model_copy(update={"max_tokens": override})
+
+
 def resolve(config: Config, role: AgentRole) -> Config:
     """Resolve the effective model connection for one agent role.
 
@@ -653,8 +673,16 @@ def resolve(config: Config, role: AgentRole) -> Config:
     (the input unchanged when only the env layer applies), so callers can
     feed it straight into `agent_model.build_model`. A role with no
     selection anywhere resolves to "model not set": an empty `model` in
-    the returned config (`is_ready` is False).
+    the returned config (`is_ready` is False). The project's per-role
+    max_tokens override (`ProjectSettings.role_max_tokens`) is applied to
+    every outcome — it is the most specific layer.
     """
+    return _apply_role_max_tokens(_resolve_connection(config, role), role)
+
+
+def _resolve_connection(config: Config, role: AgentRole) -> Config:
+    """Resolve the role's model CONNECTION (without the per-role
+    max_tokens overlay) — the body of the historical `resolve`."""
     # 1. Env override: DRCODE_MODEL / DRCODE_BASE_URL win globally for all
     #    roles — they are already baked into `config` by the ordinary
     #    Config layering, so nothing to resolve here.

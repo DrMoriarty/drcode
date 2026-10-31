@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
-from drcode.models import GoalType, TaskKind, TaskStatus
+from drcode.models import GoalStatus, GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
 from drcode.tui.command_providers import GoalCommandsProvider
 from drcode.tui.goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
@@ -69,23 +69,37 @@ async def test_sidebar_goals_section_rows_and_counters(app: DrCodeApp) -> None:
         app.manager.goals.update(milestone.id, type="milestone")
         child = app.manager.goals.create("Async core", parent_id=milestone.id)
         idea = app.manager.goals.create("wild idea")
-        # One research task linked to the sub-goal, done immediately.
+        # One research task linked to the sub-goal, still unfinished: the
+        # child is ACTIVE and both counters read 0/1.
         task = app.manager.create(
             "migrate", "x", kind=TaskKind.RESEARCH, goal_id=child.id
         )
-        app.manager.mark_done(task.id)
         app.refresh_sidebar()
         rows = goal_rows(app)
         assert set(rows) == {milestone.id, child.id, idea.id}
-        # The milestone sums its subtree: the sub-goal's task is done → 1/1.
-        assert "1/1" in rows[milestone.id].text
-        assert "1/1" in rows[child.id].text
+        # The milestone sums its subtree: the sub-goal's task is pending → 0/1.
+        assert "0/1" in rows[milestone.id].text
+        assert "0/1" in rows[child.id].text
         # An idea without tasks shows the "—" placeholder.
         assert "—" in rows[idea.id].text
         # The sub-goal row is indented under its parent.
         assert rows[child.id].text.startswith("  ")
         # The capture shortcut row is always there.
         assert add_goal_row(app) is not None
+
+        # Completing the child's only task auto-dones the child goal
+        # (task_manager._goal_auto_done): its row leaves the sidebar's
+        # ACTIVE-only section, while the still-ACTIVE milestone keeps
+        # summing the subtree (1/1).
+        app.manager.mark_done(task.id)
+        app.refresh_sidebar()
+        # The child's row removal is async (a ListView prune round-trip):
+        # let it land before asserting the row is gone.
+        await pilot.pause()
+        rows = goal_rows(app)
+        assert set(rows) == {milestone.id, idea.id}
+        assert "1/1" in rows[milestone.id].text
+        assert app.manager.goals.get(child.id).status is GoalStatus.DONE
 
 
 async def test_sidebar_goal_marker_on_task_row(app: DrCodeApp) -> None:

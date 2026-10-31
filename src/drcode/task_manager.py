@@ -12,6 +12,7 @@ from pathlib import Path
 from .goals import GoalStore
 from .models import (
     Goal,
+    GoalStatus,
     GoalType,
     PendingInput,
     Task,
@@ -181,6 +182,11 @@ class TaskManager:
         # FIRST so a caller-registered listener that raises cannot suppress
         # it — listeners are individually guarded anyway).
         self.add_completion_listener(self._goal_progress_event)
+        # Auto-lifecycle of the goal itself (registered AFTER the progress
+        # event, so the "n/m" line lands in the chat before the auto-done
+        # line): when the LAST linked task honestly completes, the goal
+        # moves to DONE on its own.
+        self.add_completion_listener(self._goal_auto_done)
 
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
@@ -316,6 +322,37 @@ class TaskManager:
             TaskEvent(
                 kind="goals",
                 text=f"цель {goal.title_display} ({goal.id}): {done}/{total} задач завершено",
+            )
+        )
+        task.touch()
+        self.storage.save(task)
+
+    def _goal_auto_done(self, task: Task, _old: TaskStatus, _origin: str) -> None:
+        """Completion listener closing the goal LIFECYCLE loop: when every
+        task linked to the goal has honestly reached COMPLETED, the goal
+        itself flips to DONE — the "✓ done" mark stops being a manual
+        chore. Scope: only the goal's own live links (task.goal_id mirror,
+        the same set goal_progress counts) — a goal without any linked
+        task is never touched (ideas are naturally out of scope), an
+        ARCHIVED goal is never resurrected/re-stamped, and an already-DONE
+        goal is left as is. Cancelled tasks do not count as done: cancel
+        is a user opt-out, not a completion (the goal then simply stays
+        active until its remaining tasks finish). Goes through
+        goals.update like every other status mutation."""
+        goal = self.goals.goals.get(task.goal_id) if task.goal_id else None
+        if goal is None or goal.status is not GoalStatus.ACTIVE:
+            return
+        linked = [t for t in self.tasks.values() if t.goal_id == goal.id]
+        if not linked or not all(
+            t.status is TaskStatus.COMPLETED and not t.cancelled for t in linked
+        ):
+            return
+        self.goals.update(goal.id, status=GoalStatus.DONE)
+        task.events.append(
+            TaskEvent(
+                kind="goals",
+                text=f"цель {goal.title_display} ({goal.id}) переведена "
+                f"в done — все {len(linked)} связанных задач завершено",
             )
         )
         task.touch()
@@ -467,6 +504,9 @@ class TaskManager:
             goal.linked_task_ids.append(task.id)
             goal.touch()
             self.goals.save(goal)
+            # A freshly created task is by definition not COMPLETED yet:
+            # assigning it to a done goal re-opens the goal.
+            self._goal_reactivate_if_done(goal, task)
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
         if draft:
@@ -595,6 +635,10 @@ class TaskManager:
             # Human intervention breaks the fix loop too: the consecutive
             # failed development rounds restart.
             task.fix_rounds = 0
+            # The task is honest work again: a stale cancel marker (the
+            # goal auto-lifecycle skips cancelled "completions") is
+            # cleared — the next completion will be a real one.
+            task.cancelled = False
             task.touch()
             self._save_changed(task, old, "user")
         elif task.status is TaskStatus.AWAITING_CLARIFICATION:
@@ -685,6 +729,29 @@ class TaskManager:
                     total += c_total
         return done, total
 
+    def _goal_reactivate_if_done(self, goal: Goal, task: Task) -> None:
+        """Auto-return from done: assigning a NOT-yet-completed task to a
+        DONE goal flips the goal back to ACTIVE — a done goal that has
+        just picked up fresh work is not done anymore. An ARCHIVED goal is
+        left alone (its status is not DONE, so the guard below already
+        excludes it — stated explicitly in the docstring because the
+        auto-mechanics must never resurrect the archive), and a COMPLETED
+        task keeps the goal where it is (nothing new to do)."""
+        if goal.status is not GoalStatus.DONE:
+            return
+        if task.status is TaskStatus.COMPLETED:
+            return
+        self.goals.update(goal.id, status=GoalStatus.ACTIVE)
+        task.events.append(
+            TaskEvent(
+                kind="goals",
+                text=f"цель {goal.title_display} ({goal.id}) возвращена "
+                "в active — к ней привязана незавершённая задача",
+            )
+        )
+        task.touch()
+        self.storage.save(task)
+
     def link_goal(self, task_id: str, goal_id: str) -> Task:
         """Attach a task to a goal (the header's "+ assign"/"✏"
         links). An unknown goal id raises ValueError (the caller
@@ -709,6 +776,7 @@ class TaskManager:
             goal.linked_task_ids.append(task_id)
             goal.touch()
             self.goals.save(goal)
+        self._goal_reactivate_if_done(goal, task)
         return task
 
     def unlink_goal(self, task_id: str) -> Task:
@@ -954,6 +1022,10 @@ class TaskManager:
         old = task.status
         task.pending_input.clear()
         task.unfinished = False
+        # The cancel marker: the status lands on COMPLETED like an honest
+        # finish, but the goal auto-lifecycle must not count this task as
+        # done (cancelled work is opted-out work, not completed work).
+        task.cancelled = True
         task.clarification = None
         task.queue_head = False
         # Cancelling from TESTING (or a re-queued round): a stale passed/

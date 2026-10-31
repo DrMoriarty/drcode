@@ -197,11 +197,12 @@ def test_completion_appends_goal_progress_event(manager) -> None:
     assert len(events) == 1
     assert "1/2 задач завершено" in events[0]
     assert goal.title_display in events[0]
-    # The second task's own completion sees both done.
+    # The second task's own completion sees both done — and closes the
+    # goal: the progress event is followed by the auto-done one.
     manager.mark_done(second.id)
     events2 = [e.text for e in manager.get(second.id).events if e.kind == "goals"]
-    assert len(events2) == 1
     assert "2/2 задач завершено" in events2[0]
+    assert any("переведена" in e and "done" in e for e in events2)
 
 
 def test_completion_without_goal_has_no_goal_event(manager) -> None:
@@ -229,8 +230,114 @@ def test_requeued_completed_task_keeps_goal_link_and_counts_once(manager) -> Non
     assert goal.linked_task_ids == [task.id]
     manager.mark_done(task.id)
     events = [e.text for e in task.events if e.kind == "goals"]
-    assert len(events) == 2
-    assert "1/1 задач завершено" in events[-1]
+    # Two progress events (one per completion) plus the auto-done line the
+    # first completion produced (the goal re-opens only via a NEW task
+    # assignment, not by re-queuing an old one — see the lifecycle tests;
+    # the second completion finds the goal already DONE and adds nothing).
+    progress = [
+        e for e in events if "задач завершено" in e and "переведена" not in e
+    ]
+    assert len(progress) == 2
+    assert "1/1 задач завершено" in progress[-1]
+    assert sum("переведена" in e for e in events) == 1
+
+
+def test_goal_auto_done_when_all_linked_tasks_complete(manager, project_root) -> None:
+    goal = manager.goals.create("Async core")
+    first = manager.create(
+        "migrate storage", "do it", kind=TaskKind.RESEARCH, goal_id=goal.id
+    )
+    second = manager.create(
+        "migrate agent", "do it", kind=TaskKind.RESEARCH, goal_id=goal.id
+    )
+
+    manager.mark_done(first.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+    manager.mark_done(second.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+    # The auto-done is announced in the last completing task's chat log.
+    events = [e.text for e in manager.get(second.id).events if e.kind == "goals"]
+    assert any("переведена" in e and "done" in e for e in events)
+    # Persisted.
+    reloaded = GoalStore(project_root)
+    assert reloaded.get(goal.id).status is GoalStatus.DONE
+
+
+def test_goal_auto_done_single_task(manager) -> None:
+    goal = manager.goals.create("solo")
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+
+def test_goal_auto_done_ignores_goal_without_tasks(manager) -> None:
+    goal = manager.goals.create("orphan idea")
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH)
+    manager.mark_done(task.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+
+
+def test_goal_auto_done_not_triggered_by_cancel(manager) -> None:
+    goal = manager.goals.create("Async core")
+    first = manager.create(
+        "migrate storage", "do it", kind=TaskKind.RESEARCH, goal_id=goal.id
+    )
+    second = manager.create(
+        "migrate agent", "do it", kind=TaskKind.RESEARCH, goal_id=goal.id
+    )
+    manager.mark_done(first.id)
+    manager.cancel(second.id)
+    # A cancelled task is not an honest completion: the goal stays active.
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+
+
+def test_goal_auto_done_skips_archived_goal(manager) -> None:
+    goal = manager.goals.create("shelved")
+    manager.goals.update(goal.id, status=GoalStatus.ARCHIVED)
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.ARCHIVED
+
+
+def test_goal_reactivates_when_new_task_created(manager) -> None:
+    goal = manager.goals.create("Async core")
+    first = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(first.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+    manager.create("t2", "more work", goal_id=goal.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+
+
+def test_goal_reactivates_on_link(manager) -> None:
+    goal = manager.goals.create("Async core")
+    done = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(done.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+    other = manager.create("t2", "brief", kind=TaskKind.RESEARCH)
+    manager.link_goal(other.id, goal.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+    events = [e.text for e in manager.get(other.id).events if e.kind == "goals"]
+    assert any("возвращена" in e and "active" in e for e in events)
+
+
+def test_goal_reactivate_skips_completed_task_and_archived(manager) -> None:
+    goal = manager.goals.create("Async core")
+    done = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(done.id)
+
+    # Linking a COMPLETED task leaves the goal done.
+    another_done = manager.create("t2", "brief", kind=TaskKind.RESEARCH)
+    manager.mark_done(another_done.id)
+    manager.link_goal(another_done.id, goal.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+    # An archived goal is never resurrected by an unfinished task.
+    archived = manager.goals.create("shelved")
+    manager.goals.update(archived.id, status=GoalStatus.ARCHIVED)
+    manager.create("t3", "brief", goal_id=archived.id)
+    assert manager.goals.get(archived.id).status is GoalStatus.ARCHIVED
 
 
 # -- goal tools (agent layer) -----------------------------------------------------

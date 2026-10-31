@@ -312,6 +312,12 @@ class Task(BaseModel):
     # agent resumes the attempt without new user text on the next
     # activation (run_agent's continuation turn).
     unfinished: bool = False
+    # True when the user CANCELLED the task (Ctrl+X): the status is
+    # COMPLETED (cancel completes immediately, skipping the tester) but the
+    # task's work was never honestly finished — the goal auto-lifecycle
+    # (TaskManager._goal_auto_done) must not count it as a done task.
+    # Cleared when the task is re-queued with new input (send()).
+    cancelled: bool = False
     # The worktree-isolation mode this task is PINNED to, stamped at its
     # FIRST activation (None = never activated — the live `task_isolation`
     # setting decides). True/False freeze the mode for the task's whole

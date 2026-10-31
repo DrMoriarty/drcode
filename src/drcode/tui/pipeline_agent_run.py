@@ -331,11 +331,15 @@ class PipelineAgentRunLayer(DrCodeState):
             message = f"Task isolated in worktree {root} (branch drcode/{task_id})."
             if iso_note:
                 message += f" ({iso_note})"
-            self._show_event(task, message)
+            # A network retry re-enters run_agent whole and reuses the
+            # worktree created by the first attempt — announce it once,
+            # not once per retry (see _show_event_once).
+            self._show_event_once(task, message)
         elif iso_note:
             # Isolation is on but the worktree could not be created:
-            # the task falls back to the project directory — say so.
-            self._show_event(task, f"Task isolation unavailable: {iso_note}")
+            # the task falls back to the project directory — say so
+            # (deduplicated the same way: retries repeat it verbatim).
+            self._show_event_once(task, f"Task isolation unavailable: {iso_note}")
         # Custom workflow (`.drcode/workflow.py`): the on_task_start
         # hook runs before the first activation (branch checkout etc.);
         # its instructions are prepended to the first consumed prompt.

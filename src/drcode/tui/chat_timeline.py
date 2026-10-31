@@ -262,6 +262,19 @@ class ChatTimelineLayer(DrCodeState):
         if self.viewed_id == task.id:
             self._write_history_line("event", self._format_event(task.events[-1]))
 
+    def _show_event_once(self, task: Task, text: str, *, kind: str = "system") -> None:
+        """`_show_event` deduplicated per task and wording: an identical
+        line already sitting in the task's event log is not appended
+        again.
+
+        For announcements that fire on EVERY activation of a run — the
+        worktree-isolation notes: a network retry re-enters `run_agent`
+        whole (`_agent_turn_network_error` reschedules it), the worktree
+        is merely reused, and without the dedupe each retry would repeat
+        the same "Task isolated in worktree …" line into the chat."""
+        if not any(e.text == text for e in task.events):
+            self._show_event(task, text, kind=kind)
+
     def _isolation_pin_note(self, task: Task, *, save: bool) -> None:
         """Run-boundary bookkeeping for the isolation pin
         (`task.isolation_pinned`, stamped by `ensure_root` on the task's

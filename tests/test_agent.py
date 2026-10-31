@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -52,6 +53,7 @@ from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.settings import GitPolicy
 from drcode.task_manager import TaskManager
 from drcode.tools import PathViolation
+from drcode.transcript import _message_time
 
 
 def user_msg(text: str) -> ModelRequest:
@@ -270,6 +272,51 @@ def test_extract_display_user_and_assistant() -> None:
         ("user", "question"),
         ("assistant", "answer"),
     ]
+
+
+def test_extract_display_resumed_request_uses_prompt_stamp() -> None:
+    """A resumed request (network retry without new text) carries a fresh
+    top-level timestamp from pydantic-ai's resume path while the
+    UserPromptPart keeps the moment the prompt was typed — display order
+    must follow the part stamp, or the prompt drops below the service
+    events that happened between typing and the successful attempt
+    (task 27ef7164)."""
+    typed = datetime(2026, 10, 31, 6, 47, 20, tzinfo=UTC)
+    resumed = datetime(2026, 10, 31, 6, 48, 9, tzinfo=UTC)
+    request = ModelRequest(
+        parts=[UserPromptPart(content="hi", timestamp=typed)], timestamp=resumed
+    )
+    out = extract_display(serialize_messages([request]))
+    assert [(at, role) for at, role, _ in out] == [(typed, "user")]
+
+
+def test_message_time_fallbacks() -> None:
+    # No top-level timestamp (legacy transcripts): the latest part stamp wins.
+    legacy = {
+        "kind": "request",
+        "parts": [
+            {
+                "part_kind": "user-prompt",
+                "content": "hi",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    assert _message_time(legacy) == datetime(2026, 1, 1, tzinfo=UTC)
+    # Non-prompt request (tool returns): top-level timestamp wins.
+    tools = {
+        "kind": "request",
+        "timestamp": "2026-01-02T00:00:00+00:00",
+        "parts": [
+            {
+                "part_kind": "tool-return",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+    assert _message_time(tools) == datetime(2026, 1, 2, tzinfo=UTC)
+    # Nothing recorded at all.
+    assert _message_time({"kind": "request", "parts": []}) is None
 
 
 def test_extract_display_groups_thinking_and_text() -> None:

@@ -328,27 +328,48 @@ def _message_time(msg: dict[str, Any]) -> datetime | None:
     pydantic-ai 2.x puts a top-level `timestamp` on both ModelRequest and
     ModelResponse; older transcripts only carried per-part timestamps on
     requests (UserPromptPart / ToolReturnPart), so those are used as a
-    fallback (the latest part stamp)."""
+    fallback (the latest part stamp).
+
+    A request carrying a user prompt is ordered by the PROMPT's own part
+    stamp, not the top-level one: pydantic-ai's resume path
+    (_resumed_request → _prepare_request) rebuilds the tail ModelRequest
+    with a fresh top-level timestamp (the moment the retried/resumed
+    attempt actually runs) while leaving UserPromptPart.timestamp at the
+    moment the prompt was typed. Trusting the top-level stamp would drop
+    the user's message below service events that happened in between."""
     raw = msg.get("timestamp")
+    top: datetime | None = None
     if isinstance(raw, str):
         try:
-            return datetime.fromisoformat(raw)
+            top = datetime.fromisoformat(raw)
         except ValueError:
-            raw = None
-    if isinstance(raw, datetime):
-        return raw
+            top = None
+    elif isinstance(raw, datetime):
+        top = raw
+    is_request = msg.get("kind") == "request" or msg.get("role") == "request"
     stamps: list[datetime] = []
+    prompt_stamp: datetime | None = None
     for part in msg.get("parts", []):
         if not isinstance(part, dict):
             continue
         part_raw = part.get("timestamp")
+        stamp: datetime | None = None
         if isinstance(part_raw, str):
             try:
-                stamps.append(datetime.fromisoformat(part_raw))
+                stamp = datetime.fromisoformat(part_raw)
             except ValueError:
-                pass
+                stamp = None
         elif isinstance(part_raw, datetime):
-            stamps.append(part_raw)
+            stamp = part_raw
+        if stamp is None:
+            continue
+        stamps.append(stamp)
+        if is_request and part.get("part_kind") == "user-prompt":
+            prompt_stamp = stamp
+    if is_request and prompt_stamp is not None:
+        return prompt_stamp
+    if top is not None:
+        return top
     return max(stamps) if stamps else None
 
 

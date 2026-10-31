@@ -131,6 +131,40 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     CSS = """
     Screen { layers: base toast; }
 
+    # --- Compact form widgets -------------------------------------------
+    # Stock Textual draws a tall border (1 line above + 1 below) around
+    # every form widget, so each Button/Select/Input/Switch eats 3 lines
+    # and dialog forms (setup, task settings, github, voice, …) balloon.
+    # Force the stock "compact" geometry app-wide (the same rules the
+    # widgets' own DEFAULT_CSS applies under `.-textual-compact`): the
+    # border goes away and the widget becomes 1 line tall. Focus stays
+    # readable without the border — the widgets' :focus rules already
+    # paint a background-tint; the block below strengthens it slightly so
+    # a borderless focused field is still obvious.
+    Button, Input, Switch, Checkbox, RadioButton, RadioSet, OptionList,
+    Select > SelectCurrent {
+        border: none !important;
+    }
+    Input {
+        height: 1;
+        padding: 0 1;
+    }
+    Select > SelectCurrent {
+        padding: 0 1 0 0;
+    }
+    RadioSet {
+        padding: 0;
+    }
+    OptionList {
+        padding: 0;
+        & > .option-list--option { padding: 0; }
+    }
+    Button:focus, Input:focus, Switch:focus, Checkbox:focus,
+    RadioButton:focus, OptionList:focus, Select:focus > SelectCurrent {
+        background-tint: $foreground 10%;
+    }
+
+
 
     #main { height: 1fr; }
     #sidebar-col { width: 36; border-right: solid $primary; }

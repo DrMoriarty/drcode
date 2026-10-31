@@ -114,15 +114,16 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
     #voice-note { color: $text-disabled; }
     .voice-label {
         width: auto;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
         color: $text-muted;
         text-style: bold;
     }
+    /* Compact form widgets are 1 line tall (see DrCodeApp.CSS). */
     #voice-url, #voice-key, #voice-asr, #voice-tts-model, #voice-tts-voice {
-        height: 3;
+        height: 1;
     }
     #voice-lang {
-        height: 3;
+        height: auto;
         width: 30;
     }
     .voice-row { height: auto; }
@@ -131,7 +132,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
        space; each half is a label-above-widget column. */
     .voice-pair { height: auto; }
     .voice-pair > Vertical { width: auto; height: auto; }
-    .voice-pair .voice-label { margin-top: 1; }
+    .voice-pair .voice-label { margin-top: 0; }
     #voice-tts-voice { width: 30; }
     /* Pinned footer (dock survives the dialog's scroll): Check + Save on
        one line with the esc hint, the Check status line below it — both

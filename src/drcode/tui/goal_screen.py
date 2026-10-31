@@ -144,7 +144,7 @@ class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
     #goal-title { margin-bottom: 1; }
     #goal-edit-desc-label, #goal-edit-notes-label {
         color: $text-muted;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
     }
     #goal-edit-desc { height: 4; border: solid $primary; }
     #goal-edit-notes { height: 12; border: solid $primary; }

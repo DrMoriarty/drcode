@@ -148,7 +148,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     .ts-label {
         width: auto;
         color: $text-muted;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
     }
     #ts-preset {
         margin-top: 1;
@@ -172,11 +172,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     Select {
         width: 1fr;
     }
-    Select.changed {
-        border: tall $warning;
-    }
+    # "Changed" marker: a border-tint is useless under the compact form
+    # styles (the border the signal used to color is gone) — tint the
+    # widget's background instead; visible on Select and Switch alike.
+    Select.changed,
     Switch.changed {
-        border: tall $warning;
+        background-tint: $warning 25%;
     }
     .ts-dormant {
         opacity: 0.55;

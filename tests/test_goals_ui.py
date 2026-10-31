@@ -132,7 +132,7 @@ async def test_sidebar_marker_tracks_link_changes(app: DrCodeApp) -> None:
         app.link_viewed_goal(goal.id)
         app.refresh_sidebar()
         assert goal.id in task_row(app, task.id).text
-        app.unlink_viewed_goal()
+        app.action_unlink_viewed_goal()
         app.refresh_sidebar()
         assert "◆" not in task_row(app, task.id).text
 
@@ -414,7 +414,7 @@ async def test_goal_provider_create_only_and_header_links(app: DrCodeApp) -> Non
         assert "change" in extra
         assert "unlink" in extra
         # Fire the unlink header link.
-        app.unlink_viewed_goal()
+        app.action_unlink_viewed_goal()
         await pilot.pause()
         assert task.goal_id is None
         extra = str(app.query_one("#task-status-extra", Static).content)

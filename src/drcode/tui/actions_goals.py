@@ -165,7 +165,7 @@ class GoalsActionsLayer(DrCodeState):
             return
         self.link_viewed_goal(goal_id)
 
-    def unlink_viewed_goal(self) -> None:
+    def action_unlink_viewed_goal(self) -> None:
         """The "unlink" header fragment over the viewed task (also a
         click target — a drag-selection ending on it is copying text,
         not navigating, same guard as the other header links)."""

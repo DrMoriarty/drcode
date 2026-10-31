@@ -15,7 +15,7 @@
 - ``GoalScreen`` — the full-screen roadmap view: milestone → sub-goal
   tree with n/m progress counters, a status filter, Enter-expandable
   description/notes details and the keyboard action set
-  (N/R/T/E/M/A/Ctrl+Up/Down/Esc). The tree itself is collapsible:
+  (N/R/T/E/M/A/D/Ctrl+Up/Down/Esc). The tree itself is collapsible:
   → (a button and the Right key) toggles the cursor goal's sub-goals
   and detail rows together, ← (a button and the Left key) lifts the
   cursor to the parent goal. The screen is a viewer + decision pad:
@@ -532,7 +532,8 @@ class GoalScreen(ModalScreen[None]):
     pattern): N new (sub-)goal · R research task for the goal · T task
     from the goal (the standard Ctrl+N form with the link preset) · E
     edit description/notes · M reparent (picker or Make top-level) · A
-    archive/unarchive · Ctrl+Up/Down reorder among siblings · F cycle
+    archive/unarchive · D done/undone (toggle GoalStatus.DONE) ·
+    Ctrl+Up/Down reorder among siblings · F cycle
     the status filter · → expand/collapse the cursor goal's sub-goals
     AND its detail rows together ·
     ← lift the cursor to the parent goal · Esc close."""
@@ -548,6 +549,7 @@ class GoalScreen(ModalScreen[None]):
         Binding("e", "edit_goal", "Edit"),
         Binding("m", "reparent", "Move"),
         Binding("a", "archive", "Archive"),
+        Binding("d", "toggle_done", "Done"),
         Binding("ctrl+up", "move_up", "Move up", show=False),
         Binding("ctrl+down", "move_down", "Move down", show=False),
         # Alt duplicates: macOS intercepts ctrl+arrows system-wide.
@@ -710,8 +712,8 @@ class GoalScreen(ModalScreen[None]):
             yield ListView(id="goal-tree")
             yield Static(
                 "n new · r research task · t task · e edit · m move · "
-                "a archive/unarchive · f filter · ctrl+↑/↓ reorder · "
-                "enter details · ←/→ tree · esc close",
+                "a archive/unarchive · d done/undone · f filter · "
+                "ctrl+↑/↓ reorder · enter details · ←/→ tree · esc close",
                 id="goal-screen-footer",
             )
 
@@ -1038,6 +1040,28 @@ class GoalScreen(ModalScreen[None]):
         self.notify(
             f"#{goal.id} {goal.title_display} "
             + ("archived" if to_archived else "returned to active"),
+            title="Goals",
+            timeout=4,
+        )
+        self._refresh_all()
+
+    def action_toggle_done(self) -> None:
+        """D: mark the cursor goal done — the status the "done" filter
+        (F) selects on — or return an already done one to active (an
+        undo for a mis-strike). Archive (A) stays a separate toggle:
+        done means "achieved", archived means "shelved"."""
+        goal = self._require_cursor()
+        if goal is None:
+            return
+        app = self._app()
+        to_done = goal.status is not GoalStatus.DONE
+        app.manager.goals.update(
+            goal.id,
+            status=GoalStatus.DONE if to_done else GoalStatus.ACTIVE,
+        )
+        self.notify(
+            f"#{goal.id} {goal.title_display} "
+            + ("marked done" if to_done else "returned to active"),
             title="Goals",
             timeout=4,
         )

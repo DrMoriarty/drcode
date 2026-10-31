@@ -183,6 +183,41 @@ async def test_goal_screen_tree_and_details(app: DrCodeApp) -> None:
         assert any("notes:" in t for t in texts)
 
 
+async def test_goal_screen_done_toggle(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        goal = app.manager.goals.create("Async core")
+        other = app.manager.goals.create("unrelated")
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+
+        def shown() -> set[str]:
+            return {
+                w.goal_id
+                for w in listing.children
+                if isinstance(w, TaskItem) and w.goal_id
+            }
+
+        # Default filter "active": the fresh goal is visible, `d` marks
+        # it done — the row leaves the active filter immediately.
+        assert shown() == {goal.id, other.id}
+        await pilot.press("d")
+        await pilot.pause()
+        assert app.manager.goals.get(goal.id).status == "done"
+        assert shown() == {other.id}
+        # The "done" filter (f f from active) now selects the goal.
+        await pilot.press("f")
+        await pilot.press("f")
+        await pilot.pause()
+        assert shown() == {goal.id}
+        # `d` again undoes it: back to active, the done filter empties.
+        await pilot.press("d")
+        await pilot.pause()
+        assert app.manager.goals.get(goal.id).status == "active"
+        assert shown() == set()
+
+
 async def test_goal_screen_filter_cycle(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)

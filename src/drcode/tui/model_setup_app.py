@@ -91,7 +91,9 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-left { width: 34; margin-right: 2; height: auto; }
     #mc-providers { height: 6; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }
-    #mc-name, #mc-url, #mc-key { height: 3; }
+    /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
+       border-inclusive height:3 would pad every field with 2 blank rows. */
+    #mc-name, #mc-url, #mc-key { height: 1; }
     .mc-btnrow {
         height: auto;
         margin-top: 1;
@@ -108,11 +110,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         margin-top: 1;
     }
     #mc-model-row { height: auto; }
-    #mc-model-row Input { height: 3; }
+    #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
     #mc-roles { height: auto; margin-top: 1; }
-    #mc-roles Select { width: 1fr; height: 3; }
+    #mc-roles Select { width: 1fr; height: auto; }
     #mc-footer {
         height: auto;
         margin-top: 1;

@@ -79,7 +79,7 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
     #gh-title { color: $text; margin-bottom: 1; text-style: bold; }
     .gh-label {
         width: auto;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
         color: $text-muted;
         text-style: bold;
     }

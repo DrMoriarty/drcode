@@ -60,7 +60,7 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
     #ntf-note { color: $text-disabled; }
     .ntf-label {
         width: auto;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
         color: $text-muted;
         text-style: bold;
     }

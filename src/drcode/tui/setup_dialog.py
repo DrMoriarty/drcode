@@ -69,7 +69,9 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
     #sd-note .req { color: $error; }
     .sd-label {
         width: auto;
-        margin-top: 1;
+        /* Compact form widgets are 1 line tall — the old margin-top: 1
+           (spacing for the removed border rows) just adds air now. */
+        margin-top: 0;
         color: $text-muted;
         text-style: bold;
     }

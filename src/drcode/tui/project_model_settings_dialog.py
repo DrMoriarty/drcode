@@ -160,14 +160,16 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     .pms-label {
         width: auto;
         color: $text-muted;
-        margin-top: 1;
+        margin-top: 0; /* compact widgets need no border-spacing */
         height: 1;
     }
     Select {
         width: 1fr;
     }
     Select.changed {
-        border: tall $warning;
+        /* Compact form styles removed the border this marker used to
+           color — tint the background instead (see DrCodeApp.CSS). */
+        background-tint: $warning 25%;
     }
     .pms-hint {
         height: auto;

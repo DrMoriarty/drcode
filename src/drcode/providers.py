@@ -449,6 +449,11 @@ class UserModelsStore:
     """
 
     def __init__(self, path: Path | None = None) -> None:
+        # Whether the path was passed explicitly matters for the agent-guard
+        # in `save` (incident ebe6ba15): a verification snippet default-
+        # constructed inside a drcode agent's run_bash child must never
+        # resolve to the real user catalog.
+        self._explicit_path = path is not None
         self.path = path or user_models_file()
         self.last_warning: str | None = None
 
@@ -491,6 +496,19 @@ class UserModelsStore:
 
     def save(self, catalog: UserModelsConfig) -> Path:
         """Atomically persist the catalog, backing up the previous version."""
+        if os.environ.get("DRCODE_TASK_ID") and not self._explicit_path:
+            # Defense in depth (incident ebe6ba15): a default-constructed
+            # store inside a run_bash child resolves to the REAL
+            # ~/.config/drcode/models.json. The error reaches the agent as
+            # the snippet's output (same mechanism as ModelRetry /
+            # PathViolation) and the agent fixes itself by passing an
+            # explicit tmp path. The TUI and drcode-models run without
+            # DRCODE_TASK_ID and are unaffected.
+            raise ValueError(
+                "UserModelsStore: running under a drcode agent (DRCODE_TASK_ID "
+                "is set); writing to the real user catalog is forbidden — "
+                "pass an explicit path (a tmp directory) to UserModelsStore()."
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             try:

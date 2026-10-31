@@ -1093,6 +1093,41 @@ def test_seed_skipped_when_user_config_has_no_model(user_config_dir: Path) -> No
     assert catalog.providers == []
 
 
+# -- agent guard on save (incident ebe6ba15) ----------------------------------------
+
+
+def test_save_under_agent_without_explicit_path_raises(
+    user_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DRCODE_TASK_ID", "t1")
+    with pytest.raises(ValueError, match="explicit path"):
+        UserModelsStore().save(UserModelsConfig())
+    # Nothing was written anywhere.
+    assert not UserModelsStore().path.exists()
+
+
+def test_save_under_agent_with_explicit_path_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DRCODE_TASK_ID", "t1")
+    target = tmp_path / "models.json"
+    catalog = UserModelsConfig(
+        providers=[Provider(name="p", base_url="http://x/v1")]
+    )
+    written = UserModelsStore(path=target).save(catalog)
+    assert written == target
+    assert UserModelsStore(path=target).load() == catalog
+
+
+def test_save_without_agent_marker_unchanged(user_config_dir: Path) -> None:
+    # No DRCODE_TASK_ID (conftest strips it): implicit path behaves as before.
+    catalog = UserModelsConfig(
+        providers=[Provider(name="p", base_url="http://x/v1")]
+    )
+    UserModelsStore().save(catalog)
+    assert UserModelsStore().load() == catalog
+
+
 # -- fetch_models ------------------------------------------------------------------
 
 

@@ -99,7 +99,7 @@ class TaskStatusLayer(DrCodeState):
         except NoMatches:
             return
         # The second row's fragments are deliberately colored (cyan deps /
-        # magenta goal / blue branch), and almost every one of them is also
+        # magenta goal / deepskyblue branch), and almost every one of them is also
         # a link (@click). Textual applies the widget's link style ON TOP of
         # any segment carrying @click meta, and the auto link color (near-
         # white over the panel background) plus the underline paints over
@@ -189,7 +189,7 @@ class TaskStatusLayer(DrCodeState):
 
         The whole fragment is tinted cyan (the dependency-list color of
         the second header row, distinct from the magenta goal and the
-        blue branch); the per-dependency state colors below override it
+        deepskyblue branch); the per-dependency state colors below override it
         inside their own spans."""
         if not task.depends_on:
             return ""
@@ -241,10 +241,10 @@ class TaskStatusLayer(DrCodeState):
             # single spaces — the icons hug the goal title (the row's
             # three-space fragment separator would leave a double gap).
             bits.append(
-                "[@click=app.assign_goal][blue]✏[/][/] "
+                "[@click=app.assign_goal][deepskyblue]✏[/][/] "
                 "[@click=app.unlink_viewed_goal][red]✕[/][/] "
                 # The goal fragment is magenta (the goal color of this
-                # row, distinct from the cyan deps and the blue branch).
+                # row, distinct from the cyan deps and the deepskyblue branch).
                 f"[magenta][@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
                 f"◆ {escape(goal.title_display)}[/]"
             )
@@ -256,11 +256,11 @@ class TaskStatusLayer(DrCodeState):
         if task.github_issue is not None:
             bits.append(f"issue: [dim]#{task.github_issue}[/]")
         if task.isolation_pinned:
-            # The branch fragment is blue (the branch color of this row,
+            # The branch fragment is deepskyblue (the branch color of this row,
             # distinct from the cyan deps and the magenta goal).
             branch = f"drcode/{task.id}"
             bits.append(
-                f"[@click=app.copy_task_branch('{branch}')][blue]branch: {branch}[/]"
+                f"[@click=app.copy_task_branch('{branch}')][deepskyblue]branch: {branch}[/]"
             )
         if task.needs_human:
             bits.append("[bold red]✋ needs human[/]")

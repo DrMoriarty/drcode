@@ -452,9 +452,50 @@ def sanitized_env() -> dict[str, str]:
 DESTRUCTIVE_COMMANDS = {"rm", "mv", "cp"}
 # Common wrappers that may prefix the actual command.
 COMMAND_WRAPPERS = {"sudo", "nohup", "nice", "env", "command", "time"}
-# Shell separators that split a command line into independent segments.
-_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n&]")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _split_segments(command: str) -> list[str]:
+    """Split a command line on shell separators (`&&`, `||`, `;`, `|`, `&`,
+    newline) while honoring quoting: `'...'`, `"..."` and backslash escapes
+    keep their content intact, so a newline or `;` inside a quoted argument
+    (a multi-line commit message, say) never tears a segment into an
+    unparsable half and feeds literal text to the destructive-command
+    fallback."""
+    segments: list[str] = []
+    start = 0
+    i = 0
+    n = len(command)
+    quote: str | None = None
+    while i < n:
+        c = command[i]
+        if quote:
+            # A backslash escapes the next char only inside double quotes.
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+        elif c == "\\":
+            i += 2
+        elif c in "'\"":
+            quote = c
+            i += 1
+        elif c in ";\n":
+            segments.append(command[start:i])
+            i += 1
+            start = i
+        elif c in "&|":
+            segments.append(command[start:i])
+            if command[i + 1 : i + 2] == c:
+                i += 1
+            i += 1
+            start = i
+        else:
+            i += 1
+    segments.append(command[start:])
+    return segments
 _DESTRUCTIVE_WORD = re.compile(r"(?:^|[\s;&|(])(sudo\s+)?(rm|mv|cp)\b")
 # Conservative fallback for unparsable segments: any `git … stash …` in there.
 _GIT_STASH_WORD = re.compile(r"\bgit\b[^;&|]*\bstash\b")
@@ -516,7 +557,7 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
     changes. `git stash list` (read-only) stays allowed.
     """
     state_dir = (root / PROJECT_STATE_DIRNAME).resolve()
-    for segment in _SEGMENT_SPLIT.split(command):
+    for segment in _split_segments(command):
         segment = segment.strip()
         if not segment:
             continue

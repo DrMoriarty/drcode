@@ -622,6 +622,31 @@ def test_check_command_segments(project_root: Path) -> None:
         check_command(project_root, "echo hi\nrm /etc/passwd")
 
 
+def test_check_command_multiline_quoted_argument(project_root: Path) -> None:
+    # A newline inside a quoted argument does not split the segment:
+    # multi-line commit messages that merely mention cp/rm/mv must run
+    # (regression: the tester's `git commit -m '...\ncp mentions...'`).
+    msg = "Live progress bar for cloudcp cp with --threads > 1\n\nmv and rm mentioned as plain words."
+    check_command(project_root, f"git commit -m '{msg}'")
+    check_command(project_root, f'git commit -m "{msg}"')
+    check_command(project_root, f"printf '{msg}'")
+    # The exact incident shape: shell-escaped apostrophe inside the message
+    # (`don'"'"'t`) plus the standalone word `cp` in the body.
+    incident = (
+        "Live progress bar (%, speed, ETA) for cloudcp cp with --threads > 1\n\n"
+        "Per-chunk thread-safe byte counting; Bar.update/_draw now run under a\n"
+        "lock so worker threads don'\"'\"'t interleave stderr draws."
+    )
+    check_command(project_root, f"git commit -m '{incident}'")
+    # Separators inside quotes are literal text, not command separators.
+    check_command(project_root, "echo 'a; rm /etc/passwd' && echo done")
+    # Real separators outside the quotes still split and are still checked.
+    with pytest.raises(PathViolation):
+        check_command(project_root, "echo 'text' && rm /etc/passwd")
+    with pytest.raises(PathViolation):
+        check_command(project_root, "echo 'text'\nrm /etc/passwd")
+
+
 def test_check_command_flags_not_paths(project_root: Path) -> None:
     # Flags like -rf or --recursive must not be treated as paths.
     check_command(project_root, "rm -rf --recursive ./build")

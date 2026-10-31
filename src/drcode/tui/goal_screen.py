@@ -788,20 +788,31 @@ class GoalScreen(ModalScreen[None]):
         return rows
 
     def _rebuild(self) -> None:
-        """Re-render the tree, keeping the cursor on its goal."""
+        """Re-render the tree, keeping the cursor on its goal.
+
+        The actual re-render runs in an exclusive worker: ListView's
+        clear()/extend() settle asynchronously (the old rows are pruned
+        on a later message), so restoring the cursor synchronously would
+        scan the doomed pre-clear children and highlight a stale row —
+        the lost-cursor bug of Ctrl+Up/Down. A newer rebuild (key repeat)
+        cancels the in-flight one and starts from the current store."""
         if not self.is_mounted:
             return
+        self.run_worker(self._rebuild_worker(), exclusive=True, group="goal-rebuild")
+
+    async def _rebuild_worker(self) -> None:
         app = self._app()
         listing = self.query_one("#goal-tree", ListView)
         cursor_id = self._cursor_goal_id() or self._focus_goal_id
-        listing.clear()
+        await listing.clear()
+        items: list[TaskItem] = []
         for goal, depth in self._visible_rows():
-            listing.append(
+            items.append(
                 TaskItem(self._row_text(goal, depth, app), None, goal_id=goal.id)
             )
             if goal.id in self._expanded:
-                for row in self._detail_rows(goal, depth):
-                    listing.append(row)
+                items.extend(self._detail_rows(goal, depth))
+        await listing.extend(items)
         if cursor_id:
             for index, child in enumerate(listing.children):
                 if isinstance(child, TaskItem) and child.goal_id == cursor_id:
@@ -812,6 +823,10 @@ class GoalScreen(ModalScreen[None]):
             # row): land on the first row so the action keys work right
             # away, without an extra arrow press.
             listing.index = 0
+        # The cursor hint for the next rebuild: while a previous rebuild
+        # is still settling, highlighted_child is None and the move
+        # actions fall back to the goal it was about to restore.
+        self._focus_goal_id = cursor_id
         self._update_top()
 
     def _refresh_all(self) -> None:
@@ -1030,6 +1045,12 @@ class GoalScreen(ModalScreen[None]):
 
     def _move(self, *, up: bool) -> None:
         goal_id = self._cursor_goal_id()
+        if goal_id is None:
+            # A rebuild worker may still be settling (cleared ListView):
+            # fall back to the cursor it was about to restore, so a held
+            # Ctrl+Up/Down keeps moving the same goal instead of no-oping.
+            hint = self._focus_goal_id
+            goal_id = hint if hint and hint in self._app().manager.goals else None
         if goal_id is None:
             return
         self._app().manager.goals.move(goal_id, up=up)

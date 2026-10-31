@@ -142,8 +142,9 @@ class TaskStatusLayer(DrCodeState):
             status += f" [{status_color}]⏱ {self._fmt_age(seconds)}[/]"
         parts = [
             kind,
-            # The task's own id is a link too: clicking it copies the bare
-            # short id to the clipboard (action_copy_task_id).
+            # The task's own id is a link too: clicking it copies the
+            # short id (with the `#` prefix) to the clipboard
+            # (action_copy_task_id).
             (
                 f"[@click=app.copy_task_id('{task.id}')]#{task.id}[/] "
                 f"{escape(task.title_display)}"
@@ -260,13 +261,15 @@ class TaskStatusLayer(DrCodeState):
         update_static_if_changed(widget, markup)
 
     def action_copy_task_id(self, task_id: str) -> None:
-        """Click on the viewed task's own #id in the header: copy the bare
-        short id to the clipboard. A drag-selection ending on the link is
-        copying text, not navigating (same guard as action_open_task)."""
+        """Click on the viewed task's own #id in the header: copy the short
+        id WITH the `#` prefix to the clipboard (a pasted `#<hex>` mention
+        renders as a clickable task link — the bare id does not). A
+        drag-selection ending on the link is copying text, not navigating
+        (same guard as action_open_task)."""
         if self.screen.selections:
             return
         task_id = task_id.lower()
-        self._copy_with_fallback(task_id)
+        self._copy_with_fallback(f"#{task_id}")
         self._show_copy_toast(f"#{task_id}")
 
     def action_copy_task_branch(self, branch: str) -> None:

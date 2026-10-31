@@ -98,6 +98,17 @@ class TaskStatusLayer(DrCodeState):
             extra = self.query_one("#task-status-extra", Static)
         except NoMatches:
             return
+        # The second row's fragments are deliberately colored (cyan deps /
+        # magenta goal / blue branch), and almost every one of them is also
+        # a link (@click). Textual applies the widget's link style ON TOP of
+        # any segment carrying @click meta, and the auto link color (near-
+        # white over the panel background) plus the underline paints over
+        # the markup color. auto_links = False skips that overlay — click
+        # dispatch works off the segment meta, not the link style, so the
+        # links keep working; only the underline/hover highlight is given
+        # up (the colors carry the clickability). Not settable via CSS —
+        # auto_links is a reactive, not a style rule.
+        extra.auto_links = False
         # The new-task form is not tied to any task: keep the bar empty so
         # the previously viewed task doesn't keep updating behind the form.
         if self._new_task_mode:

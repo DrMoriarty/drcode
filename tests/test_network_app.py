@@ -2966,7 +2966,7 @@ def _fake_tester_live_tokens(
     def fake(run: Any) -> int | None:
         try:
             msgs = run.all_messages()
-        except Exception:
+        except Exception:  # noqa: BLE001 - mirrors run_context_tokens: state may be mid-teardown
             return None
         texts = [
             p.content

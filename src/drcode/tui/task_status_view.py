@@ -237,12 +237,14 @@ class TaskStatusLayer(DrCodeState):
         if goal is not None:
             # The two compact icon buttons come first (left of the goal
             # fragment): ✏ opens the assign picker, ✕ detaches the task
-            # from the goal.
-            bits.append("[@click=app.assign_goal][blue]✏[/][/]")
-            bits.append("[@click=app.unlink_viewed_goal][red]✕[/][/]")
-            # The goal fragment is magenta (the goal color of this row,
-            # distinct from the cyan deps and the blue branch).
+            # from the goal. The whole group is one fragment joined with
+            # single spaces — the icons hug the goal title (the row's
+            # three-space fragment separator would leave a double gap).
             bits.append(
+                "[@click=app.assign_goal][blue]✏[/][/] "
+                "[@click=app.unlink_viewed_goal][red]✕[/][/] "
+                # The goal fragment is magenta (the goal color of this
+                # row, distinct from the cyan deps and the blue branch).
                 f"[magenta][@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
                 f"◆ {escape(goal.title_display)}[/]"
             )

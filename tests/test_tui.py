@@ -643,6 +643,212 @@ async def test_pick_option_package_keeps_typed_free_text(app: DrCodeApp) -> None
         assert app.chat_input.text == "SQLite, но с миграцией\nНет"
 
 
+async def test_pick_option_multiple_accumulates_and_toggles(app: DrCodeApp) -> None:
+    """A MULTIPLE-choice question never submits or replaces on click: clicks
+    toggle membership in the accumulated set, the draft line shows the set
+    "; "-joined, and Enter submits the joined line as ONE pending_input."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(
+                question="Какие меры оформить в бэклог?",
+                options=["мера 1", "мера 2", "мера 3", "мера 4"],
+                multiple=True,
+            )
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Clicks accumulate, nothing is sent (pending_input unchanged apart
+        # from the creation prompt).
+        app.action_pick_option(0, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 2"
+        assert len(task.pending_input) == 1  # only the creation prompt
+        app.action_pick_option(0, 3)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 2; мера 4"
+        # Clicking a selected option again unselects it (toggle).
+        app.action_pick_option(0, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 4"
+        app.action_pick_option(0, 0)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 1; мера 4"
+        # Enter submits the accumulated set as one answer.
+        app.submit_chat_input()
+        await pilot.pause()
+        assert [e.text for e in task.pending_input][-1] == "мера 1; мера 4"
+        assert app.chat_input.text == ""
+
+
+async def test_pick_option_multiple_single_question_renders_question_indexed_ids(
+    app: DrCodeApp,
+) -> None:
+    """A single MULTIPLE-choice question is rendered with the question-
+    indexed click ids (app.pick_option(0, <i>)) instead of the legacy flat
+    ones, and the hint advertises the multi-select behaviour."""
+    from drcode.models import Clarification, ClarificationItem
+
+    def rendered() -> str:
+        return "\n".join(
+            str(w.content)  # pyright: ignore[reportAttributeAccessIssue]
+            for w in app.query(".chat-block")
+        )
+
+    app.manager.create("research", "plan it")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._write_clarification(
+            Clarification(
+                questions=[
+                    ClarificationItem(
+                        question="Какие файлы трогать?",
+                        options=["a.py", "b.py"],
+                        multiple=True,
+                    )
+                ]
+            )
+        )
+        await pilot.pause()
+        text = rendered()
+    assert "[@click=app.pick_option(0,0)][underline cyan]a.py[/]" in text
+    assert "[@click=app.pick_option(0,1)][underline cyan]b.py[/]" in text
+    assert "app.pick_option(0)]" not in text  # no legacy flat id
+    assert "Multiple choices allowed" in text
+    assert "Click an option or answer in the input below" not in text
+
+
+async def test_pick_option_multiple_empty_enter_submits_nothing(app: DrCodeApp) -> None:
+    """Submitting a MULTIPLE-choice question with nothing selected and no
+    text is a valid "none of them" answer, not a no-op; without a
+    multiple question an empty Enter still does nothing."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(
+                question="Какие меры оформить в бэклог?",
+                options=["мера 1", "мера 2"],
+                multiple=True,
+            )
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Click then unselect everything: the input is empty again, Enter
+        # still submits the "nothing" answer.
+        app.action_pick_option(0, 0)
+        await pilot.pause()
+        app.action_pick_option(0, 0)
+        await pilot.pause()
+        assert app.chat_input.text == ""
+        app.submit_chat_input()
+        await pilot.pause()
+        assert [e.text for e in task.pending_input][-1] == "(nothing)"
+        # ...and without an open multiple question an empty Enter is a no-op.
+        app.chat_input.clear()
+        app.submit_chat_input()
+        await pilot.pause()
+        assert [e.text for e in task.pending_input][-1] == "(nothing)"
+
+
+async def test_pick_option_multiple_manual_text_overrides_clicks(
+    app: DrCodeApp,
+) -> None:
+    """Free text typed into a multiple question's line overrides the
+    accumulated click set for THAT question (both at render and at
+    submit); clicking the question's options again switches back to the
+    click set."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(
+                question="Какие меры?", options=["мера 1", "мера 2"], multiple=True
+            ),
+            ClarificationItem(question="Какая БД?", options=["Postgres", "SQLite"]),
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Accumulate clicks on question 1...
+        app.action_pick_option(0, 0)
+        app.action_pick_option(0, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 1; мера 2"
+        # ...then override the line with manual text and click question 2.
+        app.chat_input.load_text("мера 1 и ещё своя\n")
+        app.action_pick_option(1, 0)
+        await pilot.pause()
+        # The manual text survived the click on the OTHER question...
+        assert app.chat_input.text == "мера 1 и ещё своя\nPostgres"
+        app.submit_chat_input()
+        await pilot.pause()
+        assert [e.text for e in task.pending_input][-1] == "мера 1 и ещё своя\nPostgres"
+        # ...but clicking the overridden question's own options switches it
+        # back to the click set. (The submit above answered the pending
+        # clarification, so re-ask a fresh identical package first.)
+        task.clarification = Clarification(
+            questions=[
+                ClarificationItem(
+                    question="Какие меры?", options=["мера 1", "мера 2"], multiple=True
+                ),
+                ClarificationItem(question="Какая БД?", options=["Postgres", "SQLite"]),
+            ]
+        )
+        app._write_clarification(task.clarification)
+        await pilot.pause()
+        app.action_pick_option(0, 1)
+        await pilot.pause()
+        assert app.chat_input.text == "мера 2"
+
+
+async def test_pick_option_multiple_legacy_flat_id_accumulates(app: DrCodeApp) -> None:
+    """A legacy flat click id (app.pick_option(<i>)) pointing at a
+    multiple-choice single question validates against the combined list and
+    follows the accumulate path — immediate-submit is disabled for
+    multiple."""
+    from drcode.models import Clarification, ClarificationItem
+
+    task = app.manager.create("research", "plan it")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(
+                question="Какие?",
+                options=["a", "b"],
+                agent_proposals=["c"],
+                multiple=True,
+            )
+        ]
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        # Flat ids (option is None): index 2 is the starred proposal.
+        app.action_pick_option(0)
+        await pilot.pause()
+        assert app.chat_input.text == "a"
+        assert len(task.pending_input) == 1  # nothing sent
+        app.action_pick_option(2)
+        await pilot.pause()
+        assert app.chat_input.text == "a; c"
+        app.action_pick_option(0)
+        await pilot.pause()
+        assert app.chat_input.text == "c"
+
+
 async def test_fat_live_write_mounts_through_drain(app: DrCodeApp) -> None:
     """A fat live write (a big tool result) is NOT one synchronous mount:
     it seeds the chunked drain, the ledger counts it as ONE live entry, and

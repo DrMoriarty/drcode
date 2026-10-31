@@ -833,6 +833,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # action_pick_option. Reset whenever a fresh Clarification is
         # rendered (_write_clarification) or the input is sent.
         self._clarification_picks: dict[int, str] = {}
+        # Accumulated clicks of MULTIPLE-choice questions (question index →
+        # selected indices in the question's combined option list): a click
+        # toggles membership instead of submitting/replacing, and the set is
+        # rendered into the question's draft line as "; "-joined texts — see
+        # action_pick_option. Same lifecycle as _clarification_picks.
+        self._clarification_multi: dict[int, set[int]] = {}
         # Fingerprint of the screen's active bindings at the last footer
         # refresh (refresh_task_status): a bindings publish that changes
         # nothing still recomposes the whole Footer (see the annotation).

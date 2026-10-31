@@ -930,6 +930,11 @@ class DrCodeState(App[None]):
     # index → option text): rendered into the chat input as one line per
     # question and submitted together on Enter (see action_pick_option).
     _clarification_picks: dict[int, str]
+    # Accumulated clicks of MULTIPLE-choice questions (question index →
+    # selected indices in the combined option list): toggled by clicks,
+    # rendered "; "-joined into the question's draft line (see
+    # action_pick_option).
+    _clarification_multi: dict[int, set[int]]
 
     # -- delta re-render bookkeeping ----------------------------------------
     # When the open chat is a canonical history render (no live/streamed

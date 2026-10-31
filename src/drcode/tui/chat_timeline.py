@@ -1034,13 +1034,17 @@ class ChatTimelineLayer(DrCodeState):
             # click picks from the old package must not leak into the new
             # draft (see action_pick_option).
             self._clarification_picks = {}
+            self._clarification_multi = {}
         # A package holds one or more questions (the agent is prompted to
         # batch ALL its open questions into one call). Each question renders
         # separately with its own clickable options; a package question is
         # numbered and its options carry the question index in the click id
         # (app.pick_option(<q>, <i>)) so a click answers exactly that
         # question — a single-question package keeps the legacy flat id
-        # (app.pick_option(<i>)) and the immediate-submit behaviour.
+        # (app.pick_option(<i>)) and the immediate-submit behaviour, UNLESS
+        # the question is multiple-choice: those always get the question-
+        # indexed id and the accumulating (toggle) click behaviour, never
+        # the immediate submit.
         questions = clarification.questions
         lines: list[str] = []
         packaged = len(questions) > 1
@@ -1053,13 +1057,19 @@ class ChatTimelineLayer(DrCodeState):
             # `options`, and action_pick_option validates against the
             # combined list.
             has_agent_option = False
+            question_indexed = packaged or item.multiple
 
             def _option_line(
-                index: int, display: str, *, star: bool, qi: int = qi
+                index: int,
+                display: str,
+                *,
+                star: bool,
+                qi: int = qi,
+                question_indexed: bool = question_indexed,
             ) -> str:
                 click = (
                     f"app.pick_option({qi},{index})"
-                    if packaged
+                    if question_indexed
                     else f"app.pick_option({index})"
                 )
                 return (
@@ -1080,12 +1090,21 @@ class ChatTimelineLayer(DrCodeState):
                     "[dim]★ — option proposed by the agent on its own "
                     "initiative, not part of your request.[/]"
                 )
+            if item.multiple:
+                # The click log stays append-only (no ticks are drawn into
+                # the rendered history) — the accumulated selection is
+                # visible only in the input draft line, so point at it.
+                lines.append(
+                    "[dim]Multiple choices allowed — click every option you "
+                    "need (click again to unselect), then press Enter; "
+                    "nothing selected means \u201cnone of them\u201d.[/]"
+                )
         if len(questions) > 1:
             lines.append(
                 "[dim]Click an option per question or type answers — one "
                 "line per question — then press Enter to send them all at "
                 "once.[/]"
             )
-        else:
+        elif not any(q.multiple for q in questions):
             lines.append("[dim]Click an option or answer in the input below.[/]")
         self._write_chat("\n".join(lines))

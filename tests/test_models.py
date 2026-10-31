@@ -156,3 +156,24 @@ def test_clarification_batched_roundtrip() -> None:
     assert [q["question"] for q in data["questions"]] == ["q1?", "q2?"]
     assert data["questions"][1]["agent_proposals"] == ["p1", "p2"]
     assert Clarification.model_validate(data) == batched
+
+
+def test_clarification_item_multiple_flag_backwards_compatible() -> None:
+    """`multiple` defaults to False: old JSONs without the field validate
+    unchanged, and a JSON carrying it round-trips."""
+    from drcode.models import Clarification
+
+    old = Clarification.model_validate(
+        {
+            "questions": [
+                {"question": "q?", "options": ["a", "b"], "agent_proposals": ["p"]}
+            ]
+        }
+    )
+    assert old.questions[0].multiple is False
+
+    multi = Clarification.model_validate(
+        {"questions": [{"question": "q?", "options": ["a", "b"], "multiple": True}]}
+    )
+    assert multi.questions[0].multiple is True
+    assert Clarification.model_validate_json(multi.model_dump_json()) == multi

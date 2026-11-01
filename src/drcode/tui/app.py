@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.markup import escape
-from textual import events
+from textual import events, messages
 from textual.app import (
     App,
     ComposeResult,
@@ -89,6 +89,7 @@ from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem
 from .state import LiveTailEntry
+from .sync_output import apply_sync_output_override, sync_output_disabled
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
@@ -403,6 +404,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     ]
 
     def __init__(self, project_root: Path) -> None:
+        # iTerm2 3.7.x workaround (see tui/sync_output.py): with
+        # DRCODE_DISABLE_SYNC_OUTPUT=1 set, stop textual from probing for /
+        # enabling DEC 2026 synchronized output — the terminal buffers the
+        # synced frames and keystroke echo lags 0.5–1.0 s. No-op otherwise.
+        apply_sync_output_override()
         super().__init__()
         # Resolve once: a relative or symlinked root would leak into storage,
         # git and the tool sandbox (tools compare resolved paths against it).
@@ -1025,6 +1031,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         thread-safe); it is a no-op once the app is shutting down.
         """
         self.call_later(self._update_terminal_title)
+
+    def _on_terminal_supports_synchronized_output(
+        self, message: messages.TerminalSupportsSynchronizedOutput
+    ) -> None:
+        """iTerm2 3.7.x workaround (see tui/sync_output.py): when
+        DRCODE_DISABLE_SYNC_OUTPUT is set, never flip ``_sync_available`` —
+        even if a DECRQM 2026 answer slips through, frames stay unwrapped."""
+        if sync_output_disabled():
+            return
+        super()._on_terminal_supports_synchronized_output(message)
 
     def _notify_error(self, text: str) -> None:
         """Delivery failures of the notifications module, surfaced in-app.

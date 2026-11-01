@@ -423,7 +423,10 @@ class SearchDialog(ModalScreen[None]):
         self.dismiss(None)
         assert isinstance(app, DrCodeApp)
         app.view_task(task_id)
-        app.chat_input.focus()
+        # A DRAFT redirect leaves the focus in the new-task editor — don't
+        # steal it back to the (hidden) chat input.
+        if not app._new_task_mode:
+            app.chat_input.focus()
 
     def action_focus_results(self) -> None:
         self.query_one("#srch-results", ListView).focus()

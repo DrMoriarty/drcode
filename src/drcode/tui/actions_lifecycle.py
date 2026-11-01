@@ -548,7 +548,10 @@ class TaskLifecycleLayer(DrCodeState):
                 return
             if item.task_id:
                 self.view_task(item.task_id)
-                self.chat_input.focus()
+                # A DRAFT redirect leaves the focus in the new-task editor —
+                # don't steal it back to the (hidden) chat input.
+                if not self._new_task_mode:
+                    self.chat_input.focus()
 
     def submit_chat_input(self) -> None:
         """Send the chat editor's content (Enter in the chat input)."""

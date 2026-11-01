@@ -2023,6 +2023,86 @@ async def test_search_dialog_finds_and_opens_task(app: DrCodeApp) -> None:
         assert not isinstance(app.screen, SearchDialog)
 
 
+async def test_sidebar_opens_draft_focuses_new_task_editor(
+    app: DrCodeApp,
+) -> None:
+    """Opening a DRAFT from the sidebar must leave the focus in the
+    new-task editor (Ctrl+Enter works right away); a non-draft task
+    still returns the focus to the chat input."""
+    draft = app.manager.create("draft item", "compose me", draft=True)
+    queued = app.manager.create("queued item", "plain task")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.pause()
+        sidebar = app.sidebar
+
+        async def open_from_sidebar(task_id: str) -> None:
+            row = next(
+                w
+                for w in sidebar.children
+                if isinstance(w, TaskItem) and w.task_id == task_id
+            )
+            sidebar.focus()
+            sidebar.index = sidebar._nodes.index(row)
+            await pilot.pause()
+            sidebar.action_select_cursor()
+            await pilot.pause()
+
+        # Normalize the state: the startup view pick skips DRAFTS, so view
+        # the queued task first (the editor is NOT open on the draft).
+        await open_from_sidebar(queued.id)
+        assert not app._new_task_mode
+        assert app.chat_input.has_focus
+
+        await open_from_sidebar(draft.id)
+        # action_open_draft clears viewed_id: nothing is "viewed" while the
+        # editor is open.
+        assert app._new_task_mode
+        assert app.viewed_id is None
+        assert app.new_task_input.has_focus
+        assert not app.chat_input.has_focus
+
+        # Regression: a non-draft task returns the focus to the chat input.
+        await open_from_sidebar(queued.id)
+        assert not app._new_task_mode
+        assert app.viewed_id == queued.id
+        assert app.chat_input.has_focus
+
+
+async def test_search_dialog_opens_draft_focuses_new_task_editor(
+    app: DrCodeApp,
+) -> None:
+    """The same draft-focus rule holds for the Ctrl+F search dialog."""
+    from drcode.tui.search_dialog import SearchDialog
+
+    draft = app.manager.create("websocket draft", "compose me", draft=True)
+    # A second non-draft task: the startup view pick skips DRAFTS, so the
+    # draft's editor is NOT already open when the dialog opens.
+    app.manager.create("unrelated", "something else entirely")
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.press("escape")  # close the editor the startup pick opened
+        await pilot.pause()
+        assert not app._new_task_mode
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchDialog)
+        for char in "websocket":
+            await pilot.press(char)
+        await wait_until(
+            lambda: bool(_result_ids(app.screen)) and draft.id in _result_ids(app.screen),
+            pilot,
+        )
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert app._new_task_mode
+        assert app.viewed_id is None  # the editor is open on the draft
+        assert app.new_task_input.has_focus
+        assert app.chat_input.has_focus is False
+        assert not isinstance(app.screen, SearchDialog)
+
+
 async def test_search_dialog_row_shows_prompt_over_two_lines(
     app: DrCodeApp,
 ) -> None:

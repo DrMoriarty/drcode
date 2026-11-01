@@ -13,7 +13,7 @@ from rich.markup import escape
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
-from ..agent import last_context_tokens, subagent_limit_for
+from ..agent import all_user_prompts, last_context_tokens, subagent_limit_for
 from ..context_layout import (
     AGENT_DEV,
     AGENT_RESOLVER,
@@ -214,8 +214,9 @@ class TaskStatusLayer(DrCodeState):
         """The second header row (under the kind/id/date/status line):
         the full dependency list with its gate colors, the goal link
         with its ✏/✕ icon fragments (or the "+ assign" picker
-        link when unattached), the GitHub issue number, the worktree
-        branch (clickable — copies the branch name) and the warning
+        link when unattached), the GitHub issue number, the round
+        counters (dev/test/resolve, dim, hidden while all zero), the
+        worktree branch (clickable — copies the branch name) and the warning
         markers that the sidebar also carries (needs_human,
         unfinished). Fragments the task has none of are omitted; an
         entirely empty result hides the row (`_set_extra_row`)."""
@@ -255,6 +256,29 @@ class TaskStatusLayer(DrCodeState):
             bits.append("[@click=app.assign_goal][magenta]+ assign[/][/]")
         if task.github_issue is not None:
             bits.append(f"issue: [dim]#{task.github_issue}[/]")
+        # Round counters (dev / test / resolve) — one per started round:
+        # dev = user prompts of the dev transcript (the initial assignment,
+        # clarifications and tester bug-reports; a continuation of an
+        # interrupted attempt adds no prompt, compaction machinery is
+        # filtered by all_user_prompts), test/resolve = transcript entries
+        # (one appended per fresh round; a network retry or a compaction
+        # pause resumes the same round and does not bump the count). Zero
+        # values are dropped and the whole fragment hides while every
+        # counter is zero — a fresh task shows nothing here.
+        dev_rounds = len(all_user_prompts(task.messages))
+        test_rounds = len(task.tester_messages)
+        resolve_rounds = len(task.resolver_messages)
+        if dev_rounds or test_rounds or resolve_rounds:
+            shown = [
+                f"{name} {n}"
+                for name, n in (
+                    ("dev", dev_rounds),
+                    ("test", test_rounds),
+                    ("resolve", resolve_rounds),
+                )
+                if n
+            ]
+            bits.append(f"[dim]rounds: {' · '.join(shown)}[/]")
         if task.isolation_pinned:
             # The branch fragment is deepskyblue (the branch color of this row,
             # distinct from the cyan deps and the magenta goal).

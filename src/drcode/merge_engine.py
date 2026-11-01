@@ -72,7 +72,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .tools import child_priority_kwargs
+from .tools import child_priority_kwargs, strip_malloc_stack_logging_noise
 
 __all__ = [
     "ADD_ADD",
@@ -315,7 +315,9 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
-    return proc.returncode, (proc.stdout + proc.stderr).strip()
+    return proc.returncode, strip_malloc_stack_logging_noise(
+        proc.stdout + proc.stderr
+    ).strip()
 
 
 def _git_bytes(*args: str, cwd: Path) -> tuple[int, bytes]:

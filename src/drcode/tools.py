@@ -669,6 +669,38 @@ def child_priority_kwargs() -> dict[str, Any]:
     return {}
 
 
+# -- macOS malloc-stack-logging noise -------------------------------------------
+#
+# Corporate monitoring daemons (siagent/SearchInform, Check Point cpard) toggle
+# malloc stack logging REMOTELY in live processes — including the TUI's python.
+# libmalloc then makes every fork()ed child of such a process print a
+# `Name(pid) MallocStackLogging: ...` report line to the INHERITED stderr in
+# the window between fork() and exec() — before Python dup2's the capture
+# pipes, so `capture_output` cannot intercept it (on the TUI that is the
+# terminal; run_bash's own `2>` shell filter mirrors
+# _install_stderr_filter). For a child that gets toggled ON while running
+# (long verification runs), the same lines land in its CAPTURED stderr and
+# from there into service events and agent transcripts — never the tool's
+# own output. CPython 3.14 on macOS cannot avoid the fork path (close_fds
+# defaults to True and os.POSIX_SPAWN_CLOSEFROM is missing, so posix_spawn is
+# ineligible for nearly every spawn), hence the lines are stripped at the
+# capture boundary instead of being prevented at the source.
+
+_MALLOC_STACK_LOGGING_LINE_RE = re.compile(
+    r"(?m)^[^(\n]+\(\d+\) MallocStackLogging: .*(?:\n|$)"
+)
+
+
+def strip_malloc_stack_logging_noise(text: str) -> str:
+    """Remove libmalloc `Name(pid) MallocStackLogging: ...` report lines.
+
+    Applied to every captured child output that is shown to the model or
+    stored in transcripts/service events. Normal lines — including lines that
+    merely QUOTE the word in some other context — are kept intact.
+    """
+    return _MALLOC_STACK_LOGGING_LINE_RE.sub("", text)
+
+
 def clamp_bash_timeout(timeout: float | None) -> float:
     """Resolve the effective timeout of a run_bash call.
 
@@ -806,9 +838,8 @@ async def run_bash(
         except asyncio.CancelledError:
             pass
         raise
-    out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()[
-        :MAX_TOOL_OUTPUT
-    ]
+    raw = stdout.decode(errors="replace") + stderr.decode(errors="replace")
+    out = strip_malloc_stack_logging_noise(raw).strip()[:MAX_TOOL_OUTPUT]
     return f"exit={proc.returncode}\n{out or '(no output)'}"
 
 

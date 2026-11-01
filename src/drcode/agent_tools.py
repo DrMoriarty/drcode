@@ -557,7 +557,9 @@ def _run_project_check(
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"exit=-1\n({type(e).__name__}: {e})"
-    out = (proc.stdout + "\n" + proc.stderr).strip()[: tools.MAX_TOOL_OUTPUT]
+    out = tools.strip_malloc_stack_logging_noise(
+        proc.stdout + "\n" + proc.stderr
+    ).strip()[: tools.MAX_TOOL_OUTPUT]
     return f"exit={proc.returncode}\n{out or '(no output)'}"
 
 

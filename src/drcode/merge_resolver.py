@@ -53,7 +53,7 @@ from pathlib import Path
 
 from . import merge_engine
 from .merge_engine import MergeReport
-from .tools import child_priority_kwargs
+from .tools import child_priority_kwargs, strip_malloc_stack_logging_noise
 
 __all__ = [
     "REVIEW_DIFF_CHAR_CAP",
@@ -161,7 +161,9 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
-    return proc.returncode, (proc.stdout + proc.stderr).strip()
+    return proc.returncode, strip_malloc_stack_logging_noise(
+        proc.stdout + proc.stderr
+    ).strip()
 
 
 # -- conflict-marker scan -------------------------------------------------------
@@ -343,7 +345,7 @@ def _run_checked(
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return CheckResult(name=name, ok=False, output=f"{type(e).__name__}: {e}")
-    out = (proc.stdout + "\n" + proc.stderr).strip()
+    out = strip_malloc_stack_logging_noise(proc.stdout + "\n" + proc.stderr).strip()
     return CheckResult(name=name, ok=proc.returncode == 0, output=out[:8000])
 
 
@@ -530,7 +532,11 @@ def compile_check(worktree: Path) -> CheckResult:
         )
         if proc.returncode != 0:
             ok = False
-            output.append((proc.stdout + proc.stderr).strip()[:4000])
+            output.append(
+                strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()[
+                    :4000
+                ]
+            )
     return CheckResult(
         name="compile (py_compile of tracked .py files)",
         ok=ok,
@@ -607,7 +613,11 @@ def mechanical_checks(
             )
             if proc.returncode != 0:
                 ok = False
-                output.append((proc.stdout + proc.stderr).strip()[:4000])
+                output.append(
+                    strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()[
+                        :4000
+                    ]
+                )
         results.append(
             CheckResult(
                 name="compile (py_compile of tracked .py files)",

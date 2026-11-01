@@ -49,7 +49,7 @@ from pathlib import Path
 
 from . import merge_engine
 from .merge_engine import MergeReport
-from .tools import child_priority_kwargs
+from .tools import child_priority_kwargs, strip_malloc_stack_logging_noise
 
 __all__ = [
     "CHOICES",
@@ -226,7 +226,9 @@ class ConflictWorktree:
             check=False,
             **child_priority_kwargs(),
         )
-        return proc.returncode, (proc.stdout + proc.stderr).strip()
+        return proc.returncode, strip_malloc_stack_logging_noise(
+            proc.stdout + proc.stderr
+        ).strip()
 
     # -- live state ---------------------------------------------------------------
 
@@ -333,7 +335,10 @@ class ConflictWorktree:
             **child_priority_kwargs(),
         )
         if proc.returncode != 0:
-            return False, f"git cat-file failed: {proc.stderr.decode()[:300]}"
+            return False, (
+                f"git cat-file failed: "
+                f"{strip_malloc_stack_logging_noise(proc.stderr.decode())[:300]}"
+            )
         target = self.worktree / path
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

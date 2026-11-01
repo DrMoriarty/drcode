@@ -173,7 +173,11 @@ from pathlib import Path
 from typing import Any
 
 from .models import Task
-from .tools import child_priority_kwargs, sanitized_env
+from .tools import (
+    child_priority_kwargs,
+    sanitized_env,
+    strip_malloc_stack_logging_noise,
+)
 
 WORKFLOW_SCRIPT = "workflow.py"
 GIT_WORKFLOW_FILE = "git-workflow.md"
@@ -762,7 +766,9 @@ class WorkflowHooks:
                 pass
             raise
         if proc.returncode != 0:
-            detail = (stderr or stdout).decode(errors="replace").strip()
+            detail = strip_malloc_stack_logging_noise(
+                (stderr or stdout).decode(errors="replace")
+            ).strip()
             return HookResult(
                 ok=False,
                 error=(

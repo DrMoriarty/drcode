@@ -143,7 +143,7 @@ from pathlib import Path
 
 from ..gitignore import _is_git_repo
 from ..settings import ProjectSettings, TaskIsolation
-from ..tools import child_priority_kwargs
+from ..tools import child_priority_kwargs, strip_malloc_stack_logging_noise
 from ._common import (
     _COPY_FILE_LIMIT,
     _COPY_SKIP_DIRS,
@@ -297,7 +297,7 @@ class TaskEnvironment(_WorktreeLifecycleMixin, _BranchStateMixin):
             check=False,
             **child_priority_kwargs(),
         )
-        out = (proc.stdout + proc.stderr).strip()
+        out = strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()
         return proc.returncode, out
 
     def _branch_exists(self, branch: str) -> bool:

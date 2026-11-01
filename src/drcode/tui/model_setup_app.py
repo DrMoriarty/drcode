@@ -4,9 +4,10 @@ Edits the user-level catalog (`~/.config/drcode/models.json`, see
 `drcode.providers`) — the only UI that writes that file, so no manual JSON
 editing is ever needed. Two entry points share this one screen:
 
-1. the standalone `drcode-models` utility (a tiny App pushing the screen);
-2. the main TUI's Settings palette ("Provider catalog…"), which pushes the
-   same screen modally.
+1. the main TUI's Settings palette ("Provider catalog…"), which pushes the
+   screen modally;
+2. a standalone debug app (`python -m drcode.tui.model_setup_app`, a tiny
+   App pushing the screen — deliberately not installed as a command).
 
 Per provider: name / base URL / API key editing with a live connection
 check (`probe_model`), one-click model auto-discovery (`fetch_models`,
@@ -64,7 +65,7 @@ _ROLES: tuple[AgentRole, ...] = (
 
 class ModelCatalogScreen(ModalScreen[None]):
     """Provider/model catalog editor (modal inside the main TUI, or the
-    whole UI of the standalone `drcode-models` utility)."""
+    whole UI of the standalone debug app)."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "close", "Close", priority=True),
@@ -673,7 +674,7 @@ class ModelCatalogScreen(ModalScreen[None]):
 
 
 class ModelCatalogApp(App[None]):
-    """Standalone `drcode-models` utility: just the catalog screen."""
+    """Standalone debug app: just the catalog screen."""
 
     TITLE = "drcode models"
 

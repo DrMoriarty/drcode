@@ -392,7 +392,7 @@ async def test_seeded_screen_escape_discards_seed(tmp_path: Path) -> None:
 
 
 async def test_standalone_app_escape_quits() -> None:
-    """The `drcode-models` utility has the catalog screen as its whole UI:
+    """The standalone debug app has the catalog screen as its whole UI:
     pressing esc must exit the app, not leave an empty black terminal."""
     from drcode.tui.model_setup_app import ModelCatalogApp
 

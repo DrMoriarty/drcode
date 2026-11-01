@@ -8,8 +8,8 @@ connection (the json layers no longer provide its model fields — see
    (`~/.config/drcode/models.json`, XDG_CONFIG_HOME-aware), each with its
    base URL, API key, cached health-check endpoint and a list of models
    (auto-discovered via `agent_model.fetch_models` or entered by hand).
-   The file is written exclusively by the `drcode-models` utility (or the
-   catalog screen mounted inside the main TUI) — never by hand. When the
+   The file is written exclusively by the catalog screen mounted inside
+   the main TUI ("Provider catalog…" in Settings) — never by hand. When the
    file does not exist yet but the user-level drcode.json (legacy flat
    config) or the project's `custom_models` already describe models, the
    catalog screen pre-fills itself from that data (`load_seeded_catalog`)
@@ -502,7 +502,7 @@ class UserModelsStore:
             # ~/.config/drcode/models.json. The error reaches the agent as
             # the snippet's output (same mechanism as ModelRetry /
             # PathViolation) and the agent fixes itself by passing an
-            # explicit tmp path. The TUI and drcode-models run without
+            # explicit tmp path. The TUI runs without
             # DRCODE_TASK_ID and are unaffected.
             raise ValueError(
                 "UserModelsStore: running under a drcode agent (DRCODE_TASK_ID "
@@ -628,8 +628,8 @@ def load_seeded_catalog(
 ) -> tuple[UserModelsConfig, str | None]:
     """Load the catalog, pre-filling it from legacy flat model data.
 
-    Migration convenience for `drcode-models` (and the main TUI's catalog
-    screen): when the catalog file does not exist yet but the user-level
+    Migration convenience for the main TUI's catalog screen: when the
+    catalog file does not exist yet but the user-level
     drcode.json and/or the project's `custom_models` already describe
     models, an in-memory catalog with the corresponding providers is built
     from that data (the provider name is derived from the base URL host).

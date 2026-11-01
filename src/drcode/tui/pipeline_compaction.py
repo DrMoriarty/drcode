@@ -274,7 +274,7 @@ class PipelineCompactionLayer(DrCodeState):
             tail = (
                 "Compaction stopped; the next model request will fail with "
                 "a context overflow. Raise the model's max_context_tokens "
-                "in the provider catalog (drcode-models)."
+                "in the provider catalog (Settings → Provider catalog)."
             )
         else:
             threshold = min(max(config.compaction_threshold, 1), 100)
@@ -289,7 +289,7 @@ class PipelineCompactionLayer(DrCodeState):
                 "mid-round compaction and a request past the hard limit "
                 "will fail with a context overflow. Raise the model's "
                 "max_context_tokens or lower the compaction threshold in "
-                "the provider catalog (drcode-models)."
+                "the provider catalog (Settings → Provider catalog)."
             )
         self._show_event(
             task,
@@ -463,7 +463,8 @@ class PipelineCompactionLayer(DrCodeState):
             f"prompt and tool schemas ≈{framing} tokens, output reserve "
             f"≈{output} tokens) plus the original prompt(s) kept verbatim "
             "already overflow it. Raise the model's max_context_tokens in "
-            "the provider catalog (drcode-models) or shorten the task's "
+            "the provider catalog (Settings → Provider catalog) or shorten "
+            "the task's "
             "original prompt — the task is marked as needing human "
             "attention."
         )

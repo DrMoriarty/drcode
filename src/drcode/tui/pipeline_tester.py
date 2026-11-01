@@ -217,8 +217,8 @@ class PipelineTesterLayer(DrCodeState):
             f"The testing round is given up: the tester model's requests "
             f"are deterministically rejected with a context overflow — "
             f"{reason} (window {window} tokens). Retry loops cannot help. "
-            "Pick a larger-window model for the tester role (Settings / "
-            "drcode-models) or shorten the task, then send input to the "
+            "Pick a larger-window model for the tester role (Settings → "
+            "Provider catalog) or shorten the task, then send input to the "
             "task to re-queue it.",
         )
         self.notifier.task_context_overflow(task.title)

@@ -83,7 +83,7 @@ installed package.
 
 Model selection is two-level:
 
-- **User level** (`~/.config/drcode/`) — the provider/model catalog `models.json`, edited via Settings → **Provider catalog…** (or the standalone `drcode-models` utility): OpenAI-compatible endpoints with their API keys, auto-discovered or hand-entered models (with context sizes and optional per-model compaction limits) and per-role defaults. The catalog is shared by every project.
+- **User level** (`~/.config/drcode/`) — the provider/model catalog `models.json`, edited via Settings → **Provider catalog…**: OpenAI-compatible endpoints with their API keys, auto-discovered or hand-entered models (with context sizes and optional per-model compaction limits) and per-role defaults. The catalog is shared by every project.
 - **Project level** (`.drcode/drcode.json`) — a model per agent role (coding / research / tester / compaction / resolver), chosen in Settings ("Coding model: …", "Resolver model: …" etc.) either from the catalog or as a **custom model** (a free-form connection stored under `custom_models[role]`, one independent entry per role). Switching a role to a catalog model parks its custom model — the picker offers it back as "Custom: <model-id>" without re-entering anything. The research and resolver roles need no explicit pick: when nothing is selected for them anywhere, they transparently run on the coding model — pin a dedicated model only if you want a cheaper one for the read-heavy analysis load (research) or the conflict-resolution rounds (resolver).
 
 A plain env override still wins over both levels (or a `.env` file in the project root):

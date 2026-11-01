@@ -156,9 +156,9 @@ class ModelSelectionLayer(DrCodeState):
 
     def action_open_model_catalog(self) -> None:
         """Open the provider/model catalog editor (user-level models.json)
-        as a modal screen. Shared with the standalone `drcode-models`
-        utility; when no catalog exists yet, the screen pre-fills itself
-        from this project's custom models (saved only on explicit Save).
+        as a modal screen. Also used by the standalone debug app; when no
+        catalog exists yet, the screen pre-fills itself from this
+        project's custom models (saved only on explicit Save).
         On close the per-role resolutions are recomputed."""
         if isinstance(self.screen, CommandPalette):
             return

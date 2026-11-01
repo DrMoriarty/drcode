@@ -298,8 +298,8 @@ def ensure_user_config_dir() -> None:
             # to where the user config would live, so it's discoverable.
             USER_CONFIG_EXAMPLE_FILE.write_text(payload)
         # One-line hint for the user-level model catalog (written/managed
-        # exclusively by the `drcode-models` utility or the main TUI's
-        # "Provider catalog…" screen — never by hand).
+        # exclusively by the main TUI's "Provider catalog…" screen —
+        # never by hand).
         if not (_USER_CONFIG_DIR / "models.json.example").exists():
             (_USER_CONFIG_DIR / "models.json.example").write_text(
                 json.dumps(

@@ -86,6 +86,13 @@ class MergeActionsLayer(DrCodeState):
             # the list would be a pointless extra click.
             self.open_merge_for(ready[0])
             return
+        # The screen modules are imported lazily BELOW: against a package
+        # upgraded on disk mid-session that import reads fresh files while
+        # the rest of sys.modules is stale — the exact half-upgraded zoo
+        # this guard exists to explain (see package_watch). The drift was
+        # already toasted by the 30 s poll; here it just stops the click.
+        if self.package_drift_guard():
+            return
         from .unmerged_screen import UnmergedListScreen
 
         self.push_screen(UnmergedListScreen(ready))
@@ -114,6 +121,13 @@ class MergeActionsLayer(DrCodeState):
         is imported lazily (the codebase's idiom for widget→app edges —
         importing it at the top would make every actions import pay for
         the screen and risk a cycle through the app)."""
+        # Before the lazy import: after an on-disk package upgrade the
+        # fresh merge_screen.py would import names from the STALE
+        # in-memory drcode.tools/conflict and crash with an ImportError
+        # for a function that exists on disk (real case 31.10→01.11).
+        # The guard toasts the drift and refuses the import instead.
+        if self.package_drift_guard():
+            return
         from .merge_screen import ConflictScreen
 
         if not self.task_env.active:

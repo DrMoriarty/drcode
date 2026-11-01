@@ -299,6 +299,10 @@ class DrCodeState(App[None]):
 
     def _model_setup_done(self, setup: ModelSetup | None) -> None: ...
 
+    # -- package drift guard (implemented in DrCodeApp, see package_watch) ----
+
+    def package_drift_guard(self) -> bool: ...
+
     # -- per-role model resolution (implemented in DrCodeApp / ActionsLayer) --
 
     def resolved_config(self, role: AgentRole) -> Config: ...

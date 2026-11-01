@@ -38,11 +38,13 @@ from ..models import (
     Clarification,
     PendingInput,
     Task,
+    TaskEvent,
     TaskKind,
     TaskStatus,
     VerificationStatus,
 )
 from ..notifications import Notifier
+from ..package_watch import capture_baseline, drift_since_baseline
 from ..providers import (
     AgentRole,
     UserModelsStore,
@@ -406,6 +408,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # git and the tool sandbox (tools compare resolved paths against it).
         project_root = Path(project_root).resolve()
         self.project_root = project_root
+        # Pin the installed package's fingerprint BEFORE anything else:
+        # every later lazy screen import is measured against this capture
+        # (see package_watch — an on-disk upgrade under a live TUI makes
+        # stale sys.modules meet fresh files and ends in ImportErrors).
+        capture_baseline()
+        self._package_drift_reported = False
         # One-time migrations BEFORE the config is built: legacy flat model
         # keys in the user-level / project drcode.json move into the user
         # catalog and the project's per-role custom models, and are removed
@@ -1337,6 +1345,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # busy state independent of pipeline transitions and respawns a
         # dead caffeinate child while work is in flight.
         self.set_interval(5, self._update_keepawake)
+        # On-disk package upgrade detector: `uv tool upgrade` (or a dev
+        # edit) under a live session leaves stale modules in sys.modules
+        # while lazy imports read the new files — warn instead of letting
+        # the next Ctrl+M crash with a cryptic ImportError (see
+        # _poll_package_drift).
+        self.set_interval(30, self._poll_package_drift)
         # Pre-stamp the isolation pins of tasks that were mid-work at the
         # previous shutdown (see prestamp_isolation_pins): this must land
         # BEFORE the pipeline's first _advance() below — the resumed
@@ -1819,6 +1833,64 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             return
         self._copy_with_fallback(text)
         self._show_copy_toast(text)
+
+    def _poll_package_drift(self) -> None:
+        """Periodic package-drift check (30 s tick, stat-only — see
+        package_watch). Reports ONCE per session: the situation does not
+        heal by itself and a re-toast every 30 s would bury the user in
+        noise; the guard in the lazy screen imports re-checks cheaply and
+        keeps the eventual failure explained even mid-interval."""
+        if self._package_drift_reported:
+            return
+        reason = self._report_package_drift()
+        if reason is not None:
+            self._package_drift_reported = True
+
+    def _report_package_drift(self) -> str | None:
+        """Check for on-disk drift; toast + service event when found.
+
+        Returns the drift reason (also when already reported — the
+        import guards use the truthiness only) or None when the package
+        matches the startup fingerprint. Never raises: a stat error is
+        folded into the fingerprint by package_watch itself."""
+        try:
+            reason = drift_since_baseline()
+        except Exception:  # noqa: BLE001 - defensive, keep the UI alive
+            return None
+        if reason is None:
+            return None
+        self.notify(
+            f"The drcode package was upgraded on disk ({reason}). "
+            "Loaded modules are stale — restart the app (Ctrl+C, "
+            "`uv run drcode`) before opening screens; a lazy import "
+            "may otherwise fail with a confusing ImportError.",
+            title="Package upgraded",
+            severity="warning",
+            timeout=12,
+        )
+        task = self.viewed
+        if task is not None:
+            task.events.append(
+                TaskEvent(
+                    kind="package",
+                    text=f"Package upgraded on disk while the app runs "
+                    f"({reason}) — in-memory modules are stale, restart "
+                    f"recommended",
+                )
+            )
+            task.touch()
+            self.manager.storage.save(task)
+        return reason
+
+    def package_drift_guard(self) -> bool:
+        """True when the package drifted since startup (and the drift
+        was just reported). The lazy screen imports call this BEFORE
+        touching disk — importing a fresh screen module against stale
+        sys.modules is the exact crash this feature exists to explain
+        (Ctrl+M → merge_screen → conflict, 31.10→01.11)."""
+        if self._package_drift_reported:
+            return True
+        return self._report_package_drift() is not None
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         for command in super().get_system_commands(screen):

@@ -28,7 +28,12 @@ The screen is a viewer + decision pad, never an autonomous actor:
 
 - left: the conflicted files of the triage report with their LIVE status
   (resolved / N hunks / untouched — refreshed from the worktree, the
-  report alone would go stale as the user works);
+  report alone would go stale as the user works); in the ff-ready and
+  staged-but-uncommitted modes the same panel instead lists the diff
+  content with `git diff --numstat` counts (`path  +42 −7`, binary files
+  as `bin`) under a git-style "N files changed, ..." summary line — the
+  decision about f/s deserves the same picture of the change size as
+  the resolution does;
 - right: the selected file in its zdiff3 form — ours (the task branch),
   the common ancestor (the `|||||||` section the engine's zdiff3 markers
   embed) and theirs (the base branch), with a cursor over the hunks;
@@ -109,6 +114,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from rich.markup import escape
 from rich.segment import Segment
 from rich.style import Style
 from textual import work
@@ -126,6 +132,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 from .. import merge_resolver
 from ..conflict import (
     ConflictWorktree,
+    DiffStat,
     FileState,
     Hunk,
     parse_hunks,
@@ -519,6 +526,24 @@ class FileItem(ListItem):
         self.path = state.path
 
 
+class DiffStatItem(ListItem):
+    """One row of the numstat file list (ff-ready / staged modes):
+    `path  +42 −7`, additions green, deletions red; a binary file shows
+    `bin`. Carries the path for the selection handler — clicking a row
+    loads the file's worktree content into the viewer (the worktree
+    holds the branch/resolved state in both diff modes)."""
+
+    def __init__(self, stat: DiffStat) -> None:
+        if stat.binary:
+            counts = "[dim]bin[/]"
+        else:
+            counts = f"[$success]+{stat.added}[/] [$error]−{stat.deleted}[/]"
+        # escape: the path is arbitrary repo content — literal [brackets]
+        # in it must never trip the markup.
+        super().__init__(Label(f"{escape(stat.path)}  {counts}"))
+        self.path = stat.path
+
+
 class ConflictScreen(ModalScreen[None]):
     """Manual merge-conflict resolution for one task's parked merge."""
 
@@ -573,12 +598,18 @@ class ConflictScreen(ModalScreen[None]):
         text-style: bold;
     }
     #merge-body { height: 1fr; }
-    #merge-files {
+    #merge-files-pane {
         width: 34;
         min-width: 20;
         border-right: solid $panel;
         background: $surface;
     }
+    #merge-files-summary {
+        height: auto;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    #merge-files { height: 1fr; }
     #merge-files ListItem { padding: 0 1; }
     #merge-view { width: 1fr; }
     #merge-footer {
@@ -668,12 +699,23 @@ class ConflictScreen(ModalScreen[None]):
         # prepare's final states. None = unavailable — the titles stay
         # as they were.
         self._merge_desc: str | None = None
+        # The file-list mode the last prepare landed in: "ff" (ff-ready,
+        # numstat of base..branch), "staged" (resolved but uncommitted,
+        # numstat of the index) or None (the conflict mode and every
+        # other state — the list shows the conflict states). `r` reads
+        # it to re-fetch the RIGHT list: the conflict-mode reload would
+        # wipe the numstat view in the two diff modes.
+        self._numstat_mode: str | None = None
 
     # -- composition ------------------------------------------------------------
 
     @property
     def files_list(self) -> ListView:
         return self.query_one("#merge-files", ListView)
+
+    @property
+    def files_summary(self) -> Static:
+        return self.query_one("#merge-files-summary", Static)
 
     @property
     def view(self) -> ConflictView:
@@ -686,7 +728,12 @@ class ConflictScreen(ModalScreen[None]):
             # must never trip Rich markup.
             yield Static("Merge conflicts", id="merge-title", markup=False)
             with Horizontal(id="merge-body"):
-                yield ListView(id="merge-files")
+                with Vertical(id="merge-files-pane"):
+                    # The git-style "N files changed, ..." summary of the
+                    # numstat list below (empty/invisible in the conflict
+                    # mode, where the list shows conflict states instead).
+                    yield Static("", id="merge-files-summary")
+                    yield ListView(id="merge-files")
                 yield ConflictView(id="merge-view")
             # markup=False: the progress lines carry literal [ok] / [ ]
             # brackets that must never trip Rich markup.
@@ -870,6 +917,7 @@ class ConflictScreen(ModalScreen[None]):
         if not report.ok:
             self._ff_ready = False
             self._conflicted = False
+            self._numstat_mode = None
             self._set_title(f"Merge conflicts — {report.message}")
             self._update_footer()
             self._hide_prepare()
@@ -884,16 +932,23 @@ class ConflictScreen(ModalScreen[None]):
             if report.fast_forward is True:
                 self._ff_ready = True
                 self._conflicted = False
+                self._numstat_mode = "ff"
                 self._set_title(
                     f"{report.message} — nothing to resolve; "
                     f"press f to merge {report.branch} into "
                     f"{report.base_branch} (ff-only)"
                 )
                 self._update_footer()
+                # What the ff would land in the base: the plain branch
+                # diff (the base is already vouched an ancestor, so the
+                # two-rev diff IS the merge content). One git call in
+                # the project root, off the UI thread.
+                await self._refresh_diff_stats()
                 self._hide_prepare()
                 return
             self._ff_ready = False
             self._conflicted = False
+            self._numstat_mode = "staged" if report.fast_forward is None else None
             if report.fast_forward is False:
                 self._set_title(
                     f"{report.message} — {report.branch} holds no commits "
@@ -908,11 +963,15 @@ class ConflictScreen(ModalScreen[None]):
                     f"#{self.task_id} — the merge is resolved but NOT "
                     f"committed on {report.branch}; press s to commit it"
                 )
+                # The future merge commit's content: the staged diff
+                # against the branch tip, in the worktree.
+                await self._refresh_diff_stats()
             self._update_footer()
             self._hide_prepare()
             return
         self._ff_ready = False
         self._conflicted = True
+        self._numstat_mode = None
         self._set_title(
             f"#{self.task_id} — merge {report.base_branch} into "
             f"{report.branch}: {len(report.remaining)} file(s) to resolve"
@@ -1312,6 +1371,38 @@ class ConflictScreen(ModalScreen[None]):
 
     # -- file list / viewer ---------------------------------------------------------
 
+    @staticmethod
+    def _stat_summary(stats: list[DiffStat]) -> str:
+        """The git-style summary line ("3 files changed, 42 insertions(+),
+        7 deletions(-)") with the counts colored — built ONLY from the
+        numstat numbers (never from repo content), so it is safe to
+        render with markup on."""
+        files = len(stats)
+        ins = sum(s.added or 0 for s in stats)
+        dels = sum(s.deleted or 0 for s in stats)
+        return (
+            f"{files} file{'s' if files != 1 else ''} changed, "
+            f"[$success]{ins} insertion{'s' if ins != 1 else ''}(+)[/], "
+            f"[$error]{dels} deletion{'s' if dels != 1 else ''}(-)[/]"
+        )
+
+    async def _show_diff_stats(self, stats: list[DiffStat]) -> None:
+        """Fill the file list with the numstat rows (ff-ready / staged
+        modes) and the git-style summary line above them. The list was
+        fetched in a worker thread; the widget updates run here."""
+        if not self.is_mounted:
+            return
+        try:
+            self.files_list.clear()
+            if stats:
+                self.files_list.extend(DiffStatItem(s) for s in stats)
+                self.files_list.index = 0
+            self.files_summary.update(self._stat_summary(stats) if stats else "")
+        except NoMatches:
+            # The user closed the screen mid-prepare — a late worker is
+            # a no-op.
+            return
+
     async def _reload_files(self) -> None:
         """Rebuild the file list from the LIVE worktree state (resolved
         files stay visible — the user watches their own progress). The
@@ -1323,6 +1414,9 @@ class ConflictScreen(ModalScreen[None]):
             states = await asyncio.to_thread(self.wt.file_states)
             items = [FileItem(s) for s in states]
             self.files_list.clear()
+            # The conflict mode's list shows per-file conflict states, not
+            # numstat — the ff/staged summary line has no meaning here.
+            self.files_summary.update("")
             if items:
                 self.files_list.extend(items)
             # Keep the selection (or default to the first file), then load
@@ -1353,10 +1447,12 @@ class ConflictScreen(ModalScreen[None]):
             item = self.files_list.highlighted_child
         except NoMatches:  # the screen is already unmounted (a late worker)
             return None
-        return item.path if isinstance(item, FileItem) else None
+        if isinstance(item, (FileItem, DiffStatItem)):
+            return item.path
+        return None
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if isinstance(event.item, FileItem):
+        if isinstance(event.item, (FileItem, DiffStatItem)):
             self.run_worker(self._refresh_view(), exclusive=True, group="merge-view")
 
     async def _refresh_view(self) -> None:
@@ -1944,10 +2040,39 @@ class ConflictScreen(ModalScreen[None]):
             return
         self._show_busy("refreshing")
         try:
-            await asyncio.to_thread(self.wt.refresh)
-            await self._reload_files()
+            if self._numstat_mode is not None:
+                # The ff-ready / staged modes: no merge to re-triage in
+                # the worktree (or the triage would just re-report the
+                # staged state) — re-fetch the numstat list itself, the
+                # conflict-mode reload would WIPE the diff view.
+                await self._refresh_diff_stats()
+            else:
+                await asyncio.to_thread(self.wt.refresh)
+                await self._reload_files()
         finally:
             self._end_busy()
+
+    def _fetch_diff_stats(self) -> list[DiffStat]:
+        """The numstat rows for the current file-list mode (`_numstat_mode`):
+        `base..branch` in the project root for ff-ready, the staged index
+        diff for the resolved-but-uncommitted mode. Sync + blocking —
+        callers wrap it in a worker thread."""
+        assert self.wt is not None
+        if self._numstat_mode == "ff" and self.wt.report is not None:
+            app = cast("DrCodeApp", self.app)
+            return self.wt.numstat(
+                self.wt.report.base_branch,
+                self.wt.report.branch,
+                cwd=app.project_root,
+            )
+        return self.wt.numstat("--cached")
+
+    async def _refresh_diff_stats(self) -> None:
+        """Re-fetch and re-render the numstat list (the `r` refresh of
+        the ff-ready / staged modes, and the tail of prepare's own
+        final states)."""
+        stats = await asyncio.to_thread(self._fetch_diff_stats)
+        await self._show_diff_stats(stats)
 
     def action_close(self) -> None:
         self.dismiss()

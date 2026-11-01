@@ -54,6 +54,7 @@ from .tools import child_priority_kwargs, strip_malloc_stack_logging_noise
 __all__ = [
     "CHOICES",
     "ConflictWorktree",
+    "DiffStat",
     "FileState",
     "Hunk",
     "parse_hunks",
@@ -190,6 +191,21 @@ class FileState:
         return "[yellow]edited, unstaged[/]"
 
 
+@dataclass
+class DiffStat:
+    """One row of `git diff --numstat`: a path with its added/deleted
+    line counts. ``added``/``deleted`` are None for a binary file
+    (numstat reports `-\\t-\\t<path>` there)."""
+
+    path: str
+    added: int | None
+    deleted: int | None
+
+    @property
+    def binary(self) -> bool:
+        return self.added is None
+
+
 class ConflictWorktree:
     """The parked conflict of one task's worktree, as the screen sees it.
 
@@ -229,6 +245,46 @@ class ConflictWorktree:
         return proc.returncode, strip_malloc_stack_logging_noise(
             proc.stdout + proc.stderr
         ).strip()
+
+    # -- diff stats ---------------------------------------------------------------
+
+    def numstat(self, *args: str, cwd: Path | None = None) -> list[DiffStat]:
+        """`git diff --numstat <args>` parsed into DiffStat rows.
+
+        Callers wrap this in a worker thread (sync + blocking, like
+        everything else here). Two uses on the screen:
+
+        - `numstat(f"{base}..{branch}", cwd=project_root)` — what a
+          fast-forward would land in the base (the base is already
+          vouched an ancestor, so the plain diff is the merge content);
+        - `numstat("--cached")` — the future merge commit's content
+          while the merge is resolved and staged but not committed.
+        """
+        proc = subprocess.run(
+            ["git", "diff", "--numstat", *args],
+            cwd=cwd or self.worktree,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            **child_priority_kwargs(),
+        )
+        if proc.returncode != 0:
+            return []
+        stats: list[DiffStat] = []
+        for line in strip_malloc_stack_logging_noise(proc.stdout).splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            added, deleted, path = parts
+            stats.append(
+                DiffStat(
+                    path=path,
+                    added=None if added == "-" else int(added),
+                    deleted=None if deleted == "-" else int(deleted),
+                )
+            )
+        return stats
 
     # -- live state ---------------------------------------------------------------
 

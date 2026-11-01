@@ -28,7 +28,11 @@ from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
-from drcode.tui.merge_screen import CheckDetailsScreen, ConflictScreen
+from drcode.tui.merge_screen import (
+    CheckDetailsScreen,
+    ConflictScreen,
+    DiffStatItem,
+)
 from tests.network_mocks import wait_until
 
 # -- shared fixtures (mirroring tests/test_merge_engine.py / test_unmerged_reminder.py)
@@ -226,6 +230,25 @@ def test_abort_rolls_back(repo: Path) -> None:
     assert (wt / "app.py").read_text() == "a\nTASK\nc\n"
 
 
+def test_numstat_parses_counts_and_binary(repo: Path) -> None:
+    """`git diff --numstat` parsing: text files carry their ±line counts,
+    binary files (git reports `-\\t-\\t<path>`) flag as binary, and a
+    failed git call (an unknown rev) yields an empty list."""
+    _env, wt = _branch_with_work(repo, "t9")
+    (wt / "code.py").write_text("x\ny\n")
+    (wt / "logo.bin").write_bytes(b"\x00\x01\x02")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "mixed edit")
+    w = ConflictWorktree(repo, "t9", wt)
+    stats = w.numstat("main", branch_for("t9"), cwd=repo)
+    by = {s.path: s for s in stats}
+    assert by["fix.txt"].added == 1 and by["fix.txt"].deleted == 0
+    assert by["code.py"].added == 2 and by["code.py"].deleted == 0
+    assert by["logo.bin"].binary
+    # A failing git call (unknown rev) is an empty list, not a crash.
+    assert w.numstat("main", "no-such-branch", cwd=repo) == []
+
+
 # -- TaskEnvironment.ff_merge_branch (the user-triggered ff-merge) -------------------
 
 
@@ -401,6 +424,9 @@ async def test_screen_resolves_hunk_and_commits(
             what="conflict screen prepared",
         )
         assert screen.view.current_hunk() is not None
+        # The conflict mode's list shows conflict states, not numstat —
+        # the summary line stays empty there.
+        assert str(screen.files_summary.content) == ""
 
         await pilot.press("o")
         await wait_until(
@@ -877,6 +903,17 @@ def _toasts(app: DrCodeApp) -> list[str]:
     return [n.message for n in app._notifications._notifications.values()]
 
 
+def _numstat_rows(screen: ConflictScreen) -> dict[str, str]:
+    """The DiffStatItem rows as path -> rendered text. Tolerates the
+    one-frame window where a row is in the ListView but its Label child
+    has not mounted yet (skipped — the caller waits for full rows)."""
+    rows: dict[str, str] = {}
+    for item in screen.files_list.children:
+        if isinstance(item, DiffStatItem) and item.children:
+            rows[item.path] = str(item.children[0].content)
+    return rows
+
+
 async def test_ff_ready_screen_merges_into_base_and_clears_counter(
     isolated: Path, configured_env: None
 ) -> None:
@@ -941,6 +978,106 @@ async def test_ff_ready_screen_merges_into_base_and_clears_counter(
             "ff-only" in event.text
             for event in TaskManager(isolated).get(task_id).events
         )
+
+
+async def test_ff_ready_screen_lists_numstat_rows(
+    isolated: Path, configured_env: None
+) -> None:
+    """The ff-ready screen shows WHAT the fast-forward would land in the
+    base: one row per changed path with its ±line counts (binary files
+    as `bin`) under the git-style summary line — the picture of the
+    change size at the moment the f decision is made."""
+    task_id, wt = _finished_task_with_branch(isolated)
+    # Widen the branch's diff beyond the helper's single text file: a
+    # tracked edit and a binary file.
+    (wt / "app.py").write_text("a\nBRANCH\nc\nd\n")
+    (wt / "logo.bin").write_bytes(b"\x00\x01\x02")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "more work")
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and screen._ff_ready
+                and set(_numstat_rows(screen)) == {"fix.txt", "app.py", "logo.bin"}
+            ),
+            pilot=pilot,
+            what="ff-ready numstat list filled",
+        )
+        rows = _numstat_rows(screen)
+        assert set(rows) == {"fix.txt", "app.py", "logo.bin"}
+        assert "+1" in rows["fix.txt"] and "−0" in rows["fix.txt"]
+        assert "+2" in rows["app.py"] and "−1" in rows["app.py"]
+        assert "bin" in rows["logo.bin"]
+        summary = str(screen.files_summary.content)
+        assert "3 files changed" in summary
+        assert "3 insertions(+)" in summary
+        assert "1 deletion(-)" in summary
+
+
+async def test_ff_ready_r_refresh_rereads_numstat(
+    isolated: Path, configured_env: None
+) -> None:
+    """`r` in the ff-ready mode re-reads the numstat list (the spec's
+    "список перечитается"): the conflict-mode reload would wipe the
+    panel — no merge is parked in the worktree to re-triage."""
+    task_id, wt = _finished_task_with_branch(isolated)
+    (wt / "app.py").write_text("a\nBRANCH\nc\nd\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "more work")
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen.wt is not None and screen._ff_ready,
+            pilot=pilot,
+            what="ff-ready state reached",
+        )
+        await wait_until(
+            lambda: set(_numstat_rows(screen)) == {"fix.txt", "app.py"},
+            pilot=pilot,
+            what="ff-ready numstat list filled",
+        )
+
+        await pilot.press("r")
+        await pilot.pause()
+        await pilot.pause()
+        await wait_until(
+            lambda: screen._busy is None and not screen._preparing,
+            pilot=pilot,
+            what="refresh done",
+        )
+        await wait_until(
+            lambda: set(_numstat_rows(screen)) == {"fix.txt", "app.py"},
+            pilot=pilot,
+            what="r re-read the numstat list",
+        )
+        summary = str(screen.files_summary.content)
+        assert "2 files changed" in summary
 
 
 async def test_ff_merge_refused_when_base_moved(
@@ -1053,6 +1190,74 @@ async def test_staged_unconcluded_merge_is_not_ff_ready(
         )
         assert _git(wt, "rev-parse", "HEAD").strip() != head_before
         assert me.is_fast_forward(isolated, branch_for(task.id), "main")
+
+
+async def test_staged_mode_shows_numstat_of_future_commit(
+    isolated: Path, configured_env: None
+) -> None:
+    """The "resolved but NOT committed (press s)" mode lists the future
+    merge commit's content: the staged diff against the branch tip as
+    numstat rows + the git-style summary line."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    _env, wt = _parked_content_conflict(isolated, task.id)
+    # Resolve and stage by hand, do NOT commit — the resuming scenario.
+    # Staged "resolved\nb\n" against the branch tip "a\nTASK\nc\n":
+    # +2 −3.
+    (wt / "app.py").write_text("resolved\nb\n")
+    _git(wt, "add", "app.py")
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and screen._ff_ready is False
+                and set(_numstat_rows(screen)) == {"app.py"}
+            ),
+            pilot=pilot,
+            what="staged numstat list filled",
+        )
+        rows = _numstat_rows(screen)
+        assert set(rows) == {"app.py"}
+        assert "+2" in rows["app.py"] and "−3" in rows["app.py"]
+        summary = str(screen.files_summary.content)
+        assert "1 file changed" in summary
+        assert "2 insertions(+)" in summary
+        assert "3 deletions(-)" in summary
+        # The merge stays uncommitted: the list is a preview, s still
+        # the next step.
+        assert me.in_progress(wt)
+
+        # And `r` re-reads the staged numstat list instead of swapping
+        # it for the conflict-state view.
+        await pilot.press("r")
+        await pilot.pause()
+        await pilot.pause()
+        await wait_until(
+            lambda: screen._busy is None and not screen._preparing,
+            pilot=pilot,
+            what="refresh done",
+        )
+        await wait_until(
+            lambda: set(_numstat_rows(screen)) == {"app.py"},
+            pilot=pilot,
+            what="r re-read the staged numstat list",
+        )
+        summary = str(screen.files_summary.content)
+        assert "1 file changed" in summary and "2 insertions(+)" in summary
 
 
 # -- the title's merge description (commit subject / task-title fallback) --------

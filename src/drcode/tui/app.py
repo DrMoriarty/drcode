@@ -384,6 +384,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         Binding("alt+down", "move_task_down", "Move down", show=False),
         ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+f", "search_tasks", "Find task"),
+        ("ctrl+g", "task_statistics", "Stats"),
         ("ctrl+m", "open_merge", "Merge…"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the

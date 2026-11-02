@@ -162,6 +162,14 @@ class PipelineResolverLayer(DrCodeState):
         self._resolver_resume_round.discard(task_id)
         run: AgentRun[ResolverDeps, str] | None = None
         cancelled = False
+        # Statistics: when the report turns out genuinely conflicted, the
+        # round is timed from here to its conclusion (success, human
+        # hand-off) — resolving is not a status, the dwell lives only
+        # here. `concluded` marks an invocation that ENDED the logical
+        # round (a scheduled retry continues it in the next invocation:
+        # its elapsed time still accumulates, the round is counted once).
+        round_t0: float | None = None
+        concluded = False
         # True when the except-branch scheduled a retry: the finally-block
         # must then leave the retry state alone (needs_human may be a
         # stale flag from a PREVIOUS round — popping here would cancel the
@@ -214,6 +222,7 @@ class PipelineResolverLayer(DrCodeState):
                 f"file(s) — starting an automatic resolution round.",
                 kind="workflow",
             )
+            round_t0 = time.monotonic()
 
             # -- the agent round -----------------------------------------------------
             if not resume_round:
@@ -376,6 +385,7 @@ class PipelineResolverLayer(DrCodeState):
             await self._apply_resolver_outcome(
                 task, root, base, outcome, [f.path for f in report.files]
             )
+            concluded = True
         except asyncio.CancelledError:
             cancelled = True
             self._persist_resolver_messages(task, run)
@@ -396,6 +406,7 @@ class PipelineResolverLayer(DrCodeState):
                     "a human takes over.",
                 )
                 await self._give_up_to_human(task, root, base)
+                concluded = True
                 return
             network = _is_retryable_network_error(e)
             if network:
@@ -415,6 +426,7 @@ class PipelineResolverLayer(DrCodeState):
                     f"({type(e).__name__}: {e}) — a human takes over.",
                 )
                 await self._give_up_to_human(task, root, base)
+                concluded = True
                 return
             delay = min(_RETRY_BASE_DELAY_S * 2 ** (attempt - 1), 300)
             self._resolver_retry_at[task_id] = time.monotonic() + delay
@@ -436,6 +448,8 @@ class PipelineResolverLayer(DrCodeState):
             self._live_ctx_resolver.pop(task_id, None)
             self.refresh_status()
             self.refresh_sidebar()
+            if round_t0 is not None and not cancelled:
+                self._flush_resolver_time(task, time.monotonic() - round_t0, concluded)
             if not cancelled:
                 # Clean the retry state only when THIS attempt handed the
                 # task to a human (needs_human freshly set, no retry
@@ -446,6 +460,22 @@ class PipelineResolverLayer(DrCodeState):
                     self._resolver_retry_at.pop(task_id, None)
                     self._resolver_resume_round.discard(task_id)
                 self._advance()
+
+    def _flush_resolver_time(self, task: Task, elapsed: float, concluded: bool) -> None:
+        """Fold one resolver invocation's wall time into the statistics
+        (see drcode.stats): the task's cumulative `resolver_seconds` plus
+        the day bucket — a full second-granularity chunk goes to the day
+        the invocation ended. A round is counted once: a scheduled retry
+        continues the same logical round, so only a concluded invocation
+        (outcome applied / handed to a human) bumps `resolver_rounds`.
+        The task save is explicit: the conclusion paths that persist the
+        task may already have run (the finally here is later)."""
+        if elapsed <= 0:
+            return
+        task.resolver_seconds += elapsed
+        self.manager.stats.add_time("resolver", elapsed, rounds=1 if concluded else 0)
+        if task.id in self.manager.tasks:
+            self.manager.storage.save(task)
 
     def _retry_resolver(self) -> None:
         """A scheduled resolver retry: pick the task waiting out its

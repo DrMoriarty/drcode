@@ -60,6 +60,7 @@ from ..settings import (
 )
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
+from ..usage_store import UsageStore
 from ..workflow import WorkflowHooks
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
 from .command_providers import WorkflowPreset
@@ -173,7 +174,11 @@ class DrCodeState(App[None]):
     @staticmethod
     def _fmt_tokens(n: int) -> str: ...
 
-    def _record_session_usage(self, usage: RunUsage | None) -> None: ...
+    def _record_session_usage(
+        self, usage: RunUsage | None, role: AgentRole, model_id: str
+    ) -> None: ...
+
+    def resolved_model_key(self, role: AgentRole) -> str: ...
 
     def _header_usage_text(self) -> str: ...
 
@@ -832,6 +837,7 @@ class DrCodeState(App[None]):
     _session_created: dict[TaskKind, int]
     _session_completed: int
     _session_usage: SessionTokenUsage
+    _usage_store: UsageStore
     _session_durations: list[float]
 
     # -- new-task form ------------------------------------------------------

@@ -364,6 +364,21 @@ class Task(BaseModel):
     # consecutive failed rounds (project setting) the tester's failure
     # completes the task as FAILED and the bug report is created as usual.
     fix_rounds: int = 0
+    # Cumulative seconds the task has spent in each status, keyed by the
+    # status VALUE ("active", "testing", ...). Accumulated at every status
+    # transition in TaskManager.fire_status_change (dwell = now −
+    # status_changed_at, added BEFORE the stamp is refreshed) — both this
+    # and status_changed_at persist, so the counters survive restarts (the
+    # startup demotion of a stale ACTIVE task closes out its last stay).
+    # Feeds the project statistics' dev/testing time averages; idle time
+    # inside a stay (nudges, waiting) is NOT subtracted — a deliberate v1
+    # simplification.
+    time_in_status: dict[str, float] = Field(default_factory=dict)
+    # Cumulative seconds the conflict resolver spent on this task (measured
+    # around each resolver round in tui/pipeline_resolver.py — resolving is
+    # not expressible as a status, the task stays parked while the resolver
+    # runs). Persisted like every other Task field; 0.0 for old task files.
+    resolver_seconds: float = 0.0
     # True while a COMPLETED task awaits an ASYNCHRONOUS external review
     # verdict (workflow with on_development_done but no on_review: the task
     # completes with an open PR and the verdict arrives via the periodic

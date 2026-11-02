@@ -838,6 +838,20 @@ async def run_bash(
         except asyncio.CancelledError:
             pass
         raise
+    # Normal completion: the shell exited, but grandchildren that outlive it
+    # (a backgrounded daemon, a pty harness) stay in its process group and
+    # reparent to init — the group still exists while any member lives, so a
+    # single best-effort killpg takes the leftovers down (incident
+    # 2026-11-02: orphaned pty-harness processes eating ~80% CPU for hours
+    # after run_bash had returned). When the group is already empty this is
+    # a no-op (ProcessLookupError). Processes that fully detached into a NEW
+    # session (forkpty/setsid) are unreachable this way — that is the
+    # scratch-cleanup report's second echelon.
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # group already gone / partial permission
     raw = stdout.decode(errors="replace") + stderr.decode(errors="replace")
     out = strip_malloc_stack_logging_noise(raw).strip()[:MAX_TOOL_OUTPUT]
     return f"exit={proc.returncode}\n{out or '(no output)'}"

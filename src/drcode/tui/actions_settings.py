@@ -90,6 +90,24 @@ class SettingsLayer(DrCodeState):
 
         self.push_screen(SearchDialog(self.manager.storage.root))
 
+    def action_task_statistics(self) -> None:
+        """Open the project statistics dialog (Ctrl+G).
+
+        Reads `<main checkout>/.drcode/stats.json` fresh in the dialog's
+        own worker thread — the manager's in-memory store is deliberately
+        not consulted, a pure read must not race the pipeline's writes."""
+        from .stats_dialog import StatsDialog
+
+        self.push_screen(StatsDialog(self.manager.storage.root))
+
+    def action_open_usage_dialog(self) -> None:
+        """Open the user-level token-usage dialog (Settings →
+        "Token usage…"): the persistent per-day, per-model statistics
+        collected by the pipeline's single usage hook."""
+        from .usage_dialog import UsageDialog
+
+        self.push_screen(UsageDialog())
+
     def action_settings(self) -> None:
         """Open the Settings modal (the command palette, Ctrl+S)."""
         if isinstance(self.screen, CommandPalette):

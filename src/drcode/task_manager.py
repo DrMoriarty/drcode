@@ -22,6 +22,7 @@ from .models import (
     VerificationStatus,
     _now,
 )
+from .stats import StatsStore
 from .storage import Storage
 from .tools import remove_scratch
 from .transcript import is_pending_retry
@@ -138,6 +139,13 @@ class TaskManager:
         # on the manager so both the agent tools and the TUI reach the same
         # in-memory state through `manager.goals`.
         self.goals = GoalStore(project_root)
+        # Project statistics (<project>/.drcode/stats.json): the day
+        # buckets are folded at event time (creation, a transition into
+        # COMPLETED, a finished ACTIVE/TESTING stay) — never recomputed
+        # from the archive, so the retention cleanup cannot disturb them.
+        # Built BEFORE the tasks load: the startup demotion of a stale
+        # ACTIVE task closes out its last development stay into the store.
+        self.stats = StatsStore(project_root)
         # Scaffold the workflow templates (.drcode/workflow.py.example,
         # .drcode/git-workflow.md.example) — idempotent, never overwrites.
         ensure_workflow_examples(project_root)
@@ -174,6 +182,7 @@ class TaskManager:
         # On startup at most one task may have been active when the app closed.
         for t in self.tasks.values():
             if t.status is TaskStatus.ACTIVE:
+                self._close_out_stale_active(t)
                 t.status = TaskStatus.QUEUED
                 self.storage.save(t)
         # Goal-progress loop closure: every transition INTO COMPLETED of a
@@ -187,10 +196,35 @@ class TaskManager:
         # line): when the LAST linked task honestly completes, the goal
         # moves to DONE on its own.
         self.add_completion_listener(self._goal_auto_done)
+        # Statistics: every creation (user, agent bug report, GitHub
+        # import — it all funnels through create()) bumps the day's
+        # "created" counter.
+        self.add_creation_listener(self._stats_created)
 
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
         return self._queue_seq
+
+    def _stats_created(self, task: Task, origin: str) -> None:
+        """Creation listener folding the "created" counter into the
+        project statistics (see drcode.stats)."""
+        self.stats.record_created()
+
+    def _close_out_stale_active(self, task: Task) -> None:
+        """Fold the interrupted ACTIVE stay of a task found ACTIVE at
+        startup into the statistics (the demotion loop bypasses
+        fire_status_change — it must stay silent: no notifications for a
+        restart artifact). Same dwell attribution as a live transition:
+        the whole chunk goes to the day it is closed out on."""
+        now = _now()
+        if task.status_changed_at is not None:
+            dwell = (now - task.status_changed_at).total_seconds()
+            if dwell > 0:
+                task.time_in_status["active"] = (
+                    task.time_in_status.get("active", 0.0) + dwell
+                )
+                self.stats.add_time("dev", dwell, rounds=1)
+        task.status_changed_at = now
 
     def _evict_transcript(self, task_id: str) -> bool:
         """Storage sidecar-LRU callback (see Storage.transcript_cache_limit):
@@ -272,7 +306,25 @@ class TaskManager:
         # statusbar's duration counter always measures the current stay.
         # Persisting is the caller's job (_save_changed / the pipeline's own
         # save right after).
-        task.status_changed_at = _now()
+        now = _now()
+        # Project statistics: close out the finished stay in the OLD status
+        # (dwell = now − the stamp about to be refreshed) — dev = time in
+        # ACTIVE across all rounds, testing = time in TESTING; the whole
+        # chunk is attributed to the day the stay ended (a midnight-
+        # crossing chunk is deliberately not split). The round counts ride
+        # on the same event so the seconds/rounds pair stays consistent
+        # within one day bucket.
+        if task.status_changed_at is not None:
+            dwell = (now - task.status_changed_at).total_seconds()
+            if dwell > 0:
+                task.time_in_status[old.value] = (
+                    task.time_in_status.get(old.value, 0.0) + dwell
+                )
+                if old is TaskStatus.ACTIVE:
+                    self.stats.add_time("dev", dwell, rounds=1)
+                elif old is TaskStatus.TESTING:
+                    self.stats.add_time("testing", dwell, rounds=1)
+        task.status_changed_at = now
         for listener in list(self._status_listeners):
             try:
                 listener(task, old, task.status, origin)
@@ -287,6 +339,15 @@ class TaskManager:
         # for completion-side side effects (worktree_removal:
         # on_completion).
         if task.status is TaskStatus.COMPLETED and old is not TaskStatus.COMPLETED:
+            # Statistics: every completion counts again ("how many
+            # completions that day", not "how many unique tasks"), split
+            # by cancel / failed verdict / honest completion. Folded here,
+            # in the single funnel — the GitHub-imported task counted
+            # itself at create().
+            self.stats.record_completion(
+                cancelled=task.cancelled,
+                failed=task.verification is VerificationStatus.FAILED,
+            )
             self._fire_completed(task, old, origin)
 
     def _save_changed(self, task: Task, old: TaskStatus, origin: str) -> None:

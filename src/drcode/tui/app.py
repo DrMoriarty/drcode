@@ -51,6 +51,7 @@ from ..providers import (
     migrate_project_config,
     migrate_user_config,
     project_has_model_selection,
+    resolve_model_key,
 )
 from ..providers import resolve_effective as resolve_model_config
 from ..settings import (
@@ -64,6 +65,7 @@ from ..settings import (
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
+from ..usage_store import UsageStore, usage_file
 from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
@@ -384,6 +386,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         Binding("alt+down", "move_task_down", "Move down", show=False),
         ("ctrl+e", "edit_task", "Edit held"),
         ("ctrl+f", "search_tasks", "Find task"),
+        ("ctrl+g", "task_statistics", "Stats"),
         ("ctrl+m", "open_merge", "Merge…"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the
@@ -420,6 +423,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # stale sys.modules meet fresh files and ends in ImportErrors).
         capture_baseline()
         self._package_drift_reported = False
+        # Throttle for the repeat reminders the drift guard emits on each
+        # blocked action (monotonic; -inf → the first blocked click always
+        # reminds, the full explanation toast may have scrolled away).
+        self._package_drift_remind_at = float("-inf")
         # One-time migrations BEFORE the config is built: legacy flat model
         # keys in the user-level / project drcode.json move into the user
         # catalog and the project's per-role custom models, and are removed
@@ -701,6 +708,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # (main agent + tester + compaction summarizer) — shown in the
         # expanded header's bottom line. Session-scoped: resets on restart.
         self._session_usage = SessionTokenUsage()
+        # Persistent per-day, per-model token usage
+        # (~/.config/drcode/usage.json): every model call funnels through
+        # _record_session_usage, which folds into BOTH the session totals
+        # above and this store (one atomic file write per model call — a
+        # crash loses at most the in-flight call, never the day).
+        # The path is passed EXPLICITLY (resolved through the ordinary
+        # config layering): a dogfood child TUI inherits DRCODE_TASK_ID
+        # from the run_bash that launched it, and the store's agent-guard
+        # fires only for a non-explicit path — a legitimate TUI process
+        # (main or child) must write to its own, possibly sandboxed
+        # location, while a bare UsageStore() in an agent's verification
+        # snippet stays guarded.
+        self._usage_store = UsageStore(path=usage_file())
         # Activation → completion spans (seconds) of the tasks completed
         # this session; feeds the average/median figures.
         self._session_durations: list[float] = []
@@ -896,6 +916,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # catalog from disk. Invalidated whenever the flat config, the
         # project `models` slots or the catalog change.
         self._resolved_configs: dict[AgentRole, Config] = {}
+        # Usage-accounting keys ("<provider>/<model-id>" or the bare
+        # model id) of the resolved configs, cached with them — see
+        # `resolved_model_key`.
+        self._resolved_model_keys: dict[AgentRole, str] = {}
 
     # -- per-role model resolution -------------------------------------------
 
@@ -911,10 +935,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             self._resolved_configs[role] = cached
         return cached
 
+    def resolved_model_key(self, role: AgentRole) -> str:
+        """Usage-accounting model id of the role's effective model, in the
+        catalog's "<provider>/<model-id>" format (bare id for custom
+        models and the env override — they carry no provider name; empty
+        when nothing is selected). Cached alongside `resolved_config`,
+        invalidated with it."""
+        cached = self._resolved_model_keys.get(role)
+        if cached is None:
+            cached = resolve_model_key(self.config, role)
+            self._resolved_model_keys[role] = cached
+        return cached
+
     def invalidate_resolved_configs(self) -> None:
         """Drop the cached per-role resolutions (after any change to the
         flat config, the project model slots or the user catalog)."""
         self._resolved_configs.clear()
+        self._resolved_model_keys.clear()
 
     def push_screen(self, *args: Any, **kwargs: Any) -> Any:
         """A modal screen is a context change: any in-flight dictation
@@ -1894,10 +1931,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     def _poll_package_drift(self) -> None:
         """Periodic package-drift check (30 s tick, stat-only — see
-        package_watch). Reports ONCE per session: the situation does not
-        heal by itself and a re-toast every 30 s would bury the user in
-        noise; the guard in the lazy screen imports re-checks cheaply and
-        keeps the eventual failure explained even mid-interval."""
+        package_watch). The poll reports ONCE per session with the full
+        explanation (a re-toast every 30 s would bury the user in noise);
+        after that the drift guard re-toasts a SHORT reminder on each
+        blocked action, throttled — see `package_drift_guard`."""
         if self._package_drift_reported:
             return
         reason = self._report_package_drift()
@@ -1945,10 +1982,38 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         was just reported). The lazy screen imports call this BEFORE
         touching disk — importing a fresh screen module against stale
         sys.modules is the exact crash this feature exists to explain
-        (Ctrl+M → merge_screen → conflict, 31.10→01.11)."""
+        (Ctrl+M → merge_screen → conflict, 31.10→01.11).
+
+        Every True here interrupts a user action, so an already-known
+        drift re-toasts a short reminder (throttled — see
+        `_remind_package_drift`); only the FIRST report carries the
+        full explanation."""
         if self._package_drift_reported:
+            self._remind_package_drift()
             return True
         return self._report_package_drift() is not None
+
+    _PACKAGE_DRIFT_REMIND_INTERVAL = 30.0
+
+    def _remind_package_drift(self) -> None:
+        """Short repeat toast for actions the drift guard keeps refusing.
+
+        The one-time poll toast (12 s) is easy to miss; without this every
+        later Ctrl+M / footer / ⎇-click died silently while the UI kept
+        showing unmerged work (real case 02.11). Throttled to one reminder
+        per `_PACKAGE_DRIFT_REMIND_INTERVAL` seconds — the action is still
+        refused on every press, only the noise is capped."""
+        now = time.monotonic()
+        if now - self._package_drift_remind_at < self._PACKAGE_DRIFT_REMIND_INTERVAL:
+            return
+        self._package_drift_remind_at = now
+        self.notify(
+            "Package upgraded on disk — restart the app (Ctrl+C, "
+            "drcode) to open screens",
+            title="Package upgraded",
+            severity="warning",
+            timeout=6,
+        )
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         for command in super().get_system_commands(screen):

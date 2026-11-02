@@ -156,6 +156,15 @@ class PipelineAgentRunLayer(DrCodeState):
                             # create DRAFT tasks when the setting is on
                             # (the user finishes them in the editor).
                             agent_creates_drafts=(self.settings.agent_creates_drafts),
+                            # delegate_research subagents run on THIS
+                            # role's model: their usage folds into the
+                            # per-day store under the parent's key (see
+                            # _record_session_usage).
+                            record_usage=(
+                                lambda u, _role=role: self._record_session_usage(
+                                    u, _role, self.resolved_model_key(_role)
+                                )
+                            ),
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -183,7 +192,7 @@ class PipelineAgentRunLayer(DrCodeState):
                                         stream.feed(event)
                                 stream.finish_node()
                                 self._agent_model_request_done(
-                                    task, task_id, run, consumed, text
+                                    task, task_id, run, consumed, text, role
                                 )
                             elif Agent.is_call_tools_node(node):
                                 if await self._agent_tools_node(
@@ -453,6 +462,7 @@ class PipelineAgentRunLayer(DrCodeState):
         run: AgentRun[AgentDeps, str],
         consumed: list[PendingInput],
         text: str | None,
+        role: AgentRole,
     ) -> None:
         """Bookkeeping after one completed model request node: backdate
         the just-recorded prompt, refresh the live context counter, fold
@@ -478,8 +488,10 @@ class PipelineAgentRunLayer(DrCodeState):
             if self.viewed_id == task_id:
                 self.refresh_task_status()
         # Exact per-request usage of the completed model call, into the
-        # session totals.
-        self._record_session_usage(last_response_usage(run))
+        # session totals and the persistent per-day usage store.
+        self._record_session_usage(
+            last_response_usage(run), role, self.resolved_model_key(role)
+        )
         # A model call went through: the network-retry budget for this
         # task starts over, so the NEXT network error counts from one
         # again — even mid-run, where a single turn makes many model

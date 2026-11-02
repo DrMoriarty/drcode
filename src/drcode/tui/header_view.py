@@ -273,14 +273,30 @@ class HeaderLayer(DrCodeState):
             return fmt(n / 1_000_000, "M")
         return str(n)
 
-    def _record_session_usage(self, usage: RunUsage | None) -> None:
+    def _record_session_usage(
+        self, usage: RunUsage | None, role: AgentRole, model_id: str
+    ) -> None:
         """Fold one model call's exact token usage into the session
-        totals (main agent, tester and compaction summarizer alike) and
-        refresh the expanded header line for an instant update — the 1 s
-        poller keeps it live while the header is collapsed (no-op there)."""
+        totals (main agent, tester, compaction summarizer, resolver and
+        research subagents alike) AND into the persistent per-day,
+        per-model store (`~/.config/drcode/usage.json`, keyed
+        "<role>/<model-id>" — every call site knows the role and the
+        resolved model). Then refresh the expanded header line for an
+        instant update — the 1 s poller keeps it live while the header
+        is collapsed (no-op there).
+
+        The store write is best-effort: statistics must never break the
+        model run this hook sits in the hot path of (a failed write —
+        disk full, a read-only config dir, the agent-guard — costs at
+        most that call's counters; this run's exception handlers turn an
+        escape into a demoted task, which is far too high a price)."""
         if usage is None:
             return
         self._session_usage.add(usage)
+        try:
+            self._usage_store.record(role, model_id, usage)
+        except Exception:  # noqa: BLE001, S110 - statistics never fatal
+            pass
         self._render_header_tall()
 
     def _header_usage_text(self) -> str:

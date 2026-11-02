@@ -51,6 +51,7 @@ from ..providers import (
     migrate_project_config,
     migrate_user_config,
     project_has_model_selection,
+    resolve_model_key,
 )
 from ..providers import resolve_effective as resolve_model_config
 from ..settings import (
@@ -64,6 +65,7 @@ from ..settings import (
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
+from ..usage_store import UsageStore, usage_file
 from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
@@ -706,6 +708,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # (main agent + tester + compaction summarizer) — shown in the
         # expanded header's bottom line. Session-scoped: resets on restart.
         self._session_usage = SessionTokenUsage()
+        # Persistent per-day, per-model token usage
+        # (~/.config/drcode/usage.json): every model call funnels through
+        # _record_session_usage, which folds into BOTH the session totals
+        # above and this store (one atomic file write per model call — a
+        # crash loses at most the in-flight call, never the day).
+        # The path is passed EXPLICITLY (resolved through the ordinary
+        # config layering): a dogfood child TUI inherits DRCODE_TASK_ID
+        # from the run_bash that launched it, and the store's agent-guard
+        # fires only for a non-explicit path — a legitimate TUI process
+        # (main or child) must write to its own, possibly sandboxed
+        # location, while a bare UsageStore() in an agent's verification
+        # snippet stays guarded.
+        self._usage_store = UsageStore(path=usage_file())
         # Activation → completion spans (seconds) of the tasks completed
         # this session; feeds the average/median figures.
         self._session_durations: list[float] = []
@@ -901,6 +916,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # catalog from disk. Invalidated whenever the flat config, the
         # project `models` slots or the catalog change.
         self._resolved_configs: dict[AgentRole, Config] = {}
+        # Usage-accounting keys ("<provider>/<model-id>" or the bare
+        # model id) of the resolved configs, cached with them — see
+        # `resolved_model_key`.
+        self._resolved_model_keys: dict[AgentRole, str] = {}
 
     # -- per-role model resolution -------------------------------------------
 
@@ -916,10 +935,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             self._resolved_configs[role] = cached
         return cached
 
+    def resolved_model_key(self, role: AgentRole) -> str:
+        """Usage-accounting model id of the role's effective model, in the
+        catalog's "<provider>/<model-id>" format (bare id for custom
+        models and the env override — they carry no provider name; empty
+        when nothing is selected). Cached alongside `resolved_config`,
+        invalidated with it."""
+        cached = self._resolved_model_keys.get(role)
+        if cached is None:
+            cached = resolve_model_key(self.config, role)
+            self._resolved_model_keys[role] = cached
+        return cached
+
     def invalidate_resolved_configs(self) -> None:
         """Drop the cached per-role resolutions (after any change to the
         flat config, the project model slots or the user catalog)."""
         self._resolved_configs.clear()
+        self._resolved_model_keys.clear()
 
     def push_screen(self, *args: Any, **kwargs: Any) -> Any:
         """A modal screen is a context change: any in-flight dictation

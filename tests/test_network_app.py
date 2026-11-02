@@ -1690,7 +1690,10 @@ async def test_map_reduce_compaction_over_window(
     monkeypatch.setattr(
         DrCodeApp,
         "_record_session_usage",
-        lambda self, usage: (recorded.append(usage), orig_record(self, usage)),
+        lambda self, usage, role, model_id: (
+            recorded.append(usage),
+            orig_record(self, usage, role, model_id),
+        ),
     )
 
     app = DrCodeApp(project_root)

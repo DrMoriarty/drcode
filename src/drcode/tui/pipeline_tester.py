@@ -490,8 +490,13 @@ class PipelineTesterLayer(DrCodeState):
                                     if self.viewed_id == task_id:
                                         self.refresh_task_status()
                                 # Exact per-request usage of the completed
-                                # model call, into the session totals.
-                                self._record_session_usage(last_response_usage(run))
+                                # model call, into the session totals and
+                                # the persistent per-day usage store.
+                                self._record_session_usage(
+                                    last_response_usage(run),
+                                    AgentRole.TESTER,
+                                    self.resolved_model_key(AgentRole.TESTER),
+                                )
                                 # A model call went through: the network-retry
                                 # budget for this testing round starts over,
                                 # so the NEXT network error counts from one

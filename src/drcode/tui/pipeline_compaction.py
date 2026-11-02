@@ -557,13 +557,19 @@ class PipelineCompactionLayer(DrCodeState):
 
     async def _run_summarizer(self, prompt: str) -> str:
         """One compaction model call: run the tool-less summarizer and
-        record its usage into the session totals like every other model
-        call. Raises on failure — the callers turn that into a non-fatal
-        compaction-failed event."""
+        record its usage into the session totals and the persistent
+        per-day usage store like every other model call (under the
+        COMPACTION role — the summarizer always runs on the compaction
+        model, whatever transcript it shrinks). Raises on failure — the
+        callers turn that into a non-fatal compaction-failed event."""
         agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
         result = await agent.run(prompt)
         # The summarizer's model calls count toward the session usage too.
-        self._record_session_usage(result.usage)
+        self._record_session_usage(
+            result.usage,
+            AgentRole.COMPACTION,
+            self.resolved_model_key(AgentRole.COMPACTION),
+        )
         return result.output
 
     async def _reduce_partials(

@@ -290,7 +290,11 @@ class PipelineResolverLayer(DrCodeState):
                                 self._live_ctx_resolver[task_id] = live_tokens
                                 if self.viewed_id == task_id:
                                     self.refresh_task_status()
-                            self._record_session_usage(last_response_usage(run))
+                            self._record_session_usage(
+                                last_response_usage(run),
+                                AgentRole.RESOLVER,
+                                self.resolved_model_key(AgentRole.RESOLVER),
+                            )
                             self._note_network_recovered(task, self._resolver_net_count)
                             self._resolver_net_count.pop(task_id, None)
                         elif Agent.is_call_tools_node(node):
@@ -570,7 +574,11 @@ class PipelineResolverLayer(DrCodeState):
                 deps=rdeps,
                 usage_limits=UsageLimits(request_limit=self.config.request_limit),
             )
-            self._record_session_usage(result.usage)
+            self._record_session_usage(
+                result.usage,
+                AgentRole.RESOLVER,
+                self.resolved_model_key(AgentRole.RESOLVER),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - a failed review blocks the commit

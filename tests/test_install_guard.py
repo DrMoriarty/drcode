@@ -330,6 +330,14 @@ async def test_deferred_rerun_after_manual_merge_once(app_env: DrCodeApp) -> Non
         await asyncio.to_thread(app._unmerged_completed_ids)
         app._maybe_rerun_pending_installs()
         await wait_until(lambda: marker.exists(), pilot, what="deferred install ran")
+        # The worker clears install_pending/hook_merge_failed only AFTER the
+        # hook subprocess returns — under parallel-suite load the marker can
+        # appear while the worker is still in flight; wait on the state.
+        await wait_until(
+            lambda: not task.install_pending and not task.hook_merge_failed,
+            pilot,
+            what="deferred install state cleared",
+        )
         await pilot.pause()
         assert len(marker.read_text().splitlines()) == 1
         assert not task.install_pending

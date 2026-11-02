@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from textual.content import Content
-from textual.widgets import Static
+from textual.widgets import Label, Static
 
 from drcode import merge_engine as me
 from drcode import merge_resolver
@@ -916,7 +916,7 @@ def _numstat_rows(screen: ConflictScreen) -> dict[str, str]:
         if not (isinstance(item, DiffStatItem) and item.children):
             continue
         child = item.children[0]
-        if isinstance(child, Static):
+        if isinstance(child, Label):
             rows[item.path] = str(child.content)
     return rows
 

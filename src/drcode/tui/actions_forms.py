@@ -230,7 +230,8 @@ class TaskFormLayer(DrCodeState):
             )
             hint.update(
                 "tab — switch type   ctrl+g — depends on   ctrl+enter — create   "
-                "ctrl+h — create on hold   esc — cancel" + voice
+                "ctrl+h — create on hold   ctrl+d — create as draft   esc — cancel"
+                + voice
             )
 
     def action_edit_task(self) -> None:
@@ -465,7 +466,15 @@ class TaskFormLayer(DrCodeState):
         """Ctrl+H while editing a held task: save it back on hold."""
         self._submit_new_form(hold=True)
 
-    def _submit_new_form(self, *, hold: bool) -> None:
+    def action_submit_new_task_draft(self) -> None:
+        """Ctrl+D in the form: create the task as a DRAFT — parked in the
+        sidebar's DRAFTS block, never picked up by the pipeline until the
+        user opens it (Ctrl+E) and finishes it. Fresh creation only: a
+        held task cannot become a draft, and a draft being finished is
+        already one (ESC keeps it)."""
+        self._submit_new_form(hold=False, draft=True)
+
+    def _submit_new_form(self, *, hold: bool, draft: bool = False) -> None:
         if self._editing_task_id is not None:
             self._finish_task_edit(queue=not hold)
             return
@@ -482,10 +491,24 @@ class TaskFormLayer(DrCodeState):
             text,
             kind=self.new_task_kind,
             hold=hold,
+            draft=draft,
             goal_id=self._new_task_goal_id,
         )
         if deps:
             self.manager.set_dependencies(task.id, deps)
+        if draft:
+            # A draft never enters the pipeline and has no chat view:
+            # leave the form and restore the pre-form view (cancel_new_task
+            # skips drafts — no redirect trap), the draft waits in the
+            # sidebar's DRAFTS block.
+            self.cancel_new_task()
+            self.refresh_sidebar()
+            self.notify(
+                "Draft created — open it (ctrl+e) to finish and queue it",
+                title="New task",
+                timeout=6,
+            )
+            return
         self._leave_new_task_mode()
         self.refresh_sidebar()
         self.view_task(task.id)

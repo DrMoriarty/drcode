@@ -90,12 +90,14 @@ __all__ = [
     "is_fast_forward",
     "load_report",
     "merge_base_into_worktree",
+    "remove_report",
     "report_path",
     "rerere_replay",
     "rerere_status",
     "resolve_identical",
     "save_report",
     "triage",
+    "triage_reports",
     "unmerged_paths",
 ]
 
@@ -939,6 +941,46 @@ def report_path(project_root: Path, task_id: str) -> Path:
     """Where the triage report of `task_id` is persisted (the TUI
     ConflictScreen and the agent resolver read it from here)."""
     return project_root / _REPORTS_SUBDIR / f"{task_id}.json"
+
+
+def remove_report(project_root: Path, task_id: str) -> None:
+    """Delete the persisted triage report of `task_id` (best-effort).
+
+    The report is the engine's marker of a PARKED conflict — once the
+    merge is concluded (committed / ff-merged) or aborted, keeping it
+    would make the footer's Merge… entry and the header's ✋ marker
+    claim work that no longer exists. The adjacent verify/timings
+    artifacts are informational and stay."""
+    try:
+        report_path(project_root, task_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def triage_reports(project_root: Path) -> list[tuple[Path, str]]:
+    """Every persisted triage report as ``(path, task_id)`` — the sweep's
+    input. Reports are recognized by their schema (a `task_id` plus a
+    `files` array); the adjacent `-verify.txt` / `*-timings.json`
+    artifacts never carry that shape and are skipped, so the id does not
+    have to be recovered from the file name (task ids contain dashes)."""
+    directory = project_root / _REPORTS_SUBDIR
+    try:
+        candidates = sorted(directory.glob("*.json"))
+    except OSError:
+        return []
+    result: list[tuple[Path, str]] = []
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("task_id"), str)
+            and isinstance(data.get("files"), list)
+        ):
+            result.append((path, data["task_id"]))
+    return result
 
 
 def save_report(project_root: Path, task_id: str, report: MergeReport) -> Path | None:

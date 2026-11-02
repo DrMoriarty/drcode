@@ -1474,6 +1474,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # No isolation — no branches; the only deferred-install
             # blocker is the shared checkout itself (mid-merge / dirty).
             self._install_rerun_ids = self._install_rerun_candidates([])
+            self._purge_stale_merge_reports()
             self._merge_poll_done = True
             return []
         workflow = self.workflow
@@ -1494,6 +1495,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if not candidates:
             self._merge_state = {}
             self._install_rerun_ids = self._install_rerun_candidates([])
+            self._purge_stale_merge_reports()
             self._merge_poll_done = True
             return []
         # ONE wholesale mergedness answer for every candidate branch (a
@@ -1539,13 +1541,49 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 task.touch()
                 self.manager.storage.save(task)
         # A fill has completed: check_action "open_merge" may now trust
-        # the negative answer (until the next poll refreshes it).
+        # the negative answer (until the next poll refreshes it). The
+        # stale-report sweep runs first — a resolved conflict's leftover
+        # report must not keep the footer's Merge… entry alive.
+        self._purge_stale_merge_reports()
         self._merge_poll_done = True
         # Same pass, different flag: deferred installs whose blocker just
         # disappeared (the branch is merged — exactly the ids NOT in the
         # unmerged result above).
         self._install_rerun_ids = self._install_rerun_candidates(result)
         return result
+
+    def _purge_stale_merge_reports(self) -> None:
+        """Delete triage reports whose conflict is already gone.
+
+        The engine persists a report only while a conflicted merge is
+        parked (see merge_engine._maybe_save), but nothing used to clean
+        it up when the merge concluded — a stale `.drcode/merge_reports/
+        <id>.json` then kept the footer's Merge… entry and the header's
+        ✋ marker claiming work that no longer existed (the exact
+        "Merge visible with nothing to merge" report). A report survives
+        this sweep only while it still vouches for something real: the
+        task carries `needs_human`, the branch counts as unmerged (the
+        10 s poll's snapshot — also covers the hook's grace window), or
+        a merge is still half-done in the task's worktree. Blocking file
+        IO plus one git call per surviving-candidate worktree — run in
+        the tracking's worker thread (the callers of
+        _unmerged_completed_ids). Best-effort: a purge failure keeps the
+        file for the next tick."""
+        from ..merge_engine import in_progress as merge_in_progress
+        from ..merge_engine import remove_report, triage_reports
+
+        for _path, task_id in triage_reports(self.project_root):
+            task = self.manager.tasks.get(task_id)
+            if task is not None and task.needs_human:
+                continue
+            if self._merge_state.get(task_id) == "unmerged":
+                continue
+            worktree = (
+                self.task_env.worktree_path(task_id) if self.task_env.active else None
+            )
+            if worktree is not None and merge_in_progress(worktree):
+                continue
+            remove_report(self.project_root, task_id)
 
     def _install_rerun_candidates(self, unmerged_ids: list[str]) -> list[str]:
         """Completed PASSED tasks with a deferred on_tester_passed install
@@ -1773,6 +1811,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 or any(report_path(self.project_root, t.id).exists() for t in tasks)
             )
         if action == "submit_new_task_hold":
+            return self._new_task_mode and self._editing_task_id is None
+        if action == "submit_new_task_draft":
+            # Fresh creation only — the edit modes have no draft semantics
+            # (a held task stays held; a finished draft is left via ESC).
             return self._new_task_mode and self._editing_task_id is None
         if action == "save_task_edit_hold":
             return self._new_task_mode and self._editing_task_id is not None

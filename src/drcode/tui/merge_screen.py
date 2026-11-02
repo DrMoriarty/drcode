@@ -137,7 +137,7 @@ from ..conflict import (
     Hunk,
     parse_hunks,
 )
-from ..merge_engine import MergeReport, is_fast_forward
+from ..merge_engine import MergeReport, is_fast_forward, remove_report
 from ..merge_resolver import CheckResult
 from ..tools import child_priority_kwargs
 
@@ -1898,6 +1898,9 @@ class ConflictScreen(ModalScreen[None]):
         task.touch()
         app.manager.storage.save(task)
         if ok:
+            # The conflict is concluded — its triage report is obsolete
+            # (a leftover would keep the footer's Merge… entry alive).
+            await asyncio.to_thread(remove_report, app.project_root, self.task_id)
             app._show_event(
                 task,
                 f"Conflict resolution committed on {branch} via the "
@@ -1940,6 +1943,10 @@ class ConflictScreen(ModalScreen[None]):
         finally:
             self._end_busy()
         if ok:
+            # The parked conflict is rolled back — the triage report no
+            # longer vouches for anything (footer Merge… hygiene).
+            app = cast("DrCodeApp", self.app)
+            await asyncio.to_thread(remove_report, app.project_root, self.task_id)
             self.notify(
                 "Merge aborted — worktree back to the pre-merge state",
                 title="Merge",
@@ -2040,6 +2047,9 @@ class ConflictScreen(ModalScreen[None]):
             task.needs_human = False
             task.touch()
             app.manager.storage.save(task)
+        # The merge concluded — the triage report is obsolete (a leftover
+        # would keep the footer's Merge… entry alive).
+        await asyncio.to_thread(remove_report, app.project_root, self.task_id)
         app._show_event(
             task,
             f"merged {branch} into {base} (ff-only) via the conflict screen",

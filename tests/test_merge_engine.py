@@ -471,6 +471,50 @@ def test_load_report_corrupt_file_is_none(repo: Path) -> None:
     assert me.load_report(repo, "t1") is None
 
 
+def test_remove_report_deletes_only_the_triage_report(repo: Path) -> None:
+    wt = _task_worktree(repo, "t1")
+    (wt / "app.py").write_text("task\nb\n")
+    _run(wt, "commit", "-qam", "task edit")
+    (repo / "app.py").write_text("main\nb\n")
+    _run(repo, "commit", "-qam", "main edit")
+    me.merge_base_into_worktree(repo, "t1", wt, "main", save=True)
+    # The adjacent informational artifacts the resolver/screen write.
+    verify = me.report_path(repo, "t1").with_name("t1-verify.txt")
+    timings = me.report_path(repo, "t1").with_name("t1-prepare-timings.json")
+    verify.write_text("checks", encoding="utf-8")
+    timings.write_text("{}", encoding="utf-8")
+
+    me.remove_report(repo, "t1")
+
+    assert not me.report_path(repo, "t1").is_file()
+    assert verify.is_file() and timings.is_file()
+    # Best-effort: a missing report is not an error.
+    me.remove_report(repo, "t1")
+
+
+def test_triage_reports_lists_only_report_schema(repo: Path) -> None:
+    directory = me.report_path(repo, "t1").parent
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "t1.json").write_text(
+        '{"task_id": "t1", "files": []}', encoding="utf-8"
+    )
+    (directory / "t2.json").write_text(
+        '{"task_id": "t2", "files": [{"path": "a"}]}', encoding="utf-8"
+    )
+    # The resolver/screen's adjacent artifacts share the directory but
+    # never carry the report schema — the sweep must skip them.
+    (directory / "t3-prepare-timings.json").write_text("{}", encoding="utf-8")
+    (directory / "t4-verify.txt").write_text("checks", encoding="utf-8")
+    (directory / "broken.json").write_text("{not json", encoding="utf-8")
+
+    assert me.triage_reports(repo) == [
+        (directory / "t1.json", "t1"),
+        (directory / "t2.json", "t2"),
+    ]
+    # No reports dir at all: empty, never a crash.
+    assert me.triage_reports(repo / "nowhere") == []
+
+
 def test_summary_shapes(repo: Path) -> None:
     wt = _task_worktree(repo, "t1")
     (wt / "app.py").write_text("task\nb\n")

@@ -398,6 +398,12 @@ class UnmergedListScreen(ModalScreen[None]):
                         task.needs_human = False
                         task.touch()
                         app.manager.storage.save(task)
+                    # The conflict is concluded — its triage report is
+                    # obsolete (a leftover would keep the footer's
+                    # Merge… entry alive).
+                    await asyncio.to_thread(
+                        merge_engine.remove_report, app.project_root, task_id
+                    )
                     app._show_event(
                         task,
                         f"Resolved merge committed on {branch} via the "
@@ -486,6 +492,9 @@ class UnmergedListScreen(ModalScreen[None]):
             task.needs_human = False
             task.touch()
             app.manager.storage.save(task)
+        # The merge concluded — the triage report is obsolete (a leftover
+        # would keep the footer's Merge… entry alive).
+        await asyncio.to_thread(merge_engine.remove_report, app.project_root, task_id)
         app._show_event(
             task,
             f"merged {branch} into {base} (ff-only) via the unmerged list",

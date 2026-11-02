@@ -1017,6 +1017,35 @@ def test_run_bash_timeout_kills_grandchildren(project_root: Path) -> None:
     assert leftover.returncode != 0  # no surviving grandchild
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_run_bash_normal_exit_kills_grandchildren(project_root: Path) -> None:
+    # NORMAL completion needs the same group sweep as timeout/cancel: a
+    # grandchild surviving the shell's exit reparents to init and lives on
+    # (incident 2026-11-02: 10 orphaned processes at ~80% CPU for hours).
+    # The outer shell backgrounds a python grandchild holding the marker and
+    # exits immediately — before the fix that grandchild outlived run_bash by
+    # the full 30 seconds. (A plain `sh -c 'sleep 30 # marker'` is no good:
+    # the shell exec-optimizes the single command away and the marker
+    # vanishes from every cmdline, so pgrep has nothing to find.) The
+    # grandchild's output is redirected so it does NOT hold run_bash's pipes
+    # (a detached daemon/pty harness wouldn't either): otherwise
+    # communicate() would wait for the pipes to close and the normal-exit
+    # path would never fire while it lived.
+    marker = f"drcode-orphan-{os.getpid()}"
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            f'"{sys.executable}" -c "import time; time.sleep(30)  # {marker}"'
+            " >/dev/null 2>&1 &",
+        )
+    )
+    assert out.startswith("exit=0")
+    leftover = subprocess.run(
+        ["pgrep", "-f", marker], check=False, capture_output=True, text=True
+    )
+    assert leftover.returncode != 0  # no surviving grandchild
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX tty semantics")
 def test_run_bash_child_stdin_is_not_a_tty(project_root: Path) -> None:
     # The child's stdin is DEVNULL, never the inherited tty: an interactive

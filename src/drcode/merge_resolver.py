@@ -544,6 +544,15 @@ def compile_check(worktree: Path) -> CheckResult:
     )
 
 
+# The funnel judges the RESULT OF THE MERGE, not pre-existing lint debt in
+# service files: `.drcode/` is only partially gitignored (subpaths like
+# tasks/, worktrees/ — a user's `workflow.py` sits in the tree), and
+# `respect-gitignore` alone does not hide it. `--extend-exclude` keeps
+# ruff's default excludes AND hides drcode's own service dir (569b6a8a:
+# PLW1510 in .drcode/workflow.py rolled back a correct resolution).
+RUFF_CHECK_ARGS = ["-m", "ruff", "check", "--extend-exclude", ".drcode", "."]
+
+
 def ruff_check(worktree: Path) -> CheckResult:
     """The best-effort ruff check — MUST come from the project's own
     environment: a random PATH binary carries a different default
@@ -556,7 +565,7 @@ def ruff_check(worktree: Path) -> CheckResult:
     cmd, fix_path = plan
     return _run_checked(
         "ruff check",
-        [*cmd, "-m", "ruff", "check", "."],
+        [*cmd, *RUFF_CHECK_ARGS],
         worktree,
         # Same pinning as mechanical_checks: tools with their own
         # environment discovery must not land on a foreign interpreter.
@@ -635,7 +644,7 @@ def mechanical_checks(
         results.append(
             _run_checked(
                 "ruff check",
-                [*ruff_cmd, "-m", "ruff", "check", "."],
+                [*ruff_cmd, *RUFF_CHECK_ARGS],
                 worktree,
                 env=_worktree_pythonpath_env(worktree) if fix_path else None,
             )

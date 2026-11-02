@@ -22,6 +22,7 @@ from drcode import merge_engine as me
 from drcode import merge_resolver
 from drcode.conflict import (
     ConflictWorktree,
+    DiffStat,
     parse_hunks,
 )
 from drcode.merge_resolver import CheckResult
@@ -34,6 +35,8 @@ from drcode.tui.merge_screen import (
     CheckDetailsScreen,
     ConflictScreen,
     DiffStatItem,
+    _diffstat_row_text,
+    _elide_middle,
 )
 from tests.network_mocks import wait_until
 
@@ -911,10 +914,11 @@ def _numstat_rows(screen: ConflictScreen) -> dict[str, str]:
     has not mounted yet (skipped — the caller waits for full rows)."""
     rows: dict[str, str] = {}
     for item in screen.files_list.children:
-        if isinstance(item, DiffStatItem) and item.children:
-            label = item.children[0]
-            if isinstance(label, Label):
-                rows[item.path] = str(label.content)
+        if not (isinstance(item, DiffStatItem) and item.children):
+            continue
+        child = item.children[0]
+        if isinstance(child, Label):
+            rows[item.path] = str(child.content)
     return rows
 
 
@@ -1028,8 +1032,88 @@ async def test_ff_ready_screen_lists_numstat_rows(
         assert "bin" in rows["logo.bin"]
         summary = str(screen.files_summary.content)
         assert "3 files changed" in summary
-        assert "3 insertions(+)" in summary
-        assert "1 deletion(-)" in summary
+        assert "3 (+)" in summary
+        assert "1 (-)" in summary
+
+        # Every rendered row fits the list's width — counts INCLUDED
+        # (the regression this pins: eliding only to `width - padding`
+        # pushed `  +N −M` fully past the right edge for every elided
+        # row). Long paths are middle-elided, the counts stay visible.
+        (wt / "very").mkdir()
+        (wt / "very" / "deep").mkdir()
+        (wt / "very" / "deep" / "nested").mkdir()
+        long_name = "very/deep/nested/some_module_name_that_is_pretty_long_indeed.txt"
+        (wt / long_name).write_text("x\n")
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-qm", "long path")
+        await pilot.press("r")
+        await wait_until(
+            lambda: (
+                screen._busy is None
+                and not screen._preparing
+                and long_name in _numstat_rows(screen)
+            ),
+            pilot=pilot,
+            what="refreshed numstat list with the long path",
+        )
+        available = screen.files_list.size.width - 2  # ListItem padding 0 1
+        for item in screen.files_list.children:
+            if not (isinstance(item, DiffStatItem) and item.children):
+                continue
+            child = item.children[0]
+            if not isinstance(child, Static):
+                continue
+            rendered = Content.from_markup(str(child.content))
+            assert rendered.cell_length <= available, f"row clipped: {rendered.plain!r}"
+        long_row = _numstat_rows(screen)[long_name]
+        assert "…" in long_row  # the long path was actually elided
+        assert "+1" in long_row and "−0" in long_row  # counts survive
+
+
+def test_numstat_row_elides_long_path_middle() -> None:
+    """A long path in the numstat list is middle-elided so the WHOLE row
+    (path + separator + counts) fits the given cell budget: the counts
+    stay intact, the file name's END (what distinguishes look-alike
+    paths) stays visible."""
+    long = "src/drcode/very/deep/nested/directory/structure/module_impl.py"
+    max_row = 40
+    row = _diffstat_row_text(DiffStat(path=long, added=1044, deleted=330), max_row)
+    # The counts always fit and the visible tail is the file name.
+    assert "+1044" in row and "−330" in row
+    visible = Content.from_markup(row).plain
+    path_part = visible.split("  +")[0]
+    assert path_part.endswith("module_impl.py")
+    # The path is cut in the MIDDLE, not cropped at the end.
+    assert "…" in path_part
+    assert path_part.startswith("src")
+    # The whole visible row honors the budget (counts included — this
+    # is what keeps `+N −M` from being clipped off the pane).
+    assert Content.from_markup(row).cell_length <= max_row
+    # A wide counts block eats into the PATH budget, never overflows:
+    # 5-digit counts leave a 4-cell path minimum and the row still fits.
+    wide = _diffstat_row_text(DiffStat(path=long, added=12345, deleted=67890), 24)
+    assert "+12345" in wide and "−67890" in wide
+    assert Content.from_markup(wide).cell_length <= 24
+    # Short paths are shown verbatim.
+    assert (
+        _diffstat_row_text(DiffStat(path="fix.txt", added=1, deleted=0), 24)
+        == "fix.txt  [$success]+1[/] [$error]−0[/]"
+    )
+    # Binary rows keep the `bin` marker.
+    assert "bin" in _diffstat_row_text(
+        DiffStat(path="logo.bin", added=None, deleted=None), 24
+    )
+
+
+def test_elide_middle_bounds_and_edges() -> None:
+    """The elision helper honors the budget and degenerates safely for
+    tiny budgets / short inputs."""
+    assert _elide_middle("short.py", 30) == "short.py"
+    out = _elide_middle("x" * 100, 20)
+    assert len(out) <= 20
+    assert out.endswith("x" * 10)  # the tail half is kept
+    # A too-tiny budget leaves the text alone (no degenerate "…" rows).
+    assert _elide_middle("anything", 3) == "anything"
 
 
 async def test_numstat_long_path_elision_keeps_tail_and_counts(
@@ -1305,8 +1389,8 @@ async def test_staged_mode_shows_numstat_of_future_commit(
         assert "+2" in rows["app.py"] and "−3" in rows["app.py"]
         summary = str(screen.files_summary.content)
         assert "1 file changed" in summary
-        assert "2 insertions(+)" in summary
-        assert "3 deletions(-)" in summary
+        assert "2 (+)" in summary
+        assert "3 (-)" in summary
         # The merge stays uncommitted: the list is a preview, s still
         # the next step.
         assert me.in_progress(wt)
@@ -1327,7 +1411,7 @@ async def test_staged_mode_shows_numstat_of_future_commit(
             what="r re-read the staged numstat list",
         )
         summary = str(screen.files_summary.content)
-        assert "1 file changed" in summary and "2 insertions(+)" in summary
+        assert "1 file changed" in summary and "2 (+)" in summary
 
 
 # -- the title's merge description (commit subject / task-title fallback) --------
@@ -1358,8 +1442,9 @@ async def test_title_carries_commit_subject_when_ff_ready(
             what="ff-ready state reached",
         )
         assert screen._merge_desc == "fix app"
-        title = str(screen.query_one("#merge-title", Static).content)
-        assert "«fix app»" in title
+        # The commit subject lives on its own second line of the header.
+        desc = str(screen.query_one("#merge-desc", Static).content)
+        assert "«fix app»" in desc
 
 
 async def test_title_carries_commit_subject_on_conflict(
@@ -1393,8 +1478,8 @@ async def test_title_carries_commit_subject_on_conflict(
             what="conflict screen prepared",
         )
         assert screen._merge_desc == "task edit"
-        title = str(screen.query_one("#merge-title", Static).content)
-        assert "«task edit»" in title
+        desc = str(screen.query_one("#merge-desc", Static).content)
+        assert "«task edit»" in desc
 
 
 async def test_title_falls_back_to_task_title_without_branch(
@@ -1428,8 +1513,8 @@ async def test_title_falls_back_to_task_title_without_branch(
             what="screen prepared",
         )
         assert screen._merge_desc == "Fallback title"
-        title = str(screen.query_one("#merge-title", Static).content)
-        assert "«Fallback title»" in title
+        desc = str(screen.query_one("#merge-desc", Static).content)
+        assert "«Fallback title»" in desc
 
 
 async def test_conflicted_mode_keeps_ff_out_and_resolution_in(

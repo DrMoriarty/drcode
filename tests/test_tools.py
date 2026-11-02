@@ -1017,6 +1017,35 @@ def test_run_bash_timeout_kills_grandchildren(project_root: Path) -> None:
     assert leftover.returncode != 0  # no surviving grandchild
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_run_bash_normal_exit_kills_grandchildren(project_root: Path) -> None:
+    # NORMAL completion needs the same group sweep as timeout/cancel: a
+    # grandchild surviving the shell's exit reparents to init and lives on
+    # (incident 2026-11-02: 10 orphaned processes at ~80% CPU for hours).
+    # The outer shell backgrounds a python grandchild holding the marker and
+    # exits immediately — before the fix that grandchild outlived run_bash by
+    # the full 30 seconds. (A plain `sh -c 'sleep 30 # marker'` is no good:
+    # the shell exec-optimizes the single command away and the marker
+    # vanishes from every cmdline, so pgrep has nothing to find.) The
+    # grandchild's output is redirected so it does NOT hold run_bash's pipes
+    # (a detached daemon/pty harness wouldn't either): otherwise
+    # communicate() would wait for the pipes to close and the normal-exit
+    # path would never fire while it lived.
+    marker = f"drcode-orphan-{os.getpid()}"
+    out = asyncio.run(
+        run_bash(
+            project_root,
+            f'"{sys.executable}" -c "import time; time.sleep(30)  # {marker}"'
+            " >/dev/null 2>&1 &",
+        )
+    )
+    assert out.startswith("exit=0")
+    leftover = subprocess.run(
+        ["pgrep", "-f", marker], check=False, capture_output=True, text=True
+    )
+    assert leftover.returncode != 0  # no surviving grandchild
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX tty semantics")
 def test_run_bash_child_stdin_is_not_a_tty(project_root: Path) -> None:
     # The child's stdin is DEVNULL, never the inherited tty: an interactive
@@ -1149,5 +1178,42 @@ def test_remove_scratch_skips_live_foreign_owner(scratch_root: Path) -> None:
     finally:
         other.kill()
         other.wait()
+    tools.remove_scratch("abc12345")
+    assert not scratch.exists()
+
+
+def test_remove_scratch_kills_scratch_dwellers(scratch_root: Path) -> None:
+    # A process fully detached from run_bash's process group (own session,
+    # like a forkpty harness) but with its cwd inside the scratch must not
+    # survive the cleanup: deleting the directory alone leaves it running
+    # (incident 2026-11-02: ten orphaned ~80%-CPU processes).
+    scratch = scratch_root / "abc12345"
+    scratch.mkdir(parents=True)
+    (scratch / "pty_geom.log").write_text("x")
+    dweller = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        cwd=str(scratch),
+        start_new_session=True,
+    )
+    try:
+        assert dweller.poll() is None
+        tools.remove_scratch("abc12345")
+        assert not scratch.exists()
+        assert dweller.wait(timeout=15) != 0  # terminated by the echelon
+    finally:
+        if dweller.poll() is None:
+            dweller.kill()
+            dweller.wait()
+
+
+def test_remove_scratch_dweller_scan_is_best_effort(
+    scratch_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A broken/absent lsof must not break the removal: degrade to rmtree-only.
+    monkeypatch.setattr(
+        tools, "_scratch_dweller_pids", lambda scratch: (_ for _ in ()).throw(OSError)
+    )
+    scratch = scratch_root / "abc12345"
+    scratch.mkdir(parents=True)
     tools.remove_scratch("abc12345")
     assert not scratch.exists()

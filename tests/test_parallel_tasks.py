@@ -23,6 +23,7 @@ import asyncio
 import subprocess
 import time
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ import pytest
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from drcode import agent_model
-from drcode.models import Task, TaskStatus
+from drcode.models import Task, TaskKind, TaskStatus
 from drcode.settings import (
     EscAbort,
     ProjectSettings,
@@ -617,6 +618,28 @@ async def test_promoted_while_testing_task_in_retry_backoff(
         assert c.status is TaskStatus.ACTIVE
         assert a.status is TaskStatus.TESTING
         assert not app.tester_running, "the tester must not start for a backoff task"
+
+
+async def test_next_testing_prefers_bugs(parallel_app: DrCodeApp) -> None:
+    """When tasks of different kinds wait for the tester, a bug task is
+    picked first regardless of creation order (within a kind — the
+    oldest first, the historical rule)."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        f_old = app.manager.create("feature old", "do f", kind=TaskKind.FEATURE)
+        f_new = app.manager.create("feature new", "do f2", kind=TaskKind.FEATURE)
+        bug = app.manager.create("bug", "fix b", kind=TaskKind.BUG)
+        # Make the creation order explicit (timestamps may share a tick).
+        f_old.created_at -= timedelta(seconds=20)
+        f_new.created_at -= timedelta(seconds=10)
+        for t in (f_old, f_new, bug):
+            _to_testing(app, t)
+        assert app._next_testing() is bug
+        # A bug stuck in retry backoff does not block the tester: the
+        # oldest ready feature is picked.
+        app._tester_retry_at[bug.id] = time.monotonic() + 3600
+        assert app._next_testing() is f_old
 
 
 async def test_ready_testing_still_blocks_promotion(parallel_app: DrCodeApp) -> None:

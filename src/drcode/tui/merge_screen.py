@@ -177,8 +177,10 @@ def _elide_middle(path: str, max_cells: int) -> str:
     """Middle-elide a path to at most ``max_cells`` cells: a head prefix
     and the file-name tail (the last ``/`` component, or its END when
     even that alone is too long — the extension survives) joined by
-    "…". Paths that already fit pass through unchanged."""
-    if max_cells <= 0 or cell_len(path) <= max_cells:
+    "…". Paths that already fit pass through unchanged. A budget below
+    4 cells also leaves the path untouched — a degenerate elision would
+    show less than a plain crop."""
+    if max_cells < 4 or cell_len(path) <= max_cells:
         return path
     ell = "…"
     keep = max_cells - cell_len(ell)
@@ -562,10 +564,36 @@ class FileItem(ListItem):
         self.path = state.path
 
 
+def _diffstat_row_text(stat: DiffStat, max_row: int | None) -> str:
+    """The rendered row text of a numstat list item: the (middle-elided)
+    path, two spaces and the `+42 −7` counts (a binary file shows
+    `bin`). `max_row` is the whole row's cell budget (path + separator +
+    counts TOGETHER): the counts are always rendered in full — eliding
+    THEM would defeat the row's purpose — so the path gets whatever
+    cells remain after its own counts block; a long path can therefore
+    never push the counts off the pane. Pure string work —
+    unit-testable without an app."""
+    if stat.binary:
+        counts, plain = "[dim]bin[/]", "bin"
+    else:
+        counts = f"[$success]+{stat.added}[/] [$error]−{stat.deleted}[/]"
+        plain = f"+{stat.added} −{stat.deleted}"
+    path = stat.path
+    if max_row is not None:
+        budget = max(max_row - len(plain) - 2, 4)
+        path = _elide_middle(path, budget)
+    # escape: the path is arbitrary repo content — literal [brackets]
+    # in it must never trip the markup.
+    return f"{escape(path)}  {counts}"
+
+
 class DiffStatItem(ListItem):
     """One row of the numstat file list (ff-ready / staged modes):
     `path  +42 −7`, additions green, deletions red; a binary file shows
-    `bin`. Carries the path for the selection handler — clicking a row
+    `bin`. `max_path` bounds the path's OWN cell width — the counts are
+    always rendered in full (eliding them would defeat the row's
+    purpose), the path is middle-elided (the file name's tail kept) to
+    fit. Carries the path for the selection handler — clicking a row
     loads the file's worktree content into the viewer (the worktree
     holds the branch/resolved state in both diff modes)."""
 
@@ -635,6 +663,14 @@ class ConflictScreen(ModalScreen[None]):
         padding: 0 1;
         color: $text;
         text-style: bold;
+    }
+    #merge-desc {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    #merge-desc.hidden {
+        display: none;
     }
     #merge-body { height: 1fr; }
     #merge-files-pane {
@@ -764,8 +800,14 @@ class ConflictScreen(ModalScreen[None]):
         with Vertical(id="merge-dialog"):
             # markup=False: the title embeds a commit subject (and git
             # notes/messages) that may carry literal [brackets] — they
-            # must never trip Rich markup.
+            # must never trip Rich markup. The commit subject lives on
+            # its OWN second line (#merge-desc, hidden until a
+            # description is known): on the status line it competed for
+            # the width with the state text ("… already contains main —
+            # nothing to resolve; press f …") and only its first few
+            # words survived the clipping.
             yield Static("Merge conflicts", id="merge-title", markup=False)
+            yield Static("", id="merge-desc", markup=False)
             with Horizontal(id="merge-body"):
                 with Vertical(id="merge-files-pane"):
                     # The git-style "N files changed, ..." summary of the
@@ -1018,24 +1060,29 @@ class ConflictScreen(ModalScreen[None]):
         await self._reload_files()
         self._hide_prepare()
 
-    def _titled(self, text: str) -> str:
-        """`text` with the merge description (`_merge_desc`) appended —
-        the single place every title passes through, so the description
-        survives all the rewrites of `_prepare`'s final states (isolation
-        off, note, !report.ok, ff-ready, not-committed, conflicted) and
-        of the later commit/ff outcomes."""
-        if self._merge_desc:
-            return f"{text} — «{self._merge_desc}»"
-        return text
-
     def _set_title(self, text: str) -> None:
-        # A worker may reach this after the user already closed the
-        # screen (ESC mid-prepare) — an unmounted screen is a no-op.
+        """Rewrite the status line of the two-line header; the merge
+        description (`_merge_desc`) rides on the SEPARATE second line
+        below it — its own full width, so the commit subject survives
+        all the rewrites of `_prepare`'s final states (isolation off,
+        note, !report.ok, ff-ready, not-committed, conflicted) and of
+        the later commit/ff outcomes. Hidden while no description is
+        known (or the screen is mid-teardown — an unmounted screen is a
+        no-op; a worker may reach this after the user already closed it
+        with ESC mid-prepare)."""
         if not self.is_mounted:
             return
         title = self._static("#merge-title")
         if title is not None:
-            title.update(self._titled(text))
+            title.update(text)
+        desc = self._static("#merge-desc")
+        if desc is not None:
+            if self._merge_desc:
+                desc.update(f"«{self._merge_desc}»")
+                desc.remove_class("hidden")
+            else:
+                desc.update("")
+                desc.add_class("hidden")
 
     def _fetch_merge_desc(self) -> str | None:
         """What the merge carries, by descending preference: the subject
@@ -1421,8 +1468,7 @@ class ConflictScreen(ModalScreen[None]):
         dels = sum(s.deleted or 0 for s in stats)
         return (
             f"{files} file{'s' if files != 1 else ''} changed, "
-            f"[$success]{ins} insertion{'s' if ins != 1 else ''}(+)[/], "
-            f"[$error]{dels} deletion{'s' if dels != 1 else ''}(-)[/]"
+            f"[$success]{ins} (+)[/], [$error]{dels} (-)[/]"
         )
 
     def _diffstat_max_path(self, stats: list[DiffStat]) -> int | None:

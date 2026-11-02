@@ -307,8 +307,29 @@ def test_mechanical_checks_ruff_from_worktree_venv(
     # random PATH binary with a different default ruleset. (pyright may
     # follow it in the log — it resolves through the same env.)
     assert ["-c", "import ruff"] == lines[:2]
-    windows = [lines[i : i + 4] for i in range(len(lines) - 3)]
-    assert ["-m", "ruff", "check", "."] in windows
+    n = len(mr.RUFF_CHECK_ARGS)
+    windows = [lines[i : i + n] for i in range(len(lines) - n + 1)]
+    assert mr.RUFF_CHECK_ARGS in windows
+
+
+def test_ruff_check_ignores_drcode_service_files(repo: Path) -> None:
+    # The 569b6a8a class: a pre-existing lint violation in the user's
+    # .drcode/workflow.py (only SUBPATHS of .drcode/ are gitignored, so
+    # ruff's respect-gitignore does not hide the file) rolled back a
+    # correct resolution. The funnel's ruff run excludes .drcode — it
+    # judges the merge result, not service-file lint debt. A violation in
+    # a real project file must still fail (proves ruff actually ran).
+    (repo / ".drcode").mkdir()
+    (repo / ".drcode" / "workflow.py").write_text(
+        "import subprocess\n\n"
+        "proc = subprocess.run(['git', 'status'], capture_output=True)\n"
+    )
+    (repo / "app.py").write_text("value = 1\n")  # lint-clean project file
+    result = mr.ruff_check(repo)
+    assert result.ok and not result.skipped
+    (repo / "app.py").write_text("import os\n")  # F401 — must still be caught
+    result = mr.ruff_check(repo)
+    assert not result.ok
 
 
 def test_mechanical_checks_skips_ruff_when_project_env_lacks_it(

@@ -217,6 +217,7 @@ class SettingsPalette(CommandPalette):
         "Screenshot",
         "Theme",
         "Find task…",
+        "Statistics…",
         "Create goal…",
         "New goal",
         "Update/create AGENTS.md",
@@ -356,6 +357,13 @@ class ServiceCommandsProvider(CommandListProvider):
                 "Search the task archive by keywords — title, prompt, "
                 "edited files, the agent's final summary (the same "
                 "dialog as Ctrl+F)",
+            ),
+            CommandEntry(
+                "Statistics…",
+                app.action_task_statistics,
+                "Project statistics: created/completed/cancelled/failed "
+                "per day and the average dev/testing/resolver time "
+                "(the same dialog as Ctrl+G)",
             ),
             CommandEntry(
                 "Update/create AGENTS.md",

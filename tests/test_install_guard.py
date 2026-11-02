@@ -70,6 +70,7 @@ def git_root(project_root: Path) -> Path:
     (project_root / ".gitignore").write_text(
         ".drcode/tasks/\n.drcode/settings.json\n.drcode/github_state.json\n"
         ".drcode/worktrees/\n.drcode/merge_reports/\n.drcode/pending_notifications.json\n"
+        ".drcode/stats.json\n"
     )
     (project_root / "README.md").write_text("hello")
     _git(project_root, "add", "-A")

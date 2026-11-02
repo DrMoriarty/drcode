@@ -30,6 +30,7 @@ GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/github_state.json",
     ".drcode/worktrees/",
     ".drcode/merge_reports/",
+    ".drcode/stats.json",
 )
 
 # Spellings of the legacy whole-directory entry older drcode versions

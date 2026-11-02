@@ -149,6 +149,7 @@ class PipelineResolverLayer(DrCodeState):
         resolver agent, then the mandatory verification funnel."""
         self._resolver_running = True
         self._resolver_task_id = task_id
+        self.refresh_sidebar()
         self._resolver_generation += 1
         run_key: tuple[str, str, int] = (
             "resolver",

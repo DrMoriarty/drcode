@@ -344,7 +344,12 @@ class SidebarLayer(DrCodeState):
     def _task_row_text(self, t: Task) -> str:
         """Rendered label of a task row (the incremental refresh compares
         it against the mounted row to skip unchanged labels)."""
-        if t.status.value == "completed":
+        # The automatic conflict resolver is working on this task right
+        # now — its ⚙️ replaces the regular marker (the resolver is
+        # single, so the symbol is never ambiguous).
+        if self._resolver_running and self._resolver_task_id == t.id:
+            marker = "⚙️"
+        elif t.status.value == "completed":
             # The ✓ color tracks the mergedness of the task's
             # `drcode/<id>` branch (refreshed by the 10 s git poll):
             # orange while the work sits unmerged, green once merged,

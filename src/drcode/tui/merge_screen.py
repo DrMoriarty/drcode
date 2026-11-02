@@ -297,6 +297,13 @@ class ConflictView(ScrollView, can_focus=True):
         self._hunks: list[Hunk] = []
         self.cursor: int = -1
 
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            # CHOPS misses the viewport's last line in its dirty regions
+            # during wheel-event scrolling — a full refresh repaints it.
+            self.refresh()
+
     # -- content -----------------------------------------------------------------
 
     def set_file(self, text: str, hunks: list[Hunk]) -> None:
@@ -416,6 +423,12 @@ class CheckOutputView(ScrollView, can_focus=True):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lines: list[str] = []
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            # Same CHOPS last-line workaround as ConflictView above.
+            self.refresh()
 
     def set_output(self, text: str) -> None:
         """Replace the shown output and scroll back to the top-left."""

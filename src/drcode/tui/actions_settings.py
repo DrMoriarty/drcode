@@ -90,6 +90,14 @@ class SettingsLayer(DrCodeState):
 
         self.push_screen(SearchDialog(self.manager.storage.root))
 
+    def action_open_usage_dialog(self) -> None:
+        """Open the user-level token-usage dialog (Settings →
+        "Token usage…"): the persistent per-day, per-model statistics
+        collected by the pipeline's single usage hook."""
+        from .usage_dialog import UsageDialog
+
+        self.push_screen(UsageDialog())
+
     def action_settings(self) -> None:
         """Open the Settings modal (the command palette, Ctrl+S)."""
         if isinstance(self.screen, CommandPalette):

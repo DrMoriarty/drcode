@@ -29,6 +29,7 @@ from drcode.providers import (
     project_has_model_selection,
     resolve,
     resolve_effective,
+    resolve_model_key,
     set_project_custom_active,
     set_project_custom_model,
     set_project_model,
@@ -413,6 +414,79 @@ def test_resolve_effective_research_uses_own_selection(
     assert resolved.model == "research-m"
     assert resolved.base_url == "http://research/v1"
     assert resolved.max_context_tokens == 400_000
+
+
+# -- resolve_model_key (usage-accounting keys) ---------------------------------------
+
+
+def test_model_key_catalog_slot_and_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """Catalog selections produce the "<provider>/<model-id>" reference
+    format — for both the project slot and the user-level default."""
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    catalog.defaults[AgentRole.TESTER] = ModelRef(provider="local-swap", model="small")
+    UserModelsStore().save(catalog)
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.CODING) == "local-swap/qwen3-coder-30b"
+    assert resolve_model_key(config, AgentRole.TESTER) == "local-swap/small"
+
+
+def test_model_key_custom_slot_and_env_have_no_provider(
+    project_root: Path, catalog: UserModelsConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Custom models and the DRCODE_* env override carry no provider
+    name: the key is the bare model id."""
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(model="custom-m", base_url="http://custom/v1"),
+    )
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.TESTER) == "custom-m"
+    monkeypatch.setenv("DRCODE_MODEL", "env-model")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://env/v1")
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.CODING) == "env-model"
+
+
+def test_model_key_dangling_ref_falls_through(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """A dangling project reference falls through to the user default —
+    exactly like `_resolve_connection` does for the connection itself."""
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="gone", model="x")
+    )
+    catalog.defaults[AgentRole.TESTER] = ModelRef(provider="cloud", model="cloud-m")
+    UserModelsStore().save(catalog)
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.TESTER) == "cloud/cloud-m"
+
+
+def test_model_key_research_falls_back_to_coding(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The research/resolver fallback of `resolve_effective` applies to
+    the key too: unset roles inherit the coding role's key."""
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.RESEARCH) == (
+        "local-swap/qwen3-coder-30b"
+    )
+
+
+def test_model_key_nothing_selected_is_empty(project_root: Path) -> None:
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.CODING) == ""
 
 
 def test_resolve_effective_research_fallback_tracks_coding_changes(
@@ -1111,9 +1185,7 @@ def test_save_under_agent_with_explicit_path_writes(
 ) -> None:
     monkeypatch.setenv("DRCODE_TASK_ID", "t1")
     target = tmp_path / "models.json"
-    catalog = UserModelsConfig(
-        providers=[Provider(name="p", base_url="http://x/v1")]
-    )
+    catalog = UserModelsConfig(providers=[Provider(name="p", base_url="http://x/v1")])
     written = UserModelsStore(path=target).save(catalog)
     assert written == target
     assert UserModelsStore(path=target).load() == catalog
@@ -1121,9 +1193,7 @@ def test_save_under_agent_with_explicit_path_writes(
 
 def test_save_without_agent_marker_unchanged(user_config_dir: Path) -> None:
     # No DRCODE_TASK_ID (conftest strips it): implicit path behaves as before.
-    catalog = UserModelsConfig(
-        providers=[Provider(name="p", base_url="http://x/v1")]
-    )
+    catalog = UserModelsConfig(providers=[Provider(name="p", base_url="http://x/v1")])
     UserModelsStore().save(catalog)
     assert UserModelsStore().load() == catalog
 

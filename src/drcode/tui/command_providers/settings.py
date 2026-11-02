@@ -217,6 +217,7 @@ class SettingsPalette(CommandPalette):
         "Screenshot",
         "Theme",
         "Find task…",
+        "Token usage…",
         "Create goal…",
         "New goal",
         "Update/create AGENTS.md",
@@ -356,6 +357,13 @@ class ServiceCommandsProvider(CommandListProvider):
                 "Search the task archive by keywords — title, prompt, "
                 "edited files, the agent's final summary (the same "
                 "dialog as Ctrl+F)",
+            ),
+            CommandEntry(
+                "Token usage…",
+                app.action_open_usage_dialog,
+                "Per-day, per-model token statistics of every model call "
+                "(input / output / cache breakdown, request counts) — "
+                "accumulated in ~/.config/drcode/usage.json",
             ),
             CommandEntry(
                 "Update/create AGENTS.md",

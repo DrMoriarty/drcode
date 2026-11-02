@@ -146,18 +146,24 @@ class PipelineCoreLayer(DrCodeState):
         has expired. Tasks whose tester run failed recently are skipped
         until their scheduled retry time. A TESTING task the tester already
         PASSED is not "testing" — it awaits the external review verdict
-        (see _next_review) and is never re-tested."""
+        (see _next_review) and is never re-tested. Bug reports have
+        priority: when several tasks of different kinds are waiting for
+        the tester, bug tasks are picked before everything else (within
+        each kind — oldest first)."""
         now = time.monotonic()
-        return next(
-            (
-                t
-                for t in self.manager.all_tasks()
-                if t.status is TaskStatus.TESTING
-                and t.verification is not VerificationStatus.PASSED
-                and self._tester_retry_at.get(t.id, 0.0) <= now
-            ),
-            None,
+        candidates = [
+            t
+            for t in self.manager.all_tasks()
+            if t.status is TaskStatus.TESTING
+            and t.verification is not VerificationStatus.PASSED
+            and self._tester_retry_at.get(t.id, 0.0) <= now
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda t: (t.kind is not TaskKind.BUG, t.created_at)
         )
+        return candidates[0]
 
     def _schedule_pipeline_timer(
         self, delay: float, callback: Callable[[], Any]

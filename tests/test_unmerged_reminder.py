@@ -11,6 +11,7 @@ fixes."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from drcode import merge_engine
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.settings import (
     ProjectSettings,
@@ -847,6 +849,82 @@ async def test_sidebar_row_marker_follows_merge_state(app_env: DrCodeApp) -> Non
         plain = app._task_row_text(task)
         assert "✓" in plain
         assert "[orange]" not in plain and "[green]✓" not in plain
+        await pilot.pause()
+
+
+# -- stale triage-report sweep (the footer's Merge… entry) ---------------------------
+
+
+def _write_report(project_root: Path, task_id: str) -> Path:
+    path = project_root / ".drcode" / "merge_reports" / f"{task_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"task_id": task_id, "files": []}), encoding="utf-8")
+    return path
+
+
+def _park_conflict(app: DrCodeApp, task_id: str) -> None:
+    """A real parked conflict: diverging edits on the same file, then the
+    engine's reversed merge with the report persisted (merge in progress
+    in the task's worktree)."""
+    wt, _ = app.task_env.ensure_root(task_id)
+    base = app.task_env.base_branch()
+    (wt / "README.md").write_text("task side\n")
+    _git(wt, "commit", "-qam", f"task edit {task_id}")
+    (app.project_root / "README.md").write_text("main side\n")
+    _git(app.project_root, "commit", "-qam", f"main edit {task_id}")
+    report = merge_engine.merge_base_into_worktree(
+        app.project_root, task_id, wt, base, save=True
+    )
+    assert report.ok and report.conflicted
+
+
+async def test_stale_merge_report_purged_but_live_ones_kept(
+    app_env: DrCodeApp,
+) -> None:
+    """The sweep inside _unmerged_completed_ids: a report whose conflict
+    is gone (no branch, task not needs_human) is deleted — a leftover
+    used to keep the footer's Merge… entry and the header's ✋ marker
+    alive forever. A report stays while it still vouches for something:
+    the task needs a human, or a merge is parked in the worktree."""
+    app = app_env
+    merged = finished_task(app)
+    stale = _write_report(app.project_root, merged.id)
+    orphan = _write_report(app.project_root, "deadbeef")
+    human = finished_task(app)
+    human.needs_human = True
+    app.manager.storage.save(human)
+    kept_human = _write_report(app.project_root, human.id)
+    parked = app.manager.create("Active task", "active")
+    _park_conflict(app, parked.id)
+    kept_parked = _write_report(app.project_root, parked.id)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._unmerged_completed_ids()
+        # The stale report (task exists, branch "none") and the orphan
+        # (task long deleted) are gone; the live ones survive.
+        assert not stale.exists()
+        assert not orphan.exists()
+        assert kept_human.is_file()
+        assert kept_parked.is_file()
+        await pilot.pause()
+
+
+async def test_concluded_conflict_hides_footer_merge_entry(
+    app_env: DrCodeApp,
+) -> None:
+    """The exact reported bug: with a stale report left behind and no
+    unmerged branch anywhere, check_action "open_merge" kept the
+    footer's Merge… item visible. After the sweep the state is KNOWN
+    empty (_merge_poll_done) and the entry disappears."""
+    app = app_env
+    task = finished_task(app)
+    _write_report(app.project_root, task.id)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._unmerged_completed_ids()
+        assert app._merge_poll_done
+        assert app.check_action("open_merge", ()) is False
         await pilot.pause()
 
 

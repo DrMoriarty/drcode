@@ -1774,6 +1774,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             )
         if action == "submit_new_task_hold":
             return self._new_task_mode and self._editing_task_id is None
+        if action == "submit_new_task_draft":
+            # Fresh creation only — the edit modes have no draft semantics
+            # (a held task stays held; a finished draft is left via ESC).
+            return self._new_task_mode and self._editing_task_id is None
         if action == "save_task_edit_hold":
             return self._new_task_mode and self._editing_task_id is not None
         if action == "hold_task":

@@ -114,6 +114,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from rich.cells import cell_len
 from rich.markup import escape
 from rich.segment import Segment
 from rich.style import Style
@@ -170,6 +171,28 @@ def _fmt_seconds(seconds: float | None) -> str:
         return f"{minutes}m{secs:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
+
+
+def _elide_middle(path: str, max_cells: int) -> str:
+    """Middle-elide a path to at most ``max_cells`` cells: a head prefix
+    and the file-name tail (the last ``/`` component, or its END when
+    even that alone is too long — the extension survives) joined by
+    "…". Paths that already fit pass through unchanged."""
+    if max_cells <= 0 or cell_len(path) <= max_cells:
+        return path
+    ell = "…"
+    keep = max_cells - cell_len(ell)
+    if keep <= 0:
+        return ell
+    head, _sep, tail = path.rpartition("/")
+    if tail and cell_len(tail) <= keep:
+        # The name fits whole: fill the rest of the budget with head.
+        head_budget = keep - cell_len(tail)
+        while head and cell_len(head) > head_budget:
+            head = head[:-1]
+        return f"{head}{ell}{tail}" if head else f"{ell}{tail}"
+    # The file name itself does not fit: keep its end.
+    return f"{ell}{tail[-keep:]}" if tail else f"{ell}{path[-keep:]}"
 
 
 @dataclass
@@ -297,6 +320,13 @@ class ConflictView(ScrollView, can_focus=True):
         self._hunks: list[Hunk] = []
         self.cursor: int = -1
 
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            # CHOPS misses the viewport's last line in its dirty regions
+            # during wheel-event scrolling — a full refresh repaints it.
+            self.refresh()
+
     # -- content -----------------------------------------------------------------
 
     def set_file(self, text: str, hunks: list[Hunk]) -> None:
@@ -417,6 +447,12 @@ class CheckOutputView(ScrollView, can_focus=True):
         super().__init__(**kwargs)
         self._lines: list[str] = []
 
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            # Same CHOPS last-line workaround as ConflictView above.
+            self.refresh()
+
     def set_output(self, text: str) -> None:
         """Replace the shown output and scroll back to the top-left."""
         self._lines = text.split("\n") if text else ["(no output)"]
@@ -533,14 +569,17 @@ class DiffStatItem(ListItem):
     loads the file's worktree content into the viewer (the worktree
     holds the branch/resolved state in both diff modes)."""
 
-    def __init__(self, stat: DiffStat) -> None:
+    def __init__(self, stat: DiffStat, max_path: int | None = None) -> None:
         if stat.binary:
             counts = "[dim]bin[/]"
         else:
             counts = f"[$success]+{stat.added}[/] [$error]−{stat.deleted}[/]"
+        # Middle-elide to the caller's budget so the count block stays
+        # inside the label even for deep paths; None = no budget known.
+        shown = stat.path if max_path is None else _elide_middle(stat.path, max_path)
         # escape: the path is arbitrary repo content — literal [brackets]
         # in it must never trip the markup.
-        super().__init__(Label(f"{escape(stat.path)}  {counts}"))
+        super().__init__(Label(f"{escape(shown)}  {counts}"))
         self.path = stat.path
 
 
@@ -1386,6 +1425,26 @@ class ConflictScreen(ModalScreen[None]):
             f"[$error]{dels} deletion{'s' if dels != 1 else ''}(-)[/]"
         )
 
+    def _diffstat_max_path(self, stats: list[DiffStat]) -> int | None:
+        """The path budget for the numstat rows: the label content area
+        (files_list width − the ListItem's "0 1" padding) minus the
+        two-cell gap and the widest count block of the current rows —
+        so `path  +N −M` always fits and the counts stay visible even
+        on a middle-elided deep path. None before the first layout (no
+        width known yet — no elision possible)."""
+        widest = 0
+        for s in stats:
+            block = (
+                cell_len("bin")
+                if s.binary
+                else cell_len(f"+{s.added}") + 1 + cell_len(f"−{s.deleted}")
+            )
+            widest = max(widest, block)
+        width = self.files_list.size.width
+        if width <= 0:
+            return None
+        return max(width - 4 - widest, 1)
+
     async def _show_diff_stats(self, stats: list[DiffStat]) -> None:
         """Fill the file list with the numstat rows (ff-ready / staged
         modes) and the git-style summary line above them. The list was
@@ -1395,7 +1454,10 @@ class ConflictScreen(ModalScreen[None]):
         try:
             self.files_list.clear()
             if stats:
-                self.files_list.extend(DiffStatItem(s) for s in stats)
+                max_path = self._diffstat_max_path(stats)
+                self.files_list.extend(
+                    DiffStatItem(s, max_path=max_path) for s in stats
+                )
                 self.files_list.index = 0
             self.files_summary.update(self._stat_summary(stats) if stats else "")
         except NoMatches:

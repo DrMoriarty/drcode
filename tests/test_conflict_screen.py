@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
+from textual.content import Content
 from textual.widgets import Label, Static
 
 from drcode import merge_engine as me
@@ -1028,6 +1030,72 @@ async def test_ff_ready_screen_lists_numstat_rows(
         assert "3 files changed" in summary
         assert "3 insertions(+)" in summary
         assert "1 deletion(-)" in summary
+
+
+async def test_numstat_long_path_elision_keeps_tail_and_counts(
+    isolated: Path, configured_env: None
+) -> None:
+    """A deep path wider than the file pane is middle-elided so BOTH the
+    file-name tail and the +/− counts stay visible: the full row's cell
+    width (markup stripped) never exceeds the label content area — the
+    count block must not be pushed past the right edge and clipped."""
+    manager = TaskManager(isolated)
+    _git(isolated, "add", "-A")
+    _git(isolated, "commit", "-qm", "gitignore")
+    long_rel = (
+        Path("very") / "deep" / "nested" / "directory" / "structure"
+        / "_is_pretty_long.txt"
+    )
+    (isolated / long_rel).parent.mkdir(parents=True)
+    (isolated / long_rel).write_text("old\n" * 1044)
+    _git(isolated, "add", "-A")
+    _git(isolated, "commit", "-qm", "long file")
+    task = manager.create("Fix app", "fix the app")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.touch()
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    wt, _note = env.ensure_root(task.id)
+    (wt / "fix.txt").write_text("fixed\n")
+    (wt / long_rel).write_text("".join(f"new {i}\n" for i in range(330)))
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "rewrite long file")
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: (
+                screen.wt is not None
+                and screen._ff_ready
+                and set(_numstat_rows(screen)) == {str(long_rel), "fix.txt"}
+            ),
+            pilot=pilot,
+            what="ff-ready numstat list filled",
+        )
+        rows = _numstat_rows(screen)
+        long_row = rows[str(long_rel)]
+        # The counts and the file-name tail survive the elision.
+        assert "+330" in long_row
+        assert "−1044" in long_row
+        assert "is_pretty_long.txt" in long_row
+        # Every row fits the label content area (ListItem padding "0 1").
+        content_width = screen.files_list.size.width - 2
+        for row in rows.values():
+            assert cell_len(Content.from_markup(row).plain) <= content_width
 
 
 async def test_ff_ready_r_refresh_rereads_numstat(

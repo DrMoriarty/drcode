@@ -105,6 +105,18 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.keep_awake = src.keep_awake
 
 
+class DialogScroll(VerticalScroll):
+    """Dialog scroll area: on a line-granular scroll change a full
+    refresh — the CHOPS renderer misses the viewport's last line in its
+    dirty regions during wheel-event scrolling (same workaround as
+    ConflictView/CheckOutputView in merge_screen)."""
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            self.refresh()
+
+
 class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     """Modal form: preset radio row, three sections of field widgets,
     live hints, Apply / ESC-to-cancel. Returns the accepted draft (the
@@ -265,7 +277,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         matched = workflow_preset_for(d)
         with Vertical(id="ts-dialog"):
             yield Static("Task settings", id="ts-title")
-            with VerticalScroll(id="ts-body"):
+            with DialogScroll(id="ts-body"):
                 yield Label("Workflow preset", classes="ts-section")
                 with RadioSet(id="ts-preset"):
                     for preset in WORKFLOW_PRESETS:

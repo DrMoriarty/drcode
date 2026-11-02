@@ -31,6 +31,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -934,12 +935,90 @@ def _foreign_live_owner(scratch: Path) -> bool:
     return pid != os.getpid() and _pid_alive(pid)
 
 
+# Seconds between the SIGTERM and the SIGKILL for processes found living in
+# a scratch directory: enough for a well-behaved TUI/server to shut down.
+_SCRATCH_KILL_GRACE = 2.0
+# Hard cap on the lsof scan itself: scratch trees are small, but a stray
+# mount/symlink fan-out must not stall the cleanup (it runs on the UI thread
+# via _remove_scratch_background's thread, still — keep it bounded).
+_LSOF_TIMEOUT = 15.0
+
+
+def _scratch_dweller_pids(scratch: Path) -> set[int]:
+    """PIDs of THIS user's processes whose cwd or an open file lies under
+    `scratch` (recursive lsof scan, best-effort).
+
+    A missing/broken/timed-out lsof yields an empty set — the removal then
+    proceeds rmtree-only, exactly as before this echelon existed. Processes
+    of other users are filtered out even if lsof ever reports them (only
+    root's lsof could): a path coincidence inside /tmp/drcode is ownership
+    proof for the task, never a licence to kill someone else's process.
+    """
+    if os.name != "posix":
+        return set()
+    try:
+        proc = subprocess.run(
+            ["lsof", "-t", "-w", "+D", str(scratch)],
+            check=False,
+            capture_output=True,
+            timeout=_LSOF_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids: set[int] = set()
+    for token in proc.stdout.decode(errors="replace").split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            continue  # already gone / foreign process — not ours to signal
+        pids.add(pid)
+    pids.discard(os.getpid())
+    return pids
+
+
+def _kill_scratch_dwellers(scratch: Path) -> None:
+    """SIGTERM → short wait → SIGKILL the processes living in `scratch`.
+
+    The only defense against processes that fully detached from run_bash's
+    process group (forkpty/setsid) — killpg cannot reach them, but their cwd
+    or open files still sit in the directory being removed.
+    """
+    try:
+        pids = _scratch_dweller_pids(scratch)
+    except OSError:
+        return  # scan failed entirely — degrade to rmtree-only
+    if not pids:
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    deadline = time.monotonic() + _SCRATCH_KILL_GRACE
+    while time.monotonic() < deadline and any(_pid_alive(p) for p in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def remove_scratch(task_id: str) -> None:
     """Best-effort removal of a task's scratch directory.
 
     Called when the task reaches COMPLETED or is deleted. It is NOT called
     on an interrupted/re-queued task: the next activation resumes the work
     and may still need the scratch files from the interrupted attempt.
+
+    Processes the agent left running from inside the scratch (pty harnesses,
+    TUIs, servers) are terminated first — deleting a directory does not
+    stop the processes whose cwd or open files live in it (incident
+    2026-11-02: ten orphaned ~80%-CPU processes survived the rmtree).
 
     A directory owned by another live drcode process is left alone: task
     ids are per-project, so another instance's active task may share this
@@ -949,6 +1028,7 @@ def remove_scratch(task_id: str) -> None:
     scratch = scratch_dir(task_id)
     if _foreign_live_owner(scratch):
         return
+    _kill_scratch_dwellers(scratch)
     shutil.rmtree(scratch, ignore_errors=True)
 
 

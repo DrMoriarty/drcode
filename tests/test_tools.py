@@ -1180,3 +1180,40 @@ def test_remove_scratch_skips_live_foreign_owner(scratch_root: Path) -> None:
         other.wait()
     tools.remove_scratch("abc12345")
     assert not scratch.exists()
+
+
+def test_remove_scratch_kills_scratch_dwellers(scratch_root: Path) -> None:
+    # A process fully detached from run_bash's process group (own session,
+    # like a forkpty harness) but with its cwd inside the scratch must not
+    # survive the cleanup: deleting the directory alone leaves it running
+    # (incident 2026-11-02: ten orphaned ~80%-CPU processes).
+    scratch = scratch_root / "abc12345"
+    scratch.mkdir(parents=True)
+    (scratch / "pty_geom.log").write_text("x")
+    dweller = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        cwd=str(scratch),
+        start_new_session=True,
+    )
+    try:
+        assert dweller.poll() is None
+        tools.remove_scratch("abc12345")
+        assert not scratch.exists()
+        assert dweller.wait(timeout=15) != 0  # terminated by the echelon
+    finally:
+        if dweller.poll() is None:
+            dweller.kill()
+            dweller.wait()
+
+
+def test_remove_scratch_dweller_scan_is_best_effort(
+    scratch_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A broken/absent lsof must not break the removal: degrade to rmtree-only.
+    monkeypatch.setattr(
+        tools, "_scratch_dweller_pids", lambda scratch: (_ for _ in ()).throw(OSError)
+    )
+    scratch = scratch_root / "abc12345"
+    scratch.mkdir(parents=True)
+    tools.remove_scratch("abc12345")
+    assert not scratch.exists()

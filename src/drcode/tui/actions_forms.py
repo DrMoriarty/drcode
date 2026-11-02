@@ -190,6 +190,9 @@ class TaskFormLayer(DrCodeState):
         """Note + hint line of the new-task form, per mode: fresh creation,
         editing a held task or finishing an agent-created draft (the same
         editor, different wording)."""
+        # The chat hint belongs to the (hidden) chat editor below — it must
+        # not float above the form.
+        self.query_one("#chat-hint", Static).add_class("hidden")
         note = self.query_one("#nt-note", Static)
         hint = self.query_one("#nt-hint", Static)
         # Push-to-talk is bound in the form's editor too; advertised only
@@ -328,6 +331,8 @@ class TaskFormLayer(DrCodeState):
         self._new_task_mode = False
         self.query_one("#new-task", Vertical).add_class("hidden")
         self.chat_log.remove_class("hidden")
+        # The chat editor is back — restore its hint line.
+        self.query_one("#chat-hint", Static).remove_class("hidden")
         # The preset goal link (the GoalScreen's T) belongs to the form
         # session: consumed by the submit, dropped by a cancel.
         self._new_task_goal_id = None

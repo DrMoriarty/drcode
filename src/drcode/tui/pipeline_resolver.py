@@ -52,7 +52,7 @@ from ..agent import (
     run_context_tokens,
     serialize_messages,
 )
-from ..merge_engine import MergeReport
+from ..merge_engine import MergeReport, remove_report
 from ..merge_resolver import (
     ResolverOutcome,
     build_agent_context,
@@ -588,6 +588,10 @@ class PipelineResolverLayer(DrCodeState):
                 task.needs_human = False
                 task.touch()
                 self.manager.storage.save(task)
+                # The conflict is concluded — its triage report is
+                # obsolete (a leftover would keep the footer's Merge…
+                # entry alive).
+                await asyncio.to_thread(remove_report, self.project_root, task.id)
                 self._show_event(
                     task,
                     f"Conflict resolution verified and committed on "

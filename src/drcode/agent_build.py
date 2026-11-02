@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.usage import RunUsage
 
 from . import agent_model, task_search, tools
 from .agent_model import EXTRA_HEADERS
@@ -111,7 +112,13 @@ class AgentDeps:
 
     `agent_creates_drafts` mirrors the project setting: the research
     agent's create_bug_report/create_feature_request tools then create
-    DRAFT tasks the user must finish before they enter the queue."""
+    DRAFT tasks the user must finish before they enter the queue.
+
+    `record_usage`, when set, is called by the nested `delegate_research`
+    subagent run with its total RunUsage — the pipeline wires it to
+    `_record_session_usage` with the PARENT's role and model key, so the
+    subagent's tokens are accounted on the model that actually served
+    them (the subagent runs on the parent's config)."""
 
     root: Path
     manager: TaskManager
@@ -120,6 +127,7 @@ class AgentDeps:
     subagent_gate: SubagentGate | None = None
     activity: Callable[[], None] | None = None
     agent_creates_drafts: bool = False
+    record_usage: Callable[[RunUsage], None] | None = None
 
 
 @dataclass

@@ -226,6 +226,16 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
                 raise RuntimeError("subagent produced no result")
             output = (result.output or "").strip()
             usage = result.usage
+            # The subagent's tokens are billed the same as the parent's:
+            # fold the whole nested run's usage into the per-day usage
+            # store under the parent's role/model key (the recorder is
+            # wired by the pipeline — see AgentDeps.record_usage). Best
+            # effort: an accounting failure must not fail the delegation.
+            if deps.record_usage is not None and usage.total_tokens:
+                try:
+                    deps.record_usage(usage)
+                except Exception:  # noqa: BLE001, S110 - statistics never fatal
+                    pass
             requests = getattr(usage, "requests", 0) or 0
             tokens = usage.total_tokens
             log_service_event(

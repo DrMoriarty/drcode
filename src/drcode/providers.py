@@ -762,6 +762,46 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
     return config.model_copy(update={"model": ""})
 
 
+def resolve_model_key(config: Config, role: AgentRole) -> str:
+    """The usage-accounting model id of the role's EFFECTIVE model: the
+    catalog's "<provider>/<model-id>" reference format when the model
+    comes from the catalog; the bare model id when it comes from a
+    custom slot or the DRCODE_* env override (neither carries a provider
+    name). Empty when nothing is selected for the role.
+
+    Mirrors `resolve`/`resolve_effective` precedence — env override, the
+    project slot (a dangling catalog reference falls through to the user
+    default, same as `_resolve_connection`), the user-level default —
+    including the research/resolver fallback to the coding model. Feeds
+    the TUI's usage-accounting key ("<role>/<model-id>", see
+    `drcode.usage_store`); kept in sync with `_resolve_connection` by
+    construction (same walk, same fall-throughs).
+    """
+    resolved = resolve(config, role)
+    if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
+        return resolve_model_key(config, AgentRole.CODING)
+    if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
+        # The env layer wins for all roles and carries no provider name.
+        return resolved.model
+    catalog = UserModelsStore().load()
+    project_root = config._project_root
+    slot = load_project_model_slots(project_root).get(role)
+    if isinstance(slot, ModelRef):
+        provider = next((p for p in catalog.providers if p.name == slot.provider), None)
+        if provider is not None:
+            return f"{slot.provider}/{slot.model}"
+    elif slot == "custom":
+        custom = load_project_custom_models(project_root).get(role)
+        if custom is not None:
+            return custom.model
+    ref = catalog.defaults.get(role)
+    if ref is not None:
+        provider = next((p for p in catalog.providers if p.name == ref.provider), None)
+        if provider is not None:
+            return f"{ref.provider}/{ref.model}"
+    return resolved.model
+
+
 def resolve_effective(config: Config, role: AgentRole) -> Config:
     """Resolve the effective model for a role, with the fallback roles.
 

@@ -1666,6 +1666,59 @@ async def test_create_task_on_hold_through_ui(app: DrCodeApp) -> None:
         assert app.viewed_id == task.id
 
 
+async def test_create_task_as_draft_through_ui(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        nt_input = app.query_one("#nt-input", TextArea)
+        nt_input.text = "draft idea\nmore text"
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+
+        tasks = app.manager.all_tasks()
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task.status is TaskStatus.DRAFT
+        assert [e.text for e in task.pending_input] == ["draft idea\nmore text"]
+        assert not app._new_task_mode
+        # A draft has no chat view: the form closes without redirecting
+        # into the draft's editor (view_task's draft redirect), the
+        # pre-form view is restored instead.
+        assert app.viewed_id != task.id
+        # The pipeline never picks a draft up.
+        assert app.manager.promote_next() is None
+
+        # The draft waits in the sidebar's DRAFTS block and is finished
+        # through the usual open-draft path (ctrl+enter → queue).
+        app.action_open_draft(task.id)
+        await pilot.pause()
+        assert app._editing_task_id == task.id
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        assert task.status is not TaskStatus.DRAFT
+        assert app.viewed_id == task.id
+
+
+async def test_draft_submit_gated_while_editing_held_task(app: DrCodeApp) -> None:
+    task = app.manager.create("held", "condition")
+    app.manager.set_hold(task.id, on=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_edit_task()
+        await pilot.pause()
+        app.new_task_input.text = "edited condition"
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        # The edit mode has no draft semantics: the key falls through to
+        # the app's global ctrl+d ("Done"), a no-op inside the form —
+        # nothing is created, the held task stays held, the form is open.
+        assert [t.status for t in app.manager.all_tasks()] == [TaskStatus.HOLD]
+        assert app._new_task_mode
+        assert app._editing_task_id == task.id
+        assert [e.text for e in task.pending_input] == ["condition"]
+
+
 async def test_edit_held_task_merges_and_queues(app: DrCodeApp) -> None:
     task = app.manager.create("held", "original condition")
     app.manager.send(task.id, "extra comment")

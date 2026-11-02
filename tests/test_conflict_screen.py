@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from textual.widgets import Static
+from textual.widgets import Label, Static
 
 from drcode import merge_engine as me
 from drcode import merge_resolver
@@ -910,7 +910,9 @@ def _numstat_rows(screen: ConflictScreen) -> dict[str, str]:
     rows: dict[str, str] = {}
     for item in screen.files_list.children:
         if isinstance(item, DiffStatItem) and item.children:
-            rows[item.path] = str(item.children[0].content)
+            label = item.children[0]
+            if isinstance(label, Label):
+                rows[item.path] = str(label.content)
     return rows
 
 

@@ -1220,6 +1220,67 @@ async def test_retry_failed_here_respects_custom_cap(tmp_path: Path) -> None:
     assert "create_bug_report" in message
 
 
+# -- tester create_bug_report: the report waits for the verified task ----------------
+
+
+def _bug_report_tool(ag: Any) -> Any:
+    """The registered create_bug_report tool of a built tester agent."""
+    return next(
+        t for t in ag._function_toolset.tools.values() if t.name == "create_bug_report"
+    )
+
+
+def _run_bug_report(tool: Any, deps: Any, title: str, description: str) -> str:
+    """Invoke the tool's raw function with a minimal stand-in RunContext
+    (the tester's create_bug_report only touches `ctx.deps`)."""
+    return cast(
+        "str",
+        tool.function(cast("Any", SimpleNamespace(deps=deps)), title, description),
+    )
+
+
+def test_tester_bug_report_depends_on_verified_task(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """The tester's create_bug_report gates the new report on the verified
+    task (the c8623e0c incident class): the report is not promoted until
+    that task is COMPLETED and (under isolation) merged, so the fix agent's
+    worktree reproduces the observed defect. The description records the
+    origin; without isolation no branch is named."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    result = _run_bug_report(tool, deps, "Broken X", "pytest fails")
+
+    report = next(t for t in deps.manager.tasks.values() if t.id != deps.task_id)
+    assert report.depends_on == [deps.task_id]
+    assert report.kind is TaskKind.BUG
+    assert f"It waits for: #{deps.task_id}" in result
+    prompt = report.pending_input[0].text
+    assert f"Origin: filed by the tester of task #{deps.task_id}" in prompt
+    assert "pytest fails" in prompt
+    assert "branch" not in prompt
+
+
+def test_tester_bug_report_names_branch_under_isolation(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """When the tester ran in the verified task's worktree, the origin note
+    names that worktree and its drcode/<id> branch."""
+    deps = _tester_deps(tmp_path)
+    worktree = tmp_path / ".drcode" / "worktrees" / deps.task_id
+    worktree.mkdir(parents=True)
+    deps.root = worktree
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    _run_bug_report(tool, deps, "Broken X", "pytest fails")
+
+    report = next(t for t in deps.manager.tasks.values() if t.id != deps.task_id)
+    assert f"(its worktree, branch drcode/{deps.task_id})" in (
+        report.pending_input[0].text
+    )
+
+
 async def test_retry_failed_here_ignores_non_testing_task(tmp_path: Path) -> None:
     deps = _tester_deps(tmp_path)
     task = deps.manager.get(deps.task_id)

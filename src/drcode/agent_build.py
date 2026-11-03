@@ -54,6 +54,7 @@ from .prompts import (
 from .service_events import log_service_event
 from .settings import GitPolicy
 from .subagents import SubagentGate, run_delegate_tool
+from .task_env import WORKTREES_SUBDIR, branch_for
 from .task_manager import TaskManager
 from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
 from .transcript import _context_status, ctx_context_tokens
@@ -1036,19 +1037,44 @@ def build_tester_agent(
         ctx: RunContext[TesterDeps], title: str, description: str
     ) -> str:
         """Create a bug report task. It is placed at the head of the execution
-        queue. Use it to file problems found during verification that are NOT
-        caused by the verified task's own changes (pre-existing/foreign bugs,
-        environment or infrastructure issues) — the verified task itself then
-        passes (set_verification(success=True)); see set_verification."""
+        queue. Use it to file problems found during verification — both
+        foreign/pre-existing ones (the verified task itself then passes,
+        set_verification(success=True)) and the verified task's own bug that
+        survived its fix-round cap (set_verification's tool result tells you
+        when that is mandatory). The report is created with a dependency on
+        the verified task: it is not promoted until that task is COMPLETED
+        and (under worktree isolation) its drcode/<id> branch is merged, so
+        the fix agent gets a worktree where the observed defect actually
+        exists."""
         # origin="system" — see the research variant of this tool above.
-        _, text = _create_report_task(
+        task_id = ctx.deps.task_id
+        origin = (
+            f"\n\nOrigin: filed by the tester of task #{task_id} — the defect"
+            " was observed in that task's verification environment"
+        )
+        if (
+            ctx.deps.root.resolve()
+            == (ctx.deps.manager.storage.root / WORKTREES_SUBDIR / task_id).resolve()
+        ):
+            origin += f" (its worktree, branch {branch_for(task_id)})"
+        origin += "."
+        bug, text = _create_report_task(
             ctx.deps,
             title,
-            description,
+            description + origin,
             kind=TaskKind.BUG,
             creator="tester",
+            # The report describes a defect observed in the verified task's
+            # environment: gate its promotion on that task being COMPLETED
+            # and merged (the unmerged_ids half of the dependency gate).
+            # Without this the report's worktree forks from the base branch,
+            # where the defect may not exist at all (the c8623e0c incident:
+            # a fix agent editing pyproject "blindly"). A task completed as
+            # FAILED after the fix-round cap is COMPLETED too, so the gate
+            # resolves on that path as well.
+            depends_on=[task_id],
         )
-        return text
+        return text + _deps_suffix(bug)
 
     # The commit tool exists only when the project's tester git policy
     # allows it: with policy off the model cannot commit even if it

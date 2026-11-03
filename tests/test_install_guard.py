@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 
+from drcode.gitignore import GITIGNORE_ENTRIES
 from drcode.models import TaskStatus, VerificationStatus
 from drcode.settings import (
     ProjectSettings,
@@ -67,10 +68,13 @@ def git_root(project_root: Path) -> Path:
     _git(project_root, "init", "-q")
     _git(project_root, "config", "user.email", "test@example.com")
     _git(project_root, "config", "user.name", "Test")
+    # Exactly the private subset drcode's gitignore enforcement would
+    # write (gitignore.GITIGNORE_ENTRIES): a missing entry would be
+    # APPENDED at app start, leaving the tracked .gitignore modified —
+    # a dirty main checkout makes _install_rerun_candidates wait forever
+    # and the deferred-install tests would time out.
     (project_root / ".gitignore").write_text(
-        ".drcode/tasks/\n.drcode/settings.json\n.drcode/github_state.json\n"
-        ".drcode/worktrees/\n.drcode/merge_reports/\n.drcode/pending_notifications.json\n"
-        ".drcode/stats.json\n"
+        "\n".join(GITIGNORE_ENTRIES) + "\n"
     )
     (project_root / "README.md").write_text("hello")
     _git(project_root, "add", "-A")

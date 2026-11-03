@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 from collections.abc import Callable
@@ -999,3 +1000,230 @@ def search(
             f"(.drcode/tasks/{exclude_task_id}.transcript.json)."
         )
     return "\n".join(lines)
+
+
+# --- Bug-report deduplication (the tester's create_bug_report) -------------
+#
+# The guard is deliberately mechanical — keyword extraction with a stopword
+# list, the same light stemming the search matches with, and a fixed
+# minimum-overlap threshold. No model call decides "is this the same bug":
+# the tool reports the found open report(s) to the model, which either drops
+# the call or overrides with force=true (a false-positive match).
+
+# A candidate is reported as similar when at least this many DISTINCT
+# keywords from the proposed report occur in the existing one (anywhere in
+# its indexed fields). Two generic words alone must not block a report, so
+# the stopword list below strips the vocabulary every bug report shares.
+DUP_MIN_KEYWORDS = 2
+
+# Keyword extraction: tokens shorter than this are dropped (mostly digits
+# and function words — the stem variants keep 4 characters anyway).
+_DUP_MIN_TOKEN_LEN = 4
+
+# Stopwords (lowercase) too generic to signal "same defect": boilerplate of
+# bug reports in both UI languages plus common function words. Deliberately
+# NOT exhaustive — the minimum-overlap threshold is the second line of
+# defense; this list only keeps the signal-bearing words.
+_DUP_STOPWORDS = frozenset(
+    {
+        # English function words.
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "when",
+        "then",
+        "than",
+        "after",
+        "before",
+        "under",
+        "over",
+        "also",
+        "been",
+        "were",
+        "have",
+        "has",
+        "had",
+        "will",
+        "would",
+        "should",
+        "could",
+        "must",
+        "does",
+        "isn",
+        "doesnt",
+        "didnt",
+        "cannot",
+        "their",
+        "there",
+        "them",
+        "they",
+        "some",
+        "such",
+        "only",
+        "very",
+        "while",
+        "which",
+        "even",
+        "just",
+        # English bug-report boilerplate.
+        "bug",
+        "bugs",
+        "report",
+        "issue",
+        "error",
+        "errors",
+        "failed",
+        "fails",
+        "failure",
+        "failures",
+        "fix",
+        "fixed",
+        "fixes",
+        "broken",
+        "wrong",
+        "incorrect",
+        "problem",
+        "problems",
+        "crash",
+        "crashes",
+        "wrongly",
+        # Russian function words (≤3 characters are dropped by length).
+        "этот",
+        "этого",
+        "этой",
+        "когда",
+        "чтобы",
+        "который",
+        "которая",
+        "которые",
+        "которое",
+        "после",
+        "перед",
+        "надо",
+        "нужно",
+        "нужен",
+        "должен",
+        "должна",
+        "работает",
+        "работать",
+        "своего",
+        "своей",
+        # Russian bug-report boilerplate.
+        "ошибка",
+        "ошибки",
+        "ошибку",
+        "ошибок",
+        "баг",
+        "бага",
+        "баге",
+        "репорт",
+        "отчет",
+        "отчёт",
+        "исправить",
+        "исправлен",
+        "исправлена",
+        "сломан",
+        "сломано",
+        "сломалась",
+        "проблема",
+        "проблемы",
+        "падает",
+        "падение",
+    }
+)
+
+
+def dedup_keywords(*texts: str) -> list[str]:
+    """Significant keywords of a proposed bug report, in first-seen order.
+
+    Splits on anything non-alphanumeric (so "ruff-format" yields "ruff" and
+    "format"), lowercases, drops short tokens and the generic stopword list
+    above, deduplicates. Order matters for nothing but determinism — the
+    caller passes the whole list to the matching below.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for raw in re.findall(r"[\w]+", text.lower()):
+            token = raw.strip("_")
+            if len(token) < _DUP_MIN_TOKEN_LEN or token in _DUP_STOPWORDS:
+                continue
+            if token not in seen:
+                seen.add(token)
+                keywords.append(token)
+    return keywords
+
+
+# Statuses of an OPEN bug report: everything that can still be picked up
+# and fixed. COMPLETED covers both successful completions and tasks
+# completed as FAILED (a failed task is a completed one in the state
+# machine) — neither is a duplicate target. DRAFT is included: an
+# agent-created report waiting for the user to finish it is as open as a
+# queued one.
+_OPEN_REPORT_STATUSES = frozenset(
+    member.value for member in TaskStatus if member is not TaskStatus.COMPLETED
+)
+
+
+def find_similar_open_bugs(
+    project_root: Path,
+    keywords: list[str],
+    *,
+    exclude_task_id: str | None = None,
+    min_keywords: int = DUP_MIN_KEYWORDS,
+) -> list[TaskHit]:
+    """OPEN bug reports sharing `min_keywords`+ of `keywords`, ranked.
+
+    Built on the same machinery as `search` (the incremental archive cache,
+    the stem variants, the reduced records): a record matches when at least
+    `min_keywords` DISTINCT keywords occur anywhere in its indexed fields;
+    title matches rank first (a shared title is a far stronger duplicate
+    signal than shared prompt text), then total distinct matches, then
+    newest-first. Only kind=bug tasks with a status from
+    _OPEN_REPORT_STATUSES are considered; `exclude_task_id` (the verified
+    task) is skipped. Blocking file I/O — callers on an event loop must run
+    it in a worker thread.
+    """
+    if len(keywords) < min_keywords:
+        # Too few signal words to dedup on — the guard stays silent rather
+        # than blocking every report over a single generic token.
+        return []
+    variants_per_keyword = [_variants(k) for k in keywords]
+    matches: list[tuple[int, int, float, TaskHit]] = []
+    for task_id, data, fields in load_archive(project_root):
+        if data.get("kind") != TaskKind.BUG.value:
+            continue
+        status = data.get("status")
+        if status not in _OPEN_REPORT_STATUSES:
+            continue
+        if exclude_task_id is not None and task_id == exclude_task_id:
+            continue
+        title = str(data.get("title") or "").lower()
+        haystack = "\n".join(text for _, text in fields).lower()
+        title_hits = sum(
+            1 for vs in variants_per_keyword if any(v in title for v in vs)
+        )
+        text_hits = sum(
+            1 for vs in variants_per_keyword if any(v in haystack for v in vs)
+        )
+        if text_hits < min_keywords:
+            continue
+        hit = TaskHit(
+            task_id=task_id,
+            title=" ".join(str(data.get("title") or "").split()),
+            status=str(status or ""),
+            kind=str(data.get("kind") or ""),
+            first_prompt=_first_prompt(data),
+            snippet=_build_snippet(fields, variants_per_keyword),
+            score=text_hits,
+            date=_date(data),
+            verification=_verification_marker(data),
+            unfinished=bool(data.get("unfinished")),
+            hook_merge_failed=bool(data.get("hook_merge_failed")),
+            last_error_event=_last_error_event(data),
+        )
+        matches.append((title_hits, text_hits, _recency(data), hit))
+    matches.sort(key=lambda m: (-m[0], -m[1], -m[2]))
+    return [m[3] for m in matches]

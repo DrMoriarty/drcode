@@ -880,3 +880,123 @@ def test_load_archive_ignores_transcript_files(project_root: Path) -> None:
     )
     records = task_search.load_archive(project_root)
     assert [task_id for task_id, _, _ in records] == [task.id]
+
+
+# -- bug-report deduplication (the tester's create_bug_report guard) --------
+
+
+def test_dedup_keywords_drops_generic_words_and_short_tokens() -> None:
+    keywords = task_search.dedup_keywords(
+        "Fix: ruff-format fails on 6 files after merge (bug #12)"
+    )
+    # Only true bug-report boilerplate is stripped, plus the too-short
+    # tokens and the id digits; "files" is real signal and must survive.
+    assert "ruff" in keywords
+    assert "format" in keywords
+    assert "fix" not in keywords
+    assert "fails" not in keywords
+    assert "bug" not in keywords
+    assert all(len(k) >= 4 for k in keywords)
+    # Deduplication: a repeated word appears once.
+    assert len(keywords) == len(set(keywords))
+
+
+def test_find_similar_open_bugs_matches_title_and_stems(project_root: Path) -> None:
+    open_bug = _task(title="Fix ruff-format debt in six files", kind=TaskKind.BUG)
+    _write_task(project_root, open_bug)
+
+    hits = task_search.find_similar_open_bugs(
+        project_root, task_search.dedup_keywords("Ruff formatting debt: six files")
+    )
+
+    assert [h.task_id for h in hits] == [open_bug.id]
+    # A stem variant matches too ("formatting" → "format").
+    assert hits[0].status == TaskStatus.QUEUED.value
+    assert hits[0].kind == TaskKind.BUG.value
+
+
+def test_find_similar_open_bugs_ignores_completed_reports(project_root: Path) -> None:
+    done = _task(
+        title="Fix ruff-format debt in six files",
+        kind=TaskKind.BUG,
+        status=TaskStatus.COMPLETED,
+    )
+    _write_task(project_root, done)
+
+    assert (
+        task_search.find_similar_open_bugs(
+            project_root, task_search.dedup_keywords("Ruff format debt in six files")
+        )
+        == []
+    )
+
+
+def test_find_similar_open_bugs_ignores_other_kinds(project_root: Path) -> None:
+    feature = _task(title="Fix ruff-format debt in six files")
+    _write_task(project_root, feature)
+
+    assert (
+        task_search.find_similar_open_bugs(
+            project_root, task_search.dedup_keywords("Ruff format debt in six files")
+        )
+        == []
+    )
+
+
+def test_find_similar_open_bugs_needs_min_keyword_overlap(
+    project_root: Path,
+) -> None:
+    """One shared (even signal) word must not block a report — the guard
+    fires only from DUP_MIN_KEYWORDS distinct matches up."""
+    existing = _task(title="worktree branch leak after failed merge", kind=TaskKind.BUG)
+    _write_task(project_root, existing)
+
+    assert (
+        task_search.find_similar_open_bugs(
+            project_root, task_search.dedup_keywords("worktree cleanup after rebase")
+        )
+        == []
+    )
+    # Two shared keywords reach the threshold.
+    hits = task_search.find_similar_open_bugs(
+        project_root,
+        task_search.dedup_keywords("worktree branch leak after failed merge"),
+    )
+    assert [h.task_id for h in hits] == [existing.id]
+
+
+def test_find_similar_open_bugs_excludes_own_task(project_root: Path) -> None:
+    own = _task(title="Fix ruff-format debt in six files", kind=TaskKind.BUG)
+    _write_task(project_root, own)
+
+    hits = task_search.find_similar_open_bugs(
+        project_root,
+        task_search.dedup_keywords("Fix ruff-format debt in six files"),
+        exclude_task_id=own.id,
+    )
+    assert hits == []
+
+
+def test_find_similar_open_bugs_ranks_title_matches_first(project_root: Path) -> None:
+    """A report sharing the TITLE keywords outranks one that only matches
+    in its prompt text, regardless of the total occurrence count."""
+    title_match = _task(title="ruff format debt", kind=TaskKind.BUG)
+    prompt_match = _task(
+        title="unrelated work",
+        kind=TaskKind.BUG,
+        messages=[
+            {"parts": [{"part_kind": "user-prompt", "content": "ruff format debt"}]},
+            {
+                "parts": [
+                    {"part_kind": "user-prompt", "content": "ruff format debt again"}
+                ]
+            },
+        ],
+    )
+    _write_task(project_root, prompt_match)
+    _write_task(project_root, title_match)
+
+    hits = task_search.find_similar_open_bugs(
+        project_root, task_search.dedup_keywords("ruff format debt in six files")
+    )
+    assert [h.task_id for h in hits] == [title_match.id, prompt_match.id]

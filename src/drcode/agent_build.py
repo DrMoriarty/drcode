@@ -1188,8 +1188,12 @@ def build_tester_agent(
         When the project uses an external review, a passed task stays in
         testing until the external review delivers its verdict."""
         deps = ctx.deps
-        task = deps.manager.get(deps.task_id)
-        if not success and retry_here and task.status is TaskStatus.TESTING:
+        if not success and retry_here:
+            # Every retry_here verdict goes through _retry_failed_here: a
+            # stale one (the task already left TESTING mid-round) is
+            # ignored there and reported as such — the model must never
+            # read "task completed" when nothing happened (incident
+            # 490d5652: a stale verdict produced a false bug report).
             return _retry_failed_here(deps, report)
         deps.manager.set_verification(
             deps.task_id, success, review_gate=deps.review_gate

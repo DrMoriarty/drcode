@@ -1296,6 +1296,31 @@ async def test_retry_failed_here_ignores_non_testing_task(tmp_path: Path) -> Non
     assert "no longer being tested" in message
 
 
+async def test_retry_failed_here_ignores_redeveloping_task(tmp_path: Path) -> None:
+    """A duplicate retry_here verdict arriving after the task already
+    returned to development (incident 490d5652: a stale mid-round verdict
+    was reported as "task completed" and spawned a false bug report) must
+    be ignored — the tool result says so and never claims completion."""
+    deps = _tester_deps(tmp_path)
+    task = deps.manager.get(deps.task_id)
+    task.pending_input.clear()
+    task.fix_rounds = 1  # round 2/3 is already in development
+    task.status = TaskStatus.QUEUED
+    deps.manager.storage.save(task)
+    before = list(task.pending_input)
+
+    message = agent_mod._retry_failed_here(deps, "late duplicate verdict")
+
+    assert task.status is TaskStatus.QUEUED
+    assert task.fix_rounds == 1
+    assert task.pending_input == before
+    assert task.completed_at is None
+    assert "no longer being tested" in message
+    # The model must not read a completion (and start a bug report for a
+    # fix-round cap that was never reached).
+    assert "task completed" not in message
+
+
 # -- research agent: tracked-file commit (git_commit_docs) ---------------------------
 
 

@@ -34,6 +34,7 @@ from .models import (
     TaskKind,
     TaskStatus,
     TodoItem,
+    VerificationStatus,
     render_todos,
 )
 from .service_events import log_service_event
@@ -468,11 +469,20 @@ def _retry_failed_here(deps: TesterDeps, report: str) -> str:
     success=False, retry_here=True): requeue the task into development with
     the failure report as its next input — unless the fix-round cap
     (project setting `max_dev_rounds`) is reached, in which case the task
-    completes as FAILED and the tester must create the bug report. Both
-    outcomes are logged into the task's service-event history by the
-    manager (requeue_failed_fix); returns the tool-result text telling the
+    completes as FAILED and the tester must create the bug report. A stale
+    verdict (the task is no longer TESTING — it already returned to
+    development or was cancelled/re-queued while the call was in flight)
+    changes nothing and is reported as ignored. The applied outcomes are
+    logged into the task's service-event history by the manager
+    (requeue_failed_fix); returns the tool-result text telling the
     model which path was taken."""
     task = deps.manager.get(deps.task_id)
+    if task.status is not TaskStatus.TESTING:
+        return (
+            "Verification label ignored: the task is no longer being "
+            "tested (it already returned to development) — do NOT call "
+            "create_bug_report."
+        )
     rounds_done = task.fix_rounds + 1
     max_rounds = max(1, deps.max_dev_rounds)
     deps.manager.requeue_failed_fix(deps.task_id, report, max_rounds=max_rounds)
@@ -485,15 +495,19 @@ def _retry_failed_here(deps: TesterDeps, report: str) -> str:
             "loop). The report was queued as the task's next input — do NOT "
             "call create_bug_report."
         )
-    if task.status is TaskStatus.COMPLETED:
+    if (
+        task.status is TaskStatus.COMPLETED
+        and task.verification is VerificationStatus.FAILED
+    ):
         return (
             "Verification label set: failed; task completed. The bug "
             f"survived {max_rounds} dedicated development rounds — call "
             "create_bug_report now with a clear title and a description of "
             "what still fails (the exact command and the error output)."
         )
-    # The task left TESTING while the verdict was in flight (the user
-    # re-queued or cancelled it): the stale verdict changed nothing.
+    # Defensive fallback (e.g. the user cancelled the task in the tiny
+    # window between the TESTING check above and the requeue): the stale
+    # verdict changed nothing.
     return "Verification label ignored: the task is no longer being tested."
 
 

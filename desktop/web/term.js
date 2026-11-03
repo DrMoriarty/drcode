@@ -141,6 +141,11 @@
         selectionBackground: "#2d4a6e",
       },
     });
+    // Unicode 11 width tables: the built-in UnicodeV6 provider predates emoji,
+    // so ✅ etc. render 1 cell wide while Textual (Python wcwidth) sends them
+    // as 2 — the rest of the line then drifts one cell to the left.
+    term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+    term.unicode.activeVersion = "11";
     fit = new window.FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(elTerminal);

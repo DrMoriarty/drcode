@@ -345,10 +345,12 @@ class SidebarLayer(DrCodeState):
         """Rendered label of a task row (the incremental refresh compares
         it against the mounted row to skip unchanged labels)."""
         # The automatic conflict resolver is working on this task right
-        # now — its ⚙️ replaces the regular marker (the resolver is
-        # single, so the symbol is never ambiguous).
+        # now — its 🛠️ replaces the regular marker (the resolver is
+        # single, so the symbol is never ambiguous). Full-width emoji
+        # (EAW=W, no VS-presentation ambiguity like ⚙): rich counts it
+        # as 2 cells and every terminal draws it as 2.
         if self._resolver_running and self._resolver_task_id == t.id:
-            marker = "⚙️"
+            marker = "🛠️"
         elif t.status.value == "completed":
             # The ✓ color tracks the mergedness of the task's
             # `drcode/<id>` branch (refreshed by the 10 s git poll):

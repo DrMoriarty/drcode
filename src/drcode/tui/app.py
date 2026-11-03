@@ -665,6 +665,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # resumed continuation turn must carry the compaction-resume note
         # (TESTER_COMPACTION_RESUME_PROMPT, see run_tester).
         self._tester_compaction_resumed: set[str] = set()
+        # Tasks whose testing round already issued its set_verification
+        # verdict before a compaction (the #490d5652 class): the resumed
+        # round must not re-issue it. See state.py / _maybe_compact_tester_round.
+        self._tester_compaction_verdict: set[str] = set()
         # Merge-conflict resolver (single-slot worker, mirrors the tester's
         # bookkeeping): singular running flag, per-round generation, failure
         # counters (model errors vs transient network errors) and the

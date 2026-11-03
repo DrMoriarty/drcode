@@ -67,6 +67,28 @@ TESTER_COMPACTION_RESUME_PROMPT = (
     "only."
 )
 
+
+def tester_compaction_resume_prompt(verdict_issued: bool) -> str:
+    """The resume note for a compacted tester round. When the round had
+    ALREADY issued its set_verification verdict before the compaction, an
+    explicit warning is appended (the #490d5652 class): a model waking up
+    into a summarized round has re-issued the verdict — and on a task the
+    first verdict already requeued, the second one bypasses the retry_here
+    machinery and completes the task as failed. The verdict is final; a
+    second set_verification in the same round is forbidden."""
+    if not verdict_issued:
+        return TESTER_COMPACTION_RESUME_PROMPT
+    return (
+        f"{TESTER_COMPACTION_RESUME_PROMPT}\n\n"
+        "WARNING: a set_verification verdict was ALREADY issued earlier in "
+        "this round, before the compaction — it is recorded in the summary "
+        "and is final. Do NOT call set_verification again in this round; "
+        "if the summary's verdict line conflicts with what you see in the "
+        "worktree, trust the verdict line (the developer's fix, if any, is "
+        "queued as their input and lands later, in their own run)."
+    )
+
+
 # -- start-prompt pre-flight gate (the #f425b421 class) ------------------------
 #
 # The testing round's start prompt embeds the original assignment verbatim;
@@ -227,6 +249,7 @@ class PipelineTesterLayer(DrCodeState):
         self._tester_resume_round.discard(task.id)
         self._tester_overflow_retried.discard(task.id)
         self._tester_compaction_resumed.discard(task.id)
+        self._tester_compaction_verdict.discard(task.id)
         self.manager.set_verification(task.id, success=False)
 
     @work(exclusive=True, group="tester")
@@ -245,6 +268,11 @@ class PipelineTesterLayer(DrCodeState):
             task.status is TaskStatus.TESTING
         )
         self._tester_resume_round.discard(task_id)
+        if not resume_round:
+            # A fresh testing round: the previous round's verdict-at-
+            # compaction fact no longer applies (see
+            # _maybe_compact_tester_round).
+            self._tester_compaction_verdict.discard(task_id)
         # Initialized before the try: build_tester_agent() itself may raise,
         # and the handlers below reference `run`.
         run: AgentRun[TesterDeps, str] | None = None
@@ -418,7 +446,9 @@ class PipelineTesterLayer(DrCodeState):
                 )
                 self._tester_compaction_resumed.discard(task_id)
                 text: str | None = (
-                    TESTER_COMPACTION_RESUME_PROMPT
+                    tester_compaction_resume_prompt(
+                        task_id in self._tester_compaction_verdict
+                    )
                     if resumed_compacted
                     else None
                     if resume_from_round
@@ -633,8 +663,15 @@ class PipelineTesterLayer(DrCodeState):
                             # checks already run and their outcomes — the
                             # round must continue from the remaining steps,
                             # not restart the whole verification cycle (the
-                            # 8eebbdb8 carousel).
-                            text = TESTER_COMPACTION_RESUME_PROMPT
+                            # 8eebbdb8 carousel). A round that already
+                            # issued its verdict before the compaction gets
+                            # an explicit "verdict is final" warning — a
+                            # second set_verification here would complete
+                            # the requeued task as failed (the #490d5652
+                            # class).
+                            text = tester_compaction_resume_prompt(
+                                task_id in self._tester_compaction_verdict
+                            )
                         else:
                             # The summarizer failed and the gate is now
                             # disabled for this task: resume as a plain
@@ -757,6 +794,7 @@ class PipelineTesterLayer(DrCodeState):
                 self._persist_tester_messages(task, run)
                 self._tester_resume_round.discard(task_id)
                 self._tester_compaction_resumed.discard(task_id)
+                self._tester_compaction_verdict.discard(task_id)
                 self._tester_fail_count[task_id] = (
                     self._tester_fail_count.get(task_id, 0) + 1
                 )
@@ -778,6 +816,7 @@ class PipelineTesterLayer(DrCodeState):
                 self._tester_fail_count.pop(task_id, None)
                 self._tester_overflow_retried.discard(task_id)
                 self._tester_compaction_resumed.discard(task_id)
+                self._tester_compaction_verdict.discard(task_id)
                 self._note_network_recovered(task, self._tester_net_count)
                 self._tester_net_count.pop(task_id, None)
                 self._tester_resume_round.discard(task_id)

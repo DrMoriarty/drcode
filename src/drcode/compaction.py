@@ -211,6 +211,47 @@ def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
     return found
 
 
+def tester_verdict_issued(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Facts about a set_verification verdict already issued inside a tester
+    round transcript (None while the round has not called the tool yet).
+
+    Returns the parsed tool-call arguments (success / retry_here / report)
+    and the tool-result text the model received. Read from the SERIALIZED
+    transcript — the same factual source the compaction summarizer sees —
+    so the summary anchor and the resume warning rest on actual data, never
+    on the model's own rendering of the round.
+    """
+    call_id: str | None = None
+    args: dict[str, Any] = {}
+    result_text: str | None = None
+    for msg in messages:
+        for part in msg.get("parts", []):
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("part_kind")
+            if call_id is None:
+                if kind == "tool-call" and part.get("tool_name") == "set_verification":
+                    raw = part.get("args")
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except ValueError:
+                            raw = {}
+                    if isinstance(raw, dict):
+                        args = raw
+                    call_id = part.get("tool_call_id")
+            elif (
+                kind == "tool-return"
+                and part.get("tool_call_id") == call_id
+                and result_text is None
+            ):
+                content = part.get("content")
+                result_text = content if isinstance(content, str) else str(content)
+    if call_id is None:
+        return None
+    return {"args": args, "result": result_text}
+
+
 def render_history_blocks(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Render the serialized transcript as a list of (kind, text) blocks for
     the summarizer — the chunkable unit structure behind
@@ -293,10 +334,14 @@ def build_compaction_prompt(
     transcript: str,
     template: str,
     checklist: str | None = None,
+    facts: str | None = None,
 ) -> str:
     """User prompt for the summarizer: the conversation, the anchored
-    previous summary (if any), the task's current todo checklist (when it
-    has one) and the required output structure."""
+    previous summary (if any), the task's authoritative facts (when
+    provided — e.g. the tester round's verdict status and fix-round
+    counter, taken from task state rather than the conversation text), the
+    task's current todo checklist (when it has one) and the required
+    output structure."""
     parts = [
         "Below is the conversation history of a coding session.",
         "",
@@ -308,6 +353,15 @@ def build_compaction_prompt(
         previous_summary or "(none)",
         "</previous-summary>",
     ]
+    if facts:
+        parts.extend(
+            [
+                "",
+                "<task-facts>",
+                facts,
+                "</task-facts>",
+            ]
+        )
     if checklist:
         # The checklist lives in `task.todos`, outside the transcript — the
         # summarizer cannot see it in the conversation text. Passed (and
@@ -337,6 +391,7 @@ def build_reduce_prompt(
     partials: list[str],
     template: str,
     checklist: str | None = None,
+    facts: str | None = None,
 ) -> str:
     """User prompt for the reduce step: merge the sequential partial
     summaries (one per map slice) into the single structured summary."""
@@ -355,6 +410,15 @@ def build_reduce_prompt(
         rendered,
         "</partial-summaries>",
     ]
+    if facts:
+        parts.extend(
+            [
+                "",
+                "<task-facts>",
+                facts,
+                "</task-facts>",
+            ]
+        )
     if checklist:
         parts.extend(
             [
@@ -400,13 +464,15 @@ def slice_budget_tokens(
     *,
     system_prompt: str | None = None,
     template: str | None = None,
+    facts: str | None = None,
 ) -> int:
     """Token budget for one history slice (or one reduce partials payload):
     the COMPACTION role's context window minus headroom for the system
-    prompt, the output template, the anchors riding along on every call,
-    the model's own output and the chars/4 heuristic's slack. The system
-    prompt/template overrides let a role-specific compaction template (the
-    tester variant) be accounted for instead of the default one."""
+    prompt, the output template, the anchors riding along on every call
+    (previous summary, task facts, todo checklist), the model's own output
+    and the chars/4 heuristic's slack. The system prompt/template overrides
+    let a role-specific compaction template (the tester variant) be
+    accounted for instead of the default one."""
     default_system, default_template = load_compaction_prompts()
     system_prompt = system_prompt if system_prompt is not None else default_system
     template = template if template is not None else default_template
@@ -414,6 +480,7 @@ def slice_budget_tokens(
         _estimate_tokens(system_prompt)
         + _estimate_tokens(template)
         + _estimate_tokens(anchor or "")
+        + _estimate_tokens(facts or "")
         + _estimate_tokens(checklist or "")
         + _PROMPT_SCAFFOLD_ALLOWANCE
         + _output_allowance(config)

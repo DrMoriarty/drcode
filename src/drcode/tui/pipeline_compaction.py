@@ -32,6 +32,7 @@ from ..agent import (
     slice_budget_tokens,
     split_original_prompts,
     subagent_limit_for,
+    tester_verdict_issued,
 )
 from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
@@ -478,6 +479,7 @@ class PipelineCompactionLayer(DrCodeState):
         what: str,
         checklist: str | None = None,
         hard: bool = False,
+        facts: str | None = None,
     ) -> tuple[list[dict[str, Any]], str, bool]:
         """Summarize `messages` into a compacted transcript; returns it,
         the success event text and whether the LLM summarizer path failed
@@ -511,6 +513,7 @@ class PipelineCompactionLayer(DrCodeState):
                 messages,
                 checklist=checklist,
                 tester=summary_role is AgentRole.TESTER,
+                facts=facts,
             )
         except asyncio.CancelledError:
             raise
@@ -578,6 +581,7 @@ class PipelineCompactionLayer(DrCodeState):
         template: str,
         checklist: str | None,
         depth: int = 0,
+        facts: str | None = None,
     ) -> str:
         """Merge the map step's partial summaries into the final structured
         summary. When the accumulated partials overflow the merge call, the
@@ -585,7 +589,7 @@ class PipelineCompactionLayer(DrCodeState):
         first (hierarchical reduce, depth-capped); past the cap the payload
         is mechanically trimmed per partial so the merge call always
         happens (the guaranteed floor — a bounded summary beats none)."""
-        prompt = build_reduce_prompt(partials, template, checklist)
+        prompt = build_reduce_prompt(partials, template, checklist, facts)
         compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
         if prompt_fits_window(prompt, compaction_cfg) or not partials:
             return await self._run_summarizer(prompt)
@@ -594,12 +598,12 @@ class PipelineCompactionLayer(DrCodeState):
                 partials, compaction_cfg, checklist
             )
             return await self._run_summarizer(
-                build_reduce_prompt(trimmed, template, checklist)
+                build_reduce_prompt(trimmed, template, checklist, facts)
             )
         # Hierarchical reduce: batch the partials so each batch's prompt
         # fits, reduce every batch, then merge the intermediates.
         batch_budget = slice_budget_tokens(
-            compaction_cfg, checklist=checklist, template=template
+            compaction_cfg, checklist=checklist, template=template, facts=facts
         )
         batches: list[list[str]] = []
         current: list[str] = []
@@ -624,11 +628,13 @@ class PipelineCompactionLayer(DrCodeState):
                 build_reduce_prompt(trimmed, template, checklist)
             )
         intermediates = [
-            await self._reduce_partials(batch, template, checklist, depth + 1)
+            await self._reduce_partials(
+                batch, template, checklist, depth + 1, facts=facts
+            )
             for batch in batches
         ]
         return await self._reduce_partials(
-            intermediates, template, checklist, depth + 1
+            intermediates, template, checklist, depth + 1, facts=facts
         )
 
     @staticmethod
@@ -657,13 +663,17 @@ class PipelineCompactionLayer(DrCodeState):
         *,
         checklist: str | None = None,
         tester: bool = False,
+        facts: str | None = None,
     ) -> str:
         """LLM summarization of `messages` for compaction, shared by the
         main-agent and tester-round gates (both via _compact_transcript).
         ``tester=True`` selects the tester output template
         (compaction_tester.md, with the "Verification evidence" section the
         resumed round relies on) for the single-shot, map and reduce calls
-        alike.
+        alike. ``facts`` rides along on every call as the authoritative
+        <task-facts> anchor (tester rounds: the verdict status and the
+        fix-round counter, taken from task state — the summarizer must not
+        derive them from the conversation text).
 
         Single-shot when the rendered history fits the COMPACTION role's
         window (the chars/4 pre-flight, `prompt_fits_context`); otherwise a
@@ -693,6 +703,7 @@ class PipelineCompactionLayer(DrCodeState):
             render_history_for_summary(messages),
             template,
             checklist=checklist,
+            facts=facts,
         )
         compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
         if prompt_fits_context(prompt, system_prompt, compaction_cfg):
@@ -703,6 +714,7 @@ class PipelineCompactionLayer(DrCodeState):
             checklist,
             system_prompt=system_prompt,
             template=template,
+            facts=facts,
         )
         if budget > compaction_cfg.max_context_tokens:
             raise _ChunkingImpossible(
@@ -723,11 +735,11 @@ class PipelineCompactionLayer(DrCodeState):
             partials.append(
                 await self._run_summarizer(
                     build_compaction_prompt(
-                        running, chunk, template, checklist=checklist
+                        running, chunk, template, checklist=checklist, facts=facts
                     )
                 )
             )
-        return await self._reduce_partials(partials, template, checklist)
+        return await self._reduce_partials(partials, template, checklist, facts=facts)
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -869,6 +881,85 @@ class PipelineCompactionLayer(DrCodeState):
         if self.viewed_id == task.id:
             self.view_task(task.id)
 
+    def _tester_round_facts(
+        self, task: Task, round_messages: list[dict[str, Any]], verdict_issued: bool
+    ) -> str:
+        """Authoritative task facts for the tester-round summary anchor (the
+        <task-facts> block of the summarizer prompt; the #490d5652 class).
+
+        A mid-round compaction can land right AFTER the tester issued its
+        set_verification verdict — the conversation's own last turns are
+        then summarized away, and a model that derives the state from the
+        summary alone has historically invented false facts: a queued fix
+        reported as applied, a wrong fix-round count read as an exhausted
+        cap. The counter and the verdict status here come from the task
+        state and the serialized transcript, never from the conversation
+        text, so the resumed round starts from the truth:
+        - the fix-round counter is `task.fix_rounds` (failed fix rounds so
+          far) against the project's `max_dev_rounds` cap;
+        - the verdict status is read from the round transcript itself
+          (tester_verdict_issued): ALREADY ISSUED — final for this round —
+          or NOT issued yet, and a retry_here verdict's fix is explicitly
+          marked QUEUED, not applied.
+        """
+        max_rounds = max(1, self.settings.max_dev_rounds)
+        fix_rounds = task.fix_rounds
+        cap = (
+            "REACHED — a further retry_here verdict completes the task as failed"
+            if fix_rounds >= max_rounds
+            else "NOT reached"
+        )
+        verdict = tester_verdict_issued(round_messages) if verdict_issued else None
+        lines = [
+            (
+                "TASK FACTS — authoritative task state at compaction time "
+                "(recorded outside the conversation); where the conversation "
+                "text seems to contradict them, the facts win. Copy the "
+                "verdict status and the fix-round counter into the summary "
+                "VERBATIM:"
+            ),
+            (
+                f"- Fix-round counter (from task state, not from the "
+                f"conversation): {fix_rounds} failed fix round(s) so far, cap "
+                f"{max_rounds} — the fix-round cap is {cap}."
+            ),
+        ]
+        if not verdict_issued:
+            lines.append(
+                "- Verification verdict in this round: NOT issued yet — "
+                "issuing it (set_verification) is this round's remaining "
+                "decision."
+            )
+        else:
+            lines.append(
+                "- Verification verdict in this round: ALREADY ISSUED"
+                + (
+                    ""
+                    if verdict is None
+                    else (
+                        " — set_verification("
+                        f"success={verdict['args'].get('success')}, "
+                        f"retry_here={verdict['args'].get('retry_here')})"
+                        " was called earlier in this round"
+                    )
+                )
+                + " and its outcome is final; a second set_verification in "
+                "the same round is forbidden."
+            )
+            if verdict is not None and (verdict["result"] or "").strip():
+                lines.append(
+                    f"  Tool result the verdict produced: {verdict['result'].strip()}"
+                )
+            if verdict is not None and verdict["args"].get("retry_here"):
+                lines.append(
+                    "- The verdict sent a fix request back to the developer: "
+                    "the fix is QUEUED as the developer's next input and is "
+                    "NOT applied yet — the developer has not run since. "
+                    "Never describe a queued or planned fix as applied; it "
+                    "belongs under Next Steps, not Done."
+                )
+        return "\n".join(lines)
+
     async def _maybe_compact_tester_round(
         self, task: Task, live_tokens: int | None, *, force: bool = False
     ) -> bool:
@@ -920,6 +1011,16 @@ class PipelineCompactionLayer(DrCodeState):
         instead of burning the API budget forever.
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
+        # Was the round's set_verification verdict already issued — by this
+        # transcript (the call is still visible) or by an EARLIER compaction
+        # of the same round (the call was summarized away, but the sticky
+        # flag remembers)? Recorded before anything is rewritten; on a
+        # successful compaction it seeds the resume warning (see
+        # tester_compaction_resume_prompt in pipeline_tester).
+        verdict_issued = (
+            tester_verdict_issued(round_messages) is not None
+            or task.id in self._tester_compaction_verdict
+        )
         tokens = self._fill_over_threshold(
             live_tokens, round_messages, AgentRole.TESTER
         )
@@ -986,6 +1087,7 @@ class PipelineCompactionLayer(DrCodeState):
                 task=task,
                 what="testing round",
                 hard=hard,
+                facts=self._tester_round_facts(task, round_messages, verdict_issued),
             )
         except asyncio.CancelledError:
             raise
@@ -1021,6 +1123,12 @@ class PipelineCompactionLayer(DrCodeState):
         task.touch()
         self.manager.storage.save(task)
         self._show_event(task, event)
+        if verdict_issued:
+            # The verdict call may have been summarized away by THIS
+            # compaction: the sticky flag keeps the "already issued" fact
+            # alive for any further compaction of the same round (and for
+            # the resumed round's warning).
+            self._tester_compaction_verdict.add(task.id)
         if self.viewed_id == task.id:
             self.view_task(task.id)
         return True

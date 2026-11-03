@@ -29,8 +29,14 @@
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
 
+  var DEFAULT_FONT_SIZE = 13;
+  var MIN_FONT_SIZE = 6;
+  var MAX_FONT_SIZE = 40;
+  var FONT_STEP = 1;
+
   var term = null;
   var fit = null;
+  var webgl = null;
   var ws = null;
   var currentProject = null;
   var started = false;
@@ -145,17 +151,77 @@
     term.loadAddon(fit);
     term.open(elTerminal);
     try {
-      var gl = new window.WebglAddon.WebglAddon();
-      gl.onContextLoss(function () { gl.dispose(); }); // xterm falls back to DOM renderer
-      term.loadAddon(gl);
+      webgl = new window.WebglAddon.WebglAddon();
+      webgl.onContextLoss(function () {
+        if (webgl) { webgl.dispose(); webgl = null; }
+      }); // xterm falls back to DOM renderer
+      term.loadAddon(webgl);
     } catch (err) {
+      webgl = null;
       /* no WebGL — the default renderer keeps everything working */
     }
+    term.attachCustomKeyEventHandler(terminalKeyHandler);
     term.onData(function (data) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(new TextEncoder().encode(data));
       }
     });
+  }
+
+  /* ---------------- font size (Ctrl+= / Ctrl+- / Ctrl+0) ----------------
+   * Without interception these combos would be forwarded to the PTY
+   * through term.onData; the custom handler swallows them (return false)
+   * and changes term.options.fontSize instead. The WebGL renderer in
+   * xterm 5.x can keep a stale glyph atlas across a font-size change, so
+   * the addon is re-created after each change; on failure the DOM
+   * renderer takes over. fit.fit() recomputes cols/rows for the new cell
+   * metrics and sendResize() propagates them to the PTY.
+   */
+
+  function applyFontSize(size) {
+    if (!term) return;
+    var clamped = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
+    if (clamped === term.options.fontSize) return;
+    term.options.fontSize = clamped;
+    if (webgl) {
+      try { webgl.dispose(); } catch (err) { /* already gone */ }
+      webgl = null;
+      try {
+        webgl = new window.WebglAddon.WebglAddon();
+        webgl.onContextLoss(function () {
+          if (webgl) { webgl.dispose(); webgl = null; }
+        });
+        term.loadAddon(webgl);
+      } catch (err) {
+        webgl = null; /* DOM renderer fallback */
+      }
+    }
+    if (fit) {
+      try { fit.fit(); } catch (err) { /* container not measurable */ }
+    }
+    sendResize();
+  }
+
+  function terminalKeyHandler(ev) {
+    if (ev.key === "F11") return true; // handled by the window listener
+    if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
+    var code = ev.code || "";
+    if (ev.key === "=" || ev.key === "+" || code === "NumpadAdd") {
+      ev.preventDefault();
+      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) + FONT_STEP);
+      return false;
+    }
+    if (ev.key === "-" || ev.key === "_" || code === "NumpadSubtract") {
+      ev.preventDefault();
+      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) - FONT_STEP);
+      return false;
+    }
+    if (ev.key === "0" || code === "Digit0" || code === "Numpad0") {
+      ev.preventDefault();
+      applyFontSize(DEFAULT_FONT_SIZE);
+      return false;
+    }
+    return true;
   }
 
   function currentSize() {

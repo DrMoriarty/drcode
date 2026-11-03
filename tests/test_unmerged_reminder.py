@@ -862,7 +862,7 @@ async def test_sidebar_row_marker_follows_merge_state(app_env: DrCodeApp) -> Non
 
 async def test_sidebar_row_marker_shows_resolver_gear(app_env: DrCodeApp) -> None:
     """While the automatic conflict resolver runs on a task, its row
-    renders 🛠️ instead of the regular marker (the orange unmerged ✓
+    renders ⚙ instead of the regular marker (the orange unmerged ✓
     included); after the round's `finally` clears the flags the regular
     marker is back."""
     app = app_env
@@ -876,10 +876,10 @@ async def test_sidebar_row_marker_shows_resolver_gear(app_env: DrCodeApp) -> Non
         app._resolver_running = True
         app._resolver_task_id = task.id
         row = app._task_row_text(task)
-        assert "🛠️" in row
+        assert "⚙" in row
         assert "✓" not in row
         other = app.manager.create("Other task", "other")
-        assert "🛠️" not in app._task_row_text(other)
+        assert "⚙" not in app._task_row_text(other)
         app._resolver_running = False
         app._resolver_task_id = None
         assert app._task_row_text(task) == plain

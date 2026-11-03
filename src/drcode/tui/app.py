@@ -91,7 +91,7 @@ from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem
 from .state import LiveTailEntry
-from .sync_output import apply_sync_output_override, sync_output_disabled
+from .sync_output import apply_sync_output_override, sync_output_should_be_off
 from .todo_panel import TodoPanel
 from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
@@ -407,10 +407,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     ]
 
     def __init__(self, project_root: Path) -> None:
-        # iTerm2 3.7.x workaround (see tui/sync_output.py): with
-        # DRCODE_DISABLE_SYNC_OUTPUT=1 set, stop textual from probing for /
-        # enabling DEC 2026 synchronized output — the terminal buffers the
-        # synced frames and keystroke echo lags 0.5–1.0 s. No-op otherwise.
+        # iTerm2 3.7.x workaround (see tui/sync_output.py): stop textual from
+        # probing for / enabling DEC 2026 synchronized output whenever it
+        # must stay off — DRCODE_DISABLE_SYNC_OUTPUT=1 explicitly, or on
+        # iTerm2 by default (the terminal buffers the synced frames and
+        # keystroke echo lags 0.5–1.0 s). No-op otherwise.
         apply_sync_output_override()
         super().__init__()
         # Resolve once: a relative or symlinked root would leak into storage,
@@ -1073,9 +1074,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self, message: messages.TerminalSupportsSynchronizedOutput
     ) -> None:
         """iTerm2 3.7.x workaround (see tui/sync_output.py): when
-        DRCODE_DISABLE_SYNC_OUTPUT is set, never flip ``_sync_available`` —
-        even if a DECRQM 2026 answer slips through, frames stay unwrapped."""
-        if sync_output_disabled():
+        synchronized output must stay off (explicit
+        DRCODE_DISABLE_SYNC_OUTPUT, or iTerm2 by default), never flip
+        ``_sync_available`` — even if a DECRQM 2026 answer slips through,
+        frames stay unwrapped."""
+        if sync_output_should_be_off():
             return
         super()._on_terminal_supports_synchronized_output(message)
 

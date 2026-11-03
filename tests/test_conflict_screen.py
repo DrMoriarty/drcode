@@ -1127,7 +1127,11 @@ async def test_numstat_long_path_elision_keeps_tail_and_counts(
     _git(isolated, "add", "-A")
     _git(isolated, "commit", "-qm", "gitignore")
     long_rel = (
-        Path("very") / "deep" / "nested" / "directory" / "structure"
+        Path("very")
+        / "deep"
+        / "nested"
+        / "directory"
+        / "structure"
         / "_is_pretty_long.txt"
     )
     (isolated / long_rel).parent.mkdir(parents=True)

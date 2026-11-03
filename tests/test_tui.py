@@ -2143,7 +2143,9 @@ async def test_search_dialog_opens_draft_focuses_new_task_editor(
         for char in "websocket":
             await pilot.press(char)
         await wait_until(
-            lambda: bool(_result_ids(app.screen)) and draft.id in _result_ids(app.screen),
+            lambda: (
+                bool(_result_ids(app.screen)) and draft.id in _result_ids(app.screen)
+            ),
             pilot,
         )
         await pilot.press("enter")

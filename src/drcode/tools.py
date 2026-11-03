@@ -497,6 +497,8 @@ def _split_segments(command: str) -> list[str]:
             i += 1
     segments.append(command[start:])
     return segments
+
+
 _DESTRUCTIVE_WORD = re.compile(r"(?:^|[\s;&|(])(sudo\s+)?(rm|mv|cp)\b")
 # Conservative fallback for unparsable segments: any `git … stash …` in there.
 _GIT_STASH_WORD = re.compile(r"\bgit\b[^;&|]*\bstash\b")

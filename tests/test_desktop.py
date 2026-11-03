@@ -322,3 +322,83 @@ async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:
             assert "not a directory" in event["message"]
     finally:
         await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# app.py — frozen pywebview JS-asset shim (get_js_dir)
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_js_dir_shim_prefers_meipass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frozen onedir layout: webview_js under sys._MEIPASS is picked."""
+    import app as app_mod  # type: ignore[import-not-found]
+    import webview.util
+
+    bundled = tmp_path / "webview_js"
+    bundled.mkdir()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    original = webview.util.get_js_dir
+    try:
+        app_mod._fix_frozen_pywebview_js()
+        assert webview.util.get_js_dir() == str(bundled)
+    finally:
+        webview.util.get_js_dir = original
+
+
+def test_frozen_js_dir_shim_finds_macos_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS .app layout: datas live in Contents/Resources, _MEIPASS in
+    Contents/Frameworks — the shim must find them via the executable path."""
+    import app as app_mod  # type: ignore[import-not-found]
+    import webview.util
+
+    fake_app = tmp_path / "DrCode.app" / "Contents"
+    (fake_app / "MacOS").mkdir(parents=True)
+    resources_js = fake_app / "Resources" / "webview_js"
+    resources_js.mkdir(parents=True)
+    fake_exe = fake_app / "MacOS" / "DrCode"
+    fake_exe.write_text("")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_app / "Frameworks"), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    original = webview.util.get_js_dir
+    try:
+        app_mod._fix_frozen_pywebview_js()
+        assert webview.util.get_js_dir() == str(resources_js)
+    finally:
+        webview.util.get_js_dir = original
+
+
+def test_frozen_js_dir_shim_falls_back_without_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frozen but webview_js missing everywhere: fall back to original logic."""
+    import app as app_mod  # type: ignore[import-not-found]
+    import webview.util
+
+    empty = tmp_path / "nowhere"
+    empty.mkdir()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(empty), raising=False)
+    original = webview.util.get_js_dir
+    try:
+        app_mod._fix_frozen_pywebview_js()
+        # In the test venv the original logic resolves the real webview/js.
+        assert webview.util.get_js_dir() == original()
+    finally:
+        webview.util.get_js_dir = original
+
+
+def test_js_dir_shim_noop_when_not_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dev mode: the shim must not touch webview.util.get_js_dir."""
+    import app as app_mod  # type: ignore[import-not-found]
+    import webview.util
+
+    original = webview.util.get_js_dir
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    app_mod._fix_frozen_pywebview_js()
+    assert webview.util.get_js_dir is original

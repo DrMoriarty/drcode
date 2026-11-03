@@ -44,6 +44,56 @@ APP_TITLE = "DrCode"
 WINDOW_DEFAULTS = {"width": 1100, "height": 760, "min_size": (480, 320)}
 
 
+def _frozen_js_dir_candidates() -> list[str]:
+    """Where desktop.spec may have placed the webview_js data directory.
+
+    PyInstaller's data placement differs per layout: onedir (Linux
+    AppImage/.deb, Windows) puts datas under ``sys._MEIPASS``; the macOS
+    .app bundle puts data-only directories in ``Contents/Resources``
+    while ``sys._MEIPASS`` points at ``Contents/Frameworks``.
+    """
+    meipass = getattr(sys, "_MEIPASS", "")
+    exe_dir = os.path.dirname(sys.executable)
+    candidates = []
+    if meipass:
+        candidates.append(os.path.join(meipass, "webview_js"))
+    candidates.append(os.path.join(exe_dir, "..", "Resources", "webview_js"))
+    candidates.append(os.path.join(exe_dir, "webview_js"))
+    return candidates
+
+
+def _fix_frozen_pywebview_js() -> None:
+    """Point pywebview's get_js_dir at the bundled JS assets when frozen.
+
+    In a PyInstaller bundle pywebview's pure modules live in the PYZ and
+    ``webview.util.get_js_dir`` looks for a ``webview/js`` directory next
+    to a ``__file__`` that does not exist on disk; its only fallback is
+    the py2app layout, so it raises FileNotFoundError. The cocoa/gtk
+    backends swallow that exception inside ``inject_pywebview`` and the
+    ``window.pywebview`` bridge is never injected (no native dialogs,
+    recents, clipboard fallback, fullscreen, set_title). desktop.spec
+    ships the assets to ``webview_js``; ``load_js_files`` resolves
+    ``get_js_dir`` through the module globals at call time, so replacing
+    the attribute is enough. Dev mode is untouched.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    import webview.util
+
+    original = webview.util.get_js_dir
+    bundled = next(
+        (os.path.abspath(c) for c in _frozen_js_dir_candidates() if os.path.isdir(c)),
+        None,
+    )
+
+    def _get_js_dir() -> str:
+        if bundled is not None:
+            return bundled
+        return original()
+
+    webview.util.get_js_dir = _get_js_dir
+
+
 class DesktopApi:
     """Methods exposed to the web page as ``window.pywebview.api.*``.
 
@@ -212,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.project:
         url += f"&project={args.project}"
     print(f"[desktop] serving on {ctx.base_url}, window url ready", flush=True)
+
+    _fix_frozen_pywebview_js()
 
     window_holder: dict = {}
     api = DesktopApi(window_holder, ctx, payload)

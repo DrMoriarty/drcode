@@ -33,6 +33,29 @@ datas = [
     # desktop/server.py from web/ next to the frozen modules.
     (str(DESKTOP / "web"), "web"),
 ]
+
+# pywebview's JS bridge assets (api.js/finish.js/...): pywebview's own
+# PyInstaller hook collects webview/js ONLY on Windows (is_win), so on
+# macOS/Linux the frozen app has no webview/ directory on disk at all
+# (pure modules live in the PYZ). webview.util.get_js_dir() then raises
+# FileNotFoundError inside inject_pywebview — the exception is swallowed
+# by the GUI backend and window.pywebview is never created (no native
+# dialogs, recents, clipboard bridge, fullscreen, set_title). Ship the
+# directory deterministically; the frozen shim in desktop/app.py points
+# get_js_dir at it (see _fix_frozen_pywebview_js).
+import importlib.util as _importlib_util
+
+_wv_spec = _importlib_util.find_spec("webview")
+if _wv_spec is not None and _wv_spec.origin:
+    _wv_js = (Path(_wv_spec.origin).parent / "js").resolve()
+    if _wv_js.is_dir():
+        datas.append((str(_wv_js), "webview_js"))
+else:
+    print(
+        "WARNING: pywebview not importable at spec time — webview_js data "
+        "will be missing and the frozen shell will have no bridge.",
+        file=sys.stderr,
+    )
 if (payload / exe_name).is_file():
     # The drcode onedir bundle, byte-for-byte as scripts/build-binary.sh
     # produced it: the shell never modifies its payload.

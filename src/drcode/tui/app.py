@@ -167,7 +167,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     }
     OptionList {
         padding: 0;
-        & > .option-list--option { padding: 0; }
+        # Keep the rows 1 line tall, but preserve a 2-column left inset so
+        # the option text is not glued to the modal's edge (Settings and
+        # the option pickers).
+        & > .option-list--option { padding: 0 2 0 2; }
     }
     Button:focus, Input:focus, Switch:focus, Checkbox:focus,
     RadioButton:focus, OptionList:focus, Select:focus > SelectCurrent {
@@ -360,10 +363,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #nt-kind-label.kind-feature { color: green; }
     #nt-kind-label.kind-bug { color: red; }
     #nt-kind-label.kind-research { color: yellow; }
-    #nt-hint { width: auto; color: $text-disabled; }
+    # The hint and the kind descriptions must stay inside the form's 80%
+    # width: an auto-width child wider than the container (the hint line
+    # is ~130 columns of key hints) clamps the group's horizontal
+    # alignment to 0 and glues the whole form — the centered input
+    # included — to the left edge.
+    #nt-hint {
+        width: 80%;
+        text-align: center;
+        color: $text-disabled;
+    }
     #nt-kinds {
-        width: auto;
+        width: 80%;
         margin-top: 1;
+        text-align: center;
         color: $text-disabled;
     }
     """

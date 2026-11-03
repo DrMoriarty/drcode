@@ -246,9 +246,18 @@ class PipelineAgentRunLayer(DrCodeState):
                             if Agent.is_model_request_node(node):
                                 stream.begin_node()
                                 async with node.stream(run.ctx) as node_stream:
-                                    async for event in node_stream:
-                                        stream.feed(event)
-                                stream.finish_node()
+                                    try:
+                                        async for event in node_stream:
+                                            stream.feed(event)
+                                    finally:
+                                        # A mid-stream death (network error,
+                                        # abort) propagates out of the run
+                                        # loop, skipping the normal node
+                                        # end: stop the blocks' spinners
+                                        # here, or they keep animating
+                                        # through the retry backoff (and
+                                        # the outage wait).
+                                        stream.finish_node()
                                 self._agent_model_request_done(
                                     task, task_id, run, consumed, text, role
                                 )

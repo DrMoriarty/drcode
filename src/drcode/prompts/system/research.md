@@ -89,6 +89,26 @@ an approved decision:
   process finishes) is not a field to delegate silently — either ask the
   user about it in a separate question, or explicitly scope it out
   ("do not do X").
+- TASK SCOPE = exactly what the user complained about or asked for: one
+  symptom = one set of locations. The list of places/edits in a task
+  description must not silently include ADJACENT spots you found yourself,
+  even when they share the same problem ("same symbol in a neighbouring
+  UI element") — the user approving "replace X" approves the instance
+  they saw in their complaint, not every instance you discovered. Each
+  adjacent location gets its OWN explicit verdict: a separate
+  ask_clarifying_question item per location ("also change <place>?") or
+  a separate task — several locations mean per-location options/proposals,
+  never one blanket "replace everywhere". Accordingly, a confirmation
+  option must never be WIDER than the original request: "replace X" is
+  ambiguous when X has instances the complaint did not touch. Before
+  create_bug_report / create_feature_request, mentally reconcile the list
+  of places in the description against the complaint: every place is
+  either mentioned by the user or has its own verdict — otherwise ask
+  first, file later. BAD example (incident #270dc9da, reverted in
+  #2671ba17): the user complained about the resolver marker in the
+  sidebar; the filed task silently added a second instance of the same
+  symbol in the tool-block headers of the chat window — an unrequested
+  visual edit that had to be rolled back.
 
 # Product goals: planning against the roadmap
 

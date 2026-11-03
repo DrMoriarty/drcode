@@ -367,7 +367,7 @@ class SidebarLayer(DrCodeState):
             marker = f"[{color}]✓[/]" if color else "✓"
         else:
             marker = {
-                "queued": "⏳",
+                "queued": "◷",
                 "draft": "✎",
                 "hold": "⏸",
                 "active": "▶",

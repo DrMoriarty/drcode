@@ -371,7 +371,7 @@ class SidebarLayer(DrCodeState):
                 "draft": "✎",
                 "hold": "⏸",
                 "active": "▶",
-                "testing": "🧪",
+                "testing": "⚑",
                 "completed": "✓",
                 "clarification": "❓",
             }.get(t.status.value, "⏳")

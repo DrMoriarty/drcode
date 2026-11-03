@@ -33,6 +33,12 @@ from typing import Any, Final
 ENV_VAR: Final = "DRCODE_DISABLE_SYNC_OUTPUT"
 ENABLE_ENV_VAR: Final = "DRCODE_ENABLE_SYNC_OUTPUT"
 
+# How long the TUI waits for the terminal's DECRQM 2026 answer before
+# declaring the synchronized-output mode off (the probe went out, no
+# ``TerminalSupportsSynchronizedOutput`` arrived): see
+# ``DrCodeApp._start_sync_mode_report``.
+ANSWER_TIMEOUT: Final = 1.0
+
 _TRUTHY: Final = frozenset({"1", "true", "yes", "on"})
 
 # The Linux drivers are the only ones that send the DECRQM probe
@@ -82,6 +88,28 @@ def sync_output_should_be_off() -> bool:
     if _truthy(ENABLE_ENV_VAR):
         return False
     return is_iterm2()
+
+
+def sync_output_off_reason() -> str | None:
+    """Why synchronized output is forced off — or None when undecided.
+
+    A string covers the branches of the priority matrix whose outcome is
+    known without asking the terminal: the explicit opt-out (reported
+    with the actual variable value) and the iTerm2 default. None means
+    the probe goes out and the effective state only becomes known when
+    the terminal's DECRQM 2026 answer arrives (or the
+    :data:`ANSWER_TIMEOUT` expires with no answer — then it counts as
+    off). The returned string is the diagnostic value surfaced in the
+    startup toast and the app log.
+    """
+    if sync_output_disabled():
+        value = os.environ.get(ENV_VAR, "").strip()
+        return f"{ENV_VAR}={value or '1'}"
+    if _truthy(ENABLE_ENV_VAR):
+        return None
+    if is_iterm2():
+        return "iTerm2 default"
+    return None
 
 
 def apply_sync_output_override() -> None:

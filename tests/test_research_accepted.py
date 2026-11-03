@@ -102,6 +102,12 @@ def track_toasts(app: DrCodeApp) -> list[tuple[str, str]]:
     toasts: list[tuple[str, str]] = []
 
     def notify(message: str = "", *, title: str = "", **_: Any) -> None:
+        # Same exclusion as test_unmerged_reminder.track_toasts: the
+        # startup DEC 2026 diagnostics toast fires from on_mount (its
+        # ~1 s no-answer branch can land inside a slow test) and is not
+        # part of what these hook tests assert on.
+        if message.startswith("Synchronized output (DEC 2026):"):
+            return
         toasts.append((title, message))
 
     app.notify = notify  # type: ignore[method-assign]

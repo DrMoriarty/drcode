@@ -201,6 +201,14 @@ def track_toasts(app: DrCodeApp) -> list[tuple[str, str]]:
     toasts: list[tuple[str, str]] = []
 
     def notify(message: str = "", *, title: str = "", **_: Any) -> None:
+        # The startup DEC 2026 diagnostics toast (tui/sync_output.py) is
+        # unrelated to the unmerged-work reminders under test: it fires
+        # from on_mount in every app-mounting test — with the switches
+        # stripped it is the probe branch, whose ~1 s no-answer timer can
+        # still land inside a slow test — and must not reach the empty-
+        # toast assertions.
+        if message.startswith("Synchronized output (DEC 2026):"):
+            return
         toasts.append((title, message))
 
     app.notify = notify  # type: ignore[method-assign]

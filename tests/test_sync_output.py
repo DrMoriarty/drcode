@@ -23,11 +23,13 @@ from textual.app import App
 
 from drcode.tui.app import DrCodeApp
 from drcode.tui.sync_output import (
+    ANSWER_TIMEOUT,
     ENABLE_ENV_VAR,
     ENV_VAR,
     apply_sync_output_override,
     is_iterm2,
     sync_output_disabled,
+    sync_output_off_reason,
     sync_output_should_be_off,
 )
 
@@ -299,3 +301,168 @@ def test_app_handler_accepts_sync_support_on_iterm2_with_enable(
     # The gate let it through to the (stubbed) stock handling.
     assert seen == [message]
     assert app._sync_available is False  # the stub above never flips it
+
+
+# ---------------------------------------------------------------------------
+# Startup announcement (toast + app log, with the reason)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTimer:
+    """Stand-in for textual's Timer: records stop() calls only."""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class _Capture:
+    """Everything the announcement machinery emits, recorded."""
+
+    def __init__(self) -> None:
+        self.toasts: list[str] = []
+        self.log_lines: list[str] = []
+        self.timers: list[tuple[float, Any]] = []
+
+    @property
+    def announced(self) -> list[str]:
+        """The texts as they appear (both channels must carry them)."""
+        return self.toasts
+
+
+def _capture_announcement(monkeypatch: pytest.MonkeyPatch, app: DrCodeApp) -> _Capture:
+    """Hook notify/log/set_timer on an UNMOUNTED app so the announce
+    methods can run without a live event loop."""
+    cap = _Capture()
+
+    def _fake_set_timer(delay: float, callback: Any, **_kwargs: Any) -> _FakeTimer:
+        cap.timers.append((delay, callback))
+        return _FakeTimer()
+
+    monkeypatch.setattr(app, "notify", lambda text, **kw: cap.toasts.append(text))
+    monkeypatch.setattr(
+        DrCodeApp,
+        "log",
+        property(lambda self: lambda text: cap.log_lines.append(text)),
+    )
+    monkeypatch.setattr(app, "set_timer", _fake_set_timer)
+    return cap
+
+
+def test_off_reason_from_disable_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_VAR, "1")
+    assert sync_output_off_reason() == "DRCODE_DISABLE_SYNC_OUTPUT=1"
+    monkeypatch.setenv(ENV_VAR, " true ")
+    assert sync_output_off_reason() == "DRCODE_DISABLE_SYNC_OUTPUT=true"
+
+
+def test_off_reason_none_when_decided_by_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain terminal (or an explicit enable): the probe goes out and the
+    effective state is only known from the DECRQM answer — no reason yet."""
+    _set_terminal(monkeypatch, None)
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.delenv(ENABLE_ENV_VAR, raising=False)
+    assert sync_output_off_reason() is None
+    _set_terminal(monkeypatch, "term_program")
+    monkeypatch.setenv(ENABLE_ENV_VAR, "1")
+    assert sync_output_off_reason() is None
+
+
+@pytest.mark.parametrize("how", ["term_program", "lc_terminal"])
+def test_startup_announce_off_iterm2_default(
+    how: str, project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The iTerm2 default-off is known at startup: immediate toast + log
+    line, no answer timer."""
+    _set_terminal(monkeypatch, how)
+    app = DrCodeApp(project_root)
+    cap = _capture_announcement(monkeypatch, app)
+    app._start_sync_mode_report()
+    expected = "Synchronized output (DEC 2026): off (iTerm2 default)"
+    assert cap.toasts == [expected]
+    assert cap.log_lines == [expected]
+    assert cap.timers == []
+    # One-time: a second resolution attempt must not repeat it.
+    app._start_sync_mode_report()
+    app._announce_sync_mode(True, "")
+    assert cap.toasts == [expected]
+
+
+def test_startup_announce_off_disable_env(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit opt-out is reported with the actual variable value."""
+    monkeypatch.setenv(ENV_VAR, "1")
+    app = DrCodeApp(project_root)
+    cap = _capture_announcement(monkeypatch, app)
+    app._start_sync_mode_report()
+    expected = "Synchronized output (DEC 2026): off (DRCODE_DISABLE_SYNC_OUTPUT=1)"
+    assert cap.toasts == [expected]
+    assert cap.log_lines == [expected]
+    assert cap.timers == []
+
+
+def test_startup_announce_no_answer_timeout(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe sent (plain terminal): nothing is announced until either the
+    timeout fires — "off (no terminal answer)" — or the terminal answers."""
+    _set_terminal(monkeypatch, None)
+    app = DrCodeApp(project_root)
+    cap = _capture_announcement(monkeypatch, app)
+    app._start_sync_mode_report()
+    assert cap.toasts == []
+    assert len(cap.timers) == 1
+    delay, callback = cap.timers[0]
+    assert delay == ANSWER_TIMEOUT
+    callback()
+    expected = "Synchronized output (DEC 2026): off (no terminal answer)"
+    assert cap.toasts == [expected]
+    assert cap.log_lines == [expected]
+
+
+def test_startup_announce_on_when_terminal_answers(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe sent, terminal answers "yes": "on" is announced and the
+    no-answer timer is retired — firing it afterwards changes nothing."""
+    _set_terminal(monkeypatch, None)
+    monkeypatch.setattr(
+        App,
+        "_on_terminal_supports_synchronized_output",
+        lambda self, message: None,
+    )
+    app = DrCodeApp(project_root)
+    cap = _capture_announcement(monkeypatch, app)
+    app._start_sync_mode_report()
+    app._on_terminal_supports_synchronized_output(
+        messages.TerminalSupportsSynchronizedOutput()
+    )
+    assert cap.toasts == ["Synchronized output (DEC 2026): on"]
+    assert cap.log_lines == ["Synchronized output (DEC 2026): on"]
+    # The pending timeout was stopped with the announcement...
+    _delay, callback = cap.timers[0]
+    callback()
+    # ...so the late fire must not produce a contradicting "off" toast.
+    assert cap.toasts == ["Synchronized output (DEC 2026): on"]
+
+
+def test_gated_message_never_announces_on(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With sync forced off, a slipping-through support message changes
+    nothing: no "on" toast, and the startup report still says off."""
+    monkeypatch.setenv(ENV_VAR, "1")
+    app = DrCodeApp(project_root)
+    cap = _capture_announcement(monkeypatch, app)
+    app._on_terminal_supports_synchronized_output(
+        messages.TerminalSupportsSynchronizedOutput()
+    )
+    assert cap.toasts == []
+    app._start_sync_mode_report()
+    expected = "Synchronized output (DEC 2026): off (DRCODE_DISABLE_SYNC_OUTPUT=1)"
+    assert cap.toasts == [expected]

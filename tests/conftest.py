@@ -62,6 +62,15 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         # _stderr_filter_argv() must decide "filter installed?" from the test's
         # own setup, not from the dogfooding parent's exec wrapper.
         "DRCODE_MSL_STDERR_FILTER",
+        # The DEC 2026 synchronized-output switches (tui/sync_output.py): a
+        # child pytest of a live TUI inherits them (iTerm2 sessions carry
+        # the disable by default), which would flip the app-mounting tests'
+        # startup diagnostics toast between branches. Stripped here, the
+        # probe branch is the only behavior app-mounting tests must
+        # tolerate (its ~1 s no-answer toast is filtered at the toast
+        # capture helpers).
+        "DRCODE_DISABLE_SYNC_OUTPUT",
+        "DRCODE_ENABLE_SYNC_OUTPUT",
     ):
         monkeypatch.delenv(name, raising=False)
 

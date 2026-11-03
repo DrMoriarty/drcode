@@ -763,6 +763,12 @@ class DrCodeState(App[None]):
     # Tasks whose pending round-resume follows a SUCCESSFUL compaction (see
     # run_tester): the continuation turn carries the resume note.
     _tester_compaction_resumed: set[str]
+    # Tasks whose testing round had ALREADY issued its set_verification
+    # verdict by the time a compaction landed (#490d5652 class): the resumed
+    # round must be warned not to re-issue it. Sticky across the round's
+    # compactions (the verdict call itself is summarized away by the first
+    # one); cleared when a FRESH round starts.
+    _tester_compaction_verdict: set[str]
 
     # -- merge-conflict resolver bookkeeping (single-slot worker) -----------
     _resolver_running: bool

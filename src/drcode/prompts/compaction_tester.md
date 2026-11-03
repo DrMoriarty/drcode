@@ -14,6 +14,14 @@
 ### Blocked
 - [blockers or "(none)"]
 
+## Verdict status
+- [copy VERBATIM from the <task-facts> block: either "verdict NOT issued
+  yet — issuing it is this round's remaining decision" or "verdict ALREADY
+  ISSUED (set_verification): final for this round, a second set_verification
+  in the same round is forbidden". A fix the conversation merely PLANS or
+  QUEUES (a report sent to the developer as input) is NOT applied: record
+  it under Next Steps as the developer's pending work, never under Done.]
+
 ## Verification evidence
 - [EVERY check already run in this round, VERBATIM: the tool (run_check /
   run_bash) and its exact command or module, and the exact outcome —

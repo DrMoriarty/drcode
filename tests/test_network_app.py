@@ -2130,6 +2130,194 @@ async def test_tester_round_compaction_replaces_round_transcript(
     assert any("[context summary]" in c and "THE SUMMARY BODY" in c for c in prompts)
 
 
+async def test_tester_round_compaction_records_issued_verdict_facts(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    project_root: Path,
+) -> None:
+    """A round compacted AFTER its set_verification verdict (the #490d5652
+    class): the summary prompt carries an authoritative <task-facts> block —
+    the verdict is ALREADY ISSUED and final, the fix a retry_here verdict
+    sent back is QUEUED (never applied), and the fix-round counter comes
+    from task.fix_rounds / max_dev_rounds, not from the conversation text —
+    and the task is flagged so the resumed round's continuation turn gets
+    the explicit "do not re-issue the verdict" warning."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    from drcode.tui.pipeline_tester import (
+        TESTER_COMPACTION_RESUME_PROMPT,
+        tester_compaction_resume_prompt,
+    )
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    task.fix_rounds = 1  # one failed fix round: round 2 of the default cap 3
+    # A round whose verdict (retry_here=True) was issued and returned before
+    # the compaction lands.
+    task.tester_messages = [
+        serialize_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content="Verify completed task #1")]
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="set_verification",
+                            args=(
+                                '{"success": false, "retry_here": true, '
+                                '"report": "regression"}'
+                            ),
+                            tool_call_id="c1",
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=900, output_tokens=8),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name="set_verification",
+                            content=(
+                                "Verification label set: failed. The task "
+                                "returns to development (round 2/3 of its "
+                                "fix loop)."
+                            ),
+                            tool_call_id="c1",
+                        )
+                    ]
+                ),
+            ]
+        )
+    ]
+    net_app_small_ctx.manager.storage.save(task)
+    scripted.steps = [text_response("THE SUMMARY BODY")]  # compaction summarizer
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        assert await net_app_small_ctx._maybe_compact_tester_round(task, 900) is True
+
+    # The summarizer's prompt carries the authoritative facts anchor.
+    assert "<task-facts>" in scripted.calls[0]
+    assert "ALREADY ISSUED" in scripted.calls[0]
+    assert "set_verification(success=False, retry_here=True)" in scripted.calls[0]
+    assert "NOT applied yet" in scripted.calls[0]
+    assert "cap 3" in scripted.calls[0]
+    assert "the fix-round cap is NOT reached" in scripted.calls[0]
+    assert "1 failed fix round(s) so far" in scripted.calls[0]
+    # The task is flagged: the resumed continuation turn must warn against a
+    # second set_verification in the same round.
+    assert task.id in net_app_small_ctx._tester_compaction_verdict
+    warned = tester_compaction_resume_prompt(True)
+    assert TESTER_COMPACTION_RESUME_PROMPT in warned
+    assert "Do NOT call set_verification again in this round" in warned
+    # Without a pre-compaction verdict the plain resume note is unchanged.
+    assert tester_compaction_resume_prompt(False) is TESTER_COMPACTION_RESUME_PROMPT
+
+
+def test_tester_verdict_issued_scans_round_transcript() -> None:
+    """tester_verdict_issued finds the round's set_verification call and its
+    tool result (args parsed from the serialized form) — and returns None
+    for a round that has not issued its verdict yet."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    from drcode.agent import tester_verdict_issued
+
+    plain = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="Verify completed task #1")]),
+            ModelResponse(parts=[]),
+        ]
+    )
+    assert tester_verdict_issued(plain) is None
+
+    issued = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="Verify completed task #1")]),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="set_verification",
+                        args={"success": False, "retry_here": True},
+                        tool_call_id="x1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="set_verification",
+                        content="returns to development",
+                        tool_call_id="x1",
+                    )
+                ]
+            ),
+        ]
+    )
+    verdict = tester_verdict_issued(issued)
+    assert verdict is not None
+    assert verdict["args"] == {"success": False, "retry_here": True}
+    assert verdict["result"] == "returns to development"
+
+
+async def test_tester_round_compaction_without_verdict_facts_say_not_issued(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    project_root: Path,
+) -> None:
+    """A round compacted BEFORE its verdict: the facts anchor states the
+    verdict is NOT issued yet — the resumed round still owns the decision —
+    and no resume-warning flag is set."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    net_app_small_ctx.manager.set_hold(task.id, on=True)
+    task.tester_messages = [
+        serialize_messages(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content="Verify completed task #1")]
+                ),
+                ModelResponse(
+                    parts=[TextPart("collecting evidence")],
+                    usage=RequestUsage(input_tokens=900, output_tokens=8),
+                ),
+            ]
+        )
+    ]
+    net_app_small_ctx.manager.storage.save(task)
+    scripted.steps = [text_response("THE SUMMARY BODY")]  # compaction summarizer
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        assert await net_app_small_ctx._maybe_compact_tester_round(task, 900) is True
+
+    assert "<task-facts>" in scripted.calls[0]
+    assert "NOT issued yet" in scripted.calls[0]
+    assert "ALREADY ISSUED" not in scripted.calls[0]
+    assert task.id not in net_app_small_ctx._tester_compaction_verdict
+
+
 async def test_tester_round_compaction_failure_is_not_fatal(
     net_app_small_ctx: DrCodeApp,
     wide_compaction: None,

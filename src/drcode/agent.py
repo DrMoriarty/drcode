@@ -67,6 +67,7 @@ from .compaction import (
     render_history_for_summary,
     slice_budget_tokens,
     split_original_prompts,
+    tester_verdict_issued,
 )
 from .prompts import (
     BUG_SYSTEM_PROMPT,
@@ -203,6 +204,7 @@ __all__ = [
     "split_original_prompts",
     "subagent_limit_for",
     "task_search",
+    "tester_verdict_issued",
     "todo_dynamic_instructions",
     "todo_instructions",
     "tools",

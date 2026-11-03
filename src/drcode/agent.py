@@ -93,6 +93,12 @@ from .subagents import (
     subagent_limit_for,
 )
 from .task_manager import TaskManager
+from .title_gen import (
+    TITLE_MAX_LEN,
+    build_title_agent,
+    build_title_prompt,
+    clean_generated_title,
+)
 from .tool_runtime import (
     _run_bash_logged,
     _run_tool,
@@ -130,6 +136,7 @@ __all__ = [
     "RESOLVER_SYSTEM_PROMPT",
     "TESTER_SYSTEM_PROMPT",
     "TESTER_SYSTEM_PROMPT_NO_COMMIT",
+    "TITLE_MAX_LEN",
     "TODO_MIN_ITEMS",
     "AgentDeps",
     "AsyncOpenAI",
@@ -169,7 +176,10 @@ __all__ = [
     "build_resolver_reviewer_agent",
     "build_subagent_agent",
     "build_tester_agent",
+    "build_title_agent",
+    "build_title_prompt",
     "chunk_history_for_summary",
+    "clean_generated_title",
     "compacted_messages",
     "ends_with_open_request",
     "extract_display",

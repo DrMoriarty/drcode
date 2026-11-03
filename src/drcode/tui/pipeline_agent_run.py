@@ -29,6 +29,9 @@ from ..agent import (
     SubagentGate,
     backdate_user_prompt,
     build_agent,
+    build_title_agent,
+    build_title_prompt,
+    clean_generated_title,
     ends_with_open_request,
     is_pending_retry,
     last_response_usage,
@@ -76,6 +79,55 @@ class PipelineAgentRunLayer(DrCodeState):
             exclusive=True,
         )
 
+    async def _maybe_generate_title(self, task: Task, role: AgentRole) -> None:
+        """Generate the task's title from its description with the model
+        serving the task (project setting ``generate_task_titles``).
+
+        Exactly-once semantics come from ``task.title_generated``: set only
+        on SUCCESS, so a re-activation never re-generates a generated title
+        and a failed one keeps the first-line title while the NEXT
+        activation may retry — one bounded attempt per activation, never a
+        loop within a run, and never fatal for the run itself. A task with
+        nothing queued (an unfinished resume) has no description to name it
+        from and is skipped silently. Tasks that never reach this worker
+        (hold / draft / queued) keep the title derived at creation/edit.
+        """
+        if not self.settings.generate_task_titles or task.title_generated:
+            return
+        description = self.manager.editable_condition(task.id)
+        if not description:
+            return
+        try:
+            agent = build_title_agent(self.resolved_config(role))
+            result = await agent.run(build_title_prompt(description))
+            # The title call counts toward the session usage like every
+            # other model call (under the task's serving role).
+            self._record_session_usage(
+                result.usage, role, self.resolved_model_key(role)
+            )
+            title = clean_generated_title(result.output)
+        except Exception as e:  # noqa: BLE001 - a failed title must not kill the run
+            self._show_event_once(
+                task,
+                "Title generation failed "
+                f"({type(e).__name__}: {e}); keeping the old title.",
+            )
+            return
+        if title is None:
+            self._show_event_once(
+                task,
+                "Title generation returned an empty name; keeping the old title.",
+            )
+            return
+        old_title = task.title
+        task.title = title
+        task.title_generated = True
+        task.touch()
+        self.manager.storage.save(task)
+        self._show_event_once(task, f"Task title generated: {old_title} → {title}.")
+        self.refresh_sidebar()
+        self.refresh_status()
+
     async def _run_agent_worker(self, task_id: str) -> None:
         generation = self._agent_generations.get(task_id, 0) + 1
         self._agent_generations[task_id] = generation
@@ -104,6 +156,12 @@ class PipelineAgentRunLayer(DrCodeState):
                     "available.",
                 )
                 return
+            # Agent-generated task title (project setting
+            # generate_task_titles): on the FIRST activation only, before
+            # the run loop consumes the pending input — so the user sees
+            # the new name on the active task from the very start. Never
+            # fatal: the helper swallows its own failures.
+            await self._maybe_generate_title(task, role)
             (
                 root,
                 agent,

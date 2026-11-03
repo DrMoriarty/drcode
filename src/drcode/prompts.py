@@ -286,6 +286,16 @@ def load_compaction_prompts(tester: bool = False) -> tuple[str, str]:
     return system, template
 
 
+def load_title_prompt() -> str:
+    """System prompt of the task-title generator (see drcode.title_gen).
+
+    Instructs a one-line namer: same language as the description, short
+    enough for the sidebar, title line only. The task description itself
+    rides in the user prompt built by title_gen.build_title_prompt.
+    """
+    return (_PROMPTS_DIR / "title.txt").read_text(encoding="utf-8")
+
+
 def load_init_repo_prompt(project_root: Path) -> str:
     """Prompt for the "Update/create AGENTS.md" research task.
 

@@ -461,6 +461,18 @@ class ProjectSettings(BaseModel):
     # report becomes a draft too, which does not disturb the loop itself
     # (the failed task has already completed by then).
     agent_creates_drafts: bool = False
+    # Agent-generated task titles: when on, the FIRST activation of a task
+    # asks the model serving the task (the same role config the run itself
+    # uses) to write a short title from the task's description — before the
+    # main run starts, so the user sees the new name on the active task
+    # from the very beginning. Off (the default) keeps the historical
+    # first-line-of-the-prompt title untouched. Generation is exactly-once
+    # per task lifetime (the `Task.title_generated` stamp, set on success
+    # only): a re-activation never re-generates, a failed one keeps the old
+    # title and lets the NEXT activation retry. Tasks that never reach the
+    # agent (hold / draft / queued) keep the derived title — the generator
+    # runs only in the agent-run worker.
+    generate_task_titles: bool = False
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

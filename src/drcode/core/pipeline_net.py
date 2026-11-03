@@ -12,29 +12,25 @@ import time
 from collections import deque
 from functools import partial
 
-from textual.css.query import NoMatches
-
 from ..agent import probe_model
 from ..models import Task, TaskStatus
 from ..providers import AgentRole
-from .state import DrCodeState
+from .state import CoreState
 from .usage import NETWORK_OUTAGE_PROBE_INTERVAL, NETWORK_RETRIES, tcp_reachable
 
 
-class PipelineNetLayer(DrCodeState):
+class PipelineNetLayer(CoreState):
     async def _check_model(self) -> None:
-        try:
-            await self._check_model_inner()
-        except NoMatches:
-            # Teardown race: the probe round-trip can outlive the app (ESC
-            # while the gateway answers slowly) — the header label is gone
-            # by the time the worker resumes; the indicator is cosmetic,
-            # so a vanished widget just ends the check quietly.
-            pass
+        # The NoMatches teardown guard lives in the host layer
+        # (tui.header_view): the probe round-trip can outlive the app (ESC
+        # while the gateway answers slowly) — the header label is gone by
+        # the time the worker resumes; the indicator is cosmetic, so a
+        # vanished widget just ends the check quietly. The core only sees
+        # the host seam below.
+        await self._check_model_inner()
 
     async def _check_model_inner(self) -> None:
-        label = self.model_status
-        was_error = label.has_class("error")
+        was_error = self.host.host_model_status_is_error()
         # The header shows the ACTIVE role's model connection (research >
         # coder > tester > resolver, coding when idle — see
         # _active_header_role); _render_model_status re-fires this probe
@@ -45,9 +41,7 @@ class PipelineNetLayer(DrCodeState):
         if not config.is_ready:
             self._conn_label = "○ model not configured"
             self._last_probe_ms = None
-            label.remove_class("ok", "error")
-            label.add_class("warn")
-            self._render_model_status()
+            self.host.host_publish_model_status("○ model not configured", "warn")
             return
         model = config.model
         started = time.monotonic()
@@ -65,15 +59,11 @@ class PipelineNetLayer(DrCodeState):
         if not ok:
             self._probe_fail_streak += 1
             self._conn_label = f"✗ {model} — {detail}"
-            label.remove_class("ok", "warn")
-            label.add_class("error")
-            self._render_model_status()
+            self.host.host_publish_model_status(self._conn_label, "error")
             return
         self._probe_fail_streak = 0
         self._conn_label = f"● {model}"
-        label.remove_class("warn", "error")
-        label.add_class("ok")
-        self._render_model_status()
+        self.host.host_publish_model_status(self._conn_label, "ok")
         if was_error:
             self._recover_from_outage()
 
@@ -109,9 +99,9 @@ class PipelineNetLayer(DrCodeState):
         without burning full model requests (and the transcript entries
         they would leave behind) on a host that cannot even accept a
         TCP connection."""
-        if self._exit or not self.is_running:
+        if not self.host.host_active:
             return
-        self.run_worker(
+        self.host.host_spawn_worker(
             partial(self._outage_probe, task_id, role),
             name=f"outage probe {task_id}",
             group=f"outage-{task_id}",

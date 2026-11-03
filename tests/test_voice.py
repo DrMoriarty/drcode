@@ -1097,7 +1097,7 @@ async def test_sticky_error_cleared_by_next_dictation_action(
         # complete a fresh transcription.
         controller._state = _State.TRANSCRIBING
         controller._target = app.chat_input
-        controller._context = controller._snapshot_context(app.chat_input)
+        controller._context = controller._host.voice_context_of(app.chat_input)
         controller._fail("ASR failed: HTTP 500")
         assert controller._sticky_error == "ASR failed: HTTP 500"
         app._render_model_status()
@@ -1105,7 +1105,7 @@ async def test_sticky_error_cleared_by_next_dictation_action(
 
         controller._state = _State.TRANSCRIBING
         controller._target = app.chat_input
-        controller._context = controller._snapshot_context(app.chat_input)
+        controller._context = controller._host.voice_context_of(app.chat_input)
         controller._insert(app.chat_input, "hello")
         await pilot.pause()
         assert controller._sticky_error is None
@@ -1143,7 +1143,7 @@ async def test_sticky_error_cleared_by_any_user_action(project_root: Any) -> Non
 
         controller._state = _State.RECORDING
         controller._target = app.chat_input
-        controller._context = controller._snapshot_context(app.chat_input)
+        controller._context = controller._host.voice_context_of(app.chat_input)
         controller._fail("ASR failed: HTTP 500")
         app._render_model_status()
         assert controller._sticky_error is not None
@@ -1434,7 +1434,7 @@ def _arm_transcribing(app: Any, target: Any) -> None:
     vi = app.voice_input
     vi._state = _State.TRANSCRIBING
     vi._target = target
-    vi._context = vi._snapshot_context(target)
+    vi._context = vi._host.voice_context_of(target)
 
 
 async def test_dictation_discarded_after_task_switch(project_root: Any) -> None:
@@ -1485,7 +1485,7 @@ async def test_view_task_cancels_active_recording(project_root: Any) -> None:
         recorder = MicrophoneRecorder()
         vi._recorder = recorder
         vi._target = app.chat_input
-        vi._context = vi._snapshot_context(app.chat_input)
+        vi._context = vi._host.voice_context_of(app.chat_input)
         app.view_task(t2.id)
         await pilot.pause()
         assert not vi.active
@@ -1524,7 +1524,7 @@ async def test_push_screen_cancels_active_recording(project_root: Any) -> None:
         recorder = MicrophoneRecorder()
         vi._recorder = recorder
         vi._target = app.chat_input
-        vi._context = vi._snapshot_context(app.chat_input)
+        vi._context = vi._host.voice_context_of(app.chat_input)
         app.action_change_voice()  # pushes the voice settings dialog
         await pilot.pause()
         assert not vi.active

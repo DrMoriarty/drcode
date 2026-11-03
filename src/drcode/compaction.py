@@ -118,7 +118,7 @@ def _is_summary_part(part: dict[str, Any]) -> bool:
 def _is_resume_part(part: dict[str, Any]) -> bool:
     """Compaction-continuation note (a round resumed after a successful
     compaction was nudged with this instruction, see
-    drcode.tui.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT)."""
+    drcode.core.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT)."""
     content = part.get("content")
     return isinstance(content, str) and content.startswith(COMPACTION_RESUME_PREFIX)
 

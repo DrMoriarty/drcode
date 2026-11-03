@@ -40,7 +40,6 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
 )
 from pydantic_ai.usage import UsageLimits
-from textual import work
 
 from ..agent import (
     ResolverDeps,
@@ -51,6 +50,11 @@ from ..agent import (
     resumable_history,
     run_context_tokens,
     serialize_messages,
+)
+from ..core.usage import (
+    NETWORK_RETRIES,
+    _is_context_overflow_error,
+    _is_retryable_network_error,
 )
 from ..merge_engine import MergeReport, remove_report
 from ..merge_resolver import (
@@ -67,14 +71,9 @@ from ..merge_resolver import (
 from ..models import Task
 from ..providers import AgentRole
 from ..tools import scratch_dir
-from .blocks import ToolCallBlock
 from .pipeline_stream import NodeStreamView
-from .state import DrCodeState
-from .usage import (
-    NETWORK_RETRIES,
-    _is_context_overflow_error,
-    _is_retryable_network_error,
-)
+from .state import CoreState
+from .worker_runtime import work
 
 # How many failed resolver attempts each error class gets before the
 # round gives up and a human takes over (the resolver is unattended by
@@ -91,7 +90,7 @@ _MAX_RESOLVER_NETWORK_ATTEMPTS = NETWORK_RETRIES * 3
 _RETRY_BASE_DELAY_S = 5.0
 
 
-class PipelineResolverLayer(DrCodeState):
+class PipelineResolverLayer(CoreState):
     # -- triggering ----------------------------------------------------------------
 
     def _resolver_start_refusal(self, task_id: str) -> str | None:
@@ -133,7 +132,7 @@ class PipelineResolverLayer(DrCodeState):
         the round's progress lives in the task's chat)."""
         reason = self._resolver_start_refusal(task_id)
         if reason is not None:
-            self.notify(
+            self.host.host_notify(
                 f"Cannot start the automatic resolver for #{task_id}: {reason}",
                 title="Merge",
                 severity="warning",
@@ -332,7 +331,9 @@ class PipelineResolverLayer(DrCodeState):
                                             f"resolver: {event.part.tool_name}"
                                             f"({args_str})"
                                         )
-                                        block = ToolCallBlock(call_text)
+                                        block = self.host.host_new_tool_call_block(
+                                            call_text
+                                        )
                                         self._tool_call_started(
                                             run_key,
                                             task_id,
@@ -506,7 +507,7 @@ class PipelineResolverLayer(DrCodeState):
         if task_id is None:
             # Due entries whose tasks no longer exist would otherwise
             # linger forever and swallow every later timer fire silently.
-            self.log(
+            self.host.host_log(
                 f"resolver retry timer fired, but scheduled task(s) "
                 f"{due} no longer exist — dropping them"
             )

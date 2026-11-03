@@ -41,22 +41,21 @@ from ..agent import (
     serialize_messages,
     subagent_limit_for,
 )
-from ..models import PendingInput, Task, TaskKind, TaskStatus
-from ..providers import AgentRole
-from ..tools import scratch_dir
-from .blocks import ToolCallBlock
-from .pipeline_stream import NodeStreamView
-from .state import DrCodeState
-from .usage import (
+from ..core.usage import (
     NETWORK_RETRIES,
     _in_outage,
     _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
 )
+from ..models import PendingInput, Task, TaskKind, TaskStatus
+from ..providers import AgentRole
+from ..tools import scratch_dir
+from .pipeline_stream import NodeStreamView
+from .state import CoreState
 
 
-class PipelineAgentRunLayer(DrCodeState):
+class PipelineAgentRunLayer(CoreState):
     def run_agent(self, task_id: str) -> None:
         """(Re)start the development agent for one task, in that task's
         own exclusive worker group (`agent-<task-id>`): a newer run of
@@ -65,14 +64,14 @@ class PipelineAgentRunLayer(DrCodeState):
         group always did — while every other task's run is untouched.
         This per-task independence is the base of the parallel
         development slots (see `parallel_limit`)."""
-        if self._exit or not self.is_running:
+        if not self.host.host_active:
             # Teardown race: a network-retry set_timer fired while the app
             # was being dismantled — starting a worker now would only have
             # its body trip over the already-removed DOM. The task stays
             # ACTIVE with pending retry state; nothing is lost (the next
             # start resumes it).
             return
-        self.run_worker(
+        self.host.host_spawn_worker(
             partial(self._run_agent_worker, task_id),
             name=f"agent run {task_id}",
             group=f"agent-{task_id}",
@@ -618,7 +617,7 @@ class PipelineAgentRunLayer(DrCodeState):
                     # panel of the open chat view (the 1s poll would catch
                     # it too — this is the instant path).
                     if (event.part.tool_name or "").startswith("todo_"):
-                        self.call_after_refresh(self.refresh_todo_panel)
+                        self.host.host_call_after_refresh(self.refresh_todo_panel)
                 if self.viewed_id != task_id:
                     # The tool-call block is skipped (it will come from the
                     # next re-render): the open view is missing it.
@@ -632,7 +631,7 @@ class PipelineAgentRunLayer(DrCodeState):
                         else json.dumps(args or {}, ensure_ascii=False)
                     )
                     call_text = f"{event.part.tool_name}({args_str})"
-                    block = ToolCallBlock(call_text)
+                    block = self.host.host_new_tool_call_block(call_text)
                     self._tool_call_started(
                         run_key,
                         task_id,

@@ -9,13 +9,9 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.content import Content
 
-from drcode.tui.blocks import (
-    AssistantBlock,
-    ToolCallBlock,
-    UserBlock,
-    _json_text,
-    linkify,
-)
+from drcode.core.blocks import json_text as _json_text
+from drcode.core.blocks import linkify
+from drcode.tui.blocks import AssistantBlock, ToolCallBlock, UserBlock
 
 
 def _clicks(text: Text) -> list[tuple[str, str]]:

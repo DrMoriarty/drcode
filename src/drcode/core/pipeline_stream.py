@@ -31,10 +31,10 @@ from pydantic_ai.messages import (
     ThinkingPartDelta,
 )
 
-from .blocks import AssistantBlock, ReasoningBlock
+from .host import StreamBlock
 
 if TYPE_CHECKING:
-    from .state import DrCodeState
+    from .state import CoreState
 
 
 def stream_delta(event: object) -> ThinkingPartDelta | TextPartDelta | None:
@@ -63,7 +63,7 @@ class NodeStreamView:
 
     def __init__(
         self,
-        layer: DrCodeState,
+        layer: CoreState,
         task_id: str,
         *,
         record_tps: bool,
@@ -76,8 +76,8 @@ class NodeStreamView:
         self._follow = follow
         self._track_dirty = track_dirty
         self.view_dirty = False
-        self._reasoning: ReasoningBlock | None = None
-        self._assistant: AssistantBlock | None = None
+        self._reasoning: StreamBlock | None = None
+        self._assistant: StreamBlock | None = None
 
     def begin_node(self) -> None:
         """Fresh blocks for a new model-request node."""
@@ -114,13 +114,16 @@ class NodeStreamView:
         layer = self._layer
         block = self._reasoning
         if block is None or block.stream_epoch != layer._chat_epoch:
-            old, block = block, ReasoningBlock(block.at if block else None)
+            old, block = (
+                block,
+                layer.host.host_new_reasoning_block(block.at if block else None),
+            )
             block.stream_epoch = layer._chat_epoch
             if old is not None:
                 # A mid-node view_task() re-render orphaned the old block:
                 # carry the already-streamed text over, or the rest of this
                 # response would never become visible.
-                block.set_content(old._content)
+                block.set_content(old.get_content())
             self._reasoning = block
             block.begin()
             if layer.viewed_id == self.task_id:
@@ -150,12 +153,12 @@ class NodeStreamView:
             self._reasoning.thinking(False)
         block = self._assistant
         if block is None or block.stream_epoch != layer._chat_epoch:
-            old, block = block, AssistantBlock()
+            old, block = block, layer.host.host_new_assistant_block()
             block.stream_epoch = layer._chat_epoch
             if old is not None:
                 # See the reasoning branch: re-mount after a mid-node
                 # view_task() wipe, keeping the streamed so far.
-                block.set_content(old._content)
+                block.set_content(old.get_content())
             self._assistant = block
             if layer.viewed_id == self.task_id:
                 # Noted: mirrors the timeline "assistant" entry (see the
@@ -167,7 +170,7 @@ class NodeStreamView:
         else:
             self._append(block, content)
 
-    def _append(self, block: ReasoningBlock | AssistantBlock, content: str) -> None:
+    def _append(self, block: StreamBlock, content: str) -> None:
         """Append to a mounted block, following the chat tail when the
         open view is pinned to the bottom (agent runs only)."""
         layer = self._layer

@@ -11,14 +11,13 @@ from __future__ import annotations
 import asyncio
 import time
 
-from textual import work
-
 from ..models import Task, TaskStatus
 from ..workflow import MAX_REVIEW_REJECTIONS
-from .state import DrCodeState
+from .state import CoreState
+from .worker_runtime import work
 
 
-class PipelineDepsLayer(DrCodeState):
+class PipelineDepsLayer(CoreState):
     # -- dependency gate (depends_on promotion condition) ---------------------
 
     def _dep_gate_sync(self, dep_ids: list[str]) -> tuple[set[str], str]:
@@ -51,7 +50,7 @@ class PipelineDepsLayer(DrCodeState):
         queued = [t for t in self.manager.queued() if t.depends_on]
         dep_ids = sorted({d for t in queued for d in t.depends_on})
         unmerged, base = await asyncio.to_thread(self._dep_gate_sync, dep_ids)
-        if self._exit or not self.is_running:
+        if not self.host.host_active:
             # The git check ran off the loop; the app may have been
             # dismantled in the meantime — nothing below may touch the
             # DOM (service events, refreshes) or the pipeline.
@@ -276,7 +275,7 @@ class PipelineDepsLayer(DrCodeState):
         accept, "Changes requested" → reject, still open → pending)."""
         if self.workflow is None or not self.workflow.has("on_review"):
             return
-        if self._exit or not self.is_running:
+        if not self.host.host_active:
             return
         if self._review_running:
             return

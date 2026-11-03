@@ -121,7 +121,7 @@ async def test_retry_survives_stale_needs_human(
     ) -> Agent[Any, str]:
         return Agent(state.model())
 
-    import drcode.tui.pipeline_resolver as pr
+    import drcode.core.pipeline_resolver as pr
 
     pr.build_resolver_agent = fake_build_agent
     # Shrink the 5 s backoff so the timer fires within the test.

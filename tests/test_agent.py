@@ -1230,16 +1230,18 @@ def _bug_report_tool(ag: Any) -> Any:
     )
 
 
-def _run_bug_report(tool: Any, deps: Any, title: str, description: str) -> str:
+async def _run_bug_report(tool: Any, deps: Any, title: str, description: str) -> str:
     """Invoke the tool's raw function with a minimal stand-in RunContext
     (the tester's create_bug_report only touches `ctx.deps`)."""
     return cast(
         "str",
-        tool.function(cast("Any", SimpleNamespace(deps=deps)), title, description),
+        await tool.function(
+            cast("Any", SimpleNamespace(deps=deps)), title, description
+        ),
     )
 
 
-def test_tester_bug_report_depends_on_verified_task(
+async def test_tester_bug_report_depends_on_verified_task(
     tmp_path: Path, fake_config: Config
 ) -> None:
     """The tester's create_bug_report gates the new report on the verified
@@ -1250,7 +1252,9 @@ def test_tester_bug_report_depends_on_verified_task(
     deps = _tester_deps(tmp_path)
     tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
 
-    result = _run_bug_report(tool, deps, "Broken X", "pytest fails")
+    result = await _run_bug_report(
+        tool, deps, "Broken X", "pytest fails: tests/test_x.py::test_y asserts 2 == 3"
+    )
 
     report = next(t for t in deps.manager.tasks.values() if t.id != deps.task_id)
     assert report.depends_on == [deps.task_id]
@@ -1262,7 +1266,7 @@ def test_tester_bug_report_depends_on_verified_task(
     assert "branch" not in prompt
 
 
-def test_tester_bug_report_names_branch_under_isolation(
+async def test_tester_bug_report_names_branch_under_isolation(
     tmp_path: Path, fake_config: Config
 ) -> None:
     """When the tester ran in the verified task's worktree, the origin note
@@ -1273,12 +1277,131 @@ def test_tester_bug_report_names_branch_under_isolation(
     deps.root = worktree
     tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
 
-    _run_bug_report(tool, deps, "Broken X", "pytest fails")
+    await _run_bug_report(
+        tool, deps, "Broken X", "pytest fails: tests/test_x.py::test_y asserts 2 == 3"
+    )
 
     report = next(t for t in deps.manager.tasks.values() if t.id != deps.task_id)
     assert f"(its worktree, branch drcode/{deps.task_id})" in (
         report.pending_input[0].text
     )
+
+
+# -- tester create_bug_report: mechanical stub-call validation ----------------
+
+
+def _filed_reports(deps: Any) -> list[Any]:
+    """Tasks in the manager other than the verified task itself."""
+    return [t for t in deps.manager.tasks.values() if t.id != deps.task_id]
+
+
+async def test_tester_bug_report_rejects_empty_description(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """An empty/whitespace description is refused before anything is
+    created; the ValueError reaches the model as a retry prompt."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    for description in ("", "   \n\t "):
+        with pytest.raises(ModelRetry, match="description is empty"):
+            await _run_bug_report(tool, deps, "Broken X", description)
+
+    assert _filed_reports(deps) == []
+
+
+async def test_tester_bug_report_rejects_short_description(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """A description below the minimum length cannot say what is wrong,
+    where and how it manifests — refused, nothing filed."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    with pytest.raises(ModelRetry, match="too short"):
+        await _run_bug_report(tool, deps, "Broken X", "pytest fails")
+
+    assert _filed_reports(deps) == []
+
+
+async def test_tester_bug_report_rejects_stub_description(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """Template-stub descriptions (normalized: case, whitespace, surrounding
+    punctuation) are refused — the f668795c incident class: a degraded call
+    with description='placeholder - will not file' must not file a task."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    for description in (
+        "placeholder",
+        "  PLACEHOLDER  ",
+        "Placeholder - will not file.",
+        "n/a",
+        "TODO",
+        "test",
+        "bug report",
+        "нет описания",
+    ):
+        with pytest.raises(ModelRetry, match="placeholder"):
+            await _run_bug_report(tool, deps, "Broken X", description)
+
+    assert _filed_reports(deps) == []
+
+
+async def test_tester_bug_report_rejects_empty_title(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """An empty title is refused too, nothing filed."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    with pytest.raises(ModelRetry, match="title is empty"):
+        await _run_bug_report(
+            tool,
+            deps,
+            "  ",
+            "The CLI crashes with IndexError when run on an empty input file.",
+        )
+
+    assert _filed_reports(deps) == []
+
+
+async def test_tester_bug_report_stub_title_with_real_description_passes(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """The stub check applies to the description only: a title 'placeholder'
+    over a real description is a legitimate report and is filed."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+    description = (
+        "The placeholder in the search dialog loses focus after the first "
+        "keystroke, so the second character clears the query."
+    )
+
+    await _run_bug_report(tool, deps, "placeholder", description)
+
+    reports = _filed_reports(deps)
+    assert len(reports) == 1
+    assert description in reports[0].pending_input[0].text
+
+
+async def test_tester_bug_report_validation_is_mechanical_not_meaning(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """The guard checks mechanical stub signs only: a short-looking but
+    over-the-minimum description mentioning a stub word passes."""
+    deps = _tester_deps(tmp_path)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    await _run_bug_report(
+        tool,
+        deps,
+        "Broken X",
+        "TODO comments are not stripped from the built bundle (see spec).",
+    )
+
+    assert len(_filed_reports(deps)) == 1
 
 
 async def test_retry_failed_here_ignores_non_testing_task(tmp_path: Path) -> None:

@@ -27,6 +27,8 @@ from .agent_model import EXTRA_HEADERS
 from .agent_tools import (
     _commit_tracked_files,
     _create_goal,
+    _create_report_task,
+    _create_tester_bug_report,
     _deps_suffix,
     _git_push,
     _list_goals,
@@ -44,7 +46,7 @@ from .agent_tools import (
 )
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
-from .models import Clarification, ClarificationItem, TaskEvent, TaskKind, TaskStatus
+from .models import Clarification, ClarificationItem, TaskKind, TaskStatus
 from .prompts import (
     load_resolver_prompt,
     load_resolver_reviewer_prompt,
@@ -54,7 +56,6 @@ from .prompts import (
 from .service_events import log_service_event
 from .settings import GitPolicy
 from .subagents import SubagentGate, run_delegate_tool
-from .task_env import WORKTREES_SUBDIR, branch_for
 from .task_manager import TaskManager
 from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
 from .transcript import _context_status, ctx_context_tokens
@@ -223,67 +224,6 @@ def _goal_suffix(ctx: RunContext[AgentDeps], task: Any) -> str:
     goal = ctx.deps.manager.goals.goals.get(task.goal_id)
     label = goal.title_display if goal else task.goal_id
     return f" Linked to goal '{label}' ({task.goal_id})."
-
-
-def _create_report_task(
-    deps: AgentDeps | TesterDeps,
-    title: str,
-    description: str,
-    *,
-    kind: TaskKind,
-    creator: str,
-    depends_on: list[str] | None = None,
-    goal_id: str | None = None,
-) -> tuple[Any, str]:
-    """Shared body of the agents' task-creation tools (research:
-    create_bug_report / create_feature_request; tester: create_bug_report).
-
-    Honors `deps.agent_creates_drafts`: the new task is then created in
-    the DRAFT status — it never enters the queue by itself, the user must
-    open it in the new-task editor and finish it (a service event on the
-    draft tells them so). The headless CLI and the GitHub Issues import
-    do not run through here: they create full tasks unconditionally.
-    origin="system" — the tool (not the user) created the task, so
-    creation listeners (e.g. the voice announcements) can tell
-    agent-created reports from hand-typed ones. Returns the created task
-    and the leading part of the tool-result text (the callers append
-    their dependency/goal suffixes)."""
-    draft = deps.agent_creates_drafts
-    task = deps.manager.create(
-        title,
-        description,
-        kind=kind,
-        origin="system",
-        draft=draft,
-        depends_on=depends_on,
-        goal_id=goal_id,
-    )
-    label = "Bug report" if kind is TaskKind.BUG else "Feature request"
-    if draft:
-        task.events.append(
-            TaskEvent(
-                kind="system",
-                text=(
-                    f"Created as a draft by the {creator} — open the task "
-                    "and finish it to put it into the queue."
-                ),
-            )
-        )
-        task.touch()
-        deps.manager.storage.save(task)
-        return (
-            task,
-            (
-                f"{label} #{task.id} '{task.title}' created as a draft — the "
-                "user must finish it before it enters the queue."
-            ),
-        )
-    placement = (
-        "at the head of the queue"
-        if kind is TaskKind.BUG
-        else "at the tail of the queue"
-    )
-    return task, f"{label} #{task.id} '{task.title}' created {placement}."
 
 
 def build_agent(
@@ -1033,7 +973,7 @@ def build_tester_agent(
         return await _run_tool(_run_project_check, ctx.deps.root, module, args, timeout)
 
     @agent.tool
-    def create_bug_report(
+    async def create_bug_report(
         ctx: RunContext[TesterDeps], title: str, description: str
     ) -> str:
         """Create a bug report task. It is placed at the head of the execution
@@ -1041,40 +981,19 @@ def build_tester_agent(
         foreign/pre-existing ones (the verified task itself then passes,
         set_verification(success=True)) and the verified task's own bug that
         survived its fix-round cap (set_verification's tool result tells you
-        when that is mandatory). The report is created with a dependency on
-        the verified task: it is not promoted until that task is COMPLETED
-        and (under worktree isolation) its drcode/<id> branch is merged, so
-        the fix agent gets a worktree where the observed defect actually
-        exists."""
-        # origin="system" — see the research variant of this tool above.
-        task_id = ctx.deps.task_id
-        origin = (
-            f"\n\nOrigin: filed by the tester of task #{task_id} — the defect"
-            " was observed in that task's verification environment"
-        )
-        if (
-            ctx.deps.root.resolve()
-            == (ctx.deps.manager.storage.root / WORKTREES_SUBDIR / task_id).resolve()
-        ):
-            origin += f" (its worktree, branch {branch_for(task_id)})"
-        origin += "."
-        bug, text = _create_report_task(
-            ctx.deps,
-            title,
-            description + origin,
-            kind=TaskKind.BUG,
-            creator="tester",
-            # The report describes a defect observed in the verified task's
-            # environment: gate its promotion on that task being COMPLETED
-            # and merged (the unmerged_ids half of the dependency gate).
-            # Without this the report's worktree forks from the base branch,
-            # where the defect may not exist at all (the c8623e0c incident:
-            # a fix agent editing pyproject "blindly"). A task completed as
-            # FAILED after the fix-round cap is COMPLETED too, so the gate
-            # resolves on that path as well.
-            depends_on=[task_id],
-        )
-        return text + _deps_suffix(bug)
+        when that is mandatory). The description must be REAL: what is wrong,
+        where (files/lines) and how it manifests — empty, degenerately short
+        or placeholder-stub descriptions are rejected and nothing is filed.
+        The report is created with a dependency on the verified task: it is
+        not promoted until that task is COMPLETED and (under worktree
+        isolation) its drcode/<id> branch is merged, so the fix agent gets a
+        worktree where the observed defect actually exists."""
+        # Runs through _run_tool: the mechanical validation in
+        # _create_tester_bug_report raises ValueError, which becomes a
+        # ModelRetry prompt — the model re-calls the tool with real
+        # content instead of a phantom task entering the queue
+        # (origin="system" — see the research variant of this tool above).
+        return await _run_tool(_create_tester_bug_report, ctx.deps, title, description)
 
     # The commit tool exists only when the project's tester git policy
     # allows it: with policy off the model cannot commit even if it

@@ -31,6 +31,7 @@ from .models import (
     GoalStatus,
     GoalType,
     Task,
+    TaskEvent,
     TaskKind,
     TaskStatus,
     TodoItem,
@@ -38,14 +39,18 @@ from .models import (
     render_todos,
 )
 from .service_events import log_service_event
+from .task_env import WORKTREES_SUBDIR, branch_for
 
 if TYPE_CHECKING:
     from .agent_build import AgentDeps, TesterDeps
 
 __all__ = [
+    "REPORT_DESC_MIN_CHARS",
     "TODO_MIN_ITEMS",
     "_commit_tracked_files",
     "_create_goal",
+    "_create_report_task",
+    "_create_tester_bug_report",
     "_deps_suffix",
     "_git_push",
     "_list_goals",
@@ -174,6 +179,186 @@ def _deps_suffix(task: Task) -> str:
         + ", ".join(f"#{d}" for d in task.depends_on)
         + " (not promoted until all are COMPLETED and merged)."
     )
+
+
+def _create_report_task(
+    deps: AgentDeps | TesterDeps,
+    title: str,
+    description: str,
+    *,
+    kind: TaskKind,
+    creator: str,
+    depends_on: list[str] | None = None,
+    goal_id: str | None = None,
+) -> tuple[Task, str]:
+    """Shared body of the agents' task-creation tools (research:
+    create_bug_report / create_feature_request; tester: create_bug_report).
+
+    Honors `deps.agent_creates_drafts`: the new task is then created in
+    the DRAFT status — it never enters the queue by itself, the user must
+    open it in the new-task editor and finish it (a service event on the
+    draft tells them so). The headless CLI and the GitHub Issues import
+    do not run through here: they create full tasks unconditionally.
+    origin="system" — the tool (not the user) created the task, so
+    creation listeners (e.g. the voice announcements) can tell
+    agent-created reports from hand-typed ones. Returns the created task
+    and the leading part of the tool-result text (the callers append
+    their dependency/goal suffixes)."""
+    draft = deps.agent_creates_drafts
+    task = deps.manager.create(
+        title,
+        description,
+        kind=kind,
+        origin="system",
+        draft=draft,
+        depends_on=depends_on,
+        goal_id=goal_id,
+    )
+    label = "Bug report" if kind is TaskKind.BUG else "Feature request"
+    if draft:
+        task.events.append(
+            TaskEvent(
+                kind="system",
+                text=(
+                    f"Created as a draft by the {creator} — open the task "
+                    "and finish it to put it into the queue."
+                ),
+            )
+        )
+        task.touch()
+        deps.manager.storage.save(task)
+        return (
+            task,
+            (
+                f"{label} #{task.id} '{task.title}' created as a draft — the "
+                "user must finish it before it enters the queue."
+            ),
+        )
+    placement = (
+        "at the head of the queue"
+        if kind is TaskKind.BUG
+        else "at the tail of the queue"
+    )
+    return task, f"{label} #{task.id} '{task.title}' created {placement}."
+
+
+# Minimum meaningful bug-report description (chars): anything shorter cannot
+# say what is wrong, where and how it manifests. A degraded model at the end
+# of a long testing round emits stub calls; a length floor is the mechanical
+# line of defense no prompt edit can provide at the context limit.
+REPORT_DESC_MIN_CHARS = 40
+
+# Template stubs a degraded call uses as the WHOLE description, matched after
+# normalization (lowercase, whitespace collapsed, surrounding punctuation
+# stripped). Only full-match stubs are rejected: a title "placeholder" with a
+# real description stays allowed, and so does a genuine description that
+# merely mentions the word (e.g. a bug about placeholder rendering).
+_REPORT_DESC_STUBS = frozenset(
+    {
+        "placeholder",
+        "placeholder report",
+        "placeholder bug report",
+        "placeholder will not file",
+        "placeholder will not be filed",
+        "stub",
+        "todo",
+        "tbd",
+        "n/a",
+        "na",
+        "none",
+        "no description",
+        "description",
+        "empty",
+        "test",
+        "testing",
+        "bug",
+        "bug report",
+        "issue",
+        "report",
+        "описание",
+        "нет описания",
+        "заглушка",
+        "тест",
+        "баг",
+        "багрепорт",
+    }
+)
+
+
+def _validate_bug_report_args(title: str, description: str) -> None:
+    """Mechanical guard on the tester's create_bug_report arguments.
+
+    Raises ValueError (→ ModelRetry via _run_tool) when the arguments are
+    empty, degenerately short or a template stub: a degraded-model call
+    must never become a real task (the #f668795c incident — title=
+    "placeholder", description="placeholder - will not file" reached the
+    queue as a phantom bug report). The retry tells the model to re-call
+    the tool with actual content; nothing is created in between."""
+    if not title.strip():
+        raise ValueError(
+            "create_bug_report: title is empty — repeat the call with a "
+            "short imperative summary of the defect."
+        )
+    desc = description.strip()
+    if not desc:
+        raise ValueError(
+            "create_bug_report: description is empty — repeat the call "
+            "with a description of what is wrong, where (files/lines) and "
+            "how it manifests."
+        )
+    normalized = re.sub(r"\s+", " ", desc.lower()).strip(" .!?,;:'\"`()[]<>-*—–…~")
+    # A second view with punctuation between words turned into spaces, so
+    # "placeholder - will not file" matches its dash-free stub entry (n/a
+    # keeps its own entry in both spellings).
+    collapsed = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", normalized)).strip()
+    if normalized in _REPORT_DESC_STUBS or collapsed in _REPORT_DESC_STUBS:
+        raise ValueError(
+            f"create_bug_report: description {description!r} is a "
+            "placeholder, not a bug report — repeat the call with a real "
+            "description of the defect, or do not file a report at all."
+        )
+    if len(desc) < REPORT_DESC_MIN_CHARS:
+        raise ValueError(
+            f"create_bug_report: description is too short ({len(desc)} "
+            f"chars, minimum {REPORT_DESC_MIN_CHARS}) — describe what is "
+            "wrong, where (files/lines) and how it manifests."
+        )
+
+
+def _create_tester_bug_report(deps: TesterDeps, title: str, description: str) -> str:
+    """Body of the tester's create_bug_report tool (the builder registers
+    a thin wrapper that runs this via `_run_tool`, so a ValueError from the
+    validation below becomes a ModelRetry prompt).
+
+    Validates the arguments mechanically first — a degraded-model stub call
+    is refused before anything is created — then files the report with a
+    dependency on the verified task: it is not promoted until that task is
+    COMPLETED and (under worktree isolation) merged, so the fix agent gets a
+    worktree where the observed defect actually exists (the c8623e0c
+    incident: a fix agent editing pyproject "blindly"). A task completed as
+    FAILED after the fix-round cap is COMPLETED too, so the gate resolves on
+    that path as well."""
+    _validate_bug_report_args(title, description)
+    task_id = deps.task_id
+    origin = (
+        f"\n\nOrigin: filed by the tester of task #{task_id} — the defect"
+        " was observed in that task's verification environment"
+    )
+    if (
+        deps.root.resolve()
+        == (deps.manager.storage.root / WORKTREES_SUBDIR / task_id).resolve()
+    ):
+        origin += f" (its worktree, branch {branch_for(task_id)})"
+    origin += "."
+    bug, text = _create_report_task(
+        deps,
+        title,
+        description + origin,
+        kind=TaskKind.BUG,
+        creator="tester",
+        depends_on=[task_id],
+    )
+    return text + _deps_suffix(bug)
 
 
 # Context discipline of the goal injection: the system prompt carries only

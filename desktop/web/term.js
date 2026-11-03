@@ -29,8 +29,14 @@
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
 
+  var DEFAULT_FONT_SIZE = 13;
+  var MIN_FONT_SIZE = 6;
+  var MAX_FONT_SIZE = 40;
+  var FONT_STEP = 1;
+
   var term = null;
   var fit = null;
+  var webgl = null;
   var ws = null;
   var currentProject = null;
   var started = false;
@@ -141,21 +147,86 @@
         selectionBackground: "#2d4a6e",
       },
     });
+    // Unicode 11 width tables: the built-in UnicodeV6 provider predates emoji,
+    // so ✅ etc. render 1 cell wide while Textual (Python wcwidth) sends them
+    // as 2 — the rest of the line then drifts one cell to the left.
+    term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+    term.unicode.activeVersion = "11";
     fit = new window.FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(elTerminal);
     try {
-      var gl = new window.WebglAddon.WebglAddon();
-      gl.onContextLoss(function () { gl.dispose(); }); // xterm falls back to DOM renderer
-      term.loadAddon(gl);
+      webgl = new window.WebglAddon.WebglAddon();
+      webgl.onContextLoss(function () {
+        if (webgl) { webgl.dispose(); webgl = null; }
+      }); // xterm falls back to DOM renderer
+      term.loadAddon(webgl);
     } catch (err) {
+      webgl = null;
       /* no WebGL — the default renderer keeps everything working */
     }
+    term.attachCustomKeyEventHandler(terminalKeyHandler);
     term.onData(function (data) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(new TextEncoder().encode(data));
       }
     });
+  }
+
+  /* ---------------- font size (Ctrl+= / Ctrl+- / Ctrl+0) ----------------
+   * Without interception these combos would be forwarded to the PTY
+   * through term.onData; the custom handler swallows them (return false)
+   * and changes term.options.fontSize instead. The WebGL renderer in
+   * xterm 5.x can keep a stale glyph atlas across a font-size change, so
+   * the addon is re-created after each change; on failure the DOM
+   * renderer takes over. fit.fit() recomputes cols/rows for the new cell
+   * metrics and sendResize() propagates them to the PTY.
+   */
+
+  function applyFontSize(size) {
+    if (!term) return;
+    var clamped = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
+    if (clamped === term.options.fontSize) return;
+    term.options.fontSize = clamped;
+    if (webgl) {
+      try { webgl.dispose(); } catch (err) { /* already gone */ }
+      webgl = null;
+      try {
+        webgl = new window.WebglAddon.WebglAddon();
+        webgl.onContextLoss(function () {
+          if (webgl) { webgl.dispose(); webgl = null; }
+        });
+        term.loadAddon(webgl);
+      } catch (err) {
+        webgl = null; /* DOM renderer fallback */
+      }
+    }
+    if (fit) {
+      try { fit.fit(); } catch (err) { /* container not measurable */ }
+    }
+    sendResize();
+  }
+
+  function terminalKeyHandler(ev) {
+    if (ev.key === "F11") return true; // handled by the window listener
+    if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
+    var code = ev.code || "";
+    if (ev.key === "=" || ev.key === "+" || code === "NumpadAdd") {
+      ev.preventDefault();
+      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) + FONT_STEP);
+      return false;
+    }
+    if (ev.key === "-" || ev.key === "_" || code === "NumpadSubtract") {
+      ev.preventDefault();
+      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) - FONT_STEP);
+      return false;
+    }
+    if (ev.key === "0" || code === "Digit0" || code === "Numpad0") {
+      ev.preventDefault();
+      applyFontSize(DEFAULT_FONT_SIZE);
+      return false;
+    }
+    return true;
   }
 
   function currentSize() {
@@ -303,15 +374,39 @@
   function boot() {
     createTerminal();
 
-    elPick.addEventListener("click", function () {
-      var choose = api("choose_project");
-      if (!choose) {
-        showWelcomeError("Native folder dialog is unavailable in this environment (no pywebview bridge — browser mode?). Pass --project to the binary or pick a recent project.");
-        return;
-      }
+    function runChooseProject(choose) {
       Promise.resolve(choose()).then(function (path) {
         if (path) launchProject(path);
       });
+    }
+
+    elPick.addEventListener("click", function () {
+      var choose = api("choose_project");
+      if (choose) {
+        runChooseProject(choose);
+        return;
+      }
+      // pywebview injects its bridge asynchronously; an early click may
+      // land before that — wait for the bridge (same budget as the
+      // recents retry below) instead of reporting the dialog unavailable
+      // on the first miss.
+      if (elPick.dataset.waiting) return; // a retry is already running
+      elPick.dataset.waiting = "1";
+      var attempts = 0;
+      var timer = setInterval(function () {
+        attempts += 1;
+        var retry = api("choose_project");
+        if (retry) {
+          clearInterval(timer);
+          delete elPick.dataset.waiting;
+          runChooseProject(retry);
+        } else if (attempts > 40) {
+          // ~10 s without the bridge — really no shell around the page.
+          clearInterval(timer);
+          delete elPick.dataset.waiting;
+          showWelcomeError("Native folder dialog is unavailable in this environment (no pywebview bridge — browser mode?). Pass --project to the binary or pick a recent project.");
+        }
+      }, 250);
     });
 
     document.getElementById("btn-restart").addEventListener("click", function () {

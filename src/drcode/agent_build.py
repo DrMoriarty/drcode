@@ -226,6 +226,41 @@ def _goal_suffix(ctx: RunContext[AgentDeps], task: Any) -> str:
     return f" Linked to goal '{label}' ({task.goal_id})."
 
 
+# How many similar open reports the duplicate guard lists before capping:
+# the tool result must stay compact, and five is plenty for the model to
+# judge "same defect or not".
+_DUP_REPORT_CAP = 5
+
+
+def _dup_keywords(title: str, description: str) -> list[str]:
+    """Keywords for the duplicate guard: from the title, falling back to
+    title+description when the title alone yields too few signal words
+    (an all-stopword title must not silently disable the guard)."""
+    keywords = task_search.dedup_keywords(title)
+    if len(keywords) < task_search.DUP_MIN_KEYWORDS:
+        keywords = task_search.dedup_keywords(f"{title}\n{description}")
+    return keywords
+
+
+def _duplicate_bug_warning(duplicates: list[Any]) -> str:
+    """The tool-result text returned instead of a task when the archive
+    already holds a similar OPEN bug report (the #6aa2a4ec / #927dde50
+    class: every new verification round re-files the same pre-existing
+    defect while the first report is still open). Tells the model the id,
+    title and status of each candidate and both ways out."""
+    lines = ["A similar OPEN bug report already exists:"]
+    for hit in duplicates:
+        snippet = f" — {hit.snippet}" if hit.snippet else ""
+        lines.append(f"#{hit.task_id} '{hit.title}' (status {hit.status}){snippet}")
+    lines.append(
+        "Do NOT create a duplicate: if this is really the same defect, just "
+        "do not call create_bug_report for it (mention the existing report "
+        "in your final answer instead); if it is a DIFFERENT defect, repeat "
+        "the call with force=true."
+    )
+    return "\n".join(lines)
+
+
 def build_agent(
     config: Config,
     kind: TaskKind = TaskKind.FEATURE,
@@ -974,20 +1009,35 @@ def build_tester_agent(
 
     @agent.tool
     async def create_bug_report(
-        ctx: RunContext[TesterDeps], title: str, description: str
+        ctx: RunContext[TesterDeps], title: str, description: str, force: bool = False
     ) -> str:
         """Create a bug report task. It is placed at the head of the execution
         queue. Use it to file problems found during verification — both
         foreign/pre-existing ones (the verified task itself then passes,
         set_verification(success=True)) and the verified task's own bug that
         survived its fix-round cap (set_verification's tool result tells you
-        when that is mandatory). The description must be REAL: what is wrong,
-        where (files/lines) and how it manifests — empty, degenerately short
-        or placeholder-stub descriptions are rejected and nothing is filed.
-        The report is created with a dependency on the verified task: it is
-        not promoted until that task is COMPLETED and (under worktree
-        isolation) its drcode/<id> branch is merged, so the fix agent gets a
-        worktree where the observed defect actually exists."""
+        when that is mandatory). The report is created with a dependency on
+        the verified task: it is not promoted until that task is COMPLETED
+        and (under worktree isolation) its drcode/<id> branch is merged, so
+        the fix agent gets a worktree where the observed defect actually
+        exists. The description must be REAL: what is wrong, where
+        (files/lines) and how it manifests — empty, degenerately short or
+        placeholder-stub descriptions are rejected and nothing is filed.
+        Before creating anything the tool mechanically checks the task
+        archive for OPEN bug reports with similar keywords — when one is
+        found, no task is created and the tool result lists the existing
+        report(s) instead: if that is really the same defect, do not file a
+        new report; pass `force=true` only when the match is a false
+        positive (a different defect that merely shares words)."""
+        if not force:
+            duplicates = await _run_tool(
+                task_search.find_similar_open_bugs,
+                ctx.deps.manager.storage.root,
+                _dup_keywords(title, description),
+                exclude_task_id=ctx.deps.task_id,
+            )
+            if duplicates:
+                return _duplicate_bug_warning(duplicates[:_DUP_REPORT_CAP])
         # Runs through _run_tool: the mechanical validation in
         # _create_tester_bug_report raises ValueError, which becomes a
         # ModelRetry prompt — the model re-calls the tool with real

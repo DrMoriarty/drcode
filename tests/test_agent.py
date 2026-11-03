@@ -1230,13 +1230,16 @@ def _bug_report_tool(ag: Any) -> Any:
     )
 
 
-async def _run_bug_report(tool: Any, deps: Any, title: str, description: str) -> str:
+async def _run_bug_report(
+    tool: Any, deps: Any, title: str, description: str, force: bool = False
+) -> str:
     """Invoke the tool's raw function with a minimal stand-in RunContext
-    (the tester's create_bug_report only touches `ctx.deps`)."""
+    (the tester's create_bug_report only touches `ctx.deps`). The tool is
+    async (the duplicate guard runs the archive scan in a worker thread)."""
     return cast(
         "str",
         await tool.function(
-            cast("Any", SimpleNamespace(deps=deps)), title, description
+            cast("Any", SimpleNamespace(deps=deps)), title, description, force
         ),
     )
 
@@ -1402,6 +1405,84 @@ async def test_tester_bug_report_validation_is_mechanical_not_meaning(
     )
 
     assert len(_filed_reports(deps)) == 1
+
+
+# -- tester create_bug_report: the duplicate guard ----------------
+
+
+async def test_tester_bug_report_blocks_on_similar_open_report(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """The duplicate guard (the #6aa2a4ec / #927dde50 class): when the
+    archive already holds an OPEN bug report sharing enough keywords, the
+    tool creates NO task and returns the existing report's id/title/status
+    with the force=true way out instead."""
+    deps = _tester_deps(tmp_path)
+    existing = deps.manager.create(
+        "Fix ruff-format debt in six files", "ruff format --check .", kind=TaskKind.BUG
+    )
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    result = await _run_bug_report(
+        tool, deps, "Ruff format debt in six files", "the same ruff format debt"
+    )
+
+    tasks = [t for t in deps.manager.tasks.values() if t.id != deps.task_id]
+    assert [t.id for t in tasks] == [existing.id]
+    assert f"#{existing.id}" in result
+    assert f"'{existing.title}'" in result
+    assert "(status queued)" in result
+    assert "force=true" in result
+
+
+async def test_tester_bug_report_force_overrides_duplicate_guard(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """force=true skips the guard: the report is created even when similar
+    open reports exist (the model judged the match a false positive)."""
+    deps = _tester_deps(tmp_path)
+    deps.manager.create(
+        "Fix ruff-format debt in six files", "ruff format --check .", kind=TaskKind.BUG
+    )
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    result = await _run_bug_report(
+        tool,
+        deps,
+        "Ruff format debt in six files",
+        "a second batch of ruff format debt in the six files, separate defect",
+        force=True,
+    )
+
+    reports = [t for t in deps.manager.tasks.values() if t.id != deps.task_id]
+    assert len(reports) == 2  # the pre-existing one + the forced report
+    assert "created at the head of the queue" in result
+
+
+async def test_tester_bug_report_completed_report_is_no_duplicate(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """A COMPLETED report is not a duplicate target — the defect was either
+    fixed or dismissed, a fresh report must go through."""
+    deps = _tester_deps(tmp_path)
+    existing = deps.manager.create(
+        "Fix ruff-format debt in six files", "ruff format --check .", kind=TaskKind.BUG
+    )
+    existing.status = TaskStatus.COMPLETED
+    deps.manager.storage.save(existing)
+    tool = _bug_report_tool(agent_mod.build_tester_agent(fake_config))
+
+    result = await _run_bug_report(
+        tool,
+        deps,
+        "Ruff format debt in six files",
+        "the same ruff format debt re-observed after the earlier report closed",
+    )
+
+    reports = [t for t in deps.manager.tasks.values() if t.id != deps.task_id]
+    assert [t.id for t in reports] == [existing.id, reports[-1].id]
+    assert reports[-1].id != existing.id
+    assert "created at the head of the queue" in result
 
 
 async def test_retry_failed_here_ignores_non_testing_task(tmp_path: Path) -> None:

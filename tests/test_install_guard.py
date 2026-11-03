@@ -73,9 +73,7 @@ def git_root(project_root: Path) -> Path:
     # APPENDED at app start, leaving the tracked .gitignore modified —
     # a dirty main checkout makes _install_rerun_candidates wait forever
     # and the deferred-install tests would time out.
-    (project_root / ".gitignore").write_text(
-        "\n".join(GITIGNORE_ENTRIES) + "\n"
-    )
+    (project_root / ".gitignore").write_text("\n".join(GITIGNORE_ENTRIES) + "\n")
     (project_root / "README.md").write_text("hello")
     _git(project_root, "add", "-A")
     _git(project_root, "commit", "-q", "-m", "init")

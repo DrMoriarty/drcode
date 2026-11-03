@@ -18,3 +18,5 @@ wheels/
 .drcode/worktrees/
 .drcode/merge_reports/
 .drcode/stats.json
+.drcode/search_index.json
+.drcode/pending_notifications.json

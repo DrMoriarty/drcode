@@ -43,6 +43,16 @@ def test_no_duplicate_entries(project_root: Path) -> None:
     assert (project_root / ".gitignore").read_text() == ENTRIES
 
 
+def test_machine_state_files_ignored(project_root: Path) -> None:
+    """The search index and the pending-notification queue are pure
+    machine state — they must always be among the written entries."""
+    make_git_repo(project_root)
+    ensure_drcode_gitignored(project_root)
+    text = (project_root / ".gitignore").read_text()
+    assert ".drcode/search_index.json\n" in text
+    assert ".drcode/pending_notifications.json\n" in text
+
+
 def test_partial_entries_completed(project_root: Path) -> None:
     make_git_repo(project_root)
     (project_root / ".gitignore").write_text(".drcode/tasks/\n")

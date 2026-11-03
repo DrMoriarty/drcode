@@ -536,6 +536,8 @@ class DrCodeState(App[None]):
 
     def _record_stream_tokens(self, task_id: str, text: str) -> None: ...
 
+    def _active_header_role(self) -> AgentRole: ...
+
     def _prune_tps_samples(self, now: float) -> None: ...
 
     def _tokens_per_second(self) -> float | None: ...
@@ -889,6 +891,7 @@ class DrCodeState(App[None]):
     # -- live stream / connection -------------------------------------------
     _tps_samples: dict[str, deque[tuple[float, int]]]
     _conn_label: str
+    _conn_role: AgentRole | None
     _last_probe_ms: int | None
     _probe_fail_streak: int
     _active_tools: dict[tuple[str, str, int], dict[str, tuple[str, str, ToolCallBlock]]]

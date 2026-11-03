@@ -75,8 +75,38 @@ class HeaderLayer(DrCodeState):
     def refresh_connection(self) -> None:
         self.run_worker(self._check_model(), exclusive=True, group="model-check")
 
+    def _active_header_role(self) -> AgentRole:
+        """The role whose model the header connection indicator shows:
+        the pipeline stage that is running RIGHT NOW under the priority
+        research > coder > tester > resolver, the coding model when
+        nothing runs (the historical default — the role the pipeline
+        spends most of its idle life with). Research tasks run through
+        the same `_agent_runs` registry as coding tasks, so the two are
+        told apart by the task's kind."""
+        for task_id in self._agent_runs:
+            try:
+                task = self.manager.get(task_id)
+            except KeyError:
+                continue
+            if task.kind is TaskKind.RESEARCH:
+                return AgentRole.RESEARCH
+        if self._agent_runs:
+            return AgentRole.CODING
+        if self.tester_running:
+            return AgentRole.TESTER
+        if self._resolver_running:
+            return AgentRole.RESOLVER
+        return AgentRole.CODING
+
     def _render_model_status(self) -> None:
         """Header connection label + live activity suffix.
+
+        The label shows the ACTIVE role's model (see
+        _active_header_role); when the active stage changes (coder →
+        tester → resolver as the pipeline advances), a fresh probe is
+        kicked off right away — the 1 s poll calls this renderer, so the
+        switch is picked up within a second instead of waiting out the
+        30 s probe interval.
 
         The suffix is the global "is the model producing" signal: a tok/s
         figure while tokens stream in (regardless of which task is open in
@@ -89,6 +119,10 @@ class HeaderLayer(DrCodeState):
         Also re-renders the persistent bottom-right dictation indicator —
         both render paths (the immediate _sync_indicator and the 1 s
         poll) go through here, so the corner never goes stale."""
+        role = self._active_header_role()
+        if role is not self._conn_role:
+            self._conn_role = role
+            self.refresh_connection()
         label = self.model_status
         voice = self.voice_input.indicator
         # Keep-awake marker: the assertion is held right now (the machine
@@ -194,10 +228,10 @@ class HeaderLayer(DrCodeState):
         round-trip, consecutive probe failures, network retry counters
         and the exact cumulative token usage of every model call of the
         session."""
-        coding = self.resolved_config(AgentRole.CODING)
-        if not coding.is_ready:
+        config = self.resolved_config(self._active_header_role())
+        if not config.is_ready:
             return "model not configured"
-        url = coding.base_url
+        url = config.base_url
         probe = (
             f"probe {self._last_probe_ms} ms"
             if self._last_probe_ms is not None

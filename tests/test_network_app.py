@@ -2389,6 +2389,41 @@ async def test_second_tester_round_compaction_does_not_grow_summary(
     assert "[user]\nSUMMARY ONE" not in scripted.calls[4]
 
 
+# -- header role priority (_active_header_role) -------------------------------------------
+
+
+async def test_active_header_role_priority(net_app: DrCodeApp) -> None:
+    """The header indicator follows the ACTIVE pipeline stage under the
+    priority research > coder > tester > resolver; with nothing running
+    it falls back to the coding model (the historical default)."""
+    research = net_app.manager.create("r", "brief", kind=TaskKind.RESEARCH)
+    feature = net_app.manager.create("f", "brief", kind=TaskKind.FEATURE)
+
+    # Nothing runs: the coding model is shown.
+    assert net_app._active_header_role() is AgentRole.CODING
+
+    # A coding run → CODING.
+    net_app._agent_runs[feature.id] = 1
+    assert net_app._active_header_role() is AgentRole.CODING
+
+    # A research run outranks the coding run.
+    net_app._agent_runs[research.id] = 1
+    assert net_app._active_header_role() is AgentRole.RESEARCH
+    del net_app._agent_runs[research.id]
+
+    # Tester runs (no dev runs) → TESTER, even over the resolver.
+    del net_app._agent_runs[feature.id]
+    net_app.tester_running = True
+    net_app._resolver_running = True
+    assert net_app._active_header_role() is AgentRole.TESTER
+    net_app.tester_running = False
+
+    # Resolver only → RESOLVER.
+    assert net_app._active_header_role() is AgentRole.RESOLVER
+    net_app._resolver_running = False
+    assert net_app._active_header_role() is AgentRole.CODING
+
+
 # -- connection probe (_check_model) ------------------------------------------------------
 
 

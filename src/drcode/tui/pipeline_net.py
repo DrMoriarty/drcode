@@ -35,9 +35,13 @@ class PipelineNetLayer(DrCodeState):
     async def _check_model_inner(self) -> None:
         label = self.model_status
         was_error = label.has_class("error")
-        # The header shows the CODING model's connection: the role the
-        # pipeline spends most of its life in.
-        config = self._coding_config()
+        # The header shows the ACTIVE role's model connection (research >
+        # coder > tester > resolver, coding when idle — see
+        # _active_header_role); _render_model_status re-fires this probe
+        # as soon as the active stage changes.
+        role = self._active_header_role()
+        self._conn_role = role
+        config = self.resolved_config(role)
         if not config.is_ready:
             self._conn_label = "○ model not configured"
             self._last_probe_ms = None

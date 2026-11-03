@@ -791,6 +791,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # written by _check_model; _render_model_status appends the live
         # activity suffix (tok/s / waiting / testing) on top of it.
         self._conn_label = "○ checking…"
+        # The role whose connection the header currently shows (None until
+        # the first render picks the active role and fires the probe).
+        self._conn_role: AgentRole | None = None
         # Connection probe bookkeeping for the expanded header: last
         # round-trip of probe_model in ms (None = no probe finished yet)
         # and the streak of consecutive failed probes (reset on success).

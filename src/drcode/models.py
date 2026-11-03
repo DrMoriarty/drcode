@@ -383,7 +383,7 @@ class Task(BaseModel):
     # simplification.
     time_in_status: dict[str, float] = Field(default_factory=dict)
     # Cumulative seconds the conflict resolver spent on this task (measured
-    # around each resolver round in tui/pipeline_resolver.py — resolving is
+    # around each resolver round in core/pipeline_resolver.py — resolving is
     # not expressible as a status, the task stays parked while the resolver
     # runs). Persisted like every other Task field; 0.0 for old task files.
     resolver_seconds: float = 0.0

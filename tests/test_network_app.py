@@ -32,12 +32,12 @@ from drcode.agent import (
     last_context_tokens,
     serialize_messages,
 )
+from drcode.core import pipeline as pipeline_module
+from drcode.core import pipeline_agent_run, pipeline_deps, pipeline_net, pipeline_tester
+from drcode.core.usage import NETWORK_RETRIES
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.providers import AgentRole
-from drcode.tui import pipeline as pipeline_module
-from drcode.tui import pipeline_agent_run, pipeline_deps, pipeline_net, pipeline_tester
 from drcode.tui.app import DrCodeApp
-from drcode.tui.usage import NETWORK_RETRIES
 from tests.network_mocks import (
     ScriptedState,
     api_error,
@@ -628,7 +628,7 @@ async def test_failed_queue_rescue_waits_out_network_outage(
 def test_network_retry_delay_outage_schedule() -> None:
     """In-budget schedule unchanged (5..60); the outage schedule keeps
     doubling past it, capped at NETWORK_OUTAGE_DELAY_MAX."""
-    from drcode.tui.usage import (
+    from drcode.core.usage import (
         NETWORK_OUTAGE_DELAY_MAX,
         _in_outage,
         _network_retry_delay,
@@ -658,7 +658,7 @@ async def test_tcp_reachable() -> None:
     a probe bug)."""
     import socket
 
-    from drcode.tui.usage import tcp_reachable
+    from drcode.core.usage import tcp_reachable
 
     # Refused: nothing listens on port 1.
     assert not await tcp_reachable("http://127.0.0.1:1/v1")
@@ -2152,7 +2152,7 @@ async def test_tester_round_compaction_records_issued_verdict_facts(
     )
     from pydantic_ai.usage import RequestUsage
 
-    from drcode.tui.pipeline_tester import (
+    from drcode.core.pipeline_tester import (
         TESTER_COMPACTION_RESUME_PROMPT,
         tester_compaction_resume_prompt,
     )
@@ -2817,7 +2817,7 @@ def test_context_overflow_classifier() -> None:
     """HTTP 400 whose body says the request exceeds the model's context
     window is classified as deterministic; other statuses and other 400s
     are not."""
-    from drcode.tui.usage import _is_context_overflow_error
+    from drcode.core.usage import _is_context_overflow_error
 
     assert _is_context_overflow_error(
         http_error(
@@ -2890,7 +2890,7 @@ def test_context_overflow_classifier_matches_rejected_error_alias() -> None:
     ModelHTTPError check): the classifier matches duck-typed on the
     `status_code` attribute — or the rendered "status_code: 400" message
     prefix when even the attribute is missing."""
-    from drcode.tui.usage import _is_context_overflow_error
+    from drcode.core.usage import _is_context_overflow_error
 
     overflow = (
         "This model's maximum context length is 65536 tokens. However, "

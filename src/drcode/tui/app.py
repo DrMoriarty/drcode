@@ -32,6 +32,7 @@ from textual.widgets import (
 )
 
 from ..config import Config
+from ..core.usage import SessionTokenUsage
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
 from ..models import (
@@ -51,9 +52,7 @@ from ..providers import (
     migrate_project_config,
     migrate_user_config,
     project_has_model_selection,
-    resolve_model_key,
 )
-from ..providers import resolve_effective as resolve_model_config
 from ..settings import (
     GitPolicy,
     ProjectSettings,
@@ -86,6 +85,7 @@ from .command_providers import (
     TaskSettingsCommandProvider,
 )
 from .header import ModelStatusHeader
+from .host import TextualHost
 from .inputs import ChatInput, DepsInput, NewTaskInput
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
@@ -98,8 +98,7 @@ from .sync_output import (
     sync_output_should_be_off,
 )
 from .todo_panel import TodoPanel
-from .usage import SessionTokenUsage
-from .voice_input import VoiceInputController
+from .voice_input import TextualVoiceHost, VoiceInputController
 
 
 class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
@@ -432,6 +431,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # keystroke echo lags 0.5–1.0 s). No-op otherwise.
         apply_sync_output_override()
         super().__init__()
+        # The UI seam of the core pipeline (toasts, timers, workers, chat
+        # blocks) — the pipeline layers call nothing Textual directly.
+        self.host = TextualHost(self)
         # Startup diagnostics for the effective DEC 2026 state (see
         # _start_sync_mode_report): bookkeeping only — the state itself
         # lives in App._sync_available and sync_output.py's decision
@@ -534,7 +536,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             speaker=self.voice_tts.speak,
         )
         # Push-to-talk voice dictation (Ctrl+B in the input fields).
-        self.voice_input = VoiceInputController(self)
+        self.voice_input = VoiceInputController(TextualVoiceHost(self))
         # Keep-awake (system-sleep assertion while the pipeline has work):
         # re-evaluated by the pipeline on every _advance() and by a
         # periodic tick (see on_mount); released at teardown. The busy
@@ -953,37 +955,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # `resolved_model_key`.
         self._resolved_model_keys: dict[AgentRole, str] = {}
 
-    # -- per-role model resolution -------------------------------------------
-
-    def resolved_config(self, role: AgentRole) -> Config:
-        """Effective model connection for an agent role (coding / research /
-        tester / compaction): project `models[role]` > user-level default >
-        the flat config. The research role falls back to the coding model
-        when nothing is selected for it (`providers.resolve_effective`).
-        Cached until invalidated."""
-        cached = self._resolved_configs.get(role)
-        if cached is None:
-            cached = resolve_model_config(self.config, role)
-            self._resolved_configs[role] = cached
-        return cached
-
-    def resolved_model_key(self, role: AgentRole) -> str:
-        """Usage-accounting model id of the role's effective model, in the
-        catalog's "<provider>/<model-id>" format (bare id for custom
-        models and the env override — they carry no provider name; empty
-        when nothing is selected). Cached alongside `resolved_config`,
-        invalidated with it."""
-        cached = self._resolved_model_keys.get(role)
-        if cached is None:
-            cached = resolve_model_key(self.config, role)
-            self._resolved_model_keys[role] = cached
-        return cached
-
-    def invalidate_resolved_configs(self) -> None:
-        """Drop the cached per-role resolutions (after any change to the
-        flat config, the project model slots or the user catalog)."""
-        self._resolved_configs.clear()
-        self._resolved_model_keys.clear()
+    # -- per-role model resolution (implemented in core.state.CoreState) -----
 
     def push_screen(self, *args: Any, **kwargs: Any) -> Any:
         """A modal screen is a context change: any in-flight dictation
@@ -1868,10 +1840,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     @property
     def activity_status(self) -> Static:
         return self.query_one("#activity-status", Static)
-
-    @property
-    def viewed(self) -> Task | None:
-        return self.manager.tasks.get(self.viewed_id) if self.viewed_id else None
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Gate the app-level bindings on the current state: a binding that

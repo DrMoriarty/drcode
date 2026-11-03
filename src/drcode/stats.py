@@ -27,7 +27,7 @@ What is counted and when:
 - ``resolver_seconds`` / ``resolver_rounds`` — conflict-resolution is NOT
   expressible as a task status (the resolver runs while the task is
   parked), so it is measured directly around the resolver round in
-  ``tui/pipeline_resolver.py`` and accumulated on ``task.resolver_seconds``.
+  ``core/pipeline_resolver.py`` and accumulated on ``task.resolver_seconds``.
 
 The aggregates are folded into the day buckets AT THE MOMENT of the event
 (a transition, a completion, a round end), never recomputed from the task

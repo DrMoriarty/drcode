@@ -26,6 +26,7 @@ from ..agent import (
     extract_display,
     is_pending_retry,
 )
+from ..core.blocks import TASK_MENTION_RE
 from ..models import (
     Clarification,
     Task,
@@ -34,7 +35,6 @@ from ..models import (
 )
 from .blocks import (
     _SCROLL_FOLLOW_THRESHOLD,
-    TASK_MENTION_RE,
     AssistantBlock,
     ReasoningBlock,
     ToolCallBlock,

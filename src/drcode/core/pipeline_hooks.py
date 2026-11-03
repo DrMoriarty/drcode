@@ -12,15 +12,14 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from textual import work
-
 from ..merge_engine import in_progress as merge_in_progress
 from ..models import Task, TaskKind, TaskStatus
 from ..task_env import branch_for
-from .state import DrCodeState
+from .state import CoreState
+from .worker_runtime import work
 
 
-class PipelineHooksLayer(DrCodeState):
+class PipelineHooksLayer(CoreState):
     # -- external review (.drcode/workflow.py hooks) -----------------------------------
 
     def _hook_env(self, task: Task) -> tuple[Path, dict[str, str] | None]:
@@ -291,7 +290,7 @@ class PipelineHooksLayer(DrCodeState):
             task.touch()
             self.manager.storage.save(task)
         # The chat may be open on another task — also raise a toast.
-        self.notify(
+        self.host.host_notify(
             text, title="Suspicious task branch", severity="warning", timeout=12
         )
         return True
@@ -466,7 +465,9 @@ class PipelineHooksLayer(DrCodeState):
             and not task.hook_merge_failed
         ):
             # The chat may be open on another task — also raise a toast.
-            self.notify(text, title="Unmerged work", severity="warning", timeout=12)
+            self.host.host_notify(
+                text, title="Unmerged work", severity="warning", timeout=12
+            )
 
     def _apply_review_accept(self, task: Task) -> None:
         """Finish the task after an accept verdict: a sync-mode task is

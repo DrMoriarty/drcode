@@ -12,7 +12,7 @@ stamp is set only on SUCCESS, so a failed attempt keeps the historical
 first-line title and the NEXT activation may retry (one bounded attempt
 per activation — never a loop within a run). Tasks that never reach the
 agent (hold / draft / queued) keep their derived titles: the generator
-runs only in the agent-run worker (see drcode.tui.pipeline_agent_run).
+runs only in the agent-run worker (see drcode.core.pipeline_agent_run).
 """
 
 from __future__ import annotations

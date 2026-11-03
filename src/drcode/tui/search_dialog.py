@@ -51,8 +51,13 @@ from textual.timer import Timer
 from textual.widgets import Input, ListView, Static
 
 from .. import task_search
+from ..core.blocks import (
+    SPINNER_FRAMES as _SPINNER_FRAMES,
+)
+from ..core.blocks import (
+    SPINNER_INTERVAL as _SPINNER_INTERVAL,
+)
 from ..task_search import TaskHit
-from .blocks import _SPINNER_FRAMES, _SPINNER_INTERVAL
 from .sidebar import TaskItem
 
 # Keystroke debounce: the in-memory filtering is cheap, but re-rendering

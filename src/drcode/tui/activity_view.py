@@ -16,11 +16,11 @@ from functools import partial
 from rich.cells import cell_len
 from textual.css.query import NoMatches
 
+from ..core.usage import NETWORK_RETRIES
 from ..models import Task, TaskStatus
 from ..version import APP_VERSION
 from .header import HeaderGitIndicator
 from .state import DrCodeState, update_static_if_changed
-from .usage import NETWORK_RETRIES
 
 
 class ActivityLayer(DrCodeState):

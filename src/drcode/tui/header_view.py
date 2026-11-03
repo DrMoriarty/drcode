@@ -16,6 +16,7 @@ from rich.cells import cell_len
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
+from ..core.usage import NETWORK_RETRIES
 from ..models import TaskKind, TaskStatus
 from ..providers import AgentRole
 from .header import (
@@ -24,7 +25,6 @@ from .header import (
     ModelStatusHeader,
 )
 from .state import DrCodeState, update_static_if_changed
-from .usage import NETWORK_RETRIES
 
 
 class HeaderLayer(DrCodeState):
@@ -71,6 +71,18 @@ class HeaderLayer(DrCodeState):
         ]:
             self._tester_retry_at.pop(task_id, None)
         self._advance()
+
+    async def _check_model(self) -> None:
+        # Teardown-race guard around the core probe: the probe round-trip
+        # can outlive the app (ESC while the gateway answers slowly) — the
+        # header label is gone by the time the worker resumes; the
+        # indicator is cosmetic, so a vanished widget just ends the check
+        # quietly. (The core's own _check_model is this inner probe without
+        # the Textual-specific exception.)
+        try:
+            await self._check_model_inner()
+        except NoMatches:
+            pass
 
     def refresh_connection(self) -> None:
         self.run_worker(self._check_model(), exclusive=True, group="model-check")

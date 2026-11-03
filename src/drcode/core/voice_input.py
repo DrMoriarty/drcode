@@ -1,0 +1,446 @@
+"""Push-to-talk voice dictation state machine (the Ctrl+B hotkey in the
+input fields).
+
+Push-to-talk state machine, one instance per app:
+
+- idle → recording: a worker thread opens the microphone
+  (:class:`drcode.voice.MicrophoneRecorder`); the persistent corner
+  indicator is refreshed through the host seam — the UI event loop
+  never touches PortAudio.
+- recording → idle (second press): the same worker thread stops the
+  recorder, uploads the WAV to the ASR endpoint and inserts the
+  recognized text at the cursor of the field that started the
+  recording — the user edits before sending.
+- recording → idle (ESC): the recording is discarded (stream closed on
+  a worker thread, never on the UI thread).
+- any failure (no config, no sounddevice, microphone busy, network) is
+  a readable toast; the state machine resets to idle.
+
+The state machine itself lives here, UI-neutral: every display concern
+(toasts, the header/corner indicator, inserting into a Textual input,
+validating that the target field is still on screen) goes through the
+:class:`VoiceDictationHost` seam. The Textual implementation of the
+seam lives in `drcode.tui.voice_input` (a future GUI implements the
+same protocol its own way).
+
+While a recording runs the persistent indicator lives in two places,
+re-rendered by the host on every state change and on the 1 s poll: the
+header status line and a dedicated corner widget docked to the
+bottom-right of the window. Only error toasts are transient — and even
+they have a sticky shadow: the last failure stays in the corner
+(``⚠ <message>``) until the user's next dictation action, so a
+6-second toast can no longer hide why a transcription died.
+
+Capture-side audio loss is visible in the indicator itself: while the
+recorder reports input-buffer overflows (PortAudio dropping frames) or
+callback failures, the recording line reads ``● запись… (потери!)`` —
+answering at a glance whether speech was lost on capture (microphone/
+buffer, shown live during the recording) or on transmission (HTTP/ASR,
+shown as the sticky ``ASR failed …`` error).
+
+Everything audio/network runs in short-lived daemon worker threads (the
+tool_runtime pattern); the only UI-thread work is inserting the text
+and showing toasts (via the host's UI-thread hop).
+"""
+
+from __future__ import annotations
+
+import enum
+import sys
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Protocol
+
+from .. import voice
+from ..voice import (
+    SOUNDDEVICE_AVAILABLE,
+    VOICE_UNAVAILABLE_HINT,
+    MicrophoneRecorder,
+    VoiceClient,
+    VoiceError,
+    config_from_settings,
+)
+
+if TYPE_CHECKING:
+    from ..settings import ProjectSettings
+
+
+class _State(enum.Enum):
+    IDLE = "idle"
+    RECORDING = "recording"
+    TRANSCRIBING = "transcribing"
+
+
+# Terminal auto-repeat sends a burst of synthetic presses while Ctrl+B is
+# held (a natural push-to-talk reflex); the Key event carries no repeat
+# marker, so the toggle is guarded in time instead. Auto-repeat
+# intervals (~15–90 ms) are far below the debounce window, and the first
+# repeat — arriving after the initial delay, which can exceed it — is
+# caught by the minimum-recording guard.
+_TOGGLE_DEBOUNCE = 0.3  # s between distinct toggle presses
+_MIN_RECORDING = 0.7  # a stop sooner than this cannot be real speech
+
+
+class VoiceDictationHost(Protocol):
+    """The UI seam of the dictation state machine (implemented by the
+    TUI over the app; a future GUI implements it its own way)."""
+
+    def voice_settings(self) -> ProjectSettings:
+        """The project settings the voice config is read from."""
+        ...
+
+    def voice_notify(self, message: str, *, error: bool = False) -> None:
+        """Show a (transient) toast."""
+        ...
+
+    def voice_sync_indicator(self) -> None:
+        """Re-render the persistent dictation indicator right away
+        (safe from any thread)."""
+        ...
+
+    def voice_on_ui_thread(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Run `fn(*args, **kwargs)` on the UI thread (from a worker
+        thread)."""
+        ...
+
+    def voice_context_of(self, target: Any) -> tuple[str, Any]:
+        """Freeze the UI context the dictation belongs to (which logical
+        view owns `target`)."""
+        ...
+
+    def voice_context_valid(self, target: Any, context: tuple[str, Any]) -> bool:
+        """Re-validate at insert time (runs on the UI thread): the target
+        is still mounted/visible/in the same context."""
+        ...
+
+    def voice_insert_text(self, target: Any, text: str) -> None:
+        """Insert `text` at the cursor of `target` (never sends it).
+        Prefix-spacing failures are swallowed internally (best-effort);
+        insertion failures raise."""
+        ...
+
+
+class VoiceInputController:
+    """Toggle-style push-to-talk: first press starts, second stops and
+    inserts; ESC cancels. Created by the app shell (``app.voice_input``)."""
+
+    def __init__(self, host: VoiceDictationHost) -> None:
+        self._host = host
+        self._state = _State.IDLE
+        self._recorder: MicrophoneRecorder | None = None
+        # The field whose cursor receives the recognized text.
+        self._target: Any = None
+        # Context snapshot taken together with the target (see
+        # voice_context_of): the recognized text is only ever inserted
+        # while the app is still in the same context the dictation was
+        # started in (same screen, same viewed task / same new-task form).
+        self._context: tuple[str, Any] | None = None
+        self._last_toggle = 0.0  # auto-repeat guard stamp (monotonic)
+        self._recording_since = 0.0
+        # The last dictation failure, kept visible in the corner until the
+        # user's next dictation action (the error toast alone auto-dismisses
+        # after six seconds — exactly long enough to miss).
+        self._sticky_error: str | None = None
+
+    @property
+    def active(self) -> bool:
+        """A recording or transcription is in flight (drives the ESC
+        handling of the input fields)."""
+        return self._state is not _State.IDLE
+
+    def _capture_loss(self) -> bool:
+        """The live recorder reports lost speech on the capture side
+        (input-buffer overframes dropped by PortAudio, or failing
+        audio-thread callbacks)."""
+        recorder = self._recorder
+        if recorder is None:
+            return False
+        return recorder.overflows > 0 or recorder.callback_errors > 0
+
+    @property
+    def indicator(self) -> str | None:
+        """Persistent status text for the header line while busy (None
+        when idle) — the auto-dismissing toast alone left any utterance
+        longer than a few seconds with no visible sign that dictation
+        was still running.
+
+        While recording, a capture-side loss flips the line into the
+        alarm state ``● запись… (потери!)``: the user sees the dropped
+        frames the moment they happen, not only in the (absent) result."""
+        if self._state is _State.RECORDING:
+            if self._capture_loss():
+                return "● запись… (потери!)"
+            return "● запись…"
+        if self._state is _State.TRANSCRIBING:
+            return "● распознаю…"
+        return None
+
+    @property
+    def corner_indicator(self) -> str | None:
+        """Status text for the persistent bottom-right corner widget
+        (None when there is nothing to show): the base status from
+        ``indicator`` plus the push-to-talk hint while recording — the
+        corner is where the user watches while dictating, so the
+        stop/cancel keys must be right there for the whole session, not
+        just the first four seconds.
+
+        After a failure the corner stays occupied by the sticky error
+        (``⚠ <message>``) even though the state is back to IDLE — the
+        six-second toast is not the only trace of why the dictation
+        died. Cleared by the next dictation action (a new recording,
+        ESC cancel, a successful insert)."""
+        if self._state is _State.IDLE:
+            if self._sticky_error is not None:
+                return f"⚠ {self._sticky_error}"
+            return None
+        base = self.indicator
+        if base is None:
+            return None
+        if self._state is _State.RECORDING:
+            return f"{base}  Ctrl+B — готово, ESC — отмена"
+        return base
+
+    def dismiss_sticky_error(self) -> None:
+        """Drop the sticky corner error on ANY user action (a key press,
+        a click — hooked from the app's event handler before the event is
+        forwarded to the focused widget). The error explains a failed
+        dictation until the user moves on; once they act on anything
+        else it must not hang in the corner forever. The dictation
+        state machine itself clears the flag on its own actions
+        (new recording, cancel, insert) — this covers everything else."""
+        if self._sticky_error is None:
+            return
+        self._sticky_error = None
+        if self._state is _State.IDLE:
+            self._sync_indicator()
+
+    def _notify(self, message: str, *, error: bool = False) -> None:
+        try:
+            self._host.voice_notify(message, error=error)
+        except Exception as e:  # noqa: BLE001 - toasts are best-effort
+            print(f"drcode voice: notify failed: {e}", file=sys.stderr)
+
+    def toggle(self, target: Any) -> None:
+        """The hotkey action: start recording, or stop it and insert the
+        text (called on the UI thread).
+
+        Guarded against terminal auto-repeat: holding Ctrl+B produces
+        synthetic presses indistinguishable from real ones, and without
+        the guard the first repeat would stop the recording it just
+        started (a tiny fragment, flickering toasts). Every call —
+        accepted or swallowed — refreshes the stamp, so a held key can
+        never flip the state machine no matter how long it is held."""
+        now = time.monotonic()
+        repeated = now - self._last_toggle < _TOGGLE_DEBOUNCE
+        self._last_toggle = now
+        if repeated:
+            return
+        if self._state is _State.TRANSCRIBING:
+            self._notify("Still recognizing the previous utterance…")
+            return
+        if self._state is _State.RECORDING:
+            if now - self._recording_since < _MIN_RECORDING:
+                # A stop within the first beat slipped past the debounce
+                # (initial auto-repeat delay can exceed it) — it is not
+                # intent, and must not cut the recording to a fragment.
+                return
+            self._state = _State.TRANSCRIBING
+            self._sync_indicator()
+            self._transcribe()
+            return
+        self._start(target)
+
+    def _sync_indicator(self) -> None:
+        """Re-render the persistent header indicator right away (the 1 s
+        activity poll would refresh it anyway). Also refreshes the
+        bindings, so the footer's "Cancel recording" entry appears and
+        disappears together with the state. Safe from any thread."""
+        try:
+            self._host.voice_sync_indicator()
+        except Exception as e:  # noqa: BLE001 - the indicator is cosmetic
+            print(f"drcode voice: indicator failed: {e}", file=sys.stderr)
+
+    def cancel(self, *, silent: bool = False) -> bool:
+        """ESC while a recording runs: drop it. True when something was
+        cancelled (the caller then swallows the ESC).
+
+        ``silent=True`` is for the automatic navigation hooks (task
+        switch, new-task form leave, modal push): the discard is part of
+        the navigation the user just performed, no extra toast.
+
+        The stream close is offloaded to a worker thread — the UI thread
+        never touches PortAudio. A TRANSCRIBING phase cannot be cancelled
+        this way (no stream left); the insert-time context validation
+        drops its text instead."""
+        if self._state is not _State.RECORDING:
+            return False
+        recorder, self._recorder = self._recorder, None
+        self._state = _State.IDLE
+        self._target = None
+        self._context = None
+        self._sticky_error = None
+        if recorder is not None:
+            _thread_start(_discard_recorder, recorder)
+        self._sync_indicator()
+        self._notify("Запись отменена")
+        return True
+
+    # -- phases ------------------------------------------------------------------
+
+    def _start(self, target: Any) -> None:
+        """Config/availability checks, then open the microphone in a
+        worker thread."""
+        settings = self._host.voice_settings()
+        try:
+            config = config_from_settings(settings)
+        except Exception as e:  # noqa: BLE001 - config must never break typing
+            self._notify(f"Voice settings unreadable: {e}", error=True)
+            return
+        if config is None or not config.asr_model:
+            self._notify(
+                "Voice dictation is not configured — Settings → Voice… "
+                "(audio API base URL + ASR model).",
+                error=True,
+            )
+            return
+        if not SOUNDDEVICE_AVAILABLE:
+            reason = (
+                f" ({voice._SOUNDDEVICE_ERROR})" if voice._SOUNDDEVICE_ERROR else ""
+            )
+            self._notify(
+                f"sounddevice is not available{reason} — {VOICE_UNAVAILABLE_HINT}",
+                error=True,
+            )
+            return
+        recorder = MicrophoneRecorder()
+        self._recorder = recorder
+        self._target = target
+        self._context = self._host.voice_context_of(target)
+        self._state = _State.RECORDING
+        self._recording_since = time.monotonic()
+        # The user is acting again: the previous failure's sticky corner
+        # error gives way to the fresh recording.
+        self._sticky_error = None
+        self._sync_indicator()
+        _thread_start(self._open_microphone, recorder)
+
+    def _open_microphone(self, recorder: MicrophoneRecorder) -> None:
+        """Worker thread: open the PortAudio stream (a slow syscall — the
+        event loop never waits for it). The persistent corner indicator
+        (with the Ctrl+B/ESC hint) is already up from ``_start`` — the
+        old confirming status toast here auto-dismissed after a few
+        seconds, which is exactly the feedback gap it claimed to fill."""
+        try:
+            recorder.start()
+        except VoiceError as e:
+            self._fail(str(e))
+            return
+        if self._state is not _State.RECORDING:
+            return
+        # The microphone is confirmed open: re-render the corner once so
+        # a state flip racing the slow open is caught up immediately.
+        self._sync_indicator()
+
+    def _transcribe(self) -> None:
+        """Stop the recorder, upload the WAV, insert the text at the
+        cursor — all in a worker thread; only the insertion is UI work.
+
+        The target and the context snapshot stay on the controller until
+        the insert: ``_insert`` re-validates them against the CURRENT app
+        state (they are not stale-cleared here), so a context change
+        while ASR runs drops the text instead of inserting it."""
+        recorder = self._recorder
+        target = self._target
+        self._recorder = None
+        _thread_start(self._recognize, recorder, target)
+
+    def _recognize(self, recorder: MicrophoneRecorder, target: Any) -> None:
+        """Worker thread: close the stream, upload the WAV to the ASR
+        endpoint and hop back into the app thread to insert the text."""
+        try:
+            wav = recorder.stop()
+            config = config_from_settings(self._host.voice_settings())
+            if config is None or not config.asr_model:
+                raise VoiceError("Voice dictation is not configured")
+            text = VoiceClient(config).transcribe(wav)
+        except VoiceError as e:
+            self._fail(str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - a dictation never breaks the app
+            self._fail(f"{type(e).__name__}: {e}")
+            return
+        try:
+            self._host.voice_on_ui_thread(self._insert, target, text)
+        except Exception as e:  # noqa: BLE001 - app may be shutting down
+            print(f"drcode voice: insert failed: {e}", file=sys.stderr)
+
+    def _insert(self, target: Any, text: str) -> None:
+        """Insert the recognized text at the cursor of the field that
+        started the recording (never sends it).
+
+        The dictation belongs to the context it was started in: if the
+        user navigated away while ASR was in flight (another task, the
+        new-task form, a modal dialog, a hidden target), the text is
+        dropped with a toast instead of landing in a stale field."""
+        self._state = _State.IDLE
+        # A completed insert means transmission worked: the sticky corner
+        # error (from an earlier failed attempt) has served its purpose.
+        self._sticky_error = None
+        self._sync_indicator()
+        if target is None:
+            self._target = None
+            self._context = None
+            return
+        valid = self._context is None or self._host.voice_context_valid(
+            target, self._context
+        )
+        self._target = None
+        self._context = None
+        if not valid:
+            self._notify("Dictation discarded — context changed")
+            return
+        try:
+            self._host.voice_insert_text(target, text)
+        except Exception as e:  # noqa: BLE001 - insertion is best-effort
+            self._notify(f"Could not insert the text: {e}", error=True)
+
+    def _fail(self, message: str) -> None:
+        """Abort the state machine with a readable error (from any
+        thread).
+
+        The error is sticky: besides the six-second toast it stays in the
+        corner (``⚠ <message>``) until the next dictation action — an ASR
+        or capture failure must still be explainable after the toast is
+        gone. The message itself already separates the two loss sites:
+        ``Recording incomplete …`` (capture) vs ``ASR failed: HTTP …
+        (12.3s, 456 KB)`` (transmission)."""
+        self._recorder = None
+        self._target = None
+        self._context = None
+        self._state = _State.IDLE
+        self._sticky_error = message
+        self._sync_indicator()
+        try:
+            self._host.voice_on_ui_thread(self._notify, message, error=True)
+        except Exception:  # noqa: BLE001 - app may be shutting down
+            self._notify(message, error=True)
+
+
+def _discard_recorder(recorder: MicrophoneRecorder) -> None:
+    """Worker body for the ESC path: close the PortAudio stream off the
+    UI thread (cancel never blocks the event loop on audio syscalls)."""
+    recorder.discard()
+
+
+def _thread_start(func: object, *args: object) -> None:
+    """A short-lived daemon worker (open-mic / transcribe phases): the
+    audio and network calls must never touch the UI event loop (same
+    pattern as tool_runtime's worker threads)."""
+
+    def wrapper() -> None:
+        try:
+            func(*args)  # type: ignore[operator]
+        except Exception as e:  # noqa: BLE001 - a dictation never breaks the app
+            print(f"drcode voice: {type(e).__name__}: {e}", file=sys.stderr)
+
+    threading.Thread(target=wrapper, daemon=True, name="drcode-voice").start()

@@ -22,7 +22,6 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
 )
 from pydantic_ai.usage import UsageLimits
-from textual import work
 
 from ..agent import (
     COMPACTION_RESUME_PREFIX,
@@ -33,20 +32,20 @@ from ..agent import (
     resumable_history,
     run_context_tokens,
 )
-from ..github import issue_commit_hint
-from ..models import Task, TaskStatus, VerificationStatus
-from ..providers import AgentRole
-from ..tools import scratch_dir
-from .blocks import ToolCallBlock
-from .pipeline_stream import NodeStreamView
-from .state import DrCodeState
-from .usage import (
+from ..core.usage import (
     NETWORK_RETRIES,
     _in_outage,
     _is_context_overflow_error,
     _is_retryable_network_error,
     _network_retry_delay,
 )
+from ..github import issue_commit_hint
+from ..models import Task, TaskStatus, VerificationStatus
+from ..providers import AgentRole
+from ..tools import scratch_dir
+from .pipeline_stream import NodeStreamView
+from .state import CoreState
+from .worker_runtime import work
 
 # The user message a paused testing round is resumed with after a SUCCESSFUL
 # mid-round compaction. Without it the model sees only the original prompt
@@ -130,7 +129,7 @@ def _trim_oversized_text(text: str, keep_chars: int, task_id: str) -> str:
     return text[:head] + note + (text[-tail:] if tail > 0 else "")
 
 
-class PipelineTesterLayer(DrCodeState):
+class PipelineTesterLayer(CoreState):
     # -- tester run ------------------------------------------------------------------
 
     def _schedule_tester_retry(self, task_id: str) -> None:
@@ -574,7 +573,9 @@ class PipelineTesterLayer(DrCodeState):
                                                 f"tester: {event.part.tool_name}"
                                                 f"({args_str})"
                                             )
-                                            block = ToolCallBlock(call_text)
+                                            block = self.host.host_new_tool_call_block(
+                                                call_text
+                                            )
                                             self._tool_call_started(
                                                 run_key,
                                                 task_id,

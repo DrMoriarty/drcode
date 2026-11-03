@@ -43,12 +43,12 @@ from ..context_layout import (
     tester_tool_schemas,
     tool_schemas,
 )
+from ..core.usage import _is_context_overflow_error
 from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
 from ..transcript import estimate_tokens
-from .state import DrCodeState
-from .usage import _is_context_overflow_error
+from .state import CoreState
 
 # Hard-limit compaction level (percent of max_context_tokens): the last
 # safe line before the serving model deterministically rejects the next
@@ -105,7 +105,7 @@ class _ChunkingImpossible(Exception):
     to apply the mechanical floor instead of calling the model."""
 
 
-class PipelineCompactionLayer(DrCodeState):
+class PipelineCompactionLayer(CoreState):
     def _fill_over_threshold(
         self,
         live_tokens: int | None,

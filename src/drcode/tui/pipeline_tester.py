@@ -511,9 +511,16 @@ class PipelineTesterLayer(DrCodeState):
                                 # a perfectly healthy run.
                                 view.begin_node()
                                 async with node.stream(run.ctx) as node_stream:
-                                    async for event in node_stream:
-                                        view.feed(event)
-                                view.finish_node()
+                                    try:
+                                        async for event in node_stream:
+                                            view.feed(event)
+                                    finally:
+                                        # A mid-stream death (network error,
+                                        # abort) skips the normal node end:
+                                        # stop the spinners here, or they
+                                        # keep animating through the retry
+                                        # backoff (and the outage wait).
+                                        view.finish_node()
                                 live_tokens = run_context_tokens(run)
                                 if live_tokens is not None:
                                     self._live_ctx_tester[task_id] = live_tokens

@@ -272,6 +272,34 @@ async def test_server_ws_bridge_roundtrip(tmp_path: Path) -> None:
         await runner.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# web/term.js — welcome-screen pick-project handler (static, headless)
+# ---------------------------------------------------------------------------
+
+# pywebview injects its JS bridge asynchronously AFTER the DOM loads, so an
+# early click on "choose project" used to hit api("choose_project") == null
+# and report the native folder dialog as unavailable even though the bridge
+# was about to appear. The handler must retry for the bridge (like the
+# recents get_info loop) and show the error only after the budget is
+# exhausted. The JS itself needs a GUI session — checked statically here.
+
+
+def test_term_js_pick_project_retries_before_error() -> None:
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    start = js.index('elPick.addEventListener("click"')
+    end = js.index('document.getElementById("btn-restart")', start)
+    handler = js[start:end]
+
+    # The unavailability message is only reachable past the retry loop.
+    msg_at = handler.index("Native folder dialog is unavailable")
+    assert handler.index("setInterval") < msg_at
+    assert handler.index("attempts > 40") < msg_at
+    # Retry polls the same bridge call the click originally missed.
+    assert handler.count('api("choose_project")') == 2
+    # A second click while a retry is running does not stack another loop.
+    assert "dataset.waiting" in handler
+
+
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:
     ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
     try:

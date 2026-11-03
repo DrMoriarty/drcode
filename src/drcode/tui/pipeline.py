@@ -160,9 +160,7 @@ class PipelineCoreLayer(DrCodeState):
         ]
         if not candidates:
             return None
-        candidates.sort(
-            key=lambda t: (t.kind is not TaskKind.BUG, t.created_at)
-        )
+        candidates.sort(key=lambda t: (t.kind is not TaskKind.BUG, t.created_at))
         return candidates[0]
 
     def _schedule_pipeline_timer(

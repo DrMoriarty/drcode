@@ -65,7 +65,7 @@ async def test_status_change_reuses_row_widget(app: DrCodeApp, two_tasks) -> Non
     async with app.run_test() as pilot:
         await _started(app, pilot)
         row = row_of(app, a.id)
-        assert "⏳" in row.text
+        assert "◷" in row.text
 
         a.status = TaskStatus.ACTIVE
         a.touch()

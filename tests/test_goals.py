@@ -234,9 +234,7 @@ def test_requeued_completed_task_keeps_goal_link_and_counts_once(manager) -> Non
     # first completion produced (the goal re-opens only via a NEW task
     # assignment, not by re-queuing an old one — see the lifecycle tests;
     # the second completion finds the goal already DONE and adds nothing).
-    progress = [
-        e for e in events if "задач завершено" in e and "переведена" not in e
-    ]
+    progress = [e for e in events if "задач завершено" in e and "переведена" not in e]
     assert len(progress) == 2
     assert "1/1 задач завершено" in progress[-1]
     assert sum("переведена" in e for e in events) == 1

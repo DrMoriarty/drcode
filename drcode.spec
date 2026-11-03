@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 ROOT = Path(SPECPATH).resolve()
 ONEFILE = os.environ.get("DRCODE_ONEFILE", "") not in ("", "0", "false")
@@ -71,7 +71,14 @@ a = Analysis(
     # anyio imports its backend dynamically — PyInstaller can't see it
     # from static analysis alone; sounddevice is a core dependency
     # (imported lazily by drcode.voice; numpy-free via raw streams).
-    hiddenimports=["anyio._backends._asyncio", "sounddevice"],
+    # textual resolves widgets lazily through textual/widgets/__init__.__getattr__
+    # (e.g. `textual.widgets._tab` behind TabbedContent) — its PyInstaller hook
+    # does not collect those, so bundle every widget submodule explicitly.
+    hiddenimports=[
+        "anyio._backends._asyncio",
+        "sounddevice",
+        *collect_submodules("textual.widgets"),
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -79,6 +79,57 @@ configuration (env vars,
 `~/.config/drcode/drcode.json`, per-project `.env` / `.drcode/drcode.json`) as the
 installed package.
 
+## DrCode Desktop
+
+A native app shell that runs the existing drcode TUI binary inside an
+embedded terminal (`xterm.js` + PTY) in a real window — no GUI re-imagining,
+byte-for-byte the same TUI with full functional parity by construction: the
+window simply spawns the unmodified onedir bundle (above) with your chosen
+project folder as its working directory.
+
+What the shell adds around the terminal:
+
+- native window with project picker (system folder dialog) and a
+  recent-projects list (`~/.config/drcode-desktop.json`);
+- OSC 52 interception — copying from the TUI lands in the system clipboard;
+- bundled Nerd font (no system font install needed), WebGL renderer with
+  graceful fallback, SGR mouse support, Cyrillic/IME;
+- window resize propagates to the PTY (Textual handles SIGWINCH itself);
+- drcode exits cleanly → the window closes; it crashes → a restart dialog;
+- fullscreen (F11) and session restart (⌘/Ctrl+Shift+R).
+
+Voice I/O (push-to-talk/TTS) lives inside the drcode process and works as
+usual. No tabs/multiple sessions — one window is one PTY session, on
+purpose.
+
+Build (per platform; the drcode payload must exist first):
+
+```bash
+bash scripts/build-binary.sh                      # the payload: dist/drcode/
+uv sync --group desktop --group build
+
+# macOS: dist-desktop/DrCode.app + dist/DrCode-<v>-macos-arm64.zip
+uv run --group desktop --group build python -m desktop.packaging --target macos
+# Linux: AppImage (bundles WebKitGTK) — needs libwebkit2gtk-4.1-dev etc.
+uv run --group desktop --group build python -m desktop.packaging --target appimage
+# Linux: .deb (depends on the distro's WebKitGTK instead of bundling it)
+uv run --group desktop --group build python -m desktop.packaging --target deb
+```
+
+Run the shell from source (dev mode; the payload resolves from
+`desktop/resources/` or `dist/`):
+
+```bash
+uv run --group desktop python desktop/app.py --project /path/to/project
+```
+
+Signing/notarization on macOS: local builds are ad-hoc signed (right-click →
+Open on first launch); release builds pass `DRCODE_CODESIGN_IDENTITY` with a
+Developer ID Application certificate, then notarize the zip. Tag-driven
+releases (push a `v*` tag) build the desktop artifacts in CI alongside the
+terminal bundles and attach them to the same GitHub Release — see
+`desktop/README.md` for architecture notes.
+
 ## Configuration
 
 Model selection is two-level:

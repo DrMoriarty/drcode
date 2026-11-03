@@ -59,7 +59,32 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-xdist>=3.8",
     "ruff>=0.17.1",
+    # aiohttp backs the desktop shell's ws/pty bridge (desktop/server.py)
+    # AND its tests; it is pure-python and light, so it lives in `dev` —
+    # the default `uv sync` (core+dev) must be able to collect the whole
+    # test suite, including tests/test_desktop.py. pywebview/PyGObject
+    # stay desktop-only (platform-heavy GTK/native stacks).
+    "aiohttp>=3.9",
+    # Pure-python imports the desktop shell's sources need for TYPE
+    # CHECKING (`uv run pyright` is part of the default gate, and it
+    # resolves imports against this venv): pywebview (no platform extras
+    # here — desktop adds the GTK backend) and Pillow (used only by
+    # desktop/packaging.py icon generation). Without them a default-
+    # synced env reports unresolved imports in desktop/.
+    "pywebview>=5.4",
+    "Pillow>=10.0",
 ]
 build = [
     "pyinstaller>=6.10",
+]
+# DrCode Desktop shell (pywebview window + aiohttp ws/pty bridge).
+# Dev/build: `uv sync --group desktop --group build`.
+# Linux: GTK backend (WebKitGTK via PyGObject); PyGObject is pinned below
+# 3.52 so it builds against libgirepository-1.0 (present on every
+# supported runner/dist), not the girepository-2.0 the newer releases need.
+desktop = [
+    "pywebview>=5.4; sys_platform == 'darwin'",
+    "pywebview[gtk]>=5.4; sys_platform == 'linux'",
+    "PyGObject>=3.42,<3.52; sys_platform == 'linux'",
+    "Pillow>=10.0",
 ]

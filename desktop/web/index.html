@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ws: wss:;">
+  <title>DrCode</title>
+  <link rel="stylesheet" href="static/vendor/xterm.min.css">
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <!-- Welcome / project picker: visible until a session starts -->
+  <div id="welcome" class="welcome">
+    <div class="welcome-card">
+      <div class="brand">
+        <span class="brand-mark">&gt;_</span>
+        <span class="brand-name">DrCode Desktop</span>
+      </div>
+      <p class="brand-sub">Native shell around the drcode TUI.<br>
+        Pick a project folder — the bundled <code>drcode</code> binary runs inside this window with that folder as its working directory.</p>
+
+      <button id="pick-project" class="btn btn-primary" type="button">Open project folder…</button>
+
+      <div id="recents-block" class="recents hidden">
+        <div class="recents-title">Recent projects</div>
+        <ul id="recents-list" class="recents-list"></ul>
+      </div>
+
+      <div id="welcome-error" class="welcome-error hidden"></div>
+
+      <div class="hints">
+        <div class="hints-title">Shortcuts</div>
+        <div><kbd>F11</kbd> fullscreen &nbsp;·&nbsp; <kbd>⌘/Ctrl</kbd>+<kbd>⇧</kbd>+<kbd>R</kbd> restart session</div>
+        <div>OSC 52 clipboard is wired: copying from the TUI lands in the system clipboard.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Terminal fills the window once the session starts -->
+  <div id="terminal" class="terminal hidden"></div>
+
+  <!-- Crash / exit dialog -->
+  <div id="exit-dialog" class="overlay hidden">
+    <div class="dialog">
+      <div id="exit-title" class="dialog-title">drcode exited</div>
+      <div id="exit-text" class="dialog-text"></div>
+      <div class="dialog-actions">
+        <button id="btn-restart" class="btn btn-primary" type="button">Restart</button>
+        <button id="btn-close" class="btn" type="button">Close window</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="boot-error" class="boot-error hidden"></div>
+
+  <script src="static/vendor/xterm.min.js"></script>
+  <script src="static/vendor/xterm-addon-fit.js"></script>
+  <script src="static/vendor/xterm-addon-webgl.js"></script>
+  <script src="static/term.js"></script>
+</body>
+</html>

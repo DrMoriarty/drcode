@@ -11,6 +11,15 @@ uv run pytest -n 0                         # serial run — for debugging (-s/--
 uv run ruff check src                      # lint (no config; ruff defaults)
 uv run ruff format src
 uv run pyright                             # typecheck (dev dep; no config)
+
+# DrCode Desktop (desktop/ — pywebview shell around the TUI bundle):
+bash scripts/build-binary.sh               # payload first: dist/drcode/
+uv sync --group desktop --group build      # desktop deps (pywebview, aiohttp)
+uv run --group desktop python desktop/app.py --project /tmp/scratch   # dev run
+uv run --group desktop --group build python -m desktop.packaging --target macos     # DrCode.app (macOS)
+uv run --group desktop --group build python -m desktop.packaging --target appimage  # AppImage (Linux)
+uv run --group desktop --group build python -m desktop.packaging --target deb       # .deb (Linux)
+uv run pytest tests/test_desktop.py -n 0   # headless shell tests (GUI needs a desktop session)
 ```
 
 - No CI runs tests and there are no pre-commit hooks — local `ruff` + `pyright` + `pytest` is the only gate. Exercise the TUI by launching `uv run drcode` in a scratch directory.
@@ -26,6 +35,7 @@ uv run pyright                             # typecheck (dev dep; no config)
 - Standalone binary: `bash scripts/build-binary.sh` (provisions PyInstaller via `uv sync --group build`; platform-specific, no cross-compilation). Onedir on purpose — see README; `DRCODE_ONEFILE=1` builds the legacy single-file. `drcode_entry.py` is the PyInstaller stub; it sets `PYDANTIC_DISABLE_PLUGINS=logfire-plugin,logfire` because the logfire pydantic plugin crashes in a frozen app.
 - Headless CLI (entry point `drcode:main`): `drcode --bug-report DESC` / `--feature-request DESC` create a task without the TUI; `--git-hub-sync` runs one GitHub Issues sync cycle. The user model catalog is edited in the TUI's Settings → Provider catalog.
 - Releases are tag-driven: pushing a `v*` tag runs `.github/workflows/build-binaries.yml` (onedir bundles for macOS arm64, Linux x86_64/arm64, Windows, attached to a GitHub Release).
+- DrCode Desktop (`desktop/`) is a pywebview shell that spawns the unmodified onedir bundle inside a PTY and relays bytes to xterm.js — zero drcode logic in the shell (details in `desktop/README.md`). Gotchas: `uv sync --group build` (run by `scripts/build-binary.sh`) removes the `desktop` dependency group — re-run `uv sync --group desktop --group build` after a payload build; the shell is built with `--distpath dist-desktop --workpath build-desktop` because on macOS's case-insensitive FS a `DrCode` COLLECT output would merge into the payload's `dist/drcode`; the payload must never be modified at packaging time. `textual.widgets` submodules are lazy-imported — `drcode.spec` collects them explicitly, keep that when touching the spec.
 - Voice I/O (push-to-talk dictation + TTS announcements): `sounddevice` is a CORE dependency — the `--extra voice` is a historic no-op kept only for old install instructions. The sounddevice import is guarded lazily in `voice.py`: a missing system PortAudio library degrades to a toast, never a crash. On Linux a frozen bundle needs `bash scripts/fetch-portaudio.sh` BEFORE `build-binary.sh` (no manylinux sounddevice wheel; the distro libportaudio2 hard-links JACK, so the script builds an ALSA-only PortAudio from source — needs gcc + ALSA headers). macOS/Windows wheels ship the binary.
 
 ## Custom team workflow (see docs/workflow.md)

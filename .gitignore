@@ -3,6 +3,9 @@ __pycache__/
 *.py[oc]
 build/
 dist/
+dist-desktop/
+build-desktop/
+desktop/build/
 wheels/
 *.egg-info
 

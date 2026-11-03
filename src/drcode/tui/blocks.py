@@ -464,7 +464,7 @@ class ToolCallBlock(Static):
     """Collapsible tool-call block; collapsed by default, click to toggle.
 
     Header shows the tool name plus the value of its primary argument
-    ("🛠️ edit_file src/drcode/agent.py") in gray; expanding reveals the
+    ("⚙ edit_file src/drcode/agent.py") in gray; expanding reveals the
     full arguments as syntax-highlighted JSON (keys, strings, numbers and
     punctuation in their own colors; unparsable arguments stay plain).
     """
@@ -583,12 +583,8 @@ class ToolCallBlock(Static):
         # Plain Text, not a markup string — tool arguments are model JSON and
         # may contain bracket sequences Textual's markup parser takes for tags.
         arrow = "▸" if self.has_class("collapsed") else "▾"
-        # 🛠️ (U+1F6E0 U+FE0F) instead of the bare ⚙: EAW=W, so rich's
-        # cell_len (2) matches what every terminal draws — the ambiguous
-        # ⚙ rendered wide shifted the right-aligned timestamp one cell
-        # off the edge.
         marker = (
-            _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "🛠️"
+            _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "⚙"
         )
         text = Text(f"{arrow} {marker} {self._header}")
         elapsed = self._elapsed_text()

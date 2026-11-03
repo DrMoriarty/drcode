@@ -20,7 +20,7 @@ inside a desktop build is the repo root `version` file (same `v*` tag).
 | `projects.py` | recent projects (`~/.config/drcode-desktop.json`, XDG-aware) |
 | `packaging.py` | `.app` / AppImage / `.deb` assembly (see below) |
 | `desktop.spec` | PyInstaller spec for the SHELL; copies the pre-built payload in as `resources/drcode` |
-| `web/` | `index.html`, `term.js`, styles, vendored xterm.js UMD bundles + fit/WebGL addons (no npm/webpack), bundled Nerd font |
+| `web/` | `index.html`, `term.js`, styles, vendored xterm.js UMD bundles + fit/WebGL/unicode11 addons (no npm/webpack), bundled Nerd font |
 
 One pty session per window — no tabs, by design. The window closes when
 drcode exits with code 0; a crash (non-zero exit) opens a restart dialog.
@@ -33,6 +33,13 @@ drcode exits with code 0; a crash (non-zero exit) opens a restart dialog.
   (`api.set_clipboard` → `NSPasteboard` on macOS, `wl-copy`/`xclip`/`xsel`
   on Linux). Without this handler, copying in the TUI would not work.
 - **Bracketed paste** — handled by xterm.js out of the box (DECSET 2004).
+- **Character width** — `term.js` loads the vendored
+  `xterm-addon-unicode11.js` and activates `term.unicode.activeVersion = "11"`.
+  xterm.js's built-in UnicodeV6 tables predate emoji, so characters like ✅
+  (U+2705) were measured 1 cell wide while Textual (Python wcwidth) emits them
+  as 2 — everything after such a character drifted one cell to the left.
+  Unicode 11 makes the vast majority of emoji wide, matching Textual; a few
+  characters introduced in Unicode 13–15 may still disagree.
 - **Nerd font** — bundled in `web/fonts/` via `@font-face`.
 - **Mouse** — SGR escapes, covered by xterm.js; kitty protocol not
   required (graceful fallback).

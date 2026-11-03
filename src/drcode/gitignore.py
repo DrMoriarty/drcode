@@ -23,14 +23,17 @@ from pathlib import Path
 
 # The private subset: per-task transcripts (may contain proprietary code
 # and conversation), settings (tokens), sync bookkeeping (machine state),
-# merge-conflict triage reports and pending push notifications.
+# the task-archive search index (machine state), merge-conflict triage
+# reports and pending push notifications.
 GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/tasks/",
     ".drcode/settings.json",
     ".drcode/github_state.json",
+    ".drcode/search_index.json",
     ".drcode/worktrees/",
     ".drcode/merge_reports/",
     ".drcode/stats.json",
+    ".drcode/pending_notifications.json",
 )
 
 # Spellings of the legacy whole-directory entry older drcode versions

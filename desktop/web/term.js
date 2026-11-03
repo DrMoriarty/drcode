@@ -303,15 +303,39 @@
   function boot() {
     createTerminal();
 
-    elPick.addEventListener("click", function () {
-      var choose = api("choose_project");
-      if (!choose) {
-        showWelcomeError("Native folder dialog is unavailable in this environment (no pywebview bridge — browser mode?). Pass --project to the binary or pick a recent project.");
-        return;
-      }
+    function runChooseProject(choose) {
       Promise.resolve(choose()).then(function (path) {
         if (path) launchProject(path);
       });
+    }
+
+    elPick.addEventListener("click", function () {
+      var choose = api("choose_project");
+      if (choose) {
+        runChooseProject(choose);
+        return;
+      }
+      // pywebview injects its bridge asynchronously; an early click may
+      // land before that — wait for the bridge (same budget as the
+      // recents retry below) instead of reporting the dialog unavailable
+      // on the first miss.
+      if (elPick.dataset.waiting) return; // a retry is already running
+      elPick.dataset.waiting = "1";
+      var attempts = 0;
+      var timer = setInterval(function () {
+        attempts += 1;
+        var retry = api("choose_project");
+        if (retry) {
+          clearInterval(timer);
+          delete elPick.dataset.waiting;
+          runChooseProject(retry);
+        } else if (attempts > 40) {
+          // ~10 s without the bridge — really no shell around the page.
+          clearInterval(timer);
+          delete elPick.dataset.waiting;
+          showWelcomeError("Native folder dialog is unavailable in this environment (no pywebview bridge — browser mode?). Pass --project to the binary or pick a recent project.");
+        }
+      }, 250);
     });
 
     document.getElementById("btn-restart").addEventListener("click", function () {

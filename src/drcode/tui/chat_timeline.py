@@ -16,7 +16,6 @@ from datetime import UTC, datetime
 from functools import partial
 
 from rich.console import RenderableType
-from rich.markup import escape
 from textual.css.query import NoMatches
 from textual.widget import Widget
 from textual.widgets import Static
@@ -67,6 +66,31 @@ _CHAT_MOUNT_BYTES = 16_384
 _RICH_TAG_RE = re.compile(r"(?<!\\)\[[^\[\]]*\]")
 
 
+def _full_escape(text: str) -> str:
+    r"""Fully escape raw text (model/tool output) for a markup string.
+
+    rich's escape() only escapes tag-LIKE sequences (`[a-z#/@…]`), so a
+    stray bracket sequence such as `[?]` passes through raw — and then
+    the splitter's tag stack (which counts any `[...]`) disagrees with
+    the Textual parser (which treats it as literal text), producing
+    extra closing `[/]` on split and a MarkupError. Escaping EVERY
+    bracket restores the agreement: the splitter's lookbehind skips
+    `\[?` and Textual un-escapes it back to a literal `[`.
+
+    Backslashes are deliberately left alone: Textual renders a `\\`
+    pair literally (it does not un-escape it), so doubling them would
+    show two backslashes for every one in the raw output; a raw `\`
+    before a bracket already shields it from both parsers. The only
+    residual quirk — a raw `\` directly abutting one of OUR structural
+    tags (e.g. the final `[/]` of the wrapper) makes that tag render
+    literally — is shared with rich's own escape() and is cosmetic (no
+    MarkupError: the swallowed tag never opens, so closers never
+    outnumber opens).
+    """
+
+    return text.replace("[", "\\[")
+
+
 def _safe_markup_cut(line: str, limit: int) -> int:
     """Largest cut index <= limit that does not split a markup tag or a
     backslash escape in half — the fallback for a single over-long line
@@ -101,12 +125,20 @@ def _split_chat_text(text: str, limit: int) -> list[str]:
     if len(text) <= limit:
         return [text]
     lines: list[str] = []
-    for raw in text.split("\n"):
+    # Whether a newline precedes this line-piece in the original text
+    # (False between hard-split pieces of one over-long line — joining
+    # those with "\n" would invent line breaks that were never there).
+    nl_before: list[bool] = []
+    for li, raw in enumerate(text.split("\n")):
+        first_piece = True
         while len(raw) > limit:
             cut = _safe_markup_cut(raw, limit)
             lines.append(raw[:cut])
+            nl_before.append(first_piece and li > 0)
             raw = raw[cut:]
+            first_piece = False
         lines.append(raw)
+        nl_before.append(first_piece and li > 0)
     # Open-tag stack after each line: parts are closed/reopened so each
     # renders standalone (an unclosed [dim] would raise MarkupError).
     stack: list[str] = []
@@ -125,18 +157,23 @@ def _split_chat_text(text: str, limit: int) -> list[str]:
     size = 0
     reopen = ""
     for i, line in enumerate(lines):
-        if buf and size + len(line) + 1 > limit:
-            parts.append(reopen + "\n".join(buf) + "[/]" * len(stacks[i - 1]))
+        sep = "\n" if nl_before[i] else ""
+        if buf and size + len(sep) + len(line) > limit:
+            # The separator that preceded this line belongs to the END of
+            # the closing part (before the appended closers) — dropping it
+            # would silently swallow one newline per part boundary.
+            parts.append(
+                reopen + "".join(buf) + sep + "[/]" * len(stacks[i - 1])
+            )
             buf, size = [], 0
             reopen = "".join(stacks[i - 1])
-        if buf:
-            buf.append(line)
-            size += len(line) + 1
-        else:
             buf.append(reopen + line)
             size = len(reopen) + len(line)
+        else:
+            buf.append(sep + line if buf else line)
+            size += len(sep) + len(line)
     if buf:
-        parts.append(reopen + "\n".join(buf))
+        parts.append(reopen + "".join(buf))
     return parts
 
 
@@ -160,8 +197,9 @@ def _mention_markup(text: str) -> str:
     """Wrap task-id mentions (#69c8bd30) in click markup for markup-string
     lines (tool output, tester/system/event lines, statusbar fragments).
 
-    *text* must already be ESCAPED (rich `escape`): the wrapper only touches
-    `#`+hex runs, which escaping never alters, and Textual's markup parser
+    *text* must already be ESCAPED (`_full_escape`): the wrapper only
+    touches `#`+hex runs, which escaping never alters, and Textual's
+    markup parser
     fires the `@click` action on the span (same mechanism as the
     clarification options' `[@click=…]` tags). Unknown ids are caught at
     click time by the action's "not found" toast.
@@ -254,7 +292,7 @@ class ChatTimelineLayer(DrCodeState):
     @staticmethod
     def _format_event(event: TaskEvent) -> str:
         ts = event.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        return f"[dim]{ts}[/] {_mention_markup(escape(event.text))}"
+        return f"[dim]{ts}[/] {_mention_markup(_full_escape(event.text))}"
 
     def _show_event(self, task: Task, text: str, *, kind: str = "system") -> None:
         """Persist an event and, if the task is open, render it live."""
@@ -993,13 +1031,15 @@ class ChatTimelineLayer(DrCodeState):
         elif role == "assistant":
             block = AssistantBlock(text)
         elif role == "tool":
-            self._write_chat(f"[dim]{_mention_markup(escape(text))}[/]", note=note)
+            self._write_chat(
+                f"[dim]{_mention_markup(_full_escape(text))}[/]", note=note
+            )
         elif role == "tester":
             # tester output is raw model text: escape it before the markup
             # parser sees it (a stray bracket would crash rendering), then
             # wrap task-id mentions into click links.
             self._write_chat(
-                f"[bold magenta]tester ›[/] {_mention_markup(escape(text))}",
+                f"[bold magenta]tester ›[/] {_mention_markup(_full_escape(text))}",
                 note=note,
             )
         elif role == "testing-sep":
@@ -1018,7 +1058,9 @@ class ChatTimelineLayer(DrCodeState):
             self._write_chat(f"[bold red]event ›[/] {text}", note=note)
         elif role == "system":
             note = None
-            self._write_chat(f"[bold red]error ›[/] {_mention_markup(escape(text))}")
+            self._write_chat(
+                f"[bold red]error ›[/] {_mention_markup(_full_escape(text))}"
+            )
         if block is not None:
             if isinstance(block, ReasoningBlock | AssistantBlock):
                 self._write_chat(block, note=(role, text, block))
@@ -1050,7 +1092,9 @@ class ChatTimelineLayer(DrCodeState):
         packaged = len(questions) > 1
         for qi, item in enumerate(questions):
             header = f"{qi + 1}. {item.question}" if packaged else item.question
-            lines.append(f"[bold blue]drcode ❓[/] {_mention_markup(escape(header))}")
+            lines.append(
+                f"[bold blue]drcode ❓[/] {_mention_markup(_full_escape(header))}"
+            )
             # Plain options first (a legacy agent-marker inside an old
             # option's text still gets its ★ via _split_agent_marker), then
             # the agent's own proposals with a ★ — indices CONTINUE after
@@ -1075,7 +1119,7 @@ class ChatTimelineLayer(DrCodeState):
                 return (
                     f"  ▸ {'[bold yellow]★[/] ' if star else ''}"
                     f"[@click={click}]"
-                    f"[underline cyan]{escape(display)}[/][/]"
+                    f"[underline cyan]{_full_escape(display)}[/][/]"
                 )
 
             for i, option in enumerate(item.options):

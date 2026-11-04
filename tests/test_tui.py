@@ -45,6 +45,7 @@ from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock, UserBlock
 from drcode.tui.chat_timeline import (
     _SCROLL_FOLLOW_THRESHOLD,
+    _full_escape,
     _split_agent_marker,
     _split_chat_text,
 )
@@ -362,6 +363,80 @@ def test_split_chat_text_hard_splits_long_line() -> None:
     # No part starts with a bare '[' that used to be an escape sequence.
     for part in parts[1:]:
         assert not part.startswith("[lit]")
+
+
+def test_split_chat_text_raw_bracket_sequences_survive_render() -> None:
+    """Regression: a tool/tester write containing a sequence rich's escape()
+    leaves raw (e.g. `a[?]` — first char after `[` outside [a-z#/@]) used to
+    crash the TUI when the write was split (_CHAT_LIVE_MOUNT_LIMIT path): the
+    splitter counted `[?]` as an open tag while the Textual parser treats it
+    as literal text, so the appended closers outnumbered the real open tags
+    and each part raised MarkupError("auto closing tag … has nothing to
+    close"). Raw text is now fully escaped (every `[`), so the splitter's
+    tag stack matches the Textual parser's."""
+    from textual.markup import MarkupError, to_content
+
+    nasty = "a[?] [/] \\[lit] [] [Q] [!] back\\slash"
+    text = "[dim]" + _full_escape((nasty + "\n") * 1_000) + "[/]"
+    assert len(text) > 16_000
+    parts = _split_chat_text(text, 4_000)
+    assert len(parts) > 1
+    for part in parts:
+        to_content(part)  # must not raise MarkupError
+
+    # The escape round-trips: the rendered plain text keeps the literal
+    # brackets (and backslashes) the raw text carried.
+    joined = "".join(to_content(part).plain for part in parts)
+    assert "a[?]" in joined
+    assert "\\[lit]" in joined
+    assert "back\\slash" in joined
+
+    # The short (non-split) path is consistent for the same input.
+    with pytest.raises(MarkupError):
+        # sanity: the UNescaped raw text inside [dim]…[/] still breaks the
+        # parser once a stray closer shows up (this is what we fixed).
+        to_content("[dim]a[?] x[/][/]")
+    to_content(f"[dim]{_full_escape('a[?] x')}[/]")  # escaped: fine
+
+
+def test_full_escape_round_trips_brackets_and_backslashes() -> None:
+    """_full_escape escapes every bracket exactly once and leaves
+    backslashes alone: the rendered text must be byte-identical to the
+    raw input (doubling backslashes would corrupt every path or escape
+    sequence a tool prints, since Textual renders a `\\\\` pair
+    literally)."""
+    from textual.markup import to_content
+
+    raw = "plain [tag?] and \\[literal] and back\\slash"
+    escaped = _full_escape(raw)
+    assert "\\[" in escaped
+    # every original backslash and bracket yields exactly ONE escape char
+    assert escaped.count("\\") == raw.count("\\") + raw.count("[")
+    # rendered back: brackets and backslashes exactly as in the raw text
+    assert to_content(escaped).plain == raw
+
+
+def test_split_chat_text_preserves_separators_exactly() -> None:
+    """Splitting must neither lose nor invent text: the newline between two
+    lines travels with the closing part (it used to be swallowed at every
+    part boundary), and hard-split pieces of one over-long line are glued
+    back WITHOUT an invented newline."""
+    from textual.markup import to_content
+
+    # Many short lines: every boundary newline survives.
+    text = "[dim]" + _full_escape("ab\n" * 3_000) + "[/]"
+    parts = _split_chat_text(text, 1_000)
+    assert len(parts) > 5
+    joined = "".join(to_content(part).plain for part in parts)
+    assert joined == to_content(text).plain
+
+    # One over-long line: no newline in the raw text — none in the render.
+    text = "[dim]" + _full_escape("z" * 9_000 + "a[?]x") + "[/]"
+    parts = _split_chat_text(text, 4_000)
+    assert len(parts) > 2
+    joined = "".join(to_content(part).plain for part in parts)
+    assert joined == to_content(text).plain
+    assert "\n" not in joined
 
 
 def test_split_agent_marker_canonical_and_fallbacks() -> None:

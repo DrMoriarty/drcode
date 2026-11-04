@@ -550,6 +550,10 @@ async def test_watchdog_nudges_only_the_stalled_run(
         # The nudge aborts ONLY the stalled run and restarts it (a fresh
         # run generation resuming the attempt after the restart delay);
         # the healthy run keeps its original run untouched.
+        events = [e.text for e in app.manager.get(a.id).events]
+        assert any("restarting" in e for e in events), (
+            "the watchdog restart must leave a service event in the chat"
+        )
         gen_a = app._agent_generations.get(a.id, 0)
         gen_b = app._agent_generations.get(b.id, 0)
         await wait_until(
@@ -562,6 +566,50 @@ async def test_watchdog_nudges_only_the_stalled_run(
         assert not b.unfinished
         release.set()
         await wait_until(lambda: not app._agent_runs, pilot, what="runs finished")
+
+
+async def test_ctrl_r_restart_leaves_event_and_toast(
+    parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual Ctrl+R on a live run is a destructive restart — it must
+    never be silent (the incident: a healthy run killed and restarted by
+    repeated Ctrl+R looked like "the task does not resume"). The restart
+    leaves a service event in the task's chat and a toast; a Ctrl+R on a
+    task with nothing to restart stays quiet."""
+    app = parallel_app
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda message, **kw: toasts.append(str(message))
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        a = app.manager.create("one", "work a")
+        app._advance()
+        await pilot.pause()
+        assert a.status is TaskStatus.ACTIVE
+        # A live run without a real model behind it (same trick as the
+        # ESC-matrix tests); the restart timer is stubbed out — the event
+        # and the toast are written synchronously by the nudge itself.
+        app._agent_runs[a.id] = 1
+        monkeypatch.setattr(app, "_schedule_pipeline_timer", lambda *args, **kw: None)
+        app.view_task(a.id)
+        app.action_nudge_run()
+        await pilot.pause()
+        assert a.id not in app._agent_runs
+        events = [e.text for e in app.manager.get(a.id).events]
+        assert any("restarted by Ctrl+R" in e for e in events)
+        assert any("Run restarted" in t for t in toasts)
+        # Nothing to restart: a QUEUED task's Ctrl+R is a no-op — no event,
+        # no toast (an ACTIVE task with no live run WOULD restart: that is
+        # the documented one-key resume).
+        b = app.manager.create("two", "work b")
+        app.view_task(b.id)
+        app.action_nudge_run()
+        await pilot.pause()
+        assert not any(
+            "restarted by Ctrl+R" in e.text for e in app.manager.get(b.id).events
+        )
+        assert toasts.count("Run restarted — resuming from where it stopped") == 1
 
 
 # -- promotion while the tester is busy ------------------------------------------------

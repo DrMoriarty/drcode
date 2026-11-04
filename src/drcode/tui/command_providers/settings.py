@@ -204,33 +204,30 @@ class SettingsPalette(CommandPalette):
     # prefixes must include it where present). Reordering lines here — or
     # adding prefixes for new entries — rearranges the menu arbitrarily;
     # anything not matching a prefix slots in right before the last entry
-    # ("Quit"). Head block per the current UX convention: Keys, Screenshot,
-    # Theme, then the "Find task…" action; Quit is pinned to the very end.
-    # The model-related entries
+    # ("Quit"). Head block per the current UX convention: Keys, Theme, then
+    # the "Find task…" action. The read-only statistics entries
+    # (Screenshot / Statistics / Token usage) sit at the very bottom, right
+    # before the pinned Quit. The model-related entries
     # (provider catalog + the per-role project settings form) live in
-    # the "Model settings…" sub-menu (ModelSettingsPalette), and the six
-    # task-management
-    # preferences live in the "Task settings…" sub-menu
-    # (TaskSettingsPalette) — not here.
+    # the "Model settings…" sub-menu (ModelSettingsPalette), and the task
+    # management preferences (incl. the ESC stop behavior) live in the
+    # "Task settings…" dialog — not here.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Keys",
-        "Screenshot",
         "Theme",
         "Find task…",
-        "Statistics…",
-        "Token usage…",
-        "Create goal…",
-        "New goal",
         "Update/create AGENTS.md",
         "Model settings",
-        "ESC stop behavior:",
         "Task settings",
-        "Workflow:",
+        "Workflow",
         "GitHub integration:",
         "Notifications:",
         "Voice:",
         "Maximize",
         "Minimize",
+        "Screenshot",
+        "Statistics…",
+        "Token usage…",
         "Quit",
     )
 
@@ -346,7 +343,7 @@ class ServiceCommandsProvider(CommandListProvider):
 
     Registered alongside the system commands via `DrCodeApp.COMMANDS`;
     every hit is an app action — most create a pre-configured service
-    task, the ESC-stop entry toggles a project preference.
+    task. The ESC-stop preference lives in the Task-settings dialog.
     """
 
     def _commands(self) -> list[CommandEntry]:
@@ -377,14 +374,6 @@ class ServiceCommandsProvider(CommandListProvider):
                 "Update/create AGENTS.md",
                 app.action_update_agents_md,
                 "research task: agent creates or refreshes AGENTS.md",
-            ),
-            CommandEntry(
-                f"ESC stop behavior: {app.settings.esc_abort.label}",
-                app.action_change_esc_abort,
-                "How ESC stops a running agent/tester: double-press "
-                "(the first ESC only arms the stop, the second "
-                "confirms) or instant — the historical single-press "
-                "stop (project setting)",
             ),
         ]
 
@@ -470,12 +459,13 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
         app = cast("DrCodeApp", self.app)
         return [
             CommandEntry(
-                f"Workflow: {app.workflow_status_label()}",
+                "Workflow",
                 app.action_workflow_info,
                 "Custom branching/review rules: .drcode/git-workflow.md "
                 "(prose rules for the agents) and .drcode/workflow.py "
                 "(lifecycle hooks, incl. external code review) — press "
-                "for details",
+                "for details (the same status is also shown at the "
+                "bottom of Task settings)",
             ),
             CommandEntry(
                 f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}",

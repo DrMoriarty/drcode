@@ -2442,8 +2442,9 @@ async def test_pipeline_settled_notification_primes_then_sends(
 
 async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
     """The Settings menu lists its entries in the fixed logical order
-    (Keys, Screenshot, Theme, …, Quit) — never alphabetically and never in
-    the provider-completion order, which would differ from run to run."""
+    (Keys, Theme, …, Screenshot, Statistics, Token usage, Quit) — never
+    alphabetically and never in the provider-completion order, which would
+    differ from run to run."""
     async with app.run_test() as pilot:
         await pilot.press("escape")  # skip the first-start setup dialog
         app.action_settings()
@@ -2467,11 +2468,13 @@ async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
             for n in names
         ]
         assert ranks == sorted(ranks)
-        # Head block and pinned tail, exactly as the UX specifies.
+        # Head block, no goal capture (the sidebar owns it) and the pinned
+        # read-only tail, exactly as the UX specifies.
         assert names[0] == "Keys"
-        assert names[1] == "Screenshot"
-        assert names[2] == "Theme"
-        assert names[-1] == "Quit"
+        assert names[1] == "Theme"
+        assert "Create goal…" not in names
+        assert "ESC stop behavior: double-press confirm" not in "".join(names)
+        assert names[-4:] == ["Screenshot", "Statistics…", "Token usage…", "Quit"]
 
 
 # -- terminal tab title ---------------------------------------------------------
@@ -3286,8 +3289,10 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     )
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
 
-    # The main menu has no direct task entries anymore.
+    # The main menu has no direct task entries anymore (the ESC stop
+    # behavior moved into the dialog too).
     assert "Task settings" in SettingsPalette.ENTRY_ORDER
+    assert "ESC stop behavior:" not in SettingsPalette.ENTRY_ORDER
     for prefix in (
         "Auto-delete completed tasks:",
         "Verification:",
@@ -3324,6 +3329,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             "#ts-verification",
             "#ts-dev-rounds",
             "#ts-nudge",
+            "#ts-esc-abort",
             "#ts-git-tester",
             "#ts-git-research",
             "#ts-retention",
@@ -3346,7 +3352,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         main_names = [c.name for c in main]
         assert main_names == [
-            f"Workflow: {app.workflow_status_label()}",
+            "Workflow",
             (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",

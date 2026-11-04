@@ -46,8 +46,8 @@ class GoalsActionsLayer(DrCodeState):
     ) -> None:
         """Push the capture dialog, remembering what the created goal
         should be pre-wired to: a parent (the GoalScreen's N) and/or a
-        task to link (the palette's "Create goal…" over a viewed task).
-        The plain Ctrl+Y passes nothing."""
+        task to link (a future caller over a viewed task). The plain
+        Ctrl+Y passes nothing."""
         self._goal_capture_context = (parent_id, link_task_id)
         self.push_screen(
             GoalEditScreen(

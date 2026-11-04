@@ -750,10 +750,12 @@ class SettingsLayer(DrCodeState):
         active (from .drcode/git-workflow.md and .drcode/workflow.py)."""
         return describe_project_workflow(self.project_root)
 
-    def action_workflow_info(self) -> None:
-        """Settings entry ("Workflow: …") — informational: explains which
-        workflow layers are active and where their files live. The workflow
-        is enabled by file presence alone; there is nothing to toggle."""
+    def workflow_info_lines(self) -> list[str]:
+        """The lines describing the custom team workflow's state: which
+        layers are active and where their files live. Shared by the
+        "Workflow" palette entry (a toast) and the Task-settings dialog
+        (the bottom info block). The workflow is enabled by file presence
+        alone; there is nothing to toggle."""
         parts = [
             (
                 "Git rules: .drcode/git-workflow.md — "
@@ -775,8 +777,14 @@ class SettingsLayer(DrCodeState):
             "your user permissions — never trust it from a repository you "
             "did not author."
         )
+        return parts
+
+    def action_workflow_info(self) -> None:
+        """Settings entry ("Workflow") — informational: explains which
+        workflow layers are active and where their files live (the same
+        lines as the Task-settings dialog's bottom info block)."""
         self.notify(
-            "\n".join(parts),
+            "\n".join(self.workflow_info_lines()),
             title="Custom workflow",
             timeout=10,
         )

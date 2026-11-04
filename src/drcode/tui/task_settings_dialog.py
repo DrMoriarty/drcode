@@ -11,7 +11,7 @@ the old TaskSettingsPalette sub-menu; the per-field palettes and their
   one applies it to the draft and every field widget updates in place;
   "Custom" is only the display state of a draft matching no preset
   (mirrors ``action_workflow_preset_custom``);
-- groups the 11 field widgets into the three sections of the old sub-menu
+- groups the field widgets into the three sections of the old sub-menu
   (Workflow / Testing / Git) — the closely-related fields sit side by side
   in two-column rows — marking fields that differ from the saved
   values and dimming the currently dormant ones (their value parks and
@@ -51,6 +51,7 @@ from textual.widgets import (
 
 from ..settings import (
     DEV_ROUNDS_OPTIONS,
+    ESC_ABORT_OPTIONS,
     GIT_POLICY_OPTIONS,
     ISOLATION_OPTIONS,
     PARALLEL_TASKS_OPTIONS,
@@ -61,6 +62,7 @@ from ..settings import (
     WORKTREE_REMOVAL_OPTIONS,
     WORKTREE_SNAPSHOT_OPTIONS,
     CompletedRetention,
+    EscAbort,
     GitPolicy,
     ProjectSettings,
     StallNudge,
@@ -89,6 +91,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     the rest of ProjectSettings (GitHub, voice, …) is untouched.
     """
     dst.completed_retention = src.completed_retention
+    dst.esc_abort = src.esc_abort
     dst.verification = src.verification
     dst.git_policy.tester = src.git_policy.tester
     dst.git_policy.research = src.git_policy.research
@@ -231,6 +234,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         margin-left: 1;
         height: auto;
     }
+    #ts-workflow-info {
+        color: $text-muted;
+        margin-top: 1;
+    }
     #ts-buttons {
         dock: bottom;
         height: auto;
@@ -333,13 +340,23 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-removal",
                         )
-                yield Label("Worktree snapshot", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in WORKTREE_SNAPSHOT_OPTIONS],
-                    value=d.worktree_snapshot,
-                    allow_blank=False,
-                    id="ts-snapshot",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Worktree snapshot", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in WORKTREE_SNAPSHOT_OPTIONS],
+                            value=d.worktree_snapshot,
+                            allow_blank=False,
+                            id="ts-snapshot",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Auto-delete completed tasks", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in RETENTION_OPTIONS],
+                            value=d.completed_retention,
+                            allow_blank=False,
+                            id="ts-retention",
+                        )
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
                         yield Label("Subagents (coder)", classes="ts-label")
@@ -390,13 +407,23 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-dev-rounds",
                         )
-                yield Label("Nudge stalled agent after", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in STALL_NUDGE_OPTIONS],
-                    value=d.stall_nudge,
-                    allow_blank=False,
-                    id="ts-nudge",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Nudge stalled agent after", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in STALL_NUDGE_OPTIONS],
+                            value=d.stall_nudge,
+                            allow_blank=False,
+                            id="ts-nudge",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("ESC stop behavior", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in ESC_ABORT_OPTIONS],
+                            value=d.esc_abort,
+                            allow_blank=False,
+                            id="ts-esc-abort",
+                        )
                 yield Label("Git", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -415,16 +442,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-git-research",
                         )
-                yield Label("Auto-delete completed tasks", classes="ts-label")
-                yield Select(
-                    [(o.label, o) for o in RETENTION_OPTIONS],
-                    value=d.completed_retention,
-                    allow_blank=False,
-                    id="ts-retention",
-                )
                 yield Label("Keep computer awake", classes="ts-label")
                 yield Switch(value=d.keep_awake, id="ts-keep-awake")
             yield Vertical(id="ts-hints")
+            yield Static("", id="ts-workflow-info")
             with Horizontal(id="ts-buttons"):
                 yield Button("Apply", variant="primary", id="ts-apply")
                 yield Button("Cancel", id="ts-cancel")
@@ -434,8 +455,19 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if self._git_available is None:
             app = self._drcode_app()
             self._git_available = app.task_env.available
+        self._fill_workflow_info()
         self._refresh()
         self.run_worker(self._load_branches(), exclusive=True, group="ts-branches")
+
+    def _fill_workflow_info(self) -> None:
+        """The bottom info block: the status of the optional custom team
+        workflow (moved here from the Settings menu's "Workflow" entry —
+        informational, nothing to toggle)."""
+        try:
+            lines = self._drcode_app().workflow_info_lines()
+        except Exception:  # noqa: BLE001 — info must never break the dialog
+            lines = []
+        self.query_one("#ts-workflow-info", Static).update("\n".join(lines))
 
     def _drcode_app(self) -> DrCodeApp:
         from .app import DrCodeApp
@@ -514,6 +546,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-git-tester", d.git_policy.tester)
         self._set_select("#ts-git-research", d.git_policy.research)
         self._set_select("#ts-retention", d.completed_retention)
+        self._set_select("#ts-esc-abort", d.esc_abort)
         switch = self.query_one("#ts-keep-awake", Switch)
         if switch.value != d.keep_awake:
             with self.prevent(Switch.Changed):  # same staleness rule
@@ -542,6 +575,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-git-tester": d.git_policy.tester is not o.git_policy.tester,
             "#ts-git-research": d.git_policy.research is not o.git_policy.research,
             "#ts-retention": d.completed_retention is not o.completed_retention,
+            "#ts-esc-abort": d.esc_abort is not o.esc_abort,
             "#ts-keep-awake": d.keep_awake != o.keep_awake,
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
@@ -735,6 +769,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             event.value is not self._draft.completed_retention
         ):
             self._draft.completed_retention = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-esc-abort")
+    def _esc_abort_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, EscAbort) and (
+            event.value is not self._draft.esc_abort
+        ):
+            self._draft.esc_abort = event.value
             self._refresh()
 
     @on(Switch.Changed, "#ts-keep-awake")

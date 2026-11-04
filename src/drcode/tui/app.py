@@ -77,7 +77,6 @@ from .blocks import (  # noqa: F401
 from .chat_view import ChatViewLayer
 from .command_providers import (
     DependencyCommandsProvider,
-    GoalCommandsProvider,
     MergeCommandsProvider,
     ModelSettingsCommandProvider,
     ProjectSettingsCommandsProvider,
@@ -134,7 +133,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
         DependencyCommandsProvider,
-        GoalCommandsProvider,
         MergeCommandsProvider,
     }
 

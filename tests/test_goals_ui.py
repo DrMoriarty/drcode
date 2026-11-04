@@ -7,8 +7,8 @@ the ◆<goal-id> link marker on task rows, the GoalScreen tree (filter,
 Enter-expandable details, link marker of the viewed task, the ←/→
 subtree-collapse and cursor-to-parent controls) and its R/T
 actions, the Ctrl+Y capture context (parent preset + task link), the
-"Create goal…" palette entry, the header assign/change/unlink links and
-the GoalStore ordering primitives (move/reparent).
+header assign/change/unlink links and the GoalStore ordering
+primitives (move/reparent).
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
 from drcode.models import GoalStatus, GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
-from drcode.tui.command_providers import GoalCommandsProvider
 from drcode.tui.goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
 from drcode.tui.sidebar import TaskItem
 
@@ -439,18 +438,18 @@ async def test_goal_capture_with_parent_and_link(app: DrCodeApp) -> None:
         assert goal.type.value == "goal"
 
 
-async def test_goal_provider_create_only_and_header_links(app: DrCodeApp) -> None:
+async def test_goal_capture_not_in_palette_and_header_links(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
         goal = app.manager.goals.create("Async core")
         task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
         app.view_task(task.id)
         await pilot.pause()
-        # The provider yields only the capture entry — the task↔goal
-        # link/unlink commands moved into the task header.
-        commands = GoalCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        names = [c.name for c in commands]
-        assert names == ["Create goal…"]
+        # The Settings palette no longer offers goal capture: the sidebar's
+        # "+ add goal" row (and Ctrl+Y) is the single capture entry point.
+        providers = {getattr(p, "__name__", "") for p in app.COMMANDS}
+        assert "GoalCommandsProvider" not in providers
+        assert any(item.goal_add for item in app.sidebar.query(TaskItem))
         # Unlinked task: the header extra row shows only "+ assign".
         extra = str(app.query_one("#task-status-extra", Static).content)
         assert "+ assign" in extra

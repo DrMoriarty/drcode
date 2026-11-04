@@ -24,6 +24,15 @@ happens automatically at the right point).
 A sidecar-transcript LRU (see `transcript_cache_limit`) evicts the
 in-memory transcripts of idle COMPLETED tasks so long sessions don't
 accumulate every transcript ever viewed.
+
+A THIRD, append-only file exists per task when the main transcript was
+ever compacted: `<id>.transcript.archive.jsonl` — one JSON line per
+compaction of `task.messages`, carrying the full pre-compaction
+transcript plus metadata (timestamp, gate level, compaction path, role).
+It exists purely for incident forensics (the compacted transcript itself
+loses the middle of the history — irreversibly so on the mechanical
+floor): it is only ever appended to, is never read back by the app, and
+is deleted together with the task.
 """
 
 from __future__ import annotations
@@ -47,10 +56,15 @@ from .transcript import build_skeleton
 # glob over the tasks dir must skip these (they are not task metadata).
 TRANSCRIPT_SUFFIX = ".transcript.json"
 
+# Append-only compaction archive suffix: `<id>.transcript.archive.jsonl`
+# next to the metadata+sidecar pair. Also skipped by every metadata glob.
+ARCHIVE_SUFFIX = ".transcript.archive.jsonl"
+
 
 def is_transcript_path(path: Path) -> bool:
-    """True for a sidecar transcript file (not task metadata)."""
-    return path.name.endswith(TRANSCRIPT_SUFFIX)
+    """True for a sidecar transcript file or the compaction archive
+    (neither is task metadata)."""
+    return path.name.endswith((TRANSCRIPT_SUFFIX, ARCHIVE_SUFFIX))
 
 
 def _write_tmp(path: Path, text: str) -> str:
@@ -108,6 +122,11 @@ class Storage:
 
     def transcript_path(self, task_id: str) -> Path:
         return self.tasks_dir / f"{task_id}{TRANSCRIPT_SUFFIX}"
+
+    def archive_path(self, task_id: str) -> Path:
+        """The append-only compaction archive of `task_id` (may not exist —
+        it is created on the first archived compaction)."""
+        return self.tasks_dir / f"{task_id}{ARCHIVE_SUFFIX}"
 
     def task_file_paths(self) -> list[Path]:
         """The metadata files of the archive (sidecar transcripts and
@@ -234,6 +253,21 @@ class Storage:
             result[key] = value if isinstance(value, list) else []
         return result
 
+    def append_transcript_archive(self, task_id: str, record: dict[str, Any]) -> None:
+        """Append one eviction record (a JSON line) to the task's
+        compaction archive, creating the file on first use.
+
+        The archive is APPEND-ONLY by contract: existing lines are never
+        rewritten or dropped, so a crash mid-write can only truncate the
+        very last line (the next append starts a fresh one). Raises OSError
+        on failure — the caller decides how survivable that is (the
+        compaction pipeline logs a service event and moves on)."""
+        path = self.archive_path(task_id)
+        line = json.dumps(record, ensure_ascii=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
     # -- sidecar LRU --------------------------------------------------------------
 
     def _touch_transcript_use(self, task_id: str) -> None:
@@ -284,4 +318,5 @@ class Storage:
     def delete(self, task_id: str) -> None:
         self.task_path(task_id).unlink(missing_ok=True)
         self.transcript_path(task_id).unlink(missing_ok=True)
+        self.archive_path(task_id).unlink(missing_ok=True)
         self._transcript_order.pop(task_id, None)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from ..agent import (
@@ -480,12 +481,16 @@ class PipelineCompactionLayer(CoreState):
         checklist: str | None = None,
         hard: bool = False,
         facts: str | None = None,
-    ) -> tuple[list[dict[str, Any]], str, bool]:
+    ) -> tuple[list[dict[str, Any]], str, bool, bool]:
         """Summarize `messages` into a compacted transcript; returns it,
-        the success event text and whether the LLM summarizer path failed
+        the success event text, whether the LLM summarizer path failed
         (`llm_failed` — callers keep `_compaction_failed` set for such
         tasks, meaning "the summarizer is unavailable", and clear it when
-        the summarizer ran fine).
+        the summarizer ran fine) and whether the result was produced by
+        the mechanical floor rather than the summarizer (`mechanical` —
+        note `llm_failed` alone does NOT identify the mechanical path: the
+        `_ChunkingImpossible` escalation trims mechanically with
+        `llm_failed=False`).
 
         The LLM path goes through `_summarize_history`, which owns the
         single-shot pre-flight (the rendered prompt must fit the COMPACTION
@@ -523,7 +528,7 @@ class PipelineCompactionLayer(CoreState):
             trimmed, event = self._mechanical_compact(
                 task, messages, summary_role, what
             )
-            return trimmed, event, False
+            return trimmed, event, False, True
         except Exception as e:
             if _is_context_overflow_error(e):
                 # The estimate under-shot and the gateway rejected the
@@ -538,7 +543,7 @@ class PipelineCompactionLayer(CoreState):
                 trimmed, event = self._mechanical_compact(
                     task, messages, summary_role, what
                 )
-                return trimmed, event, True
+                return trimmed, event, True, True
             if not hard:
                 raise
             # The fill is at the hard-limit level: retrying later is not an
@@ -552,11 +557,11 @@ class PipelineCompactionLayer(CoreState):
             trimmed, event = self._mechanical_compact(
                 task, messages, summary_role, what
             )
-            return trimmed, event, True
+            return trimmed, event, True, True
         event = (
             f"Context compacted: {what} summarized, original prompt(s) kept verbatim."
         )
-        return compacted_messages(messages, summary), event, False
+        return compacted_messages(messages, summary), event, False, False
 
     async def _run_summarizer(self, prompt: str) -> str:
         """One compaction model call: run the tool-less summarizer and
@@ -825,9 +830,10 @@ class PipelineCompactionLayer(CoreState):
             task,
             f"Context fill {pct}% — pausing the agent and compacting history…",
         )
+        old_messages = task.messages
         try:
-            new_messages, event, llm_failed = await self._compact_transcript(
-                task.messages,
+            compacted = await self._compact_transcript(
+                old_messages,
                 summary_role=self._task_role(task),
                 task=task,
                 what="history",
@@ -853,9 +859,12 @@ class PipelineCompactionLayer(CoreState):
                 "at the hard limit — trimming mechanically instead.",
             )
             new_messages, event = self._mechanical_compact(
-                task, task.messages, self._task_role(task), "history"
+                task, old_messages, self._task_role(task), "history"
             )
             llm_failed = True
+            mechanical = True
+        else:
+            new_messages, event, llm_failed, mechanical = compacted
         if llm_failed:
             self._compaction_failed.add(task.id)
             self._hard_limit_exhausted.discard(task.id)
@@ -870,6 +879,13 @@ class PipelineCompactionLayer(CoreState):
             # hard-level gate bypass for this task — firing it again would
             # loop pause→resume with no effect.
             self._hard_limit_exhausted.add(task.id)
+        self._archive_transcript_replacement(
+            task,
+            old_messages,
+            new_messages,
+            hard=hard,
+            mechanical=mechanical,
+        )
         task.messages = new_messages
         task.touch()
         self.manager.storage.save(task)
@@ -880,6 +896,49 @@ class PipelineCompactionLayer(CoreState):
         self._show_event(task, event)
         if self.viewed_id == task.id:
             self.view_task(task.id)
+
+    def _archive_transcript_replacement(
+        self,
+        task: Task,
+        old_messages: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        *,
+        hard: bool,
+        mechanical: bool,
+    ) -> None:
+        """Forensic archive of ONE main-transcript compaction: the full
+        pre-compaction transcript is appended as a JSON line to the task's
+        append-only `<id>.transcript.archive.jsonl` (see storage.py).
+
+        Compaction rewrites `task.messages` in place and the mechanical
+        floor drops the middle of the history with no summary at all —
+        after which the full chronology is unrecoverable from the task
+        files. This archive is the only record; it is never read back by
+        the app (the chat window, resume and the sidecar format are
+        untouched) and never loaded at startup. Identical replacement (the
+        estimate-based no-op guards can let a compaction produce the same
+        transcript) is not recorded — the archive holds eviction acts, not
+        gate firings. A write failure must never kill the compaction ("the
+        run must go on"): it degrades to a service event. The tester- and
+        resolver-round rewrites are deliberately NOT archived here (scoped
+        out — a separate decision)."""
+        if new_messages == old_messages:
+            return
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": "hard" if hard else "threshold",
+            "compaction": "mechanical" if mechanical else "llm",
+            "role": self._task_role(task).value,
+            "messages": old_messages,
+        }
+        try:
+            self.manager.storage.append_transcript_archive(task.id, record)
+        except (OSError, TypeError, ValueError) as e:
+            self._show_event(
+                task,
+                f"transcript archive write failed ({type(e).__name__}: {e}) — "
+                "the compaction itself is unaffected.",
+            )
 
     def _tester_round_facts(
         self, task: Task, round_messages: list[dict[str, Any]], verdict_issued: bool
@@ -1081,7 +1140,7 @@ class PipelineCompactionLayer(CoreState):
             f"Context fill {pct}% — compacting the testing round…",
         )
         try:
-            new_messages, event, llm_failed = await self._compact_transcript(
+            compacted = await self._compact_transcript(
                 round_messages,
                 summary_role=AgentRole.TESTER,
                 task=task,
@@ -1107,6 +1166,8 @@ class PipelineCompactionLayer(CoreState):
                 task, round_messages, AgentRole.TESTER, "testing round"
             )
             llm_failed = True
+        else:
+            new_messages, event, llm_failed, _mechanical = compacted
         if llm_failed:
             self._compaction_failed.add(task.id)
             self._hard_limit_exhausted.discard(task.id)
@@ -1192,7 +1253,7 @@ class PipelineCompactionLayer(CoreState):
             f"Context fill {pct}% — compacting the conflict-resolution round…",
         )
         try:
-            new_messages, event, llm_failed = await self._compact_transcript(
+            compacted = await self._compact_transcript(
                 round_messages,
                 summary_role=AgentRole.RESOLVER,
                 task=task,
@@ -1215,6 +1276,8 @@ class PipelineCompactionLayer(CoreState):
                 task, round_messages, AgentRole.RESOLVER, "conflict-resolution round"
             )
             llm_failed = True
+        else:
+            new_messages, event, llm_failed, _mechanical = compacted
         if llm_failed:
             self._resolver_compaction_failed.add(task.id)
             self._resolver_hard_limit_exhausted.discard(task.id)

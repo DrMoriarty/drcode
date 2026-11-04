@@ -323,6 +323,74 @@ def test_delete_removes_sidecar_too(project_root: Path) -> None:
     assert not storage.transcript_path(task.id).exists()
 
 
+# -- compaction archive (append-only forensics) --------------------------------------
+
+
+def test_append_transcript_archive_creates_and_appends(project_root: Path) -> None:
+    """The archive file appears on the first appended record and grows by
+    exactly one JSON line per record — existing lines are never touched."""
+    storage = Storage(project_root)
+    task = make_task("archived")
+    storage.save(task)
+    archive = storage.archive_path(task.id)
+    assert not archive.exists()  # created lazily, on the first compaction
+
+    storage.append_transcript_archive(
+        task.id,
+        {"timestamp": "t1", "level": "threshold", "compaction": "llm", "messages": []},
+    )
+    storage.append_transcript_archive(
+        task.id,
+        {
+            "timestamp": "t2",
+            "level": "hard",
+            "compaction": "mechanical",
+            "messages": [],
+        },
+    )
+    lines = archive.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["timestamp"] == "t1"
+    assert json.loads(lines[1])["compaction"] == "mechanical"
+
+
+def test_archive_not_read_at_load_all(project_root: Path) -> None:
+    """Startup stays metadata-only: load_all neither parses nor requires
+    the archive (a corrupted archive line must not affect anything), the
+    sidecar stays lazy, and the archive is excluded from the metadata
+    globs."""
+    storage = Storage(project_root)
+    task = make_task("lazy")
+    task.messages = [_user_msg("hello")]
+    storage.save(task)
+    storage.append_transcript_archive(
+        task.id, {"timestamp": "t", "messages": [_user_msg("evicted")]}
+    )
+    # Corrupt the archive: load_all must not care in the slightest.
+    storage.archive_path(task.id).write_text('{"broken": tr')
+
+    loaded = Storage(project_root).load_all()
+    assert [t.id for t in loaded] == [task.id]
+    # The transcript sidecar was NOT loaded at startup (lazy) — and the
+    # archive played no role either way.
+    assert not loaded[0].transcripts_loaded
+    assert loaded[0].messages == [_user_msg("hello")]
+    assert storage.archive_path(task.id).read_text(encoding="utf-8") == '{"broken": tr'
+    # Metadata globs never pick the archive up as a task file.
+    assert storage.task_file_paths() == [storage.task_path(task.id)]
+
+
+def test_delete_removes_archive_too(project_root: Path) -> None:
+    storage = Storage(project_root)
+    task = make_task("doomed")
+    storage.save(task)
+    storage.append_transcript_archive(task.id, {"messages": []})
+    assert storage.archive_path(task.id).is_file()
+
+    storage.delete(task.id)
+    assert not storage.archive_path(task.id).exists()
+
+
 # -- legacy monolithic migration --------------------------------------------------
 
 

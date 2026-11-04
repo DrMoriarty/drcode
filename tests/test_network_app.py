@@ -16,6 +16,7 @@ itself gets dedicated tests).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -834,6 +835,158 @@ async def test_compaction_overflow_fallback_trims_mechanically(
     assert any("Context compacted mechanically" in t for t in texts)
     assert not any("compaction failed" in t for t in texts)
     assert "dropped mechanically" in (extract_previous_summary(task.messages) or "")
+
+
+# -- compaction transcript archive ---------------------------------------------------
+
+
+def _archive_lines(project_root: Path, task_id: str) -> list[dict[str, Any]]:
+    """The parsed JSONL records of the task's compaction archive
+    (`<id>.transcript.archive.jsonl`); [] when the file does not exist."""
+    path = project_root / ".drcode" / "tasks" / f"{task_id}.transcript.archive.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+async def test_llm_compaction_appends_evicted_transcript_to_archive(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    project_root: Path,
+) -> None:
+    """The LLM summarizer path replaces `task.messages` in place: the full
+    pre-compaction transcript is appended to the task's append-only
+    archive with the gate metadata, so the chronology stays recoverable
+    after the live transcript is rewritten."""
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+    old = list(task.messages)
+    scripted.steps = [text_response("THE SUMMARY BODY")]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    records = _archive_lines(project_root, task.id)
+    assert len(records) == 1
+    record = records[0]
+    assert record["level"] == "threshold"
+    assert record["compaction"] == "llm"
+    assert record["role"] == "research"
+    assert record["messages"] == old
+    assert "partial work" in json.dumps(record["messages"])
+    # The live transcript is compacted exactly as before — the archive
+    # changed nothing about the chat window or the resume path.
+    assert len(task.messages) == 2
+    assert is_summary_message(task.messages[1])
+
+
+async def test_mechanical_compaction_appends_evicted_transcript_to_archive(
+    net_app_small_ctx: DrCodeApp, scripted: ScriptedState, project_root: Path
+) -> None:
+    """The mechanical floor drops the middle of the history with NO
+    summary at all — the archive line is the only place the evicted
+    content survives (the most important case: otherwise irreversible)."""
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+    old = list(task.messages)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted mechanically" in t for t in event_texts(task))
+    records = _archive_lines(project_root, task.id)
+    assert len(records) == 1
+    record = records[0]
+    assert record["level"] == "threshold"
+    assert record["compaction"] == "mechanical"
+    # The evicted response ("partial work") is gone from the live
+    # transcript but preserved verbatim in the archive.
+    assert "partial work" not in json.dumps(task.messages)
+    assert record["messages"] == old
+
+
+async def test_noop_replacement_does_not_grow_archive(
+    net_app_small_ctx: DrCodeApp,
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+) -> None:
+    """An estimate-based no-op replacement (new == old) records nothing:
+    the archive holds eviction acts, not gate firings."""
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async def noop_compact(
+        messages: list[dict[str, Any]], **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], str, bool, bool]:
+        return list(messages), "no-op event", False, False
+
+    monkeypatch.setattr(net_app_small_ctx, "_compact_transcript", noop_compact)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert _archive_lines(project_root, task.id) == []
+    # The (no-op) replacement itself still happened, event and all.
+    assert any("no-op event" in t for t in event_texts(task))
+
+
+async def test_tester_round_compaction_does_not_touch_archive(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    project_root: Path,
+) -> None:
+    """The tester-round rewrite (`task.tester_messages[-1]`) is scoped OUT
+    of the archive: after a main-transcript compaction archived one line,
+    a tester-round compaction leaves the archive byte-for-byte the same."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+    scripted.steps = [
+        text_response("MAIN SUMMARY"),
+        text_response("TESTER SUMMARY"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        task.tester_messages = [
+            serialize_messages(
+                [
+                    ModelRequest(
+                        parts=[UserPromptPart(content="Verify completed task #1")]
+                    ),
+                    ModelResponse(
+                        parts=[TextPart("working")],
+                        usage=RequestUsage(input_tokens=850, output_tokens=8),
+                    ),
+                ]
+            )
+        ]
+        assert await net_app_small_ctx._maybe_compact_tester_round(task, 850)
+        await pilot.pause()
+
+    # The tester round WAS compacted…
+    assert any(is_summary_message(m) for m in task.tester_messages[-1])
+    # …but the archive still holds exactly the main-transcript record.
+    records = _archive_lines(project_root, task.id)
+    assert len(records) == 1
+    assert records[0]["compaction"] == "llm"
+    assert "partial work" in json.dumps(records[0]["messages"])
 
 
 def _coding_window_app(
@@ -3154,12 +3307,14 @@ async def test_compact_transcript_selects_template_by_summary_role(
     scripted.steps = [text_response("SUMMARY BODY") for _ in range(2)]
     async with net_app_small_ctx.run_test() as pilot:
         await pilot.pause()
-        _, _event_tester, failed_tester = await net_app_small_ctx._compact_transcript(
+        result_tester = await net_app_small_ctx._compact_transcript(
             messages, AgentRole.TESTER, task, "testing round"
         )
-        _, _event_dev, failed_dev = await net_app_small_ctx._compact_transcript(
+        failed_tester = result_tester[2]
+        result_dev = await net_app_small_ctx._compact_transcript(
             messages, AgentRole.CODING, task, "history"
         )
+        failed_dev = result_dev[2]
     assert not failed_tester and not failed_dev
     assert "Verification evidence" in scripted.calls[0]
     assert "Verification evidence" not in scripted.calls[1]

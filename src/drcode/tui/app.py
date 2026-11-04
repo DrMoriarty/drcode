@@ -87,6 +87,7 @@ from .command_providers import (
 from .header import ModelStatusHeader
 from .host import TextualHost
 from .inputs import ChatInput, DepsInput, NewTaskInput
+from .key_compat import apply_alt_enter_fix
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem
@@ -430,6 +431,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # iTerm2 by default (the terminal buffers the synced frames and
         # keystroke echo lags 0.5–1.0 s). No-op otherwise.
         apply_sync_output_override()
+        # Terminal.app Alt+Enter workaround (see tui/key_compat.py): textual
+        # 8.2.8's parser drops the Alt modifier from ESC-prefixed keys whose
+        # sequence maps to a tuple (ESC+CR → plain enter), which made
+        # Alt+Enter send the chat draft instead of inserting a newline.
+        # No-op on the second call.
+        apply_alt_enter_fix()
         super().__init__()
         # The UI seam of the core pipeline (toasts, timers, workers, chat
         # blocks) — the pipeline layers call nothing Textual directly.

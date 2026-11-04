@@ -321,6 +321,11 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     assert "ev.shiftKey || ev.ctrlKey || ev.altKey" in handler
     # The payload is the kitty CSI u encoding Textual understands.
     assert '"\\x1b[13;" + mods + "u"' in handler
+    # Only keydown acts: xterm.js also invokes the custom handler on
+    # keyup/keypress — a keyup-matching Enter branch would send a second
+    # CSI u and duplicate the newline (double font-size step likewise).
+    guard = handler.index('ev.type !== "keydown"')
+    assert guard < enter_at
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

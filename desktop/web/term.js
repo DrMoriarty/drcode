@@ -225,6 +225,12 @@
   }
 
   function terminalKeyHandler(ev) {
+    // xterm.js invokes the custom handler for keydown, keyup AND keypress.
+    // Reacting to keyup would re-fire every interception (a second CSI u
+    // for modified Enter → a duplicated newline, a second font-size step),
+    // so only keydown acts; keyup/keypress fall through to xterm's own
+    // (no-op for our cases) handling.
+    if (ev.type !== "keydown") return true;
     if (ev.key === "F11") return true; // handled by the window listener
     if (ev.key === "Enter" && (ev.shiftKey || ev.ctrlKey || ev.altKey)) {
       if (!ws || ws.readyState !== WebSocket.OPEN || !started) return true;

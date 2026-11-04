@@ -129,6 +129,16 @@ class DesktopApi:
             "project": self._ctx.current_project,
         }
 
+    # -- terminal font settings --------------------------------------------
+
+    def get_settings(self) -> dict:
+        """Persisted shell settings (terminal font), nulls = defaults."""
+        return projects_mod.load_font_settings()
+
+    def set_font_settings(self, font_family: str | None, font_size: object) -> dict:
+        """Validate (size clamped to 6–40), persist and confirm."""
+        return projects_mod.save_font_settings(font_family, font_size)
+
     def open_recent(self, project: str) -> str | None:
         """Record-free convenience for the welcome screen (kept for parity)."""
         return project if Path(project).is_dir() else None

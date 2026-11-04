@@ -87,6 +87,32 @@ html, body {
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #10131a; font-weight: 600; }
 .btn-primary:hover { filter: brightness(1.08); }
 
+.welcome-actions { display: flex; gap: 10px; }
+.welcome-actions .btn-primary { flex: 1; }
+
+/* ---- settings dialog form ---- */
+
+.settings-form { display: flex; flex-direction: column; }
+.settings-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  margin: 12px 0 5px;
+}
+.settings-input {
+  background: #16181d;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  width: 100%;
+}
+.settings-input:focus { outline: none; border-color: var(--accent); }
+.settings-input.hidden { display: none; }
+
 .recents { margin-top: 22px; }
 .recents-title {
   color: var(--muted);

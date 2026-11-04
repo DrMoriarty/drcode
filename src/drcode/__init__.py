@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,55 +20,130 @@ if TYPE_CHECKING:
 # The TUI forks constantly (git polls, run_bash, hooks), so an affected
 # session floods the terminal with these lines. CPython 3.14 on macOS cannot
 # avoid the fork path (close_fds defaults to True and
-# os.POSIX_SPAWN_CLOSEFROM is missing), so the only in-process fix is to make
-# the TUI's own fd2 a filtered stream: re-exec through a bash process
-# substitution that drops exactly the noise lines and passes everything else
-# (tracebacks, warnings) through. Mirrors the manual
-# `uv run drcode 2> >(grep -v MallocStackLogging >&2)` workaround.
+# os.POSIX_SPAWN_CLOSEFROM is missing), so the fix is to split the TUI's own
+# fd2 through a filter process that drops exactly the noise lines and passes
+# everything else (tracebacks, warnings) through.
+#
+# The filter is a BYTE stream, deliberately not `grep -v`: Textual writes every
+# rendered frame to stderr, and most frames (cursor moves, partial CHOPS
+# updates) contain no trailing newline. grep's stdio buffering holds bytes
+# until a line completes, so newline-less frames stall in its buffer until the
+# next newline-terminated write — measured 0.3–1.5 s of delivery latency for
+# ~60% of all frames, i.e. the key-echo / cursor-blink / stale-bottom-line
+# stalls. This filter writes everything through immediately; it only HOLDS a
+# trailing fragment that could still grow into a noise line, and even that
+# only while the fragment is short, newline-free and ESC-free (Textual frames
+# always contain ESC, so real frames are never held).
+#
+# The filter child is a fork() of this very process — it already runs on the
+# right interpreter. Launching one via `sys.executable -c` is not an option:
+# in a frozen bundle sys.executable is the app binary, and /usr/bin/python3
+# would pop the CLT install dialog. The fork happens in main() before any
+# threads exist, and the child never returns into application code.
 
 _MSL_FILTER_ENV = "DRCODE_MSL_STDERR_FILTER"
-_MSL_FILTER_SCRIPT = 'exec 2> >(grep -v MallocStackLogging >&2); exec "$@"'
-_MSL_FILTER_MARKER = "drcode-stderr-filter"
+# One libmalloc report line: name (no parens/newline), `(pid) MallocStack
+# Logging: `, message, newline. Applied to complete lines only.
+_MSL_NOISE_RE = re.compile(rb"(?m)^[^(\n]{0,100}\(\d+\) MallocStackLogging: [^\n]*\n")
+# After the last `(` of a held fragment: digits, optional `)`, then an
+# optional PREFIX of the fixed keyword — anything else can never grow into
+# a noise line.
+_MSL_TAIL_PID_RE = re.compile(rb"\d{0,8}\)?")
+_MSL_TAIL_KEYWORD = b" MallocStackLogging: "
+# A longer newline-less fragment is flushed even if it may be a noise line:
+# unbounded holding is worse than a rare half-filtered line.
+_MSL_TAIL_LIMIT = 128
 
 
-def _stderr_filter_argv() -> list[str] | None:
-    """The re-exec argv installing the fd2 noise filter, or None when it
-    must not (or need not) be installed: not macOS, stderr is not the
-    terminal (redirected to a file/pipe — the user manages their own
-    filtering, and a nested `2> >(grep …)` workaround stays untouched
-    because a pipe is not a tty), the filter is already installed, or bash
-    is unavailable (non-macOS fallbacks, hardened systems)."""
-    if sys.platform != "darwin" or not os.isatty(2):
-        return None
-    if os.environ.get(_MSL_FILTER_ENV):
-        return None
-    if not os.path.exists("/bin/bash"):
-        return None
-    argv0 = sys.argv[0]
-    rest = sys.argv[1:]
-    if argv0.endswith("__main__.py") and os.path.exists(argv0):
-        # `python -m drcode`: exec the module file through the same
-        # interpreter (preserving -u), a shebang-less file cannot be
-        # exec'd directly.
-        cmd: list[str] = [sys.executable]
-        if not getattr(sys.flags, "buffered", 1):  # `-u`
-            cmd.append("-u")
-        cmd.append(argv0)
-        return ["/bin/bash", "-c", _MSL_FILTER_SCRIPT, _MSL_FILTER_MARKER, *cmd, *rest]
-    # Console script (`~/.local/bin/drcode`), frozen binary, `python
-    # /path/to/script`: argv[0] is executable as-is; a bare name found via
-    # PATH stays resolvable because bash's exec searches PATH too.
-    return ["/bin/bash", "-c", _MSL_FILTER_SCRIPT, _MSL_FILTER_MARKER, argv0, *rest]
+def _stderr_filter_needed() -> bool:
+    """Whether the fd2 noise filter must be installed: only on macOS with
+    stderr attached to the terminal. Redirected stderr (file/pipe) is the
+    user's own filtering — a nested `2> >(grep …)` workaround stays
+    untouched because a pipe is not a tty — and every child of a live TUI
+    inherits the marker env var, so nested drcode instances never stack
+    filters."""
+    return (
+        sys.platform == "darwin"
+        and os.isatty(2)
+        and not os.environ.get(_MSL_FILTER_ENV)
+    )
+
+
+def _msl_tail_may_become_noise(tail: bytes) -> bool:
+    """Whether a trailing newline-less fragment could still be the beginning
+    of a noise line and therefore must be held back until the line
+    completes (or the fuse fires)."""
+    if not tail or b"\n" in tail or b"\x1b" in tail or len(tail) > _MSL_TAIL_LIMIT:
+        return False
+    if b"MallocStackLogging" in tail:
+        return True  # already inside the message part of a noise line
+    i = tail.rfind(b"(")
+    if i == -1:
+        return True  # still inside the process-name part
+    m = _MSL_TAIL_PID_RE.match(tail, i + 1)
+    after = tail[m.end() :] if m else tail[i + 1 :]
+    return not after or _MSL_TAIL_KEYWORD.startswith(after)
+
+
+def _msl_filter_loop(read_fd: int, write_fd: int) -> None:
+    """The filter child body: read raw stderr bytes, drop completed noise
+    lines, pass everything else through immediately (unbuffered)."""
+    buf = b""
+
+    def emit(data: bytes) -> None:
+        while data:
+            data = data[os.write(write_fd, data) :]
+
+    while True:
+        chunk = os.read(read_fd, 65536)
+        if not chunk:
+            break
+        buf += chunk
+        cut = buf.rfind(b"\n")
+        if cut >= 0:
+            emit(_MSL_NOISE_RE.sub(b"", buf[: cut + 1]))
+            buf = buf[cut + 1 :]
+        if buf and not _msl_tail_may_become_noise(buf):
+            emit(buf)
+            buf = b""
+    if buf:  # EOF: an unterminated tail can no longer grow — flush it
+        emit(buf)
 
 
 def _install_stderr_filter() -> None:
-    """Re-exec self with a filtered stderr (no-op unless needed — see
-    _stderr_filter_argv). Must run before anything spawns children."""
-    argv = _stderr_filter_argv()
-    if argv is None:
+    """Split fd2 through the byte-filter child (no-op unless needed — see
+    the module comment). Must run before anything spawns children: every
+    child born afterwards inherits the filtered fd2. The parent keeps its
+    PID and exit status (no re-exec); the filter child waits on the pipe
+    and dies of EOF when the TUI and all its descendants are gone."""
+    if not _stderr_filter_needed():
         return
+    pipe_r, pipe_w = os.pipe()
+    tty = os.dup(2)
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(pipe_r)
+        os.close(pipe_w)
+        os.close(tty)
+        return
+    if pid == 0:
+        # Filter child: the pipe becomes its stdin, the original stderr its
+        # stdout. No exception may unwind it back into application code.
+        try:
+            os.close(pipe_w)
+            os.dup2(pipe_r, 0)
+            os.close(pipe_r)
+            os.dup2(tty, 1)
+            os.close(tty)
+            _msl_filter_loop(0, 1)
+        finally:
+            os._exit(0)
+    os.close(pipe_r)
+    os.close(tty)
+    os.dup2(pipe_w, 2)
+    os.close(pipe_w)
     os.environ[_MSL_FILTER_ENV] = "1"
-    os.execv(argv[0], argv)
 
 
 def _print_help() -> None:

@@ -59,8 +59,8 @@ def _sandbox_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         "DRCODE_USER_CONFIG_DIR",
         # The fd2 malloc-noise filter marker (_install_stderr_filter in
         # __init__.py): every child of a live TUI inherits it, and
-        # _stderr_filter_argv() must decide "filter installed?" from the test's
-        # own setup, not from the dogfooding parent's exec wrapper.
+        # _stderr_filter_needed() must decide "filter installed?" from the
+        # test's own setup, not from the dogfooding parent's filter chain.
         "DRCODE_MSL_STDERR_FILTER",
         # The DEC 2026 synchronized-output switches (tui/sync_output.py): a
         # child pytest of a live TUI inherits them (iTerm2 sessions carry

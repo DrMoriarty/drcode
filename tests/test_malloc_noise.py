@@ -5,10 +5,14 @@ Diagnosis (2026-10-31, task 27ef7164): siagent/cpard toggle malloc stack
 logging remotely in live processes; libmalloc then makes every fork()ed
 child print `Name(pid) MallocStackLogging: ...` to the INHERITED stderr in
 the fork→exec window — before subprocess dup2's its capture pipes. The
-startup filter turns the TUI's fd2 into a `grep -v` stream (same mechanism
-as the manual `uv run drcode 2> >(grep -v MallocStackLogging >&2)`); the
+startup filter splits the TUI's fd2 through a byte-filter child; the
 sanitizer strips the lines that land in captured outputs anyway (a child
 toggled ON mid-run writes the report into its own captured stderr).
+
+The filter must be byte-exact, not `grep -v`: Textual frames often carry no
+trailing newline and would stall in grep's stdio buffer (up to seconds of
+key-echo/repaint latency), so the filter loop is tested to pass newline-less
+frames through while no further input arrives.
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -67,7 +73,7 @@ def test_strip_handles_pid_like_names_and_multiple_lines() -> None:
     assert strip_malloc_stack_logging_noise(text) == "kept\n"
 
 
-# -- startup filter argv --------------------------------------------------------
+# -- startup filter gating -------------------------------------------------------
 
 
 @pytest.fixture
@@ -76,97 +82,227 @@ def darwin_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "isatty", lambda fd: fd == 2)
 
 
-def test_filter_argv_skipped_when_stderr_not_tty(
+def test_filter_skipped_when_stderr_not_tty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(os, "isatty", lambda fd: False)
-    assert drcode._stderr_filter_argv() is None
+    assert not drcode._stderr_filter_needed()
 
 
-def test_filter_argv_skipped_outside_darwin(
+def test_filter_skipped_outside_darwin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(os, "isatty", lambda fd: True)
-    assert drcode._stderr_filter_argv() is None
+    assert not drcode._stderr_filter_needed()
 
 
-def test_filter_argv_skipped_when_already_installed(
+def test_filter_skipped_when_already_installed(
     monkeypatch: pytest.MonkeyPatch, darwin_tty: None
 ) -> None:
     monkeypatch.setenv(drcode._MSL_FILTER_ENV, "1")
-    assert drcode._stderr_filter_argv() is None
+    assert not drcode._stderr_filter_needed()
 
 
-def test_filter_argv_skipped_without_bash(
-    monkeypatch: pytest.MonkeyPatch, darwin_tty: None
-) -> None:
-    real_exists = os.path.exists
-    monkeypatch.setattr(
-        os.path, "exists", lambda p: False if p == "/bin/bash" else real_exists(p)
+def test_filter_needed_on_darwin_tty(darwin_tty: None) -> None:
+    assert drcode._stderr_filter_needed()
+
+
+# -- the held-tail fuse ----------------------------------------------------------
+
+
+def test_tail_esc_frame_never_held() -> None:
+    # Textual frames always contain ESC — they must pass through instantly.
+    assert not drcode._msl_tail_may_become_noise(b"\x1b[3;5Hcursor")
+    assert not drcode._msl_tail_may_become_noise(b"\x1b[1;1H\x1b[2K")
+
+
+def test_tail_potential_noise_prefixes_held() -> None:
+    assert drcode._msl_tail_may_become_noise(b"Python(42")
+    assert drcode._msl_tail_may_become_noise(b"git(7) ")
+    assert drcode._msl_tail_may_become_noise(b"git(7) MallocStack")
+    assert drcode._msl_tail_may_become_noise(
+        b"git(7) MallocStackLogging: partial message"
     )
-    assert drcode._stderr_filter_argv() is None
+    assert drcode._msl_tail_may_become_noise(b"plain name still open")
 
 
-def test_filter_argv_console_script(darwin_tty: None) -> None:
-    monkey_argv = ["/Users/x/.local/bin/drcode", "--version"]
-    original_argv, original_platform = sys.argv, sys.platform
-    sys.argv = monkey_argv
+def test_tail_innocent_or_oversized_fragments_flushed() -> None:
+    assert not drcode._msl_tail_may_become_noise(b"Traceback (most")
+    assert not drcode._msl_tail_may_become_noise(b"Python(42) Malformed output")
+    assert not drcode._msl_tail_may_become_noise(b"Python(42) x")
+    assert not drcode._msl_tail_may_become_noise(b"x" * 200)
+
+
+# -- the byte filter loop --------------------------------------------------------
+
+
+class _FilterFixture:
+    """A live _msl_filter_loop in a thread, fed through pipes."""
+
+    def __init__(self) -> None:
+        self.in_r, self.in_w = os.pipe()
+        self.out_r, self.out_w = os.pipe()
+        os.set_blocking(self.out_r, False)
+        self.thread = threading.Thread(
+            target=drcode._msl_filter_loop, args=(self.in_r, self.out_w), daemon=True
+        )
+        self.thread.start()
+
+    def feed(self, data: bytes) -> None:
+        os.write(self.in_w, data)
+
+    def drain(self, timeout: float = 5.0) -> bytes:
+        """Read everything currently available, waiting up to `timeout`
+        for the first byte (then only for a quiet gap)."""
+        got = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                part = os.read(self.out_r, 65536)
+            except BlockingIOError:
+                if got:
+                    break
+                time.sleep(0.005)
+                continue
+            if not part:
+                break
+            got += part
+        return got
+
+    def close_input(self) -> None:
+        os.close(self.in_w)
+        self.thread.join(timeout=10)
+        assert not self.thread.is_alive()
+
+    def read_all(self) -> bytes:
+        os.close(self.out_w)  # the loop thread is done — drop our copy for EOF
+        os.set_blocking(self.out_r, True)
+        chunks = []
+        while True:
+            part = os.read(self.out_r, 65536)
+            if not part:
+                break
+            chunks.append(part)
+        return b"".join(chunks)
+
+    def cleanup(self) -> None:
+        for fd in (self.in_r, self.out_r, self.out_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _run_filter(chunks: list[bytes]) -> bytes:
+    fx = _FilterFixture()
     try:
-        argv = drcode._stderr_filter_argv()
+        for chunk in chunks:
+            fx.feed(chunk)
+        fx.close_input()
+        return fx.read_all()
     finally:
-        sys.argv, sys.platform = original_argv, original_platform
-    assert argv is not None
-    assert argv[:3] == ["/bin/bash", "-c", drcode._MSL_FILTER_SCRIPT]
-    # $0 is a throwaway marker; the real command follows in $@
-    assert argv[3] == drcode._MSL_FILTER_MARKER
-    assert argv[4:] == monkey_argv
+        fx.cleanup()
 
 
-def test_filter_argv_python_m(darwin_tty: None) -> None:
-    main_py = str(__import__("pathlib").Path(drcode.__file__).with_name("__main__.py"))
-    original_argv = sys.argv
-    sys.argv = [main_py, "-x"]
+def test_filter_drops_noise_keeps_rest() -> None:
+    out = _run_filter(
+        [
+            b"err-line\n",
+            (
+                b"Python(4242) MallocStackLogging: can't turn off malloc stack "
+                b"logging because it was not enabled.\n"
+            ),
+            (
+                b"git(7) MallocStackLogging: stack logs being written to "
+                b"/private/tmp/stack-logs.7\n"
+            ),
+        ]
+    )
+    assert out == b"err-line\n"
+
+
+def test_filter_keeps_word_in_other_context() -> None:
+    # Only the exact libmalloc report shape is dropped.
+    text = (
+        b"MallocStackLogging is documented in the manual\n"
+        b"grep: MallocStackLogging: no such file\n"
+        b"user said: MallocStackLogging=1 helps\n"
+    )
+    assert _run_filter([text]) == text
+
+
+def test_filter_handles_pid_like_names_and_multiple_lines() -> None:
+    noise = (
+        b"uv(43486) MallocStackLogging: stack logs being written to "
+        b"/private/tmp/stack-logs.43486.10fcfc000.uv\n"
+        b"Python Helper(12) MallocStackLogging: could not tag MSL-related "
+        b"memory as no_footprint\n"
+        b"siagent(32197) MallocStackLogging: can't turn off malloc stack "
+        b"logging because it was not enabled.\n"
+    )
+    assert _run_filter([noise, b"kept\n"]) == b"kept\n"
+
+
+def test_filter_flushes_unterminated_tail_at_eof() -> None:
+    # An incomplete last line can no longer grow at EOF — it is passed
+    # through (it never became a noise *line*).
+    out = _run_filter(
+        [b"real output\nPython(1) MallocStackLogging: turning off stack logging."]
+    )
+    assert out == (
+        b"real output\nPython(1) MallocStackLogging: turning off stack logging."
+    )
+
+
+def test_filter_passes_newline_less_frame_immediately() -> None:
+    # THE regression: a Textual-like frame without trailing newline must
+    # reach the terminal while NO further input arrives — under the grep
+    # filter it stalled until the next newline-terminated write.
+    fx = _FilterFixture()
     try:
-        argv = drcode._stderr_filter_argv()
+        fx.feed(b"\x1b[3;5Hcursor")
+        assert fx.drain(timeout=1.0) == b"\x1b[3;5Hcursor"
     finally:
-        sys.argv = original_argv
-    assert argv is not None
-    assert argv[4] == sys.executable
-    assert argv[5] == main_py
-    assert argv[6:] == ["-x"]
+        fx.close_input()
+        fx.cleanup()
 
 
-# -- the bash filter script itself ---------------------------------------------
+def test_filter_holds_possible_noise_start_until_line_completes() -> None:
+    fx = _FilterFixture()
+    try:
+        fx.feed(b"Python(42")
+        assert fx.drain(timeout=0.2) == b""  # held: could grow into a noise line
+        fx.feed(b") MallocStackLogging: not enabled.\n")
+        assert fx.drain(timeout=0.5) == b""  # completed line was noise — dropped
+        fx.feed(b"\x1b[1;1Hok")
+        assert fx.drain(timeout=1.0) == b"\x1b[1;1Hok"
+    finally:
+        fx.close_input()
+        fx.cleanup()
 
 
-@pytest.mark.skipif(not os.path.exists("/bin/bash"), reason="bash required")
-def test_bash_filter_drops_noise_keeps_rest() -> None:
+def test_filter_flushes_held_noise_message_at_eof() -> None:
+    out = _run_filter([b"Python(42) MallocStackLogging: unterminated message"])
+    assert out == b"Python(42) MallocStackLogging: unterminated message"
+
+
+def test_filter_on_captured_child_stderr() -> None:
+    # End-to-end shape: what the sanitizer sees for a child toggled ON
+    # mid-run, fed through the real filter loop.
     emitter = (
         "echo out-line; "
         "echo \"Python(4242) MallocStackLogging: can't turn off "
         'malloc stack logging because it was not enabled." >&2; '
-        'echo "git(7) MallocStackLogging: stack logs being written to '
-        '/private/tmp/stack-logs.7" >&2; '
         "echo err-line >&2"
     )
     proc = subprocess.run(
-        [
-            "/bin/bash",
-            "-c",
-            drcode._MSL_FILTER_SCRIPT,
-            drcode._MSL_FILTER_MARKER,
-            "/bin/sh",
-            "-c",
-            emitter,
-        ],
+        ["/bin/sh", "-c", emitter],
         capture_output=True,
-        text=True,
         timeout=15,
         check=False,
     )
     assert proc.returncode == 0
-    assert proc.stdout.strip() == "out-line"
-    # The real stderr survives; the noise does not.
-    assert proc.stderr.strip() == "err-line"
+    assert proc.stdout.strip() == b"out-line"
+    assert _run_filter([proc.stderr]) == b"err-line\n"

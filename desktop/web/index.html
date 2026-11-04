@@ -3,8 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- 'unsafe-eval' is REQUIRED: pywebview's js_api bridge (_createApi in webview/js/api.js)
+       builds bridge methods via new Function() inside evaluateJavaScript (finish.js);
+       WebKit 16+ subjects that to the page's CSP, so without it window.pywebview.api
+       stays empty and every bridge call (choose_project, get_info, set_title, ...)
+       silently fails. Content is served by our own localhost aiohttp server only. -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ws: wss:;">
+        content="default-src 'none'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ws: wss:;">
   <title>DrCode</title>
   <link rel="stylesheet" href="static/vendor/xterm.min.css">
   <link rel="stylesheet" href="static/style.css">

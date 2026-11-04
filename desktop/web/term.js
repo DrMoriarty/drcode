@@ -207,8 +207,31 @@
     sendResize();
   }
 
+  /* Modified Enter variants (Shift+Enter etc.) must reach the PTY as a
+   * kitty-style CSI u sequence: xterm.js encodes every Enter as plain "\r",
+   * so the TUI would only ever see "enter" and submit instead of inserting
+   * a newline. Textual's input parser decodes \x1b[13;<mods>u back into
+   * shift+enter / ctrl+enter / alt+enter (kitty modifier encoding:
+   * param = 1 + shift(1) + alt(2) + ctrl(4)). Plain Enter stays untouched.
+   * Only intercepted while a session is live — the welcome screen has no
+   * PTY to talk to.
+   */
+  function encodeEnter(event) {
+    var mods = 1;
+    if (event.shiftKey) mods += 1;
+    if (event.altKey) mods += 2;
+    if (event.ctrlKey) mods += 4;
+    return "\x1b[13;" + mods + "u";
+  }
+
   function terminalKeyHandler(ev) {
     if (ev.key === "F11") return true; // handled by the window listener
+    if (ev.key === "Enter" && (ev.shiftKey || ev.ctrlKey || ev.altKey)) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !started) return true;
+      ev.preventDefault();
+      ws.send(new TextEncoder().encode(encodeEnter(ev)));
+      return false;
+    }
     if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
     var code = ev.code || "";
     if (ev.key === "=" || ev.key === "+" || code === "NumpadAdd") {

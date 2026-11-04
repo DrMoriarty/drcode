@@ -300,6 +300,29 @@ def test_term_js_pick_project_retries_before_error() -> None:
     assert "dataset.waiting" in handler
 
 
+def test_term_js_modified_enter_sends_csi_u() -> None:
+    """xterm.js encodes every Enter as plain "\r", so Shift+Enter would
+    submit the chat input instead of inserting a newline. The key handler
+    must intercept modified Enter variants and forward them as kitty-style
+    CSI u sequences (which Textual's parser decodes back into
+    shift+enter / ctrl+enter / alt+enter), leaving plain Enter untouched."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    handler = js[js.index("function encodeEnter"):]
+
+    # Modified Enter is intercepted BEFORE the font-size shortcut gate and
+    # before the ctrl-only filter that would otherwise let it through.
+    gate = handler.index("var code = ev.code")
+    enter_at = handler.index('ev.key === "Enter"')
+    assert enter_at < gate
+
+    # Only while a live session exists (welcome screen has no PTY).
+    assert handler.index('ws.readyState !== WebSocket.OPEN') < gate
+    # Plain Enter is never intercepted: no branch matches unmodified Enter.
+    assert "ev.shiftKey || ev.ctrlKey || ev.altKey" in handler
+    # The payload is the kitty CSI u encoding Textual understands.
+    assert '"\\x1b[13;" + mods + "u"' in handler
+
+
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:
     ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
     try:

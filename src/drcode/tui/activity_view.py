@@ -305,13 +305,19 @@ class ActivityLayer(DrCodeState):
             )
             self._nudge_run(task)
 
-    def _nudge_run(self, task: Task) -> None:
+    def _nudge_run(self, task: Task, *, source: str = "watchdog") -> bool:
         """Abort the hung/stalled run for `task` (if one is in flight) and
         schedule its restart: the agent resumes via a continuation turn (no
         text is re-sent — `task.unfinished` marks the interrupted attempt),
         the tester gets a fresh verification round via the pipeline gate
         (`_advance` re-tests the still-TESTING task). Only this task's run
-        is touched — parallel slots keep the other tasks' runs alive."""
+        is touched — parallel slots keep the other tasks' runs alive.
+        `source` distinguishes the automatic watchdog nudge from the manual
+        Ctrl+R — the restart leaves a service event in the task's chat so
+        the resume is never silent (the incident this guards against: a
+        watchdog restart that only rebuilt the venv looked like "the task
+        does not resume"). Returns whether a restart was scheduled."""
+        scheduled = False
         if task.status is TaskStatus.ACTIVE:
             if task.id in self._agent_runs:
                 self.workers.cancel_group(self, f"agent-{task.id}")
@@ -322,6 +328,7 @@ class ActivityLayer(DrCodeState):
             self._schedule_pipeline_timer(
                 self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
             )
+            scheduled = True
         elif task.status is TaskStatus.TESTING:
             if self.tester_running:
                 self.workers.cancel_group(self, "tester")
@@ -329,6 +336,7 @@ class ActivityLayer(DrCodeState):
                 self._current_tool[task.id] = None
                 self.refresh_status()
             self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+            scheduled = True
         elif self.tester_running and self._tester_task_id == task.id:
             # The run hung AFTER its useful work: set_verification already
             # flipped the task to COMPLETED mid-run. Nothing to restart —
@@ -340,6 +348,7 @@ class ActivityLayer(DrCodeState):
             self._current_tool[task.id] = None
             self.refresh_status()
             self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+            scheduled = True
         elif self._resolver_running and self._resolver_task_id == task.id:
             # A hung conflict-resolver round: abort it and restart the
             # round (the transcript is kept; the round resumes as a
@@ -352,3 +361,17 @@ class ActivityLayer(DrCodeState):
             self._schedule_pipeline_timer(
                 self._NUDGE_RESTART_DELAY, partial(self.run_resolver, task.id)
             )
+            scheduled = True
+        if scheduled:
+            if source == "watchdog":
+                self._show_event(
+                    task,
+                    "run aborted after stall — restarting (it resumes from "
+                    "where it stopped)",
+                )
+            else:
+                self._show_event(
+                    task,
+                    "run restarted by Ctrl+R (it resumes from where it stopped)",
+                )
+        return scheduled

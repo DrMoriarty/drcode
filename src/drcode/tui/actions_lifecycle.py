@@ -333,11 +333,20 @@ class TaskLifecycleLayer(DrCodeState):
         """Ctrl+R on the viewed ACTIVE/TESTING task: abort its hung or
         stalled run and restart it — the same move the stall watchdog makes
         automatically, and the one-key resume for a task left "active,
-        nothing running" by a previous abort."""
+        nothing running" by a previous abort. The restart leaves a service
+        event in the task's chat (see `_nudge_run`) and a toast, so the
+        keypress never looks like a no-op — a silent destructive restart of
+        a healthy run is exactly how "the task does not resume" incidents
+        are born."""
         task = self.viewed
         if task is None:
             return
-        self._nudge_run(task)
+        if self._nudge_run(task, source="manual"):
+            self.notify(
+                "Run restarted — resuming from where it stopped",
+                title="Ctrl+R",
+                timeout=5,
+            )
 
     def action_cycle_task_kind(self) -> None:
         """Cycle the type of the viewed task (feature → bug → research).

@@ -68,6 +68,7 @@ from .compaction import (
     slice_budget_tokens,
     split_original_prompts,
     tester_verdict_issued,
+    unwrap_summary_envelope,
 )
 from .prompts import (
     BUG_SYSTEM_PROMPT,
@@ -218,4 +219,5 @@ __all__ = [
     "todo_dynamic_instructions",
     "todo_instructions",
     "tools",
+    "unwrap_summary_envelope",
 ]

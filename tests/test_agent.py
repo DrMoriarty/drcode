@@ -47,6 +47,7 @@ from drcode.agent import (
     sanitized_messages,
     serialize_messages,
     split_original_prompts,
+    unwrap_summary_envelope,
 )
 from drcode.config import Config
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
@@ -495,6 +496,54 @@ def test_extract_previous_summary_takes_latest() -> None:
         ]
     )
     assert extract_previous_summary(data) == "new"
+
+
+def test_unwrap_summary_envelope_json_summary() -> None:
+    # Model ignored the markdown template and wrapped the summary into a
+    # JSON envelope with escaped newlines: unwrap to the markdown itself.
+    text = json.dumps({"summary": "## Goal\n- Verify a\n- Verify b"})
+    assert unwrap_summary_envelope(text) == "## Goal\n- Verify a\n- Verify b"
+
+
+def test_unwrap_summary_envelope_inside_json_fence() -> None:
+    text = '```json\n{"summary": "## Goal\\n- Verify x"}\n```'
+    assert unwrap_summary_envelope(text) == "## Goal\n- Verify x"
+
+
+def test_unwrap_summary_envelope_prefers_summary_key() -> None:
+    text = json.dumps({"title": "t", "summary": "the body", "notes": "n"})
+    assert unwrap_summary_envelope(text) == "the body"
+
+
+def test_unwrap_summary_envelope_single_string_field() -> None:
+    text = json.dumps({"markdown": "## Goal\n- done"})
+    assert unwrap_summary_envelope(text) == "## Goal\n- done"
+
+
+def test_unwrap_summary_envelope_strips_bare_fence() -> None:
+    # A fence around plain markdown is also a formatting artifact: strip it.
+    assert unwrap_summary_envelope("```\n## Goal\n- x\n```") == "## Goal\n- x"
+
+
+def test_unwrap_summary_envelope_markdown_passthrough() -> None:
+    text = "## Goal\n- Verify x\n```python\nprint(1)\n```\n## Notes\nok"
+    assert unwrap_summary_envelope(text) == text
+
+
+def test_unwrap_summary_envelope_non_dict_json_passthrough() -> None:
+    assert unwrap_summary_envelope("42") == "42"
+    assert unwrap_summary_envelope('["a", "b"]') == '["a", "b"]'
+
+
+def test_unwrap_summary_envelope_json_without_string_field() -> None:
+    text = json.dumps({"count": 3, "items": [1, 2]})
+    assert unwrap_summary_envelope(text) == text
+
+
+def test_unwrap_summary_envelope_json_without_summary_key() -> None:
+    # Several string fields and no "summary": ambiguous, pass through.
+    text = json.dumps({"title": "t", "body": "b"})
+    assert unwrap_summary_envelope(text) == text
 
 
 def test_render_history_for_summary() -> None:

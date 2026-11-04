@@ -654,6 +654,51 @@ def compacted_messages(
     return preserved + serialize_messages([request])
 
 
+def unwrap_summary_envelope(text: str) -> str:
+    """Normalize a summarizer output: undo the formatting envelope when the
+    model ignored the markdown template.
+
+    The summarizer is instructed to answer with plain markdown, but some
+    models wrap the summary into a JSON object ({"summary": "## Goal\\n..."})
+    or into a ```json fence. Left as-is, the envelope poisons everything
+    downstream: the summary is shown to the user as raw JSON, becomes the
+    <previous-summary> anchor of the next compaction (the envelope then
+    travels along the whole anchor chain), and bloats every resumed round.
+
+    Undo, in order: strip a leading/trailing markdown fence around the WHOLE
+    text (inner fences stay untouched); if what remains parses as a JSON
+    object, return its "summary" field when it is a string, else its single
+    string-valued field. Anything else — plain markdown, non-dict JSON, an
+    object with several string fields and no "summary" — passes through
+    unchanged.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return text
+    fenced = False
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        # Opening fence (``` or ```json/```markdown) + closing fence only.
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            stripped = "\n".join(lines[1:-1]).strip()
+            fenced = True
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        # Not JSON: keep the fence-stripped text when a fence was removed,
+        # otherwise pass the output through unchanged.
+        return stripped if fenced else text
+    if not isinstance(data, dict):
+        return text
+    summary = data.get("summary")
+    if isinstance(summary, str):
+        return summary
+    string_fields = [v for v in data.values() if isinstance(v, str)]
+    if len(string_fields) == 1:
+        return string_fields[0]
+    return text
+
+
 # -- mechanical compaction floor (no LLM call) --------------------------------
 
 

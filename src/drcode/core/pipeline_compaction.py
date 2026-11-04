@@ -34,6 +34,7 @@ from ..agent import (
     split_original_prompts,
     subagent_limit_for,
     tester_verdict_issued,
+    unwrap_summary_envelope,
 )
 from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
 from ..config import Config
@@ -569,7 +570,14 @@ class PipelineCompactionLayer(CoreState):
         per-day usage store like every other model call (under the
         COMPACTION role — the summarizer always runs on the compaction
         model, whatever transcript it shrinks). Raises on failure — the
-        callers turn that into a non-fatal compaction-failed event."""
+        callers turn that into a non-fatal compaction-failed event.
+
+        The single funnel for every summarizer call (map, reduce and plain
+        rounds alike), so the format normalization happens exactly once:
+        models that ignore the markdown template and answer with a JSON
+        envelope or a ```json fence are unwrapped here (see
+        `unwrap_summary_envelope`) — an envelope that slipped through would
+        ride the <previous-summary> anchor chain forever."""
         agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
         result = await agent.run(prompt)
         # The summarizer's model calls count toward the session usage too.
@@ -578,7 +586,7 @@ class PipelineCompactionLayer(CoreState):
             AgentRole.COMPACTION,
             self.resolved_model_key(AgentRole.COMPACTION),
         )
-        return result.output
+        return unwrap_summary_envelope(result.output)
 
     async def _reduce_partials(
         self,

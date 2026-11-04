@@ -186,9 +186,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         width: 1fr;
     }
     # "Changed" marker: a border-tint is useless under the compact form
-    # styles (the border the signal used to color is gone) — tint the
-    # widget's background instead; visible on Select and Switch alike.
-    Select.changed,
+    # styles (the border the signal used to color is gone). Switch is
+    # tinted directly; for Select the tint goes on the child SelectCurrent
+    # — its opaque background hides the parent's tint (plus $warning text
+    # for terminals without truecolor).
+    Select.changed > SelectCurrent {
+        background-tint: $warning 25%;
+        color: $warning;
+    }
     Switch.changed {
         background-tint: $warning 25%;
     }

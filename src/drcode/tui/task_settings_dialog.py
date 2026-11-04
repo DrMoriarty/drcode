@@ -461,7 +461,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
 
     def _fill_workflow_info(self) -> None:
         """The bottom info block: the status of the optional custom team
-        workflow (moved here from the Settings menu's "Workflow" entry —
+        workflow (the former "Workflow" Settings entry, now folded here —
         informational, nothing to toggle)."""
         try:
             lines = self._drcode_app().workflow_info_lines()

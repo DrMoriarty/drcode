@@ -3352,7 +3352,6 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         main_names = [c.name for c in main]
         assert main_names == [
-            "Workflow",
             (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",

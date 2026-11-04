@@ -38,7 +38,7 @@ from ..settings import (
     parallel_tasks_label,
     subagents_label,
 )
-from ..workflow import describe_project_workflow, load_git_workflow
+from ..workflow import load_git_workflow
 from .command_providers import (
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
@@ -744,18 +744,11 @@ class SettingsLayer(DrCodeState):
             )
         )
 
-    def workflow_status_label(self) -> str:
-        """One-line status of the custom team workflow for the Settings
-        entry: "default" without the workflow files, otherwise what is
-        active (from .drcode/git-workflow.md and .drcode/workflow.py)."""
-        return describe_project_workflow(self.project_root)
-
     def workflow_info_lines(self) -> list[str]:
         """The lines describing the custom team workflow's state: which
-        layers are active and where their files live. Shared by the
-        "Workflow" palette entry (a toast) and the Task-settings dialog
-        (the bottom info block). The workflow is enabled by file presence
-        alone; there is nothing to toggle."""
+        layers are active and where their files live. Shown in the
+        Task-settings dialog's bottom info block. The workflow is enabled
+        by file presence alone; there is nothing to toggle."""
         parts = [
             (
                 "Git rules: .drcode/git-workflow.md — "
@@ -778,16 +771,6 @@ class SettingsLayer(DrCodeState):
             "did not author."
         )
         return parts
-
-    def action_workflow_info(self) -> None:
-        """Settings entry ("Workflow") — informational: explains which
-        workflow layers are active and where their files live (the same
-        lines as the Task-settings dialog's bottom info block)."""
-        self.notify(
-            "\n".join(self.workflow_info_lines()),
-            title="Custom workflow",
-            timeout=10,
-        )
 
     def action_change_github(self) -> None:
         """GitHub-integration dialog, opened from the Settings entry

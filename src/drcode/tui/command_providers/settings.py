@@ -219,7 +219,6 @@ class SettingsPalette(CommandPalette):
         "Update/create AGENTS.md",
         "Model settings",
         "Task settings",
-        "Workflow",
         "GitHub integration:",
         "Notifications:",
         "Voice:",
@@ -458,15 +457,6 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
     def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
-            CommandEntry(
-                "Workflow",
-                app.action_workflow_info,
-                "Custom branching/review rules: .drcode/git-workflow.md "
-                "(prose rules for the agents) and .drcode/workflow.py "
-                "(lifecycle hooks, incl. external code review) — press "
-                "for details (the same status is also shown at the "
-                "bottom of Task settings)",
-            ),
             CommandEntry(
                 f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}",
                 app.action_change_github,

@@ -25,7 +25,10 @@
       <p class="brand-sub">Native shell around the drcode TUI.<br>
         Pick a project folder — the bundled <code>drcode</code> binary runs inside this window with that folder as its working directory.</p>
 
-      <button id="pick-project" class="btn btn-primary" type="button">Open project folder…</button>
+      <div class="welcome-actions">
+        <button id="pick-project" class="btn btn-primary" type="button">Open project folder…</button>
+        <button id="open-settings" class="btn" type="button">Terminal font…</button>
+      </div>
 
       <div id="recents-block" class="recents hidden">
         <div class="recents-title">Recent projects</div>
@@ -36,7 +39,8 @@
 
       <div class="hints">
         <div class="hints-title">Shortcuts</div>
-        <div><kbd>F11</kbd> fullscreen &nbsp;·&nbsp; <kbd>⌘/Ctrl</kbd>+<kbd>⇧</kbd>+<kbd>R</kbd> restart session</div>
+        <div><kbd>F11</kbd> fullscreen &nbsp;·&nbsp; <kbd>⌘/Ctrl</kbd>+<kbd>⇧</kbd>+<kbd>R</kbd> restart session &nbsp;·&nbsp; <kbd>⌘/Ctrl</kbd>+<kbd>,</kbd> terminal font</div>
+        <div>Terminal font size: <kbd>⌘/Ctrl</kbd>+<kbd>=</kbd> / <kbd>⌘/Ctrl</kbd>+<kbd>-</kbd>, reset with <kbd>⌘/Ctrl</kbd>+<kbd>0</kbd>.</div>
         <div>OSC 52 clipboard is wired: copying from the TUI lands in the system clipboard.</div>
       </div>
     </div>
@@ -53,6 +57,30 @@
       <div class="dialog-actions">
         <button id="btn-restart" class="btn btn-primary" type="button">Restart</button>
         <button id="btn-close" class="btn" type="button">Close window</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Terminal font settings dialog -->
+  <div id="settings-dialog" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-title">Terminal font</div>
+      <div class="dialog-text">Applies immediately and is remembered for all projects.</div>
+      <div class="settings-form">
+        <label class="settings-label" for="settings-font-family">Font family</label>
+        <select id="settings-font-family" class="settings-input"></select>
+        <input id="settings-font-custom" class="settings-input hidden" type="text"
+               spellcheck="false" autocomplete="off" placeholder='Custom font family, e.g. "Fira Code"'>
+        <label class="settings-label" for="settings-font-size">
+          Size — <span id="settings-size-value">13</span> px (6–40)
+        </label>
+        <input id="settings-font-size" class="settings-input" type="number"
+               min="6" max="40" step="1" value="13">
+        <div id="settings-error" class="welcome-error hidden"></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="btn-settings-save" class="btn btn-primary" type="button">Save</button>
+        <button id="btn-settings-cancel" class="btn" type="button">Cancel</button>
       </div>
     </div>
   </div>

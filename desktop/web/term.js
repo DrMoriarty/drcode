@@ -26,8 +26,30 @@
   var elExitDialog = document.getElementById("exit-dialog");
   var elExitText = document.getElementById("exit-text");
   var elBootError = document.getElementById("boot-error");
+  var elSettingsDialog = document.getElementById("settings-dialog");
+  var elSettingsFont = document.getElementById("settings-font-family");
+  var elSettingsCustom = document.getElementById("settings-font-custom");
+  var elSettingsSize = document.getElementById("settings-font-size");
+  var elSettingsSizeValue = document.getElementById("settings-size-value");
+  var elSettingsError = document.getElementById("settings-error");
+  var elOpenSettings = document.getElementById("open-settings");
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
+
+  /* Fixed picker list: the webview cannot enumerate system fonts, so the
+   * dialog offers a curated set plus free-text entry. Any family is used
+   * as the FIRST entry of the fallback chain, with FONT_STACK trailing —
+   * an unknown/typo'd name degrades to the bundled font instead of blank
+   * glyphs. Empty value = default (FONT_STACK alone). */
+  var FONT_CHOICES = [
+    { label: "Default (bundled Nerd Font)", value: "" },
+    { label: "JetBrainsMono Nerd Font Mono", value: '"JetBrainsMono Nerd Font Mono"' },
+    { label: "JetBrains Mono", value: '"JetBrains Mono"' },
+    { label: "SF Mono", value: '"SF Mono"' },
+    { label: "Consolas", value: "Consolas" },
+    { label: "DejaVu Sans Mono", value: '"DejaVu Sans Mono"' },
+  ];
+  var FONT_CUSTOM_VALUE = "__custom__";
 
   var DEFAULT_FONT_SIZE = 13;
   var MIN_FONT_SIZE = 6;
@@ -41,6 +63,8 @@
   var currentProject = null;
   var started = false;
   var closing = false; // clean exit in progress: suppress the crash dialog
+  var savedSettings = null; // {font_family, font_size} from the bridge
+  var currentFontFamily = null; // primary family (null = default FONT_STACK)
 
   function api(name) {
     var bridge = window.pywebview && window.pywebview.api;
@@ -130,10 +154,20 @@
 
   /* ---------------- terminal setup ---------------- */
 
-  function createTerminal() {
+  function fontStackFor(family) {
+    var primary = family && String(family).trim();
+    return primary ? primary + ", " + FONT_STACK : FONT_STACK;
+  }
+
+  function createTerminal(settings) {
+    settings = settings || {};
+    var fontSize = typeof settings.font_size === "number"
+      ? settings.font_size
+      : DEFAULT_FONT_SIZE;
+    currentFontFamily = settings.font_family || null;
     term = new window.Terminal({
-      fontFamily: FONT_STACK,
-      fontSize: 13,
+      fontFamily: fontStackFor(settings.font_family),
+      fontSize: fontSize,
       lineHeight: 1.0,
       cursorBlink: true,
       allowProposedApi: true,
@@ -173,38 +207,59 @@
     });
   }
 
-  /* ---------------- font size (Ctrl+= / Ctrl+- / Ctrl+0) ----------------
+  /* ---------------- font settings (Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+,) -------
    * Without interception these combos would be forwarded to the PTY
    * through term.onData; the custom handler swallows them (return false)
-   * and changes term.options.fontSize instead. The WebGL renderer in
-   * xterm 5.x can keep a stale glyph atlas across a font-size change, so
-   * the addon is re-created after each change; on failure the DOM
-   * renderer takes over. fit.fit() recomputes cols/rows for the new cell
-   * metrics and sendResize() propagates them to the PTY.
+   * and changes term.options instead. The WebGL renderer in xterm 5.x can
+   * keep a stale glyph atlas across any font-metric change, so the addon
+   * is re-created after each change; on failure the DOM renderer takes
+   * over. fit.fit() recomputes cols/rows for the new cell metrics and
+   * sendResize() propagates them to the PTY.
    */
+
+  function recreateWebgl() {
+    if (!webgl) return;
+    try { webgl.dispose(); } catch (err) { /* already gone */ }
+    webgl = null;
+    try {
+      webgl = new window.WebglAddon.WebglAddon();
+      webgl.onContextLoss(function () {
+        if (webgl) { webgl.dispose(); webgl = null; }
+      });
+      term.loadAddon(webgl);
+    } catch (err) {
+      webgl = null; /* DOM renderer fallback */
+    }
+  }
+
+  function refitAfterFontChange() {
+    if (fit) {
+      try { fit.fit(); } catch (err) { /* container not measurable */ }
+    }
+    sendResize();
+  }
 
   function applyFontSize(size) {
     if (!term) return;
     var clamped = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
     if (clamped === term.options.fontSize) return;
     term.options.fontSize = clamped;
-    if (webgl) {
-      try { webgl.dispose(); } catch (err) { /* already gone */ }
-      webgl = null;
-      try {
-        webgl = new window.WebglAddon.WebglAddon();
-        webgl.onContextLoss(function () {
-          if (webgl) { webgl.dispose(); webgl = null; }
-        });
-        term.loadAddon(webgl);
-      } catch (err) {
-        webgl = null; /* DOM renderer fallback */
-      }
-    }
-    if (fit) {
-      try { fit.fit(); } catch (err) { /* container not measurable */ }
-    }
-    sendResize();
+    recreateWebgl();
+    refitAfterFontChange();
+  }
+
+  /* Changing the family changes the cell metrics exactly like a size
+   * change (glyph widths / advance), so the same WebGL re-creation +
+   * refit sequence applies. The family rides as the first entry of the
+   * fallback chain (fontStackFor) so unknown names degrade gracefully. */
+  function applyFontFamily(family) {
+    if (!term) return;
+    currentFontFamily = family || null;
+    var stack = fontStackFor(family);
+    if (stack === term.options.fontFamily) return;
+    term.options.fontFamily = stack;
+    recreateWebgl();
+    refitAfterFontChange();
   }
 
   /* Modified Enter variants (Shift+Enter etc.) must reach the PTY as a
@@ -240,6 +295,11 @@
     }
     if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
     var code = ev.code || "";
+    if (ev.key === ",") {
+      ev.preventDefault();
+      openSettings();
+      return false;
+    }
     if (ev.key === "=" || ev.key === "+" || code === "NumpadAdd") {
       ev.preventDefault();
       applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) + FONT_STEP);
@@ -275,6 +335,90 @@
     if (!ws || ws.readyState !== WebSocket.OPEN || !started) return;
     var size = currentSize();
     ws.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+  }
+
+  /* ---------------- font settings dialog ---------------- */
+
+  function populateFontSelect(selected) {
+    elSettingsFont.innerHTML = "";
+    FONT_CHOICES.forEach(function (choice) {
+      var opt = document.createElement("option");
+      opt.value = choice.value;
+      opt.textContent = choice.label;
+      elSettingsFont.appendChild(opt);
+    });
+    var custom = document.createElement("option");
+    custom.value = FONT_CUSTOM_VALUE;
+    custom.textContent = "Custom…";
+    elSettingsFont.appendChild(custom);
+
+    var known = FONT_CHOICES.some(function (c) { return c.value === selected; });
+    if (known) {
+      elSettingsFont.value = selected;
+      elSettingsCustom.value = "";
+      elSettingsCustom.classList.add("hidden");
+    } else {
+      elSettingsFont.value = FONT_CUSTOM_VALUE;
+      elSettingsCustom.value = selected || "";
+      elSettingsCustom.classList.remove("hidden");
+    }
+  }
+
+  function syncSizeLabel() {
+    elSettingsSizeValue.textContent = elSettingsSize.value || String(DEFAULT_FONT_SIZE);
+  }
+
+  function openSettings() {
+    if (!elSettingsDialog) return;
+    populateFontSelect(currentFontFamily);
+    var size = term && term.options.fontSize
+      ? term.options.fontSize
+      : (savedSettings && typeof savedSettings.font_size === "number"
+          ? savedSettings.font_size
+          : DEFAULT_FONT_SIZE);
+    elSettingsSize.value = String(size);
+    syncSizeLabel();
+    elSettingsError.classList.add("hidden");
+    elSettingsDialog.classList.remove("hidden");
+    elSettingsFont.focus();
+  }
+
+  function closeSettings() {
+    if (elSettingsDialog) elSettingsDialog.classList.add("hidden");
+  }
+
+  function showSettingsError(message) {
+    elSettingsError.textContent = message;
+    elSettingsError.classList.remove("hidden");
+  }
+
+  function saveSettings() {
+    var choice = elSettingsFont.value;
+    var family = choice === FONT_CUSTOM_VALUE
+      ? elSettingsCustom.value.trim()
+      : choice;
+    var size = parseInt(elSettingsSize.value, 10);
+    if (isNaN(size)) size = null;
+    // Apply exactly what the python side validated and stored — it is the
+    // clamp authority (6–40); a bridge-less browser mode applies locally.
+    var setFont = api("set_font_settings");
+    if (!setFont) {
+      applyFontFamily(family);
+      if (size !== null) applyFontSize(size);
+      closeSettings();
+      return;
+    }
+    Promise.resolve(setFont(family, size))
+      .then(function (res) {
+        if (res) {
+          applyFontFamily(res.font_family);
+          if (typeof res.font_size === "number") applyFontSize(res.font_size);
+        }
+        closeSettings();
+      })
+      .catch(function (err) {
+        showSettingsError("Failed to save settings: " + err);
+      });
   }
 
   /* ---------------- websocket bridge ---------------- */
@@ -401,8 +545,42 @@
   }
 
   function boot() {
-    createTerminal();
+    wireUi();
 
+    /* The bridge injects asynchronously, so settings load with the same
+     * retry pattern as recents — and the Terminal constructor (which
+     * bakes fontFamily/fontSize into its renderer) waits for them. */
+    function applyAndStart(settings) {
+      savedSettings = settings || {};
+      createTerminal(savedSettings);
+      startTerminalAndConnect();
+    }
+
+    var getSettings = api("get_settings");
+    if (getSettings) {
+      Promise.resolve(getSettings())
+        .then(applyAndStart)
+        .catch(function () { applyAndStart(null); });
+      return;
+    }
+    var attempts = 0;
+    var timer = setInterval(function () {
+      attempts += 1;
+      var retry = api("get_settings");
+      if (retry) {
+        clearInterval(timer);
+        Promise.resolve(retry())
+          .then(applyAndStart)
+          .catch(function () { applyAndStart(null); });
+      } else if (attempts > 40) {
+        // ~10 s without the bridge — browser mode: defaults, no persistence.
+        clearInterval(timer);
+        applyAndStart(null);
+      }
+    }, 250);
+  }
+
+  function wireUi() {
     function runChooseProject(choose) {
       Promise.resolve(choose()).then(function (path) {
         if (path) launchProject(path);
@@ -448,14 +626,43 @@
       else window.close();
     });
 
+    // Settings dialog wiring (open from the welcome button; Ctrl+, is
+    // intercepted in terminalKeyHandler when the terminal has focus).
+    if (elOpenSettings) {
+      elOpenSettings.addEventListener("click", openSettings);
+    }
+    if (elSettingsFont) {
+      elSettingsFont.addEventListener("change", function () {
+        var custom = elSettingsFont.value === FONT_CUSTOM_VALUE;
+        elSettingsCustom.classList.toggle("hidden", !custom);
+        if (custom) elSettingsCustom.focus();
+      });
+    }
+    if (elSettingsSize) {
+      elSettingsSize.addEventListener("input", syncSizeLabel);
+    }
+    var btnSave = document.getElementById("btn-settings-save");
+    var btnCancel = document.getElementById("btn-settings-cancel");
+    if (btnSave) btnSave.addEventListener("click", saveSettings);
+    if (btnCancel) btnCancel.addEventListener("click", closeSettings);
+
     window.addEventListener("keydown", function (ev) {
-      if (ev.key === "F11") {
+      if (ev.key === "Escape" && elSettingsDialog && !elSettingsDialog.classList.contains("hidden")) {
+        ev.preventDefault();
+        closeSettings();
+      } else if (ev.key === "F11") {
         ev.preventDefault();
         var fs = api("toggle_fullscreen");
         if (fs) fs();
       } else if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "r" || ev.key === "R")) {
         ev.preventDefault();
         if (currentProject) launchProject(currentProject);
+      } else if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && ev.key === ",") {
+        // Welcome screen / focus outside the terminal: the in-terminal
+        // case is handled by terminalKeyHandler before xterm forwards
+        // the combo to the PTY.
+        ev.preventDefault();
+        openSettings();
       }
     });
 
@@ -469,7 +676,9 @@
       ro.observe(elTerminal);
     }
     window.addEventListener("resize", sendResize);
+  }
 
+  function startTerminalAndConnect() {
     // Populate recents from the shell (pywebview bridge), then connect.
     var getInfo = api("get_info");
     var ready = getInfo

@@ -82,6 +82,73 @@ def test_recents_drops_bad_entries(config_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# projects.py — font settings storage
+# ---------------------------------------------------------------------------
+
+
+def test_font_settings_defaults_when_missing(config_dir: Path) -> None:
+    assert projects.load_font_settings() == {"font_family": None, "font_size": None}
+
+
+def test_font_settings_roundtrip(config_dir: Path) -> None:
+    saved = projects.save_font_settings('"Fira Code"', 17)
+    assert saved == {"font_family": '"Fira Code"', "font_size": 17}
+    assert projects.load_font_settings() == saved
+    assert (config_dir / "drcode-desktop.json").is_file()
+
+
+def test_font_settings_none_resets_to_defaults(config_dir: Path) -> None:
+    projects.save_font_settings('"Fira Code"', 17)
+    saved = projects.save_font_settings(None, None)
+    assert saved == {"font_family": None, "font_size": None}
+    assert projects.load_font_settings() == saved
+
+
+def test_font_settings_size_clamped(config_dir: Path) -> None:
+    assert projects.save_font_settings("X", 100)["font_size"] == projects.MAX_FONT_SIZE
+    assert projects.load_font_settings()["font_size"] == projects.MAX_FONT_SIZE
+    assert projects.save_font_settings("X", 1)["font_size"] == projects.MIN_FONT_SIZE
+    # Junk strings / bools / NaN-ish garbage → null, never a crash.
+    assert projects.save_font_settings("X", "big")["font_size"] is None
+    assert projects.save_font_settings("X", True)["font_size"] is None
+    assert projects.save_font_settings("X", None)["font_size"] is None
+
+
+def test_font_settings_blank_family_becomes_null(config_dir: Path) -> None:
+    assert projects.save_font_settings("   ", 13)["font_family"] is None
+    assert projects.load_font_settings()["font_family"] is None
+
+
+def test_font_settings_invalid_stored_values_dropped(config_dir: Path) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "drcode-desktop.json").write_text(
+        json.dumps(
+            {
+                "font_family": 42,
+                "font_size": "13",
+                "recents": [{"project": "/tmp/alpha", "last_used": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert projects.load_font_settings() == {"font_family": None, "font_size": None}
+
+
+def test_font_settings_survive_recents_write_and_vice_versa(config_dir: Path) -> None:
+    """The two halves of the desktop config coexist: writing one never
+    clobbers the other."""
+    projects.save_font_settings('"SF Mono"', 15)
+    projects.add_recent("/tmp/alpha")
+    settings = projects.load_font_settings()
+    assert settings == {"font_family": '"SF Mono"', "font_size": 15}
+    assert [r["project"] for r in projects.load_recents()] == ["/tmp/alpha"]
+
+    projects.save_font_settings("Consolas", 9)
+    recents = projects.load_recents()
+    assert [r["project"] for r in recents] == ["/tmp/alpha"]
+
+
+# ---------------------------------------------------------------------------
 # pty_session.py
 # ---------------------------------------------------------------------------
 
@@ -326,6 +393,52 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     # CSI u and duplicate the newline (double font-size step likewise).
     guard = handler.index('ev.type !== "keydown"')
     assert guard < enter_at
+
+
+def test_term_js_font_settings_wiring() -> None:
+    """Static check of the font-settings flow: boot-time load through the
+    bridge, constructor pickup, family application, and Ctrl+, interception."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    # Settings load with the bridge retry pattern, and createTerminal
+    # consumes them (constructor bakes the metrics into the renderer).
+    assert 'api("get_settings")' in js
+    boot = js[js.index("function boot"):]
+    # createTerminal must run only after settings resolve (not eagerly).
+    assert "createTerminal(savedSettings)" in boot
+    assert "fontFamily: fontStackFor(settings.font_family)" in js
+    assert "fontSize: fontSize" in js
+
+    # Family change reuses the WebGL-recreation/refit path — family swaps
+    # change cell metrics exactly like size changes.
+    apply_family = js[js.index("function applyFontFamily"):]
+    apply_size = js[js.index("function applyFontSize"):js.index("function applyFontFamily")]
+    for fn in (apply_family, apply_size):
+        assert "recreateWebgl()" in fn
+        assert "refitAfterFontChange()" in fn
+    assert "fontStackFor" in apply_family
+
+    # Ctrl+, is intercepted inside the custom key handler AFTER the
+    # ctrl-only gate — otherwise the combo reaches the PTY via onData.
+    handler = js[js.index("function terminalKeyHandler"):]
+    gate = handler.index("if (!ev.ctrlKey")
+    comma = handler.index('ev.key === ","')
+    assert gate < comma < handler.index("openSettings()")
+    assert 'ev.preventDefault();\n      openSettings();\n      return false;' in handler
+
+
+def test_index_html_has_settings_dialog() -> None:
+    html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
+    for el_id in (
+        "settings-dialog",
+        "settings-font-family",
+        "settings-font-custom",
+        "settings-font-size",
+        "btn-settings-save",
+        "btn-settings-cancel",
+        "open-settings",
+    ):
+        assert f'id="{el_id}"' in html
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

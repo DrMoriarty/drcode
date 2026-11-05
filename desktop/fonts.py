@@ -26,6 +26,23 @@ import sys
 
 __all__ = ["available_font_families", "refresh_cache"]
 
+
+def _log_probe_failure(where: str, exc: BaseException) -> None:
+    """Make a failed probe observable instead of silently failing open.
+
+    A fail-open (None) is indistinguishable from success for the user —
+    the font dialog just shows the unfiltered list. Without this line
+    the real cause (import error, ObjC exception, …) is lost forever,
+    especially in a frozen windowed app whose stderr vanishes. stderr +
+    flush: visible in a terminal run and in the macOS unified log.
+    """
+    print(
+        f"[desktop] font probe failed at {where}: {exc!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 # Two-part cache: the bool distinguishes "not computed yet" from
 # "computed, unknown" (a failed probe must stay cached as None, not
 # re-run on every dialog open).
@@ -58,7 +75,8 @@ def available_font_families() -> frozenset[str] | None:
             names = _linux_family_names()
         if names:
             result = frozenset(n.strip() for n in names if n and n.strip())
-    except Exception:  # noqa: BLE001 - enumeration is strictly best-effort
+    except Exception as exc:  # noqa: BLE001 - enumeration is strictly best-effort
+        _log_probe_failure("available_font_families", exc)
         result = None
     _cache_loaded = True
     _cache_value = result
@@ -81,15 +99,17 @@ def _macos_family_names() -> list[str] | None:
         )
 
         return [str(n) for n in CTFontCollectionCopyAvailableFontFamilyNames()]
-    except Exception:  # noqa: BLE001, S110 - bindings not installed, try AppKit
-        pass
+    except Exception as exc:  # noqa: BLE001 - bindings not installed, try AppKit
+        _log_probe_failure("CoreText import/enumeration", exc)
     try:
         from AppKit import NSFont, NSFontManager  # type: ignore[import-not-found]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_probe_failure("AppKit import", exc)
         return None
     try:
         ps_names = [str(n) for n in NSFontManager.sharedFontManager().availableFonts()]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_probe_failure("NSFontManager.availableFonts", exc)
         return None
     families: list[str] = []
     for ps_name in ps_names:

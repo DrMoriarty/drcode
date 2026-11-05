@@ -38,18 +38,34 @@
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
 
-  /* Fixed picker list: the webview cannot enumerate system fonts, so the
-   * dialog offers a curated set plus free-text entry. Any family is used
-   * as the FIRST entry of the fallback chain, with FONT_STACK trailing —
-   * an unknown/typo'd name degrades to the bundled font instead of blank
-   * glyphs. Empty value = default (FONT_STACK alone). */
+  /* Curated picker list of common monospaced families across the three
+   * platforms. Any family is used as the FIRST entry of the fallback
+   * chain, with FONT_STACK trailing — an unknown/typo'd name degrades to
+   * the bundled font instead of blank glyphs. Empty value = default
+   * (FONT_STACK alone).
+   *
+   * The webview cannot enumerate system fonts itself, so the list is
+   * broader than any single machine: get_available_fonts (bridge) names
+   * the families the OS really has and populateFontSelect hides the
+   * rest — an entry that survives filtering is guaranteed renderable,
+   * so every visible item looks (and previews) differently. */
   var FONT_CHOICES = [
     { label: "Default (bundled Nerd Font)", value: "" },
     { label: "JetBrainsMono Nerd Font Mono", value: '"JetBrainsMono Nerd Font Mono"' },
     { label: "JetBrains Mono", value: '"JetBrains Mono"' },
+    { label: "Menlo", value: "Menlo" },
+    { label: "Monaco", value: "Monaco" },
     { label: "SF Mono", value: '"SF Mono"' },
+    { label: "Courier New", value: '"Courier New"' },
     { label: "Consolas", value: "Consolas" },
+    { label: "Cascadia Code", value: '"Cascadia Code"' },
+    { label: "Fira Code", value: '"Fira Code"' },
+    { label: "Source Code Pro", value: '"Source Code Pro"' },
+    { label: "Hack", value: "Hack" },
+    { label: "Inconsolata", value: "Inconsolata" },
     { label: "DejaVu Sans Mono", value: '"DejaVu Sans Mono"' },
+    { label: "Ubuntu Mono", value: '"Ubuntu Mono"' },
+    { label: "Liberation Mono", value: '"Liberation Mono"' },
   ];
   var FONT_CUSTOM_VALUE = "__custom__";
 
@@ -67,6 +83,12 @@
   var closing = false; // clean exit in progress: suppress the crash dialog
   var savedSettings = null; // {font_family, font_size} from the bridge
   var currentFontFamily = null; // primary family (null = default FONT_STACK)
+  /* Families the OS reports as installed (bridge get_available_fonts).
+   * null = unknown (browser mode or probe failure) → NO filtering, the
+   * full curated list is shown — fail-open, exactly the pre-filtering
+   * behavior. An empty array (probe worked, nothing matched) does
+   * filter: only Default and Custom… remain. */
+  var availableFonts = null;
 
   function api(name) {
     var bridge = window.pywebview && window.pywebview.api;
@@ -369,9 +391,35 @@
 
   /* ---------------- font settings dialog ---------------- */
 
+  /* FONT_CHOICES values carry CSS quoting ("SF Mono"); the availability
+   * list from the bridge holds bare family names. Matching is case-
+   * insensitive and prefix-tolerant ("Consolas" vs the registry's
+   * "Consolas Bold (TrueType)" → "Consolas Bold"). */
+  function unquoteFamily(value) {
+    return String(value || "").replace(/["']/g, "").trim();
+  }
+
+  function fontIsAvailable(value) {
+    if (availableFonts === null) return true; // unknown → fail open
+    var want = unquoteFamily(value).toLowerCase();
+    if (!want) return true; // Default (empty) — always offered
+    return availableFonts.some(function (name) {
+      var n = String(name).toLowerCase();
+      return n === want || n.indexOf(want + " ") === 0;
+    });
+  }
+
+  /* Only the <select> is filtered — the apply path (fontStackFor: chosen
+   * family first, FONT_STACK trailing) is untouched, so a family that is
+   * missing on THIS machine still works when the project moves to one
+   * where it exists. A saved font that is no longer offered falls into
+   * the Custom… branch below: shown selected, never silently reset. */
   function populateFontSelect(selected) {
     elSettingsFont.innerHTML = "";
-    FONT_CHOICES.forEach(function (choice) {
+    var choices = FONT_CHOICES.filter(function (choice) {
+      return fontIsAvailable(choice.value);
+    });
+    choices.forEach(function (choice) {
       var opt = document.createElement("option");
       opt.value = choice.value;
       opt.textContent = choice.label;
@@ -382,7 +430,7 @@
     custom.textContent = "Custom…";
     elSettingsFont.appendChild(custom);
 
-    var known = FONT_CHOICES.some(function (c) { return c.value === selected; });
+    var known = choices.some(function (c) { return c.value === selected; });
     if (known) {
       elSettingsFont.value = selected;
       elSettingsCustom.value = "";
@@ -580,6 +628,31 @@
     }
   }
 
+  /* One-shot availability probe for the font dialog, retried with the
+   * same 250 ms × 40 pattern as the other bridge calls (pywebview
+   * injects asynchronously). Failure or absence of the bridge leaves
+   * availableFonts null → the dialog shows the full curated list. A
+   * dialog opened before the probe lands is simply unfiltered — the
+   * next open is filtered. */
+  function fetchAvailableFonts() {
+    var getFonts = api("get_available_fonts");
+    if (!getFonts) return; // browser mode: nothing to filter by
+    function apply(list) {
+      if (Array.isArray(list)) availableFonts = list;
+    }
+    var attempts = 0;
+    var timer = setInterval(function () {
+      attempts += 1;
+      var retry = api("get_available_fonts");
+      if (retry) {
+        clearInterval(timer);
+        Promise.resolve(retry()).then(apply).catch(function () {});
+      } else if (attempts > 40) {
+        clearInterval(timer); // probe never arrives: stay unfiltered
+      }
+    }, 250);
+  }
+
   /* ---------------- welcome screen ---------------- */
 
   function renderRecents(recents) {
@@ -606,6 +679,7 @@
 
   function boot() {
     wireUi();
+    fetchAvailableFonts();
 
     /* The bridge injects asynchronously, so settings load with the same
      * retry pattern as recents — and the Terminal constructor (which

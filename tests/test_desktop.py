@@ -23,6 +23,7 @@ DESKTOP_DIR = Path(__file__).resolve().parent.parent / "desktop"
 if str(DESKTOP_DIR) not in sys.path:
     sys.path.insert(0, str(DESKTOP_DIR))
 
+import fonts  # type: ignore[import-not-found]
 import projects  # type: ignore[import-not-found]
 from pty_session import (  # type: ignore[import-not-found]
     PtySession,
@@ -213,6 +214,96 @@ def test_font_settings_survive_recents_write_and_vice_versa(config_dir: Path) ->
     projects.save_font_settings("Consolas", 9)
     recents = projects.load_recents()
     assert [r["project"] for r in recents] == ["/tmp/alpha"]
+
+
+# ---------------------------------------------------------------------------
+# fonts.py — system font enumeration for the font dialog
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fonts_fresh():
+    """Isolate the module-level font cache between tests."""
+    fonts.refresh_cache()
+    yield fonts
+    fonts.refresh_cache()
+
+
+def test_linux_font_list_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fc-list output: one font per line, family aliases comma-separated."""
+
+    class FakeProc:
+        returncode = 0
+        stdout = b"Fira Code\nUbuntu Mono,Ubuntu Sans Mono\nLiberation Mono\n"
+
+    monkeypatch.setattr(fonts.subprocess, "run", lambda *a, **kw: FakeProc())
+    names = fonts._linux_family_names()
+    assert names is not None
+    for family in ("Fira Code", "Ubuntu Mono", "Ubuntu Sans Mono", "Liberation Mono"):
+        assert family in names
+
+
+def test_linux_missing_fc_list_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("fc-list")
+
+    monkeypatch.setattr(fonts.subprocess, "run", fake_run)
+    assert fonts._linux_family_names() is None
+
+
+def test_available_fonts_fail_open_on_probe_error(
+    monkeypatch: pytest.MonkeyPatch, fonts_fresh
+) -> None:
+    """A broken platform probe must yield None (unknown), never an empty
+    set — the JS side treats unknown as 'no filtering' (fail-open)."""
+    monkeypatch.setattr(fonts.sys, "platform", "linux")
+
+    def boom() -> list[str]:
+        raise RuntimeError("no fonts for you")
+
+    monkeypatch.setattr(fonts, "_linux_family_names", boom)
+    assert fonts.available_font_families() is None
+    # The failed probe is cached too: no re-running on every dialog open.
+    calls: list[int] = []
+    monkeypatch.setattr(fonts, "_linux_family_names", lambda: calls.append(1) or ["X"])
+    assert fonts.available_font_families() is None
+    assert calls == []
+
+
+def test_available_fonts_success_is_cached(
+    monkeypatch: pytest.MonkeyPatch, fonts_fresh
+) -> None:
+    monkeypatch.setattr(fonts.sys, "platform", "linux")
+    calls: list[int] = []
+
+    def probe() -> list[str]:
+        calls.append(1)
+        return ["Menlo", "Menlo ", ""]  # blanks/empties are stripped
+
+    monkeypatch.setattr(fonts, "_linux_family_names", probe)
+    assert fonts.available_font_families() == frozenset({"Menlo"})
+    assert fonts.available_font_families() == frozenset({"Menlo"})
+    assert calls == [1]  # computed once per process
+
+
+def test_desktop_api_available_fonts_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DesktopApi.get_available_fonts sorts the set and passes 'unknown'
+    (None) through untouched. Needs the desktop dependency group."""
+    try:
+        import app as app_mod  # type: ignore[import-not-found]
+        import webview  # noqa: F401
+    except Exception:  # noqa: BLE001 - webview missing / no GUI libs
+        pytest.skip("pywebview desktop group not installed")
+
+    api = app_mod.DesktopApi({}, None, Path("/dev/null"))
+    monkeypatch.setattr(
+        app_mod.fonts_mod, "available_font_families", lambda: frozenset({"B", "A"})
+    )
+    assert api.get_available_fonts() == ["A", "B"]
+    monkeypatch.setattr(app_mod.fonts_mod, "available_font_families", lambda: None)
+    assert api.get_available_fonts() is None
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +613,66 @@ def test_term_js_hotkey_font_size_persists() -> None:
     assert "savedSettings" in apply_size
 
 
+def test_term_js_font_list_curated_and_filtered() -> None:
+    """The font dialog offers a wide curated set (so filtering still
+    leaves real choices on any platform) and hides the families the OS
+    probe reports as absent. The apply path (fontStackFor) is NOT
+    touched — filtering is a <select>-only concern."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    choices = js[js.index("var FONT_CHOICES") : js.index("var FONT_CUSTOM_VALUE")]
+    for family in (
+        "Menlo",
+        "Monaco",
+        "SF Mono",
+        "Courier New",
+        "Consolas",
+        "Cascadia Code",
+        "Fira Code",
+        "Source Code Pro",
+        "DejaVu Sans Mono",
+        "Ubuntu Mono",
+    ):
+        assert family in choices
+
+    # Availability probe at boot: same retry pattern as the other bridge
+    # calls, absent bridge / failure → availableFonts stays null.
+    assert "availableFonts = null;" in js
+    assert 'api("get_available_fonts")' in js
+    boot = js[js.index("function boot") :]
+    assert "fetchAvailableFonts();" in boot
+
+    # Matching is fail-open (null → true) and Default (empty) is always
+    # offered regardless of the probe result.
+    matcher = js[js.index("function fontIsAvailable") :]
+    assert "if (availableFonts === null) return true;" in matcher
+    assert "if (!want) return true;" in matcher
+
+    populate = js[js.index("function populateFontSelect") :]
+    assert "fontIsAvailable(choice.value)" in populate
+    # Custom… is appended unconditionally — the only way to enter a rare
+    # family the curated list (or the probe) does not know.
+    assert 'custom.textContent = "Custom…"' in populate
+    # The "known" check runs against the FILTERED list: a saved font that
+    # is no longer offered falls into the Custom… branch (shown selected,
+    # never reset) instead of silently losing the selection.
+    assert "var known = choices.some(" in populate
+    # Apply path unchanged: chosen family first, bundled stack trailing.
+    assert 'return primary ? primary + ", " + FONT_STACK : FONT_STACK;' in js
+
+
+def test_app_py_exposes_available_fonts_bridge() -> None:
+    """The bridge method must exist and delegate to the fonts module —
+    app.py is not importable without the desktop group, so this stays a
+    source-level check (the behavioral test skips without webview)."""
+    src = (DESKTOP_DIR / "app.py").read_text(encoding="utf-8")
+    assert "def get_available_fonts(self)" in src
+    assert "fonts_mod.available_font_families()" in src
+    # The bridge returns None (unknown) rather than an empty list on a
+    # failed probe — the JS side fail-opens only on None.
+    assert "return sorted(fonts) if fonts is not None else None" in src
+
+
 def test_index_html_has_settings_dialog() -> None:
     html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
     for el_id in (
@@ -559,8 +710,9 @@ def test_index_html_has_floating_font_button() -> None:
     assert "position: absolute;" in btn
     assert "z-index" in btn
     overlay = css[css.index(".overlay {") : css.index(".dialog {")]
-    assert btn[btn.index("z-index: 15") + len("z-index: ") :].split(";")[0] < (
-        overlay[overlay.index("z-index: ") + len("z-index: ") :].split(";")[0]
+    assert (
+        btn[btn.index("z-index: 15") + len("z-index: ") :].split(";")[0]
+        < (overlay[overlay.index("z-index: ") + len("z-index: ") :].split(";")[0])
     ), "dialogs must cover the floating button"
 
 
@@ -571,23 +723,25 @@ def test_term_js_floating_font_button_wiring() -> None:
     js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
     assert 'document.getElementById("font-settings-btn")' in js
 
-    wiring = js[
-        js.index("if (elFontBtn) {") : js.index("if (elSettingsFont) {")
-    ]
+    wiring = js[js.index("if (elFontBtn) {") : js.index("if (elSettingsFont) {")]
     # Clicking never moves focus out of the terminal (mousedown default is
     # the focus change; the click still fires and opens the dialog).
     assert wiring.index('addEventListener("mousedown"') < wiring.index(
         'addEventListener("click", openSettings)'
     )
-    assert 'ev.preventDefault();' in wiring
+    assert "ev.preventDefault();" in wiring
 
     # Session-only visibility: revealed in the "started" event handler.
-    started = js[js.index('event.event === "started"') : js.index('event.event === "exited"')]
+    started = js[
+        js.index('event.event === "started"') : js.index('event.event === "exited"')
+    ]
     assert 'elFontBtn.classList.remove("hidden")' in started
 
     # Handing focus back to the terminal when the dialog closes — opened
     # from any of the three entry points (hotkey / welcome / button).
-    close = js[js.index("function closeSettings") : js.index("function showSettingsError")]
+    close = js[
+        js.index("function closeSettings") : js.index("function showSettingsError")
+    ]
     assert "if (started && term) term.focus();" in close
 
 
@@ -614,7 +768,6 @@ def test_term_js_font_preview_wiring() -> None:
     # size input all reach updateFontPreview.
     for fn in ("function openSettings", "function wireUi"):
         assert "updateFontPreview()" in js[js.index(fn) :]
-
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

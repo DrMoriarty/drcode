@@ -24,10 +24,12 @@ import threading
 from pathlib import Path
 
 try:  # package import (tests) or script import (PyInstaller / dev run)
+    from . import fonts as fonts_mod
     from . import projects as projects_mod
     from .pty_session import resolve_payload
     from .server import ShellContext, run_server
 except ImportError:  # pragma: no cover - script/frozen entry
+    import fonts as fonts_mod  # type: ignore[no-redef]
     import projects as projects_mod  # type: ignore[no-redef]
     from pty_session import resolve_payload  # type: ignore[no-redef]
     from server import ShellContext, run_server  # type: ignore[no-redef]
@@ -138,6 +140,18 @@ class DesktopApi:
     def set_font_settings(self, font_family: str | None, font_size: object) -> dict:
         """Validate (size clamped to 6–40), persist and confirm."""
         return projects_mod.save_font_settings(font_family, font_size)
+
+    def get_available_fonts(self) -> list[str] | None:
+        """Font families the OS/webview can actually render, sorted.
+
+        ``None`` means "unknown" (the platform probe failed) — the JS
+        side then shows the full curated list instead of filtering
+        (fail-open). Cached per process: enumerating is cheap but not
+        free (fc-list subprocess / CoreText walk), and the set does not
+        change during a session.
+        """
+        fonts = fonts_mod.available_font_families()
+        return sorted(fonts) if fonts is not None else None
 
     def open_recent(self, project: str) -> str | None:
         """Record-free convenience for the welcome screen (kept for parity)."""

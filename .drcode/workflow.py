@@ -74,7 +74,12 @@ def _git(*args, cwd=None):
     """Shared helper: run git, return (returncode, combined output).
     Never raises."""
     proc = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -189,6 +194,9 @@ def on_tester_passed(task):
     Research tasks never trigger it (they skip testing). Return
     {"text": "..."} for the task's service-event log."""
     proc = subprocess.run(
-        ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
+        ["uv", "tool", "install", ".", "--force"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return {"text": proc.stdout or proc.stderr}

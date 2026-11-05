@@ -686,6 +686,50 @@ def test_notifier_requeue_from_testing_voiced() -> None:
     assert "возвращена в разработку" in speaker.phrases[0]
 
 
+def test_notifier_clarification_voiced() -> None:
+    from drcode.models import TaskStatus
+
+    settings = _voice_settings(voice_tts_clarification=True)
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    task = _task(TaskStatus.AWAITING_CLARIFICATION)
+    notifier.task_status(task, TaskStatus.ACTIVE, TaskStatus.AWAITING_CLARIFICATION)
+    assert len(speaker.phrases) == 1
+    assert "Починить кнопку" in speaker.phrases[0]
+    assert "уточнения" in speaker.phrases[0]
+
+
+def test_notifier_clarification_checkbox_off_or_no_speaker_silent() -> None:
+    from drcode.models import TaskStatus
+
+    task = _task(TaskStatus.AWAITING_CLARIFICATION)
+    # Checkbox off (speaker present) → silence.
+    settings = _voice_settings()
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    notifier.task_status(task, TaskStatus.ACTIVE, TaskStatus.AWAITING_CLARIFICATION)
+    assert speaker.phrases == []
+    # Checkbox on, but no speaker at all → silence (no raise).
+    settings_on = _voice_settings(voice_tts_clarification=True)
+    notifier_no_speaker = _notifier(settings_on, None)
+    notifier_no_speaker.task_status(
+        task, TaskStatus.ACTIVE, TaskStatus.AWAITING_CLARIFICATION
+    )
+
+
+def test_notifier_clarification_user_origin_silent() -> None:
+    from drcode.models import TaskStatus
+
+    settings = _voice_settings(voice_tts_clarification=True)
+    speaker = _SpeakerStub()
+    notifier = _notifier(settings, speaker)
+    task = _task(TaskStatus.AWAITING_CLARIFICATION)
+    notifier.task_status(
+        task, TaskStatus.ACTIVE, TaskStatus.AWAITING_CLARIFICATION, origin="user"
+    )
+    assert speaker.phrases == []
+
+
 def test_notifier_user_origin_silent() -> None:
     from drcode.models import TaskStatus
 
@@ -788,6 +832,7 @@ def test_notifier_english_phrases_when_language_en() -> None:
         voice_tts_completed=True,
         voice_tts_tester_failed=True,
         voice_tts_queue_empty=True,
+        voice_tts_clarification=True,
     )
     speaker = _SpeakerStub()
     notifier = _notifier(settings, speaker)
@@ -802,6 +847,9 @@ def test_notifier_english_phrases_when_language_en() -> None:
     assert speaker.phrases[-1] == "Bug report created: Починить кнопку"
     notifier.pipeline_idle(blocked=False, detail="")
     assert speaker.phrases[-1] == "Queue is empty — all tasks processed"
+    clar = _task(TaskStatus.AWAITING_CLARIFICATION)
+    notifier.task_status(clar, TaskStatus.ACTIVE, TaskStatus.AWAITING_CLARIFICATION)
+    assert speaker.phrases[-1] == 'Task "Починить кнопку" needs clarification'
 
 
 def test_notifier_empty_language_defaults_to_terminal(
@@ -1175,6 +1223,7 @@ async def test_voice_settings_dialog_saves(project_root: Any) -> None:
         dialog.query_one("#voice-asr", Input).value = "x5-asr/x5-asr-large"
         dialog.query_one("#voice-tts-model", Input).value = "x5-tts/tts-1"
         dialog.query_one("#voice-tts-completed", Switch).value = True
+        dialog.query_one("#voice-tts-clarification", Switch).value = True
         dialog.query_one("#voice-save", Button).press()
         await pilot.pause()
         assert app.settings.voice_asr_model == "x5-asr/x5-asr-large"
@@ -1182,6 +1231,7 @@ async def test_voice_settings_dialog_saves(project_root: Any) -> None:
         stored = ProjectSettingsStore(project_root).load()
         assert stored.voice_asr_model == "x5-asr/x5-asr-large"
         assert stored.voice_tts_completed is True
+        assert stored.voice_tts_clarification is True
         assert stored.voice_tts_tester_failed is False
 
 

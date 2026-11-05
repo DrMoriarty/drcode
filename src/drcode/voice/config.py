@@ -90,6 +90,7 @@ VOICE_PHRASES: dict[str, dict[str, str]] = {
             "Тестирование провалено — задача «{title}» возвращена в разработку"
         ),
         "queue_empty": "Очередь пуста — все задачи обработаны",
+        "clarification": "Задача «{title}» ожидает уточнения",
     },
     VOICE_LANGUAGE_EN: {
         "bug_report": "Bug report created: {title}",
@@ -100,6 +101,7 @@ VOICE_PHRASES: dict[str, dict[str, str]] = {
         "completed_failed": 'Task "{title}" completed with an error',
         "requeued": 'Testing failed — task "{title}" returned to development',
         "queue_empty": "Queue is empty — all tasks processed",
+        "clarification": 'Task "{title}" needs clarification',
     },
 }
 

@@ -11,8 +11,8 @@ Opened from the Settings palette ("Voice…"). The form collects:
 - the TTS model id + speaker voice,
 - the announcement language (Russian/English; the dialog preselects the
   stored value, or the terminal locale's language when nothing is stored),
-- three checkboxes: which events to voice-announce (task completed,
-  tester failure, empty queue).
+- four checkboxes: which events to voice-announce (task completed,
+  tester failure, needs clarification, empty queue).
 
 "Check" probes ``GET /models`` in a worker thread; when it succeeds and a
 TTS model is set, the confirmation phrase (from
@@ -85,6 +85,7 @@ class VoiceSetup:
     tts_completed: bool
     tts_tester_failed: bool
     tts_queue_empty: bool
+    tts_clarification: bool
     language: str
 
 
@@ -173,6 +174,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         tts_completed: bool = False,
         tts_tester_failed: bool = False,
         tts_queue_empty: bool = False,
+        tts_clarification: bool = False,
         language: str = "",
     ) -> None:
         super().__init__()
@@ -195,6 +197,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             "completed": tts_completed,
             "tester_failed": tts_tester_failed,
             "queue_empty": tts_queue_empty,
+            "clarification": tts_clarification,
         }
         self._checking = False
 
@@ -269,6 +272,12 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
                     id="voice-tts-queue-empty",
                 )
                 yield Static("queue empty", classes="voice-label")
+            with Horizontal(classes="voice-row"):
+                yield Switch(
+                    value=self._initial_tts["clarification"],
+                    id="voice-tts-clarification",
+                )
+                yield Static("needs clarification", classes="voice-label")
             with Vertical(id="voice-footer"):
                 with Horizontal(id="voice-buttons"):
                     yield Button("Check", variant="default", id="voice-check")
@@ -306,6 +315,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             tts_completed=self.query_one("#voice-tts-completed", Switch).value,
             tts_tester_failed=self.query_one("#voice-tts-tester-failed", Switch).value,
             tts_queue_empty=self.query_one("#voice-tts-queue-empty", Switch).value,
+            tts_clarification=self.query_one("#voice-tts-clarification", Switch).value,
             language=str(self.query_one("#voice-lang", Select).value),
         )
 

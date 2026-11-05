@@ -512,6 +512,11 @@ class Notifier:
                 self._settings_getter().voice_tts_tester_failed,
                 self._phrase("requeued", title=task.title),
             )
+        elif new.value == "clarification":
+            self._speak(
+                self._settings_getter().voice_tts_clarification,
+                self._phrase("clarification", title=task.title),
+            )
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
         # Текст уведомления: "задача <status>" / "#{id} «{title}» — <описание статуса>".

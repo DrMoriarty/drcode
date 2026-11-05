@@ -360,6 +360,19 @@ class ActivityLayer(DrCodeState):
                 self._current_tool[task.id] = None
                 self._clear_stream_label()
                 self.refresh_status()
+            if not task.unfinished:
+                # Mark the interrupted attempt HERE, not only in the run's
+                # CancelledError handler: the worker may be cancelled
+                # before its first step (a just-dispatched run under load)
+                # or inside its setup window (worktree git, the task-start
+                # hook) — the handler then never runs, the marker is lost,
+                # and the restarted run finds no resume marker (the
+                # epilogue may even auto-complete the task with zero work).
+                # Idempotent with the handler's own marking. (Same
+                # mitigation as the ESC stop, action_abort_run.)
+                task.unfinished = True
+                task.touch()
+                self.manager.storage.save(task)
             self._schedule_pipeline_timer(
                 self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
             )

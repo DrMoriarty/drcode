@@ -545,8 +545,28 @@ class PipelineAgentRunLayer(CoreState):
                 task.unfinished = False
                 self.manager.storage.save(task)
                 return None
-            task.unfinished = False
-            self.manager.storage.save(task)
+            # The unfinished flag stays ON through the continuation turn:
+            # clearing it here (before the model request even went out)
+            # lost the resume marker when the run was cancelled in that
+            # window — a superseded run's _agent_turn_cancelled skips the
+            # restore via its generation guard, and the epilogue then
+            # auto-completed the task with zero work (incident 88dd4aad:
+            # Ctrl-R during an outage wait raced the outage probe's own
+            # restart). The flag is cleared at the SAFE moment — the turn
+            # boundary after the response lands (the
+            # `not ends_with_open_request` branch above), while the
+            # cancel / network-error / failure handlers all (re)set it.
+            # The unfinished flag stays ON through the continuation turn:
+            # clearing it here (before the model request even went out)
+            # lost the resume marker when the run was cancelled in that
+            # window — a superseded run's _agent_turn_cancelled skips the
+            # restore via its generation guard, and the epilogue then
+            # auto-completed the task with zero work (incident 88dd4aad:
+            # Ctrl-R during an outage wait raced the outage probe's own
+            # restart). The flag is cleared at the SAFE moment — the turn
+            # boundary after the response lands (the
+            # `not ends_with_open_request` branch above), while the
+            # cancel / network-error / failure handlers all (re)set it.
             return None, [], workflow_instructions
         return None
 

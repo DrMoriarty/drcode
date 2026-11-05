@@ -2120,8 +2120,11 @@ async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
     project_root: Path,
 ) -> None:
     """A failing summarizer must not turn the mid-run gate into a
-    break→continuation loop: after one failure the run continues
-    uncompressed (turn-boundary compaction still retries next turn)."""
+    break→continuation loop: after one failure the mid-run pause stays
+    silent and the run continues uncompressed — only the turn-boundary
+    gate retries (once after the continuation turn, per the documented
+    "compaction still retries next turn" semantics), still failing, and
+    the task still finishes."""
     (project_root / "README.md").write_text("hello readme")
     task = net_app_small_ctx.manager.create("docs", "long task", kind=TaskKind.RESEARCH)
     scripted_fills([100, 900, 950])
@@ -2129,10 +2132,14 @@ async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
         tool_response("read_file", {"path": "README.md"}, "c1"),
         tool_response("read_file", {"path": "README.md"}, "c2"),
         api_error("Connection error."),  # compaction summarizer dies
-        # The continuation runs past the threshold again — the gate must
-        # stay silent now, or the task would never finish.
+        # The continuation runs past the threshold again — the MID-RUN
+        # gate must stay silent now (`_compaction_failed`), or the task
+        # would never finish.
         tool_response("read_file", {"path": "README.md"}, "c3"),
         text_response("carried on"),
+        # The turn-boundary gate retries once after the continuation turn
+        # ends over the threshold — and fails again, non-fatally.
+        api_error("Connection error."),
     ]
 
     async with net_app_small_ctx.run_test() as pilot:
@@ -2147,12 +2154,14 @@ async def test_mid_run_compaction_skipped_when_summarizer_keeps_failing(
         )
 
     texts = event_texts(task)
-    assert len([t for t in texts if t.startswith("compaction failed")]) == 1
+    # Two threshold-level attempts (pre-continuation boundary + the retry
+    # after the continuation turn), both failing, neither fatal.
+    assert len([t for t in texts if t.startswith("compaction failed")]) == 2
     assert len([t for t in texts if "pausing the run" in t]) == 1
     assert not any("Context compacted" in t for t in texts)
     # Uncompressed history carried the run to the end.
     assert not any(is_summary_message(m) for m in task.messages)
-    assert len(scripted.calls) == 5
+    assert len(scripted.calls) == 6
     assert not task.unfinished
 
 

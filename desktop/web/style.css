@@ -113,6 +113,22 @@ html, body {
 .settings-input:focus { outline: none; border-color: var(--accent); }
 .settings-input.hidden { display: none; }
 
+/* Live font preview: styled inline from term.js with the same
+ * fontStackFor()/size chain the terminal renderer gets — the terminal
+ * background here mirrors the theme in term.js. white-space:pre keeps
+ * the two sample lines (ASCII + box-drawing glyphs) aligned. */
+.settings-preview {
+  margin-top: 0;
+  background: #16181d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: var(--fg);
+  overflow: hidden;
+  white-space: pre;
+  line-height: 1.4;
+}
+
 .recents { margin-top: 22px; }
 .recents-title {
   color: var(--muted);

@@ -529,11 +529,42 @@ def test_index_html_has_settings_dialog() -> None:
         "settings-font-family",
         "settings-font-custom",
         "settings-font-size",
+        "settings-font-preview",
         "btn-settings-save",
         "btn-settings-cancel",
         "open-settings",
     ):
         assert f'id="{el_id}"' in html
+    # The preview shows the glyphs the TUI actually draws: ASCII plus
+    # box-drawing characters.
+    assert "settings-preview" in html
+    assert "┌" in html
+
+
+def test_term_js_font_preview_wiring() -> None:
+    """The settings dialog's preview block must mirror the real terminal:
+    the same fontStackFor() chain (chosen family first, bundled FONT_STACK
+    trailing), the same size clamp, and live updates on every input the
+    user can change (select, custom field, size)."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    assert 'document.getElementById("settings-font-preview")' in js
+
+    # The preview update uses the terminal's own family chain, not a
+    # ad-hoc stack — otherwise it could diverge from the real rendering.
+    update = js[js.index("function updateFontPreview") :]
+    assert "fontStackFor(dialogFamily())" in update
+    assert "MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE" in update
+
+    # Custom… is resolved from the free-text field.
+    dialog_family = js[js.index("function dialogFamily") :]
+    assert "FONT_CUSTOM_VALUE" in dialog_family
+    assert "elSettingsCustom.value.trim()" in dialog_family
+
+    # Live updates: open (initial state) + select change + custom input +
+    # size input all reach updateFontPreview.
+    for fn in ("function openSettings", "function wireUi"):
+        assert "updateFontPreview()" in js[js.index(fn) :]
+
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

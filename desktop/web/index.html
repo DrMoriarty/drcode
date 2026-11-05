@@ -76,6 +76,14 @@
         </label>
         <input id="settings-font-size" class="settings-input" type="number"
                min="6" max="40" step="1" value="13">
+        <label class="settings-label">Preview</label>
+        <!-- Live font preview: term.js styles this node with the same
+             fontStackFor()/size chain the real terminal gets, so what you
+             see here is what the TUI will draw (unknown families degrade
+             to the bundled Nerd font exactly like in the terminal). -->
+        <div id="settings-font-preview" class="settings-preview" aria-hidden="true">$ drcode ✓ ✗ ▸ ⋯ → ● │ 128 tests ✓ 2.4s
+┌─ tasks ─────────┐  ✓ done   ✗ failed   ▸ running
+</div>
         <div id="settings-error" class="welcome-error hidden"></div>
       </div>
       <div class="dialog-actions">

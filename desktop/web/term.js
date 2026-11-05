@@ -32,6 +32,7 @@
   var elSettingsSize = document.getElementById("settings-font-size");
   var elSettingsSizeValue = document.getElementById("settings-size-value");
   var elSettingsError = document.getElementById("settings-error");
+  var elSettingsPreview = document.getElementById("settings-font-preview");
   var elOpenSettings = document.getElementById("open-settings");
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
@@ -396,6 +397,27 @@
     elSettingsSizeValue.textContent = elSettingsSize.value || String(DEFAULT_FONT_SIZE);
   }
 
+  /* The dialog preview must show the font EXACTLY as the terminal will
+   * draw it: the same fontStackFor() chain (chosen family first, bundled
+   * FONT_STACK trailing — unknown names degrade to the bundled Nerd font,
+   * which the @font-face in style.css provides to this page too) and the
+   * same 6–40 clamp. The preview is especially useful on the welcome
+   * screen, where the terminal itself is hidden. */
+  function dialogFamily() {
+    return elSettingsFont.value === FONT_CUSTOM_VALUE
+      ? elSettingsCustom.value.trim()
+      : elSettingsFont.value;
+  }
+
+  function updateFontPreview() {
+    if (!elSettingsPreview) return;
+    var size = parseInt(elSettingsSize.value, 10);
+    if (isNaN(size)) size = DEFAULT_FONT_SIZE;
+    size = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
+    elSettingsPreview.style.fontFamily = fontStackFor(dialogFamily());
+    elSettingsPreview.style.fontSize = size + "px";
+  }
+
   function openSettings() {
     if (!elSettingsDialog) return;
     populateFontSelect(currentFontFamily);
@@ -406,6 +428,7 @@
           : DEFAULT_FONT_SIZE);
     elSettingsSize.value = String(size);
     syncSizeLabel();
+    updateFontPreview();
     elSettingsError.classList.add("hidden");
     elSettingsDialog.classList.remove("hidden");
     elSettingsFont.focus();
@@ -664,10 +687,18 @@
         var custom = elSettingsFont.value === FONT_CUSTOM_VALUE;
         elSettingsCustom.classList.toggle("hidden", !custom);
         if (custom) elSettingsCustom.focus();
+        updateFontPreview();
       });
     }
+    if (elSettingsCustom) {
+      // "Custom…": the preview tracks the family as it is typed.
+      elSettingsCustom.addEventListener("input", updateFontPreview);
+    }
     if (elSettingsSize) {
-      elSettingsSize.addEventListener("input", syncSizeLabel);
+      elSettingsSize.addEventListener("input", function () {
+        syncSizeLabel();
+        updateFontPreview();
+      });
     }
     var btnSave = document.getElementById("btn-settings-save");
     var btnCancel = document.getElementById("btn-settings-cancel");

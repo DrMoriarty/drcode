@@ -34,6 +34,7 @@
   var elSettingsError = document.getElementById("settings-error");
   var elSettingsPreview = document.getElementById("settings-font-preview");
   var elOpenSettings = document.getElementById("open-settings");
+  var elFontBtn = document.getElementById("font-settings-btn");
 
   var FONT_STACK = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", Menlo, monospace';
 
@@ -436,6 +437,11 @@
 
   function closeSettings() {
     if (elSettingsDialog) elSettingsDialog.classList.add("hidden");
+    // The dialog (opened from the hotkey, the welcome button or the
+    // floating button) moved focus to its first field — hand it back to
+    // the terminal so hotkeys and typing keep working without a click.
+    // On the welcome screen there is no session to refocus.
+    if (started && term) term.focus();
   }
 
   function showSettingsError(message) {
@@ -517,6 +523,9 @@
       currentProject = event.project || currentProject;
       elWelcome.classList.add("hidden");
       elTerminal.classList.remove("hidden");
+      // Session-only entry point into the font dialog (the welcome
+      // screen's own button and its Ctrl+, hint are gone now).
+      if (elFontBtn) elFontBtn.classList.remove("hidden");
       hideDialog();
       if (fit) {
         try { fit.fit(); } catch (err) { /* noop */ }
@@ -677,10 +686,22 @@
       else window.close();
     });
 
-    // Settings dialog wiring (open from the welcome button; Ctrl+, is
-    // intercepted in terminalKeyHandler when the terminal has focus).
+    // Settings dialog wiring (open from the welcome button, the floating
+    // session button or the Ctrl+, hotkey — intercepted in
+    // terminalKeyHandler when the terminal has focus and in the window
+    // keydown listener otherwise).
     if (elOpenSettings) {
       elOpenSettings.addEventListener("click", openSettings);
+    }
+    if (elFontBtn) {
+      // Suppress mousedown's default (moving focus out of the terminal):
+      // the click still fires and opens the dialog, but keys the user is
+      // already typing are not stolen mid-word. The button itself needs
+      // no keyboard focus — Ctrl+, reaches openSettings from anywhere.
+      elFontBtn.addEventListener("mousedown", function (ev) {
+        ev.preventDefault();
+      });
+      elFontBtn.addEventListener("click", openSettings);
     }
     if (elSettingsFont) {
       elSettingsFont.addEventListener("change", function () {

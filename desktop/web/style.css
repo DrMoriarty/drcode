@@ -178,6 +178,30 @@ kbd {
   padding: 4px 6px;
 }
 
+/* Floating font-settings entry point: overlaid on the live terminal in a
+ * corner. Absolute positioning means it never changes the terminal's box
+ * (fit/ResizeObserver/PTY resize stay exact); z-index below .overlay (20)
+ * so dialogs cover it. Deliberately unpretentious — the hotkey remains
+ * the primary path, this is just the discoverable one. */
+.font-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 15;
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(38, 42, 50, 0.85);
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.6;
+  user-select: none;
+}
+.font-btn:hover { opacity: 1; color: var(--fg); background: #2d323b; }
+
 /* ---- dialogs ---- */
 
 .overlay {

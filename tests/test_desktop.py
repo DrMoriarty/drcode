@@ -541,6 +541,56 @@ def test_index_html_has_settings_dialog() -> None:
     assert "┌" in html
 
 
+def test_index_html_has_floating_font_button() -> None:
+    """After a project opens, the font dialog needs a VISIBLE entry point —
+    the welcome screen's button and its Ctrl+, hint disappear with it. A
+    small floating button overlays the terminal (initially hidden: the
+    welcome screen has its own entry point)."""
+    html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="font-settings-btn"' in html
+    assert "font-btn hidden" in html  # session-only: revealed on "started"
+    # It overlays the terminal, not the welcome card.
+    assert html.index('id="terminal"') < html.index('id="font-settings-btn"')
+
+    css = (DESKTOP_DIR / "web" / "style.css").read_text(encoding="utf-8")
+    btn = css[css.index(".font-btn {") : css.index(".font-btn:hover")]
+    # Absolute overlay: the terminal's box must not change when the button
+    # appears (fit/ResizeObserver-driven PTY resize stay exact).
+    assert "position: absolute;" in btn
+    assert "z-index" in btn
+    overlay = css[css.index(".overlay {") : css.index(".dialog {")]
+    assert btn[btn.index("z-index: 15") + len("z-index: ") :].split(";")[0] < (
+        overlay[overlay.index("z-index: ") + len("z-index: ") :].split(";")[0]
+    ), "dialogs must cover the floating button"
+
+
+def test_term_js_floating_font_button_wiring() -> None:
+    """The floating button opens the SAME openSettings() dialog, must not
+    steal keyboard focus from the terminal, and appears only while a
+    session is live."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    assert 'document.getElementById("font-settings-btn")' in js
+
+    wiring = js[
+        js.index("if (elFontBtn) {") : js.index("if (elSettingsFont) {")
+    ]
+    # Clicking never moves focus out of the terminal (mousedown default is
+    # the focus change; the click still fires and opens the dialog).
+    assert wiring.index('addEventListener("mousedown"') < wiring.index(
+        'addEventListener("click", openSettings)'
+    )
+    assert 'ev.preventDefault();' in wiring
+
+    # Session-only visibility: revealed in the "started" event handler.
+    started = js[js.index('event.event === "started"') : js.index('event.event === "exited"')]
+    assert 'elFontBtn.classList.remove("hidden")' in started
+
+    # Handing focus back to the terminal when the dialog closes — opened
+    # from any of the three entry points (hotkey / welcome / button).
+    close = js[js.index("function closeSettings") : js.index("function showSettingsError")]
+    assert "if (started && term) term.focus();" in close
+
+
 def test_term_js_font_preview_wiring() -> None:
     """The settings dialog's preview block must mirror the real terminal:
     the same fontStackFor() chain (chosen family first, bundled FONT_STACK

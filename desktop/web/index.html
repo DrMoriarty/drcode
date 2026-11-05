@@ -49,6 +49,14 @@
   <!-- Terminal fills the window once the session starts -->
   <div id="terminal" class="terminal hidden"></div>
 
+  <!-- Visible font-settings entry point for the live session (the welcome
+       screen has its own "Terminal font…" button and the Ctrl+, hint that
+       disappears with it). Sits ABOVE #terminal in the DOM but never
+       changes its box (absolute overlay), so xterm's fit and the
+       ResizeObserver-driven PTY resize are unaffected. -->
+  <button id="font-settings-btn" class="font-btn hidden" type="button"
+          title="Terminal font (⌘/Ctrl+,)" aria-label="Terminal font settings">Aa</button>
+
   <!-- Crash / exit dialog -->
   <div id="exit-dialog" class="overlay hidden">
     <div class="dialog">

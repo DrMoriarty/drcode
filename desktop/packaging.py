@@ -44,11 +44,16 @@ BUNDLE_ID = "com.drmoriarty.drcode-desktop"
 # them from PyInstaller output (pywebview loads the GTK/WebKit stack
 # dynamically through PyGObject). Everything each seed links against is
 # copied recursively; glibc & friends are whitelisted out.
-LIB_SEEDS = [
-    "libwebkit2gtk-4.1.so.0",
-    "libwebkit2gtk-4.0.so.0",
+# Each entry is either a single required library name or a list of
+# mutually-exclusive alternatives of the same API (WebKitGTK 4.0 vs 4.1 —
+# a distro ships exactly one of the two; e.g. libwebkit2gtk-4.0-dev was
+# removed from Ubuntu starting 23.04). At least ONE member of every
+# entry must be present; on a 4.0-only system the ldd closure pulls
+# libsoup-2.4 in automatically.
+LIB_SEED_GROUPS: list[str | list[str]] = [
+    ["libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.0.so.0"],
     "libgtk-3.so.0",
-    "libjavascriptcoregtk-4.1.so.0",
+    ["libjavascriptcoregtk-4.1.so.0", "libjavascriptcoregtk-4.0.so.0"],
     "libsoup-3.0.so.0",
     "libgirepository-1.0.so.1",
 ]
@@ -358,21 +363,31 @@ def copy_typelibs(lib_dir: Path) -> Path:
     )
 
 
+SEED_SEARCH_DIRS = [
+    Path("/usr/lib/x86_64-linux-gnu"),
+    Path("/usr/lib/aarch64-linux-gnu"),
+    Path("/usr/lib"),
+    Path("/usr/lib64"),
+]
+
+
 def find_seed_libs() -> list[Path]:
     found: list[Path] = []
-    search_dirs = [
-        Path("/usr/lib/x86_64-linux-gnu"),
-        Path("/usr/lib/aarch64-linux-gnu"),
-        Path("/usr/lib"),
-        Path("/usr/lib64"),
-    ]
-    for name in LIB_SEEDS:
-        for d in search_dirs:
-            candidate = d / name
-            if candidate.exists():
-                found.append(candidate)
+    missing: list[str] = []
+    for group in LIB_SEED_GROUPS:
+        names = [group] if isinstance(group, str) else group
+        group_found = False
+        for name in names:
+            for d in SEED_SEARCH_DIRS:
+                candidate = d / name
+                if candidate.exists():
+                    found.append(candidate)
+                    group_found = True
+                    break
+            if group_found:
                 break
-    missing = [name for name in LIB_SEEDS if not any(p.name == name for p in found)]
+        if not group_found:
+            missing.append("/".join(names))
     if missing:
         raise SystemExit(
             "WebKitGTK seed libs not found: "

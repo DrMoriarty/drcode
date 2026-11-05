@@ -82,6 +82,73 @@ def test_recents_drops_bad_entries(config_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# packaging.py — seed lib alternatives (WebKitGTK 4.0 vs 4.1)
+# ---------------------------------------------------------------------------
+
+
+def _load_packaging(monkeypatch: pytest.MonkeyPatch, lib_dir: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "drcode_desktop_packaging",
+        Path(__file__).resolve().parent.parent / "desktop" / "packaging.py",
+    )
+    assert spec is not None and spec.loader is not None
+    packaging = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packaging)
+    monkeypatch.setattr(packaging, "SEED_SEARCH_DIRS", [lib_dir])
+    return packaging
+
+
+def _make_seed_dir(tmp_path: Path, webkit: str, jsc: str) -> Path:
+    lib_dir = tmp_path / "libs"
+    lib_dir.mkdir()
+    for name in (
+        webkit,
+        jsc,
+        "libgtk-3.so.0",
+        "libsoup-3.0.so.0",
+        "libgirepository-1.0.so.1",
+    ):
+        (lib_dir / name).touch()
+    return lib_dir
+
+
+def test_seed_libs_accept_webkit41(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaging = _load_packaging(
+        monkeypatch,
+        _make_seed_dir(
+            tmp_path, "libwebkit2gtk-4.1.so.0", "libjavascriptcoregtk-4.1.so.0"
+        ),
+    )
+    names = {p.name for p in packaging.find_seed_libs()}
+    assert "libwebkit2gtk-4.1.so.0" in names
+
+
+def test_seed_libs_accept_webkit40(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaging = _load_packaging(
+        monkeypatch,
+        _make_seed_dir(
+            tmp_path, "libwebkit2gtk-4.0.so.0", "libjavascriptcoregtk-4.0.so.0"
+        ),
+    )
+    names = {p.name for p in packaging.find_seed_libs()}
+    assert "libwebkit2gtk-4.0.so.0" in names
+
+
+def test_seed_libs_missing_all_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packaging = _load_packaging(monkeypatch, tmp_path)  # empty dir
+    with pytest.raises(SystemExit, match="WebKitGTK seed libs not found"):
+        packaging.find_seed_libs()
+
+
+# ---------------------------------------------------------------------------
 # projects.py — font settings storage
 # ---------------------------------------------------------------------------
 
@@ -374,7 +441,7 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     CSI u sequences (which Textual's parser decodes back into
     shift+enter / ctrl+enter / alt+enter), leaving plain Enter untouched."""
     js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
-    handler = js[js.index("function encodeEnter"):]
+    handler = js[js.index("function encodeEnter") :]
 
     # Modified Enter is intercepted BEFORE the font-size shortcut gate and
     # before the ctrl-only filter that would otherwise let it through.
@@ -383,7 +450,7 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     assert enter_at < gate
 
     # Only while a live session exists (welcome screen has no PTY).
-    assert handler.index('ws.readyState !== WebSocket.OPEN') < gate
+    assert handler.index("ws.readyState !== WebSocket.OPEN") < gate
     # Plain Enter is never intercepted: no branch matches unmodified Enter.
     assert "ev.shiftKey || ev.ctrlKey || ev.altKey" in handler
     # The payload is the kitty CSI u encoding Textual understands.
@@ -403,7 +470,7 @@ def test_term_js_font_settings_wiring() -> None:
     # Settings load with the bridge retry pattern, and createTerminal
     # consumes them (constructor bakes the metrics into the renderer).
     assert 'api("get_settings")' in js
-    boot = js[js.index("function boot"):]
+    boot = js[js.index("function boot") :]
     # createTerminal must run only after settings resolve (not eagerly).
     assert "createTerminal(savedSettings)" in boot
     assert "fontFamily: fontStackFor(settings.font_family)" in js
@@ -411,8 +478,10 @@ def test_term_js_font_settings_wiring() -> None:
 
     # Family change reuses the WebGL-recreation/refit path — family swaps
     # change cell metrics exactly like size changes.
-    apply_family = js[js.index("function applyFontFamily"):]
-    apply_size = js[js.index("function applyFontSize"):js.index("function applyFontFamily")]
+    apply_family = js[js.index("function applyFontFamily") :]
+    apply_size = js[
+        js.index("function applyFontSize") : js.index("function applyFontFamily")
+    ]
     for fn in (apply_family, apply_size):
         assert "recreateWebgl()" in fn
         assert "refitAfterFontChange()" in fn
@@ -420,11 +489,11 @@ def test_term_js_font_settings_wiring() -> None:
 
     # Ctrl+, is intercepted inside the custom key handler AFTER the
     # ctrl-only gate — otherwise the combo reaches the PTY via onData.
-    handler = js[js.index("function terminalKeyHandler"):]
+    handler = js[js.index("function terminalKeyHandler") :]
     gate = handler.index("if (!ev.ctrlKey")
     comma = handler.index('ev.key === ","')
     assert gate < comma < handler.index("openSettings()")
-    assert 'ev.preventDefault();\n      openSettings();\n      return false;' in handler
+    assert "ev.preventDefault();\n      openSettings();\n      return false;" in handler
 
 
 def test_index_html_has_settings_dialog() -> None:

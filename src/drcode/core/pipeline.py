@@ -371,11 +371,17 @@ class PipelineCoreLayer(CoreState):
             # the app can be dismantled while that check runs.
             return False
         promoted_any = False
-        while len(self.manager.active_tasks()) < self.parallel_limit:
+        while (
+            len(self.manager.active_tasks()) - len(self._zombie_active_ids())
+            < self.parallel_limit
+        ):
             promoted = self.manager.promote_next(
                 exclude=self._agent_failed,
                 blocked=blocked,
-                max_active=self.parallel_limit,
+                # promote_next counts raw ACTIVE tasks against its cap;
+                # the zombie discount widens the cap accordingly (a
+                # zombie must not eat a slot — see _zombie_active_ids).
+                max_active=self.parallel_limit + len(self._zombie_active_ids()),
             )
             if promoted is None:
                 # Deadlock escape: the queue is not empty, but every
@@ -432,7 +438,10 @@ class PipelineCoreLayer(CoreState):
         rescue round is still within its backoff window — a timer
         re-enters _advance() when the window expires).
         """
-        if len(self.manager.active_tasks()) >= self.parallel_limit:
+        if (
+            len(self.manager.active_tasks()) - len(self._zombie_active_ids())
+            >= self.parallel_limit
+        ):
             return None
         if self._outage_active():
             # A network outage is in progress (some task sits in the
@@ -483,7 +492,8 @@ class PipelineCoreLayer(CoreState):
             )
         self.notifier.failed_tasks_requeued(len(rescued))
         return self.manager.promote_next(
-            blocked=blocked, max_active=self.parallel_limit
+            blocked=blocked,
+            max_active=self.parallel_limit + len(self._zombie_active_ids()),
         )
 
     def _notify_pipeline_settled(self) -> None:

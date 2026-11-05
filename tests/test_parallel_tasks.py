@@ -1020,3 +1020,137 @@ async def test_esc_parallel_two_arms_only_viewed_task(
         assert any("Run aborted by user (ESC)" in e for e in events)
         sibling_events = [e.text for e in app.manager.get(b.id).events]
         assert not any("Run aborted" in e for e in sibling_events)
+
+
+# -- zombie-ACTIVE recovery (incident #a2dc8424) ------------------------------------------
+#
+# A worker that exits without a trace leaves the task ACTIVE with no run:
+# promote_next never re-activates a non-queued task, so the task would sit
+# there forever — and through the raw active count block a development
+# slot. Covered: the slot accounting ignores zombies, the stall watchdog
+# sweeps them after the stall limit, and the run's own exit guard converts
+# a silent exit into an honest re-queue.
+
+
+def _to_active(app: DrCodeApp, task: Task, *, unfinished: bool = False) -> None:
+    task.status = TaskStatus.ACTIVE
+    task.unfinished = unfinished
+    app.manager.storage.save(task)
+
+
+async def test_zombie_active_does_not_block_slot(
+    configured_env: None, parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zombie-ACTIVE task (no live run, nothing legitimately paused) must
+    not eat a development slot: both queued tasks are promoted around it."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        zombie = app.manager.create("zombie", "work z")
+        b = app.manager.create("two", "work b")
+        c = app.manager.create("three", "work c")
+        _to_active(app, zombie)
+        dispatched: list[str] = []
+        monkeypatch.setattr(app, "run_agent", lambda tid: dispatched.append(tid))
+        app._advance()
+        await pilot.pause()
+        assert dispatched == [b.id, c.id], (
+            "both slots must be filled despite the zombie-ACTIVE task"
+        )
+        assert zombie.status is TaskStatus.ACTIVE  # untouched by dispatch
+
+
+async def test_watchdog_sweep_restarts_zombie_active(
+    configured_env: None, parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stall watchdog's zombie sweep: an ACTIVE task with no run is
+    nudged (restart scheduled + service event) after the stall limit; a
+    deliberately paused task (unfinished attempt) is left alone."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        zombie = app.manager.create("zombie", "work z")
+        paused = app.manager.create("paused", "work p")
+        _to_active(app, zombie)
+        _to_active(app, paused, unfinished=True)
+        now = time.monotonic()
+        app._last_activity[zombie.id] = now - 3600
+        app._last_activity[paused.id] = now - 3600
+        scheduled: list[Any] = []
+        monkeypatch.setattr(
+            app, "_schedule_pipeline_timer", lambda d, cb: scheduled.append(cb)
+        )
+        app._poll_stall()
+        events = [e.text for e in app.manager.get(zombie.id).events]
+        assert any("no run owns it" in e for e in events), (
+            "the zombie sweep must leave a service event"
+        )
+        assert len(scheduled) == 1, "exactly one restart for the zombie"
+        paused_events = [e.text for e in app.manager.get(paused.id).events]
+        assert not any("no run owns it" in e for e in paused_events), (
+            "a deliberately paused (unfinished) task is not a zombie"
+        )
+        assert paused.status is TaskStatus.ACTIVE
+
+
+async def test_watchdog_sweep_ignores_fresh_zombie_and_scheduled_retry(
+    configured_env: None, parallel_app: DrCodeApp
+) -> None:
+    """A zombie just sighted starts its stall clock (no immediate nudge);
+    a task with a scheduled network retry is a legitimate pause."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        fresh = app.manager.create("fresh", "work f")
+        retrying = app.manager.create("retrying", "work r")
+        _to_active(app, fresh)
+        _to_active(app, retrying)
+        app._agent_net_retry_at[retrying.id] = time.monotonic() + 60
+        app._poll_stall()
+        assert app.manager.get(fresh.id).status is TaskStatus.ACTIVE
+        assert app._last_activity[fresh.id] > 0  # clock started, no nudge yet
+        assert app.manager.get(retrying.id).status is TaskStatus.ACTIVE
+        assert not app._last_activity.get(retrying.id), (
+            "the retrying task is exempt, no stall clock started"
+        )
+
+
+async def test_guard_requeues_silent_exit(
+    configured_env: None,
+    parallel_app: DrCodeApp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run's exit guard: a worker that ends while its task is still
+    ACTIVE with nothing pausing it leaves the trace and re-queues the
+    task (excluded from automatic promotion like an ordinary failure);
+    deliberate pauses and tasks owned by a newer run are untouched."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        zombie = app.manager.create("zombie", "work z")
+        _to_active(app, zombie)
+        # The guard's tail _advance() would immediately rescue-rescue the
+        # re-queued task back into development (that is the intended
+        # auto-recovery); stub it out to assert the intermediate state.
+        monkeypatch.setattr(app, "_advance", lambda: None)
+        app._guard_zombie_exit(zombie, zombie.id)
+        saved = app.manager.get(zombie.id)
+        assert saved.status is TaskStatus.QUEUED
+        assert saved.unfinished  # the resume marker: promotion can pick it up
+        assert zombie.id in app._agent_failed
+        events = [e.text for e in saved.events]
+        assert any("re-queueing" in e for e in events)
+
+        # A deliberately paused task (unfinished attempt): untouched.
+        paused = app.manager.create("paused", "work p")
+        _to_active(app, paused, unfinished=True)
+        app._guard_zombie_exit(paused, paused.id)
+        assert paused.status is TaskStatus.ACTIVE
+
+        # A task a newer run owns: untouched.
+        owned = app.manager.create("owned", "work o")
+        _to_active(app, owned)
+        app._agent_runs[owned.id] = 7
+        app._guard_zombie_exit(owned, owned.id)
+        assert owned.status is TaskStatus.ACTIVE
+        assert owned.id not in app._agent_failed

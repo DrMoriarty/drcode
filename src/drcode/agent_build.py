@@ -32,6 +32,7 @@ from .agent_tools import (
     _deps_suffix,
     _git_push,
     _list_goals,
+    _mark_unneeded,
     _read_goal,
     _retry_failed_here,
     _run_project_check,
@@ -367,6 +368,16 @@ def build_agent(
             config.max_context_tokens,
             config.compaction_threshold,
         )
+
+    @agent.tool
+    async def mark_unneeded(ctx: RunContext[AgentDeps], path: str = "") -> str:
+        """Mark a tool result you no longer need: at the next batched
+        context unloading its content collapses to a short stub (nothing
+        is removed now). Without arguments marks the most recent tool
+        result; pass path="..." for the most recent call made with that
+        path. Call it right after the tool being marked; re-run the tool
+        if you need the content again."""
+        return await _run_tool(_mark_unneeded, ctx, path)
 
     # Muting-file tools are barriers: pydantic-ai runs tool calls of one
     # model response in parallel, so two concurrent edits of the same file

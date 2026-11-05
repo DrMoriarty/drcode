@@ -46,6 +46,7 @@ from ..context_layout import (
     tool_schemas,
 )
 from ..core.usage import _is_context_overflow_error
+from ..eviction import EVICTION_WINDOW_FRACTION, evict_marked, marked_tokens
 from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
@@ -139,9 +140,16 @@ class PipelineCompactionLayer(CoreState):
         """Compaction threshold check for the main agent transcript,
         measured against the model actually serving it (research tasks use
         the research role's resolved config, everything else the coding
-        one)."""
-        return self._fill_over_threshold(
-            self._live_ctx_tokens.get(task.id), task.messages, self._task_role(task)
+        one). Corrected by the batch-eviction credit — the readings
+        predate the eviction of the agent-marked tool results (see
+        _maybe_evict_marked)."""
+        return self._apply_eviction_credit(
+            task.id,
+            self._fill_over_threshold(
+                self._live_ctx_tokens.get(task.id),
+                task.messages,
+                self._task_role(task),
+            ),
         )
 
     def _fill_over_hard_limit(
@@ -171,12 +179,16 @@ class PipelineCompactionLayer(CoreState):
 
     def _hard_limit_due(self, task: Task) -> bool:
         """Hard-limit check for the main agent transcript (same role
-        resolution as `_compaction_due`)."""
+        resolution as `_compaction_due`, same eviction-credit
+        correction)."""
         return (
-            self._fill_over_hard_limit(
-                self._live_ctx_tokens.get(task.id),
-                task.messages,
-                self._task_role(task),
+            self._apply_eviction_credit(
+                task.id,
+                self._fill_over_hard_limit(
+                    self._live_ctx_tokens.get(task.id),
+                    task.messages,
+                    self._task_role(task),
+                ),
             )
             is not None
         )
@@ -754,6 +766,95 @@ class PipelineCompactionLayer(CoreState):
             )
         return await self._reduce_partials(partials, template, checklist, facts=facts)
 
+    def _eviction_due(self, task: Task) -> bool:
+        """Whether the agent-marked tool results have piled up enough to be
+        worth one batch eviction: their ≈size (chars/4, the same estimate
+        every other gate uses) reached a third of the serving role's
+        context window (see drcode.eviction). False when nothing is marked
+        or the window is unknown — the marks then just ride along until a
+        compaction takes them."""
+        if not task.marked_unneeded:
+            return False
+        window = self.resolved_config(self._task_role(task)).max_context_tokens
+        if window <= 0:
+            return False
+        pending = marked_tokens(task.messages, task.marked_unneeded)
+        return pending * EVICTION_WINDOW_FRACTION >= window
+
+    def _maybe_evict_marked(self, task: Task, force: bool = False) -> int:
+        """Batch eviction of the agent-marked tool results (the deferred
+        half of the mark_unneeded tool): collapse ALL marked tool-return
+        contents into short stubs in ONE pass (one prompt-cache
+        invalidation per batch, never per mark). The tool-call/tool-return
+        pairs survive; the stub names the tool and its arguments so the
+        model can re-run it. Marked ids are pruned (stubbed ones and stale
+        ones left over from a full compaction that rewrote the history
+        around them).
+
+        Without ``force`` the pass fires only when the pending marks'
+        ≈size (chars/4) reached a third of the serving role's window (the
+        batch gate: below it the marks ride along cheaply). ``force=True``
+        is the PRE-COMPACTION eviction from _maybe_compact: before the
+        summarizer runs, every mark is honored — the unloading alone may
+        pull the fill back under the threshold and spare the summarizer
+        entirely, and a still-needed summarizer works on the lightened
+        history either way.
+
+        The collapsed ≈size is deposited as an eviction credit
+        (`_evicted_ctx_tokens`): every fill reading the dev-transcript
+        gates take afterwards predates the eviction, so it is corrected by
+        the credit until the next real usage reading lands.
+
+        Called only between turns (from _maybe_compact and the mid-run
+        pause path), so the history is never mutated mid-stream. Returns
+        the ≈number of tokens the eviction collapsed (0 = nothing
+        evicted)."""
+        if not task.marked_unneeded or not (force or self._eviction_due(task)):
+            return 0
+        role = self._task_role(task)
+        window = self.resolved_config(role).max_context_tokens
+        pending = marked_tokens(task.messages, task.marked_unneeded)
+        result = evict_marked(task.messages, task.marked_unneeded)
+        task.messages = result.new_messages
+        evicted_set = set(result.evicted)
+        task.marked_unneeded = [
+            mark
+            for mark in task.marked_unneeded
+            if mark not in evicted_set and mark not in set(result.missing)
+        ]
+        task.touch()
+        self.manager.storage.save(task)
+        # The live token reading belongs to the pre-eviction transcript;
+        # drop it until the next model request reports real usage, and
+        # credit the collapsed ≈size so the next fill measurements (which
+        # all predate the eviction) do not over-report.
+        self._live_ctx_tokens.pop(task.id, None)
+        self._evicted_ctx_tokens[task.id] = (
+            self._evicted_ctx_tokens.get(task.id, 0) + pending
+        )
+        self._show_event(
+            task,
+            f"Context unloading: collapsed {len(result.evicted)} marked tool "
+            f"result(s) (≈{pending} tokens of a {window}-token window) — "
+            "re-run a tool if you need its result again.",
+        )
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        return pending
+
+    def _apply_eviction_credit(self, task_id: str, tokens: int | None) -> int | None:
+        """A fill reading corrected by the batch-eviction credit (≈0 when
+        the correction empties it): every reading available after an
+        eviction — the live one from the run in flight and the persisted
+        usage in the transcript alike — was taken BEFORE the marked
+        contents were collapsed, so it over-reports by exactly what the
+        eviction dropped. DEV-transcript gates only: the tester/resolver
+        rounds never evict, their gates must not see a dev credit."""
+        credit = self._evicted_ctx_tokens.get(task_id, 0)
+        if not credit or not tokens:
+            return tokens
+        return max(tokens - credit, 0) or None
+
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
         boundary is the only safe point: the transcript never ends with
@@ -789,8 +890,24 @@ class PipelineCompactionLayer(CoreState):
         for the task with a diagnostic event and the run continues (at the
         hard limit the next request dies with the deterministic context
         overflow).
+
+        The gate also owns the selective-eviction gates (drcode.eviction):
+        at entry the batch gate collapses the agent-marked tool results
+        when they reached a third of the window; when the threshold
+        measurement then comes out OVER the threshold, a forced eviction
+        of the remaining marks runs BEFORE the summarizer is considered —
+        the fill is re-measured with the eviction credit applied, so one
+        unloading can pull it back under the threshold and spare the
+        summarizer entirely; a still-needed summarizer works on the
+        already lightened history.
         """
+        self._maybe_evict_marked(task)
         tokens = self._compaction_due(task)
+        if tokens is not None and task.marked_unneeded:
+            # Pre-compaction eviction: honor every remaining mark before
+            # the summarizer is even considered, then re-measure.
+            self._maybe_evict_marked(task, force=True)
+            tokens = self._compaction_due(task)
         hard = self._hard_limit_due(task)
         # An under-threshold observation credits progress toward the
         # progress-gated reset of the threshold-livelock counter; an
@@ -899,8 +1016,11 @@ class PipelineCompactionLayer(CoreState):
         self.manager.storage.save(task)
         # The live token reading is stale now (it belongs to the old
         # transcript); drop it so the counter falls back to the compacted
-        # transcript until the next model request reports real usage.
+        # transcript until the next model request reports real usage. The
+        # eviction credit goes with it: the summary was built from the
+        # already-lightened history, the old correction no longer applies.
         self._live_ctx_tokens.pop(task.id, None)
+        self._evicted_ctx_tokens.pop(task.id, None)
         self._show_event(task, event)
         if self.viewed_id == task.id:
             self.view_task(task.id)

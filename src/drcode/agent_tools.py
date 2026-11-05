@@ -16,6 +16,7 @@ them, so a module-level import would be a needless cycle.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import subprocess
@@ -23,6 +24,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic_ai import RunContext
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
 
 from . import tools
 from .merge_resolver import _project_python, _venv_env, _worktree_pythonpath_env
@@ -54,6 +62,7 @@ __all__ = [
     "_deps_suffix",
     "_git_push",
     "_list_goals",
+    "_mark_unneeded",
     "_read_goal",
     "_retry_failed_here",
     "_run_project_check",
@@ -647,6 +656,114 @@ def load_agents_md(root: Path) -> str:
         return (root / "AGENTS.md").read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+# -- mark_unneeded: selective context eviction ---------------------------------
+
+
+def _tool_calls_by_id(messages: list[ModelMessage]) -> dict[str, ToolCallPart]:
+    """Every tool-call part of a (live) transcript, keyed by tool_call_id
+    (insertion order preserved — callers pick the MOST RECENT match)."""
+    calls: dict[str, ToolCallPart] = {}
+    for msg in messages:
+        if not isinstance(msg, ModelResponse):
+            continue
+        for part in msg.parts:
+            if isinstance(part, ToolCallPart):
+                calls[part.tool_call_id] = part
+    return calls
+
+
+def _returned_call_ids(messages: list[ModelMessage]) -> dict[str, str]:
+    """tool_call_id -> tool_name for every completed tool return in the
+    transcript (a call without a return has nothing to evict yet)."""
+    returns: dict[str, str] = {}
+    for msg in messages:
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in msg.parts:
+            if isinstance(part, ToolReturnPart):
+                returns[part.tool_call_id] = part.tool_name
+    return returns
+
+
+def _call_path_arg(part: ToolCallPart) -> str | None:
+    """The `path` argument of a tool call (None when it has none) — the
+    args ride in the sibling part of the same ModelResponse, which is what
+    makes the path-based selector possible (the model never has to quote
+    tool_call_ids)."""
+    args = part.args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    path = args.get("path")
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def _mark_unneeded(ctx: RunContext[AgentDeps], path: str = "") -> str:
+    """Record "this tool result's content is no longer needed" marks.
+
+    Nothing is removed at mark time — the pipeline collapses all marked
+    results in one batch later (see drcode.eviction). Two selectors:
+
+    - ``path`` given: the most recent tool call whose `path` argument
+      matches (read_file re-reads included) — the read the agent just
+      decided against;
+    - ``path`` empty: the most recent completed tool result (the "read it,
+      extracted what I needed, moving on" case).
+
+    Raises ValueError (→ ModelRetry) when nothing matches, so the model
+    corrects itself instead of silently marking nothing."""
+    messages: list[ModelMessage] = list(ctx.messages)
+    returns = _returned_call_ids(messages)
+    marked_id: str | None = None
+    marked_name: str | None = None
+    if path.strip():
+        wanted = path.strip()
+        for call_id, part in reversed(_tool_calls_by_id(messages).items()):
+            if _call_path_arg(part) != wanted:
+                continue
+            if call_id not in returns:
+                continue
+            marked_id, marked_name = call_id, part.tool_name
+            break
+        if marked_id is None:
+            raise ValueError(
+                f"No completed tool result for path {wanted!r} in this "
+                "session — mark_unneeded(path=...) marks the most recent "
+                "tool call made with that exact path (and it must have a "
+                "result already). Omit the argument to mark the most "
+                "recent tool result instead."
+            )
+    else:
+        # The most recent completed result that is not a mark_unneeded
+        # call of this very session (its own results are never evictable
+        # targets — they are one-liners anyway).
+        for call_id, name in reversed(returns.items()):
+            if name == "mark_unneeded":
+                continue
+            marked_id, marked_name = call_id, name
+            break
+        if marked_id is None:
+            raise ValueError("There is no completed tool result to mark yet.")
+    assert marked_id is not None
+    task = ctx.deps.manager.get(ctx.deps.task_id)
+    if marked_id not in task.marked_unneeded:
+        task.marked_unneeded.append(marked_id)
+    task.touch()
+    ctx.deps.manager.storage.save(task)
+    return (
+        f"Marked: the result of {marked_name} is no longer needed. Nothing "
+        "is removed right now — the pipeline will collapse it (together "
+        "with the other marked results, in one batch) at the next context "
+        "unloading: when ≈1/3 of the context window is marked, or just "
+        "before a full compaction. The stub left in place of the content "
+        "will say how to re-run the tool."
+    )
 
 
 def _retry_failed_here(deps: TesterDeps, report: str) -> str:

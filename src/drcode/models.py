@@ -436,6 +436,19 @@ class Task(BaseModel):
     # every compaction (see tui/pipeline.py), so the agent cannot "forget"
     # it. Rendered by render_todos below.
     todos: list[TodoItem] = Field(default_factory=list)
+    # Tool-call ids whose results the agent marked as no longer needed (the
+    # mark_unneeded tool). The mark only RECORDS the decision — nothing is
+    # removed at mark time: the pipeline collapses all marked tool-return
+    # contents in ONE batch (one prompt-cache invalidation), either when
+    # their ≈size (chars/4) reaches a third of the serving role's context
+    # window, or right before a full LLM compaction. Each collapsed return
+    # is replaced by a short stub naming the tool and its arguments; the
+    # tool-call/tool-return pair itself always survives (the transcript must
+    # stay API-valid). Ids are pruned by the eviction gate (stubbed) and by
+    # a full compaction (the summarized-away history takes the marks with
+    # it). Kept in the metadata — NOT in the serialized message parts — so
+    # ModelMessagesTypeAdapter never sees foreign fields.
+    marked_unneeded: list[str] = Field(default_factory=list)
     # The long-lived product goal this task serves (see drcode.models.Goal
     # and the goals registry under .drcode/goals/). None for tasks created
     # without a goal reference (old task files load with the plain default,

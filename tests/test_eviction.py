@@ -1,0 +1,481 @@
+"""Selective context eviction driven by the agent's mark_unneeded marks.
+
+Covers the three layers of the mechanism:
+- the pure eviction mechanics (drcode.eviction): stub replacement, the
+  intact tool-call/tool-return pairs, ≈token accounting;
+- the mark_unneeded tool body (selectors, ModelRetry on a bad target,
+  persistence through the task metadata);
+- the pipeline gates: the batch eviction at 1/3 of the window, the
+  pre-compaction eviction (spares the summarizer or lightens its input),
+  and the live-run pause→evict→resume cycle.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.usage import RequestUsage
+
+from drcode import agent_model, eviction
+from drcode.agent_tools import _mark_unneeded
+from drcode.compaction import (
+    _atomic_groups,
+    chunk_history_for_summary,
+    mechanical_compaction_messages,
+    render_history_blocks,
+)
+from drcode.models import TaskKind, TaskStatus
+from drcode.providers import AgentRole
+from drcode.storage import Storage
+from drcode.transcript import (
+    estimate_tokens,
+    load_messages,
+    resumable_history,
+    sanitized_messages,
+    serialize_messages,
+)
+from drcode.tui.app import DrCodeApp
+from tests.network_mocks import (
+    ScriptedState,
+    event_texts,
+    text_response,
+    tool_response,
+    wait_until,
+)
+
+# -- helpers ---------------------------------------------------------------------
+
+
+def user_msg(text: str) -> ModelRequest:
+    return ModelRequest(parts=[UserPromptPart(content=text)])
+
+
+def tool_call_msg(call_id: str, tool: str, args: dict[str, Any]) -> ModelResponse:
+    return ModelResponse(
+        parts=[ToolCallPart(tool_name=tool, args=args, tool_call_id=call_id)]
+    )
+
+
+def tool_return_msg(call_id: str, tool: str, content: Any) -> ModelRequest:
+    return ModelRequest(
+        parts=[ToolReturnPart(tool_name=tool, content=content, tool_call_id=call_id)]
+    )
+
+
+def big_return_transcript(content: str, usage: int = 0) -> list[dict[str, Any]]:
+    """prompt → tool call c1 → big tool return → (optionally) a usage-bearing
+    response. The shape every eviction test seeds."""
+    messages: list[Any] = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "src/big.py"}),
+        tool_return_msg("c1", "read_file", content),
+    ]
+    if usage:
+        messages.append(
+            ModelResponse(
+                parts=[TextPart("partial work")],
+                usage=RequestUsage(input_tokens=usage, output_tokens=8),
+            )
+        )
+    return serialize_messages(messages)
+
+
+def stubs_in(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        part
+        for msg in messages
+        for part in msg.get("parts", [])
+        if isinstance(part, dict) and eviction.is_evicted_stub(part.get("content"))
+    ]
+
+
+def returns_in(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        part["tool_call_id"]: part
+        for msg in messages
+        for part in msg.get("parts", [])
+        if isinstance(part, dict) and part.get("part_kind") == "tool-return"
+    }
+
+
+# -- pure eviction mechanics -------------------------------------------------------
+
+
+def test_stub_format_and_args_cap() -> None:
+    stub = eviction.evicted_stub(
+        "read_file", {"path": "src/" + "x" * 300 + ".py", "offset": 1}
+    )
+    assert stub.startswith("[tool result evicted: read_file(")
+    assert "re-run the tool if needed]" in stub
+    # The args summary is capped: the stub stays a short line.
+    assert len(stub) < 300
+
+
+def test_evict_marked_replaces_content_keeps_pair() -> None:
+    data = big_return_transcript("y" * 6000)
+    result = eviction.evict_marked(data, ["c1"])
+
+    assert result.evicted == ["c1"]
+    assert result.missing == []
+    assert result.new_messages is not data  # input never mutated in place
+    (stub_part,) = stubs_in(result.new_messages)
+    assert stub_part["tool_call_id"] == "c1"
+    assert stub_part["tool_name"] == "read_file"
+    # The sibling tool-call part is untouched — the pair survives.
+    calls = [
+        part
+        for msg in result.new_messages
+        for part in msg.get("parts", [])
+        if isinstance(part, dict) and part.get("part_kind") == "tool-call"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["tool_name"] == "read_file"
+    assert calls[0]["args"] == {"path": "src/big.py"}
+    assert calls[0]["tool_call_id"] == "c1"
+    # The transcript stays API-valid and resumable.
+    restored = load_messages(result.new_messages)
+    assert resumable_history(result.new_messages) == restored
+
+
+def test_evict_marked_missing_and_stub_are_noops() -> None:
+    data = big_return_transcript("y" * 100)
+    result = eviction.evict_marked(data, ["ghost"])
+    assert result.evicted == []
+    assert result.missing == ["ghost"]
+    assert result.new_messages == data  # nothing to do — transcript unchanged
+
+    once = eviction.evict_marked(data, ["c1"]).new_messages
+    again = eviction.evict_marked(once, ["c1"])
+    assert again.evicted == []
+    assert again.new_messages == once  # an already-stubbed return is left alone
+
+
+def test_marked_tokens_counts_pending_only() -> None:
+    data = big_return_transcript("y" * 4000)
+    assert eviction.marked_tokens(data, ["c1"]) == estimate_tokens("y" * 4000)
+    assert eviction.marked_tokens(data, ["ghost"]) == 0
+    stubbed = eviction.evict_marked(data, ["c1"]).new_messages
+    assert eviction.marked_tokens(stubbed, ["c1"]) == 0
+
+
+def test_evict_marked_matches_call_in_other_message() -> None:
+    """The stub is built from the sibling tool-call's args even when the
+    call and the return live in different messages (they always do)."""
+    data = big_return_transcript("y" * 800)
+    result = eviction.evict_marked(data, ["c1"])
+    (stub_part,) = stubs_in(result.new_messages)
+    assert "read_file" in stub_part["content"]
+    assert "src/big.py" in stub_part["content"]
+
+
+# -- compaction rendering works with stubs ------------------------------------------
+
+
+def test_render_keeps_call_and_stub_adjacent() -> None:
+    """The summarizer's chunker treats a call and its (stubbed) return as
+    one atomic group — the pair is never separated in a map slice."""
+    data = big_return_transcript("y" * 5000)
+    stubbed = eviction.evict_marked(data, ["c1"]).new_messages
+    blocks = render_history_blocks(stubbed)
+    groups = _atomic_groups(blocks)
+    # The user prompt may be glued to its answer's first group: find the
+    # group holding the tool call and check its result stays attached.
+    call_group = next(g for g in groups if any(k == "tool-call" for k, _ in g))
+    kinds = [kind for kind, _ in call_group]
+    call_idx = kinds.index("tool-call")
+    assert kinds[call_idx + 1] == "tool-result"
+    assert "tool result evicted" in call_group[call_idx + 1][1]
+    # And the whole transcript renders with the stub in place of the body.
+    rendered = "\n\n".join(text for _, text in blocks)
+    assert "y" * 100 not in rendered
+    assert "tool result evicted" in rendered
+
+
+def test_chunking_and_mechanical_floor_survive_stubs() -> None:
+    data = big_return_transcript("y" * 5000, usage=900)
+    stubbed = eviction.evict_marked(data, ["c1"]).new_messages
+    slices = chunk_history_for_summary(stubbed, budget_tokens=2000)
+    assert slices
+    # The mechanical floor keeps the pair: the stub return is not orphaned.
+    trimmed = mechanical_compaction_messages(stubbed, 100_000)
+    assert returns_in(trimmed)["c1"]["tool_call_id"] == "c1"
+    assert sanitized_messages(stubbed) == stubbed
+
+
+# -- mark_unneeded tool body ---------------------------------------------------------
+
+
+class FakeDeps:
+    def __init__(self, manager: Any, task_id: str) -> None:
+        self.manager = manager
+        self.task_id = task_id
+
+
+class FakeCtx:
+    """Just what _mark_unneeded reads: the run transcript and the deps."""
+
+    def __init__(self, messages: list[Any], deps: Any) -> None:
+        self.messages = messages
+        self.deps = deps
+
+
+def test_mark_unneeded_defaults_to_last_result(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+        tool_call_msg("c2", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c2", "grep_search", ["hit"]),
+        tool_call_msg("c3", "mark_unneeded", {}),
+    ]
+    result = _mark_unneeded(cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))))
+    assert task.marked_unneeded == ["c2"]
+    assert "no longer needed" in result
+    assert "Nothing is removed right now" in result
+
+
+def test_mark_unneeded_path_selector(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+        tool_call_msg("c2", "read_file", {"path": "b.py", "offset": 5}),
+        tool_return_msg("c2", "read_file", "content b"),
+    ]
+    _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))), path="a.py"
+    )
+    assert task.marked_unneeded == ["c1"]
+
+
+def test_mark_unneeded_unknown_path_retries(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    with pytest.raises(ValueError, match="No completed tool result"):
+        _mark_unneeded(
+            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))), path="zzz.py"
+        )
+    # No completed tool result at all — nothing to mark.
+    with pytest.raises(ValueError, match="no completed tool result"):
+        _mark_unneeded(
+            cast(Any, FakeCtx([user_msg("read things")], FakeDeps(manager, task.id)))
+        )
+    assert task.marked_unneeded == []
+
+
+def test_mark_unneeded_never_marks_itself(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "mark_unneeded", {}),
+        tool_return_msg("c1", "mark_unneeded", "Marked: ..."),
+        tool_call_msg("c2", "mark_unneeded", {}),
+    ]
+    with pytest.raises(ValueError):
+        _mark_unneeded(cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))))
+
+
+def test_mark_unneeded_survives_save_load(project_root: Path) -> None:
+    from drcode.task_manager import TaskManager
+
+    manager = TaskManager(project_root)
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    _mark_unneeded(cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))))
+    assert task.marked_unneeded == ["c1"]
+    # A fresh store over the same project reads the mark back.
+    tasks = {t.id: t for t in Storage(project_root).load_all()}
+    assert tasks[task.id].marked_unneeded == ["c1"]
+
+
+# -- pipeline gates -------------------------------------------------------------------
+
+
+@pytest.fixture
+def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DRCODE_MODEL", "mock-model")
+    monkeypatch.setenv("DRCODE_API_KEY", "mock-key")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://127.0.0.1:1/v1")
+
+
+@pytest.fixture
+def app_small_ctx(
+    project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> DrCodeApp:
+    monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "1000")
+    return DrCodeApp(project_root)
+
+
+@pytest.fixture
+def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
+    state = ScriptedState()
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    return state
+
+
+@pytest.fixture
+def wide_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = DrCodeApp.resolved_config
+
+    def resolved(self: DrCodeApp, role: AgentRole):  # type: ignore[no-untyped-def]
+        cfg = real(self, role)
+        if role is AgentRole.COMPACTION:
+            return cfg.model_copy(update={"max_context_tokens": 200_000})
+        return cfg
+
+    monkeypatch.setattr(DrCodeApp, "resolved_config", resolved)
+
+
+def _seed_marked_task(app: DrCodeApp, content: str, usage: int = 0) -> Any:
+    # No pending input (empty brief): the mount-time _advance() must leave
+    # the task queued, so the gates are exercised by direct calls, not by
+    # an auto-promoted run racing the assertions.
+    task = app.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = big_return_transcript(content, usage=usage)
+    task.marked_unneeded = ["c1"]
+    app.manager.storage.save(task)
+    return task
+
+
+async def test_batch_eviction_gate_fires_at_third_of_window(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    task = _seed_marked_task(app_small_ctx, "y" * 6000)  # ≈1500 tokens ≥ 1000/3
+    assert app_small_ctx._eviction_due(task)
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        evicted = app_small_ctx._maybe_evict_marked(task)
+        await pilot.pause()
+
+    assert evicted == estimate_tokens("y" * 6000)
+    (stub_part,) = stubs_in(task.messages)
+    assert stub_part["tool_call_id"] == "c1"
+    assert task.marked_unneeded == []
+    assert any("Context unloading" in t for t in event_texts(task))
+    # The stub is persisted, not just in memory.
+    reloaded = {t.id: t for t in Storage(app_small_ctx.project_root).load_all()}[
+        task.id
+    ]
+    assert stubs_in(reloaded.messages)
+    # The eviction credit is deposited for the fill gates.
+    assert app_small_ctx._evicted_ctx_tokens[task.id] == estimate_tokens("y" * 6000)
+
+
+async def test_batch_eviction_gate_below_threshold_is_noop(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    task = _seed_marked_task(app_small_ctx, "y" * 400)  # ≈100 tokens < 334
+    assert not app_small_ctx._eviction_due(task)
+    assert app_small_ctx._maybe_evict_marked(task) == 0
+    assert stubs_in(task.messages) == []
+    assert task.marked_unneeded == ["c1"]
+
+
+async def test_pre_compaction_eviction_spares_the_summarizer(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """Fill over the compaction threshold (900 ≥ 80% of 1000), marked
+    result worth ≈1500 tokens: the forced pre-compaction eviction pulls
+    the fill back under the threshold and the summarizer never runs."""
+    task = _seed_marked_task(app_small_ctx, "y" * 6000, usage=900)
+    assert app_small_ctx._compaction_due(task) == 908
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert scripted.calls == []  # the summarizer was never invoked
+    assert not any("Context compacted" in t for t in event_texts(task))
+    assert any("Context unloading" in t for t in event_texts(task))
+    (stub_part,) = stubs_in(task.messages)
+    assert stub_part["tool_call_id"] == "c1"
+    assert task.marked_unneeded == []
+
+
+async def test_pre_compaction_eviction_lightens_the_summarizer_input(
+    app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    wide_compaction: None,
+) -> None:
+    """The eviction alone cannot get under the threshold (the mark is
+    small next to the fill): the summarizer runs anyway — but on the
+    lightened history, seeing the stub instead of the collapsed content."""
+    task = _seed_marked_task(app_small_ctx, "y" * 400, usage=950)
+    scripted.steps = [text_response("THE SUMMARY BODY")]
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    # The summarizer request carried the stub, not the collapsed body.
+    assert "tool result evicted" in scripted.calls[-1]
+    assert "y" * 100 not in scripted.calls[-1]
+
+
+async def test_live_run_pauses_evicts_and_resumes(
+    app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    project_root: Path,
+) -> None:
+    """Full cycle on a live run: read → mark → the tools-node gate pauses
+    the run (marked results reached ≈1/3 of the window) → the next turn
+    boundary evicts in one batch → the continuation turn resumes from the
+    stubbed transcript and the task completes. The call/return pairs
+    survive; the marks are consumed."""
+    # ≈500 tokens: big enough to trip the 1/3-of-window gate (334), small
+    # enough to pass read_file's own compaction-threshold guard (800).
+    (project_root / "notes.txt").write_text("y" * 2000)
+    task = app_small_ctx.manager.create(
+        "Read stuff", "read notes.txt", kind=TaskKind.RESEARCH
+    )
+    scripted.steps = [
+        tool_response("read_file", {"path": "notes.txt"}, call_id="c1"),
+        tool_response("mark_unneeded", {"path": "notes.txt"}, call_id="c2"),
+        text_response("done reading"),
+    ]
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        app_small_ctx._advance()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="research task completed after the eviction cycle",
+        )
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("pausing the run to unload" in t for t in texts)
+    assert any("Context unloading" in t for t in texts)
+    # Three model requests: read, mark, the continuation turn.
+    assert len(scripted.calls) == 3
+    # The read result was collapsed to a stub; its tool call survives.
+    (stub_part,) = stubs_in(task.messages)
+    assert stub_part["tool_call_id"] == "c1"
+    assert "read_file" in stub_part["content"]
+    assert task.marked_unneeded == []
+    load_messages(task.messages)  # API-valid

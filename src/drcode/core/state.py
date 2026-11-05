@@ -296,6 +296,10 @@ class CoreState:
 
     def _hard_limit_due(self, task: Task) -> bool: ...
 
+    def _eviction_due(self, task: Task) -> bool: ...
+
+    def _maybe_evict_marked(self, task: Task, force: bool = False) -> int: ...
+
     def _threshold_observation(
         self,
         task: Task,
@@ -608,6 +612,15 @@ class CoreState:
 
     # -- context fill / compaction ------------------------------------------
     _live_ctx_tokens: dict[str, int]
+    # Eviction credit per task: the ≈tokens the batch eviction of the
+    # agent-marked tool results collapsed (see
+    # PipelineCompactionLayer._maybe_evict_marked). Every fill reading
+    # taken before the next real usage report over-reports by exactly
+    # that; the dev-transcript gates subtract the credit until a fresh
+    # reading consumes it (pipeline_agent_run._agent_model_request_done)
+    # or a full compaction rewrites the transcript. The tester/resolver
+    # rounds never evict — their gates must not see a dev credit.
+    _evicted_ctx_tokens: dict[str, int]
     # The same live readings for the two round-running agents: tester
     # rounds (the shared map above belongs to the dev transcript and must
     # not be polluted with the tester's) and resolver rounds. Presence of

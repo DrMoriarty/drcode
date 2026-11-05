@@ -58,10 +58,8 @@ class ActivityLayer(DrCodeState):
         (parallel development slots) collapse into a compact summary."""
         try:
             self._render_model_status()
-            # Expanded header: fold task-tree changes into the session
-            # counters and refresh the two tall-only lines (no-op while
-            # the header is collapsed).
-            self._collect_session_stats()
+            # Expanded header: refresh the two tall-only lines (no-op
+            # while the header is collapsed).
             self._render_header_tall()
             # Live duration counter in the task-statusbar: only ticks when
             # the viewed task is ACTIVE/TESTING (otherwise the header has

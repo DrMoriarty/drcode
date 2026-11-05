@@ -730,17 +730,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # holds only the current retry budgets); shown in the expanded
         # header.
         self._net_retries_total = 0
-        # Session statistics for the expanded header (never persisted):
-        # tasks present at startup don't count as "created this session",
-        # tasks already COMPLETED at startup don't count as "processed".
-        self._session_known_ids: set[str] = set(self.manager.tasks)
-        self._session_completed_ids: set[str] = {
-            t.id
-            for t in self.manager.tasks.values()
-            if t.status is TaskStatus.COMPLETED
-        }
-        self._session_created: dict[TaskKind, int] = {kind: 0 for kind in TaskKind}
-        self._session_completed = 0
         # Exact cumulative token usage of every model call this session
         # (main agent + tester + compaction summarizer) — shown in the
         # expanded header's bottom line. Session-scoped: resets on restart.
@@ -758,9 +747,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # location, while a bare UsageStore() in an agent's verification
         # snippet stays guarded.
         self._usage_store = UsageStore(path=usage_file())
-        # Activation → completion spans (seconds) of the tasks completed
-        # this session; feeds the average/median figures.
-        self._session_durations: list[float] = []
         # True while the new-task form covers the chat view. Must exist from
         # the start: the streaming loop reads it on every text delta, and an
         # unset attribute would crash the run (it did — the AttributeError

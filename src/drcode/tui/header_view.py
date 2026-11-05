@@ -1,15 +1,14 @@
 """Header layer of the chat view mixin stack.
 
 The connection status in the header (icon + label + live activity
-suffix), the expanded (tall) header's connection details and session
-statistics, and the persistent bottom-right voice-dictation indicator.
+suffix), the expanded (tall) header's connection details and the
+integration switches (TTS, notifications, GitHub), plus the persistent
+bottom-right voice-dictation indicator.
 Split out of :mod:`drcode.tui.chat_view` — see the composition in
 ``ChatViewLayer``.
 """
 
 from __future__ import annotations
-
-import statistics
 
 from pydantic_ai.usage import RunUsage
 from rich.cells import cell_len
@@ -200,40 +199,6 @@ class HeaderLayer(DrCodeState):
     def header_session_info(self) -> Static:
         return self.query_one("#header-sessions", HeaderSessionInfo)
 
-    @staticmethod
-    def _fmt_duration(seconds: float) -> str:
-        """Compact human duration for the header stats line (e.g. 45s, 6m12s)."""
-        seconds = max(0, int(seconds))
-        if seconds < 60:
-            return f"{seconds}s"
-        return f"{seconds // 60}m{seconds % 60:02d}s"
-
-    def _collect_session_stats(self) -> None:
-        """Fold task-tree changes into the session counters.
-
-        Runs on the 1 s poll: tasks that appeared since the previous tick
-        count as created this session (by kind), tasks that reached
-        COMPLETED count as processed, with the activation → completion
-        span (when both timestamps exist — a task cancelled straight from
-        the queue has no activation stamp and is counted without a
-        duration).
-        """
-        tasks = self.manager.tasks
-        for task_id in set(tasks) - self._session_known_ids:
-            self._session_known_ids.add(task_id)
-            self._session_created[tasks[task_id].kind] += 1
-        for task in tasks.values():
-            if (
-                task.status is TaskStatus.COMPLETED
-                and task.id not in self._session_completed_ids
-            ):
-                self._session_completed_ids.add(task.id)
-                self._session_completed += 1
-                if task.activated_at and task.completed_at:
-                    self._session_durations.append(
-                        (task.completed_at - task.activated_at).total_seconds()
-                    )
-
     def _header_conn_text(self) -> str:
         """The expanded header's connection line: the connection label
         (dot + model, error detail on failures), URL, last probe
@@ -261,27 +226,37 @@ class HeaderLayer(DrCodeState):
         return line
 
     def _header_stats_text(self) -> str:
-        """The expanded header's session-statistics line: tasks completed
-        this session, average/median activation→completion time and the
-        bugs:features ratio of the tasks created this session (research
-        tasks are excluded from the ratio: they are neither bug fixes nor
-        implemented features)."""
-        durations = self._session_durations
-        if durations:
-            avg = statistics.fmean(durations)
-            median = statistics.median(durations)
-            times = (
-                f"avg {self._fmt_duration(avg)} | median {self._fmt_duration(median)}"
+        """The expanded header's bottom line: the TTS-announcements and
+        ntfy push-notification switches, followed by the GitHub
+        integration status."""
+        return f"{self._header_tts_text()} | {self._header_notifications_text()} | {self._header_github_text()}"
+
+    def _header_tts_text(self) -> str:
+        """TTS-announcements status for the expanded header's bottom line:
+        on only when the audio-API endpoint and the TTS model are set AND
+        at least one announcement event is checked (an endpoint with the
+        model but no checked event would never speak a word)."""
+        s = self.settings
+        if not (
+            s.voice_api_url.strip()
+            and s.voice_tts_model.strip()
+            and any(
+                (
+                    s.voice_tts_completed,
+                    s.voice_tts_tester_failed,
+                    s.voice_tts_queue_empty,
+                    s.voice_tts_clarification,
+                )
             )
-        else:
-            times = "avg — | median —"
-        bugs = self._session_created[TaskKind.BUG]
-        features = self._session_created[TaskKind.FEATURE]
-        line = (
-            f"tasks done: {self._session_completed} | {times} | "
-            f"bugs:features {bugs}:{features}"
-        )
-        return f"{line} | {self._header_github_text()}"
+        ):
+            return "TTS: off"
+        return "TTS: on"
+
+    def _header_notifications_text(self) -> str:
+        """ntfy push-notification status for the expanded header's bottom
+        line: the switch alone (an enabled switch with no topic simply
+        stays silent — the notifier handles that, not the header)."""
+        return f"Notifications: {'on' if self.settings.notifications_enabled else 'off'}"
 
     def _header_github_text(self) -> str:
         """GitHub-integration status for the expanded header's bottom line:

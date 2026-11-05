@@ -546,14 +546,9 @@ class CoreState:
     _install_rerun_ids: list[str]
     _install_rerun_running: bool
 
-    # -- session statistics (expanded header, session-scoped) ---------------
-    _session_known_ids: set[str]
-    _session_completed_ids: set[str]
-    _session_created: dict[TaskKind, int]
-    _session_completed: int
+    # -- session usage (expanded header, session-scoped) ---------------------
     _session_usage: SessionTokenUsage
     _usage_store: UsageStore
-    _session_durations: list[float]
 
     # -- new-task form ------------------------------------------------------
     # Tab-cycle order of the task kinds (TaskFormLayer; the lifecycle

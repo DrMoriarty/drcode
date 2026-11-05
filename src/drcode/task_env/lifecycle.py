@@ -41,6 +41,16 @@ if TYPE_CHECKING:
 # the setting protected must never be destroyed by the same removal).
 _SNAPSHOT_SKIPPED_PREFIX = "auto-snapshot skipped: "
 
+# Bounded wait for the per-task and activation locks in `ensure_root`
+# (seconds): a legitimate holder keeps them only for the activation's own
+# git calls (each subprocess.run timeout=120) plus the capped untracked
+# copy — far under a minute in the normal case, so this is a generous
+# margin. A WEDGED holder (a stuck git on a dead NFS mount, a wedged
+# background removal) must surface as a TimeoutError after this bound,
+# not block the `asyncio.to_thread` worker (and a default-executor
+# thread with it) forever — the mute "active, nothing happening" hang.
+LOCK_WAIT_TIMEOUT = 600.0
+
 
 def _dirty_count(status: str) -> int:
     """Number of uncommitted changes in a `git status --porcelain` output
@@ -322,8 +332,29 @@ class _WorktreeLifecycleMixin:
         # (schedule_removal): the removal finishes before a worktree is
         # (re-)created here — or, when this activation got here first,
         # the removal's re-check sees the task alive again and skips.
-        with self._task_lock(task_id), self._activation_lock:
+        # Bounded lock waits (LOCK_WAIT_TIMEOUT): `with lock:` would block
+        # the to_thread worker forever on a wedged holder — surface a
+        # TimeoutError instead (the caller's failure path shows it as a
+        # service event and requeues the task).
+        task_lock = self._task_lock(task_id)
+        if not task_lock.acquire(timeout=LOCK_WAIT_TIMEOUT):
+            raise TimeoutError(
+                f"worktree activation: the per-task lock of {task_id} was "
+                f"not released within {LOCK_WAIT_TIMEOUT:.0f} s "
+                "(a removal or another activation is wedged)"
+            )
+        if not self._activation_lock.acquire(timeout=LOCK_WAIT_TIMEOUT):
+            task_lock.release()
+            raise TimeoutError(
+                f"worktree activation: the activation lock was not "
+                f"released within {LOCK_WAIT_TIMEOUT:.0f} s "
+                "(a concurrent activation is wedged)"
+            )
+        try:
             return self._ensure_root_locked(task_id)
+        finally:
+            self._activation_lock.release()
+            task_lock.release()
 
     def _start_point(self) -> tuple[_StartPoint | None, str]:
         """Resolve the start point of a NEW task branch.

@@ -702,6 +702,45 @@ async def test_model_not_configured_keeps_prompt_pending(project_root: Path) -> 
     assert not app.agent_running
 
 
+async def test_preparation_failure_surfaces_and_requeues(
+    net_app: DrCodeApp, scripted: ScriptedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure BEFORE the turn loop (worktree setup incl. the bounded
+    activation-lock waits, the agent build, …) must surface as a service
+    event + honest requeue — not a dead worker leaving the task ACTIVE
+    with no runner and no event (the mute "active, nothing happening"
+    hang, task #a2dc8424)."""
+    task = net_app.manager.create("docs", "do things", kind=TaskKind.RESEARCH)
+    scripted.steps = [text_response("never reached")]
+
+    async def boom(
+        self: DrCodeApp,
+        task: Any,
+        task_id: str,
+        role: Any,
+        generation: int,
+    ) -> Any:
+        raise RuntimeError("worktree setup exploded")
+
+    monkeypatch.setattr(DrCodeApp, "_prepare_agent_run", boom)
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.QUEUED and task.unfinished,
+            pilot,
+            what="task demoted to the queue with the unfinished marker",
+        )
+
+    texts = event_texts(task)
+    assert any("RuntimeError" in t and "worktree setup exploded" in t for t in texts), (
+        texts
+    )
+    # Nothing was consumed before the failure: the prompt survives for the
+    # next activation, and no agent run is left registered.
+    assert [e.text for e in task.pending_input] == ["do things"]
+    assert task.id not in net_app._agent_runs
+
+
 # -- context compaction over the network -------------------------------------------------
 
 

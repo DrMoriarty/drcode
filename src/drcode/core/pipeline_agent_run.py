@@ -342,6 +342,17 @@ class PipelineAgentRunLayer(CoreState):
                 task.unfinished = True
                 self.manager.storage.save(task)
             raise
+        except Exception as e:  # noqa: BLE001 - show preparation errors in the chat
+            # A failure BEFORE the turn loop's own handler (worktree setup
+            # incl. the bounded activation-lock waits, the task-start hook,
+            # build_agent, the consumed-prompt assembly): without this the
+            # worker would die silently — the task stays ACTIVE with no
+            # runner and no event (the mute "active, nothing happening"
+            # state, task #a2dc8424). Route it through the ordinary failure
+            # path: a visible service event + honest requeue. `run` is None
+            # here (nothing was consumed yet — pending_input is intact and
+            # `_persist_task_messages` no-ops).
+            self._agent_turn_failed(task, task_id, run, generation, e)
         finally:
             # Stop any spinner whose result event was lost to an abort or a
             # run error (normally all of them are already stopped).

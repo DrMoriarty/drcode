@@ -1377,6 +1377,29 @@ def test_detached_head_refuses_isolation(env: TaskEnvironment, git_root: Path) -
     assert events == []  # nothing was created — nothing to record
 
 
+def test_ensure_root_activation_lock_wait_is_bounded(
+    env: TaskEnvironment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wedged holder of the activation lock must surface as a
+    TimeoutError after LOCK_WAIT_TIMEOUT (the caller's failure path shows
+    it as a service event and requeues the task), not block the
+    asyncio.to_thread worker — and a default-executor thread with it —
+    forever (the mute "active, nothing happening" hang)."""
+    from drcode.task_env import lifecycle as lifecycle_module
+
+    monkeypatch.setattr(lifecycle_module, "LOCK_WAIT_TIMEOUT", 0.2)
+    assert env._activation_lock.acquire(timeout=5)
+    try:
+        with pytest.raises(TimeoutError, match="activation lock"):
+            env.ensure_root("t1")
+    finally:
+        env._activation_lock.release()
+    # The wedged holder is gone: a normal activation works again.
+    root, _ = env.ensure_root("t1")
+    assert root == env.worktree_path("t1")
+    assert branch_exists(env.project_root, "drcode/t1")
+
+
 def test_configured_start_branch_wins_even_detached(
     env: TaskEnvironment, git_root: Path
 ) -> None:

@@ -42,6 +42,21 @@ def make_config(**overrides: object) -> Config:
     return Config(**kwargs)  # type: ignore[arg-type]
 
 
+# -- production client construction -------------------------------------------------
+
+
+def test_build_model_client_disables_silent_sdk_retries() -> None:
+    """The production client must not retry transport failures inside the
+    SDK (the openai default max_retries=2 stretches a stalled request's
+    silent window to ~3 x 600 s with zero events — the mute "active,
+    nothing happening" hang): every failure must surface to drcode's own
+    retry layer, which announces each attempt in the service events."""
+    model = agent_model.build_model(make_config())
+    client = model.client
+    assert isinstance(client, AsyncOpenAI)
+    assert client.max_retries == 0
+
+
 # -- HTTP status errors ------------------------------------------------------------
 
 

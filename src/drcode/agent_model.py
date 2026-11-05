@@ -190,6 +190,19 @@ def build_model(config: Config):
         # valid Authorization header: "Bearer " is rejected by httpx.
         api_key=config.api_key or "no-key",
         default_headers=EXTRA_HEADERS,
+        # No SILENT SDK-internal retries (the openai default is
+        # max_retries=2): a stalled request (e.g. a gateway holding the
+        # call in its processing queue while the model slot is busy) is
+        # then retried invisibly twice more after the 600 s read timeout —
+        # up to ~30 min of total mute with zero events, the "active,
+        # nothing happening" hang of task #a2dc8424. drcode has its own
+        # retry layer for transport errors (core/usage.py: NETWORK_RETRIES
+        # + backoff via _agent_turn_network_error) which announces every
+        # attempt in the task's service events — the first timeout must
+        # surface THERE, not be absorbed here (the test mocks in
+        # tests/network_mocks.py already run with max_retries=0 for the
+        # same reason).
+        max_retries=0,
     )
     return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
 

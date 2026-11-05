@@ -142,6 +142,11 @@ class NewTaskInput(WordNavTextArea):
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
         ),
+        # Ctrl+Y — goal capture: the stock TextArea owns ctrl+y (Redo), so
+        # the app-level binding alone never fires while this editor is
+        # focused (and it is the default focus at startup). Off the footer
+        # (show=False): the app binding already shows "New goal" there.
+        Binding("ctrl+y", "app.new_goal", "New goal", priority=True, show=False),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 
@@ -232,6 +237,11 @@ class ChatInput(WordNavTextArea):
         # run): when nothing is recorded, SkipAction lets the key fall
         # through to the app's abort binding.
         Binding("escape", "voice_cancel", "Cancel recording", priority=True),
+        # Ctrl+Y — goal capture: the stock TextArea owns ctrl+y (Redo), so
+        # the app-level binding alone never fires while this editor is
+        # focused. Off the footer (show=False): the app binding already
+        # shows "New goal" there.
+        Binding("ctrl+y", "app.new_goal", "New goal", priority=True, show=False),
     ]
 
     def __init__(self, **kwargs: object) -> None:

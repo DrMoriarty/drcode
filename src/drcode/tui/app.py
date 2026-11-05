@@ -382,9 +382,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         ("ctrl+n", "new_task", "New task"),
         # Ctrl+Y, not ctrl+g: the new-task editor's TextArea binding owns
         # ctrl+g ("Depends on", priority=True) — inside the form the
-        # global would never fire; ctrl+y is free everywhere the app
-        # bindings reach (a focused TextArea still eats it — stock
-        # TextArea owns ctrl+y — same limitation ctrl+g had).
+        # global would never fire. NewTaskInput/ChatInput re-declare
+        # ctrl+y on the `app` namespace (the stock TextArea binding
+        # would otherwise eat it while focused); everywhere else the
+        # app-level binding below applies.
         ("ctrl+y", "new_goal", "New goal"),
         ("ctrl+d", "done_task", "Done"),
         ("ctrl+x", "cancel_task", "Cancel task"),

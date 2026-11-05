@@ -21,6 +21,7 @@ from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 from drcode.models import GoalStatus, GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
 from drcode.tui.goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
+from drcode.tui.inputs import ChatInput, NewTaskInput
 from drcode.tui.sidebar import TaskItem
 
 
@@ -546,6 +547,31 @@ async def test_goal_create_dialog_requires_title(app: DrCodeApp) -> None:
         assert isinstance(app.screen, GoalEditScreen)
         assert "required" in str(screen.query_one("#goal-error", Static).content)
         screen.action_cancel()
+
+
+async def test_ctrl_y_opens_goal_capture_from_focused_editors(app: DrCodeApp) -> None:
+    """Ctrl+Y must open the goal-capture dialog while a TextArea editor
+    holds focus: the stock TextArea owns ctrl+y (Redo) and stops
+    unhandled keys before the app-level binding, so NewTaskInput and
+    ChatInput re-declare it on the `app` namespace (the new-task editor
+    is the default focus at startup — the global binding was dead
+    there)."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        editor = app.query_one("#nt-input", NewTaskInput)
+        editor.focus()
+        await pilot.pause()
+        await pilot.press("ctrl+y")
+        await pilot.pause()
+        assert isinstance(app.screen, GoalEditScreen)
+        app.screen.action_cancel()
+        await pilot.pause()
+        chat = app.query_one("#chat-input", ChatInput)
+        chat.focus()
+        await pilot.pause()
+        await pilot.press("ctrl+y")
+        await pilot.pause()
+        assert isinstance(app.screen, GoalEditScreen)
 
 
 async def test_goal_screen_subgoal_capture(app: DrCodeApp) -> None:

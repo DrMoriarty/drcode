@@ -71,6 +71,17 @@ class PipelineAgentRunLayer(CoreState):
             # ACTIVE with pending retry state; nothing is lost (the next
             # start resumes it).
             return
+        # Register the run BEFORE the worker is spawned: between the
+        # dispatch and the worker's first tick the task must already
+        # count as owned — otherwise a same-tick _advance() (slot
+        # accounting) or the stall watchdog's zombie sweep would see an
+        # ACTIVE task with no run and misread it as a silent worker
+        # death. The generation bump moved here from the worker body
+        # for the same reason (the worker reads the pre-stamped
+        # generation).
+        generation = self._agent_generations.get(task_id, 0) + 1
+        self._agent_generations[task_id] = generation
+        self._agent_runs[task_id] = generation
         self.host.host_spawn_worker(
             partial(self._run_agent_worker, task_id),
             name=f"agent run {task_id}",
@@ -128,8 +139,14 @@ class PipelineAgentRunLayer(CoreState):
         self.refresh_status()
 
     async def _run_agent_worker(self, task_id: str) -> None:
-        generation = self._agent_generations.get(task_id, 0) + 1
+        # The generation was stamped and the run registered by run_agent()
+        # right before the spawn — read it, don't bump again: a second
+        # bump would orphan the registration (the finally below pops the
+        # registry entry keyed by THIS generation). The fallback keeps a
+        # direct invocation working the old way.
+        generation = self._agent_generations.get(task_id, 0) or 1
         self._agent_generations[task_id] = generation
+        self._agent_runs[task_id] = generation
         # Key for the tool-spinner registry: superseded runs clean up only
         # their own entries.
         run_key: tuple[str, str, int] = ("agent", task_id, generation)
@@ -374,6 +391,7 @@ class PipelineAgentRunLayer(CoreState):
             # user acts, and the newer run advances on its own completion.
             if not cancelled and self._agent_generations.get(task_id) == generation:
                 await self._agent_run_epilogue(task, task_id)
+                self._guard_zombie_exit(task, task_id)
 
     # -- run-loop helpers -------------------------------------------------------
     # (the decomposed pieces of _run_agent_worker; the worker above keeps the
@@ -947,3 +965,58 @@ class PipelineAgentRunLayer(CoreState):
             # the pipeline going with the next task (failed ones are
             # excluded, so a dead gateway can't loop the queue).
             self._advance()
+
+    def _guard_zombie_exit(self, task: Task, task_id: str) -> None:
+        """Last-resort guard at the very end of a run. By this point the
+        epilogue must have resolved the task: completed it, re-queued a
+        failure, or left it deliberately paused on an unfinished attempt
+        (abort / mid-run compaction pause — those handlers leave their
+        own traces) or behind a scheduled network retry. Reaching this
+        with the task still ACTIVE, owned by nobody and paused by
+        nothing is the silent-worker-exit state (incident #a2dc8424):
+        the worker is gone, nothing will ever pick an ACTIVE task up
+        (promote_next skips non-queued ones) and it blocks a development
+        slot forever. Leave the trace the vanished path did not write
+        and hand the task back to the pipeline: re-queue it, excluded
+        from automatic promotion for the rest of the session exactly
+        like an ordinary failure (the failed-queue rescue lifts the
+        exclusion when nothing error-free remains)."""
+        if task.status is not TaskStatus.ACTIVE:
+            return
+        if task.id in self._agent_runs or task.id in self._agent_net_retry_at:
+            # A newer run owns it / a retry is already scheduled.
+            return
+        if task.unfinished:
+            # A deliberate pause (abort, compaction): not a zombie — its
+            # own handlers left the traces and the resume markers.
+            return
+        if not self.resolved_config(self._task_role(task)).is_ready:
+            # The model-not-configured pause: the early return above the
+            # turn loop left its own event ("message is kept and will be
+            # sent once the model is available") — re-queueing here would
+            # only churn the queue while nothing can run at all.
+            return
+        if task.pending_input:
+            detail = "ended without consuming the queued message"
+        else:
+            detail = "ended without completing or re-queueing the task"
+        self._show_event(
+            task,
+            f"The agent run {detail} — re-queueing it so the pipeline keeps flowing.",
+        )
+        # The resume marker: a re-queued task is promotable only with
+        # pending input or an unfinished attempt — without one it would
+        # sit in the queue forever.
+        task.unfinished = True
+        task.status = TaskStatus.QUEUED
+        self._agent_failed.add(task_id)
+        # No live run means no retry can be in flight — drop any stale
+        # network bookkeeping or the outage latch would hold the session.
+        self._agent_net_count.pop(task_id, None)
+        self._agent_net_retry_at.pop(task_id, None)
+        self.manager.storage.save(task)
+        # The transition happened outside the manager — report it to the
+        # status observers (notifications) explicitly.
+        self.manager.fire_status_change(task, TaskStatus.ACTIVE, "system")
+        self.refresh_sidebar()
+        self._advance()

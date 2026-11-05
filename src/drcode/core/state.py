@@ -105,6 +105,29 @@ class CoreState:
         self._resolved_configs.clear()
         self._resolved_model_keys.clear()
 
+    def _zombie_active_ids(self) -> set[str]:
+        """ACTIVE tasks no live run owns and nothing legitimately pauses:
+        not in the run registry, not an unfinished attempt (abort /
+        mid-run compaction pause — its handlers left the traces and the
+        user or the restart-time auto-resume picks it up), not waiting on
+        a scheduled network retry, and a model exists to run it at all.
+
+        This is the silent-worker-exit state (incident #a2dc8424):
+        promote_next never re-activates a non-queued task, so such a task
+        would sit ACTIVE forever — and through the raw active count block
+        a development slot forever. The stall watchdog requeues or
+        restarts them after the stall limit (see _poll_stall); the slot
+        accounting refuses to count them as occupied slots in the
+        meantime."""
+        return {
+            t.id
+            for t in self.manager.active_tasks()
+            if t.id not in self._agent_runs
+            and not t.unfinished
+            and t.id not in self._agent_net_retry_at
+            and self.resolved_config(self._task_role(t)).is_ready
+        }
+
     _resolved_configs: dict[AgentRole, Config]
     _resolved_model_keys: dict[AgentRole, str]
 

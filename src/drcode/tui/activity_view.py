@@ -304,6 +304,41 @@ class ActivityLayer(DrCodeState):
                 f"{self.settings.stall_nudge.label})",
             )
             self._nudge_run(task)
+        # Zombie sweep: an ACTIVE task nobody runs and nothing legitimately
+        # pauses (see _zombie_active_ids) — the silent-worker-exit state
+        # (incident #a2dc8424): the worker vanished without a trace, the
+        # run registry is empty for it, promote_next never re-activates a
+        # non-queued task and the watchdog's live-run pass above never
+        # sees it. Same treatment as a hung run: after the stall limit,
+        # nudge it (restart the run — it resumes via pending input or the
+        # unfinished marker, or completes cleanly when there is nothing
+        # left to do).
+        for task_id in self._zombie_active_ids():
+            stamped = self._last_activity.get(task_id)
+            if stamped is None:
+                # First sight of it: start its stall clock (a run that
+                # died before its first activity stamp has no age of its
+                # own).
+                self._last_activity[task_id] = now
+                continue
+            stalled_for = now - stamped
+            if stalled_for < limit * 60:
+                continue
+            task = self.manager.tasks.get(task_id)
+            if task is None:
+                continue
+            self._show_event(
+                task,
+                f"Task active but no run owns it for "
+                f"{self._fmt_age(int(stalled_for))} — the worker must "
+                f"have exited without a trace; restarting it "
+                f"(stall limit: {self.settings.stall_nudge.label})",
+            )
+            self._nudge_run(task)
+            # Push the stall clock forward: the restart is scheduled (the
+            # nudge timer re-registers the run within seconds) — without
+            # this the sweep would re-nudge every tick until it fires.
+            self._last_activity[task_id] = now
 
     def _nudge_run(self, task: Task, *, source: str = "watchdog") -> bool:
         """Abort the hung/stalled run for `task` (if one is in flight) and

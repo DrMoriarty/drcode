@@ -109,7 +109,10 @@ class PipelineDepsLayer(CoreState):
         "manual merge not noticed while idle" gap)."""
         if self.agent_running or self._review_running:
             return
-        if len(self.manager.active_tasks()) >= self.parallel_limit:
+        if (
+            len(self.manager.active_tasks()) - len(self._zombie_active_ids())
+            >= self.parallel_limit
+        ):
             return
         if not any(t.depends_on for t in self.manager.queued()):
             return

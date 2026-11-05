@@ -206,7 +206,7 @@ class SettingsPalette(CommandPalette):
     # anything not matching a prefix slots in right before the last entry
     # ("Quit"). Head block per the current UX convention: Keys, Theme, then
     # the "Find task…" action. The read-only statistics entries
-    # (Screenshot / Statistics / Token usage) sit at the very bottom, right
+    # (Screenshot / Statistics) sit at the very bottom, right
     # before the pinned Quit. The model-related entries
     # (provider catalog + the per-role project settings form) live in
     # the "Model settings…" sub-menu (ModelSettingsPalette), and the task
@@ -226,7 +226,6 @@ class SettingsPalette(CommandPalette):
         "Minimize",
         "Screenshot",
         "Statistics…",
-        "Token usage…",
         "Quit",
     )
 
@@ -358,16 +357,10 @@ class ServiceCommandsProvider(CommandListProvider):
             CommandEntry(
                 "Statistics…",
                 app.action_task_statistics,
-                "Project statistics: created/completed/cancelled/failed "
-                "per day and the average dev/testing/resolver time "
+                "Project statistics (created/completed/cancelled/failed "
+                "per day, average dev/testing/resolver time) and the "
+                "per-day, per-model token usage — one dialog, two tabs "
                 "(the same dialog as Ctrl+G)",
-            ),
-            CommandEntry(
-                "Token usage…",
-                app.action_open_usage_dialog,
-                "Per-day, per-model token statistics of every model call "
-                "(input / output / cache breakdown, request counts) — "
-                "accumulated in ~/.config/drcode/usage.json",
             ),
             CommandEntry(
                 "Update/create AGENTS.md",

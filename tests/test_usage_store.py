@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai.usage import RunUsage
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Tabs
 
 import drcode.config as config_module
 from drcode.providers import AgentRole
@@ -260,21 +260,29 @@ async def test_app_usage_hook_is_best_effort(
 async def test_app_usage_dialog_renders_the_store(
     project_root: Path,
 ) -> None:
+    """The token-usage tab of the combined statistics dialog renders the
+    store: activating the tab triggers the lazy load, and the table shows
+    one data row + the period total."""
     from drcode.tui.app import DrCodeApp
-    from drcode.tui.usage_dialog import UsageDialog
+    from drcode.tui.stats_dialog import StatsDialog
 
     app = DrCodeApp(project_root)
-    async with app.run_test():
+    async with app.run_test() as pilot:
         app._record_session_usage(
             _usage(input=100, output=10, cache_read=50, requests=2),
             AgentRole.CODING,
             "openai/gpt-5",
         )
-        dialog = UsageDialog(store=app._usage_store)
+        dialog = StatsDialog(project_root, usage_store=app._usage_store)
         await app.push_screen(dialog)
+        await pilot.pause()
+        # Switch to the usage tab — the load starts on the FIRST
+        # activation.
+        dialog.query_one("#stats-tabs", Tabs).active = "usage"
         await app.workers.wait_for_complete()
+        await pilot.pause()
         table = dialog.query_one("#usage-table", DataTable)
         # One data row + the period total.
         assert table.row_count == 2
         status = str(dialog.query_one("#usage-status").render())
-        assert "1 day(s)" in status
+        assert "1 дн." in status

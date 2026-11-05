@@ -630,25 +630,28 @@
 
   /* One-shot availability probe for the font dialog, retried with the
    * same 250 ms × 40 pattern as the other bridge calls (pywebview
-   * injects asynchronously). Failure or absence of the bridge leaves
-   * availableFonts null → the dialog shows the full curated list. A
-   * dialog opened before the probe lands is simply unfiltered — the
-   * next open is filtered. */
+   * injects asynchronously). The FIRST api() lookup must be inside the
+   * retry loop too: boot() runs on DOMContentLoaded, which in the frozen
+   * app regularly wins the race against the bridge injection — an early
+   * miss used to bail out permanently (if (!getFonts) return) and the
+   * dialog stayed unfiltered forever (the Python probe was never even
+   * called). Failure or absence of the bridge leaves availableFonts
+   * null → the dialog shows the full curated list. A dialog opened
+   * before the probe lands is simply unfiltered — the next open is
+   * filtered. */
   function fetchAvailableFonts() {
-    var getFonts = api("get_available_fonts");
-    if (!getFonts) return; // browser mode: nothing to filter by
     function apply(list) {
       if (Array.isArray(list)) availableFonts = list;
     }
     var attempts = 0;
     var timer = setInterval(function () {
       attempts += 1;
-      var retry = api("get_available_fonts");
-      if (retry) {
+      var getFonts = api("get_available_fonts");
+      if (getFonts) {
         clearInterval(timer);
-        Promise.resolve(retry()).then(apply).catch(function () {});
+        Promise.resolve(getFonts()).then(apply).catch(function () {});
       } else if (attempts > 40) {
-        clearInterval(timer); // probe never arrives: stay unfiltered
+        clearInterval(timer); // bridge never arrives: stay unfiltered
       }
     }, 250);
   }

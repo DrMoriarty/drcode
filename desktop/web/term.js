@@ -239,6 +239,33 @@
     sendResize();
   }
 
+  /* Hotkey-driven size changes must persist like the settings dialog does.
+   * A held Ctrl+-/Ctrl+= emits a burst of keydowns, so the bridge call is
+   * debounced; at fire time the CURRENT term.options.fontSize is sent and
+   * the family is always passed along — the python side rewrites BOTH
+   * fields, and null family would wipe the stored font. Bridge-less
+   * browser mode stays local (no persistence, matching its no-disk
+   * nature). */
+  var FONT_SAVE_DEBOUNCE_MS = 500;
+  var fontSizeSaveTimer = null;
+
+  function persistFontSize() {
+    if (!term) return;
+    var size = term.options.fontSize;
+    savedSettings = { font_family: currentFontFamily, font_size: size };
+    var setFont = api("set_font_settings");
+    if (!setFont) return; // browser mode: apply locally only
+    if (fontSizeSaveTimer) clearTimeout(fontSizeSaveTimer);
+    fontSizeSaveTimer = setTimeout(function () {
+      fontSizeSaveTimer = null;
+      Promise.resolve(setFont(currentFontFamily, term.options.fontSize))
+        .then(function (res) {
+          if (res) savedSettings = res;
+        })
+        .catch(function () { /* best-effort persistence, like _save_config */ });
+    }, FONT_SAVE_DEBOUNCE_MS);
+  }
+
   function applyFontSize(size) {
     if (!term) return;
     var clamped = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
@@ -246,6 +273,7 @@
     term.options.fontSize = clamped;
     recreateWebgl();
     refitAfterFontChange();
+    persistFontSize();
   }
 
   /* Changing the family changes the cell metrics exactly like a size

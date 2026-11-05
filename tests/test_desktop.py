@@ -496,6 +496,32 @@ def test_term_js_font_settings_wiring() -> None:
     assert "ev.preventDefault();\n      openSettings();\n      return false;" in handler
 
 
+def test_term_js_hotkey_font_size_persists() -> None:
+    """Hotkey size changes (Ctrl+= / Ctrl+- / Ctrl+0) must persist like the
+    settings dialog: applyFontSize has to reach set_font_settings (debounced
+    — a held key emits a burst of keydowns) and MUST pass the current font
+    family along — the python side rewrites both fields, so a null family
+    would wipe the stored font."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    apply_size = js[
+        js.index("function persistFontSize") : js.index("function applyFontFamily")
+    ]
+
+    # The bridge save is debounced, not per-keydown.
+    assert "setTimeout" in apply_size
+    assert "clearTimeout" in apply_size
+    # The saved family rides along on every persist call.
+    assert "setFont(currentFontFamily" in apply_size
+    # Bridge-less browser mode stays local (no persistence attempt).
+    assert 'api("set_font_settings")' in apply_size
+    # applyFontSize actually triggers the persistence after its change.
+    assert apply_size.index("persistFontSize();") > apply_size.index(
+        "term.options.fontSize = clamped;"
+    )
+    # The dialog's view of the stored settings is kept current.
+    assert "savedSettings" in apply_size
+
+
 def test_index_html_has_settings_dialog() -> None:
     html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
     for el_id in (

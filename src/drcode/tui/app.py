@@ -841,6 +841,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # value of a finished task — it stays in the history via the saved
         # per-response usage).
         self._live_ctx_tokens: dict[str, int] = {}
+        # Eviction credit per task (see state.py): the ≈tokens the batch
+        # eviction of the agent-marked tool results collapsed, subtracted
+        # from the dev transcript's fill readings until a fresh usage
+        # report consumes it.
+        self._evicted_ctx_tokens: dict[str, int] = {}
         # Per-agent live readings for the tester and resolver rounds (see
         # state.py): filled from the respective run's model-request nodes,
         # popped in the run's finally-block.

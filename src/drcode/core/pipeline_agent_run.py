@@ -580,6 +580,10 @@ class PipelineAgentRunLayer(CoreState):
         ctx_tokens = run_context_tokens(run)
         if ctx_tokens is not None:
             self._live_ctx_tokens[task_id] = ctx_tokens
+            # A fresh usage reading postdates any batch eviction: the
+            # eviction credit (which corrected the pre-eviction readings)
+            # is consumed — the real numbers speak for themselves now.
+            self._evicted_ctx_tokens.pop(task_id, None)
             if self.viewed_id == task_id:
                 self.refresh_task_status()
         # Exact per-request usage of the completed model call, into the
@@ -687,6 +691,23 @@ class PipelineAgentRunLayer(CoreState):
             self._show_event(
                 task,
                 f"Context fill {pct}% — pausing the run to compact history…",
+            )
+            self._persist_task_messages(task, run)
+            task.messages = sanitized_messages(task.messages)
+            task.unfinished = True
+            self.manager.storage.save(task)
+            return True
+        # Selective-eviction gate (mark_unneeded marks): the threshold is
+        # NOT reached, but the agent-marked results have piled up to a
+        # third of the window — pause the run so the batch eviction can
+        # collapse them between turns (the actual eviction happens in
+        # _maybe_compact at the next turn boundary, exactly like a
+        # mid-run compaction pause).
+        if self._eviction_due(task):
+            self._show_event(
+                task,
+                "Marked tool results reached ≈1/3 of the context window — "
+                "pausing the run to unload them…",
             )
             self._persist_task_messages(task, run)
             task.messages = sanitized_messages(task.messages)

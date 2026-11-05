@@ -2442,9 +2442,9 @@ async def test_pipeline_settled_notification_primes_then_sends(
 
 async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
     """The Settings menu lists its entries in the fixed logical order
-    (Keys, Theme, …, Screenshot, Statistics, Token usage, Quit) — never
-    alphabetically and never in the provider-completion order, which would
-    differ from run to run."""
+    (Keys, Theme, …, Screenshot, Statistics, Quit) — never alphabetically
+    and never in the provider-completion order, which would differ from
+    run to run."""
     async with app.run_test() as pilot:
         await pilot.press("escape")  # skip the first-start setup dialog
         app.action_settings()
@@ -2474,7 +2474,7 @@ async def test_settings_palette_entry_order(app: DrCodeApp) -> None:
         assert names[1] == "Theme"
         assert "Create goal…" not in names
         assert "ESC stop behavior: double-press confirm" not in "".join(names)
-        assert names[-4:] == ["Screenshot", "Statistics…", "Token usage…", "Quit"]
+        assert names[-3:] == ["Screenshot", "Statistics…", "Quit"]
 
 
 # -- terminal tab title ---------------------------------------------------------

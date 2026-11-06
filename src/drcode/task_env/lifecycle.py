@@ -469,6 +469,11 @@ class _WorktreeLifecycleMixin:
                     f"git worktree add failed, the task falls back to the "
                     f"project directory: {(created or out)[:500]}"
                 )
+        # Submodules: `git worktree add` never populates them — populate
+        # here (best effort, see _init_submodules) so the agent does not
+        # burn a manual `git submodule update --init` on every task in a
+        # project with submodules.
+        self._init_submodules(task_id, wt)
         # The branch was just (re-)checked out here: this commit is the
         # baseline the smart snapshot gate measures the run's own commits
         # against (`worktree_snapshot: only-if-no-commits`). Deliberately
@@ -487,6 +492,45 @@ class _WorktreeLifecycleMixin:
             # as a mystery conflict an hour later.
             self.event_log(task_id, created)
         return wt, note
+
+    def _init_submodules(self, task_id: str, wt: Path) -> None:
+        """Initialize git submodules in a freshly created worktree.
+
+        `git worktree add` never populates submodules: the module
+        directories arrive empty, and agents working in such a worktree
+        burned a manual `git submodule update --init` on every task. When
+        the new worktree has a `.gitmodules`, run the recursive update
+        there; without one this is a no-op — zero overhead for projects
+        without submodules.
+
+        Best effort by contract: a failure NEVER fails the activation
+        (the task keeps working in the worktree) — it is reported as a
+        `Warning:` service event, like the start-point anomalies. Blocking
+        git — the caller (`_ensure_root_locked`) runs under the activation
+        lock, same style as its other git calls."""
+        try:
+            gitmodules = (wt / ".gitmodules").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return
+        # Count the module sections — a cheap local parse of `.gitmodules`
+        # (no extra git process just for the count in the event message).
+        count = sum(
+            1
+            for line in gitmodules.splitlines()
+            if line.strip().startswith("[submodule")
+        )
+        if not count:
+            return
+        code, out = self._git("submodule", "update", "--init", "--recursive", cwd=wt)
+        if self.event_log is None:
+            return
+        if code == 0:
+            self.event_log(task_id, f"submodules initialized ({count} modules)")
+        else:
+            detail = out.strip() or f"git exited with code {code}"
+            self.event_log(task_id, f"Warning: submodule init failed: {detail[:300]}")
 
     def _collect_untracked(self) -> list[str]:
         """Untracked (plain + gitignored) files of the main tree, relative

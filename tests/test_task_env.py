@@ -1538,3 +1538,139 @@ def test_duplicate_commits_none_without_branch_or_repo(
     # Isolation off (degenerates to pass-through at the call site).
     off = TaskEnvironment(project_root, ProjectSettings())
     assert off.duplicate_commits("t1") is None
+
+
+# -- submodules in a fresh worktree --------------------------------------------------
+
+
+@pytest.fixture
+def submodule_repo(tmp_path: Path) -> Path:
+    """A standalone repository used as the submodule's source."""
+    sub = tmp_path / "subrepo"
+    sub.mkdir()
+    _git(sub, "init", "-q")
+    _git(sub, "config", "user.email", "test@example.com")
+    _git(sub, "config", "user.name", "Test")
+    (sub / "lib.txt").write_text("submodule content")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-q", "-m", "sub init")
+    return sub
+
+
+@pytest.fixture
+def file_protocol_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Modern git blocks the file transport for submodule clones by default
+    (CVE-2022-39253). Enable it through the environment: unlike a repo-local
+    `git config` (which the `git clone` children spawned by `git submodule
+    update` never see), the env reaches EVERY git process in the tree —
+    the test's `submodule add` and the production init inside the worktree
+    alike. Production code keeps git's strict default: a local-path
+    submodule then degrades to the `Warning:` service event."""
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
+
+
+def _add_submodule(git_root: Path, submodule_repo: Path) -> None:
+    _git(git_root, "submodule", "add", "-q", str(submodule_repo), "libs/sub")
+    _git(git_root, "commit", "-q", "-m", "add submodule")
+
+
+def test_ensure_root_initializes_submodules(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    submodule_repo: Path,
+    file_protocol_ok: None,
+) -> None:
+    """A fresh worktree in a project with a submodule gets the module
+    populated automatically — no manual `git submodule update --init`."""
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    _add_submodule(git_root, submodule_repo)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert wt == git_root / ".drcode" / "worktrees" / "t1"
+    # The module directory in the worktree is NOT empty: the file from the
+    # submodule's HEAD is checked out there.
+    assert (wt / "libs" / "sub" / "lib.txt").read_text() == "submodule content"
+    # The init event is there (the branch-creation event is the other one).
+    submodule_events = [text for _, text in events if "submodule" in text]
+    assert submodule_events == ["submodules initialized (1 modules)"]
+
+
+def test_ensure_root_without_gitmodules_no_submodule_event(
+    git_root: Path, isolated_settings: ProjectSettings
+) -> None:
+    """A project without submodules: no extra event, behavior unchanged."""
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    # No submodule init event, not even a failed one (the branch-creation
+    # event of a fresh worktree is the only entry).
+    assert not any("submodule" in text for _, text in events)
+    assert wt.is_dir()
+
+
+def test_ensure_root_survives_submodule_init_failure(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    submodule_repo: Path,
+    file_protocol_ok: None,
+) -> None:
+    """A failing submodule init never fails the activation: the task keeps
+    its worktree, and the chat gets a `Warning:` service event."""
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    # A gitlink + a `.gitmodules` whose URL cannot be cloned, registered
+    # WITHOUT `git submodule add` (that would pin a WORKING url in the
+    # repo config, and worktrees share the repo config — the update could
+    # then clone from it instead of failing): the init in the fresh
+    # worktree must clone and cannot — it fails; the activation must not.
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=submodule_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    (git_root / ".gitmodules").write_text(
+        '[submodule "libs/sub"]\n'
+        "\tpath = libs/sub\n"
+        "\turl = /nonexistent/drcode-test-missing-repo\n"
+    )
+    _git(git_root, "add", ".gitmodules")
+    _git(git_root, "update-index", "--add", "--cacheinfo", f"160000,{sha},libs/sub")
+    _git(git_root, "commit", "-q", "-m", "add broken submodule")
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert wt == git_root / ".drcode" / "worktrees" / "t1"
+    assert wt.is_dir()
+    assert events and events[0][0] == "t1"
+    assert events[0][1].startswith("Warning: submodule init failed:")
+
+
+def test_ensure_root_submodule_init_without_event_log(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    submodule_repo: Path,
+    file_protocol_ok: None,
+) -> None:
+    """event_log is a best-effort sink: submodule init runs (and succeeds)
+    even with no sink wired."""
+    env = TaskEnvironment(git_root, isolated_settings)
+    _add_submodule(git_root, submodule_repo)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert (wt / "libs" / "sub" / "lib.txt").is_file()

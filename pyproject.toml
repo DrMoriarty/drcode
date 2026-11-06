@@ -11,6 +11,10 @@ dependencies = [
     "pydantic-ai>=2.56.0",
     "pydantic-settings>=2.16.0",
     "textual>=8.2.8",
+    # Direct import in github.py / notifications.py / agent_model.py /
+    # voice/client.py — must not rely on it arriving transitively
+    # (pydantic-ai switched from httpx to httpx2 in newer releases).
+    "httpx>=0.27",
     # Voice I/O (push-to-talk dictation + TTS announcements): sounddevice
     # needs the PortAudio library (bundled in its wheels; on Linux install
     # libportaudio2). numpy-free on purpose — the PCM16 buffers are handled

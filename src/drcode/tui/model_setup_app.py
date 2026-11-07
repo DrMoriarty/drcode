@@ -88,7 +88,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         color: $accent;
         text-style: bold;
     }
-    #mc-main { height: auto; }
+    #mc-main {
+        height: 1fr;
+    }
     #mc-left { width: 34; margin-right: 2; height: auto; }
     #mc-providers { height: 6; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }

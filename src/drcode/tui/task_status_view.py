@@ -246,11 +246,17 @@ class TaskStatusLayer(DrCodeState):
                 "[@click=app.unlink_viewed_goal][red]✕[/][/] "
                 # The goal fragment is magenta (the goal color of this
                 # row, distinct from the cyan deps and the deepskyblue branch).
-                f"[magenta][@click=app.open_goals('{goal.id}')]goal: #{goal.id} "
+                # No goal id in the text: the sidebar shows goals by title
+                # only, the id means nothing to the user (the click target
+                # still carries it).
+                f"[magenta][@click=app.open_goals('{goal.id}')]goal: "
                 f"◆ {escape(goal.title_display)}[/]"
             )
         elif task.goal_id:
-            bits.append(f"[dim]goal: #{task.goal_id} ?[/]")
+            # Dangling link (the goal was deleted): no title to show and
+            # the bare id tells the user nothing — just a dim marker, the
+            # "+ assign" link below handles re-linking.
+            bits.append("[dim]goal: ?[/]")
         if goal is None:
             # Same magenta family as the goal fragment it stands in for.
             bits.append("[@click=app.assign_goal][magenta]+ assign[/][/]")

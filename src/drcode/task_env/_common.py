@@ -28,7 +28,19 @@ BRANCH_PREFIX = "drcode/"
 
 # Git worktrees can be registered but missing on disk (a hand-deleted
 # directory) and directories can exist without a registration — both are
-# handled by ensure_root's fallbacks (drcode.task_env.lifecycle).
+# handled by ensure_root (drcode.task_env.lifecycle).
+
+
+class WorktreeUnavailable(RuntimeError):
+    """`git worktree add` failed and the task CANNOT run in the project
+    directory (the cb4937bb/540a500d incident: the old silent fallback let
+    two parallel rounds edit the user's checkout directly — their
+    uncommitted edits blocked every later accept-hook merge, and the
+    snapshot mechanism never saw them because it looks only at the task's
+    own worktree). ensure_root raises this instead; the pipeline surfaces
+    the full git output as a service event and requeues the task — the
+    next activation retries the worktree creation."""
+
 
 # Dependency/cache directories never copied into a fresh worktree (see the
 # package docstring): re-create them there with the package manager instead

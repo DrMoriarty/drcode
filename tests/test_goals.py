@@ -297,6 +297,100 @@ def test_goal_auto_done_skips_archived_goal(manager) -> None:
     assert manager.goals.get(goal.id).status is GoalStatus.ARCHIVED
 
 
+def test_goal_auto_done_blocked_by_active_subgoal(manager) -> None:
+    parent = manager.goals.create("parent")
+    sub = manager.goals.create("sub", parent_id=parent.id)
+    parent_task = manager.create(
+        "p", "brief", kind=TaskKind.RESEARCH, goal_id=parent.id
+    )
+    sub_task = manager.create("s", "brief", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    # Parent's own tasks are done, but the subgoal is still active.
+    manager.mark_done(parent_task.id)
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+    # Closing the subgoal's task cascades: sub done → parent done.
+    manager.mark_done(sub_task.id)
+    assert manager.goals.get(sub.id).status is GoalStatus.DONE
+    assert manager.goals.get(parent.id).status is GoalStatus.DONE
+    events = [e.text for e in manager.get(sub_task.id).events if e.kind == "goals"]
+    assert sum("переведена" in e and "done" in e for e in events) == 2
+
+
+def test_goal_auto_done_cascade_up_multiple_levels(manager) -> None:
+    root = manager.goals.create("root")
+    mid = manager.goals.create("mid", parent_id=root.id)
+    sub = manager.goals.create("sub", parent_id=mid.id)
+    # No direct tasks on root/mid at all — they close via the cascade.
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(sub.id).status is GoalStatus.DONE
+    assert manager.goals.get(mid.id).status is GoalStatus.DONE
+    assert manager.goals.get(root.id).status is GoalStatus.DONE
+    events = [e.text for e in manager.get(task.id).events if e.kind == "goals"]
+    assert sum("переведена" in e and "done" in e for e in events) == 3
+
+
+def test_goal_auto_done_without_tasks_needs_subgoals(manager) -> None:
+    # An idea without tasks AND without subgoals stays out of auto-done.
+    orphan = manager.goals.create("orphan")
+    sub = manager.goals.create("sub", parent_id=orphan.id)
+    assert manager.goals.get(orphan.id).status is GoalStatus.ACTIVE
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(orphan.id).status is GoalStatus.DONE
+
+
+def test_goal_auto_done_archived_subgoal_does_not_block(manager) -> None:
+    parent = manager.goals.create("parent")
+    sub = manager.goals.create("sub", parent_id=parent.id)
+    manager.goals.update(sub.id, status=GoalStatus.ARCHIVED)
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=parent.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(parent.id).status is GoalStatus.DONE
+
+
+def test_goal_auto_done_active_subgoal_tree_blocks_deep(manager) -> None:
+    parent = manager.goals.create("parent")
+    sub = manager.goals.create("sub", parent_id=parent.id)
+    deep = manager.goals.create("deep", parent_id=sub.id)
+    # A subgoal's own unfinished subgoal (any depth) blocks the parent.
+    manager.create("s", "brief", kind=TaskKind.RESEARCH, goal_id=deep.id)
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=parent.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+    assert manager.goals.get(sub.id).status is GoalStatus.ACTIVE
+
+
+def test_goal_reactivate_cascades_up_from_subgoal(manager) -> None:
+    parent = manager.goals.create("parent")
+    sub = manager.goals.create("sub", parent_id=parent.id)
+    done = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    manager.mark_done(done.id)
+    assert manager.goals.get(sub.id).status is GoalStatus.DONE
+    assert manager.goals.get(parent.id).status is GoalStatus.DONE
+
+    # A fresh task on the subgoal re-opens the whole chain up.
+    fresh = manager.create("t2", "more", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    assert manager.goals.get(sub.id).status is GoalStatus.ACTIVE
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+    events = [e.text for e in manager.get(fresh.id).events if e.kind == "goals"]
+    assert sum("возвращена" in e and "active" in e for e in events) == 2
+
+
+def test_goal_reactivate_cascade_stops_at_active_ancestor(manager) -> None:
+    parent = manager.goals.create("parent")
+    sub = manager.goals.create("sub", parent_id=parent.id)
+    task = manager.create("t", "brief", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    manager.mark_done(task.id)
+    assert manager.goals.get(parent.id).status is GoalStatus.DONE
+    # Parent re-opened by its own new task: the chain below re-opens
+    # only up to it — an ACTIVE ancestor is not touched again.
+    manager.create("p2", "more", kind=TaskKind.RESEARCH, goal_id=parent.id)
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+    manager.create("s2", "more", kind=TaskKind.RESEARCH, goal_id=sub.id)
+    assert manager.goals.get(sub.id).status is GoalStatus.ACTIVE
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+
+
 def test_goal_reactivates_when_new_task_created(manager) -> None:
     goal = manager.goals.create("Async core")
     first = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)

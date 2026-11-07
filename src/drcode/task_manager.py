@@ -389,35 +389,63 @@ class TaskManager:
         self.storage.save(task)
 
     def _goal_auto_done(self, task: Task, _old: TaskStatus, _origin: str) -> None:
-        """Completion listener closing the goal LIFECYCLE loop: when every
-        task linked to the goal has honestly reached COMPLETED, the goal
-        itself flips to DONE — the "✓ done" mark stops being a manual
-        chore. Scope: only the goal's own live links (task.goal_id mirror,
-        the same set goal_progress counts) — a goal without any linked
-        task is never touched (ideas are naturally out of scope), an
-        ARCHIVED goal is never resurrected/re-stamped, and an already-DONE
-        goal is left as is. Cancelled tasks do not count as done: cancel
-        is a user opt-out, not a completion (the goal then simply stays
-        active until its remaining tasks finish). Goes through
-        goals.update like every other status mutation."""
+        """Completion listener closing the goal LIFECYCLE loop: when the
+        goal is finished (goal_complete — all its live linked tasks
+        honestly COMPLETED and no ACTIVE subgoal anywhere in its
+        subtree), the goal itself flips to DONE — the "✓ done" mark
+        stops being a manual chore — and the check cascades UP the
+        parent chain: an ACTIVE parent whose decomposition just got
+        finished closes too. Scope: only the goal's own live links
+        (task.goal_id mirror, the same set goal_progress counts) — a
+        goal without any linked task AND without subgoals is never
+        touched (ideas are naturally out of scope), an ARCHIVED goal is
+        never resurrected/re-stamped, and an already-DONE goal is left
+        as is. Cancelled tasks do not count as done: cancel is a user
+        opt-out, not a completion (the goal then simply stays active
+        until its remaining tasks finish). Goes through goals.update
+        like every other status mutation."""
         goal = self.goals.goals.get(task.goal_id) if task.goal_id else None
         if goal is None or goal.status is not GoalStatus.ACTIVE:
             return
         linked = [t for t in self.tasks.values() if t.goal_id == goal.id]
-        if not linked or not all(
-            t.status is TaskStatus.COMPLETED and not t.cancelled for t in linked
-        ):
+        if not linked and not self.goals.children(goal.id):
             return
+        if not self.goal_complete(goal):
+            return
+        self._goal_close_auto(goal, task)
+
+    def _goal_close_auto(self, goal: Goal, task: Task) -> None:
+        """Flip `goal` to DONE, announce it in `task`'s chat log (the
+        message names both the linked tasks and the subgoals that made
+        the goal finished), then re-check the parent: an ACTIVE parent
+        that now satisfies goal_complete closes by the same token (the
+        just-closed subgoal no longer blocks it). Ancestors that are
+        DONE/ARCHIVED are left as is."""
+        linked = sum(1 for t in self.tasks.values() if t.goal_id == goal.id)
+        subs = len(self.goals.descendant_ids(goal.id))
         self.goals.update(goal.id, status=GoalStatus.DONE)
+        if linked and subs:
+            detail = f"все {linked} связанных задач и все {subs} суб-целей завершено"
+        elif subs:
+            detail = f"все {subs} суб-целей завершено"
+        else:
+            detail = f"все {linked} связанных задач завершено"
         task.events.append(
             TaskEvent(
                 kind="goals",
                 text=f"цель {goal.title_display} ({goal.id}) переведена "
-                f"в done — все {len(linked)} связанных задач завершено",
+                f"в done — {detail}",
             )
         )
         task.touch()
         self.storage.save(task)
+        parent = self.goals.goals.get(goal.parent_id) if goal.parent_id else None
+        if (
+            parent is not None
+            and parent.status is GoalStatus.ACTIVE
+            and self.goal_complete(parent)
+        ):
+            self._goal_close_auto(parent, task)
 
     # -- queries ------------------------------------------------------------
 
@@ -790,14 +818,40 @@ class TaskManager:
                     total += c_total
         return done, total
 
+    def goal_complete(self, goal: Goal) -> bool:
+        """The auto-done predicate ("is this goal finished?"): every task
+        linked to `goal` has honestly COMPLETED (an empty link set passes —
+        cancel is a deliberate opt-out, not a completion), AND no goal in
+        its whole subtree (parent_id descendants, any depth) is still
+        ACTIVE — done/archived subgoals are out of the lifecycle and don't
+        block. The subgoals' own linked tasks are deliberately NOT checked
+        here: they close the subgoal via _goal_auto_done, whose upward
+        cascade re-checks the parent through this same predicate — so the
+        UI and the auto-done always agree."""
+        for t in self.tasks.values():
+            if t.goal_id == goal.id and not (
+                t.status is TaskStatus.COMPLETED and not t.cancelled
+            ):
+                return False
+        for desc_id in self.goals.descendant_ids(goal.id):
+            desc = self.goals.goals.get(desc_id)
+            if desc is not None and desc.status is GoalStatus.ACTIVE:
+                return False
+        return True
+
     def _goal_reactivate_if_done(self, goal: Goal, task: Task) -> None:
         """Auto-return from done: assigning a NOT-yet-completed task to a
         DONE goal flips the goal back to ACTIVE — a done goal that has
-        just picked up fresh work is not done anymore. An ARCHIVED goal is
-        left alone (its status is not DONE, so the guard below already
-        excludes it — stated explicitly in the docstring because the
-        auto-mechanics must never resurrect the archive), and a COMPLETED
-        task keeps the goal where it is (nothing new to do)."""
+        just picked up fresh work is not done anymore. The reactivation
+        cascades UP: a DONE ancestor standing only because this subgoal
+        was done returns to ACTIVE too (each step announced in the
+        task's chat log); the walk stops at the first ancestor that is
+        not DONE (an ACTIVE one has nothing to re-open, an ARCHIVED one
+        must never be resurrected). An ARCHIVED goal itself is left alone
+        (its status is not DONE, so the guard below already excludes it —
+        stated explicitly in the docstring because the auto-mechanics
+        must never resurrect the archive), and a COMPLETED task keeps the
+        goal where it is (nothing new to do)."""
         if goal.status is not GoalStatus.DONE:
             return
         if task.status is TaskStatus.COMPLETED:
@@ -812,6 +866,21 @@ class TaskManager:
         )
         task.touch()
         self.storage.save(task)
+        parent = self.goals.goals.get(goal.parent_id) if goal.parent_id else None
+        while parent is not None and parent.status is GoalStatus.DONE:
+            self.goals.update(parent.id, status=GoalStatus.ACTIVE)
+            task.events.append(
+                TaskEvent(
+                    kind="goals",
+                    text=f"цель {parent.title_display} ({parent.id}) возвращена "
+                    f"в active — её суб-цель {goal.title_display} "
+                    f"({goal.id}) снова активна",
+                )
+            )
+            task.touch()
+            self.storage.save(task)
+            goal = parent
+            parent = self.goals.goals.get(goal.parent_id) if goal.parent_id else None
 
     def link_goal(self, task_id: str, goal_id: str) -> Task:
         """Attach a task to a goal (the header's "+ assign"/"✏"

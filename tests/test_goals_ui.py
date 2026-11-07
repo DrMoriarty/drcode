@@ -88,18 +88,25 @@ async def test_sidebar_goals_section_rows_and_counters(app: DrCodeApp) -> None:
         assert add_goal_row(app) is not None
 
         # Completing the child's only task auto-dones the child goal
-        # (task_manager._goal_auto_done): its row leaves the sidebar's
-        # ACTIVE-only section, while the still-ACTIVE milestone keeps
-        # summing the subtree (1/1).
+        # (task_manager._goal_auto_done) and the closure cascades UP
+        # (_goal_close_auto): the milestone has no direct tasks, its only
+        # subgoal is now DONE → goal_complete(milestone) is True and it
+        # auto-dones too. Both rows leave the sidebar's ACTIVE-only
+        # section; the task's chat log carries an auto-done line each.
         app.manager.mark_done(task.id)
         app.refresh_sidebar()
         # The child's row removal is async (a ListView prune round-trip):
         # let it land before asserting the row is gone.
         await pilot.pause()
         rows = goal_rows(app)
-        assert set(rows) == {milestone.id, idea.id}
-        assert "1/1" in rows[milestone.id].text
+        assert set(rows) == {idea.id}
         assert app.manager.goals.get(child.id).status is GoalStatus.DONE
+        assert app.manager.goals.get(milestone.id).status is GoalStatus.DONE
+        events = [e.text for e in task.events if e.kind == "goals"]
+        auto_done = [e for e in events if "переведена" in e and "done" in e]
+        assert len(auto_done) == 2
+        assert child.id in auto_done[0]
+        assert milestone.id in auto_done[1]
 
 
 async def test_sidebar_goal_marker_on_task_row(app: DrCodeApp) -> None:

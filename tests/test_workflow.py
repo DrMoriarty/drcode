@@ -306,6 +306,98 @@ async def test_uncommented_example_leaves_dirty_checkout_alone(
     assert not (project_root / "feature.txt").exists()
 
 
+async def test_identical_tracked_changes_cleared_before_merge(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """Tracked modifications byte-identical to the merge target's
+    versions do not block the hook-merge (the #a6552566 cascade: a
+    fallback left edits identical to the task branches' versions in the
+    main checkout, and every later accept refused with "the checkout has
+    uncommitted changes"). Dropping them loses nothing — the bytes live
+    on the branch — so the hook clears them and merges, like the TUI's
+    ff-merge path already does for untracked copies."""
+    activated = _activated_example(project_root)
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    _git_ok("checkout", "-q", "-b", "drcode/t1", cwd=project_root)
+    (project_root / "base.txt").write_text("t1 version\n")
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "t1", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    # The uncommitted dirt: byte-identical to the branch version.
+    (project_root / "base.txt").write_text("t1 version\n")
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t", "")
+    merged = await hooks.call(
+        "on_accepted",
+        task,
+        cwd=project_root,
+        worktree={
+            "path": str(project_root / ".drcode" / "worktrees" / "t1"),
+            "branch": "drcode/t1",
+        },
+    )
+    assert merged.ok, merged.error
+    assert "merged drcode/t1" in merged.output["text"]
+    assert "identical to the branch version" in merged.output["text"]
+    assert (project_root / "base.txt").read_text(encoding="utf-8") == "t1 version\n"
+    assert _git_out("status", "--porcelain", "-uno", cwd=project_root) == ""
+
+
+async def test_differing_tracked_changes_still_refuse_and_survive(
+    project_root: Path, manager: TaskManager
+) -> None:
+    """Foreign uncommitted work is never touched: with at least one dirty
+    tracked file whose content DIFFERS from the branch version, the
+    hook-merge still refuses — and the identical-to-branch file keeps its
+    modification too (no partial repair)."""
+    activated = _activated_example(project_root)
+    (project_root / "base.txt").write_text("base\n")
+    _git_ok("init", "-q", "-b", "main", cwd=project_root)
+    _git_ok("config", "user.email", "test@example.com", cwd=project_root)
+    _git_ok("config", "user.name", "Test", cwd=project_root)
+    _git_ok("add", "base.txt", cwd=project_root)
+    _git_ok("commit", "-m", "base", cwd=project_root)
+    _git_ok("checkout", "-q", "-b", "drcode/t1", cwd=project_root)
+    (project_root / "base.txt").write_text("t1 version\n")
+    (project_root / "feature.txt").write_text("feature\n")
+    _git_ok("add", "base.txt", "feature.txt", cwd=project_root)
+    _git_ok("commit", "-m", "t1", cwd=project_root)
+    _git_ok("checkout", "-q", "main", cwd=project_root)
+    (project_root / "base.txt").write_text("t1 version\n")  # identical — repairable
+    (project_root / "other.txt").write_text("base\n")
+    _git_ok("add", "other.txt", cwd=project_root)
+    _git_ok("commit", "-m", "other", cwd=project_root)
+    (project_root / "other.txt").write_text("local edit\n")  # differs — refuse
+    make_script(project_root, activated)
+    hooks = make_hooks(project_root)
+    task = manager.create("t", "")
+    merged = await hooks.call(
+        "on_accepted",
+        task,
+        cwd=project_root,
+        worktree={
+            "path": str(project_root / ".drcode" / "worktrees" / "t1"),
+            "branch": "drcode/t1",
+        },
+    )
+    assert merged.ok, merged.error
+    assert "NOT merged" in merged.output["text"]
+    assert "git merge drcode/t1" in merged.output["text"]
+    assert "other.txt" in merged.output["text"]
+    # Nothing was touched: both modifications survive, no merge happened.
+    assert (project_root / "base.txt").read_text(encoding="utf-8") == "t1 version\n"
+    assert (project_root / "other.txt").read_text(encoding="utf-8") == "local edit\n"
+    assert not (project_root / "feature.txt").exists()
+    status = _git_out("status", "--porcelain", "-uno", cwd=project_root)
+    assert "base.txt" in status and "other.txt" in status
+
+
 async def test_failed_example_merge_aborts_conflict(
     project_root: Path, manager: TaskManager
 ) -> None:

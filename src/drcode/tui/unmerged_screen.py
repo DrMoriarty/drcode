@@ -57,6 +57,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from .. import merge_engine, merge_resolver
 from ..merge_engine import is_fast_forward
+from ..task_env import WorktreeUnavailable
 
 if TYPE_CHECKING:
     from .app import DrCodeApp
@@ -343,7 +344,19 @@ class UnmergedListScreen(ModalScreen[None]):
             task = app.manager.tasks.get(task_id)
             if task is None:
                 return
-            root, note = await asyncio.to_thread(env.ensure_root, task_id, task)
+            try:
+                root, note = await asyncio.to_thread(env.ensure_root, task_id, task)
+            except WorktreeUnavailable as e:
+                # `worktree add` failed: no fallback into the user's
+                # checkout (the cb4937bb/540a500d incident) — show the
+                # full git reason and stop.
+                self.notify(
+                    f"#{task_id}: worktree unavailable — {e}",
+                    title="Merge",
+                    severity="error",
+                    timeout=8,
+                )
+                return
             if note:
                 self.notify(
                     f"#{task_id}: worktree unavailable — {note}",

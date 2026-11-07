@@ -25,6 +25,7 @@ from ._common import (
     _COPY_SKIP_DIRS,
     BRANCH_PREFIX,
     WORKTREES_SUBDIR,
+    WorktreeUnavailable,
     _copy_skipped,
     _StartPoint,
 )
@@ -56,6 +57,22 @@ def _dirty_count(status: str) -> int:
     """Number of uncommitted changes in a `git status --porcelain` output
     (one line per entry — untracked directories collapse to one line)."""
     return len([line for line in status.splitlines() if line.strip()])
+
+
+def _add_failure_detail(first: str, second: str) -> str:
+    """Full git output of a failed `worktree add` (both attempts, deduped).
+
+    The real failure reason must survive into the service event VERBATIM:
+    `git` prints its "Preparing worktree …" preamble to stderr BEFORE the
+    actual `fatal:` line, and the old truncated `(created or out)[:500]`
+    note could leave exactly that preamble visible while the reason was
+    lost (both incident tasks failed within a minute — undiagnosable)."""
+    seen: list[str] = []
+    for chunk in (first, second):
+        text = chunk.strip()
+        if text and text not in seen:
+            seen.append(text)
+    return "\n".join(seen)[:2000]
 
 
 class _WorktreeLifecycleMixin:
@@ -287,8 +304,14 @@ class _WorktreeLifecycleMixin:
         """The task's working root, with the worktree CREATED when missing.
 
         Returns ``(root, note)``: ``note`` is empty on success, otherwise a
-        human-readable reason the task fell back to the project root (the
-        pipeline logs it into the service-event history). Idempotent: an
+        human-readable reason the task runs in the project root without a
+        worktree (the benign no-git-repository mode; the pipeline logs it
+        into the service-event history). A FAILED `worktree add` never
+        falls back to the project root — it raises `WorktreeUnavailable`
+        (the cb4937bb/540a500d incident: a fallback round edits the user's
+        checkout directly, and nothing reconciles those edits afterwards);
+        the pipeline's failure paths show the reason and requeue the task.
+        Idempotent: an
         existing worktree — dirty, mid-work, resumed after a restart — is
         reused untouched; a branch left over from a removed worktree is
         re-checked-out so earlier commits survive a manual worktree
@@ -392,15 +415,15 @@ class _WorktreeLifecycleMixin:
             ref = self.current_branch()
             if ref is None:
                 return None, (
-                    "checkout is in detached HEAD / mid-rebase — task runs "
-                    "in the project directory (no task branch is forked "
-                    "from an unknown commit)"
+                    "checkout is in detached HEAD / mid-rebase — the "
+                    "isolation is refused for this activation (no task "
+                    "branch is forked from an unknown commit)"
                 )
         code, sha = self._git("rev-parse", "--verify", ref)
         if code != 0 or not sha:
             return None, (
-                f"cannot resolve the start branch '{ref}' — task runs in "
-                "the project directory"
+                f"cannot resolve the start branch '{ref}' — the isolation "
+                "is refused for this activation"
             )
         return _StartPoint(ref=ref, sha=sha, warning=warning), ""
 
@@ -430,10 +453,12 @@ class _WorktreeLifecycleMixin:
         if start is None:
             # Refusal (detached HEAD / unresolvable ref): report it as a
             # failed add whose note is the human-readable reason — the
-            # caller surfaces it into the task's service-event history.
+            # caller raises WorktreeUnavailable with it, and the pipeline's
+            # failure path surfaces it into the task's service-event
+            # history.
             code, sha = self._git("rev-parse", "HEAD")
             detail = refusal or (
-                "no usable start point — task runs in the project directory"
+                "no usable start point — the isolation is refused for this activation"
             )
             if code == 0 and sha:
                 detail += f" (HEAD at {sha[:12]})"
@@ -462,12 +487,22 @@ class _WorktreeLifecycleMixin:
         if code != 0:
             # Last resort: a broken leftover directory blocks `add` —
             # remove it (it is drcode's own private state) and retry.
+            first_out = out
             shutil.rmtree(wt, ignore_errors=True)
             code, out, created = self._worktree_add(wt, branch)
             if code != 0:
-                return self.project_root, (
-                    f"git worktree add failed, the task falls back to the "
-                    f"project directory: {(created or out)[:500]}"
+                # NO fallback to the project directory (the cb4937bb/540a500d
+                # incident): a fallback round edits the user's checkout
+                # directly, its uncommitted changes block every later
+                # accept-hook merge ("the checkout has uncommitted changes")
+                # and no snapshot ever reconciles them — the snapshot looks
+                # only at the task's own root. Refuse the activation
+                # instead: the callers' failure paths show the full git
+                # output as a service event and requeue the task; the next
+                # activation retries the creation.
+                raise WorktreeUnavailable(
+                    f"git worktree add failed for {branch}: "
+                    f"{_add_failure_detail(first_out, created or out)}"
                 )
         # Submodules: `git worktree add` never populates them — populate
         # here (best effort, see _init_submodules) so the agent does not

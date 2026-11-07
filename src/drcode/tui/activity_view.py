@@ -193,6 +193,11 @@ class ActivityLayer(DrCodeState):
         # (task.install_pending) — fire the re-run worker (a no-op when
         # the list is empty; see _maybe_rerun_pending_installs).
         self._maybe_rerun_pending_installs()
+        # The fill refreshed _merge_state: a COMPLETED task whose branch
+        # just turned merged gets its (possibly resolver-recreated)
+        # worktree removed under `worktree_removal: on_completion` —
+        # see _remove_merged_completed_worktrees.
+        self._remove_merged_completed_worktrees()
         # The footer's Merge… entry reads the same state (needs_human /
         # _merge_state / persisted conflict reports) in its synchronous
         # check_action — refresh the bindings so it appears/disappears

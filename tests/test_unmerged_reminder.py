@@ -25,6 +25,7 @@ from drcode.settings import (
     ProjectSettings,
     ProjectSettingsStore,
     TaskIsolation,
+    WorktreeRemoval,
 )
 from drcode.task_env import TaskEnvironment, branch_for
 from drcode.task_manager import TaskManager
@@ -96,6 +97,17 @@ def current_branch(root: Path) -> str:
         text=True,
         check=True,
     ).stdout.strip()
+
+
+def _branch_exists(root: Path, branch: str) -> bool:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
 
 
 # -- TaskEnvironment.unmerged_commits ----------------------------------------------
@@ -1150,3 +1162,126 @@ async def test_normal_branch_still_merges_through_hook(
         await pilot.pause()
     assert not task.hook_merge_failed
     assert "on_accepted:\nmerged" in "\n".join(event_texts(task))
+
+
+# -- post-merge worktree removal (worktree_removal: on_completion) -------------------
+
+
+@pytest.fixture
+def on_completion_app(isolated: Path, configured_env: None) -> DrCodeApp:
+    """Isolation + `worktree_removal: on_completion` persisted; the
+    background unmerged-tracking actors are quiesced EXCEPT the poll under
+    test (the startup scan and the deferred-install poll are stubbed —
+    they run the same fill in their own workers and would interleave)."""
+    ProjectSettingsStore(isolated).save(
+        ProjectSettings(
+            task_isolation=TaskIsolation.WORKTREE,
+            worktree_removal=WorktreeRemoval.ON_COMPLETION,
+        )
+    )
+    app = DrCodeApp(isolated)
+
+    async def _noop() -> None:
+        return None
+
+    app._unmerged_work_startup_scan = _noop  # type: ignore[method-assign]
+    app._poll_pending_installs = _noop  # type: ignore[method-assign]
+    app._maybe_start_resolver = lambda task_id: None  # type: ignore[method-assign]
+    return app
+
+
+async def test_post_merge_poll_removes_worktree_after_manual_merge(
+    on_completion_app: DrCodeApp,
+) -> None:
+    """The one-shot completion removal missed a later merge: the resolver
+    re-created the worktree from the kept branch (or a human parked a
+    resolution there), and only afterwards did the branch end up merged.
+    The 10 s poll's fill sees the merged branch and the existing directory
+    and schedules the removal; while the branch is still unmerged, the
+    directory stays (the resolution may still be in progress there)."""
+    app = on_completion_app
+    task = finished_task(app)
+    env = app.task_env
+    commit_on_branch(env, task.id)
+    # The directory is back on disk (the resolver's ensure_root).
+    env.ensure_root(task.id)
+    assert env.worktree_path(task.id).is_dir()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Branch unmerged: the poll leaves the directory alone.
+        await app._poll_git_indicator()
+        await pilot.pause()
+        assert env.worktree_path(task.id).is_dir()
+        # The user merges the branch by hand — the next poll removes the
+        # directory (and, the branch being merged, the branch itself).
+        _git(app.project_root, "merge", "-q", branch_for(task.id))
+        await app._poll_git_indicator()
+        await wait_until(
+            lambda: not env.worktree_path(task.id).exists(),
+            pilot,
+            what="post-merge worktree removal",
+        )
+        await pilot.pause()
+        # The branch was merged — RULE 2 deletes it along with the
+        # directory (the daemon job finishes the delete right after the
+        # directory is gone — wait it out).
+        await wait_until(
+            lambda: not _branch_exists(app.project_root, branch_for(task.id)),
+            pilot,
+            what="post-merge branch cleanup",
+        )
+        # A follow-up poll is a no-op (the task is marked done once per
+        # session) — nothing crashes, nothing is re-scheduled.
+        await app._poll_git_indicator()
+        await pilot.pause()
+        assert not env.worktree_path(task.id).exists()
+
+
+async def test_post_merge_removal_does_not_run_under_other_modes(
+    app_env: DrCodeApp,
+) -> None:
+    """Default `worktree_removal: on_delete`: a merged branch's worktree
+    is kept — the poll-driven removal belongs to on_completion only."""
+    app = app_env
+    task = finished_task(app)
+    env = app.task_env
+    commit_on_branch(env, task.id)
+    env.ensure_root(task.id)
+    _git(app.project_root, "merge", "-q", branch_for(task.id))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._poll_git_indicator()
+        await pilot.pause()
+        assert env.worktree_path(task.id).is_dir()
+
+
+async def test_noop_resolver_does_not_recreate_completed_worktree(
+    app_env: DrCodeApp,
+) -> None:
+    """A COMPLETED task whose merge left nothing parked (no triage
+    report, no half-done merge) has nothing for the resolver to re-detect.
+    Before the guard the round's ensure_root re-created the removed
+    worktree from the kept branch and prepare() planted a meaningless
+    "Merge main into drcode/<id>" commit on it — the branch counted as
+    unmerged again and lured a manual ff. The round now skips before
+    ensure_root: the directory stays gone."""
+    app = app_env
+    task = finished_task(app)
+    env = app.task_env
+    commit_on_branch(env, task.id)
+    # Simulate the on_completion removal: directory gone, branch kept,
+    # nothing parked.
+    env.remove(task.id)
+    assert not env.worktree_path(task.id).exists()
+    assert not merge_engine.report_path(app.project_root, task.id).exists()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app.run_resolver(task.id)
+        await wait_until(
+            lambda: any("nothing to resolve" in t for t in event_texts(live)),
+            pilot,
+            what="the no-op resolver skip event",
+        )
+        await pilot.pause()
+        assert not env.worktree_path(task.id).exists()

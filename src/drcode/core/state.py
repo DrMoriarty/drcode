@@ -392,6 +392,8 @@ class CoreState:
 
     def _unmerged_completed_ids(self) -> list[str]: ...
 
+    def _remove_merged_completed_worktrees(self) -> None: ...
+
     def _suggest_conflict_screen(self, task: Task) -> None: ...
 
     def _maybe_rerun_pending_installs(self) -> Any: ...
@@ -589,6 +591,10 @@ class CoreState:
     # ("none"/"unmerged"/"merged") — refreshed off the event loop in
     # _unmerged_completed_ids; the sidebar colors the ✓ marker by it.
     _merge_state: dict[str, str]
+    # Task ids already handed to the post-merge worktree removal (see
+    # DrCodeApp._remove_merged_completed_worktrees) — one scheduled
+    # removal per task per session.
+    _post_merge_removal_done: set[str]
     # Footer visibility of the Merge… binding as of the last git-indicator
     # poll (None = not evaluated yet); see check_action "open_merge".
     _merge_binding_visible: bool | None

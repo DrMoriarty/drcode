@@ -56,7 +56,7 @@ from ..core.usage import (
     _is_context_overflow_error,
     _is_retryable_network_error,
 )
-from ..merge_engine import MergeReport, remove_report
+from ..merge_engine import MergeReport, in_progress, remove_report, report_path
 from ..merge_resolver import (
     ResolverOutcome,
     build_agent_context,
@@ -68,7 +68,7 @@ from ..merge_resolver import (
     run_test_suite,
     stage_resolved,
 )
-from ..models import Task
+from ..models import Task, TaskStatus
 from ..providers import AgentRole
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
@@ -92,6 +92,17 @@ _RETRY_BASE_DELAY_S = 5.0
 
 class PipelineResolverLayer(CoreState):
     # -- triggering ----------------------------------------------------------------
+
+    def _parked_merge_exists(self, task_id: str) -> bool:
+        """Whether a conflicted merge is actually parked for `task_id`:
+        the engine's persisted triage report (`.drcode/merge_reports/`),
+        or a half-done merge (MERGE_HEAD set) in a still-existing
+        worktree. The no-op guard of the resolver round (see run_resolver)
+        reads it — blocking git, call via `asyncio.to_thread`."""
+        if report_path(self.project_root, task_id).exists():
+            return True
+        wt = self.task_env.worktree_path(task_id)
+        return wt.is_dir() and in_progress(wt)
 
     def _resolver_start_refusal(self, task_id: str) -> str | None:
         """Why a resolver round must NOT start for `task_id` right now
@@ -182,6 +193,25 @@ class PipelineResolverLayer(CoreState):
         try:
             self._current_tool[task_id] = None
             self._touch_activity(task_id)
+            # A COMPLETED task with nothing parked — no triage report and
+            # no half-done merge in a surviving worktree — has nothing for
+            # the resolver to re-detect. Running on would only `ensure_root`
+            # a worktree back into existence (worktree_removal:
+            # on_completion had removed it) and let prepare plant a
+            # meaningless "Merge <base> into drcode/<id>" commit on the
+            # branch — which then counts as unmerged again and lures a
+            # manual ff for work that was already merged. Skip instead.
+            if task.status is TaskStatus.COMPLETED and not (
+                await asyncio.to_thread(self._parked_merge_exists, task_id)
+            ):
+                self._show_event(
+                    task,
+                    "Conflict resolver: nothing to resolve — no parked "
+                    "merge and no triage report; the worktree is not "
+                    "recreated.",
+                    kind="workflow",
+                )
+                return
             # The resolver works in the task's worktree, resolved against
             # its isolation PIN (see run_agent): a mid-task toggle of the
             # setting must not move the parked merge out from under it.

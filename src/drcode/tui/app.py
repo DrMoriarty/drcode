@@ -596,6 +596,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # Replaced wholesale by the worker thread — never mutated in
         # place — so a read on the event loop is always consistent.
         self._merge_state: dict[str, str] = {}
+        # Task ids already handed to the post-merge worktree removal
+        # (see _remove_merged_completed_worktrees) — at most one scheduled
+        # removal per task per session.
+        self._post_merge_removal_done: set[str] = set()
         # Footer visibility of the Merge… binding as of the last
         # _poll_git_indicator pass: the poll refreshes the bindings only
         # when this flips (None = never evaluated — the first pass
@@ -1179,6 +1183,49 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
             return
         self.task_env.schedule_removal(task.id, task)
+
+    def _remove_merged_completed_worktrees(self) -> None:
+        """Post-merge tail of `worktree_removal: on_completion`, called
+        from the 10 s git-indicator poll after every unmerged-work fill.
+
+        The completion listener's removal is one-shot — but the directory
+        can come BACK afterwards: the conflict resolver's `ensure_root`
+        re-creates it from the kept `drcode/<id>` branch to re-deploy a
+        parked conflict, and a human may work in it via the merge
+        screens. When the branch then ends up merged (the resolver or a
+        hook concluded, the user ff-merged by hand), nothing cleaned the
+        directory up — it lingered until the retention purge, collecting
+        .venv-sized trees (the dogfooding incident: 154 worktrees,
+        ~47 GB, dozens of them behind tasks whose removal had already
+        run). A COMPLETED task whose branch reads "merged" in the
+        refreshed `_merge_state` and whose directory still exists gets
+        its removal scheduled here — covering the resolver recreation
+        and the manual merges alike.
+
+        Each task is handed to the scheduler at most once per session
+        (`_post_merge_removal_done`): a removal that keeps the directory
+        (the snapshot-skip warning) is never retried in a loop. The
+        scheduler's per-task lock plus its COMPLETED re-check keep this
+        race-safe against a concurrent re-activation; a live resolver
+        round in that worktree postpones the scheduling to the next
+        poll."""
+        if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
+            return
+        env = self.task_env
+        if not env.active:
+            return
+        for task_id, state in list(self._merge_state.items()):
+            if state != "merged" or task_id in self._post_merge_removal_done:
+                continue
+            task = self.manager.tasks.get(task_id)
+            if task is None or task.status is not TaskStatus.COMPLETED:
+                continue
+            if not env.worktree_path(task_id).is_dir():
+                continue  # nothing on disk (already removed, never created)
+            if self._resolver_running and self._resolver_task_id == task_id:
+                continue  # a resolver round is live in that worktree
+            self._post_merge_removal_done.add(task_id)
+            env.schedule_removal(task_id, task)
 
     def _on_app_thread(self) -> bool:
         return getattr(self, "_thread_id", None) == threading.get_ident()

@@ -182,6 +182,32 @@ class PipelineResolverLayer(CoreState):
         try:
             self._current_tool[task_id] = None
             self._touch_activity(task_id)
+            # A trigger that raced a merge: the audit re-stamp / startup
+            # scan acted on a batched mergedness snapshot, and between
+            # that snapshot and this round the hook (or a hand) merged
+            # the branch into the base. Re-read mergedness FRESH (no
+            # batch cache) BEFORE touching anything: a branch that no
+            # longer exists or is fully reachable from the base has
+            # nothing to resolve — skip the round without ensure_root
+            # (which would re-create a worktree removed at completion)
+            # and without prepare (which would park a pointless merge
+            # commit, re-flagging the branch as unmerged). A scheduled
+            # retry (resume_round) continues its in-flight round instead
+            # — its branch cannot have become reachable on its own.
+            if not resume_round and (
+                await asyncio.to_thread(self.task_env.unmerged_commits, task_id) == 0
+            ):
+                if task.hook_merge_failed:
+                    task.hook_merge_failed = False
+                    task.touch()
+                    self.manager.storage.save(task)
+                self._show_event(
+                    task,
+                    f"Conflict resolver: {self.task_env.branch(task_id)} is "
+                    f"already merged — resolver round skipped.",
+                    kind="workflow",
+                )
+                return
             # The resolver works in the task's worktree, resolved against
             # its isolation PIN (see run_agent): a mid-task toggle of the
             # setting must not move the parked merge out from under it.

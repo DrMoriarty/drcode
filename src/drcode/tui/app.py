@@ -1745,6 +1745,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             self._hook_merge_audit_ok[task.id] = task.completed_at or datetime.now(UTC)
             return True  # merged — the hook (or a hand) did its job
         if not task.hook_merge_failed:
+            # The batched snapshot may predate a merge that just landed
+            # (the hook finishing, a manual `git merge`): re-read THIS
+            # branch's mergedness fresh before stamping the failure, or
+            # a race stamps a merged branch and starts a resolver round
+            # that has nothing to resolve. Blocking git is fine here —
+            # this audit runs inside _unmerged_completed_ids, already on
+            # a worker thread.
+            if self.task_env.unmerged_commits(task.id) == 0:
+                self._hook_merge_audit_ok[task.id] = task.completed_at or datetime.now(
+                    UTC
+                )
+                return True  # merged between the snapshot and now
             task.hook_merge_failed = True
             task.touch()
             self.manager.storage.save(task)

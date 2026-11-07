@@ -140,6 +140,7 @@ from ..conflict import (
 )
 from ..merge_engine import MergeReport, is_fast_forward, remove_report
 from ..merge_resolver import CheckResult
+from ..task_env import WorktreeUnavailable
 from ..tools import child_priority_kwargs
 
 if TYPE_CHECKING:
@@ -956,7 +957,15 @@ class ConflictScreen(ModalScreen[None]):
             self._hide_prepare()
             return
         pinned_before = task is not None and task.isolation_pinned is not None
-        root, note = await asyncio.to_thread(env.ensure_root, self.task_id, task)
+        try:
+            root, note = await asyncio.to_thread(env.ensure_root, self.task_id, task)
+        except WorktreeUnavailable as e:
+            # `worktree add` failed: the task must NOT run in the user's
+            # checkout (the cb4937bb/540a500d incident) — show the full
+            # git reason instead of falling back.
+            self._set_title(f"Merge conflicts — unavailable: {e}")
+            self._hide_prepare()
+            return
         if task is not None:
             app._isolation_pin_note(task, save=not pinned_before)
         if note:

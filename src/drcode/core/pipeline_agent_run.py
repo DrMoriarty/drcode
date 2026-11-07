@@ -440,9 +440,11 @@ class PipelineAgentRunLayer(CoreState):
             # not once per retry (see _show_event_once).
             self._show_event_once(task, message)
         elif iso_note:
-            # Isolation is on but the worktree could not be created:
-            # the task falls back to the project directory — say so
-            # (deduplicated the same way: retries repeat it verbatim).
+            # The only remaining non-empty note is the benign
+            # "no git repository" mode: a FAILED `worktree add` raises
+            # WorktreeUnavailable now (no silent fallback into this
+            # tree — the cb4937bb/540a500d incident) and is routed
+            # through the preparation-failure handler below.
             self._show_event_once(task, f"Task isolation unavailable: {iso_note}")
         # Custom workflow (`.drcode/workflow.py`): the on_task_start
         # hook runs before the first activation (branch checkout etc.);

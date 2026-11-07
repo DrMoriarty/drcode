@@ -30,7 +30,7 @@ from drcode.settings import (
     WorktreeRemoval,
     WorktreeSnapshot,
 )
-from drcode.task_env import TaskEnvironment
+from drcode.task_env import TaskEnvironment, WorktreeUnavailable
 from drcode.task_manager import TaskManager
 
 # -- fixtures --------------------------------------------------------------------
@@ -1369,12 +1369,67 @@ def test_branch_created_from_head_branch(env: TaskEnvironment) -> None:
 def test_detached_head_refuses_isolation(env: TaskEnvironment, git_root: Path) -> None:
     _git(git_root, "checkout", "-q", "--detach", "HEAD")
     events = _capture_events(env)
-    root, note = env.ensure_root("t1")
-    assert root == git_root
-    assert "detached HEAD" in note
+    with pytest.raises(WorktreeUnavailable, match="detached HEAD"):
+        env.ensure_root("t1")
     assert not branch_exists(git_root, "drcode/t1")
     assert not env.worktree_path("t1").exists()
     assert events == []  # nothing was created — nothing to record
+
+
+def test_worktree_add_failure_never_falls_back_to_project_root(
+    env: TaskEnvironment, git_root: Path
+) -> None:
+    """The cb4937bb/540a500d incident: a failed `git worktree add` used to
+    hand the task into the user's checkout — the fallback round edited the
+    main tree directly, its uncommitted changes blocked every later
+    accept-hook merge and no snapshot ever reconciled them. The failure
+    must RAISE instead, with git's full output (the real `fatal:` reason,
+    not just the "Preparing worktree" preamble) in the message."""
+    # A plain FILE at the worktree path blocks `worktree add` ("already
+    # exists") and survives the rmtree retry — both attempts fail.
+    wt = env.worktree_path("t1")
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    wt.write_text("not a directory")
+    with pytest.raises(WorktreeUnavailable) as exc_info:
+        env.ensure_root("t1")
+    message = str(exc_info.value)
+    assert "git worktree add failed for drcode/t1" in message
+    # The REAL git reason is preserved, not truncated to the preamble.
+    assert "fatal:" in message
+    assert "already exists" in message
+    # The user's checkout was never handed over and stays untouched.
+    assert not env.worktree_path("t1").is_dir()
+
+
+def test_worktree_add_failure_detail_keeps_both_attempts(
+    env: TaskEnvironment,
+    git_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the two `worktree add` attempts fail DIFFERENTLY, both outputs
+    survive in the raised message (deduplicated, none dropped)."""
+    calls: list[tuple[int, str, str | None]] = [
+        (
+            128,
+            "Preparing worktree (checking out 'drcode/t1')\nfatal: attempt one",
+            None,
+        ),
+        (
+            128,
+            "Preparing worktree (checking out 'drcode/t1')\nfatal: attempt two",
+            None,
+        ),
+    ]
+
+    def fake_add(wt: Path, branch: str) -> tuple[int, str, str | None]:
+        return calls.pop(0)
+
+    monkeypatch.setattr(env, "_worktree_add", fake_add)
+    with pytest.raises(WorktreeUnavailable) as exc_info:
+        env.ensure_root("t1")
+    message = str(exc_info.value)
+    assert "fatal: attempt one" in message
+    assert "fatal: attempt two" in message
 
 
 def test_ensure_root_activation_lock_wait_is_bounded(

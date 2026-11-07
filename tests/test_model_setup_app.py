@@ -338,6 +338,21 @@ async def test_escape_closes_without_saving(tmp_path: Path) -> None:
         assert not path.exists()
 
 
+async def test_footer_anchored_to_dialog_bottom(tmp_path: Path) -> None:
+    """The hint text and the Save button sit at the very bottom of the
+    dialog (their bottom edge aligns with the dialog's bottom edge)."""
+    store = UserModelsStore(tmp_path / "models.json")
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        dialog = screen.query_one("#mc-dialog")
+        footer = screen.query_one("#mc-footer")
+        # The footer's content bottom coincides with the dialog's content
+        # bottom — i.e. the hint text and the Save button are anchored to the
+        # very bottom of the modal dialog.
+        assert footer.content_region.bottom == dialog.content_region.bottom
+
+
 # -- seeding from the user-level drcode.json --------------------------------------
 
 

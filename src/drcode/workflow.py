@@ -301,15 +301,97 @@ def _main_checkout(task):
     return Path.cwd()
 
 
+def _repair_identical_tracked_changes(main, branch):
+    """Drop uncommitted TRACKED modifications whose working-tree content
+    is byte-identical to the merge target's (`branch`'s) version of the
+    file — the same repair `TaskEnv.clear_identical_untracked_for_ff`
+    performs for untracked collisions before a TUI ff-merge, mirrored
+    here for the hook (the #a6552566 grid-apps cascade: identical edits
+    in the main checkout made EVERY later hook-merge refuse with "the
+    checkout has uncommitted changes"). Only plain content
+    modifications (` M` unstaged, `M ` staged with the worktree
+    matching) are repaired, and only when the local blob equals
+    `branch:<path>` — restoring such a file from HEAD loses nothing,
+    the bytes survive on the branch the merge is about to land.
+    Deletions, renames, unmerged entries and content that DIFFERS from
+    the branch are foreign uncommitted work: never touched.
+
+    Returns (repaired, blocked) path lists. NOTHING is restored while
+    any path is blocked — a partial repair must not eat some of the
+    user's files and then refuse the merge anyway. Blocking git. The
+    status is read with a RAW subprocess (not the `_git` helper, whose
+    combined-output `.strip()` would eat the leading space of the first
+    `XY` pair and shift the path columns)."""
+    proc = subprocess.run(
+        ["git", "-C", str(main), "status", "--porcelain", "-uno"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        return [], []
+    candidates: list[str] = []
+    blocked: list[str] = []
+    for line in proc.stdout.splitlines():
+        if len(line) < 4:
+            blocked.append(line.strip())
+            continue
+        code_xy, raw = line[:2], line[3:]
+        path = raw.split(" -> ")[-1].strip()  # renames: block the target name
+        if code_xy not in (" M", "M ") or "->" in raw:
+            blocked.append(path)
+            continue
+        local = main / path
+        if not local.is_file():
+            blocked.append(path)
+            continue
+        code, branch_hash = _git("-C", str(main), "rev-parse", f"{branch}:{path}")
+        if code != 0:
+            blocked.append(path)
+            continue
+        code, local_hash = _git("-C", str(main), "hash-object", "--", str(local))
+        if code != 0 or local_hash.strip() != branch_hash.strip():
+            blocked.append(path)
+            continue
+        candidates.append(path)
+    if blocked:
+        return [], blocked
+    repaired: list[str] = []
+    for path in candidates:
+        code, _ = _git("-C", str(main), "checkout", "HEAD", "--", path)
+        if code != 0:
+            return repaired, [path]
+        repaired.append(path)
+    return repaired, blocked
+
+
+def _note_repaired(result, branch, repaired):
+    """Append the repair note to a SUCCESSFUL merge's service-event text
+    (mirrors the untracked repair's wording in the TUI ff-merge path);
+    failures and refusals pass through untouched."""
+    if repaired and f"merged {branch} into" in result.get("text", ""):
+        names = ", ".join(repaired)
+        result["text"] += (
+            f"\\nCleared {len(repaired)} tracked file(s) identical to the "
+            f"branch version before the merge: {names}"
+        )
+    return result
+
+
 def _merge_task_branch(task, what):
     """Shared helper: THE DEGENERATE ACCEPT. Merge the finished task's
     branch `drcode/<task-id>` into whatever branch the main checkout has
     checked out right now (a fast-forward when possible, a merge commit
     otherwise). A checkout with modified tracked files is left alone —
     the branch is reported for a manual merge instead of fighting the
-    user's uncommitted work (untracked files, e.g. this very script, do
-    not block the merge). With isolation off the work already IS in the
-    shared tree: nothing to merge, returns None.
+    user's uncommitted work — EXCEPT tracked modifications that are
+    byte-identical to the merge target's versions of those files:
+    dropping them loses nothing (the very bytes live on the branch), so
+    they are restored from HEAD and the merge proceeds — the tracked
+    counterpart of the untracked repair the TUI's ff-merge path already
+    performs (the #a6552566 cascade). Untracked files, e.g. this very
+    script, do not block the merge. With isolation off the work already
+    IS in the shared tree: nothing to merge, returns None.
 
     CONFLICTS never touch the user's checkout. When the task's worktree
     exists and `drcode.merge_engine` is importable, the merge is REVERSED:
@@ -335,17 +417,28 @@ def _merge_task_branch(task, what):
             f"usable git checkout; merge by hand: git merge {branch}"
         }
     if status:
-        return {
-            "text": f"{what}: branch {branch} NOT merged into {base} — the "
-            f"checkout has uncommitted changes; merge by hand when ready: "
-            f"git merge {branch}"
-        }
+        # Content check before the refusal: tracked modifications
+        # byte-identical to the merge target's versions are safe to drop
+        # (the bytes live on the branch); anything else is foreign
+        # uncommitted work and still refuses the merge, untouched.
+        repaired, blocked = _repair_identical_tracked_changes(main, branch)
+        if blocked:
+            listed = ", ".join(blocked[:5]) + ("…" if len(blocked) > 5 else "")
+            return {
+                "text": f"{what}: branch {branch} NOT merged into {base} — the "
+                f"checkout has uncommitted changes ({listed}); merge by hand "
+                f"when ready: git merge {branch}"
+            }
+    else:
+        repaired = []
     wt_path = worktree.get("path")
     if wt_path and Path(wt_path).is_dir():
         result = _merge_via_worktree(task, what, branch, base, main, Path(wt_path))
         if result is not None:
-            return result
-    return _merge_in_checkout(what, branch, base, main)
+            return _note_repaired(result, branch, repaired)
+    return _note_repaired(
+        _merge_in_checkout(what, branch, base, main), branch, repaired
+    )
 
 
 def _merge_via_worktree(task, what, branch, base, main, wt_path):

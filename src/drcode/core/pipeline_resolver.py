@@ -193,16 +193,47 @@ class PipelineResolverLayer(CoreState):
         try:
             self._current_tool[task_id] = None
             self._touch_activity(task_id)
-            # A COMPLETED task with nothing parked — no triage report and
-            # no half-done merge in a surviving worktree — has nothing for
-            # the resolver to re-detect. Running on would only `ensure_root`
-            # a worktree back into existence (worktree_removal:
-            # on_completion had removed it) and let prepare plant a
-            # meaningless "Merge <base> into drcode/<id>" commit on the
-            # branch — which then counts as unmerged again and lures a
-            # manual ff for work that was already merged. Skip instead.
-            if task.status is TaskStatus.COMPLETED and not (
-                await asyncio.to_thread(self._parked_merge_exists, task_id)
+            # A trigger that raced a merge: the audit re-stamp / startup
+            # scan acted on a batched mergedness snapshot, and between
+            # that snapshot and this round the hook (or a hand) merged
+            # the branch into the base. Re-read mergedness FRESH (no
+            # batch cache) BEFORE touching anything: a branch that no
+            # longer exists or is fully reachable from the base has
+            # nothing to resolve — skip the round without ensure_root
+            # (which would re-create a worktree removed at completion)
+            # and without prepare (which would park a pointless merge
+            # commit, re-flagging the branch as unmerged). A scheduled
+            # retry (resume_round) continues its in-flight round instead
+            # — its branch cannot have become reachable on its own.
+            if not resume_round and (
+                await asyncio.to_thread(self.task_env.unmerged_commits, task_id) == 0
+            ):
+                if task.hook_merge_failed:
+                    task.hook_merge_failed = False
+                    task.touch()
+                    self.manager.storage.save(task)
+                self._show_event(
+                    task,
+                    f"Conflict resolver: {self.task_env.branch(task_id)} is "
+                    f"already merged — resolver round skipped.",
+                    kind="workflow",
+                )
+                return
+            # A COMPLETED task whose worktree is GONE and whose merge left
+            # nothing parked — no triage report and no half-done merge —
+            # has nothing for the resolver to re-detect. Running on would
+            # only `ensure_root` a worktree back into existence
+            # (worktree_removal: on_completion had removed it) and let
+            # prepare plant a meaningless "Merge <base> into drcode/<id>"
+            # commit on the branch — which then counts as unmerged again
+            # and lures a manual ff for work that was already merged.
+            # Skip instead. A SURVIVING worktree is deliberately not
+            # skipped here: prepare's base-into-worktree merge may park a
+            # real conflict that this round exists to resolve.
+            if (
+                task.status is TaskStatus.COMPLETED
+                and not self.task_env.worktree_path(task_id).is_dir()
+                and not (await asyncio.to_thread(self._parked_merge_exists, task_id))
             ):
                 self._show_event(
                     task,

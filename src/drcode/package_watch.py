@@ -43,7 +43,16 @@ WATCHED_FILES: tuple[Path, ...] = (
     Path("agent.py"),
     Path("task_manager.py"),
     Path("merge_engine.py"),
+    # The conflict screen: a thin re-export shim over the tui/merge/
+    # package — a stale submodule behind a fresh shim (or vice versa)
+    # crashes exactly like the pre-split monolith did, so both sides of
+    # the edge are fingerprinted.
     Path("tui") / "merge_screen.py",
+    Path("tui") / "merge" / "screen.py",
+    Path("tui") / "merge" / "views.py",
+    Path("tui") / "merge" / "stages.py",
+    Path("tui") / "merge" / "check_details.py",
+    Path("tui") / "merge" / "widgets.py",
     Path("tui") / "unmerged_screen.py",
 )
 

@@ -21,9 +21,9 @@ from drcode import package_watch
 def _fake_package(tmp_path: Path) -> Path:
     """A synthetic package dir carrying every watched file."""
     root = tmp_path / "pkg"
-    (root / "tui").mkdir(parents=True)
     for rel in package_watch.WATCHED_FILES:
         path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"# {rel}\n", encoding="utf-8")
     return root
 

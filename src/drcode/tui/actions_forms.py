@@ -206,12 +206,15 @@ class TaskFormLayer(DrCodeState):
         if editing is not None and editing.status is TaskStatus.DRAFT:
             note.update(
                 "Finishing an agent-created draft — its text is loaded below; "
-                "send it into the queue or park it on hold. Esc keeps the draft."
+                "send it into the queue, park it on hold or save the edits "
+                "back as a draft. Esc discards the edits without saving — "
+                "the draft keeps its previous text."
             )
             hint.update(
                 "tab — switch type   ctrl+g — depends on   "
                 "ctrl+enter — finish & queue   ctrl+h — finish on hold   "
-                "esc — keep draft" + voice
+                "ctrl+d — save as draft   "
+                "esc — discard edits, keep draft" + voice
             )
         elif self._editing_task_id is not None:
             note.update(
@@ -469,14 +472,25 @@ class TaskFormLayer(DrCodeState):
     def action_submit_new_task_draft(self) -> None:
         """Ctrl+D in the form: create the task as a DRAFT — parked in the
         sidebar's DRAFTS block, never picked up by the pipeline until the
-        user opens it (Ctrl+E) and finishes it. Fresh creation only: a
-        held task cannot become a draft, and a draft being finished is
-        already one (ESC keeps it)."""
+        user opens it (Ctrl+E) and finishes it. While editing an
+        agent-created draft the same key saves the edits back into the
+        draft: the condition and dependencies are rewritten and the form
+        closes, the task stays a DRAFT (see _save_task_edit_as_draft).
+        A held task cannot become a draft — the app's check_action keeps
+        the key disabled while editing one."""
+        self._submit_new_form(hold=False, draft=True)
+
+    def action_save_task_edit_draft(self) -> None:
+        """Ctrl+D while editing an agent-created draft: save the edits
+        back into the same draft (it stays parked in the DRAFTS block)."""
         self._submit_new_form(hold=False, draft=True)
 
     def _submit_new_form(self, *, hold: bool, draft: bool = False) -> None:
         if self._editing_task_id is not None:
-            self._finish_task_edit(queue=not hold)
+            if draft:
+                self._save_task_edit_as_draft()
+            else:
+                self._finish_task_edit(queue=not hold)
             return
         text = self.new_task_input.text.strip()
         if not text:
@@ -543,7 +557,8 @@ class TaskFormLayer(DrCodeState):
         if was_draft:
             # An agent-created draft: the edit finished its composition —
             # Ctrl+Enter sends it into the queue, Ctrl+H parks it on hold
-            # (ESC never reaches here: it cancels and keeps the draft).
+            # (ESC discards the edits; saving as a draft goes through
+            # _save_task_edit_as_draft, never here).
             self.manager.finish_draft(task.id, hold=not queue)
             if queue:
                 self._advance()
@@ -555,6 +570,42 @@ class TaskFormLayer(DrCodeState):
         self.refresh_sidebar()
         self.view_task(task.id)
         self.chat_input.focus()
+
+    def _save_task_edit_as_draft(self) -> None:
+        """Ctrl+D while editing an agent-created draft: rewrite the
+        condition and dependencies (edit_task + set_dependencies — the
+        manager deliberately leaves the DRAFT status alone) and close the
+        form WITHOUT finish_draft — the task stays a DRAFT in the
+        sidebar's DRAFTS block until the user opens it again and finishes
+        it. Unlike _finish_task_edit there is no queue/hold transition and
+        no _advance()."""
+        task_id = self._editing_task_id
+        task = self.manager.tasks.get(task_id) if task_id else None
+        if task is None:
+            # The draft vanished while the form was open (deleted
+            # elsewhere): just close the editor.
+            self._editing_task_id = None
+            self.cancel_new_task()
+            return
+        text = self.new_task_input.text.strip()
+        if not text:
+            return
+        deps = self._deps_from_form()
+        if deps is None:
+            return
+        self.manager.edit_task(task.id, text, kind=self.new_task_kind)
+        self.manager.set_dependencies(task.id, deps)
+        self._editing_task_id = None
+        # A draft has no chat view: close the form like the
+        # fresh-creation draft path above (cancel_new_task skips the
+        # draft-redirect trap and restores the pre-form view).
+        self.cancel_new_task()
+        self.refresh_sidebar()
+        self.notify(
+            "Draft saved — open it (ctrl+e) to finish and queue it",
+            title="New task",
+            timeout=6,
+        )
 
     def action_update_agents_md(self) -> None:
         """Create a research task that writes/refreshes AGENTS.md.

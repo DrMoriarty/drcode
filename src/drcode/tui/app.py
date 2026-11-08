@@ -1970,9 +1970,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if action == "submit_new_task_hold":
             return self._new_task_mode and self._editing_task_id is None
         if action == "submit_new_task_draft":
-            # Fresh creation only — the edit modes have no draft semantics
-            # (a held task stays held; a finished draft is left via ESC).
+            # Fresh creation only — a held task cannot become a draft (a
+            # draft being edited saves via save_task_edit_draft below).
             return self._new_task_mode and self._editing_task_id is None
+        if action == "save_task_edit_draft":
+            # Editing an agent-created draft: Ctrl+D saves the edits back
+            # into the same draft (the task keeps its DRAFT status).
+            if not (self._new_task_mode and self._editing_task_id is not None):
+                return False
+            task = self.manager.tasks.get(self._editing_task_id)
+            return task is not None and task.status is TaskStatus.DRAFT
         if action == "save_task_edit_hold":
             return self._new_task_mode and self._editing_task_id is not None
         if action == "hold_task":

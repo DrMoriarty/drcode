@@ -1774,6 +1774,30 @@ async def test_create_task_as_draft_through_ui(app: DrCodeApp) -> None:
         assert app.viewed_id == task.id
 
 
+async def test_save_draft_edit_as_draft_through_ui(app: DrCodeApp) -> None:
+    task = app.manager.create("", "draft idea", draft=True)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_open_draft(task.id)
+        await pilot.pause()
+        assert app._editing_task_id == task.id
+        app.new_task_input.text = "rewritten draft\nmore text"
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        # Saved back into the same draft: condition rewritten, no
+        # finish_draft — the task stays a DRAFT in the sidebar's DRAFTS
+        # block and the form is closed without a chat redirect.
+        assert task.status is TaskStatus.DRAFT
+        assert task.title == "rewritten draft"
+        assert [e.text for e in task.pending_input] == ["rewritten draft\nmore text"]
+        assert not app._new_task_mode
+        assert app._editing_task_id is None
+        assert app.viewed_id != task.id
+        # The pipeline never picks a draft up.
+        assert app.manager.promote_next() is None
+
+
 async def test_draft_submit_gated_while_editing_held_task(app: DrCodeApp) -> None:
     task = app.manager.create("held", "condition")
     app.manager.set_hold(task.id, on=True)

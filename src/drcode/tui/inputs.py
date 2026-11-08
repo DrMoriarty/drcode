@@ -135,12 +135,15 @@ class NewTaskInput(WordNavTextArea):
         Binding("ctrl+b", "push_to_talk", "Voice", priority=True, show=False),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
-        # Ctrl+D — create as draft (fresh creation only, gated by the
-        # app's check_action like the ctrl+h pair above). The widget
-        # binding out-prioritizes the app's global ctrl+d ("Done"), which
-        # is guarded to no-op in the form anyway.
+        # Ctrl+D — create as draft / save as draft while editing one
+        # (gated by the app's check_action like the ctrl+h pair above).
+        # The widget binding out-prioritizes the app's global ctrl+d
+        # ("Done"), which is guarded to no-op in the form anyway.
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
+        ),
+        Binding(
+            "ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True
         ),
         # Ctrl+Y — goal capture: the stock TextArea owns ctrl+y (Redo), so
         # the app-level binding alone never fires while this editor is
@@ -188,6 +191,9 @@ class DepsInput(Input):
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
+        ),
+        Binding(
+            "ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True
         ),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]

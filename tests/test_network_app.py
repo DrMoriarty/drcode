@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -308,6 +309,46 @@ async def test_rate_limited_run_retries_then_waits_out_outage(
     # Six failed attempts (each resumed without re-sending text) plus the
     # successful recovery call — no rescue round, no demotion.
     assert scripted.calls == ["do work"] * 7
+
+
+async def test_network_retry_backdates_consumed_prompt_stamp(
+    net_app: DrCodeApp,
+    scripted: ScriptedState,
+    instant_timers: list[float],
+) -> None:
+    """The FIRST request node died mid-flight: the consumed prompt is in
+    the transcript with the CONSUMPTION stamp (the backdating lives in the
+    node-completion bookkeeping, which the exception skipped) — the retry
+    path must backdate it to the typing time before persisting, or the
+    stamp is frozen wrong forever: the resumed attempt is a continuation
+    turn with no consumed input, and the prompt renders below the service
+    events that happened between typing and the first request
+    (task e82147d2)."""
+    task = net_app.manager.create("stamped", "do work", kind=TaskKind.RESEARCH)
+    typed_at = task.pending_input[0].at
+    # First attempt dies with a retryable transport error; the in-place
+    # retry (instant timer) resumes the attempt and succeeds.
+    scripted.steps = [api_error(), text_response("done")]
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="task completed after the network retry",
+        )
+
+    prompts = [
+        part
+        for msg in task.messages
+        if msg.get("kind") == "request" or msg.get("role") == "request"
+        for part in msg.get("parts", [])
+        if part.get("part_kind") == "user-prompt" and part.get("content") == "do work"
+    ]
+    assert len(prompts) == 1
+    # The part stamp (what the timeline sorts by) is the typing moment,
+    # not the consumption/request-start moment.
+    assert datetime.fromisoformat(prompts[0]["timestamp"]) == typed_at
+    assert not task.unfinished
 
 
 # -- agent run: connection outage -------------------------------------------------------

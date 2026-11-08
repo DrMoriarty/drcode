@@ -327,7 +327,9 @@ class PipelineAgentRunLayer(CoreState):
                     # task.unfinished marks the possibly-undone attempt and
                     # the next activation resumes it without re-sending text.
                     cancelled = True
-                    self._agent_turn_cancelled(task, task_id, run, consumed, generation)
+                    self._agent_turn_cancelled(
+                        task, task_id, run, consumed, text, generation
+                    )
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
                     # A transient network error (transport failure like a
@@ -338,10 +340,10 @@ class PipelineAgentRunLayer(CoreState):
                         e
                     ) and _is_retryable_network_error(e):
                         self._agent_turn_network_error(
-                            task, task_id, run, consumed, generation, role, e
+                            task, task_id, run, consumed, text, generation, role, e
                         )
                         return
-                    self._agent_turn_failed(task, task_id, run, generation, e)
+                    self._agent_turn_failed(task, task_id, run, consumed, text, generation, e)
                     break
         except asyncio.CancelledError:
             # Cancelled BEFORE the turn loop's own handler (worktree setup,
@@ -369,7 +371,7 @@ class PipelineAgentRunLayer(CoreState):
             # path: a visible service event + honest requeue. `run` is None
             # here (nothing was consumed yet — pending_input is intact and
             # `_persist_task_messages` no-ops).
-            self._agent_turn_failed(task, task_id, run, generation, e)
+            self._agent_turn_failed(task, task_id, run, [], None, generation, e)
         finally:
             # Stop any spinner whose result event was lost to an abort or a
             # run error (normally all of them are already stopped).
@@ -627,6 +629,32 @@ class PipelineAgentRunLayer(CoreState):
         self._failed_queue_rounds = 0
         self._failed_queue_retry_at = 0.0
 
+    def _backdate_consumed_prompt(
+        self,
+        run: AgentRun[AgentDeps, str] | None,
+        consumed: list[PendingInput],
+        text: str | None,
+    ) -> None:
+        """Backdate the consumed prompt the run's transcript already holds.
+
+        The exception handlers below run when a request node died BEFORE
+        its completion bookkeeping (`_agent_model_request_done`, the only
+        normal backdating point) — the prompt sits in the transcript with
+        the CONSUMPTION stamp, and persisting it as is freezes that stamp:
+        the resumed attempt is a continuation turn with no consumed input,
+        so nothing ever corrects it and the prompt renders BELOW the
+        service events that happened between typing and consumption. This
+        applies the same backdating the node completion would have — a
+        no-op when the prompt never reached the transcript (the caller
+        re-queues it with its original stamps then)."""
+        if run is None or not consumed or text is None:
+            return
+        try:
+            messages = run.all_messages()
+        except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
+            return
+        backdate_user_prompt(messages, text, consumed[0].at)
+
     async def _agent_tools_node(
         self,
         task: Task,
@@ -755,6 +783,7 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
+        text: str | None,
         generation: int,
     ) -> None:
         """Interrupted (abort, nudge, or a newer run taking over): keep
@@ -771,6 +800,7 @@ class PipelineAgentRunLayer(CoreState):
             # sanitize: drop the API-invalid tail (tool calls without
             # results, the empty interrupted request) so later messages
             # can append in any order.
+            self._backdate_consumed_prompt(run, consumed, text)
             self._persist_task_messages(task, run)
             if run is None and consumed:
                 # Cancelled before the run context was even entered (e.g.
@@ -799,6 +829,7 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
+        text: str | None,
         generation: int,
         role: AgentRole,
         error: Exception,
@@ -843,6 +874,11 @@ class PipelineAgentRunLayer(CoreState):
             )
         if self._agent_generations.get(task_id) == generation:
             self._drop_stream_preview(task_id, generation)
+        # The request node died mid-flight: the consumed prompt is already
+        # in the transcript with the consumption stamp (the completion
+        # bookkeeping that backdates it was skipped) — correct it before
+        # the persist freezes the wrong stamp.
+        self._backdate_consumed_prompt(run, consumed, text)
         self._persist_task_messages(task, run)
         task.messages = sanitized_messages(task.messages)
         if run is None and consumed:
@@ -884,6 +920,8 @@ class PipelineAgentRunLayer(CoreState):
         task: Task,
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
+        consumed: list[PendingInput],
+        text: str | None,
         generation: int,
         error: Exception,
     ) -> None:
@@ -902,6 +940,7 @@ class PipelineAgentRunLayer(CoreState):
             # hang in the dialog (and would be shown for whatever the
             # user does next).
             self._drop_stream_preview(task_id, generation)
+        self._backdate_consumed_prompt(run, consumed, text)
         self._persist_task_messages(task, run)
         task.messages = sanitized_messages(task.messages)
         # Not lost: unfinished marks the attempt; promotion resumes it

@@ -344,6 +344,28 @@ class UnmergedListScreen(ModalScreen[None]):
             task = app.manager.tasks.get(task_id)
             if task is None:
                 return
+            # Fast path BEFORE ensure_root: a strictly ff-able branch
+            # (the base is an ancestor of the branch tip AND the two
+            # tips differ) whose worktree is GONE needs no worktree —
+            # recreating one (worktree_removal: on_completion) would
+            # re-copy the main checkout's untracked files into the fresh
+            # worktree and let the removal snapshot commit them onto the
+            # finished branch (the 3f13160b incident). The ff-merge
+            # itself runs in the MAIN checkout (`_ff_merge`:
+            # is_fast_forward re-check, clear_identical_untracked_for_ff,
+            # ff_merge_branch) and needs nothing else. An existing
+            # worktree keeps the full prepare; the strictness keeps the
+            # row's "ff" kind honest: a branch already contained in the
+            # base ("already up to date") falls through to the full
+            # prepare, which reports it as holding nothing beyond the
+            # base.
+            branch = env.branch(task_id)
+            base = await asyncio.to_thread(env.base_branch)
+            if not env.worktree_path(task_id).is_dir() and await asyncio.to_thread(
+                merge_engine.strict_fast_forward, app.project_root, branch, base
+            ):
+                await self._ff_merge(task_id, branch, base)
+                return
             try:
                 root, note = await asyncio.to_thread(env.ensure_root, task_id, task)
             except WorktreeUnavailable as e:

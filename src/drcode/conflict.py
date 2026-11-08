@@ -57,6 +57,7 @@ __all__ = [
     "DiffStat",
     "FileState",
     "Hunk",
+    "numstat",
     "parse_hunks",
 ]
 
@@ -206,6 +207,40 @@ class DiffStat:
         return self.added is None
 
 
+def numstat(cwd: Path, *args: str) -> list[DiffStat]:
+    """`git diff --numstat <args>` in `cwd`, parsed into DiffStat rows.
+
+    Sync + blocking — callers wrap it in a worker thread. Lives at the
+    module level so the conflict screen can diff a strictly ff-able
+    branch straight in the PROJECT ROOT (the fast-path ff state has no
+    worktree at all), not only inside a task's worktree."""
+    proc = subprocess.run(
+        ["git", "diff", "--numstat", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        **child_priority_kwargs(),
+    )
+    if proc.returncode != 0:
+        return []
+    stats: list[DiffStat] = []
+    for line in strip_malloc_stack_logging_noise(proc.stdout).splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        added, deleted, path = parts
+        stats.append(
+            DiffStat(
+                path=path,
+                added=None if added == "-" else int(added),
+                deleted=None if deleted == "-" else int(deleted),
+            )
+        )
+    return stats
+
+
 class ConflictWorktree:
     """The parked conflict of one task's worktree, as the screen sees it.
 
@@ -249,7 +284,8 @@ class ConflictWorktree:
     # -- diff stats ---------------------------------------------------------------
 
     def numstat(self, *args: str, cwd: Path | None = None) -> list[DiffStat]:
-        """`git diff --numstat <args>` parsed into DiffStat rows.
+        """`git diff --numstat <args>` parsed into DiffStat rows (the
+        module-level `numstat`, run against this worktree by default).
 
         Callers wrap this in a worker thread (sync + blocking, like
         everything else here). Two uses on the screen:
@@ -260,31 +296,7 @@ class ConflictWorktree:
         - `numstat("--cached")` — the future merge commit's content
           while the merge is resolved and staged but not committed.
         """
-        proc = subprocess.run(
-            ["git", "diff", "--numstat", *args],
-            cwd=cwd or self.worktree,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-            **child_priority_kwargs(),
-        )
-        if proc.returncode != 0:
-            return []
-        stats: list[DiffStat] = []
-        for line in strip_malloc_stack_logging_noise(proc.stdout).splitlines():
-            parts = line.split("\t", 2)
-            if len(parts) < 3:
-                continue
-            added, deleted, path = parts
-            stats.append(
-                DiffStat(
-                    path=path,
-                    added=None if added == "-" else int(added),
-                    deleted=None if deleted == "-" else int(deleted),
-                )
-            )
-        return stats
+        return numstat(cwd or self.worktree, *args)
 
     # -- live state ---------------------------------------------------------------
 

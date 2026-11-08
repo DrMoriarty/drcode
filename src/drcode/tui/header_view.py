@@ -256,7 +256,9 @@ class HeaderLayer(DrCodeState):
         """ntfy push-notification status for the expanded header's bottom
         line: the switch alone (an enabled switch with no topic simply
         stays silent — the notifier handles that, not the header)."""
-        return f"Notifications: {'on' if self.settings.notifications_enabled else 'off'}"
+        return (
+            f"Notifications: {'on' if self.settings.notifications_enabled else 'off'}"
+        )
 
     def _header_github_text(self) -> str:
         """GitHub-integration status for the expanded header's bottom line:

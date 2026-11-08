@@ -162,9 +162,7 @@ def _split_chat_text(text: str, limit: int) -> list[str]:
             # The separator that preceded this line belongs to the END of
             # the closing part (before the appended closers) — dropping it
             # would silently swallow one newline per part boundary.
-            parts.append(
-                reopen + "".join(buf) + sep + "[/]" * len(stacks[i - 1])
-            )
+            parts.append(reopen + "".join(buf) + sep + "[/]" * len(stacks[i - 1]))
             buf, size = [], 0
             reopen = "".join(stacks[i - 1])
             buf.append(reopen + line)

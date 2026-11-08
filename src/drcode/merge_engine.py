@@ -96,6 +96,7 @@ __all__ = [
     "rerere_status",
     "resolve_identical",
     "save_report",
+    "strict_fast_forward",
     "triage",
     "triage_reports",
     "unmerged_paths",
@@ -370,6 +371,26 @@ def is_fast_forward(project_root: Path, branch: str, base_branch: str) -> bool:
         return False
     code, _ = _git("merge-base", "--is-ancestor", base_branch, branch, cwd=project_root)
     return code == 0
+
+
+def strict_fast_forward(project_root: Path, branch: str, base_branch: str) -> bool:
+    """is_fast_forward AND the two tips actually differ. The strictness
+    keeps the ff-offer guard honest: a branch already fully contained in
+    the base (identical tips — `merge --ff-only` would say "already up to
+    date" and do nothing) is NOT a fast-forward worth offering."""
+    if not is_fast_forward(project_root, branch, base_branch):
+        return False
+    code, branch_tip = _git(
+        "rev-parse", "--verify", "--quiet", branch, cwd=project_root
+    )
+    if code != 0 or not branch_tip.strip():
+        return False
+    code, base_tip = _git(
+        "rev-parse", "--verify", "--quiet", base_branch, cwd=project_root
+    )
+    if code != 0 or not base_tip.strip():
+        return False
+    return branch_tip.strip() != base_tip.strip()
 
 
 # -- triage -------------------------------------------------------------------

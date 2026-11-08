@@ -282,6 +282,61 @@ async def test_land_ff_merges_the_selected_branch(
         )
 
 
+async def test_land_ff_fast_path_skips_worktree_recreation(
+    isolated: Path,
+    configured_env: None,
+) -> None:
+    """The 3f13160b incident, the list's half: m on a strictly ff-able
+    row whose worktree was removed (worktree_removal: on_completion)
+    must NOT recreate the worktree (no untracked re-copy, no
+    removal-snapshot pollution of the finished branch) — the --ff-only
+    merge runs straight in the main checkout and the untracked file in
+    the root survives untouched."""
+    manager = TaskManager(isolated)
+    t1 = _completed_task(manager, "Fix one")
+    t2 = _completed_task(manager, "Fix two")
+    _unmerged_branch(isolated, t1, "ONE")
+    _unmerged_branch(isolated, t2, "TWO")
+    # The incident shape for t1: the worktree goes away (the completion
+    # removal), an untracked file stays in the main checkout's root.
+    env = TaskEnvironment(isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    env.remove(t1)
+    wt1 = isolated / ".drcode" / "worktrees" / t1
+    assert not wt1.exists()
+    (isolated / "notes.txt").write_text("local notes\n")
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(t1)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: (
+                isinstance(app.screen, UnmergedListScreen)
+                and len(app.screen._entries) == 2
+            ),
+            pilot=pilot,
+            what="unmerged list open",
+        )
+        screen = app.screen
+        assert isinstance(screen, UnmergedListScreen)
+        await pilot.press("m")
+        await wait_until(
+            lambda: _ancestor(isolated, branch_for(t1), "main"),
+            pilot=pilot,
+            what="branch ff-merged into main",
+        )
+        # The worktree was never recreated and the untracked file never
+        # leaked onto the branch or out of the root.
+        assert not wt1.exists()
+        assert not _git(
+            isolated, "ls-tree", "--", branch_for(t1), "notes.txt"
+        ).strip()
+        assert (isolated / "notes.txt").read_text() == "local notes\n"
+        # The second branch stays unmerged and the list refreshes to it.
+        assert not _ancestor(isolated, branch_for(t2), "main")
+
+
 async def test_land_refuses_to_commit_a_parked_conflict(
     isolated: Path,
     configured_env: None,

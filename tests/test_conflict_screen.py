@@ -1238,6 +1238,168 @@ async def test_ff_ready_r_refresh_rereads_numstat(
         assert "2 files changed" in summary
 
 
+# -- the fast-path ff mode (worktree removed; no recreation, no pollution) ------
+
+
+def _finished_task_removed_worktree(repo: Path) -> tuple[str, Path]:
+    """The 3f13160b incident shape: a completed PASSED task whose branch
+    holds one clean commit beyond main, whose worktree was REMOVED on
+    completion (the `worktree_removal: on_completion` removal), and with
+    an untracked file left in the main checkout's root. Returns
+    (task_id, the removed worktree path)."""
+    manager = TaskManager(repo)
+    # Track the scaffolded .gitignore BEFORE the task branch diverges
+    # (same reasoning as _finished_task_with_branch above).
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "gitignore")
+    task = manager.create("Fix app", "fix the app")
+    task.status = TaskStatus.COMPLETED
+    task.verification = VerificationStatus.PASSED
+    task.touch()
+    manager.storage.save(task)
+    env = TaskEnvironment(repo, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    wt, _note = env.ensure_root(task.id)
+    (wt / "fix.txt").write_text("fixed\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "fix app")
+    env.remove(task.id)
+    assert not wt.exists()
+    # An untracked file in the MAIN checkout — the file a recreated
+    # worktree would re-copy into itself (_copy_untracked_files) and a
+    # removal snapshot would then commit onto the branch.
+    (repo / "notes.txt").write_text("local notes\n")
+    return task.id, wt
+
+
+def _branch_has_file(repo: Path, task_id: str, path: str) -> bool:
+    proc = subprocess.run(
+        ["git", "ls-tree", "--", branch_for(task_id), path],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+async def test_ff_fast_path_opens_without_recreating_worktree(
+    isolated: Path, configured_env: None
+) -> None:
+    """The removed worktree is NOT recreated for a strictly ff-able
+    branch: the screen opens ff-ready straight from the branch/base
+    probe (`wt` stays None — no prepare, no untracked re-copy, no
+    removal-snapshot pollution of the finished branch), the numstat
+    shows the branch diff computed in the project root, and the ff keys
+    behave exactly like the worktree-backed ff-ready mode."""
+    task_id, wt = _finished_task_removed_worktree(isolated)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen._ff_ready and screen.wt is None,
+            pilot=pilot,
+            what="fast-path ff-ready state (no worktree)",
+        )
+        assert screen._ff_branch == branch_for(task_id)
+        assert screen._ff_base == "main"
+        assert not wt.exists()  # never recreated
+        assert not _branch_has_file(isolated, task_id, "notes.txt")
+        await wait_until(
+            lambda: set(_numstat_rows(screen)) == {"fix.txt"},
+            pilot=pilot,
+            what="ff numstat computed in the project root",
+        )
+        assert screen.check_action("ff_merge", ()) is True
+        assert screen.check_action("resolve", ("ours",)) is False
+        assert screen.check_action("abort_merge", ()) is False
+        footer = str(screen.query_one("#merge-footer", Static).content)
+        assert "f merge into main (ff-only)" in footer
+        assert "disabled — nothing to resolve" in footer
+
+
+async def test_ff_fast_path_merge_lands_without_touching_worktree_or_untracked(
+    isolated: Path, configured_env: None
+) -> None:
+    """`f` in the fast-path state fast-forwards the main checkout's base
+    to the branch — the untracked file in the root is untouched, no
+    worktree is ever (re)created and the branch stays free of it."""
+    task_id, wt = _finished_task_removed_worktree(isolated)
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task_id)
+        await pilot.pause()
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen._ff_ready and screen.wt is None,
+            pilot=pilot,
+            what="fast-path ff-ready state",
+        )
+        await pilot.press("f")
+        await wait_until(
+            lambda: screen._ff_done,
+            pilot=pilot,
+            what="main checkout fast-forwarded",
+        )
+        await wait_until(
+            lambda: not isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="merge screen auto-closed",
+        )
+        assert (isolated / "fix.txt").read_text() == "fixed\n"
+        # The untracked file: untouched in the root, never committed to
+        # the branch, the worktree still gone.
+        assert (isolated / "notes.txt").read_text() == "local notes\n"
+        assert not _branch_has_file(isolated, task_id, "notes.txt")
+        assert not wt.exists()
+        tips = _git(isolated, "rev-parse", "main", branch_for(task_id)).split()
+        assert tips[0] == tips[1]  # main IS the branch tip now
+
+
+def test_strict_fast_forward_excludes_up_to_date(repo: Path) -> None:
+    """strict_fast_forward = the base is an ancestor of the branch tip
+    AND the two tips differ: a branch already contained in the base
+    (`merge --ff-only` would say "already up to date") is NOT a
+    fast-forward to offer — the fast path must not claim it."""
+    from drcode.merge_engine import is_fast_forward, strict_fast_forward
+
+    _git(repo, "checkout", "-qb", "drcode/t-strict")
+    # Tips equal: is_fast_forward is True (trivial ancestor), the strict
+    # probe refuses.
+    assert is_fast_forward(repo, "drcode/t-strict", "main")
+    assert not strict_fast_forward(repo, "drcode/t-strict", "main")
+    # One commit beyond the base: strictly ff-able.
+    (repo / "x.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "ahead")
+    assert strict_fast_forward(repo, "drcode/t-strict", "main")
+    # Diverged (the base moved ahead): not ff-able at all.
+    _git(repo, "checkout", "-q", "main")
+    (repo / "app.py").write_text("a\nMAIN\nc\n")
+    _git(repo, "commit", "-qam", "main edit")
+    assert not is_fast_forward(repo, "drcode/t-strict", "main")
+    assert not strict_fast_forward(repo, "drcode/t-strict", "main")
+    # A ghost branch: False, never an exception.
+    assert not strict_fast_forward(repo, "drcode/ghost", "main")
+
+
 async def test_ff_merge_refused_when_base_moved(
     isolated: Path, configured_env: None
 ) -> None:

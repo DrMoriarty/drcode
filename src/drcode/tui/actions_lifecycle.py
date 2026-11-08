@@ -542,6 +542,13 @@ class TaskLifecycleLayer(DrCodeState):
                 event.stop()
                 self.open_new_goal_dialog()
                 return
+            if item.goal_open:
+                # The "→ all goals…" entry row: open the GoalScreen without
+                # a focused goal (the entry stays even when no ACTIVE goal
+                # is listed — done/archived ones live behind its filters).
+                event.stop()
+                self.action_open_goals()
+                return
             if item.goal_id:
                 # A goal row of the GOALS section opens the full-screen
                 # roadmap view focused on that goal (a header toggles the

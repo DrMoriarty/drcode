@@ -18,6 +18,7 @@ class TaskItem(ListItem):
         section: str | None = None,
         goal_id: str | None = None,
         goal_add: bool = False,
+        goal_open: bool = False,
     ) -> None:
         label = Label(text, classes="section-header" if header else "task-item")
         super().__init__(label)
@@ -28,12 +29,15 @@ class TaskItem(ListItem):
         # (None on task rows). Enter/space/click on a header toggles it.
         self.section = section
         # Goals-section rows (the sidebar's GOALS block): the goal the row
-        # renders (None on task/header rows) and the "+ add goal" capture
-        # row flag. Both route clicks/Enter in on_list_view_selected —
-        # goal rows open the GoalScreen, the add-row opens the capture
-        # dialog — instead of view_task.
+        # renders (None on task/header rows), the "+ add goal" capture
+        # row flag and the "→ all goals…" entry row flag. All route
+        # clicks/Enter in on_list_view_selected — goal rows open the
+        # GoalScreen focused on that goal, the open-row opens it
+        # unfocused, the add-row opens the capture dialog — instead of
+        # view_task.
         self.goal_id = goal_id
         self.goal_add = goal_add
+        self.goal_open = goal_open
 
     def set_text(self, text: str) -> None:
         """Update the row's label in place.

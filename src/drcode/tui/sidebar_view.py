@@ -411,6 +411,7 @@ class SidebarLayer(DrCodeState):
         viewed: bool = False,
         goal_id: str | None = None,
         goal_add: bool = False,
+        goal_open: bool = False,
     ) -> TaskItem:
         """Reuse (or create) the mounted row for *key* and sync it to the
         desired *text*/`viewed` class.
@@ -429,6 +430,7 @@ class SidebarLayer(DrCodeState):
                 section=section,
                 goal_id=goal_id,
                 goal_add=goal_add,
+                goal_open=goal_open,
             )
             if viewed:
                 item.add_class("viewed")
@@ -537,8 +539,13 @@ class SidebarLayer(DrCodeState):
         # empty and hide their rows when collapsed), the goals block is
         # never fully hidden: the counters stay visible even collapsed —
         # a collapsed GOALS keeps its header plus the top-level rows
-        # (only the sub-goal tree is folded away). The trailing "+ add
-        # goal" row is the capture shortcut (the same dialog as Ctrl+Y).
+        # (only the sub-goal tree is folded away). The trailing rows are
+        # the section's utility entries: "→ all goals…" opens the
+        # GoalScreen (the only entry when every goal is done/archived —
+        # the tree lists ACTIVE goals only), "+ add goal" is the capture
+        # shortcut (the same dialog as Ctrl+Y). Both belong to the
+        # expanded section only; the open-row is shown whenever ANY goal
+        # exists (any status), the add-row always.
         goals_rows = self._goals_section_rows()
         goals_header = self._sidebar_row(
             ("header", "GOALS"),
@@ -561,9 +568,21 @@ class SidebarLayer(DrCodeState):
                     goal_id=goal.id,
                 )
             )
-        # The "+ add goal" capture row belongs to the expanded section only:
-        # a collapsed GOALS shows just its header and the top-level rows.
+        # The utility rows belong to the expanded section only: a
+        # collapsed GOALS shows just its header and the top-level rows.
+        # "→ all goals…" is rendered under the goal tree and stays visible
+        # even when the tree itself is empty (all goals done/archived) —
+        # otherwise the GoalScreen would be unreachable from the sidebar.
         if not top_level_only:
+            if self.manager.goals.goals:
+                keys.add(("goal-open", ""))
+                items.append(
+                    self._sidebar_row(
+                        ("goal-open", ""),
+                        "[dim]→ all goals…[/]",
+                        goal_open=True,
+                    )
+                )
             keys.add(("goal-add", ""))
             items.append(
                 self._sidebar_row(

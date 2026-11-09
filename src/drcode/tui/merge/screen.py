@@ -124,8 +124,13 @@ from textual.timer import Timer
 from textual.widgets import ListView, Static
 
 from ... import merge_resolver
-from ...conflict import ConflictWorktree, DiffStat, Hunk, parse_hunks
-from ...merge_engine import MergeReport, is_fast_forward, remove_report
+from ...conflict import ConflictWorktree, DiffStat, Hunk, numstat, parse_hunks
+from ...merge_engine import (
+    MergeReport,
+    is_fast_forward,
+    remove_report,
+    strict_fast_forward,
+)
 from ...merge_resolver import CheckResult
 from ...task_env import WorktreeUnavailable
 from ...tools import child_priority_kwargs
@@ -259,6 +264,11 @@ class ConflictScreen(ModalScreen[None]):
         # already performed here (further f presses would be no-ops).
         self._ff_ready: bool = False
         self._ff_done: bool = False
+        # The fast-path ff state (no worktree was ever created): branch
+        # and base probed at prepare time — `_run_ff_merge` and the
+        # numstat/footer fall back to them while `self.wt` is None.
+        self._ff_branch: str | None = None
+        self._ff_base: str | None = None
         # A conflicted merge is actually parked (the report is ok and
         # conflicted): the only state where the automatic resolver (``A``)
         # has anything to attack — the ff-ready / staged states have
@@ -415,6 +425,10 @@ class ConflictScreen(ModalScreen[None]):
             base = "base"
             if self.wt is not None and self.wt.report is not None:
                 base = self.wt.report.base_branch or "base"
+            elif self._ff_base:
+                # The fast-path ff state: no worktree, the base comes
+                # from the prepare-time probe.
+                base = self._ff_base
             if self._ff_done:
                 text = f"merged into {base} · r refresh · esc close"
             else:
@@ -499,6 +513,42 @@ class ConflictScreen(ModalScreen[None]):
             self._hide_prepare()
             return
         pinned_before = task is not None and task.isolation_pinned is not None
+        base = await asyncio.to_thread(env.base_branch)
+        # Fast path BEFORE ensure_root: a strictly ff-able branch (the
+        # base is an ancestor of the branch tip AND the two tips differ)
+        # whose worktree is GONE needs no worktree at all — ensure_root
+        # would only recreate it, re-copying the main checkout's
+        # untracked files into the fresh worktree (_copy_untracked_files)
+        # and letting the removal snapshot commit them onto the finished
+        # branch — pollution a pure ff-merge never causes (the 3f13160b
+        # incident). A still-existing worktree keeps the full prepare:
+        # nothing is recreated there and the flow stays report-backed.
+        # The strictness keeps the ff-ready guard's semantics: a branch
+        # already fully contained in the base (`merge --ff-only` would
+        # say "already up to date") must NOT offer f — it falls through
+        # to the full prepare, which reports it as holding nothing
+        # beyond the base.
+        branch = env.branch(self.task_id)
+        if not env.worktree_path(self.task_id).is_dir() and await asyncio.to_thread(
+            strict_fast_forward, app.project_root, branch, base
+        ):
+            self._ff_ready = True
+            self._conflicted = False
+            self._numstat_mode = "ff"
+            self._ff_branch = branch
+            self._ff_base = base
+            self._finish_prepare_stages(ok=True)
+            self._set_title(
+                f"#{self.task_id} — {base} is behind {branch}: nothing "
+                f"to resolve; press f to merge {branch} into {base} "
+                "(ff-only)"
+            )
+            self._update_footer()
+            # What the ff would land in the base: the plain branch diff,
+            # computed straight in the project root (no worktree).
+            await self._refresh_diff_stats()
+            self._hide_prepare()
+            return
         try:
             root, note = await asyncio.to_thread(env.ensure_root, self.task_id, task)
         except WorktreeUnavailable as e:
@@ -514,7 +564,6 @@ class ConflictScreen(ModalScreen[None]):
             self._set_title(f"Merge conflicts — unavailable: {note}")
             self._hide_prepare()
             return
-        base = await asyncio.to_thread(env.base_branch)
 
         def progress(stage: str) -> None:
             # Worker thread → event loop. call_from_thread is
@@ -1565,17 +1614,18 @@ class ConflictScreen(ModalScreen[None]):
     def action_ff_merge(self) -> None:
         """f: fast-forward the MAIN checkout's base branch to the task's
         branch — available only in the ff-ready state (report ok, not
-        conflicted) and only once (check_action gates both)."""
+        conflicted) and only once (check_action gates both). Works with
+        or without a worktree: the fast-path ff state (a removed
+        worktree was never recreated) drives it off the prepare-time
+        branch/base probe alone."""
         if self._busy is not None:
             return
-        if self.wt is None or not self._ff_ready or self._ff_done:
+        if not self._ff_ready or self._ff_done:
             return
         self._do_ff_merge()
 
     @work(exclusive=True, group="merge-ff")
     async def _do_ff_merge(self) -> None:
-        if self.wt is None:
-            return
         self._show_busy("fast-forwarding")
         try:
             await self._run_ff_merge()
@@ -1586,10 +1636,16 @@ class ConflictScreen(ModalScreen[None]):
         app = cast("DrCodeApp", self.app)
         env = app.task_env
         report = self.wt.report if self.wt is not None else None
-        if report is None:
-            return
-        branch = report.branch or f"drcode/{self.task_id}"
-        base = report.base_branch or "base"
+        if report is not None:
+            branch = report.branch or f"drcode/{self.task_id}"
+            base = report.base_branch or "base"
+        else:
+            # The fast-path ff state: no worktree was ever created —
+            # is_fast_forward (the re-check below), the untracked
+            # cleanup and `ff_merge_branch` all run in the MAIN
+            # checkout and need nothing else.
+            branch = f"drcode/{self.task_id}"
+            base = self._ff_base or await asyncio.to_thread(env.base_branch)
         # The base may have moved between the screen's prepare and this
         # press — re-verify the ff-possibility at press time so the
         # refusal names the reason instead of raw git output.
@@ -1696,16 +1752,22 @@ class ConflictScreen(ModalScreen[None]):
 
     def action_refresh_state(self) -> None:
         """r: re-triage the live merge and reload everything (an external
-        editor may have changed files while the screen was suspended)."""
+        editor may have changed files while the screen was suspended). In
+        the fast-path ff state (no worktree) it re-fetches the branch
+        numstat only — there is no merge to re-triage."""
         if self._busy is not None:
             return
-        if self.wt is None:
+        if self.wt is None and self._numstat_mode != "ff":
             return
         self._refresh()
 
     @work(exclusive=True, group="merge-refresh")
     async def _refresh(self) -> None:
-        if self.wt is None or not self.is_mounted:
+        if not self.is_mounted:
+            return
+        if self.wt is None:
+            if self._numstat_mode == "ff":
+                await self._refresh_diff_stats()
             return
         self._show_busy("refreshing")
         try:
@@ -1723,10 +1785,16 @@ class ConflictScreen(ModalScreen[None]):
 
     def _fetch_diff_stats(self) -> list[DiffStat]:
         """The numstat rows for the current file-list mode (`_numstat_mode`):
-        `base..branch` in the project root for ff-ready, the staged index
-        diff for the resolved-but-uncommitted mode. Sync + blocking —
-        callers wrap it in a worker thread."""
-        assert self.wt is not None
+        `base..branch` in the project root for ff-ready (with or without a
+        worktree — the fast-path state has none and diffs straight in the
+        project root), the staged index diff for the
+        resolved-but-uncommitted mode. Sync + blocking — callers wrap it
+        in a worker thread."""
+        if self.wt is None:
+            if self._numstat_mode == "ff" and self._ff_branch and self._ff_base:
+                app = cast("DrCodeApp", self.app)
+                return numstat(app.project_root, self._ff_base, self._ff_branch)
+            return []
         if self._numstat_mode == "ff" and self.wt.report is not None:
             app = cast("DrCodeApp", self.app)
             return self.wt.numstat(

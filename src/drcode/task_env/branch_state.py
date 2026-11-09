@@ -24,6 +24,8 @@ from ._common import BRANCH_PREFIX
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from ..settings import ProjectSettings
+
 
 class _BranchStateMixin:
     """The mergedness-query half of `TaskEnvironment` (see
@@ -32,6 +34,7 @@ class _BranchStateMixin:
     if TYPE_CHECKING:
         # Members provided by the composed TaskEnvironment (facade) —
         # declarations only, no runtime impact.
+        settings: ProjectSettings
         _unmerged_cache_fingerprint: str | None
         _unmerged_cache: dict[str, bool]
         _unmerged_cache_lock: threading.Lock
@@ -50,10 +53,21 @@ class _BranchStateMixin:
     # -- mergedness queries ------------------------------------------------------
 
     def base_branch(self) -> str:
-        """The main checkout's current branch — the base the unmerged
-        commits of a task branch are counted against. Falls back to HEAD
-        (detached HEAD, unusual setups): counting against whatever HEAD
-        points at still protects the task's own commits."""
+        """The base the unmerged commits of a task branch are counted
+        against: the `isolation_start_branch` project setting when it
+        names an existing branch — the very branch task branches are
+        forked from (see lifecycle's `_start_point`), so counting
+        against it keeps mergedness correct even when the user checks a
+        task branch out in the main directory; otherwise the main
+        checkout's current branch (the auto mode the default workflow
+        merges into). A configured branch that does not exist degrades
+        to the auto mode — the same fallback the fork point uses.
+        Falls back to HEAD (detached HEAD, unusual setups): counting
+        against whatever HEAD points at still protects the task's own
+        commits."""
+        configured = (self.settings.isolation_start_branch or "").strip()
+        if configured and self._branch_exists(configured):
+            return configured
         code, out = self._git("symbolic-ref", "--short", "HEAD")
         if code == 0 and out:
             return out
@@ -78,8 +92,8 @@ class _BranchStateMixin:
 
     def unmerged_commits(self, task_id: str) -> int:
         """How many commits of the task's `drcode/<task-id>` branch are
-        NOT reachable from the main checkout's current branch
-        (`base_branch`) — the "is the task's work already merged?" check
+        NOT reachable from the base branch (`base_branch`) — the "is
+        the task's work already merged?" check
         the pipeline runs when a passed task is finalized, so an unmerged
         fix is never left as a silent responsibility of the (absent)
         `on_accepted` hook. 0 when the branch does not exist (no
@@ -101,8 +115,9 @@ class _BranchStateMixin:
         of commits already on the base branch (`git cherry <base>
         <branch>` — the `-` lines), and how many are not (`+` lines).
 
-        A task branch forked from the main checkout's current branch can
-        never contain a patch-id its base lacks a copy of — the task's
+        A task branch forked from the base branch (the configured
+        `isolation_start_branch`, else the main checkout's current one)
+        can never contain a patch-id its base lacks a copy of — the task's
         work is always new to the base. Duplicates therefore mean the
         branch was forked from a WRONG start point (a detached HEAD
         stranded mid-rebase, a foreign commit): merging would drag the

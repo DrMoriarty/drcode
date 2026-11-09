@@ -34,7 +34,7 @@ Lifecycle contract (enforced here and by the pipeline):
   hook — `on_accepted` for development tasks, `on_research_accepted`
   for research (each receives the worktree path and branch in the
   payload — see `drcode.workflow`). When the finalized task's branch
-  still holds commits the main checkout does not have, the pipeline
+  still holds commits the base branch does not have, the pipeline
   reminds the user explicitly (`unmerged_commits`) — a PASSED verdict
   never silently assumes the fix reached their checkout. The worktree
   directory lives as long as the task does; it is removed when the task
@@ -78,8 +78,10 @@ here may change its behavior):
    work). The setting never touches the agents' own commit tools
    (`git_policy` governs those).
 2. A branch with unique commits is never deleted automatically: before
-   every `branch -D`, the commits not reachable from the main checkout's
-   current branch are counted; if there are any, the branch survives
+   every `branch -D`, the commits not reachable from the base branch
+   (`base_branch`: the configured `isolation_start_branch`, else the
+   main checkout's current one) are counted; if there are any, the
+   branch survives
    (the worktree directory is still removed — commits live in the repo
    object store, the directory is disposable).
 

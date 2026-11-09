@@ -722,8 +722,11 @@ async def test_server_clean_exit_reports_tab_to_hook(tmp_path: Path) -> None:
 
 
 async def _start_project(
-    http: aiohttp.ClientSession, base_url: str, ctx: ShellContext,
-    tab: str, project: Path,
+    http: aiohttp.ClientSession,
+    base_url: str,
+    ctx: ShellContext,
+    tab: str,
+    project: Path,
 ):
     """Connect a tab and start ``project``; return (ws, all events up to
     and including the first error-or-started event)."""
@@ -813,7 +816,9 @@ async def test_server_restart_own_project_allowed(tmp_path: Path) -> None:
             )
             event, _ = await _wait_for(
                 ws,
-                lambda e: isinstance(e, dict) and e.get("event") in ("started", "error"),
+                lambda e: (
+                    isinstance(e, dict) and e.get("event") in ("started", "error")
+                ),
             )
             assert event["event"] == "started"
             assert ctx.tabs["ta"].session is not None
@@ -1219,7 +1224,9 @@ def test_term_js_duplicate_project_guard() -> None:
     js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
 
     # The occupancy helper and the shared message text exist.
-    occupied = js[js.index("function projectOccupied") : js.index("function duplicateMessage")]
+    occupied = js[
+        js.index("function projectOccupied") : js.index("function duplicateMessage")
+    ]
     assert "t.started" in occupied  # only a live session holds the project
     assert "t !== excludeTab" in occupied  # a tab may restart its own project
     dup = js[js.index("function duplicateMessage") : js.index("function launchProject")]
@@ -1227,13 +1234,17 @@ def test_term_js_duplicate_project_guard() -> None:
 
     # launchProject blocks (welcome error on an unstarted tab, boot error
     # on a live one) instead of opening a duplicate.
-    launch = js[js.index("function launchProject") : js.index("function fetchAvailableFonts")]
+    launch = js[
+        js.index("function launchProject") : js.index("function fetchAvailableFonts")
+    ]
     assert "projectOccupied(project, tab)" in launch
     assert "showWelcomeError(duplicateMessage(project))" in launch
     assert "bootError(duplicateMessage(project))" in launch
 
     # The picker blocks BEFORE creating a welcome tab.
-    picker = js[js.index("function launchFromPicker") : js.index("function loadRecents")]
+    picker = js[
+        js.index("function launchFromPicker") : js.index("function loadRecents")
+    ]
     assert "projectOccupied(project, null)" in picker
     assert picker.index("projectOccupied") < picker.index("createTab")
 
@@ -1260,6 +1271,8 @@ def test_term_js_remove_recent_button() -> None:
     assert 'api("remove_recent")' in recents
     assert "doRemove(item.project)" in recents
     assert "renderRecents(recents)" in recents
+
+
 def test_term_js_failed_start_reverts_tab() -> None:
     """A failed start (e.g. a recents entry whose directory was deleted)
     must not leave a phantom tab behind: launchProject renames the tab
@@ -1276,9 +1289,7 @@ def test_term_js_failed_start_reverts_tab() -> None:
     assert "tab.project = null" in revert
     assert "refreshTabLabels()" in revert
 
-    handler = js[
-        js.index("function handleTabEvent") : js.index("function onTabExited")
-    ]
+    handler = js[js.index("function handleTabEvent") : js.index("function onTabExited")]
     err = handler[handler.index('event.event === "error"') :]
     assert "revertTabToWelcome(tab)" in err
     # Revert happens before the error is shown, and for a started tab

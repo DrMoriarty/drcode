@@ -299,7 +299,9 @@ async def test_land_ff_fast_path_skips_worktree_recreation(
     _unmerged_branch(isolated, t2, "TWO")
     # The incident shape for t1: the worktree goes away (the completion
     # removal), an untracked file stays in the main checkout's root.
-    env = TaskEnvironment(isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE))
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
     env.remove(t1)
     wt1 = isolated / ".drcode" / "worktrees" / t1
     assert not wt1.exists()
@@ -329,9 +331,7 @@ async def test_land_ff_fast_path_skips_worktree_recreation(
         # The worktree was never recreated and the untracked file never
         # leaked onto the branch or out of the root.
         assert not wt1.exists()
-        assert not _git(
-            isolated, "ls-tree", "--", branch_for(t1), "notes.txt"
-        ).strip()
+        assert not _git(isolated, "ls-tree", "--", branch_for(t1), "notes.txt").strip()
         assert (isolated / "notes.txt").read_text() == "local notes\n"
         # The second branch stays unmerged and the list refreshes to it.
         assert not _ancestor(isolated, branch_for(t2), "main")

@@ -498,6 +498,267 @@ async def test_server_ws_bridge_roundtrip(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# server.py — tabs: one session per tab, tab-marked events
+# ---------------------------------------------------------------------------
+
+
+def _make_loop_payload(tmp_path: Path) -> str:
+    """Payload printing its cwd every 0.1 s (easy stream assertions)."""
+    script = tmp_path / "payload.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time\n"
+        "while True:\n"
+        "    sys.stdout.write(os.getcwd() + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+async def _wait_for(ws: aiohttp.ClientWebSocketResponse, predicate, timeout: float = 5):
+    """Read frames until ``predicate`` matches; return (match, all frames)."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    seen = []
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(f"condition not met in time; seen: {seen!r}")
+        msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            event = json.loads(msg.data)
+            seen.append(event)
+            if predicate(event):
+                return event, seen
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            seen.append(msg.data)
+            if predicate(msg.data):
+                return msg.data, seen
+        elif msg.type == aiohttp.WSMsgType.ERROR:
+            raise AssertionError(f"ws error; seen: {seen!r}")
+
+
+async def test_server_tabs_are_independent(tmp_path: Path) -> None:
+    """Two tabs = two PTY sessions: separate output streams, tab-marked
+    events, and killing one tab leaves the other running."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    proj_a = tmp_path / "proj-alpha"
+    proj_b = tmp_path / "proj-beta"
+    proj_a.mkdir()
+    proj_b.mkdir()
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            ws_a = await http.ws_connect(f"{base_url}/ws?token={ctx.token}&tab=ta")
+            ws_b = await http.ws_connect(f"{base_url}/ws?token={ctx.token}&tab=tb")
+            await ws_a.send_json(
+                {"type": "start", "project": str(proj_a), "rows": 24, "cols": 80}
+            )
+            await ws_b.send_json(
+                {"type": "start", "project": str(proj_b), "rows": 24, "cols": 80}
+            )
+
+            event_a, _ = await _wait_for(
+                ws_a, lambda e: isinstance(e, dict) and e.get("event") == "started"
+            )
+            assert event_a["tab"] == "ta"
+            event_b, _ = await _wait_for(
+                ws_b, lambda e: isinstance(e, dict) and e.get("event") == "started"
+            )
+            assert event_b["tab"] == "tb"
+
+            # Each stream carries only its own project's output.
+            data_a, _ = await _wait_for(
+                ws_a, lambda d: isinstance(d, bytes) and b"proj-alpha" in d
+            )
+            assert b"proj-beta" not in data_a
+            data_b, _ = await _wait_for(
+                ws_b, lambda d: isinstance(d, bytes) and b"proj-beta" in d
+            )
+            assert b"proj-alpha" not in data_b
+
+            # Killing tab ta does not touch tb.
+            await ws_a.send_json({"type": "kill", "tab": "ta"})
+            event, _ = await _wait_for(
+                ws_a,
+                lambda e: isinstance(e, dict) and e.get("event") == "exited",
+            )
+            assert event["tab"] == "ta"
+            assert ctx.tabs["ta"].session is None
+            assert ctx.tabs["tb"].session is not None
+            # tb keeps streaming after the neighbour died.
+            await _wait_for(
+                ws_b,
+                lambda d: isinstance(d, bytes) and b"proj-beta" in d,
+                timeout=2,
+            )
+
+            await ws_b.send_json({"type": "kill", "tab": "tb"})
+            await _wait_for(
+                ws_b, lambda e: isinstance(e, dict) and e.get("event") == "exited"
+            )
+            await ws_a.close()
+            await ws_b.close()
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+async def test_server_stop_all_kills_every_tab(tmp_path: Path) -> None:
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    projects = []
+    for name in ("p1", "p2", "p3"):
+        p = tmp_path / name
+        p.mkdir()
+        projects.append(p)
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            sockets = []
+            for i, proj in enumerate(projects):
+                ws = await http.ws_connect(f"{base_url}/ws?token={ctx.token}&tab=t{i}")
+                await ws.send_json(
+                    {"type": "start", "project": str(proj), "rows": 24, "cols": 80}
+                )
+                sockets.append(ws)
+            for i, ws in enumerate(sockets):
+                await _wait_for(
+                    ws, lambda e: isinstance(e, dict) and e.get("event") == "started"
+                )
+            assert ctx.live_project() == str(projects[0])
+            await ctx.stop_all()
+            for i in range(3):
+                assert ctx.tabs[f"t{i}"].session is None
+            assert ctx.live_project() is None
+            for ws in sockets:
+                await ws.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_clean_exit_reports_tab_to_hook(tmp_path: Path) -> None:
+    """A clean exit (code 0) invokes on_clean_exit with the tab id — the
+    shell closes THAT tab, not the whole window."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    closed: list[str] = []
+    ctx.on_clean_exit = closed.append
+    script = tmp_path / "payload.py"
+    script.write_text("#!/usr/bin/env python3\nprint('bye')\n", encoding="utf-8")
+    script.chmod(0o755)
+    ctx.payload = str(script)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    try:
+        async with (
+            aiohttp.ClientSession() as http,
+            http.ws_connect(f"{base_url}/ws?token={ctx.token}&tab=solo") as ws,
+        ):
+            await ws.send_json(
+                {"type": "start", "project": str(proj), "rows": 24, "cols": 80}
+            )
+            event, _ = await _wait_for(
+                ws, lambda e: isinstance(e, dict) and e.get("event") == "exited"
+            )
+            assert event["code"] == 0
+            assert event["tab"] == "solo"
+            # The hook ran before the event reached the wire.
+            assert closed == ["solo"]
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# web/term.js — tab model (static, headless)
+# ---------------------------------------------------------------------------
+
+
+def test_term_js_tab_model_wiring() -> None:
+    """The client is multi-tab: one ws per tab (tab id in the connect
+    URL), activation re-fits the active terminal, closing the last tab
+    closes the window, and a clean exit closes only its own tab."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    # One ws per tab, addressed by tab id.
+    assert '"&tab=" + encodeURIComponent(tab.id)' in js
+    # Tab switching re-fits the active terminal and resizes its PTY.
+    activate = js[js.index("function activateTab") :]
+    assert "tab.fit.fit()" in activate
+    assert "sendResize(tab)" in activate
+    # Per-tab key handler + data sink (each xterm talks to its own ws).
+    assert "function terminalKeyHandler(tab, ev)" in js
+    assert "tab.ws.send(new TextEncoder().encode(data))" in js
+
+    # Closing the last tab closes the window.
+    close = js[js.index("function closeTab") : js.index("/* Python-side hook")]
+    assert 'api("close_window")' in close
+    # A clean exit (code 0) closes ITS tab, not the window; a crash opens
+    # the restart dialog for that tab.
+    exited = js[js.index("function onTabExited") : js.index("function hideDialog")]
+    assert "closeTab(tab)" in exited
+    assert "dialogTab = tab" in exited
+
+
+def test_term_js_python_close_tab_hook() -> None:
+    """app.py closes a tab via evaluate_js on window.__drcodeDesktop —
+    the JS hook must exist and be idempotent (lookup in tabs)."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    assert "window.__drcodeDesktop" in js
+    hook = js[js.index("window.__drcodeDesktop") :]
+    assert "closeTab: function (id)" in hook
+    assert "if (tab) closeTab(tab);" in hook
+
+    src = (DESKTOP_DIR / "app.py").read_text(encoding="utf-8")
+    assert "window.__drcodeDesktop.closeTab" in src
+    assert "window.evaluate_js(" in src
+
+
+def test_index_html_has_tab_bar() -> None:
+    html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
+    for el_id in ("tabbar", "tabs", "new-tab-btn", "panes"):
+        assert f'id="{el_id}"' in html
+    css = (DESKTOP_DIR / "web" / "style.css").read_text(encoding="utf-8")
+    for selector in ("#tabbar", ".tab ", ".tab-pane", "#panes"):
+        assert selector in css
+
+
+def test_term_js_new_tab_button_and_restart_targeting() -> None:
+    """The "+" next to the tab bar opens a fresh welcome tab; Ctrl+Shift+R
+    restarts the ACTIVE tab's project; the crash dialog buttons act on the
+    tab the dialog is about."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    new_tab = js[js.index("if (elNewTab)") : js.index("// Settings dialog wiring")]
+    assert 'createTab("welcome", null)' in new_tab
+
+    keys = js[
+        js.index('window.addEventListener("keydown"') : js.index(
+            "// Keep every PTY size"
+        )
+    ]
+    restart_at = keys.index('ev.key === "r" || ev.key === "R"')
+    target = keys.index("launchProject(activeTab, activeTab.project)")
+    assert restart_at < target
+
+    restart_btn = js[
+        js.index('document.getElementById("btn-restart")') : js.index(
+            'document.getElementById("btn-close")'
+        )
+    ]
+    assert "launchProject(tab, tab.project)" in restart_btn
+    close_btn = js[
+        js.index('document.getElementById("btn-close")') : js.index("if (elNewTab)")
+    ]
+    assert "closeTab(tab)" in close_btn
+
+
+# ---------------------------------------------------------------------------
 # web/term.js — welcome-screen pick-project handler (static, headless)
 # ---------------------------------------------------------------------------
 
@@ -558,13 +819,14 @@ def test_term_js_font_settings_wiring() -> None:
     bridge, constructor pickup, family application, and Ctrl+, interception."""
     js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
 
-    # Settings load with the bridge retry pattern, and createTerminal
-    # consumes them (constructor bakes the metrics into the renderer).
+    # Settings load with the bridge retry pattern, and the shell start
+    # (first Terminal constructor included) consumes them (constructor
+    # bakes the metrics into the renderer).
     assert 'api("get_settings")' in js
     boot = js[js.index("function boot") :]
-    # createTerminal must run only after settings resolve (not eagerly).
-    assert "createTerminal(savedSettings)" in boot
-    assert "fontFamily: fontStackFor(settings.font_family)" in js
+    # The first terminal must be created only after settings resolve.
+    assert "startShell();" in boot
+    assert "fontFamily: fontStackFor(currentFontFamily)" in js
     assert "fontSize: fontSize" in js
 
     # Family change reuses the WebGL-recreation/refit path — family swaps
@@ -574,8 +836,8 @@ def test_term_js_font_settings_wiring() -> None:
         js.index("function applyFontSize") : js.index("function applyFontFamily")
     ]
     for fn in (apply_family, apply_size):
-        assert "recreateWebgl()" in fn
-        assert "refitAfterFontChange()" in fn
+        assert "recreateWebgl(tab)" in fn
+        assert "refitAfterFontChange(tab)" in fn
     assert "fontStackFor" in apply_family
 
     # Ctrl+, is intercepted inside the custom key handler AFTER the
@@ -700,8 +962,8 @@ def test_index_html_has_floating_font_button() -> None:
     html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="font-settings-btn"' in html
     assert "font-btn hidden" in html  # session-only: revealed on "started"
-    # It overlays the terminal, not the welcome card.
-    assert html.index('id="terminal"') < html.index('id="font-settings-btn"')
+    # It overlays the tab panes, not the welcome card.
+    assert html.index('id="panes"') < html.index('id="font-settings-btn"')
 
     css = (DESKTOP_DIR / "web" / "style.css").read_text(encoding="utf-8")
     btn = css[css.index(".font-btn {") : css.index(".font-btn:hover")]
@@ -742,7 +1004,10 @@ def test_term_js_floating_font_button_wiring() -> None:
     close = js[
         js.index("function closeSettings") : js.index("function showSettingsError")
     ]
-    assert "if (started && term) term.focus();" in close
+    assert (
+        "if (activeTab && activeTab.term && activeTab.started) activeTab.term.focus();"
+        in close
+    )
 
 
 def test_term_js_font_preview_wiring() -> None:

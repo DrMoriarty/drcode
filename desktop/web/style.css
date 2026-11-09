@@ -33,7 +33,98 @@ html, body {
   font-size: 14px;
 }
 
+/* Tab bar on top, tab panes fill the rest. */
+body {
+  display: flex;
+  flex-direction: column;
+}
+
 .hidden { display: none !important; }
+
+/* ---- tab bar ---- */
+
+#tabbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 8px;
+  background: #1b1e24;
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  z-index: 10;
+}
+
+.tabs {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 7px 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #20242c;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.tab.active {
+  background: #2b303a;
+  border-color: #3d434f;
+  color: var(--fg);
+}
+.tab-label { overflow: hidden; text-overflow: ellipsis; }
+.tab-close {
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--muted);
+}
+.tab-close:hover { background: #3d434f; color: var(--fg); }
+
+.new-tab-btn {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #20242c;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.new-tab-btn:hover { background: #2b303a; color: var(--fg); }
+
+/* ---- tab panes ---- */
+
+#panes {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.tab-pane {
+  position: absolute;
+  inset: 0;
+}
 
 /* ---- welcome screen ---- */
 

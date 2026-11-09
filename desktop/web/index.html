@@ -15,8 +15,20 @@
   <link rel="stylesheet" href="static/style.css">
 </head>
 <body>
-  <!-- Welcome / project picker: visible until a session starts -->
-  <div id="welcome" class="welcome">
+  <!-- Tab bar: one tab per project (its own drcode process in its own
+       PTY). Panes below hold one terminal (or the shared welcome node)
+       per tab; term.js creates the tab elements and the panes. -->
+  <div id="tabbar">
+    <ul id="tabs" class="tabs"></ul>
+    <button id="new-tab-btn" class="new-tab-btn" type="button"
+            title="New project tab" aria-label="New project tab">+</button>
+  </div>
+
+  <div id="panes">
+    <!-- Welcome / project picker: a SINGLE shared node that term.js moves
+         into whichever welcome-tab is active (only one tab is visible at
+         a time, so reparenting is enough). -->
+    <div id="welcome" class="welcome hidden">
     <div class="welcome-card">
       <div class="brand">
         <span class="brand-mark">&gt;_</span>
@@ -44,27 +56,28 @@
         <div>OSC 52 clipboard is wired: copying from the TUI lands in the system clipboard.</div>
       </div>
     </div>
+    </div>
   </div>
 
-  <!-- Terminal fills the window once the session starts -->
-  <div id="terminal" class="terminal hidden"></div>
-
-  <!-- Visible font-settings entry point for the live session (the welcome
+  <!-- Visible font-settings entry point for a live session (the welcome
        screen has its own "Terminal font…" button and the Ctrl+, hint that
-       disappears with it). Sits ABOVE #terminal in the DOM but never
-       changes its box (absolute overlay), so xterm's fit and the
-       ResizeObserver-driven PTY resize are unaffected. -->
+       disappears with it). Sits ABOVE the tab panes in the DOM but never
+       changes their box (absolute overlay), so xterm's fit and the
+       ResizeObserver-driven PTY resize are unaffected. Shown only while
+       the active tab runs a session. -->
   <button id="font-settings-btn" class="font-btn hidden" type="button"
           title="Terminal font (⌘/Ctrl+,)" aria-label="Terminal font settings">Aa</button>
 
-  <!-- Crash / exit dialog -->
+  <!-- Crash / exit dialog: one overlay, but always about a single tab —
+       Restart respawns that tab's project, Close closes that tab (and
+       the window follows when the last tab is gone). -->
   <div id="exit-dialog" class="overlay hidden">
     <div class="dialog">
       <div id="exit-title" class="dialog-title">drcode exited</div>
       <div id="exit-text" class="dialog-text"></div>
       <div class="dialog-actions">
         <button id="btn-restart" class="btn btn-primary" type="button">Restart</button>
-        <button id="btn-close" class="btn" type="button">Close window</button>
+        <button id="btn-close" class="btn" type="button">Close tab</button>
       </div>
     </div>
   </div>

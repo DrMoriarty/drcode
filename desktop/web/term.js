@@ -1,10 +1,18 @@
 /*
- * DrCode Desktop — terminal client.
+ * DrCode Desktop — terminal client (multi-tab).
  *
- * xterm.js (vendored UMD bundles, no frontend build) wired to the local
- * aiohttp server's /ws bridge:
+ * One window, one tab per project: each tab owns an xterm.js instance
+ * and its own WebSocket to the local aiohttp server's /ws bridge (the
+ * tab id rides along as a query param), i.e. its own drcode process in
+ * its own PTY:
  *   - binary frames: raw PTY output (server->client) / stdin (client->server)
  *   - text frames:   JSON control events (start/resize/exited/...)
+ *
+ * Tab switching hides the inactive pane and re-fits the active terminal
+ * (fit() + a resize control message to its PTY). Everything not tied to
+ * a single project is window-global: the OSC 52 clipboard filter (per
+ * stream, but the behavior is shared), the font settings (applied to
+ * every live terminal), the settings dialog, fullscreen, recents.
  *
  * OSC 52 (the clipboard escape drcode uses) is intercepted in the output
  * byte stream BEFORE xterm.js sees it and routed to the system clipboard:
@@ -17,7 +25,10 @@
   var params = new URLSearchParams(location.search);
   var TOKEN = params.get("token") || "";
 
-  var elTerminal = document.getElementById("terminal");
+  var elTabbar = document.getElementById("tabbar");
+  var elTabs = document.getElementById("tabs");
+  var elNewTab = document.getElementById("new-tab-btn");
+  var elPanes = document.getElementById("panes");
   var elWelcome = document.getElementById("welcome");
   var elPick = document.getElementById("pick-project");
   var elRecentsBlock = document.getElementById("recents-block");
@@ -74,13 +85,18 @@
   var MAX_FONT_SIZE = 40;
   var FONT_STEP = 1;
 
-  var term = null;
-  var fit = null;
-  var webgl = null;
-  var ws = null;
-  var currentProject = null;
-  var started = false;
-  var closing = false; // clean exit in progress: suppress the crash dialog
+  /* ---- tab model ---- */
+  /* tabs[] holds one object per tab, in tab-bar order:
+   *   { id, kind: "welcome"|"terminal", project, started, closing,
+   *     ws, term, fit, webgl, filter, pane, elTerm, tabEl, labelEl }
+   * The welcome node (#welcome) is a SINGLE shared element moved into
+   * whichever welcome-tab is active — only one tab is visible at a
+   * time, so reparenting is enough. */
+  var tabs = [];
+  var activeTab = null;
+  var nextTabSeq = 1;
+  var dialogTab = null; // tab the crash dialog is about
+
   var savedSettings = null; // {font_family, font_size} from the bridge
   var currentFontFamily = null; // primary family (null = default FONT_STACK)
   /* Families the OS reports as installed (bridge get_available_fonts).
@@ -176,21 +192,185 @@
     }
   }
 
-  /* ---------------- terminal setup ---------------- */
+  /* ---------------- tabs ---------------- */
 
   function fontStackFor(family) {
     var primary = family && String(family).trim();
     return primary ? primary + ", " + FONT_STACK : FONT_STACK;
   }
 
-  function createTerminal(settings) {
-    settings = settings || {};
+  function projectTitle(path) {
+    var parts = String(path || "").split("/").filter(Boolean);
+    return parts.pop() || path || "DrCode";
+  }
+
+  function nextTabId() {
+    return "t" + nextTabSeq++;
+  }
+
+  function createTab(kind, project) {
+    var tab = {
+      id: nextTabId(),
+      kind: kind, // "welcome" (picker, no process yet) or "terminal"
+      project: project || null,
+      started: false,
+      closing: false, // deliberate close in progress: suppress dialogs
+      ws: null,
+      term: null,
+      fit: null,
+      webgl: null,
+      filter: null,
+      pane: null,
+      elTerm: null,
+      tabEl: null,
+      labelEl: null,
+    };
+    tabs.push(tab);
+
+    var tabEl = document.createElement("li");
+    tabEl.className = "tab";
+    var label = document.createElement("span");
+    label.className = "tab-label";
+    tabEl.appendChild(label);
+    var closeBtn = document.createElement("span");
+    closeBtn.className = "tab-close";
+    closeBtn.textContent = "×";
+    closeBtn.title = "Close tab";
+    tabEl.appendChild(closeBtn);
+    closeBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      closeTab(tab);
+    });
+    tabEl.addEventListener("click", function () { activateTab(tab); });
+    tab.tabEl = tabEl;
+    tab.labelEl = label;
+    elTabs.appendChild(tabEl);
+
+    var pane = document.createElement("div");
+    pane.className = "tab-pane hidden";
+    tab.pane = pane;
+    elPanes.appendChild(pane);
+
+    if (kind === "terminal") createTerminalHost(tab);
+    refreshTabLabels();
+    activateTab(tab);
+    return tab;
+  }
+
+  function createTerminalHost(tab) {
+    // The xterm container: hidden until the session's "started" event
+    // (the shared welcome node keeps the pane occupied until then).
+    var elTerm = document.createElement("div");
+    elTerm.className = "terminal hidden";
+    tab.pane.appendChild(elTerm);
+    tab.elTerm = elTerm;
+    if (resizeObserver) resizeObserver.observe(elTerm);
+  }
+
+  function refreshTabLabels() {
+    tabs.forEach(function (tab) {
+      if (tab.kind === "welcome") {
+        tab.labelEl.textContent = "New project";
+        tab.tabEl.title = "New project";
+      } else {
+        tab.labelEl.textContent = projectTitle(tab.project);
+        tab.tabEl.title = tab.project || "";
+      }
+    });
+  }
+
+  function activateTab(tab) {
+    if (!tab) return;
+    activeTab = tab;
+    tabs.forEach(function (t) {
+      t.pane.classList.toggle("hidden", t !== tab);
+      t.tabEl.classList.toggle("active", t === tab);
+    });
+    if (tab.kind === "welcome") {
+      // Move the shared welcome node into this pane (appendChild on an
+      // already-attached node relocates it).
+      tab.pane.appendChild(elWelcome);
+      elWelcome.classList.remove("hidden");
+      updateFontBtnVisibility();
+      setWindowTitle("DrCode");
+      return;
+    }
+    if (tab.started) {
+      if (tab.fit) {
+        try { tab.fit.fit(); } catch (err) { /* container not measurable */ }
+      }
+      sendResize(tab);
+      if (tab.term) tab.term.focus();
+    }
+    if (tab.project) setWindowTitle("DrCode — " + projectTitle(tab.project));
+    updateFontBtnVisibility();
+  }
+
+  function updateFontBtnVisibility() {
+    if (!elFontBtn) return;
+    var show = !!(activeTab && activeTab.started);
+    elFontBtn.classList.toggle("hidden", !show);
+  }
+
+  function setWindowTitle(title) {
+    document.title = title;
+    var setTitle = api("set_title");
+    if (setTitle) setTitle(title);
+  }
+
+  function closeTab(tab) {
+    if (!tab || tab.closing) return;
+    tab.closing = true;
+    // Kill the PTY explicitly: tab sessions deliberately outlive a ws
+    // reconnect, so the server will not infer the close from the socket.
+    if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+      try { tab.ws.send(JSON.stringify({ type: "kill", tab: tab.id })); } catch (err) { /* gone */ }
+    }
+    if (tab.ws) {
+      try { tab.ws.close(); } catch (err) { /* gone */ }
+    }
+    if (dialogTab === tab) {
+      dialogTab = null;
+      hideDialog();
+    }
+    if (tab.term) {
+      try { tab.term.dispose(); } catch (err) { /* already gone */ }
+    }
+    if (elWelcome.parentNode === tab.pane) elWelcome.remove();
+    if (tab.pane) tab.pane.remove();
+    if (tab.tabEl) tab.tabEl.remove();
+    var idx = tabs.indexOf(tab);
+    if (idx >= 0) tabs.splice(idx, 1);
+    if (activeTab === tab) {
+      activeTab = null;
+      if (tabs.length) activateTab(tabs[Math.max(0, idx - 1)]);
+    }
+    if (!tabs.length) {
+      // Last tab closed — the window has nothing left to show.
+      var closeWindow = api("close_window");
+      if (closeWindow) closeWindow();
+      else window.close();
+    }
+  }
+
+  /* Python-side hook (ctx.on_clean_exit → evaluate_js) closes the tab
+   * through this; idempotent with the ws "exited"-event path. */
+  window.__drcodeDesktop = {
+    closeTab: function (id) {
+      var tab = tabs.filter(function (t) { return t.id === id; })[0];
+      if (tab) closeTab(tab);
+    },
+  };
+
+  /* ---------------- terminal setup (per tab) ---------------- */
+
+  function createTerminalFor(tab) {
+    var settings = savedSettings || {};
     var fontSize = typeof settings.font_size === "number"
       ? settings.font_size
       : DEFAULT_FONT_SIZE;
-    currentFontFamily = settings.font_family || null;
-    term = new window.Terminal({
-      fontFamily: fontStackFor(settings.font_family),
+    tab.term = new window.Terminal({
+      fontFamily: fontStackFor(currentFontFamily),
       fontSize: fontSize,
       lineHeight: 1.0,
       cursorBlink: true,
@@ -208,25 +388,27 @@
     // Unicode 11 width tables: the built-in UnicodeV6 provider predates emoji,
     // so ✅ etc. render 1 cell wide while Textual (Python wcwidth) sends them
     // as 2 — the rest of the line then drifts one cell to the left.
-    term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
-    term.unicode.activeVersion = "11";
-    fit = new window.FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open(elTerminal);
+    tab.term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+    tab.term.unicode.activeVersion = "11";
+    tab.fit = new window.FitAddon.FitAddon();
+    tab.term.loadAddon(tab.fit);
+    tab.term.open(tab.elTerm);
     try {
-      webgl = new window.WebglAddon.WebglAddon();
-      webgl.onContextLoss(function () {
-        if (webgl) { webgl.dispose(); webgl = null; }
+      tab.webgl = new window.WebglAddon.WebglAddon();
+      tab.webgl.onContextLoss(function () {
+        if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
       }); // xterm falls back to DOM renderer
-      term.loadAddon(webgl);
+      tab.term.loadAddon(tab.webgl);
     } catch (err) {
-      webgl = null;
+      tab.webgl = null;
       /* no WebGL — the default renderer keeps everything working */
     }
-    term.attachCustomKeyEventHandler(terminalKeyHandler);
-    term.onData(function (data) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(new TextEncoder().encode(data));
+    tab.term.attachCustomKeyEventHandler(function (ev) {
+      return terminalKeyHandler(tab, ev);
+    });
+    tab.term.onData(function (data) {
+      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        tab.ws.send(new TextEncoder().encode(data));
       }
     });
   }
@@ -239,28 +421,31 @@
    * is re-created after each change; on failure the DOM renderer takes
    * over. fit.fit() recomputes cols/rows for the new cell metrics and
    * sendResize() propagates them to the PTY.
+   *
+   * Font settings are WINDOW-global (remembered for all projects), so a
+   * change fans out to every live terminal, not just the active one.
    */
 
-  function recreateWebgl() {
-    if (!webgl) return;
-    try { webgl.dispose(); } catch (err) { /* already gone */ }
-    webgl = null;
+  function recreateWebgl(tab) {
+    if (!tab.webgl) return;
+    try { tab.webgl.dispose(); } catch (err) { /* already gone */ }
+    tab.webgl = null;
     try {
-      webgl = new window.WebglAddon.WebglAddon();
-      webgl.onContextLoss(function () {
-        if (webgl) { webgl.dispose(); webgl = null; }
+      tab.webgl = new window.WebglAddon.WebglAddon();
+      tab.webgl.onContextLoss(function () {
+        if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
       });
-      term.loadAddon(webgl);
+      tab.term.loadAddon(tab.webgl);
     } catch (err) {
-      webgl = null; /* DOM renderer fallback */
+      tab.webgl = null; /* DOM renderer fallback */
     }
   }
 
-  function refitAfterFontChange() {
-    if (fit) {
-      try { fit.fit(); } catch (err) { /* container not measurable */ }
+  function refitAfterFontChange(tab) {
+    if (tab.fit) {
+      try { tab.fit.fit(); } catch (err) { /* container not measurable */ }
     }
-    sendResize();
+    sendResize(tab);
   }
 
   /* Hotkey-driven size changes must persist like the settings dialog does.
@@ -274,15 +459,15 @@
   var fontSizeSaveTimer = null;
 
   function persistFontSize() {
-    if (!term) return;
-    var size = term.options.fontSize;
-    savedSettings = { font_family: currentFontFamily, font_size: size };
+    var ref = activeTab && activeTab.term;
+    if (!ref) return;
+    savedSettings = { font_family: currentFontFamily, font_size: ref.options.fontSize };
     var setFont = api("set_font_settings");
     if (!setFont) return; // browser mode: apply locally only
     if (fontSizeSaveTimer) clearTimeout(fontSizeSaveTimer);
     fontSizeSaveTimer = setTimeout(function () {
       fontSizeSaveTimer = null;
-      Promise.resolve(setFont(currentFontFamily, term.options.fontSize))
+      Promise.resolve(setFont(currentFontFamily, ref.options.fontSize))
         .then(function (res) {
           if (res) savedSettings = res;
         })
@@ -291,13 +476,16 @@
   }
 
   function applyFontSize(size) {
-    if (!term) return;
     var clamped = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
-    if (clamped === term.options.fontSize) return;
-    term.options.fontSize = clamped;
-    recreateWebgl();
-    refitAfterFontChange();
-    persistFontSize();
+    var changed = false;
+    tabs.forEach(function (tab) {
+      if (!tab.term || tab.term.options.fontSize === clamped) return;
+      tab.term.options.fontSize = clamped;
+      recreateWebgl(tab);
+      refitAfterFontChange(tab);
+      changed = true;
+    });
+    if (changed) persistFontSize();
   }
 
   /* Changing the family changes the cell metrics exactly like a size
@@ -305,13 +493,14 @@
    * refit sequence applies. The family rides as the first entry of the
    * fallback chain (fontStackFor) so unknown names degrade gracefully. */
   function applyFontFamily(family) {
-    if (!term) return;
     currentFontFamily = family || null;
     var stack = fontStackFor(family);
-    if (stack === term.options.fontFamily) return;
-    term.options.fontFamily = stack;
-    recreateWebgl();
-    refitAfterFontChange();
+    tabs.forEach(function (tab) {
+      if (!tab.term || tab.term.options.fontFamily === stack) return;
+      tab.term.options.fontFamily = stack;
+      recreateWebgl(tab);
+      refitAfterFontChange(tab);
+    });
   }
 
   /* Modified Enter variants (Shift+Enter etc.) must reach the PTY as a
@@ -320,8 +509,8 @@
    * a newline. Textual's input parser decodes \x1b[13;<mods>u back into
    * shift+enter / ctrl+enter / alt+enter (kitty modifier encoding:
    * param = 1 + shift(1) + alt(2) + ctrl(4)). Plain Enter stays untouched.
-   * Only intercepted while a session is live — the welcome screen has no
-   * PTY to talk to.
+   * Only intercepted while the tab's session is live — the welcome screen
+   * has no PTY to talk to.
    */
   function encodeEnter(event) {
     var mods = 1;
@@ -331,7 +520,7 @@
     return "\x1b[13;" + mods + "u";
   }
 
-  function terminalKeyHandler(ev) {
+  function terminalKeyHandler(tab, ev) {
     // xterm.js invokes the custom handler for keydown, keyup AND keypress.
     // Reacting to keyup would re-fire every interception (a second CSI u
     // for modified Enter → a duplicated newline, a second font-size step),
@@ -340,9 +529,9 @@
     if (ev.type !== "keydown") return true;
     if (ev.key === "F11") return true; // handled by the window listener
     if (ev.key === "Enter" && (ev.shiftKey || ev.ctrlKey || ev.altKey)) {
-      if (!ws || ws.readyState !== WebSocket.OPEN || !started) return true;
+      if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN || !tab.started) return true;
       ev.preventDefault();
-      ws.send(new TextEncoder().encode(encodeEnter(ev)));
+      tab.ws.send(new TextEncoder().encode(encodeEnter(ev)));
       return false;
     }
     if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
@@ -354,12 +543,12 @@
     }
     if (ev.key === "=" || ev.key === "+" || code === "NumpadAdd") {
       ev.preventDefault();
-      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) + FONT_STEP);
+      applyFontSize(((activeTab && activeTab.term ? activeTab.term.options.fontSize : 0) || DEFAULT_FONT_SIZE) + FONT_STEP);
       return false;
     }
     if (ev.key === "-" || ev.key === "_" || code === "NumpadSubtract") {
       ev.preventDefault();
-      applyFontSize((term.options.fontSize || DEFAULT_FONT_SIZE) - FONT_STEP);
+      applyFontSize(((activeTab && activeTab.term ? activeTab.term.options.fontSize : 0) || DEFAULT_FONT_SIZE) - FONT_STEP);
       return false;
     }
     if (ev.key === "0" || code === "Digit0" || code === "Numpad0") {
@@ -370,11 +559,11 @@
     return true;
   }
 
-  function currentSize() {
+  function currentSize(tab) {
     var size = { cols: 80, rows: 24 };
-    if (fit) {
-      try { fit.fit(); } catch (err) { /* container not measurable yet */ }
-      var proposal = fit.proposeDimensions();
+    if (tab && tab.fit) {
+      try { tab.fit.fit(); } catch (err) { /* container not measurable yet */ }
+      var proposal = tab.fit.proposeDimensions();
       if (proposal && proposal.cols && proposal.rows) {
         size.cols = proposal.cols;
         size.rows = proposal.rows;
@@ -383,10 +572,11 @@
     return size;
   }
 
-  function sendResize() {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !started) return;
-    var size = currentSize();
-    ws.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+  function sendResize(tab) {
+    tab = tab || activeTab;
+    if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN || !tab.started) return;
+    var size = currentSize(tab);
+    tab.ws.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows, tab: tab.id }));
   }
 
   /* ---------------- font settings dialog ---------------- */
@@ -470,8 +660,8 @@
   function openSettings() {
     if (!elSettingsDialog) return;
     populateFontSelect(currentFontFamily);
-    var size = term && term.options.fontSize
-      ? term.options.fontSize
+    var size = activeTab && activeTab.term && activeTab.term.options.fontSize
+      ? activeTab.term.options.fontSize
       : (savedSettings && typeof savedSettings.font_size === "number"
           ? savedSettings.font_size
           : DEFAULT_FONT_SIZE);
@@ -487,9 +677,9 @@
     if (elSettingsDialog) elSettingsDialog.classList.add("hidden");
     // The dialog (opened from the hotkey, the welcome button or the
     // floating button) moved focus to its first field — hand it back to
-    // the terminal so hotkeys and typing keep working without a click.
-    // On the welcome screen there is no session to refocus.
-    if (started && term) term.focus();
+    // the active terminal so hotkeys and typing keep working without a
+    // click. On the welcome screen there is no session to refocus.
+    if (activeTab && activeTab.term && activeTab.started) activeTab.term.focus();
   }
 
   function showSettingsError(message) {
@@ -526,86 +716,88 @@
       });
   }
 
-  /* ---------------- websocket bridge ---------------- */
+  /* ---------------- websocket bridge (one ws per tab) ---------------- */
 
-  function connect() {
+  function connectTab(tab) {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(TOKEN));
+    var ws = new WebSocket(
+      proto + "//" + location.host + "/ws?token=" + encodeURIComponent(TOKEN) +
+      "&tab=" + encodeURIComponent(tab.id)
+    );
     ws.binaryType = "arraybuffer";
-
-    var filter = makeOsc52Filter(
+    tab.ws = ws;
+    tab.filter = makeOsc52Filter(
       function (bytes) {
-        if (term) term.write(bytes);
+        if (tab.term) tab.term.write(bytes);
       },
       copyToClipboard
     );
 
     ws.onopen = function () {
-      var size = currentSize();
-      if (currentProject) {
-        ws.send(JSON.stringify({ type: "start", project: currentProject, cols: size.cols, rows: size.rows }));
+      if (tab.project) {
+        var size = currentSize(tab);
+        ws.send(JSON.stringify({ type: "start", project: tab.project, cols: size.cols, rows: size.rows, tab: tab.id }));
       }
     };
 
     ws.onmessage = function (msg) {
       if (msg.data instanceof ArrayBuffer) {
-        filter(new Uint8Array(msg.data));
+        tab.filter(new Uint8Array(msg.data));
         return;
       }
       var event;
       try { event = JSON.parse(msg.data); } catch (err) { return; }
-      handleEvent(event);
+      handleTabEvent(tab, event);
     };
 
     ws.onclose = function () {
-      if (started && !closing) {
+      if (tab.started && !tab.closing && activeTab === tab) {
         // The shell server itself went away before any exit event arrived.
         bootError("Connection to the DrCode shell server was lost.");
       }
     };
   }
 
-  function handleEvent(event) {
+  function handleTabEvent(tab, event) {
     if (event.event === "started") {
-      started = true;
-      currentProject = event.project || currentProject;
-      elWelcome.classList.add("hidden");
-      elTerminal.classList.remove("hidden");
-      // Session-only entry point into the font dialog (the welcome
-      // screen's own button and its Ctrl+, hint are gone now).
-      if (elFontBtn) elFontBtn.classList.remove("hidden");
+      tab.started = true;
+      if (event.project) tab.project = event.project;
+      if (elWelcome.parentNode === tab.pane) elWelcome.remove();
+      if (tab.elTerm) tab.elTerm.classList.remove("hidden");
+      refreshTabLabels();
       hideDialog();
-      if (fit) {
-        try { fit.fit(); } catch (err) { /* noop */ }
+      if (tab.fit) {
+        try { tab.fit.fit(); } catch (err) { /* noop */ }
       }
-      sendResize();
-      if (term) term.focus();
-      var setTitle = api("set_title");
-      if (setTitle) {
-        var name = currentProject.split("/").filter(Boolean).pop() || currentProject;
-        setTitle("DrCode — " + name);
+      sendResize(tab);
+      if (activeTab === tab) {
+        if (tab.term) tab.term.focus();
+        setWindowTitle("DrCode — " + projectTitle(tab.project));
+        if (elFontBtn) elFontBtn.classList.remove("hidden");
       }
     } else if (event.event === "exited") {
-      started = false;
-      onProcessExited(event.code);
+      tab.started = false;
+      onTabExited(tab, event.code);
     } else if (event.event === "error") {
-      if (!started) showWelcomeError(event.message);
+      if (activeTab !== tab) return;
+      if (!tab.started) showWelcomeError(event.message);
       else bootError(event.message);
     }
   }
 
-  function onProcessExited(code) {
-    if (code === 0 || closing) {
-      closing = true;
-      var closeWindow = api("close_window");
-      if (closeWindow) closeWindow();
-      else window.close();
+  function onTabExited(tab, code) {
+    if (code === 0 || tab.closing) {
+      // Clean exit (or a deliberate kill): close THIS tab; the window
+      // itself goes away when the last tab is gone (closeTab handles it).
+      closeTab(tab);
+      updateFontBtnVisibility();
       return;
     }
     // Crash (or external kill): offer a restart instead of closing.
+    dialogTab = tab;
     elExitText.textContent =
       "The drcode process exited unexpectedly with code " + code +
-      (currentProject ? " while working in " + currentProject + "." : ".");
+      (tab.project ? " while working in " + tab.project + "." : ".");
     elExitDialog.classList.remove("hidden");
   }
 
@@ -618,13 +810,22 @@
     elWelcomeError.classList.remove("hidden");
   }
 
-  function launchProject(project) {
-    if (!project) return;
+  function launchProject(tab, project) {
+    if (!tab || !project) return;
+    if (activeTab !== tab) activateTab(tab);
     elWelcomeError.classList.add("hidden");
-    currentProject = project;
-    var size = currentSize();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "start", project: project, cols: size.cols, rows: size.rows }));
+    tab.project = project;
+    if (!tab.elTerm) {
+      tab.kind = "terminal";
+      createTerminalHost(tab);
+      createTerminalFor(tab);
+    }
+    refreshTabLabels();
+    if (!tab.ws) {
+      connectTab(tab); // start message is sent from ws.onopen
+    } else if (tab.ws.readyState === WebSocket.OPEN) {
+      var size = currentSize(tab);
+      tab.ws.send(JSON.stringify({ type: "start", project: project, cols: size.cols, rows: size.rows, tab: tab.id }));
     }
   }
 
@@ -674,10 +875,47 @@
       when.textContent = item.last_used ? new Date(item.last_used * 1000).toLocaleDateString() : "";
       li.appendChild(path);
       li.appendChild(when);
-      li.addEventListener("click", function () { launchProject(item.project); });
+      li.addEventListener("click", function () { launchFromPicker(item.project); });
       elRecentsList.appendChild(li);
     });
     elRecentsBlock.classList.remove("hidden");
+  }
+
+  /* Projects picked on the welcome screen open in the tab the welcome
+   * node currently lives in — unless that tab is already a live session,
+   * in which case a fresh tab takes it (the picker is only reachable
+   * from a welcome tab in practice). */
+  function launchFromPicker(project) {
+    var tab = activeTab && activeTab.kind === "welcome"
+      ? activeTab
+      : createTab("welcome", null);
+    launchProject(tab, project);
+  }
+
+  function loadRecents() {
+    var getInfo = api("get_info");
+    if (getInfo) {
+      Promise.resolve(getInfo())
+        .then(function (info) {
+          if (info && info.recents) renderRecents(info.recents);
+        })
+        .catch(function () { /* recents are cosmetic */ });
+      return;
+    }
+    // pywebview injects its bridge asynchronously; recents may need a retry.
+    var attempts = 0;
+    var timer = setInterval(function () {
+      attempts += 1;
+      var retry = api("get_info");
+      if (retry) {
+        clearInterval(timer);
+        Promise.resolve(retry()).then(function (info) {
+          if (info && info.recents) renderRecents(info.recents);
+        });
+      } else if (attempts > 40) {
+        clearInterval(timer);
+      }
+    }, 250);
   }
 
   function boot() {
@@ -685,12 +923,13 @@
     fetchAvailableFonts();
 
     /* The bridge injects asynchronously, so settings load with the same
-     * retry pattern as recents — and the Terminal constructor (which
-     * bakes fontFamily/fontSize into its renderer) waits for them. */
+     * retry pattern as recents — and the first Terminal constructor
+     * (which bakes fontFamily/fontSize into its renderer) waits for
+     * them. */
     function applyAndStart(settings) {
       savedSettings = settings || {};
-      createTerminal(savedSettings);
-      startTerminalAndConnect();
+      currentFontFamily = savedSettings.font_family || null;
+      startShell();
     }
 
     var getSettings = api("get_settings");
@@ -717,10 +956,23 @@
     }, 250);
   }
 
+  function startShell() {
+    loadRecents();
+    // CLI-pinned project (--project at app start): tab #1 auto-launches,
+    // skipping the welcome screen. Everything else opens from the UI.
+    var projectArg = params.get("project");
+    if (projectArg) {
+      var tab = createTab("terminal", projectArg);
+      launchProject(tab, projectArg);
+    } else {
+      createTab("welcome", null);
+    }
+  }
+
   function wireUi() {
     function runChooseProject(choose) {
       Promise.resolve(choose()).then(function (path) {
-        if (path) launchProject(path);
+        if (path) launchFromPicker(path);
       });
     }
 
@@ -754,14 +1006,29 @@
     });
 
     document.getElementById("btn-restart").addEventListener("click", function () {
+      var tab = dialogTab;
       hideDialog();
-      launchProject(currentProject);
+      dialogTab = null;
+      if (tab && tab.project) launchProject(tab, tab.project);
     });
     document.getElementById("btn-close").addEventListener("click", function () {
-      var closeWindow = api("close_window");
-      if (closeWindow) closeWindow();
-      else window.close();
+      var tab = dialogTab;
+      hideDialog();
+      dialogTab = null;
+      if (tab) closeTab(tab); // last tab closed → the window follows
+      else {
+        var closeWindow = api("close_window");
+        if (closeWindow) closeWindow();
+        else window.close();
+      }
     });
+
+    // "New project" next to the tab bar: a fresh welcome tab.
+    if (elNewTab) {
+      elNewTab.addEventListener("click", function () {
+        createTab("welcome", null);
+      });
+    }
 
     // Settings dialog wiring (open from the welcome button, the floating
     // session button or the Ctrl+, hotkey — intercepted in
@@ -813,7 +1080,8 @@
         if (fs) fs();
       } else if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "r" || ev.key === "R")) {
         ev.preventDefault();
-        if (currentProject) launchProject(currentProject);
+        // Restart the ACTIVE tab's project.
+        if (activeTab && activeTab.project) launchProject(activeTab, activeTab.project);
       } else if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && ev.key === ",") {
         // Welcome screen / focus outside the terminal: the in-terminal
         // case is handled by terminalKeyHandler before xterm forwards
@@ -823,55 +1091,24 @@
       }
     });
 
-    // Keep the PTY size in sync with the window size.
+    // Keep every PTY size in sync with the window size — but only the
+    // ACTIVE tab sends resizes (hidden panes keep their stale geometry;
+    // switching back re-fits and re-sends).
     if (typeof ResizeObserver !== "undefined") {
-      var pending = null;
-      var ro = new ResizeObserver(function () {
-        if (pending) clearTimeout(pending);
-        pending = setTimeout(sendResize, 80); // debounce live-drag resizes
+      resizeObserver = new ResizeObserver(function (entries) {
+        var touchesActive = entries.some(function (entry) {
+          return activeTab && entry.target === activeTab.elTerm;
+        });
+        if (!touchesActive) return;
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(function () { sendResize(activeTab); }, 80); // debounce live-drag resizes
       });
-      ro.observe(elTerminal);
     }
-    window.addEventListener("resize", sendResize);
+    window.addEventListener("resize", function () { sendResize(activeTab); });
   }
 
-  function startTerminalAndConnect() {
-    // Populate recents from the shell (pywebview bridge), then connect.
-    var getInfo = api("get_info");
-    var ready = getInfo
-      ? Promise.resolve(getInfo()).then(function (info) {
-          if (info && info.recents) renderRecents(info.recents);
-        })
-      : Promise.resolve();
-
-    // CLI-pinned project (--project at app start): auto-launch, skip the welcome.
-    var projectArg = params.get("project");
-    if (projectArg) launchProject(projectArg);
-
-    ready
-      .then(function () { connect(); })
-      .catch(function (err) {
-        connect(); // still work, just without recents
-        bootError("Failed to load shell info: " + err);
-      });
-
-    // pywebview injects its bridge asynchronously; recents may need a retry.
-    if (!getInfo) {
-      var attempts = 0;
-      var timer = setInterval(function () {
-        attempts += 1;
-        var retry = api("get_info");
-        if (retry) {
-          clearInterval(timer);
-          Promise.resolve(retry()).then(function (info) {
-            if (info && info.recents) renderRecents(info.recents);
-          });
-        } else if (attempts > 40) {
-          clearInterval(timer);
-        }
-      }, 250);
-    }
-  }
+  var resizeObserver = null;
+  var resizeTimer = null;
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot);

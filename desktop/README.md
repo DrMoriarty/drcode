@@ -15,15 +15,29 @@ inside a desktop build is the repo root `version` file (same `v*` tag).
 | file | role |
 |---|---|
 | `app.py` | pywebview window + lifecycle: starts the aiohttp server thread, native folder dialog, clipboard bridge, fullscreen/title/close |
-| `server.py` | aiohttp on `127.0.0.1:<ephemeral>`; serves `web/`; `/ws?token=<random>` is the WebSocket ↔ PTY bridge (pywebview's own HTTP helper has no WebSocket support — not used) |
+| `server.py` | aiohttp on `127.0.0.1:<ephemeral>`; serves `web/`; `/ws?token=<random>&tab=<id>` is the WebSocket ↔ PTY bridge, one connection per tab (pywebview's own HTTP helper has no WebSocket support — not used) |
 | `pty_session.py` | `os.openpty()` + spawn; asyncio read/write pumps; window resize → `ioctl(TIOCSWINSZ)` (Textual reacts to SIGWINCH itself); child env `TERM=xterm-256color`, `COLORTERM=truecolor` |
 | `projects.py` | recent projects (`~/.config/drcode-desktop.json`, XDG-aware) |
 | `packaging.py` | `.app` / AppImage / `.deb` assembly (see below) |
 | `desktop.spec` | PyInstaller spec for the SHELL; copies the pre-built payload in as `resources/drcode` |
 | `web/` | `index.html`, `term.js`, styles, vendored xterm.js UMD bundles + fit/WebGL/unicode11 addons (no npm/webpack), bundled Nerd font |
 
-One pty session per window — no tabs, by design. The window closes when
-drcode exits with code 0; a crash (non-zero exit) opens a restart dialog.
+One window, one tab per project. Each tab runs its own drcode process
+in its own PTY with the project as `cwd` and has its own xterm.js
+instance plus its own WebSocket connection (`/ws?token=…&tab=<id>`); the
+`+` button next to the tab bar opens a fresh project-picker tab, and the
+`--project` CLI flag simply pre-launches tab #1. Tab switching re-fits
+the active terminal and resizes its PTY. Font settings, recents,
+fullscreen and the OSC 52 clipboard are shared for the whole window.
+
+When a tab's drcode exits with code 0, that tab closes (the window goes
+away when the last tab is gone); a crash (non-zero exit) opens a
+per-tab restart dialog. Tab sessions deliberately outlive a WebSocket
+reconnect — the client kills its PTY explicitly on tab close.
+
+Knowingly out of scope: opening the same project in two tabs at once
+(the shared `<project>/.drcode/` state would conflict), activity badges
+on inactive tabs, several terminals inside one tab.
 
 ## Terminal compatibility
 

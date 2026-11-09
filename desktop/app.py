@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -128,7 +129,7 @@ class DesktopApi:
         return {
             "recents": projects_mod.load_recents(),
             "payload": str(self._payload),
-            "project": self._ctx.current_project,
+            "project": self._ctx.live_project(),
         }
 
     # -- terminal font settings --------------------------------------------
@@ -310,14 +311,20 @@ def main(argv: list[str] | None = None) -> int:
     window_holder["window"] = window
     print("[desktop] window created, starting GUI loop", flush=True)
 
-    # Clean exit of drcode (code 0) closes the whole shell window.
-    def _close() -> None:
+    # Clean exit of drcode (code 0) closes ITS tab, not the window; the
+    # window goes away when the last tab is closed (driven from term.js).
+    # The exited event usually reaches the client over its ws — this
+    # evaluate_js hook covers the cases where it does not (reloading page,
+    # detached tab) and is idempotent with the ws path.
+    def _close_tab(tab_id: str) -> None:
         try:
-            window.destroy()
+            window.evaluate_js(
+                f"window.__drcodeDesktop && window.__drcodeDesktop.closeTab({json.dumps(tab_id)})"
+            )
         except Exception:  # noqa: BLE001, S110 - window may already be gone
             pass
 
-    ctx.on_clean_exit = _close
+    ctx.on_clean_exit = _close_tab
 
     try:
         webview.start(debug=os.environ.get("DRCODE_DESKTOP_DEBUG") == "1")
@@ -328,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         loop = ctx.loop
         if loop is not None and loop.is_running():
             try:
-                stop = asyncio.run_coroutine_threadsafe(ctx.stop_session(), loop)
+                stop = asyncio.run_coroutine_threadsafe(ctx.stop_all(), loop)
                 stop.result(timeout=3)
             except Exception:  # noqa: BLE001, S110 - shutdown must not raise
                 pass

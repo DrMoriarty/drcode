@@ -199,7 +199,7 @@ from pathlib import Path
 
 
 def on_accepted(task) -> None:
-    branch = task["worktree"]["branch"]     # drcode/<task-id>
+    branch = task["worktree"]["branch"]  # drcode/<task-id>
     # With isolation on the hook's cwd IS the task's worktree
     # (<project>/.drcode/worktrees/<id>): the main checkout is two
     # levels up.

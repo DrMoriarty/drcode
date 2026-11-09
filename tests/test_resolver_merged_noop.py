@@ -154,7 +154,10 @@ async def test_resolver_skips_fully_merged_branch(
 
 
 async def test_resolver_runs_for_unmerged_branch(
-    isolated: Path, env: TaskEnvironment, configured_env: None
+    isolated: Path,
+    env: TaskEnvironment,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A genuinely unmerged branch: the round works exactly as before —
     ensure_root runs, prepare parks the conflict, the agent round
@@ -185,9 +188,11 @@ async def test_resolver_runs_for_unmerged_branch(
     ) -> Agent[Any, str]:
         return Agent(state.model())
 
-    pr.build_resolver_agent = fake_build_agent
+    # Restored on teardown — a leaked stub (an agent with NO tools) would
+    # poison every later resolver test scheduled on the same xdist worker.
+    monkeypatch.setattr(pr, "build_resolver_agent", fake_build_agent)
     # Burn the retries fast — the test is over once the round started.
-    pr._RETRY_BASE_DELAY_S = 0.05
+    monkeypatch.setattr(pr, "_RETRY_BASE_DELAY_S", 0.05)
 
     async with app.run_test() as pilot:
         await pilot.pause()

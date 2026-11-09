@@ -911,3 +911,70 @@ def test_task_new_fields_default() -> None:
     task = Task(title="t")
     assert task.resolver_messages == []
     assert task.needs_human is False
+
+
+# -- scope guard (the c3b17718 incident) ---------------------------------------------
+
+
+def test_out_of_scope_changes_tracks_and_ignores(repo: Path) -> None:
+    wt, report = _conflicted_repo(repo, "t-scope")
+    allowed = [f.path for f in report.files]
+    assert allowed == ["app.py"]
+    # The conflict itself is in the allowed set — never out of scope.
+    assert mr.out_of_scope_changes(wt, allowed) == []
+    # The round's baseline is captured BEFORE the agent works (the merge's
+    # own staging plus pre-existing untracked files).
+    (wt / "preexisting.txt").write_text("predates the round\n")
+    baseline = mr.dirty_paths(wt)
+    assert "preexisting.txt" in baseline
+    # A tracked edit outside the set (the incident: a foreign file edited
+    # during the round) IS out of scope; the baseline untracked file is
+    # not; a tool-cache path is never counted.
+    (wt / "other.py").write_text("foreign\n")
+    cache = wt / ".pytest_cache" / "v"
+    cache.mkdir(parents=True)
+    (cache / "x").write_text("cache artifact\n")
+    assert mr.out_of_scope_changes(wt, allowed, baseline) == ["other.py"]
+
+
+def test_out_of_scope_changes_merges_staging_is_legitimate(repo: Path) -> None:
+    """The merge machinery stages the base side's clean merges (index-only
+    `X ` entries outside the conflict set) — that is the deployment doing
+    its job, never the resolver's scope expansion. The resolver agent
+    never touches the index: only UNSTAGED worktree changes outside the
+    set are its doing."""
+    wt = _task_worktree(repo, "t-scope3")
+    (wt / "app.py").write_text("task\nb\n")
+    _run(wt, "commit", "-qam", "task edit")
+    # The base side changes TWO files; only app.py will conflict.
+    (repo / "app.py").write_text("main\nb\n")
+    (repo / "baseonly.txt").write_text("base side feature\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-qam", "main edit")
+    report = mr.prepare(repo, "t-scope3", wt, "main")
+    assert report.ok and report.conflicted
+    allowed = [f.path for f in report.files]
+    baseline = mr.dirty_paths(wt)
+    assert "baseonly.txt" in baseline  # staged by the merge itself
+    assert mr.out_of_scope_changes(wt, allowed, baseline) == []
+    # The resolver editing that same merged file unstaged IS a violation.
+    (wt / "baseonly.txt").write_text("resolver touched it\n")
+    assert mr.out_of_scope_changes(wt, allowed, baseline) == ["baseonly.txt"]
+
+
+def test_out_of_scope_changes_without_baseline_flags_untracked(repo: Path) -> None:
+    """With no baseline (a resume round), even pre-existing-looking
+    untracked files count — an interrupted attempt's own additions must
+    not be re-blessed."""
+    wt, report = _conflicted_repo(repo, "t-scope2")
+    (wt / "new.py").write_text("made by the interrupted attempt\n")
+    assert mr.out_of_scope_changes(wt, [f.path for f in report.files]) == ["new.py"]
+
+
+def test_resolver_outcome_summary_names_scope_violations(repo: Path) -> None:
+    outcome = mr.ResolverOutcome(verdict="needs-human")
+    outcome.scope_violations = ["src/drcode/tui/merge/screen.py"]
+    text = outcome.summary()
+    assert "SCOPE EXPANSION" in text
+    assert "src/drcode/tui/merge/screen.py" in text
+    assert "NOTHING committed" in text

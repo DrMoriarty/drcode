@@ -19,6 +19,14 @@ The funnel (all of it must pass before anything is committed):
    diff(resolved, ours) and diff(resolved, theirs) and answers whether a
    piece of either side was lost (the #6c065401 incident class).
 
+Before the funnel a SCOPE GUARD rejects the round outright when the
+worktree carries changes outside the triage report's paths (the
+#c3b17718 incident class — a foreign edit would be silently unverified,
+silently uncommitted, and would block the accept hook with a dirty
+worktree), and EVERY round end — success, failure, error/retry,
+cancellation — reports any uncommitted leftovers outside the set into
+the task's service events (end-of-round hygiene).
+
 Only a full pass commits (`merge_engine.finish`) — the merge into the
 base branch then becomes a fast-forward. Any failure rolls the worktree
 back to the PRISTINE conflicted state, marks the task `needs_human` and
@@ -61,7 +69,9 @@ from ..merge_resolver import (
     ResolverOutcome,
     build_agent_context,
     conclude,
+    dirty_paths,
     mechanical_checks,
+    out_of_scope_changes,
     prepare,
     restore_conflict,
     review_diffs,
@@ -190,6 +200,13 @@ class PipelineResolverLayer(CoreState):
         # even when the failure happened before ensure_root/base_branch.
         root: Path | None = None
         base = ""
+        # The scope guard's inputs, filled once the round reaches the
+        # agent stage (the finally-block's hygiene report is gated on
+        # reached_agent — a round refused by prepare never touched the
+        # tree, its pre-existing dirt is not the resolver's doing).
+        triage_paths: list[str] = []
+        baseline: set[str] = set()
+        reached_agent = False
         try:
             self._current_tool[task_id] = None
             self._touch_activity(task_id)
@@ -284,10 +301,19 @@ class PipelineResolverLayer(CoreState):
                 kind="workflow",
             )
             round_t0 = time.monotonic()
+            reached_agent = True
 
             # -- the agent round -----------------------------------------------------
             if not resume_round:
                 task.resolver_messages.append([])
+                # The round's dirty-paths baseline (the scope guard,
+                # c3b17718): everything dirty NOW predates the agent —
+                # the merge's own staging plus pre-existing untracked
+                # files. Kept across scheduled retries, so a resume round
+                # still counts the interrupted attempt's own edits as its
+                # own; popped when the round concludes.
+                baseline = await asyncio.to_thread(dirty_paths, root)
+                self._resolver_round_baseline[task_id] = baseline
                 # A fresh round starts with a clean threshold-livelock
                 # slate (see run_tester / _threshold_observation).
                 self._resolver_threshold_compactions.pop(task_id, None)
@@ -454,11 +480,33 @@ class PipelineResolverLayer(CoreState):
                     self.view_task(task_id)
                 break
 
-            # -- the verification funnel ----------------------------------------------
-            outcome = await self._verify_resolution(task, root, report, deps)
-            await self._apply_resolver_outcome(
-                task, root, base, outcome, [f.path for f in report.files]
+            # -- the scope guard -------------------------------------------------------
+            # Before ANY verdict is applied: every worktree change outside
+            # the triage report's set is a scope expansion (the c3b17718
+            # incident — a foreign feature ported into the resolution) —
+            # it would bypass the funnel's checks AND the concluding
+            # commit's staging. The round is rejected outright (rollback +
+            # needs_human) with the files named in the service events;
+            # the funnel does not run on a tree the report never covered.
+            triage_paths = [f.path for f in report.files]
+            extra = await asyncio.to_thread(
+                out_of_scope_changes,
+                root,
+                triage_paths,
+                self._resolver_round_baseline.get(task_id, set()),
             )
+            if extra:
+                verdict_record = deps.verdicts[-1] if deps.verdicts else None
+                outcome = ResolverOutcome(verdict="needs-human")
+                outcome.agent_resolved = bool(
+                    verdict_record and verdict_record.resolved
+                )
+                outcome.agent_report = verdict_record.report if verdict_record else ""
+                outcome.scope_violations = extra
+            else:
+                # -- the verification funnel -------------------------------------------
+                outcome = await self._verify_resolution(task, root, report, deps)
+            await self._apply_resolver_outcome(task, root, base, outcome, triage_paths)
             concluded = True
         except asyncio.CancelledError:
             cancelled = True
@@ -524,6 +572,25 @@ class PipelineResolverLayer(CoreState):
             self.refresh_sidebar()
             if round_t0 is not None and not cancelled:
                 self._flush_resolver_time(task, time.monotonic() - round_t0, concluded)
+            if reached_agent and root is not None:
+                # End-of-round hygiene (the c3b17718 incident): whatever
+                # the round leaves uncommitted OUTSIDE the conflicted set
+                # gets a named trace in the task's chat — success,
+                # verification failure, error/retry and cancellation
+                # alike. A silent dirty tail used to block the accept
+                # hook hours later with the cause recoverable only from
+                # the transcript.
+                self._report_resolver_leftovers(
+                    task,
+                    root,
+                    triage_paths,
+                    # A resumed round reports against the fresh round's
+                    # baseline (still in the dict — a retry never
+                    # concludes); the local covers every other path.
+                    self._resolver_round_baseline.get(task_id, baseline),
+                )
+            if concluded:
+                self._resolver_round_baseline.pop(task_id, None)
             if not cancelled:
                 # Clean the retry state only when THIS attempt handed the
                 # task to a human (needs_human freshly set, no retry
@@ -728,9 +795,18 @@ class PipelineResolverLayer(CoreState):
                 "it by hand before resolving)"
             )
         )
+        # A scope-expansion rejection never reached the funnel — the
+        # event must say WHY the round failed (the c3b17718 incident's
+        # "successfully concluded" round hid a foreign edit).
+        headline = (
+            "Automatic conflict resolution REJECTED — the resolver changed "
+            "files outside the conflicted set (scope expansion)"
+            if outcome.scope_violations
+            else "Automatic conflict resolution FAILED verification"
+        )
         self._show_event(
             task,
-            f"Automatic conflict resolution FAILED verification{note} — "
+            f"{headline}{note} — "
             f"NOTHING was committed, the conflict is back untouched in the "
             f"worktree, a human must take over.\n{outcome.summary()}",
             kind="workflow",
@@ -767,6 +843,32 @@ class PipelineResolverLayer(CoreState):
             kind="workflow",
         )
         self._suggest_conflict_screen(task)
+
+    def _report_resolver_leftovers(
+        self,
+        task: Task,
+        root: Path,
+        allowed: list[str],
+        baseline: set[str],
+    ) -> None:
+        """End-of-round hygiene (the c3b17718 incident): name every
+        uncommitted worktree change OUTSIDE the conflicted set in the
+        task's service events. Deliberately SYNC (one fast `git status
+        --porcelain`): it also runs on the cancellation path, where an
+        await after the cancel is not safe to rely on. Never raises."""
+        try:
+            extra = out_of_scope_changes(root, allowed, baseline)
+        except Exception:  # noqa: BLE001 - teardown hygiene must not crash
+            return
+        if not extra:
+            return
+        self._show_event(
+            task,
+            "Resolver round left uncommitted changes outside the conflicted "
+            "set (a sign of scope expansion — inspect before resolving):\n"
+            + "\n".join(f"- {p}" for p in extra),
+            kind="workflow",
+        )
 
     # -- persistence -----------------------------------------------------------------
 

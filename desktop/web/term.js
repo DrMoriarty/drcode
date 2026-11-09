@@ -774,6 +774,11 @@
       if (tab.elTerm) tab.elTerm.classList.remove("hidden");
       refreshTabLabels();
       hideDialog();
+      // The server has just recorded the project in recents (its
+      // on_project_launched fires before this event is pumped out):
+      // re-fetch the list so the next welcome tab shows it — the list
+      // is otherwise only read once at page boot.
+      loadRecents();
       if (tab.fit) {
         try { tab.fit.fit(); } catch (err) { /* noop */ }
       }

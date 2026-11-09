@@ -1273,6 +1273,16 @@ def test_term_js_remove_recent_button() -> None:
     assert "renderRecents(recents)" in recents
 
 
+def test_term_js_started_refreshes_recents() -> None:
+    """A successful start must re-fetch the recents: the server records
+    the project on launch, but the list is only read once at page boot —
+    without the refresh a newly opened project appears in the welcome
+    screen's recents only after an app restart."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    started = js[js.index('event.event === "started"') : js.index('event.event === "exited"')]
+    assert "loadRecents()" in started
+
+
 def test_term_js_failed_start_reverts_tab() -> None:
     """A failed start (e.g. a recents entry whose directory was deleted)
     must not leave a phantom tab behind: launchProject renames the tab

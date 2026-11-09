@@ -1,8 +1,8 @@
 """Tests for the unmerged-work reminder: after a tester PASSED finalizes
 a task (worktree isolation on), drcode checks whether the task's
-`drcode/<task-id>` branch holds commits the main checkout's current
-branch does not have, and reminds the user explicitly — merging is a
-team decision (drcode never merges), but it must not be a silent one.
+`drcode/<task-id>` branch holds commits the base branch does not have,
+and reminds the user explicitly — merging is a team decision (drcode
+never merges), but it must not be a silent one.
 Covers `TaskEnvironment.unmerged_commits` / `base_branch`, the pipeline
 reminder on the finalization paths (toast + service event, softened by
 an `on_accepted` hook — research tasks are covered by the same reminder
@@ -119,6 +119,57 @@ def test_unmerged_commits_counts_task_branch_work(env: TaskEnvironment) -> None:
     commit_on_branch(env, "t1")
     assert env.unmerged_commits("t1") == 1
     assert env.base_branch() == current_branch(root)
+
+
+# -- base_branch under a configured isolation_start_branch -------------------------
+
+
+def test_base_branch_follows_configured_start_branch(env: TaskEnvironment) -> None:
+    """With `isolation_start_branch` configured, mergedness is measured
+    against THAT branch — not against whatever the main checkout's HEAD
+    happens to be on. The regression scenario: the user checks the task's
+    branch out in the project directory for manual inspection — under the
+    old logic `rev-list base..branch` collapsed to 0 and the task looked
+    merged (green ✓, unblocked dependents) although nothing reached the
+    configured base."""
+    root = env.project_root
+    _git(root, "branch", "develop")
+    env.settings.isolation_start_branch = "develop"
+    # A task branch forked from the configured base, one commit ahead.
+    _git(root, "branch", branch_for("t1"), "develop")
+    # The user inspects the task's branch in the main checkout.
+    _git(root, "checkout", "-q", branch_for("t1"))
+    (root / "fix.txt").write_text("fix")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "fix t1")
+
+    assert env.base_branch() == "develop"
+    assert env.unmerged_commits("t1") == 1
+    # The batched paths (10 s header poll / 30 s dependency tick) agree.
+    assert env.drcode_branch_state()[1] == {branch_for("t1")}
+    assert env.unmerged_ids(["t1"]) == {"t1"}
+    # The accept-hook guard stays consistent: the branch is forked from
+    # the configured base, so it is ahead but carries no patch-id twins.
+    assert env.duplicate_commits("t1") == (0, 1)
+
+    # Merging into the CONFIGURED base clears it dynamically — even with
+    # the main checkout still sitting on the task's branch.
+    _git(root, "checkout", "-q", "develop")
+    _git(root, "merge", "-q", "--no-ff", branch_for("t1"), "-m", "merge t1")
+    _git(root, "checkout", "-q", branch_for("t1"))
+    assert env.unmerged_commits("t1") == 0
+    assert env.drcode_branch_state()[1] == set()
+    assert env.unmerged_ids(["t1"]) == set()
+
+
+def test_base_branch_missing_configured_start_branch_falls_back(
+    env: TaskEnvironment,
+) -> None:
+    """A configured branch that does not exist degrades to the auto mode
+    (the main checkout's current branch) — the same fallback the fork
+    point uses; the default workflow is untouched."""
+    env.settings.isolation_start_branch = "no-such-branch"
+    assert env.base_branch() == current_branch(env.project_root)
 
 
 def test_unmerged_commits_zero_after_merge(env: TaskEnvironment) -> None:

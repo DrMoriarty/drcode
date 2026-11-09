@@ -416,7 +416,7 @@ class PipelineHooksLayer(CoreState):
         drcode deliberately never merges it back (merging is a team
         decision, see `drcode.task_env`); it is left to the project's
         `on_accepted` hook or to the user. When the branch still holds
-        commits the main checkout's current branch does not have, say so
+        commits the base branch does not have, say so
         explicitly — into the task's service-event log and as a toast —
         instead of leaving a PASSED label imply that the user's checkout
         already has the fix (for a research task, that its docs commit

@@ -1587,7 +1587,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     def _unmerged_completed_ids(self) -> list[str]:
         """Synchronous half of the unmerged-work tracking: ids of
         completed tasks whose `drcode/<task-id>` branch still holds
-        commits the main checkout's current branch does not have — the
+        commits the base branch does not have — the
         "stuck" fixes the startup scan reminds about and the header's
         unmerged-work indicator counts. Skipped per task kind when the
         merge is automated by the kind's accept hook (`on_accepted` /

@@ -19,9 +19,11 @@ LLM-free, the round machinery has its own tests."""
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
+from textual.widgets import Static
 
 from drcode import merge_engine as me
 from drcode.models import TaskStatus, VerificationStatus
@@ -415,6 +417,180 @@ async def test_auto_resolve_starts_round_and_closes_list(
             what="resolver round started for the selected task",
         )
         assert not isinstance(app.screen, UnmergedListScreen)  # dismissed
+
+
+# -- the busy spinner ---------------------------------------------------------------
+
+
+def _footer_text(screen: UnmergedListScreen) -> str:
+    return str(screen.query_one("#unmerged-footer", Static).content)
+
+
+async def test_busy_spinner_replaces_and_restores_footer(
+    isolated: Path,
+    configured_env: None,
+) -> None:
+    """_show_busy paints the animated line into the footer and locks
+    every key but esc (check_action); _end_busy restores the hotkey line
+    and re-enables the actions — the mechanics the m/r ops rely on."""
+    manager = TaskManager(isolated)
+    t1 = _completed_task(manager, "Fix one")
+    t2 = _completed_task(manager, "Fix two")
+    _unmerged_branch(isolated, t1, "ONE")
+    _unmerged_branch(isolated, t2, "TWO")
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(t1)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: (
+                isinstance(app.screen, UnmergedListScreen)
+                and len(app.screen._entries) == 2
+            ),
+            pilot=pilot,
+            what="unmerged list open",
+        )
+        screen = app.screen
+        assert isinstance(screen, UnmergedListScreen)
+        assert "m merge/commit" in _footer_text(screen)  # the idle hint
+        assert screen.check_action("land", ()) is True
+        screen._show_busy("committing")
+        await pilot.pause()
+        text = _footer_text(screen)
+        assert "committing…" in text
+        assert "(0s)" in text  # seconds since the op's start
+        assert screen._busy is True
+        assert screen.check_action("land", ()) is False
+        assert screen.check_action("refresh", ()) is False
+        assert screen.check_action("close", ()) is True  # esc stays live
+        # The animation tick advances the spinner frame.
+        frame_before = screen._spinner_frame
+        screen._tick_busy_animation()
+        assert screen._spinner_frame != frame_before
+        screen._end_busy()
+        await pilot.pause()
+        assert screen._busy is False
+        assert "m merge/commit" in _footer_text(screen)  # the hint is back
+        assert screen.check_action("land", ()) is True
+
+
+async def test_refresh_shows_busy_spinner_while_git_runs(
+    isolated: Path,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r: the busy spinner shows "refreshing…" while the git sweep runs
+    in the worker, and the footer returns to the hotkey line when it is
+    done (the list stays open and the rows are recomputed)."""
+    manager = TaskManager(isolated)
+    t1 = _completed_task(manager, "Fix one")
+    t2 = _completed_task(manager, "Fix two")
+    _unmerged_branch(isolated, t1, "ONE")
+    _unmerged_branch(isolated, t2, "TWO")
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(t1)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: (
+                isinstance(app.screen, UnmergedListScreen)
+                and len(app.screen._entries) == 2
+            ),
+            pilot=pilot,
+            what="unmerged list open",
+        )
+        screen = app.screen
+        assert isinstance(screen, UnmergedListScreen)
+        # Slow the git sweep down so the busy state is observable.
+        original = screen._collect_entries
+
+        def slow_collect(task_ids: list[str]) -> list:
+            time.sleep(0.4)
+            return original(task_ids)
+
+        monkeypatch.setattr(screen, "_collect_entries", slow_collect)
+        await pilot.press("r")
+        await pilot.pause()
+        await wait_until(
+            lambda: "refreshing…" in _footer_text(screen),
+            pilot=pilot,
+            what="refreshing spinner visible",
+        )
+        assert screen._busy is True
+        # A second press during the sweep is inert (the busy gate).
+        await pilot.press("r")
+        await wait_until(
+            lambda: "m merge/commit" in _footer_text(screen),
+            pilot=pilot,
+            what="footer restored after the refresh",
+        )
+        assert screen._busy is False
+        assert len(screen._entries) == 2  # rows recomputed, screen alive
+
+
+async def test_land_spins_through_phases_and_restores_footer(
+    isolated: Path,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """m on an ff-able row: the footer shows the preparing phase label,
+    then "fast-forwarding…" while the --ff-only merge runs, and the
+    hotkey line is back when the op ends (even though the op itself
+    succeeded and the list refreshed)."""
+    manager = TaskManager(isolated)
+    t1 = _completed_task(manager, "Fix one")
+    t2 = _completed_task(manager, "Fix two")
+    _unmerged_branch(isolated, t1, "ONE")
+    _unmerged_branch(isolated, t2, "TWO")
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(t1)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: (
+                isinstance(app.screen, UnmergedListScreen)
+                and len(app.screen._entries) == 2
+            ),
+            pilot=pilot,
+            what="unmerged list open",
+        )
+        screen = app.screen
+        assert isinstance(screen, UnmergedListScreen)
+        # Slow the concluding ff-merge so its phase is observable.
+        env = app.task_env
+        original_ff = env.ff_merge_branch
+
+        def slow_ff(task_id: str) -> tuple[bool, str]:
+            time.sleep(0.4)
+            return original_ff(task_id)
+
+        monkeypatch.setattr(env, "ff_merge_branch", slow_ff)
+        await pilot.press("m")
+        await wait_until(
+            lambda: f"merging #{t1}" in _footer_text(screen),
+            pilot=pilot,
+            what="preparing phase visible",
+        )
+        await wait_until(
+            lambda: "fast-forwarding…" in _footer_text(screen),
+            pilot=pilot,
+            what="fast-forwarding phase visible",
+        )
+        await wait_until(
+            lambda: _ancestor(isolated, branch_for(t1), "main"),
+            pilot=pilot,
+            what="branch ff-merged into main",
+        )
+        await wait_until(
+            lambda: "m merge/commit" in _footer_text(screen),
+            pilot=pilot,
+            what="footer restored after the land",
+        )
+        assert screen._busy is False
+        assert screen.check_action("land", ()) is True
 
 
 # -- the ConflictScreen's A key ----------------------------------------------------

@@ -493,6 +493,13 @@ class CoreState:
     _resolver_retry_at: dict[str, float]
     _resolver_net_count: dict[str, int]
     _resolver_resume_round: set[str]
+    # The dirty-paths baseline of the running resolver round (the scope
+    # guard, c3b17718): captured when a FRESH round starts — the engine
+    # refuses to deploy a merge onto a dirty tracked tree, so everything
+    # dirty then is the merge's own staging plus pre-existing untracked
+    # files, never the resolver's work — kept across the round's
+    # scheduled retries, popped when the round concludes.
+    _resolver_round_baseline: dict[str, set[str]]
     # Compaction-failure bookkeeping of the resolver rounds — separate
     # from the agent/tester sets so a broken summarizer seen by one role
     # never disables another role's gate.

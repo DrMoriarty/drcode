@@ -47,7 +47,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -64,9 +64,11 @@ __all__ = [
     "conclude",
     "conflict_marker_check",
     "conflict_marker_hits",
+    "dirty_paths",
     "failed_names",
     "format_verify_report",
     "mechanical_checks",
+    "out_of_scope_changes",
     "prepare",
     "pyright_check",
     "restore_conflict",
@@ -77,6 +79,7 @@ __all__ = [
     "stage_resolved",
     "unresolved_conflict_paths",
     "verify_report_path",
+    "worktree_status",
 ]
 # (check-timings helpers are intentionally not re-exported: they serve the
 # interactive funnel only.)
@@ -891,6 +894,98 @@ def _cap(text: str, cap: int) -> str:
     return text[:cap] + f"\n… [truncated at {cap} chars — the review diff is partial]"
 
 
+# -- scope guard -------------------------------------------------------------------
+# The c3b17718 incident: the resolver agent edited a file OUTSIDE the triage
+# report's set (ported a foreign feature into the resolution round). The
+# funnel measured only the conflicted paths, the concluding commit staged
+# only them — the foreign edit stayed uncommitted in the worktree and
+# blocked the accept hook hours later ("the worktree has uncommitted
+# changes"), with the cause recoverable only from the transcript. These
+# helpers let the pipeline detect out-of-scope worktree changes before the
+# verdict is applied and name any leftover tail at every round end.
+
+
+# Tool-cache paths a test/tool run creates inside the worktree — never
+# counted as the resolver's doing (the funnel's pytest and the agent's own
+# probe runs would otherwise trip the scope guard / the hygiene report).
+_CACHE_PATH_PREFIXES = (
+    "__pycache__/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".mypy_cache/",
+    ".hypothesis/",
+    "htmlcov/",
+    ".coverage",
+)
+
+
+def _is_cache_path(rel: str) -> bool:
+    return rel.startswith(_CACHE_PATH_PREFIXES)
+
+
+def worktree_status(worktree: Path) -> list[tuple[str, str]]:
+    """The `(XY, path)` entries of `git status --porcelain` (with all
+    untracked files): XY is the two-character status (`X` — the index
+    side, `Y` — the worktree side, `??` — untracked). Empty when git
+    fails; rename entries contribute their new path."""
+    code, out = _git("status", "--porcelain", "--untracked-files=all", cwd=worktree)
+    entries: list[tuple[str, str]] = []
+    if code != 0:
+        return entries
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        body = line[3:]
+        if " -> " in body:
+            body = body.split(" -> ", 1)[1]
+        entries.append((line[:2], body.strip()))
+    return entries
+
+
+def dirty_paths(worktree: Path) -> set[str]:
+    """Every path with a staged, unstaged or untracked change, from
+    `worktree_status`. Serves as the round baseline (captured before the
+    agent works) — whatever is dirty THEN predates the resolver."""
+    return {path for _, path in worktree_status(worktree)}
+
+
+def out_of_scope_changes(
+    worktree: Path,
+    allowed: Iterable[str],
+    baseline: Iterable[str] = (),
+) -> list[str]:
+    """The paths the resolver touched OUTSIDE the conflicted set
+    `allowed` (the c3b17718 incident class — silently unverified by the
+    funnel, silently left uncommitted by the concluding commit).
+
+    Authorship is inferred from the index discipline: the resolver agent
+    never touches the index, so
+
+    - an UNSTAGED worktree change (Y ≠ ' ') outside `allowed` is the
+      resolver's doing, whatever the baseline says — a resumed round
+      must still answer for the interrupted attempt's edits;
+    - an index-only staged change (`X `) outside `allowed` is the merge
+      machinery deploying the base side's clean merges — legitimate,
+      UNLESS the path was not yet dirty in `baseline` (captured before
+      the agent round): then someone staged it mid-round (run_bash);
+    - an untracked path counts unless it is in `baseline` (pre-existing
+      files are not the resolver's doing) or a tool-cache artifact.
+
+    Returns a sorted list; empty = nothing out of scope."""
+    allowed_set = set(allowed)
+    baseline_set = set(baseline)
+    extra: set[str] = set()
+    for code, path in worktree_status(worktree):
+        if path in allowed_set or _is_cache_path(path):
+            continue
+        if code == "??":
+            if path not in baseline_set:
+                extra.add(path)
+        elif code[1] != " " or path not in baseline_set:
+            extra.add(path)
+    return sorted(extra)
+
+
 # -- outcome -----------------------------------------------------------------------
 
 
@@ -945,6 +1040,10 @@ class ResolverOutcome:
     tests: CheckResult | None = None
     review_verdict: str = ""  # "intact" | "lost" | "unsure" | "" (not run)
     review_report: str = ""
+    # Paths the resolver changed outside the conflicted set (the scope
+    # guard, c3b17718): the round is rejected outright, the files are
+    # named here and in the service events — never silently absorbed.
+    scope_violations: list[str] = field(default_factory=list)
     committed: bool = False
 
     def summary(self) -> str:
@@ -975,5 +1074,11 @@ class ResolverOutcome:
             lines.append(f"intent review: {self.review_verdict}")
         if self.review_report:
             lines.append(f"review report:\n{self.review_report[:4000]}")
+        if self.scope_violations:
+            lines.append(
+                "SCOPE EXPANSION — files changed outside the conflicted "
+                "set (never verified, never committed):\n"
+                + "\n".join(f"- {p}" for p in self.scope_violations)
+            )
         lines.append("committed" if self.committed else "NOTHING committed")
         return "\n".join(lines)

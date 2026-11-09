@@ -693,6 +693,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._resolver_retry_at: dict[str, float] = {}
         self._resolver_net_count: dict[str, int] = {}
         self._resolver_resume_round: set[str] = set()
+        self._resolver_round_baseline: dict[str, set[str]] = {}
         self._resolver_compaction_failed: set[str] = set()
         self._resolver_hard_limit_exhausted: set[str] = set()
         self._resolver_hard_limit_compactions: dict[str, int] = {}

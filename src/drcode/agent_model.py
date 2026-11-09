@@ -16,6 +16,7 @@ import httpx
 from openai import AsyncOpenAI
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from .config import Config
 from .providers import ModelEntry
@@ -27,6 +28,14 @@ from .version import APP_VERSION
 # (pydantic-ai перебивает client-заголовки per-request заголовком pydantic-ai/x.y).
 USER_AGENT = f"drcode/{APP_VERSION}"
 EXTRA_HEADERS = {"User-Agent": USER_AGENT}
+
+# Флаг prompt-кэширования OpenAI-совместимых серверов (vLLM, llama.cpp
+# server): true — сервер кэширует префикс промпта (системный промпт +
+# неизменяемое начало истории), что заметно ускоряет и удешевляет
+# повторные запросы с длинным общим префиксом. Уходит в тело POST
+# /chat/completions через extra_body (pydantic-ai ModelSettings);
+# строгие OpenAI-совместимые серверы могут отвергнуть неизвестное поле.
+CACHE_PROMPT_SETTINGS: ModelSettings = {"extra_body": {"cache_prompt": True}}
 
 
 def _candidate_urls(base_url: str, health_check_url: str) -> list[tuple[str, bool]]:

@@ -23,7 +23,7 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.usage import RunUsage
 
 from . import agent_model, task_search, tools
-from .agent_model import EXTRA_HEADERS
+from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
 from .agent_tools import (
     _commit_tracked_files,
     _create_goal,
@@ -313,6 +313,7 @@ def build_agent(
         model_settings={
             "extra_headers": EXTRA_HEADERS,
             "max_tokens": config.max_tokens,
+            **CACHE_PROMPT_SETTINGS,
         },
         retries=10,
     )
@@ -930,6 +931,7 @@ def build_tester_agent(
         model_settings={
             "extra_headers": EXTRA_HEADERS,
             "max_tokens": config.max_tokens,
+            **CACHE_PROMPT_SETTINGS,
         },
         retries=10,
     )
@@ -1285,6 +1287,7 @@ def build_resolver_agent(
         model_settings={
             "extra_headers": EXTRA_HEADERS,
             "max_tokens": config.max_tokens,
+            **CACHE_PROMPT_SETTINGS,
         },
         retries=10,
     )
@@ -1428,6 +1431,7 @@ def build_resolver_reviewer_agent(
         model_settings={
             "extra_headers": EXTRA_HEADERS,
             "max_tokens": config.max_tokens,
+            **CACHE_PROMPT_SETTINGS,
         },
         retries=10,
     )

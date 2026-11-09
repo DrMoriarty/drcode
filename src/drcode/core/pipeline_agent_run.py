@@ -343,7 +343,9 @@ class PipelineAgentRunLayer(CoreState):
                             task, task_id, run, consumed, text, generation, role, e
                         )
                         return
-                    self._agent_turn_failed(task, task_id, run, consumed, text, generation, e)
+                    self._agent_turn_failed(
+                        task, task_id, run, consumed, text, generation, e
+                    )
                     break
         except asyncio.CancelledError:
             # Cancelled BEFORE the turn loop's own handler (worktree setup,

@@ -142,9 +142,7 @@ class NewTaskInput(WordNavTextArea):
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
         ),
-        Binding(
-            "ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True
-        ),
+        Binding("ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True),
         # Ctrl+Y — goal capture: the stock TextArea owns ctrl+y (Redo), so
         # the app-level binding alone never fires while this editor is
         # focused (and it is the default focus at startup). Off the footer
@@ -192,9 +190,7 @@ class DepsInput(Input):
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
         ),
-        Binding(
-            "ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True
-        ),
+        Binding("ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 

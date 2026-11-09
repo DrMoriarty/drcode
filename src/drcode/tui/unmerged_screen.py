@@ -44,6 +44,7 @@ everything else lands on the task's own branch.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -53,14 +54,28 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Label, ListItem, ListView, Static
 
 from .. import merge_engine, merge_resolver
 from ..merge_engine import is_fast_forward
 from ..task_env import WorktreeUnavailable
+from .merge.stages import _fmt_seconds
 
 if TYPE_CHECKING:
     from .app import DrCodeApp
+
+# The busy spinner of the short blocking ops (r / m): braille frames and
+# the footer redraw interval — the same look as the ConflictScreen's
+# progress panel (which owns the canonical copies).
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_INTERVAL = 0.15
+
+# The footer's idle content (the hotkey line) — restored when a busy op
+# ends.
+_FOOTER_HINT = (
+    "enter manual resolve · a auto resolve · m merge/commit · r refresh · esc close"
+)
 
 
 @dataclass
@@ -135,6 +150,13 @@ class UnmergedListScreen(ModalScreen[None]):
         # every key but esc is inert (check_action) — git must not race a
         # second press.
         self._busy = False
+        # The busy spinner's state (the animated footer line): the label
+        # names the current phase of the op, the clock runs from the op's
+        # START (phase changes keep it — the user watches the total).
+        self._busy_label: str | None = None
+        self._busy_started: float | None = None
+        self._busy_timer: Timer | None = None
+        self._spinner_frame = 0
 
     # -- composition ----------------------------------------------------------
 
@@ -148,12 +170,7 @@ class UnmergedListScreen(ModalScreen[None]):
             # literal [brackets] — they must never trip Rich markup.
             yield Static("Unmerged task branches", id="unmerged-title", markup=False)
             yield ListView(id="unmerged-list")
-            yield Static(
-                "enter manual resolve · a auto resolve · m merge/commit · "
-                "r refresh · esc close",
-                id="unmerged-footer",
-                markup=False,
-            )
+            yield Static(_FOOTER_HINT, id="unmerged-footer", markup=False)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "close":
@@ -163,6 +180,64 @@ class UnmergedListScreen(ModalScreen[None]):
         if action in ("open_screen", "auto_resolve", "land"):
             return self._selected() is not None
         return True
+
+    # -- busy state of the short blocking ops (r / m) -----------------------------
+
+    def _show_busy(self, label: str) -> None:
+        """A short blocking op (refresh / the m prepare→commit→ff chain)
+        starts or enters its next phase: one spinner line with the
+        elapsed seconds replaces the footer's hotkey line, and
+        `check_action` locks every key but esc until `_end_busy`. The
+        clock keeps running across phases — it measures the whole
+        operation, the label alone names the current phase."""
+        self._busy = True
+        self._busy_label = label
+        if self._busy_started is None:
+            self._busy_started = time.monotonic()
+        if not self.is_mounted:
+            return
+        self._render_busy_footer()
+        if self._busy_timer is None:
+            self._busy_timer = self.set_interval(
+                _SPINNER_INTERVAL, self._tick_busy_animation
+            )
+
+    def _end_busy(self) -> None:
+        """The op is over: restore the footer's hotkey line. Safe for a
+        late worker after the screen was dismissed/unmounted (unmount
+        stops the timer separately, the query is guarded)."""
+        self._busy = False
+        self._busy_label = None
+        self._busy_started = None
+        if self._busy_timer is not None:
+            self._busy_timer.stop()
+            self._busy_timer = None
+        if not self.is_mounted:
+            return
+        try:
+            footer = self.query_one("#unmerged-footer", Static)
+        except NoMatches:
+            return
+        footer.update(_FOOTER_HINT)
+
+    def _tick_busy_animation(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        self._render_busy_footer()
+
+    def _render_busy_footer(self) -> None:
+        if not self.is_mounted or self._busy_label is None:
+            return
+        try:
+            footer = self.query_one("#unmerged-footer", Static)
+        except NoMatches:
+            return
+        elapsed = (
+            (time.monotonic() - self._busy_started)
+            if self._busy_started is not None
+            else 0.0
+        )
+        frame = _SPINNER_FRAMES[self._spinner_frame]
+        footer.update(f"[{frame}] {self._busy_label}…  ({_fmt_seconds(elapsed)})")
 
     # -- state ------------------------------------------------------------------
 
@@ -246,10 +321,22 @@ class UnmergedListScreen(ModalScreen[None]):
     def action_refresh(self) -> None:
         if self._busy:
             return
-        self._refresh_entries()
+        self._refresh_entries(show_busy=True)
 
     @work(exclusive=True, group="unmerged-refresh")
-    async def _refresh_entries(self) -> None:
+    async def _refresh_entries(self, show_busy: bool = False) -> None:
+        # The explicit r press gets the busy spinner (the git sweep can
+        # take seconds); the automatic refreshes (on resume, after a
+        # land) stay silent — the user did not press anything.
+        if show_busy:
+            self._show_busy("refreshing")
+        try:
+            await self._run_refresh()
+        finally:
+            if show_busy:
+                self._end_busy()
+
+    async def _run_refresh(self) -> None:
         sel = self._selected()
         selected = sel.task_id if sel is not None else None
         entries = await asyncio.to_thread(self._collect_entries, self.task_ids)
@@ -337,7 +424,7 @@ class UnmergedListScreen(ModalScreen[None]):
 
     @work(exclusive=True, group="unmerged-land")
     async def _do_land(self, task_id: str) -> None:
-        self._busy = True
+        self._show_busy(f"merging #{task_id} — preparing")
         app = cast("DrCodeApp", self.app)
         env = app.task_env
         try:
@@ -421,6 +508,7 @@ class UnmergedListScreen(ModalScreen[None]):
                 # it the branch becomes ff-ready, the next m lands it).
                 from ..conflict import ConflictWorktree
 
+                self._show_busy("committing")
                 branch = report.branch or f"drcode/{task_id}"
                 message = (
                     f"Merge {report.base_branch or base} into {branch}: "
@@ -467,7 +555,7 @@ class UnmergedListScreen(ModalScreen[None]):
                 timeout=6,
             )
         finally:
-            self._busy = False
+            self._end_busy()
             await app._poll_git_indicator()
             if self.is_mounted:
                 self._refresh_entries()
@@ -478,6 +566,7 @@ class UnmergedListScreen(ModalScreen[None]):
         with the same press-time re-verification (the base may have moved
         since the row was painted); a refusal is an error toast, never a
         conflicted merge in the user's tree."""
+        self._show_busy("fast-forwarding")
         app = cast("DrCodeApp", self.app)
         if not await asyncio.to_thread(is_fast_forward, app.project_root, branch, base):
             self.notify(

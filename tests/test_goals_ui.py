@@ -124,7 +124,7 @@ async def test_sidebar_goal_marker_on_task_row(app: DrCodeApp) -> None:
         assert "◆" not in plain.text
 
 
-async def test_sidebar_collapsed_goals_keeps_top_level_counters(app: DrCodeApp) -> None:
+async def test_sidebar_collapsed_goals_shows_header_only(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
         milestone = app.manager.goals.create("Release 1.0")
@@ -133,9 +133,9 @@ async def test_sidebar_collapsed_goals_keeps_top_level_counters(app: DrCodeApp) 
         app.toggle_sidebar_section("GOALS")
         await pilot.pause()  # the removed row's prune is an async round-trip
         rows = goal_rows(app)
-        # Collapsed folds only the sub-goal tree away: the top-level row
-        # (with its counter) and the header stay visible.
-        assert milestone.id in rows
+        # Collapsed folds the whole goal tree away — only the header
+        # (with the "+" marker and the counter) stays visible.
+        assert milestone.id not in rows
         assert child.id not in rows
         app.toggle_sidebar_section("GOALS")
         await pilot.pause()

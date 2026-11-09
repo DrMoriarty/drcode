@@ -538,14 +538,14 @@ class SidebarLayer(DrCodeState):
         # above the pipeline sections. Unlike those (which vanish when
         # empty and hide their rows when collapsed), the goals block is
         # never fully hidden: the counters stay visible even collapsed —
-        # a collapsed GOALS keeps its header plus the top-level rows
-        # (only the sub-goal tree is folded away). The trailing rows are
-        # the section's utility entries: "→ all goals…" opens the
-        # GoalScreen (the only entry when every goal is done/archived —
-        # the tree lists ACTIVE goals only), "+ add goal" is the capture
-        # shortcut (the same dialog as Ctrl+Y). Both belong to the
-        # expanded section only; the open-row is shown whenever ANY goal
-        # exists (any status), the add-row always.
+        # A collapsed GOALS keeps only its header line, same as every
+        # other section (the "+" marker announces the hidden rows). The
+        # expanded section's trailing rows are its utility entries:
+        # "→ all goals…" opens the GoalScreen (the only entry when every
+        # goal is done/archived — the tree lists ACTIVE goals only),
+        # "+ add goal" is the capture shortcut (the same dialog as
+        # Ctrl+Y). The open-row is shown whenever ANY goal exists (any
+        # status), the add-row always.
         goals_rows = self._goals_section_rows()
         goals_header = self._sidebar_row(
             ("header", "GOALS"),
@@ -556,24 +556,25 @@ class SidebarLayer(DrCodeState):
         )
         keys.add(("header", "GOALS"))
         items.append(goals_header)
-        top_level_only = "GOALS" in self._collapsed_sections
-        for goal, depth in goals_rows:
-            if top_level_only and depth > 0:
-                continue
-            keys.add(("goal", goal.id))
-            items.append(
-                self._sidebar_row(
-                    ("goal", goal.id),
-                    self._goal_row_text(goal, depth, self.manager.goal_progress(goal)),
-                    goal_id=goal.id,
+        collapsed_goals = "GOALS" in self._collapsed_sections
+        if not collapsed_goals:
+            for goal, depth in goals_rows:
+                keys.add(("goal", goal.id))
+                items.append(
+                    self._sidebar_row(
+                        ("goal", goal.id),
+                        self._goal_row_text(
+                            goal, depth, self.manager.goal_progress(goal)
+                        ),
+                        goal_id=goal.id,
+                    )
                 )
-            )
         # The utility rows belong to the expanded section only: a
-        # collapsed GOALS shows just its header and the top-level rows.
-        # "→ all goals…" is rendered under the goal tree and stays visible
-        # even when the tree itself is empty (all goals done/archived) —
-        # otherwise the GoalScreen would be unreachable from the sidebar.
-        if not top_level_only:
+        # collapsed GOALS shows just its header. "→ all goals…" is
+        # rendered under the goal tree and stays visible whenever the
+        # tree itself is empty (all goals done/archived) — otherwise the
+        # GoalScreen would be unreachable from the sidebar.
+        if not collapsed_goals:
             if self.manager.goals.goals:
                 keys.add(("goal-open", ""))
                 items.append(

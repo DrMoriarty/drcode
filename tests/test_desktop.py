@@ -57,6 +57,47 @@ def test_recents_roundtrip(config_dir: Path) -> None:
     assert [r["project"] for r in recents] == ["/tmp/alpha", "/tmp/beta"]
 
 
+def test_recents_remove(config_dir: Path) -> None:
+    projects.add_recent("/tmp/alpha", title="alpha")
+    projects.add_recent("/tmp/beta")
+    recents = projects.remove_recent("/tmp/alpha")
+    assert [r["project"] for r in recents] == ["/tmp/beta"]
+    assert [r["project"] for r in projects.load_recents()] == ["/tmp/beta"]
+    # Removing an unknown path is a no-op; removing everything empties.
+    assert [r["project"] for r in projects.remove_recent("/nope")] == ["/tmp/beta"]
+    assert projects.remove_recent("/tmp/beta") == []
+    assert projects.load_recents() == []
+    # The other config keys survive the removal write.
+    projects.save_font_settings("Fira Code", 14)
+    projects.add_recent("/tmp/alpha")
+    projects.remove_recent("/tmp/alpha")
+    assert projects.load_font_settings() == {
+        "font_family": "Fira Code",
+        "font_size": 14,
+    }
+
+
+def test_desktop_api_remove_recent_bridge(
+    config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DesktopApi.remove_recent delegates to projects.remove_recent."""
+    try:
+        import app as app_mod  # type: ignore[import-not-found]
+        import webview  # noqa: F401
+    except Exception:  # noqa: BLE001 - webview missing / no GUI libs
+        pytest.skip("pywebview desktop group not installed")
+
+    projects.add_recent("/tmp/alpha")
+    projects.add_recent("/tmp/beta")
+    api = app_mod.DesktopApi({}, None, Path("/dev/null"))
+    recents = api.remove_recent("/tmp/alpha")
+    assert [r["project"] for r in recents] == ["/tmp/beta"]
+    monkeypatch.setattr(
+        app_mod.projects_mod, "remove_recent", lambda project: [{"project": "stub"}]
+    )
+    assert api.remove_recent("whatever") == [{"project": "stub"}]
+
+
 def test_recents_capped(config_dir: Path) -> None:
     for i in range(20):
         projects.add_recent(f"/tmp/p{i}")
@@ -1204,6 +1245,21 @@ def test_term_js_duplicate_project_guard() -> None:
     assert "duplicateMessage(item.project)" in recents
     # The list re-renders on welcome activation so the marks stay fresh.
     assert "renderRecents(lastRecents)" in js
+
+
+def test_term_js_remove_recent_button() -> None:
+    """Every recents entry carries a remove button: it stops the row's
+    launch handler, calls the bridge and re-renders from the returned
+    list; without the bridge it is a no-op."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    recents = js[js.index("function renderRecents") : js.index("/* Projects picked")]
+    assert 'remove.className = "remove"' in recents
+    assert '"Remove from recent projects"' in recents
+    # The click must not launch the project being removed.
+    assert "ev.stopPropagation()" in recents
+    assert 'api("remove_recent")' in recents
+    assert "doRemove(item.project)" in recents
+    assert "renderRecents(recents)" in recents
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

@@ -911,6 +911,22 @@
       when.textContent = item.last_used ? new Date(item.last_used * 1000).toLocaleDateString() : "";
       li.appendChild(path);
       li.appendChild(when);
+      var remove = document.createElement("span");
+      remove.className = "remove";
+      remove.textContent = "×";
+      remove.title = "Remove from recent projects";
+      remove.setAttribute("aria-label", "Remove from recent projects");
+      remove.addEventListener("click", function (ev) {
+        // Delete the recents entry, not the project: stop the li's
+        // launch/error handler before it fires.
+        ev.stopPropagation();
+        var doRemove = api("remove_recent");
+        if (!doRemove) return; // no bridge (browser mode) — nothing to do
+        Promise.resolve(doRemove(item.project))
+          .then(function (recents) { renderRecents(recents); })
+          .catch(function () { /* storage is best-effort; keep the list */ });
+      });
+      li.appendChild(remove);
       if (occupied) {
         var mark = document.createElement("span");
         mark.className = "open-mark";

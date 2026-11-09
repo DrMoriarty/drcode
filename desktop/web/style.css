@@ -255,6 +255,19 @@ body {
   padding: 1px 6px;
   white-space: nowrap;
 }
+/* Per-entry "remove from recents" button: invisible until the row is
+ * hovered, so it never competes with the path for attention. */
+.recents-list .remove {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 4px;
+  visibility: hidden;
+  flex-shrink: 0;
+}
+.recents-list li:hover .remove { visibility: visible; }
+.recents-list .remove:hover { color: var(--danger); background: #2a2f38; }
 
 .welcome-error {
   margin-top: 16px;

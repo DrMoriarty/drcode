@@ -72,6 +72,19 @@ def add_recent(project: str, *, title: str | None = None) -> list[dict[str, obje
     return recents
 
 
+def remove_recent(project: str) -> list[dict[str, object]]:
+    """Drop one entry by its project path; returns the updated recents.
+
+    Matching is on the stored ``project`` string (exactly the value the
+    welcome screen got from ``load_recents`` and passes back). Removing
+    an unknown path is a no-op; storage failures are silently ignored
+    like everywhere else (best-effort file).
+    """
+    recents = [r for r in load_recents() if r.get("project") != project]
+    _save(recents)
+    return recents
+
+
 def _save_config(data: dict[str, object]) -> None:
     """Atomic best-effort write of the whole config (recents included)."""
     path = config_path()

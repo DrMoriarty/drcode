@@ -158,6 +158,10 @@ class DesktopApi:
         """Record-free convenience for the welcome screen (kept for parity)."""
         return project if Path(project).is_dir() else None
 
+    def remove_recent(self, project: str) -> list:
+        """Delete one entry from the recents; returns the updated list."""
+        return projects_mod.remove_recent(project or "")
+
     # -- window controls ---------------------------------------------------
 
     def toggle_fullscreen(self) -> bool:

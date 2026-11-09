@@ -225,6 +225,7 @@ class MergeReport:
     files: list[ConflictFile] = field(default_factory=list)
     rerere: dict[str, object] = field(default_factory=dict)
     conflict_style: str = "zdiff3"
+    dry_run: bool = False
 
     @property
     def resolved(self) -> list[ConflictFile]:
@@ -248,6 +249,7 @@ class MergeReport:
             "message": self.message,
             "conflict_style": self.conflict_style,
             "rerere": self.rerere,
+            "dry_run": self.dry_run,
             "files": [f.to_dict() for f in self.files],
             "resolved": [f.to_dict() for f in self.resolved],
             "remaining": [f.to_dict() for f in self.remaining],
@@ -804,11 +806,23 @@ def merge_base_into_worktree(
     branch: str | None = None,
     rerere: bool = True,
     save: bool = False,
+    dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> MergeReport:
     """THE REVERSED MERGE: merge `base_branch` INTO the task's worktree
     (branch `branch`, default: the worktree's checked-out branch) instead
     of merging the task branch into the user's checkout.
+
+    WARNING: the default call MUTATES git state. `save` gates ONLY the
+    triage-report file — the real `git merge` runs regardless, the safe
+    auto-resolvers attack any conflict, and when they clear everything
+    the merge is even committed right here (via `finish`). A diagnostic
+    call that must not touch the worktree passes `dry_run=True`: it
+    answers from pure reads (rev-parse/status/merge-base) — refusals,
+    the up-to-date case and a parked conflict are reported faithfully,
+    a would-be merge is reported as such WITHOUT evaluating its conflict
+    outcome — and never runs the merge, stages anything or persists a
+    report.
 
     Never touches anything outside the task's worktree — the user's
     checkout is not even read beyond `project_root` (used only to persist
@@ -826,7 +840,10 @@ def merge_base_into_worktree(
         branch=branch or "?",
         base_branch=base_branch,
         worktree=str(worktree),
+        dry_run=dry_run,
     )
+    if dry_run:
+        save = False  # a diagnostic call never persists a report
     wt = worktree
     if not wt.is_dir():
         report.message = f"worktree {wt} does not exist"
@@ -864,6 +881,35 @@ def merge_base_into_worktree(
             report.fast_forward = True
             report.message = f"{branch} already contains {base_branch}"
             return _maybe_save(project_root, task_id, report, save)
+
+    if dry_run:
+        # Diagnostic mode ends here: everything above was pure reading
+        # (rev-parse/status/merge-base), nothing was staged or committed.
+        # A real call would now run the merge — report the would-be
+        # action instead of performing it.
+        report.ok = True
+        if resuming:
+            remaining = unmerged_paths(wt)
+            report.conflicted = bool(remaining)
+            if remaining:
+                report.message = (
+                    f"dry run: a merge of {base_branch} is already in "
+                    f"progress in {wt} — {len(remaining)} conflicted "
+                    f"path(s) remain, nothing was touched"
+                )
+            else:
+                report.message = (
+                    f"dry run: a merge of {base_branch} is in progress in "
+                    f"{wt} and fully resolved but NOT committed — "
+                    f"concluding it would commit; nothing was touched"
+                )
+        else:
+            report.message = (
+                f"dry run: {base_branch} is not contained in {branch} — a "
+                f"real call would merge it into {branch} in {wt} (conflict "
+                f"outcome not evaluated; no git state was touched)"
+            )
+        return _maybe_save(project_root, task_id, report, save)
 
     # The merge itself, with the safe-resolver machinery switched on for
     # THIS invocation only (`-c`, never the repository config):
@@ -1044,6 +1090,7 @@ def load_report(project_root: Path, task_id: str) -> MergeReport | None:
         files=files,
         rerere=rerere if isinstance(rerere, dict) else {},
         conflict_style=str(data.get("conflict_style", "zdiff3")),
+        dry_run=bool(data.get("dry_run")),
     )
 
 

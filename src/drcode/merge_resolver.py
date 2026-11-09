@@ -123,6 +123,7 @@ def prepare(
     worktree: Path,
     base_branch: str,
     progress: Callable[[str], None] | None = None,
+    dry_run: bool = False,
 ) -> MergeReport:
     """Deploy (or re-detect) the conflicted merge in the task's worktree.
 
@@ -134,6 +135,12 @@ def prepare(
     for the agent to do (clean merge, already up to date, or the engine
     refused).
 
+    Like the engine's plain call, this MUTATES git state (the merge, the
+    auto-resolvers, a commit on full auto-resolution). A diagnostic call
+    passes `dry_run=True` — the engine then answers from pure reads and
+    never touches the worktree (`report.dry_run` is stamped on the
+    result).
+
     `progress` is an optional callback invoked from the calling thread at
     the step boundaries — ``"worktree"`` (this function's own deploy
     checks), then the engine's ``"merge"`` / ``"triage"`` /
@@ -144,7 +151,13 @@ def prepare(
     if progress is not None:
         progress("worktree")
     return merge_engine.merge_base_into_worktree(
-        project_root, task_id, worktree, base_branch, save=True, progress=progress
+        project_root,
+        task_id,
+        worktree,
+        base_branch,
+        save=not dry_run,
+        dry_run=dry_run,
+        progress=progress,
     )
 
 

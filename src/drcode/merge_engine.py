@@ -79,6 +79,12 @@ __all__ = [
     "CONTENT",
     "DELETE_DELETE",
     "MODIFY_DELETE",
+    "REFUSED_DIRTY",
+    "REFUSED_MERGE_FAILED",
+    "REFUSED_NOT_WORKTREE",
+    "REFUSED_NO_BASE",
+    "REFUSED_NO_WORKTREE",
+    "REFUSED_WRONG_BRANCH",
     "RENAME_DELETE",
     "RENAME_RENAME",
     "ConflictFile",
@@ -113,6 +119,21 @@ DELETE_DELETE = "delete-delete"  # both deleted (DD; only via renames)
 
 # Zero oid git reports for an absent stage in `status --porcelain=v2`.
 _ZERO_OID = "0" * 40
+
+# Machine-readable refusal kinds (MergeReport.reason, set whenever the
+# engine refuses and report.ok stays False). The human-oriented wording
+# lives in `message`; agents and tests match on THESE, never on prose.
+REFUSED_NO_WORKTREE = "worktree-missing"  # the worktree directory is gone
+REFUSED_NOT_WORKTREE = "worktree-unusable"  # git refuses to operate in it
+REFUSED_WRONG_BRANCH = "wrong-branch"  # checked out on a different branch
+REFUSED_NO_BASE = "base-branch-missing"  # the base branch does not exist
+REFUSED_DIRTY = "dirty-worktree"  # uncommitted changes, no merge in progress
+REFUSED_MERGE_FAILED = "merge-failed"  # git merge refused to even start
+
+# The dirty-file listing in the refusal message is capped — a pathological
+# tree must not produce a hundred-line message (the full list is in
+# `MergeReport.dirty_files` anyway).
+_DIRTY_LIST_CAP = 20
 
 # Where the engine persists triage reports (inside the already-gitignored
 # `.drcode/` state directory).
@@ -222,6 +243,13 @@ class MergeReport:
     up_to_date: bool = False
     fast_forward: bool | None = None
     message: str = ""
+    # Refusal bookkeeping (meaningful only while ok is False): `reason`
+    # is one of the REFUSED_* kinds — the machine-readable carrier of the
+    # meaning, so the human text in `message` is never its only source —
+    # and `dirty_files` holds the raw `git status --porcelain -uno` lines
+    # behind a dirty-worktree refusal.
+    reason: str = ""
+    dirty_files: list[str] = field(default_factory=list)
     files: list[ConflictFile] = field(default_factory=list)
     rerere: dict[str, object] = field(default_factory=dict)
     conflict_style: str = "zdiff3"
@@ -246,6 +274,8 @@ class MergeReport:
             "up_to_date": self.up_to_date,
             "fast_forward": self.fast_forward,
             "message": self.message,
+            "reason": self.reason,
+            "dirty_files": list(self.dirty_files),
             "conflict_style": self.conflict_style,
             "rerere": self.rerere,
             "files": [f.to_dict() for f in self.files],
@@ -345,9 +375,45 @@ def in_progress(worktree: Path) -> bool:
     return code == 0
 
 
-def _dirty(worktree: Path) -> bool:
-    code, out = _git("status", "--porcelain", "-uno", cwd=worktree)
-    return code == 0 and bool(out)
+def _dirty_files(worktree: Path) -> list[str]:
+    """The uncommitted TRACKED changes as raw `git status --porcelain
+    -uno` lines (" M path"). Empty = clean (untracked files never block
+    a merge — git merges around them just fine). The output is parsed
+    straight from stdout — `_git` strips it, and that would eat the
+    leading status column of the FIRST line (" M path" → "M path")."""
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "-uno"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+            check=False,
+            **child_priority_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _dirty_message(worktree: Path, files: list[str]) -> str:
+    """The human-oriented dirty-worktree refusal: the worktree path, the
+    full (capped) file list and the concrete way out — no jargon, no
+    internal function names."""
+    lines = [
+        (
+            f"the worktree {worktree} has uncommitted changes — commit or "
+            "discard them (git restore <file> / git checkout -- <file>), "
+            "then open the merge screen again:"
+        )
+    ]
+    shown = files[:_DIRTY_LIST_CAP]
+    lines.extend(f"  {entry}" for entry in shown)
+    if len(files) > len(shown):
+        lines.append(f"  … and {len(files) - len(shown)} more")
+    return "\n".join(lines)
 
 
 def _current_branch(worktree: Path) -> str | None:
@@ -816,10 +882,13 @@ def merge_base_into_worktree(
     the worktree (that is the point): resolve there, then `finish`, then
     the merge into the base is a fast-forward.
 
-    Refusals (report.ok is False, git state untouched): the worktree is
-    not a usable git tree, is dirty without a merge in progress (snapshot
-    first — see `drcode.task_env.snapshot`), is checked out on a different
-    branch than requested, or the base branch does not exist.
+    Refusals (report.ok is False, git state untouched): the worktree does
+    not exist or is not a usable git tree, is dirty without a merge in
+    progress (the message lists the files and the concrete way out), is
+    checked out on a different branch than requested, or the base branch
+    does not exist. Every refusal carries a machine-readable kind in
+    `report.reason` (the REFUSED_* constants) — match on that, never on
+    the human text in `report.message`.
     """
     report = MergeReport(
         task_id=task_id,
@@ -829,30 +898,50 @@ def merge_base_into_worktree(
     )
     wt = worktree
     if not wt.is_dir():
-        report.message = f"worktree {wt} does not exist"
+        report.reason = REFUSED_NO_WORKTREE
+        report.message = (
+            f"the worktree {wt} does not exist — it is (re)created when "
+            "the task next runs in its isolated worktree; open the merge "
+            "screen again afterwards"
+        )
         return _maybe_save(project_root, task_id, report, save)
     code, out = _git("rev-parse", "--is-inside-work-tree", cwd=wt)
     if code != 0 or out != "true":
-        report.message = f"{wt} is not a usable git worktree"
+        report.reason = REFUSED_NOT_WORKTREE
+        report.message = (
+            f"the directory {wt} is not a usable git worktree (git "
+            f"refuses to operate in it: {out[:200]}) — inspect it by hand"
+        )
         return _maybe_save(project_root, task_id, report, save)
     current = _current_branch(wt)
     if branch is None:
         branch = current or "?"
         report.branch = branch
     if current != branch:
-        report.message = f"{wt} is on {current or '(detached HEAD)'}, expected {branch}"
+        report.reason = REFUSED_WRONG_BRANCH
+        shown = current or "(detached HEAD)"
+        report.message = (
+            f"the worktree {wt} is checked out on {shown}, expected "
+            f"{branch} — switch it back (git switch {branch} in {wt}) "
+            "and open the merge screen again"
+        )
         return _maybe_save(project_root, task_id, report, save)
     if not _branch_exists(base_branch, cwd=project_root):
-        report.message = f"base branch {base_branch} does not exist"
+        report.reason = REFUSED_NO_BASE
+        report.message = (
+            f"the base branch {base_branch} does not exist — the task "
+            "may have forked from a branch that has since been deleted; "
+            "check the task's isolation start branch"
+        )
         return _maybe_save(project_root, task_id, report, save)
 
     resuming = in_progress(wt)
     if not resuming:
-        if _dirty(wt):
-            report.message = (
-                f"the worktree has uncommitted changes; snapshot them onto "
-                f"{branch} first (drcode.task_env.snapshot), then retry"
-            )
+        dirty = _dirty_files(wt)
+        if dirty:
+            report.reason = REFUSED_DIRTY
+            report.dirty_files = dirty
+            report.message = _dirty_message(wt, dirty)
             return _maybe_save(project_root, task_id, report, save)
         # Already up to date? The task branch containing the base tip
         # means there is nothing to merge (and the base→task merge would
@@ -883,6 +972,7 @@ def merge_base_into_worktree(
     if code != 0 and not in_progress(wt):
         # The merge never started (unrelated histories, index.lock, …):
         # report the refusal, git state untouched.
+        report.reason = REFUSED_MERGE_FAILED
         report.message = f"git merge failed without starting: {out[:1000]}"
         return _maybe_save(project_root, task_id, report, save)
 
@@ -1041,6 +1131,8 @@ def load_report(project_root: Path, task_id: str) -> MergeReport | None:
         up_to_date=bool(data.get("up_to_date")),
         fast_forward=data.get("fast_forward"),  # type: ignore[arg-type]
         message=str(data.get("message", "")),
+        reason=str(data.get("reason", "")),
+        dirty_files=[str(f) for f in data.get("dirty_files", []) if isinstance(f, str)],
         files=files,
         rerere=rerere if isinstance(rerere, dict) else {},
         conflict_style=str(data.get("conflict_style", "zdiff3")),

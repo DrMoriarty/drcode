@@ -1206,6 +1206,34 @@ def test_term_js_duplicate_project_guard() -> None:
     assert "renderRecents(lastRecents)" in js
 
 
+def test_term_js_failed_start_reverts_tab() -> None:
+    """A failed start (e.g. a recents entry whose directory was deleted)
+    must not leave a phantom tab behind: launchProject renames the tab
+    BEFORE the server's verdict, so the error handler has to revert the
+    never-started tab to the welcome picker — otherwise the tab stays
+    named after the missing project and a second picker click stacks
+    yet another tab."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    revert = js[
+        js.index("function revertTabToWelcome") : js.index("function projectOccupied")
+    ]
+    assert 'tab.kind = "welcome"' in revert
+    assert "tab.project = null" in revert
+    assert "refreshTabLabels()" in revert
+
+    handler = js[
+        js.index("function handleTabEvent") : js.index("function onTabExited")
+    ]
+    err = handler[handler.index('event.event === "error"') :]
+    assert "revertTabToWelcome(tab)" in err
+    # Revert happens before the error is shown, and for a started tab
+    # (crash dialog path) it must NOT fire.
+    assert err.index("revertTabToWelcome") < err.index("showWelcomeError")
+    started_branch = err[err.index("activeTab === tab") :]
+    assert "revertTabToWelcome" not in started_branch
+
+
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:
     ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
     try:

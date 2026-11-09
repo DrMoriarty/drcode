@@ -787,9 +787,14 @@
       tab.started = false;
       onTabExited(tab, event.code);
     } else if (event.event === "error") {
-      if (activeTab !== tab) return;
-      if (!tab.started) showWelcomeError(event.message);
-      else bootError(event.message);
+      if (!tab.started) {
+        // The start never happened (missing directory, spawn failure):
+        // revert the tab instead of keeping a renamed phantom.
+        revertTabToWelcome(tab);
+        if (activeTab === tab) showWelcomeError(event.message);
+      } else if (activeTab === tab) {
+        bootError(event.message);
+      }
     }
   }
 
@@ -816,6 +821,34 @@
   function showWelcomeError(message) {
     elWelcomeError.textContent = message;
     elWelcomeError.classList.remove("hidden");
+  }
+
+  /* A failed start (e.g. a recents entry whose directory was deleted)
+   * must not leave a phantom tab behind: launchProject has already
+   * renamed the tab and converted it to "terminal", so the error
+   * handler reverts it to the welcome picker it was launched from —
+   * clicking the same bad entry again then just re-shows the error
+   * instead of stacking another renamed tab. */
+  function revertTabToWelcome(tab) {
+    tab.project = null;
+    tab.kind = "welcome";
+    tab.started = false;
+    if (tab.term) {
+      try { tab.term.dispose(); } catch (err) { /* already gone */ }
+      tab.term = null;
+    }
+    tab.fit = null;
+    tab.webgl = null;
+    tab.filter = null;
+    if (tab.elTerm) {
+      if (resizeObserver) {
+        try { resizeObserver.unobserve(tab.elTerm); } catch (err) { /* gone */ }
+      }
+      tab.elTerm.remove();
+      tab.elTerm = null;
+    }
+    refreshTabLabels();
+    if (activeTab === tab) activateTab(tab);
   }
 
   /* One drcode instance per project: its state lives in the shared

@@ -67,6 +67,99 @@ def _stage_equal_versions(wt: Path, path: str, oid: str) -> None:
     assert proc.returncode == 0
 
 
+# -- dry run --------------------------------------------------------------------
+
+
+def _wt_state(wt: Path) -> tuple[str, str]:
+    """Everything a diagnostic call must not change: the commit graph and
+    the worktree/index status."""
+    log = _run(wt, "log", "--oneline", "-n", "50").stdout
+    status = _run(wt, "status", "--porcelain").stdout
+    return log, status
+
+
+def _diverged(repo: Path, wt: Path) -> None:
+    """Task branch and main both advance (mergeable, no conflict yet)."""
+    (wt / "task.txt").write_text("task work\n")
+    _run(wt, "add", ".")
+    _run(wt, "commit", "-qm", "task work")
+    (repo / "main.txt").write_text("main work\n")
+    _run(repo, "add", ".")
+    _run(repo, "commit", "-qm", "main work")
+
+
+def test_dry_run_reports_would_merge_without_touching_state(repo: Path) -> None:
+    wt = _task_worktree(repo, "t1")
+    _diverged(repo, wt)
+    before = _wt_state(wt)
+
+    report = me.merge_base_into_worktree(
+        repo, "t1", wt, "main", dry_run=True, save=True
+    )
+
+    assert report.ok and report.dry_run
+    assert "dry run" in report.message and "would merge" in report.message
+    # Neither the graph nor the index/worktree moved, and even save=True
+    # persists nothing — a diagnostic call is side-effect free.
+    assert _wt_state(wt) == before
+    assert me.load_report(repo, "t1") is None
+    # The merge is still pending: a real call now performs it.
+    real = me.merge_base_into_worktree(repo, "t1", wt, "main")
+    assert real.ok and not real.conflicted
+
+
+def test_dry_run_up_to_date_after_real_merge(repo: Path) -> None:
+    wt = _task_worktree(repo, "t1")
+    _diverged(repo, wt)
+    assert me.merge_base_into_worktree(repo, "t1", wt, "main").ok
+    before = _wt_state(wt)
+
+    report = me.merge_base_into_worktree(repo, "t1", wt, "main", dry_run=True)
+
+    assert report.ok and report.up_to_date and report.fast_forward
+    assert report.dry_run
+    assert _wt_state(wt) == before
+
+
+def test_dry_run_reports_parked_conflict_without_touching(repo: Path) -> None:
+    wt = _task_worktree(repo, "t1")
+    (wt / "app.py").write_text("task\nb\n")
+    _run(wt, "commit", "-qam", "task edit")
+    (repo / "app.py").write_text("main\nb\n")
+    _run(repo, "commit", "-qam", "main edit")
+    assert me.merge_base_into_worktree(repo, "t1", wt, "main").conflicted
+    before = _wt_state(wt)
+
+    report = me.merge_base_into_worktree(repo, "t1", wt, "main", dry_run=True)
+
+    assert report.ok and report.conflicted and report.dry_run
+    assert "in progress" in report.message
+    # The auto-resolvers did NOT run: the conflict stands exactly as parked.
+    assert me.unmerged_paths(wt) == ["app.py"]
+    assert _wt_state(wt) == before
+
+
+def test_dry_run_refusals_match_real_call(repo: Path) -> None:
+    wt = _task_worktree(repo, "t1")
+    (wt / "app.py").write_text("dirty\n")
+    report = me.merge_base_into_worktree(repo, "t1", wt, "main", dry_run=True)
+    assert not report.ok and "uncommitted changes" in report.message
+    _run(wt, "checkout", "--", "app.py")
+
+    report = me.merge_base_into_worktree(
+        repo, "t1", wt, "main", branch="drcode/other", dry_run=True
+    )
+    assert not report.ok and "expected drcode/other" in report.message
+
+    report = me.merge_base_into_worktree(repo, "t1", wt, "no/such/branch", dry_run=True)
+    assert not report.ok and "does not exist" in report.message
+
+    report = me.merge_base_into_worktree(
+        repo, "t1", repo / ".drcode" / "worktrees" / "gone", "main", dry_run=True
+    )
+    assert not report.ok and "does not exist" in report.message
+
+
 # -- the reversed merge -----------------------------------------------------------
 
 

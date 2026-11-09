@@ -112,6 +112,28 @@ def test_prepare_reruns_on_already_parked_merge(repo: Path) -> None:
     assert [f.path for f in report.remaining] == [f.path for f in report2.remaining]
 
 
+def test_prepare_dry_run_never_merges(repo: Path) -> None:
+    """A diagnostic prepare answers from pure reads: the would-be merge
+    is reported, but the worktree's graph and status stay untouched."""
+    wt = _task_worktree(repo, "t1")
+    (wt / "task.txt").write_text("task work\n")
+    _run(wt, "add", ".")
+    _run(wt, "commit", "-qm", "task work")
+    (repo / "main.txt").write_text("main work\n")
+    _run(repo, "add", ".")
+    _run(repo, "commit", "-qm", "main work")
+    log_before = _run(wt, "log", "--oneline").stdout
+    status_before = _run(wt, "status", "--porcelain").stdout
+
+    report = mr.prepare(repo, "t1", wt, "main", dry_run=True)
+
+    assert report.ok and report.dry_run
+    assert "would merge" in report.message
+    assert _run(wt, "log", "--oneline").stdout == log_before
+    assert _run(wt, "status", "--porcelain").stdout == status_before
+    assert me.load_report(repo, "t1") is None
+
+
 # -- verification funnel: mechanics -------------------------------------------------
 
 

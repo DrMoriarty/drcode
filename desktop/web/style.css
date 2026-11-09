@@ -240,8 +240,21 @@ body {
   font-size: 13px;
 }
 .recents-list li:hover { background: #2a2f38; }
+.recents-list li.occupied { cursor: not-allowed; }
+.recents-list li.occupied:hover { background: transparent; }
 .recents-list .path { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recents-list .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
+/* "open" badge on a recent project already live in another tab. */
+.recents-list .open-mark {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
 
 .welcome-error {
   margin-top: 16px;

@@ -106,6 +106,11 @@
    * filter: only Default and Custom… remain. */
   var availableFonts = null;
 
+  /* Last recents payload from the bridge, kept so the list can be
+   * re-rendered (with fresh occupied/open marks) whenever a welcome tab
+   * is activated — tabs may have opened or closed since the last look. */
+  var lastRecents = null;
+
   function api(name) {
     var bridge = window.pywebview && window.pywebview.api;
     if (!bridge || typeof bridge[name] !== "function") return null;
@@ -291,6 +296,9 @@
       // already-attached node relocates it).
       tab.pane.appendChild(elWelcome);
       elWelcome.classList.remove("hidden");
+      // Re-render the recents with current occupancy: tabs opened or
+      // closed since the last render change which projects are open.
+      if (lastRecents) renderRecents(lastRecents);
       updateFontBtnVisibility();
       setWindowTitle("DrCode");
       return;
@@ -810,8 +818,30 @@
     elWelcomeError.classList.remove("hidden");
   }
 
+  /* One drcode instance per project: its state lives in the shared
+   * <project>/.drcode/ (tasks, worktrees, search index), so a second
+   * tab over the same path would race it. Best-effort pre-check on the
+   * open tabs (the server re-checks with realpath normalization and
+   * answers an error event — this only spares the round trip). */
+  function projectOccupied(project, excludeTab) {
+    if (!project) return false;
+    return tabs.some(function (t) {
+      return t !== excludeTab && t.kind === "terminal" && t.started && t.project === project;
+    });
+  }
+
+  function duplicateMessage(project) {
+    return "This project is already open in another tab: " + project +
+      ". Close that tab first.";
+  }
+
   function launchProject(tab, project) {
     if (!tab || !project) return;
+    if (projectOccupied(project, tab)) {
+      if (tab.started) bootError(duplicateMessage(project));
+      else showWelcomeError(duplicateMessage(project));
+      return;
+    }
     if (activeTab !== tab) activateTab(tab);
     elWelcomeError.classList.add("hidden");
     tab.project = project;
@@ -864,9 +894,15 @@
       elRecentsBlock.classList.add("hidden");
       return;
     }
+    lastRecents = recents;
     elRecentsList.innerHTML = "";
     recents.forEach(function (item) {
       var li = document.createElement("li");
+      var occupied = projectOccupied(item.project, null);
+      if (occupied) {
+        li.className = "occupied";
+        li.title = "This project is already open in another tab";
+      }
       var path = document.createElement("span");
       path.className = "path";
       path.textContent = item.project;
@@ -875,7 +911,18 @@
       when.textContent = item.last_used ? new Date(item.last_used * 1000).toLocaleDateString() : "";
       li.appendChild(path);
       li.appendChild(when);
-      li.addEventListener("click", function () { launchFromPicker(item.project); });
+      if (occupied) {
+        var mark = document.createElement("span");
+        mark.className = "open-mark";
+        mark.textContent = "open";
+        li.appendChild(mark);
+        // Occupied entries are not launchable — clicking explains why.
+        li.addEventListener("click", function () {
+          showWelcomeError(duplicateMessage(item.project));
+        });
+      } else {
+        li.addEventListener("click", function () { launchFromPicker(item.project); });
+      }
       elRecentsList.appendChild(li);
     });
     elRecentsBlock.classList.remove("hidden");
@@ -886,6 +933,12 @@
    * in which case a fresh tab takes it (the picker is only reachable
    * from a welcome tab in practice). */
   function launchFromPicker(project) {
+    // Blocked BEFORE any tab is created/activated: an occupied project
+    // must not leave an extra welcome tab behind.
+    if (projectOccupied(project, null)) {
+      showWelcomeError(duplicateMessage(project));
+      return;
+    }
     var tab = activeTab && activeTab.kind === "welcome"
       ? activeTab
       : createTab("welcome", null);

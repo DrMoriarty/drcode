@@ -23,6 +23,14 @@ messages may restate it). Events are always marked with the same tab:
 Each tab holds at most one PTY session; the context holds any number of
 tabs (a tab's session outlives a ws reconnect by design — the client
 kills it explicitly with the ``kill`` control message).
+
+A project (normalized absolute path — realpath, so symlinks and
+``/private/tmp``-style aliases resolve to the same key) can back at most
+ONE live session across all tabs: drcode keeps its state in the shared
+``<project>/.drcode/`` (tasks, worktrees, search index, settings) and
+two instances over one project would race. ``start``/``restart`` on an
+occupied project is answered with an ``{"event": "error", ...}`` frame
+instead of a spawn.
 """
 
 from __future__ import annotations
@@ -89,6 +97,25 @@ class ShellContext:
                 return state.project
         return None
 
+    def project_tab(self, project: str, exclude_tab: str | None = None) -> str | None:
+        """Tab id already running ``project`` in a live session, or None.
+
+        Comparison is on realpath-normalized absolute paths, so ``/tmp/x``,
+        a symlink to it, and macOS's ``/private/tmp/x`` all count as the
+        same project. A tab whose session has exited (crash, kill) does
+        not hold the project anymore. ``exclude_tab`` lets a tab restart
+        its own project.
+        """
+        if not project:
+            return None
+        real = os.path.realpath(project)
+        for tab_id, state in self.tabs.items():
+            if tab_id == exclude_tab or state.session is None or not state.project:
+                continue
+            if os.path.realpath(state.project) == real:
+                return tab_id
+        return None
+
     # -- session management -------------------------------------------------
 
     async def start_session(
@@ -122,6 +149,13 @@ class ShellContext:
             on_exit=_on_exit,
         )
         state.session = session
+        # Claim the project BEFORE the await so two near-simultaneous
+        # starts cannot both pass the project_tab() check (the second one
+        # then sees this tab's session even though the PTY is still
+        # booting). A failed start clears the session; the stale project
+        # string is harmless (never counted while session is None) and is
+        # overwritten by the next successful spawn.
+        state.project = project
         if os.environ.get("DRCODE_DESKTOP_DEBUG") == "1":
             print(
                 f"[desktop] spawning {self.payload} in {project} (tab {tab_id})",
@@ -137,7 +171,6 @@ class ShellContext:
             if state.session is session:
                 state.session = None
             raise
-        state.project = project
         if os.environ.get("DRCODE_DESKTOP_DEBUG") == "1":
             print(
                 f"[desktop] session started, tab={tab_id}, "
@@ -255,6 +288,25 @@ async def _handle_control(ctx: ShellContext, raw: str, conn_tab: str) -> None:
 
     if kind in ("start", "restart"):
         project = str(msg.get("project") or state.project or "")
+        # One live drcode instance per project: its state lives in the
+        # shared <project>/.drcode/ (tasks, worktrees, search index), so
+        # a second tab over the same path would race it. A tab may always
+        # restart its own project (exclude_tab below).
+        holder = ctx.project_tab(project, exclude_tab=tab_id)
+        if holder is not None:
+            event = state.event_sink
+            if event is not None:
+                event(
+                    {
+                        "event": "error",
+                        "message": (
+                            "This project is already open in another tab: "
+                            f"{project} (tab {holder}). Close that tab first."
+                        ),
+                        "tab": tab_id,
+                    }
+                )
+            return
         try:
             await ctx.start_session(tab_id, project, rows, cols)
         except Exception as exc:  # noqa: BLE001 - any spawn failure becomes an error event

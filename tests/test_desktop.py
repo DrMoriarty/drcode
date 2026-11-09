@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -675,6 +676,141 @@ async def test_server_clean_exit_reports_tab_to_hook(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# server.py — one live session per project (duplicate-project guard)
+# ---------------------------------------------------------------------------
+
+
+async def _start_project(
+    http: aiohttp.ClientSession, base_url: str, ctx: ShellContext,
+    tab: str, project: Path,
+):
+    """Connect a tab and start ``project``; return (ws, all events up to
+    and including the first error-or-started event)."""
+    ws = await http.ws_connect(f"{base_url}/ws?token={ctx.token}&tab={tab}")
+    await ws.send_json(
+        {"type": "start", "project": str(project), "rows": 24, "cols": 80}
+    )
+    event, _ = await _wait_for(
+        ws,
+        lambda e: isinstance(e, dict) and e.get("event") in ("started", "error"),
+    )
+    return ws, event
+
+
+async def test_server_duplicate_project_blocked_in_other_tab(tmp_path: Path) -> None:
+    """The second tab over the same project gets an error event instead of
+    a session; the first tab keeps running."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            ws_a, event_a = await _start_project(http, base_url, ctx, "ta", proj)
+            assert event_a["event"] == "started"
+
+            ws_b, event_b = await _start_project(http, base_url, ctx, "tb", proj)
+            assert event_b["event"] == "error"
+            assert "already open in another tab" in event_b["message"]
+            assert "proj" in event_b["message"]
+            assert ctx.tabs["tb"].session is None
+            # The first tab's session is untouched.
+            assert ctx.tabs["ta"].session is not None
+            await _wait_for(
+                ws_a, lambda d: isinstance(d, bytes) and b"proj" in d, timeout=2
+            )
+            await ws_a.close()
+            await ws_b.close()
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+async def test_server_duplicate_project_symlink_same_path(tmp_path: Path) -> None:
+    """A symlink to the project resolves to the same realpath: opening it
+    from another tab is blocked too (macOS /private/tmp aliases included)."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    proj = tmp_path / "real-proj"
+    proj.mkdir()
+    link = tmp_path / "link-proj"
+    link.symlink_to(proj)
+    assert os.path.realpath(link) == os.path.realpath(proj)
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            ws_a, event_a = await _start_project(http, base_url, ctx, "ta", proj)
+            assert event_a["event"] == "started"
+
+            ws_b, event_b = await _start_project(http, base_url, ctx, "tb", link)
+            assert event_b["event"] == "error"
+            assert "already open in another tab" in event_b["message"]
+            assert ctx.tabs["tb"].session is None
+            await ws_a.close()
+            await ws_b.close()
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+async def test_server_restart_own_project_allowed(tmp_path: Path) -> None:
+    """Restarting a tab's OWN project never trips the guard (the holder
+    is the tab itself)."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            ws, event = await _start_project(http, base_url, ctx, "ta", proj)
+            assert event["event"] == "started"
+
+            await ws.send_json(
+                {"type": "restart", "project": str(proj), "rows": 24, "cols": 80}
+            )
+            event, _ = await _wait_for(
+                ws,
+                lambda e: isinstance(e, dict) and e.get("event") in ("started", "error"),
+            )
+            assert event["event"] == "started"
+            assert ctx.tabs["ta"].session is not None
+            await ws.close()
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+async def test_server_project_free_after_tab_closed(tmp_path: Path) -> None:
+    """Killing the holding tab frees the project: another tab can open it."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    ctx.payload = _make_loop_payload(tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            ws_a, event_a = await _start_project(http, base_url, ctx, "ta", proj)
+            assert event_a["event"] == "started"
+
+            await ws_a.send_json({"type": "kill", "tab": "ta"})
+            await _wait_for(
+                ws_a, lambda e: isinstance(e, dict) and e.get("event") == "exited"
+            )
+            assert ctx.tabs["ta"].session is None
+
+            ws_b, event_b = await _start_project(http, base_url, ctx, "tb", proj)
+            assert event_b["event"] == "started"
+            assert ctx.tabs["tb"].session is not None
+            await ws_a.close()
+            await ws_b.close()
+    finally:
+        await ctx.stop_all()
+        await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
 # web/term.js — tab model (static, headless)
 # ---------------------------------------------------------------------------
 
@@ -1033,6 +1169,41 @@ def test_term_js_font_preview_wiring() -> None:
     # size input all reach updateFontPreview.
     for fn in ("function openSettings", "function wireUi"):
         assert "updateFontPreview()" in js[js.index(fn) :]
+
+
+def test_term_js_duplicate_project_guard() -> None:
+    """One drcode instance per project, enforced in the client too: the
+    launch paths pre-check the open tabs, the picker blocks before any
+    tab is created, and occupied recents are marked and inert."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+    # The occupancy helper and the shared message text exist.
+    occupied = js[js.index("function projectOccupied") : js.index("function duplicateMessage")]
+    assert "t.started" in occupied  # only a live session holds the project
+    assert "t !== excludeTab" in occupied  # a tab may restart its own project
+    dup = js[js.index("function duplicateMessage") : js.index("function launchProject")]
+    assert "already open in another tab" in dup
+
+    # launchProject blocks (welcome error on an unstarted tab, boot error
+    # on a live one) instead of opening a duplicate.
+    launch = js[js.index("function launchProject") : js.index("function fetchAvailableFonts")]
+    assert "projectOccupied(project, tab)" in launch
+    assert "showWelcomeError(duplicateMessage(project))" in launch
+    assert "bootError(duplicateMessage(project))" in launch
+
+    # The picker blocks BEFORE creating a welcome tab.
+    picker = js[js.index("function launchFromPicker") : js.index("function loadRecents")]
+    assert "projectOccupied(project, null)" in picker
+    assert picker.index("projectOccupied") < picker.index("createTab")
+
+    # Occupied recents: "open" mark, not-allowed cursor, and the click
+    # explains instead of launching.
+    recents = js[js.index("function renderRecents") : js.index("/* Projects picked")]
+    assert 'mark.className = "open-mark"' in recents
+    assert 'li.className = "occupied"' in recents
+    assert "duplicateMessage(item.project)" in recents
+    # The list re-renders on welcome activation so the marks stay fresh.
+    assert "renderRecents(lastRecents)" in js
 
 
 async def test_server_start_rejects_missing_project(tmp_path: Path) -> None:

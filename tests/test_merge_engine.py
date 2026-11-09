@@ -496,10 +496,52 @@ def test_dirty_worktree_refused_without_merge(repo: Path) -> None:
     report = me.merge_base_into_worktree(repo, "t1", wt, "main")
 
     assert not report.ok
-    assert "snapshot" in report.message
+    # Human-oriented: the worktree path, the offending file, the concrete
+    # way out — and the reason is carried structurally, not only in prose.
+    assert "uncommitted changes" in report.message
+    assert str(wt) in report.message
+    assert "app.py" in report.message
+    assert "git restore" in report.message
+    assert "drcode.task_env.snapshot" not in report.message
+    assert report.reason == me.REFUSED_DIRTY
+    assert report.dirty_files == [" M app.py"]
     # Git state untouched: no merge started.
     assert not me.in_progress(wt)
     assert _head(repo) == _run(wt, "rev-parse", "main").stdout.strip()
+
+
+def test_dirty_refusal_lists_every_file_and_round_trips(repo: Path) -> None:
+    """The refusal message carries the FULL dirty list (capped display),
+    the raw porcelain lines land in `dirty_files`, and the structured
+    reason survives the report round trip."""
+    wt = _task_worktree(repo, "t1")
+    (wt / "app.py").write_text("uncommitted\n")
+    (wt / "extra.py").write_text("also dirty\n")
+    _run(wt, "add", "extra.py")
+
+    report = me.merge_base_into_worktree(repo, "t1", wt, "main")
+
+    assert not report.ok and report.reason == me.REFUSED_DIRTY
+    assert len(report.dirty_files) == 2
+    assert any("app.py" in line for line in report.dirty_files)
+    assert any("extra.py" in line for line in report.dirty_files)
+    assert "app.py" in report.message and "extra.py" in report.message
+    data = report.to_dict()
+    assert data["reason"] == me.REFUSED_DIRTY
+    # to_dict is dict[str, object] — narrow the list before len().
+    dirty = data["dirty_files"]
+    assert isinstance(dirty, list) and len(dirty) == 2
+    loaded = me.MergeReport(
+        task_id="t1",
+        branch="drcode/t1",
+        base_branch="main",
+        worktree=str(wt),
+    )
+    loaded.ok = False
+    loaded.message = report.message
+    loaded.reason = report.reason
+    loaded.dirty_files = report.dirty_files
+    assert loaded.to_dict() == report.to_dict()
 
 
 def test_wrong_branch_refused(repo: Path) -> None:
@@ -507,6 +549,7 @@ def test_wrong_branch_refused(repo: Path) -> None:
     report = me.merge_base_into_worktree(repo, "t1", wt, "main", branch="drcode/other")
     assert not report.ok
     assert "expected drcode/other" in report.message
+    assert report.reason == me.REFUSED_WRONG_BRANCH
 
 
 def test_missing_base_refused(repo: Path) -> None:
@@ -514,6 +557,7 @@ def test_missing_base_refused(repo: Path) -> None:
     report = me.merge_base_into_worktree(repo, "t1", wt, "no/such/branch")
     assert not report.ok
     assert "does not exist" in report.message
+    assert report.reason == me.REFUSED_NO_BASE
 
 
 def test_missing_worktree_refused(repo: Path) -> None:
@@ -522,6 +566,7 @@ def test_missing_worktree_refused(repo: Path) -> None:
     )
     assert not report.ok
     assert "does not exist" in report.message
+    assert report.reason == me.REFUSED_NO_WORKTREE
 
 
 def test_dirty_worktree_resumes_in_progress_merge(repo: Path) -> None:

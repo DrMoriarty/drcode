@@ -495,6 +495,104 @@ async def test_commit_refused_while_conflicts_remain(
         assert "<<<<<<<" in (wt / "app.py").read_text()
 
 
+async def test_dirty_worktree_refusal_is_visible_and_recoverable(
+    isolated: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The c3b17718 incident class: a dirty task worktree refuses the
+    prepare — the reason must be visible in the files pane, in the s
+    toast and in the task's chat (a service event that outlives the
+    screen), the merge keys must go dead, and committing the dirty file
+    plus `r` must recover the screen into the parked-conflict state."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix app", "fix the app")
+    manager.set_hold(task.id, on=True)
+    wt = isolated / ".drcode" / "worktrees" / task.id
+    _git(isolated, "worktree", "add", str(wt), "-b", branch_for(task.id), "HEAD")
+    (wt / "app.py").write_text("a\nTASK\nc\n")
+    _git(wt, "commit", "-qam", "task edit")
+    (isolated / "app.py").write_text("a\nMAIN\nc\n")
+    _git(isolated, "commit", "-qam", "main edit")
+    # The blocker itself: an UNCOMMITTED tracked change in the worktree.
+    (wt / "app.py").write_text("a\nTASK\nuncommitted\nc\n")
+
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(task.id)
+        # The incident's entry path: an unmerged task opens the screen
+        # (the Ctrl+M candidate gate reads the 10 s poll's cached
+        # mergedness — open_merge_for is what that gate funnels into).
+        app.open_merge_for(task.id)
+        await wait_until(
+            lambda: isinstance(app.screen, ConflictScreen),
+            pilot=pilot,
+            what="conflict screen open",
+        )
+        screen = app.screen
+        assert isinstance(screen, ConflictScreen)
+        await wait_until(
+            lambda: screen._refusal is not None,
+            pilot=pilot,
+            what="prepare refused with a reason",
+        )
+        refusal = screen._refusal or ""
+        assert "uncommitted changes" in refusal
+        assert "app.py" in refusal
+        assert "git restore" in refusal
+        # The pane carries the reason, visible and marker-free; the file
+        # list makes way for it.
+        panel = screen.refusal_panel
+        assert "visible" in panel.classes
+        assert "app.py" in str(panel.content)
+        assert not screen.files_list.children
+        # Every merge key is dead; s (it names the reason), the re-check
+        # and esc stay live.
+        assert screen.check_action("resolve", ()) is False
+        assert screen.check_action("verify", ()) is False
+        assert screen.check_action("auto_resolve", ()) is False
+        assert screen.check_action("ff_merge", ()) is False
+        assert screen.check_action("abort_merge", ()) is False
+        assert screen.check_action("commit", ()) is True
+        assert screen.check_action("refresh_state", ()) is True
+        assert screen.check_action("close", ()) is True
+
+        # The service event persists on the task — readable in the chat
+        # without ever opening the screen again.
+        reloaded = TaskManager(isolated).get(task.id)
+        assert any(
+            "Merge refused" in e.text and "uncommitted changes" in e.text
+            for e in reloaded.events
+        )
+
+        # The s toast names the reason instead of a bare "no merge".
+        toasts: list[str] = []
+        monkeypatch.setattr(
+            screen, "notify", lambda message, **_: toasts.append(str(message))
+        )
+        await pilot.press("s")
+        await pilot.pause()
+        assert any(
+            t.startswith("No merge is in progress") and "uncommitted" in t
+            for t in toasts
+        ), toasts
+        assert not me.in_progress(wt)
+
+        # The way out: commit the dirty change, press r — the prepare
+        # re-runs and parks the conflict as usual.
+        _git(wt, "commit", "-qam", "task dirty edit")
+        await pilot.press("r")
+        await wait_until(
+            lambda: (
+                screen._refusal is None
+                and screen.wt is not None
+                and me.in_progress(screen.wt.worktree)
+            ),
+            pilot=pilot,
+            what="prepare recovered into the parked conflict",
+        )
+        assert "<<<<<<<" in (wt / "app.py").read_text()
+
+
 async def test_needs_human_task_opens_screen_without_parked_merge(
     isolated: Path, configured_env: None
 ) -> None:

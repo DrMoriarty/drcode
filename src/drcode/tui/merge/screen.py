@@ -234,6 +234,13 @@ class ConflictScreen(ModalScreen[None]):
     }
     #merge-files { height: 1fr; }
     #merge-files ListItem { padding: 0 1; }
+    #merge-refusal {
+        display: none;
+        padding: 0 1 1 1;
+        color: $error;
+        text-style: bold;
+    }
+    #merge-refusal.visible { display: block; }
     #merge-view { width: 1fr; }
     #merge-footer {
         dock: bottom;
@@ -320,6 +327,12 @@ class ConflictScreen(ModalScreen[None]):
         self._resolver_timer: Timer | None = None
         self._resolver_poll: Timer | None = None
         self._preparing = False
+        # The last prepare refusal's human text (report.ok was False —
+        # dirty worktree, wrong branch, …): shown in the files pane, in
+        # the "no merge" toasts and logged into the task's chat; `r`
+        # re-runs the prepare instead of a mere re-triage while it is
+        # set. None once a prepare succeeds.
+        self._refusal: str | None = None
         # What the merge actually carries (the task branch's last commit
         # subject, falling back to the task title): fetched once at the
         # very start of prepare and woven into EVERY title via
@@ -346,6 +359,10 @@ class ConflictScreen(ModalScreen[None]):
         return self.query_one("#merge-files-summary", Static)
 
     @property
+    def refusal_panel(self) -> Static:
+        return self.query_one("#merge-refusal", Static)
+
+    @property
     def view(self) -> ConflictView:
         return self.query_one("#merge-view", ConflictView)
 
@@ -367,6 +384,12 @@ class ConflictScreen(ModalScreen[None]):
                     # numstat list below (empty/invisible in the conflict
                     # mode, where the list shows conflict states instead).
                     yield Static("", id="merge-files-summary")
+                    # The prepare-refusal reason (dirty worktree, wrong
+                    # branch, …): hidden unless the last prepare was
+                    # refused — the reason must be readable in the pane,
+                    # not only in the clipped title line. markup=False:
+                    # the text embeds raw paths (literal [brackets]).
+                    yield Static("", id="merge-refusal", markup=False)
                     yield ListView(id="merge-files")
                 yield ConflictView(id="merge-view")
             # markup=False: the progress lines carry literal [ok] / [ ]
@@ -393,6 +416,13 @@ class ConflictScreen(ModalScreen[None]):
             return True  # esc stays live: a worker's write-backs are guarded
         if self._busy is not None or self._resolver_round:
             return False
+        if self._refusal is not None:
+            # The prepare was refused (no merge exists): everything that
+            # needs a real merge goes dead. ``s`` stays live ON PURPOSE —
+            # its handler is the one that names the refusal reason in a
+            # toast (the bare "No merge is in progress" incident), a
+            # fully inert key would say nothing at all.
+            return action in ("refresh_state", "commit")
         if action == "ff_merge":
             return self._ff_ready and not self._ff_done
         return not (self._ff_ready and action in self._FF_DISABLED_ACTIONS)
@@ -421,6 +451,12 @@ class ConflictScreen(ModalScreen[None]):
                 "automatic resolver running — o/t/b/e/v/d/s/a/A/f disabled "
                 "until the round ends · esc close"
             )
+        elif self._refusal is not None:
+            text = (
+                "merge refused — see the reason in the file panel · "
+                "s names it · r re-check after fixing · esc close · "
+                "o/t/b/e/v/d/a/A/f disabled"
+            )
         elif self._ff_ready:
             base = "base"
             if self.wt is not None and self.wt.report is not None:
@@ -443,6 +479,52 @@ class ConflictScreen(ModalScreen[None]):
                 "A auto resolve · r refresh · esc close"
             )
         footer.update(text)
+
+    # -- prepare refusal (the engine refused: show it, keep it, log it) ----------
+
+    def _show_refusal(self, reason: str) -> None:
+        """The prepare was refused (report.ok is False): the reason goes
+        into the files pane — bold, in the pane's body, never only in the
+        clipped title line — and the (empty) file list and numstat
+        summary make way for it. A late worker after unmount is a
+        no-op."""
+        self._refusal = reason
+        if not self.is_mounted:
+            return
+        try:
+            panel = self.refusal_panel
+            self.files_list.clear()
+            self.files_summary.update("")
+        except NoMatches:
+            # The screen is being torn down mid-prepare.
+            return
+        panel.update(reason)
+        panel.add_class("visible")
+
+    def _hide_refusal(self) -> None:
+        """A prepare succeeded (or a fresh one is starting): the refusal
+        block goes away."""
+        self._refusal = None
+        if not self.is_mounted:
+            return
+        try:
+            panel = self.refusal_panel
+        except NoMatches:
+            return
+        panel.update("")
+        panel.remove_class("visible")
+
+    def _log_refusal_event(self, reason: str) -> None:
+        """Persist the refusal into the task's chat as a service event —
+        the reason must survive the screen closing (it used to be visible
+        at most in the title line, and the real cause had to be dug out
+        of the task events and the resolver transcript by hand).
+        Deduplicated per wording: an r-refresh hitting the SAME refusal
+        does not spam the chat; a changed file list logs again."""
+        app = cast("DrCodeApp", self.app)
+        task = app.manager.get(self.task_id)
+        text = "; ".join(line.strip() for line in reason.splitlines() if line.strip())
+        app._show_event_once(task, f"Merge refused: {text}", kind="workflow")
 
     # -- preparation (the engine's reversed merge) -------------------------------
 
@@ -494,6 +576,9 @@ class ConflictScreen(ModalScreen[None]):
         # heavy prepare — so the title (and the progress panel's first
         # line) already say WHAT is being resolved from the first frame.
         self._merge_desc = await asyncio.to_thread(self._fetch_merge_desc)
+        # A fresh prepare wipes the previous refusal (the engine may
+        # succeed this time — e.g. the user committed the dirty files).
+        self._hide_refusal()
         self._begin_prepare()
         if self._merge_desc:
             self._set_title(f"#{self.task_id} — merge conflicts")
@@ -600,6 +685,12 @@ class ConflictScreen(ModalScreen[None]):
             self._conflicted = False
             self._numstat_mode = None
             self._set_title(f"Merge conflicts — {report.message}")
+            # The reason where it is actually readable: the files pane's
+            # body (the title clips long reasons), a service event in
+            # the task's chat (it must outlive the screen), and the
+            # no-merge toasts read it back from `_refusal`.
+            self._show_refusal(report.message)
+            self._log_refusal_event(report.message)
             self._update_footer()
             self._hide_prepare()
             return
@@ -1274,7 +1365,7 @@ class ConflictScreen(ModalScreen[None]):
         if self._busy is not None:
             return
         if self.wt is None or not self.wt.in_progress():
-            self.notify("No merge is in progress", title="Merge", timeout=4)
+            self._no_merge_toast()
             return
         self._begin_checks()
         self._run_checks()
@@ -1509,18 +1600,37 @@ class ConflictScreen(ModalScreen[None]):
             timeout=_ARM_SECONDS + 0.5,
         )
 
+    def _no_merge_toast(self) -> None:
+        """The "no merge is in progress" toast, carrying the last
+        prepare refusal's reason when there was one — a bare "No merge
+        is in progress" once sent the user digging through the task's
+        events by hand (the s-press incident)."""
+        if self._refusal:
+            self.notify(
+                f"No merge is in progress — {self._refusal}",
+                title="Merge",
+                severity="warning",
+                timeout=8,
+            )
+        else:
+            self.notify("No merge is in progress", title="Merge", timeout=4)
+
     def action_commit(self) -> None:
         if self._busy is not None:
             return
         if self.wt is None:
             return
+        # Validate BEFORE arming: with no merge to commit (typically the
+        # prepare refused — dirty worktree & co.) the first s press says
+        # WHY instead of asking for a confirmation press that could only
+        # end in the same refusal.
+        if not self.wt.in_progress():
+            self._no_merge_toast()
+            return
         if self._armed != "commit":
             self._arm("commit")
             return
         self._disarm()
-        if not self.wt.in_progress():
-            self.notify("No merge is in progress", title="Merge", timeout=4)
-            return
         self._do_commit()
 
     @work(exclusive=True, group="merge-commit")
@@ -1754,8 +1864,15 @@ class ConflictScreen(ModalScreen[None]):
         """r: re-triage the live merge and reload everything (an external
         editor may have changed files while the screen was suspended). In
         the fast-path ff state (no worktree) it re-fetches the branch
-        numstat only — there is no merge to re-triage."""
+        numstat only — there is no merge to re-triage. After a prepare
+        refusal (dirty worktree, wrong branch, …) it re-runs the WHOLE
+        prepare instead: the user may have committed/discarded the
+        offending changes since, and only a fresh prepare can recover
+        the screen into a working state."""
         if self._busy is not None:
+            return
+        if self._refusal is not None:
+            self._prepare()
             return
         if self.wt is None and self._numstat_mode != "ff":
             return

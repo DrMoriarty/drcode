@@ -30,6 +30,7 @@ from tests.network_mocks import (
     ScriptedState,
     api_error,
     event_texts,
+    http_error,
     wait_until,
 )
 
@@ -159,3 +160,134 @@ async def test_retry_survives_stale_needs_human(
             what="second retry announcement",
         )
         assert app._resolver_net_count.get(task.id) == 2
+
+
+# -- the intent review's own retry budget (#9c3236e8) ----------------------------
+#
+# The reviewer pass is the CHEAP tail of the verification funnel, but an
+# infrastructure failure there used to be silently treated as an 'unsure'
+# verdict — rolling back the whole EXPENSIVE resolver round. These tests
+# exercise `_verify_resolution` directly with the funnel's mechanical
+# parts stubbed green and a scripted reviewer.
+
+from types import SimpleNamespace
+
+from pydantic_ai.usage import RunUsage
+
+from drcode.agent import ResolutionVerdict, ResolverDeps
+from drcode.merge_engine import ConflictFile, MergeReport
+from drcode.merge_resolver import CheckResult
+
+
+class _FakeReviewer:
+    """Stands in for the reviewer agent: raises the scripted exceptions
+    in order, then succeeds and reports the given verdict label."""
+
+    def __init__(self, failures: list[Exception], label: str = "intact") -> None:
+        self.failures = failures
+        self.label = label
+        self.calls = 0
+
+    async def run(self, prompt: str, deps: ResolverDeps, usage_limits: Any) -> Any:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        deps.verdicts.append(
+            ResolutionVerdict(resolved=False, report="nothing lost", label=self.label)
+        )
+        return SimpleNamespace(usage=RunUsage())
+
+
+def _report(task_id: str) -> MergeReport:
+    return MergeReport(
+        task_id=task_id,
+        branch=f"drcode/{task_id}",
+        base_branch="main",
+        worktree="/tmp/nowhere",
+        ok=True,
+        conflicted=True,
+        files=[ConflictFile(path="shared.txt", kind="content")],
+    )
+
+
+def _verify_deps(app: DrCodeApp, task: Any, root: Path) -> ResolverDeps:
+    return ResolverDeps(
+        root=root,
+        manager=app.manager,
+        task_id=task.id,
+        scratch=Path("/tmp/drcode-does-not-exist"),
+        verdicts=[ResolutionVerdict(resolved=True, report="markers cleaned")],
+    )
+
+
+async def test_reviewer_429_retried_then_intact(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two 429s from the reviewer, then a successful 'intact' pass: the
+    round must COMMIT (verdict 'resolved') — the reviewer's own retry
+    budget absorbs the infra hiccups without burning the round's."""
+    import drcode.core.pipeline_resolver as pr
+
+    task = conflicted_task
+    app = DrCodeApp(isolated)
+    reviewer = _FakeReviewer([http_error(429), http_error(429)])
+    monkeypatch.setattr(pr, "_RETRY_BASE_DELAY_S", 0.01)
+    monkeypatch.setattr(pr, "build_resolver_reviewer_agent", lambda *a, **k: reviewer)
+    monkeypatch.setattr(pr, "mechanical_checks", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pr, "run_test_suite", lambda *a, **k: CheckResult(name="pytest", ok=True)
+    )
+    monkeypatch.setattr(pr, "review_diffs", lambda *a, **k: ("", ""))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        outcome = await app._verify_resolution(
+            live, isolated, _report(task.id), _verify_deps(app, live, isolated)
+        )
+        assert reviewer.calls == 3
+        assert outcome.review_verdict == "intact"
+        assert outcome.verdict == "resolved"
+        texts = event_texts(live)
+        retries = [t for t in texts if "Intent review failed" in t and "retrying" in t]
+        assert len(retries) == 2
+
+
+async def test_reviewer_context_overflow_no_retry(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deterministic context-overflow 400 from the reviewer: NO retries
+    (every replay is guaranteed the same 400) — straight to 'unsure', the
+    review stays mandatory (nothing committed)."""
+    import drcode.core.pipeline_resolver as pr
+
+    task = conflicted_task
+    app = DrCodeApp(isolated)
+    reviewer = _FakeReviewer(
+        [http_error(400, "This model's maximum context length is exceeded")]
+    )
+    monkeypatch.setattr(pr, "_RETRY_BASE_DELAY_S", 0.01)
+    monkeypatch.setattr(pr, "build_resolver_reviewer_agent", lambda *a, **k: reviewer)
+    monkeypatch.setattr(pr, "mechanical_checks", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pr, "run_test_suite", lambda *a, **k: CheckResult(name="pytest", ok=True)
+    )
+    monkeypatch.setattr(pr, "review_diffs", lambda *a, **k: ("", ""))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        outcome = await app._verify_resolution(
+            live, isolated, _report(task.id), _verify_deps(app, live, isolated)
+        )
+        assert reviewer.calls == 1  # a blind retry would make this 2+
+        assert outcome.review_verdict == "unsure"
+        assert outcome.verdict == "needs-human"
+        assert "context overflow" in outcome.review_report
+        assert any("retrying cannot help" in t for t in event_texts(live))

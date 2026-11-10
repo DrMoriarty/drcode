@@ -20,6 +20,7 @@ import json
 import re
 import shlex
 import subprocess
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,11 @@ from .models import (
 )
 from .service_events import log_service_event
 from .task_env import WORKTREES_SUBDIR, branch_for
+from .task_overlap import (
+    build_overlap_event_text,
+    build_overlap_warning,
+    find_file_overlaps,
+)
 from .transcript import ctx_context_tokens, estimate_tokens, serialize_messages
 
 if TYPE_CHECKING:
@@ -237,6 +243,7 @@ def _create_report_task(
                 ),
             )
         )
+        warning = _file_overlap_warning(deps, task, description)
         task.touch()
         deps.manager.storage.save(task)
         return (
@@ -244,14 +251,51 @@ def _create_report_task(
             (
                 f"{label} #{task.id} '{task.title}' created as a draft — the "
                 "user must finish it before it enters the queue."
-            ),
+            )
+            + warning,
         )
+    warning = _file_overlap_warning(deps, task, description)
     placement = (
         "at the head of the queue"
         if kind is TaskKind.BUG
         else "at the tail of the queue"
     )
-    return task, f"{label} #{task.id} '{task.title}' created {placement}."
+    return task, f"{label} #{task.id} '{task.title}' created {placement}." + warning
+
+
+def _file_overlap_warning(
+    deps: AgentDeps | TesterDeps, task: Task, description: str
+) -> str:
+    """The file-overlap warning of a freshly created report task.
+
+    Appends a system TaskEvent to the new task (per-task breakdown for
+    the human) and returns the one-line warning for the tool result —
+    the creating agent reads THAT text right now, while `depends_on` is
+    still a parameter it can pass on the next call. Never raises and
+    never blocks: a scan failure must not fail a task creation."""
+    try:
+        overlaps = find_file_overlaps(
+            deps.manager.tasks,
+            f"{task.title}\n{description}",
+            exclude_id=task.id,
+            depends_on=task.depends_on,
+        )
+    except Exception as e:  # noqa: BLE001 - a warning must never break creation
+        print(
+            f"drcode: file-overlap scan failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return ""
+    if not overlaps:
+        return ""
+    task.events.append(
+        TaskEvent(kind="system", text=build_overlap_event_text(overlaps))
+    )
+    # Persist immediately, like log_service_event does: the event must
+    # survive a forced TUI death before the pipeline's next save.
+    task.touch()
+    deps.manager.storage.save(task)
+    return "\n" + build_overlap_warning(overlaps)
 
 
 # Minimum meaningful bug-report description (chars): anything shorter cannot

@@ -14,9 +14,14 @@ import sys
 from pathlib import Path
 
 from .github import GitHubClient, GitHubError, GitHubSyncStateStore, sync_issues
-from .models import TaskKind
+from .models import TaskEvent, TaskKind
 from .settings import ProjectSettingsStore
 from .task_manager import TaskManager
+from .task_overlap import (
+    build_overlap_event_text,
+    build_overlap_warning,
+    find_file_overlaps,
+)
 
 
 def run_github_sync(project_root: Path) -> int:
@@ -62,7 +67,9 @@ def create_task_from_cli(project_root: Path, kind: TaskKind, description: str) -
     Stores the description as the task's first queued message (the title
     is derived from its first line, like in the app) and prints the id of
     the created task. The pipeline itself is left to the next interactive
-    start — no agent run is started here.
+    start — no agent run is started here. When the description overlaps
+    by files with unfinished tasks, the overlap is printed as a warning
+    (never a block) and recorded as a system event on the new task.
     """
     text = description.strip()
     if not text:
@@ -75,5 +82,14 @@ def create_task_from_cli(project_root: Path, kind: TaskKind, description: str) -
 
     manager = TaskManager(project_root)
     task = manager.create("", text, kind=kind)
+    overlaps = find_file_overlaps(
+        manager.tasks, text, exclude_id=task.id, depends_on=task.depends_on
+    )
+    if overlaps:
+        task.events.append(
+            TaskEvent(kind="system", text=build_overlap_event_text(overlaps))
+        )
+        manager.storage.save(task)
+        print(build_overlap_warning(overlaps))
     print(f"Task {task.id} ({kind.value}) created successfully.")
     return 0

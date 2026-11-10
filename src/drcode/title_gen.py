@@ -10,7 +10,10 @@ tool-less mini-agent that reads the description and returns one line.
 Generation is exactly-once per task lifetime: the ``Task.title_generated``
 stamp is set only on SUCCESS, so a failed attempt keeps the historical
 first-line title and the NEXT activation may retry (one bounded attempt
-per activation — never a loop within a run). Tasks that never reach the
+per activation — never a loop within a run). EXPLICIT author titles
+(``Task.title_explicit`` — the agents' report tools, the GitHub import,
+a goal's title) are never touched: only titles derived from the first
+line of the description are rewritten. Tasks that never reach the
 agent (hold / draft / queued) keep their derived titles: the generator
 runs only in the agent-run worker (see drcode.core.pipeline_agent_run).
 """

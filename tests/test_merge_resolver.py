@@ -724,6 +724,100 @@ def test_review_diffs_show_both_sides(repo: Path) -> None:
     assert "truncated" in ours_capped
 
 
+# -- window-aware review chunking -----------------------------------------------------
+
+
+def test_review_char_budget_scales_with_window() -> None:
+    # A known window: the budget leaves room for the non-diff overhead
+    # (system prompt, resolver report, verdict output) plus a safety
+    # margin, and grows with the window.
+    small = mr.review_char_budget(32_000)
+    large = mr.review_char_budget(128_000)
+    assert 0 < small < large
+    # The estimated prompt (diff chars / 4 + overhead) stays inside the window.
+    assert small // 4 + mr._REVIEW_OVERHEAD_TOKENS <= 32_000
+    assert large // 4 + mr._REVIEW_OVERHEAD_TOKENS <= 128_000
+    # An unknown/zero window falls back to the legacy per-side cap.
+    assert mr.review_char_budget(0) == mr.REVIEW_DIFF_CHAR_CAP * 2
+    assert mr.review_char_budget(-5) == mr.REVIEW_DIFF_CHAR_CAP * 2
+
+
+def test_plan_review_chunks_groups_and_isolates_oversized() -> None:
+    # Greedy packing keeps the given order; a path whose diffs alone
+    # overflow the budget gets a chunk of its own.
+    sizes = {"a": 10, "b": 10, "big": 100, "c": 5}
+    assert mr.plan_review_chunks(sizes, budget=25) == [["a", "b"], ["big"], ["c"]]
+    # A non-positive budget degenerates to the legacy fallback, not to
+    # empty chunks.
+    assert mr.plan_review_chunks({"a": 10}, budget=0) == [["a"]]
+
+
+def _multi_conflicted_repo(
+    repo: Path, task_id: str, names: list[str]
+) -> tuple[Path, me.MergeReport]:
+    """A conflict parked in several files at once — the review-chunking
+    scenario (a 28-file C++ conflict cannot fit one reviewer prompt)."""
+    wt = _task_worktree(repo, task_id)
+    for name in names:
+        (wt / name).write_text("task side of " + name + "\nshared\n")
+    _run(wt, "add", "-A")
+    _run(wt, "commit", "-qm", "task edits")
+    for name in names:
+        (repo / name).write_text("main side of " + name + "\nshared\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-qm", "main edits")
+    report = mr.prepare(repo, task_id, wt, "main")
+    assert report.ok and report.conflicted
+    return wt, report
+
+
+def test_review_diff_chunks_fit_budget(repo: Path) -> None:
+    wt, report = _multi_conflicted_repo(repo, "t1", ["a.py", "b.py", "c.py"])
+    # "Resolve" by hand: union of both sides — every diff is non-empty.
+    for name in ("a.py", "b.py", "c.py"):
+        (wt / name).write_text("task side\nmain side\nshared\n")
+    paths = [f.path for f in report.files]
+    # A generous budget: everything in ONE chunk, nothing truncated.
+    chunks = mr.review_diff_chunks(wt, paths, budget=100_000)
+    assert len(chunks) == 1
+    assert set(chunks[0].paths) == set(paths)
+    assert "truncated" not in chunks[0].ours
+    assert "truncated" not in chunks[0].theirs
+    # A tiny budget: one chunk per file, and an oversized single file's
+    # sides are truncated with the explicit partial marker.
+    chunks = mr.review_diff_chunks(wt, paths, budget=10)
+    assert sorted(c.paths for c in chunks) == [["a.py"], ["b.py"], ["c.py"]]
+    for chunk in chunks:
+        assert "truncated" in chunk.ours
+        assert "truncated" in chunk.theirs
+
+
+def test_aggregate_review_verdicts_folds_chunks() -> None:
+    # Any 'lost' dominates; the report carries every chunk that found a loss.
+    label, report = mr.aggregate_review_verdicts(
+        [
+            ("intact", ""),
+            ("lost", "a.py: wiring dropped"),
+            ("lost", "c.py: helper gone"),
+        ]
+    )
+    assert label == "lost"
+    assert "wiring dropped" in report and "helper gone" in report
+    # Without a loss, any 'unsure' blocks the auto-commit.
+    label, report = mr.aggregate_review_verdicts(
+        [("intact", ""), ("unsure", "diff too partial to judge")]
+    )
+    assert label == "unsure" and "too partial" in report
+    # All intact → intact, with the chunk's report preserved.
+    label, report = mr.aggregate_review_verdicts([("intact", "clean")])
+    assert label == "intact" and report == "clean"
+    # No verdicts at all can never read as a pass.
+    assert mr.aggregate_review_verdicts([]) == (
+        "unsure",
+        "the review produced no chunk verdicts",
+    )
+
+
 def test_restore_conflict_returns_pristine_state(repo: Path) -> None:
     wt, _report = _conflicted_repo(repo, "t1")
     # Simulate an agent's failed attempt: the file was edited (markers gone).

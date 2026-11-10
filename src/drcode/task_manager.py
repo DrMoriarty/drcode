@@ -577,8 +577,14 @@ class TaskManager:
         first_line = (
             first_message.splitlines()[0][:60] if first_message.splitlines() else ""
         )
+        # A non-empty title argument is an EXPLICIT author title (the
+        # agents' report tools, the GitHub import, a goal's title): it is
+        # never overwritten by the title generator. The first-line fallback
+        # is derived — still eligible for generation.
+        title_explicit = bool(title.strip())
         task = Task(
             title=title or first_line or "New task",
+            title_explicit=title_explicit,
             kind=kind,
             queue_seq=self._next_queue_seq(),
         )
@@ -653,7 +659,11 @@ class TaskManager:
         task.pending_input.clear()
         task.pending_input.append(PendingInput(text=stripped))
         task.clarification = None
+        # edit_task always re-derives the title from the first line (it has
+        # no separate title input): the title becomes derived again, so the
+        # generator may name the rewritten condition.
         task.title = stripped.splitlines()[0][:60]
+        task.title_explicit = False
         # Reuses the queue repositioning rules of set_kind (which does
         # not check the status: held tasks are not started either).
         if kind is not None and task.kind is not kind:

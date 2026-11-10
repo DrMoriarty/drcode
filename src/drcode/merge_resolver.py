@@ -18,10 +18,15 @@ round that must be deterministic —
 - `mechanical_checks` / `run_test_suite` — level 1 and 2 of the
   verification funnel (the conflict-marker scan + compile/ruff/pyright;
   the project's test suite);
-- `review_diffs` — the level-3 payloads: diff(resolved, ours) and
-  diff(resolved, theirs), the inputs of the intent-preservation review
-  (the direct protection against the #6c065401 incident class — a lost
-  piece of someone else's feature inside a "clean" resolution);
+- `review_diffs` / `review_diff_chunks` — the level-3 payloads:
+  diff(resolved, ours) and diff(resolved, theirs), the inputs of the
+  intent-preservation review (the direct protection against the #6c065401
+  incident class — a lost piece of someone else's feature inside a
+  "clean" resolution). The chunked variant sizes its chunks from the
+  reviewer model's context window (`review_char_budget`) so a
+  many-file conflict is reviewed in several self-contained passes and
+  the verdicts fold (`aggregate_review_verdicts`); the single-payload
+  form is the unknown-window fallback;
 - `restore_conflict` — roll a FAILED attempt back to the pristine
   conflicted state (abort + re-run the reversed merge), so a human always
   takes over exactly the conflict the engine deployed — never a
@@ -59,6 +64,8 @@ __all__ = [
     "REVIEW_DIFF_CHAR_CAP",
     "TEST_TIMEOUT",
     "CheckResult",
+    "ReviewChunk",
+    "aggregate_review_verdicts",
     "build_agent_context",
     "compile_check",
     "conclude",
@@ -69,9 +76,12 @@ __all__ = [
     "format_verify_report",
     "mechanical_checks",
     "out_of_scope_changes",
+    "plan_review_chunks",
     "prepare",
     "pyright_check",
     "restore_conflict",
+    "review_char_budget",
+    "review_diff_chunks",
     "review_diffs",
     "ruff_check",
     "run_test_suite",
@@ -90,10 +100,17 @@ _TIMEOUT = 120
 # while, but it must never hang the pipeline forever (the stall watchdog
 # does not cover this worker).
 TEST_TIMEOUT = 1800
-# Cap for each side's review diff (chars): a giant generated diff would
-# blow the reviewer's context; the cap is generous enough for any real
-# conflict and the truncation is announced in the payload.
+# Cap for each side's review diff (chars): the LEGACY fallback used only
+# when the reviewer model's context window is unknown — the window-aware
+# budget comes from `review_char_budget` below.
 REVIEW_DIFF_CHAR_CAP = 120_000
+# Reserve (tokens) of the reviewer's window for everything that is NOT the
+# review diffs: the system prompt, the resolver's report, the chunk framing
+# and the verdict/report output.
+_REVIEW_OVERHEAD_TOKENS = 8_000
+# The `len/4` chars-per-token heuristic of `context_layout` errs in both
+# directions; keep headroom so a chunk never rides the window's edge.
+_REVIEW_SAFETY_MARGIN = 0.8
 
 
 # -- data model ----------------------------------------------------------------
@@ -888,17 +905,122 @@ def save_prepare_timings(
     return _save_timings(prepare_timings_path(project_root, task_id), timings)
 
 
+@dataclass
+class ReviewChunk:
+    """One window-sized slice of the intent-preservation review: the diff
+    payloads of a SUBSET of the conflicted paths, both sides. A multi-chunk
+    review runs the reviewer once per chunk and folds the verdicts
+    (`aggregate_review_verdicts`)."""
+
+    paths: list[str]
+    ours: str
+    theirs: str
+
+
 def review_diffs(
     worktree: Path, paths: list[str], cap: int = REVIEW_DIFF_CHAR_CAP
 ) -> tuple[str, str]:
-    """The level-3 payloads: (diff(resolved, ours), diff(resolved,
-    theirs)) limited to the conflicted paths. "ours" is HEAD (the task
-    branch), "theirs" MERGE_HEAD (the base branch) of the in-progress
-    merge. Each side is capped at `cap` chars with an explicit truncation
-    marker — the reviewer must know when it sees a partial picture."""
+    """The legacy single-payload form of the level-3 diffs:
+    (diff(resolved, ours), diff(resolved, theirs)) limited to the
+    conflicted paths. "ours" is HEAD (the task branch), "theirs"
+    MERGE_HEAD (the base branch) of the in-progress merge. Each side is
+    capped at `cap` chars with an explicit truncation marker — the
+    reviewer must know when it sees a partial picture. The pipeline uses
+    the window-aware `review_diff_chunks` instead; this shape remains the
+    unknown-window fallback and a stable API for diagnostics."""
     ours = _git("diff", "HEAD", "--", *paths, cwd=worktree)[1]
     theirs = _git("diff", "MERGE_HEAD", "--", *paths, cwd=worktree)[1]
     return (_cap(ours, cap), _cap(theirs, cap))
+
+
+def review_char_budget(max_context_tokens: int) -> int:
+    """Combined character budget (BOTH diff sides together) for one review
+    chunk, derived from the reviewer model's context window: the window
+    minus the non-diff overhead (system prompt, resolver report, verdict
+    output), times the `len/4` chars-per-token heuristic of
+    `context_layout` and a safety margin. An unknown/zero window falls
+    back to the legacy per-side `REVIEW_DIFF_CHAR_CAP`."""
+    window = max(0, max_context_tokens)
+    if window <= 0:
+        return REVIEW_DIFF_CHAR_CAP * 2
+    usable_tokens = int((window - _REVIEW_OVERHEAD_TOKENS) * _REVIEW_SAFETY_MARGIN)
+    if usable_tokens <= 0:
+        return REVIEW_DIFF_CHAR_CAP * 2
+    return usable_tokens * 4
+
+
+def plan_review_chunks(path_sizes: dict[str, int], budget: int) -> list[list[str]]:
+    """Greedy packing of the conflicted paths into review chunks. Paths
+    keep the given (triage report's) order and are grouped while the
+    chunk's combined diff size fits `budget`; a path whose diffs alone
+    overflow it gets a chunk of its own (its diffs are truncated at
+    payload build time, see `review_diff_chunks`)."""
+    if budget <= 0:
+        budget = REVIEW_DIFF_CHAR_CAP * 2
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_size = 0
+    for path, size in path_sizes.items():  # dict insertion order = given order
+        if current and current_size + size > budget:
+            groups.append(current)
+            current, current_size = [], 0
+        current.append(path)
+        current_size += size
+    if current:
+        groups.append(current)
+    return groups
+
+
+def review_diff_chunks(
+    worktree: Path, paths: list[str], budget: int
+) -> list[ReviewChunk]:
+    """The level-3 payloads, window-aware: the conflicted paths are
+    grouped into chunks whose combined diffs (both sides) fit `budget`
+    characters — one chunk is one self-contained reviewer prompt. A
+    single path whose diffs alone overflow the budget forms its own chunk
+    with each side truncated at half the budget (explicit marker — the
+    reviewer must know it sees a partial picture)."""
+    if budget <= 0:
+        budget = REVIEW_DIFF_CHAR_CAP * 2
+    diffs: dict[str, tuple[str, str]] = {}
+    sizes: dict[str, int] = {}
+    for path in paths:
+        ours = _git("diff", "HEAD", "--", path, cwd=worktree)[1]
+        theirs = _git("diff", "MERGE_HEAD", "--", path, cwd=worktree)[1]
+        diffs[path] = (ours, theirs)
+        sizes[path] = len(ours) + len(theirs)
+    chunks = []
+    for group in plan_review_chunks(sizes, budget):
+        ours = "".join(diffs[p][0] for p in group)
+        theirs = "".join(diffs[p][1] for p in group)
+        if len(ours) + len(theirs) > budget:
+            half = budget // 2
+            ours = _cap(ours, half)
+            theirs = _cap(theirs, half)
+        chunks.append(ReviewChunk(paths=group, ours=ours, theirs=theirs))
+    return chunks
+
+
+def aggregate_review_verdicts(
+    results: list[tuple[str, str]],
+) -> tuple[str, str]:
+    """Fold the per-chunk review (label, report) pairs into one verdict:
+    any 'lost' chunk fails the review (the report carries every chunk
+    that found a loss), otherwise any 'unsure' blocks the auto-commit,
+    otherwise the resolution is 'intact'. Reports are joined with blank
+    lines; an empty result list can never read as a pass."""
+    lost = [report for label, report in results if label == "lost"]
+    unsure = [report for label, report in results if label == "unsure"]
+    if lost:
+        chosen = lost
+    elif unsure:
+        chosen = unsure
+    else:
+        chosen = [report for _, report in results]
+    report = "\n\n".join(r.strip() for r in chosen if r.strip())
+    if not results:
+        return "unsure", "the review produced no chunk verdicts"
+    return ("lost" if lost else "unsure" if unsure else "intact"), report
 
 
 def _cap(text: str, cap: int) -> str:

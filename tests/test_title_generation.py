@@ -7,6 +7,9 @@ Covered behaviour:
 - flag on — the title request runs BEFORE the main run (its model call is
   first), the generated name replaces the derived one, the stamp persists,
   and a re-activation does NOT re-generate;
+- an explicit author title (a non-empty title at creation — the agents'
+  report tools, the GitHub import, a goal's title) is NEVER regenerated;
+  edit_task re-derives the title and makes it generable again;
 - tasks the agent never sees (HOLD, DRAFT) keep the derived title;
 - a failed generation is non-fatal: the old title stays, the run
   completes, a service event tells the user (and the stamp stays off, so
@@ -85,7 +88,7 @@ async def test_flag_off_keeps_derived_title(
     configured_env: None,
     scripted: ScriptedState,
 ) -> None:
-    task = TaskManager(project_root).create("first line", DESCRIPTION)
+    task = TaskManager(project_root).create("", DESCRIPTION)
     scripted.steps = [*DEV_AND_TESTER_STEPS]
     app = DrCodeApp(project_root)
     async with app.run_test() as pilot:
@@ -96,7 +99,7 @@ async def test_flag_off_keeps_derived_title(
             what="task completed",
         )
         await settle(pilot)
-        assert live.title == "first line"
+        assert live.title == DESCRIPTION
         assert not live.title_generated
         assert title_calls(scripted) == []
 
@@ -107,7 +110,9 @@ async def test_flag_on_generates_title_before_run(
     scripted: ScriptedState,
 ) -> None:
     enable_titles(project_root)
-    task = TaskManager(project_root).create("первая строка", DESCRIPTION)
+    # An empty title argument: the title is the derived first line —
+    # exactly what the TUI "New task" form and the CLI produce.
+    task = TaskManager(project_root).create("", DESCRIPTION)
     scripted.steps = [
         text_response(GENERATED_TITLE),
         *DEV_AND_TESTER_STEPS,
@@ -143,7 +148,7 @@ async def test_regeneration_never_repeats(
     """A re-activation (new input on a completed task) does not re-generate:
     the stamp is set on the first success and generation is exactly-once."""
     enable_titles(project_root)
-    task = TaskManager(project_root).create("первая строка", DESCRIPTION)
+    task = TaskManager(project_root).create("", DESCRIPTION)
     # Both activations' steps up front: the trailing async tail of the
     # first tester round must never steal the second activation's steps.
     scripted.steps = [
@@ -173,6 +178,69 @@ async def test_regeneration_never_repeats(
         await settle(pilot)
         assert len(title_calls(scripted)) == 1
         assert live.title == GENERATED_TITLE
+
+
+async def test_explicit_title_is_never_regenerated(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+) -> None:
+    """An explicit author title (non-empty title argument at creation —
+    the path of the agents' report tools / GitHub import / goal titles)
+    is never overwritten by the generator: no title call, the first model
+    request is the main run's own."""
+    enable_titles(project_root)
+    task = TaskManager(project_root).create("Авторский заголовок", DESCRIPTION)
+    assert task.title_explicit
+    # No title step scripted: the dev run is the FIRST model call.
+    scripted.steps = [*DEV_AND_TESTER_STEPS]
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        live = app.manager.get(task.id)
+        await wait_until(
+            lambda: live.status is TaskStatus.COMPLETED,
+            pilot,
+            what="task completed",
+        )
+        await settle(pilot)
+        assert live.title == "Авторский заголовок"
+        assert not live.title_generated
+        assert title_calls(scripted) == []
+        assert scripted.calls[0] == DESCRIPTION
+
+
+async def test_edit_task_rederived_title_is_generated(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+) -> None:
+    """edit_task re-derives the title from the first line: an explicitly
+    titled task becomes generable again after a rewrite."""
+    enable_titles(project_root)
+    manager = TaskManager(project_root)
+    task = manager.create("Авторский заголовок", DESCRIPTION, hold=True)
+    assert task.title_explicit
+    manager.edit_task(task.id, "переписанное условие задачи")
+    edited = manager.get(task.id)
+    assert edited.title == "переписанное условие задачи"
+    assert not edited.title_explicit
+    scripted.steps = [
+        text_response(GENERATED_TITLE),
+        *DEV_AND_TESTER_STEPS,
+    ]
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        live = app.manager.get(task.id)
+        app.manager.set_hold(task.id, on=False)
+        app._advance()
+        await wait_until(
+            lambda: live.status is TaskStatus.COMPLETED and live.title_generated,
+            pilot,
+            what="title generated and task completed",
+        )
+        await settle(pilot)
+        assert live.title == GENERATED_TITLE
+        assert len(title_calls(scripted)) == 1
 
 
 async def test_hold_and_draft_keep_derived_title(
@@ -205,7 +273,7 @@ async def test_failed_generation_does_not_break_the_run(
     scripted: ScriptedState,
 ) -> None:
     enable_titles(project_root)
-    task = TaskManager(project_root).create("первая строка", DESCRIPTION)
+    task = TaskManager(project_root).create("", DESCRIPTION)
     # The title request fails (network/model error); the main run follows
     # and must complete regardless.
     scripted.steps = [
@@ -221,6 +289,6 @@ async def test_failed_generation_does_not_break_the_run(
             what="task completed despite title failure",
         )
         await settle(pilot)
-        assert live.title == "первая строка"
+        assert live.title == DESCRIPTION
         assert not live.title_generated
         assert any("Title generation failed" in e.text for e in live.events)

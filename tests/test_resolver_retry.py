@@ -14,6 +14,7 @@ round must actually resume after the backoff.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ from typing import Any
 import pytest
 from pydantic_ai import Agent
 
+from drcode import agent_model
+from drcode import merge_engine as me
+from drcode.agent import build_resolver_agent, build_resolver_reviewer_agent
 from drcode.models import TaskKind
 from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment
@@ -30,6 +34,8 @@ from tests.network_mocks import (
     ScriptedState,
     api_error,
     event_texts,
+    text_response,
+    tool_response,
     wait_until,
 )
 
@@ -159,3 +165,241 @@ async def test_retry_survives_stale_needs_human(
             what="second retry announcement",
         )
         assert app._resolver_net_count.get(task.id) == 2
+
+
+# -- the targeted-repair fork (a 'lost' intent-review verdict) -----------------------
+# The old behavior on ANY failed funnel level: restore the pristine conflict —
+# a 35-file resolution thrown away over a one-line fix the reviewer itself
+# described. The repair fork feeds the review report back into the SAME
+# resolver transcript and re-runs the FULL funnel; the budget is 2 per
+# conflict, and everything that is not a concrete 'lost' finding still rolls
+# back.
+
+_LOST_REPORT = (
+    "shared.txt: the base side's greeting line was lost — the merged "
+    "content must keep the greeting the task branch removed."
+)
+
+
+def _resolve_steps(report: str = "wove both sides") -> list[Any]:
+    return [
+        tool_response("write_file", {"path": "shared.txt", "content": "merged\n"}),
+        tool_response("set_resolution", {"resolved": True, "report": report}),
+        text_response("done"),
+    ]
+
+
+def _repair_steps() -> list[Any]:
+    # The repair continuation: a point fix in the SAME transcript.
+    return [
+        tool_response(
+            "set_resolution", {"resolved": True, "report": "restored the greeting"}
+        ),
+        text_response("repaired"),
+    ]
+
+
+def _review_steps(verdict: str, report: str) -> list[Any]:
+    return [
+        tool_response("set_review", {"verdict": verdict, "report": report}),
+        text_response("reviewed"),
+    ]
+
+
+def _repair_app(
+    isolated: Path,
+    task: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    state: ScriptedState,
+) -> DrCodeApp:
+    """The scripted-model app for the repair tests: the real resolver and
+    reviewer builders (both draw their model through agent_model.build_model),
+    the background actors quiesced, the repair delay shrunk."""
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    import drcode.core.pipeline_resolver as pr
+
+    monkeypatch.setattr(pr, "build_resolver_agent", build_resolver_agent)
+    monkeypatch.setattr(
+        pr, "build_resolver_reviewer_agent", build_resolver_reviewer_agent
+    )
+    monkeypatch.setattr(pr, "_REPAIR_RETRY_DELAY_S", 0.2)
+
+    app = DrCodeApp(isolated)
+
+    async def _noop() -> None:
+        return None
+
+    app._unmerged_work_startup_scan = _noop  # type: ignore[method-assign]
+    app._poll_git_indicator = _noop  # type: ignore[method-assign]
+    app._poll_pending_installs = _noop  # type: ignore[method-assign]
+    app.run_agent = lambda task_id: None  # type: ignore[method-assign]
+    return app
+
+
+async def test_repair_round_fixes_lost_work_and_commits(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 'lost' review verdict with a concrete finding schedules a repair
+    round INSTEAD of the rollback: the resolution stays in the worktree,
+    the review report continues the SAME transcript, the full funnel
+    re-runs, and an 'intact' re-review commits the merged result."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = (
+        _resolve_steps()
+        + _review_steps("lost", _LOST_REPORT)
+        + _repair_steps()
+        + _review_steps("intact", "both sides present")
+    )
+    app = _repair_app(isolated, task, monkeypatch, state)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("FAILED the intent review" in t for t in event_texts(live)),
+            pilot,
+            what="the repair-fork announcement",
+        )
+        assert "nothing is rolled back" in "\n".join(event_texts(live))
+        assert not live.needs_human
+        # The repair invocation continues the round — the conflict is NOT
+        # redeployed over the resolution.
+        await wait_until(
+            lambda: any("targeted repair" in t for t in event_texts(live)),
+            pilot,
+            what="the repair continuation event",
+        )
+        await wait_until(
+            lambda: any("verified and committed" in t for t in event_texts(live)),
+            pilot,
+            what="the committed resolution",
+        )
+        assert not live.needs_human
+        # ONE round entry: the repair turn rides in task.resolver_messages[-1].
+        assert len(live.resolver_messages) == 1
+        blob = json.dumps(live.resolver_messages[-1])
+        assert "intent review report" in blob
+        assert "greeting" in blob  # the reviewer's finding reached the agent
+        assert app._resolver_repair_count.get(task.id) == 1
+        assert not app._resolver_repair_round
+        # The merge is concluded in the worktree — a fast-forward for the hook.
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert not me.in_progress(wt)
+        assert (wt / "shared.txt").read_text() == "merged\n"
+
+
+async def test_repair_budget_exhaustion_rolls_back(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the repair budget (2) is spent on a persistently 'lost'
+    verdict, the behavior is the old one: the conflict is restored and a
+    human takes over."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = (
+        _resolve_steps()
+        + _review_steps("lost", _LOST_REPORT)
+        + _repair_steps()  # repair 1
+        + _review_steps("lost", _LOST_REPORT)
+        + _repair_steps()  # repair 2
+        + _review_steps("lost", _LOST_REPORT)
+    )
+    app = _repair_app(isolated, task, monkeypatch, state)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("human must take over" in t for t in event_texts(live)),
+            pilot,
+            what="the final human hand-off",
+        )
+        assert live.needs_human
+        assert app._resolver_repair_count.get(task.id) == 2
+        assert not app._resolver_repair_round
+        texts = "\n".join(event_texts(live))
+        assert "Repair round 1 of 2" in texts
+        assert "Repair round 2 of 2" in texts
+        # The pristine conflict is back.
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert "<<<<<<<" in (wt / "shared.txt").read_text()
+
+
+async def test_unsure_verdict_never_repairs(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'unsure' is not a concrete finding — no repair round, the old
+    rollback runs immediately."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = _resolve_steps() + _review_steps(
+        "unsure", "something might be missing but I cannot name it"
+    )
+    app = _repair_app(isolated, task, monkeypatch, state)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("human must take over" in t for t in event_texts(live)),
+            pilot,
+            what="the human hand-off",
+        )
+        assert live.needs_human
+        texts = "\n".join(event_texts(live))
+        assert "targeted repair" not in texts
+        assert app._resolver_repair_count.get(task.id) is None
+        assert not app._resolver_repair_round
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert "<<<<<<<" in (wt / "shared.txt").read_text()
+
+
+async def test_vague_lost_report_never_repairs(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 'lost' verdict whose report names nothing concrete (no file, no
+    path, too short to act on) keeps the rollback."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = _resolve_steps() + _review_steps(
+        "lost", "Work from one side of the merge appears to be missing."
+    )
+    app = _repair_app(isolated, task, monkeypatch, state)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("human must take over" in t for t in event_texts(live)),
+            pilot,
+            what="the human hand-off",
+        )
+        assert live.needs_human
+        assert "targeted repair" not in "\n".join(event_texts(live))
+        assert app._resolver_repair_count.get(task.id) is None

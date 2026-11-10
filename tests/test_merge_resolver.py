@@ -913,7 +913,52 @@ def test_task_new_fields_default() -> None:
     assert task.needs_human is False
 
 
-# -- scope guard (the c3b17718 incident) ---------------------------------------------
+# -- the targeted-repair fork (lost-intent-review repair) -----------------------------
+
+
+def test_review_report_actionable_gate() -> None:
+    """The repair fork needs a CONCRETE finding: a conflicted file (full
+    path or bare name), any path-like token, or a detailed enough report.
+    Vague/empty reports are rollback territory."""
+    from drcode.core.pipeline_resolver import _review_report_actionable
+
+    paths = ["src/mainwindow.cpp"]
+    concrete = (
+        "The onToolbarCreateScene wiring in src/mainwindow.cpp dropped the "
+        "returned newId — createEntity takes the entity by value."
+    )
+    assert _review_report_actionable(concrete, paths)
+    # Bare file name counts (the reviewer gets the conflicted list).
+    assert _review_report_actionable(
+        "mainwindow.cpp lost the base side's status-bar update.", paths
+    )
+    # A path-like token (dir/file) counts even for a foreign file.
+    assert _review_report_actionable(
+        "the handler in src/widgets/toolbar.cpp was dropped entirely", paths
+    )
+    # A long detailed report is actionable even without a path token.
+    assert _review_report_actionable("x" * 200, paths)
+    # Vague or empty: no repair, roll back as before.
+    assert not _review_report_actionable("", paths)
+    assert not _review_report_actionable("   \n  ", paths)
+    assert not _review_report_actionable("some work may be missing", paths)
+    assert not _review_report_actionable(
+        "The resolution may have dropped some work from one side.", paths
+    )
+
+
+def test_build_repair_prompt_carries_finding_and_budget() -> None:
+    from drcode.core.pipeline_resolver import (
+        _MAX_REPAIR_ROUNDS,
+        _build_repair_prompt,
+    )
+
+    assert _MAX_REPAIR_ROUNDS == 2
+    prompt = _build_repair_prompt("mainwindow.cpp lost the wiring", 1)
+    assert "repair round 1 of 2" in prompt
+    assert "NOTHING was rolled back" in prompt
+    assert "set_resolution" in prompt
+    assert "mainwindow.cpp lost the wiring" in prompt
 
 
 def test_out_of_scope_changes_tracks_and_ignores(repo: Path) -> None:

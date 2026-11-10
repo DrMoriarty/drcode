@@ -1037,7 +1037,20 @@ def merge_base_into_worktree(
     files = triage(wt)
     if progress is not None:
         progress("auto-resolve")
-    rerere_staged = rerere_replay(wt, files) if rerere else []
+    # A RESUMED merge (re-triaged in place) may already carry the resolver
+    # AGENT's uncommitted edits (a network-retry or a targeted-repair
+    # continuation). Blanket-staging every marker-free path here would
+    # pass the agent's UNVERIFIED work off as rerere's pre-approved
+    # content — and, with `remaining` empty, auto-conclude the merge
+    # without the verification funnel — and the `git rerere` invocation
+    # would RECORD the agent's resolution in rr-cache, polluting a later
+    # restore_conflict's faithful redeploy. On a FRESH merge every
+    # marker-free path IS rerere's own replay (the merge just ran); on a
+    # resumed one the two are indistinguishable per path — skip the
+    # replay machinery and let the funnel + stage_resolved stage every
+    # resolution at conclude. (`git rerere` is likewise not invoked: it
+    # records postimages for working-tree resolutions.)
+    rerere_staged = [] if resuming else (rerere_replay(wt, files) if rerere else [])
     identical = resolve_identical(wt, files)
     report.files = files
     report.rerere = {

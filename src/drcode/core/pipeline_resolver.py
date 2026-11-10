@@ -31,12 +31,21 @@ Only a full pass commits (`merge_engine.finish`) — the merge into the
 base branch then becomes a fast-forward. Any failure rolls the worktree
 back to the PRISTINE conflicted state, marks the task `needs_human` and
 logs the full report into the service events; nothing is ever committed.
+
+The one bounded exception: an intent review that finds a CONCRETE loss
+(verdict 'lost' with an actionable report) schedules up to
+`_MAX_REPAIR_ROUNDS` targeted repair rounds — the resolution stays in
+the worktree, the review report continues the SAME round transcript
+(the coding agent's reject-rework pattern), and the FULL funnel re-runs
+after the fix. A spent budget, 'unsure', a scope expansion or a vague
+report all keep the rollback.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -98,6 +107,61 @@ _MAX_RESOLVER_ATTEMPTS = 5
 _MAX_RESOLVER_NETWORK_ATTEMPTS = NETWORK_RETRIES * 3
 # Base of the capped exponential backoff between attempts (5, 10, 20 ... s).
 _RETRY_BASE_DELAY_S = 5.0
+# Targeted-repair rounds after a 'lost' intent-review verdict (per
+# CONFLICT, not per round): instead of rolling the whole resolution back,
+# the review report is fed back into the SAME resolver transcript and the
+# round continues with a point fix — then the FULL funnel re-runs. After
+# the budget is spent the behavior is the old one: restore + needs_human.
+_MAX_REPAIR_ROUNDS = 2
+# The tiny gap between scheduling a repair round and its invocation (the
+# scheduler re-enters run_resolver through the retry timer; the current
+# invocation's finally-block must run first).
+_REPAIR_RETRY_DELAY_S = 1.0
+# A review report shorter than this is never "actionable" (a concrete
+# finding needs somewhere to name the lost work).
+_MIN_ACTIONABLE_REPORT_CHARS = 40
+# A report this long is treated as actionable even without a recognizable
+# file mention — it almost certainly names the finding.
+_DETAILED_REPORT_CHARS = 160
+
+
+def _review_report_actionable(report: str, paths: list[str]) -> bool:
+    """Whether a 'lost' review report names its finding concretely enough
+    for a targeted repair: it must point at the lost work — a conflicted
+    file (full path or bare name — the reviewer receives that list in its
+    prompt), any path-like token (`dir/file`, `file.ext`), or be detailed
+    enough to act on. A vague "something may be missing" is not a
+    finding — that is 'unsure' territory and keeps the old rollback."""
+    text = (report or "").strip()
+    if len(text) < _MIN_ACTIONABLE_REPORT_CHARS:
+        return False
+    lowered = text.lower()
+    for p in paths:
+        name = p.rsplit("/", 1)[-1].lower()
+        if name and (p.lower() in lowered or name in lowered):
+            return True
+    if re.search(r"\S+/\S+", text):
+        return True
+    return len(text) >= _DETAILED_REPORT_CHARS
+
+
+def _build_repair_prompt(review_report: str, number: int) -> str:
+    """The repair continuation turn fed into the SAME resolver transcript
+    (mirrors the coding agent's reject-rework pattern): the resolution
+    stays in the worktree, the review's finding gets fixed in place."""
+    return (
+        f"The verification funnel's intent-preservation review REJECTED "
+        f"your resolution: it found work from one side of the merge that "
+        f"the resolution lost (verdict: lost; repair round {number} of "
+        f"{_MAX_REPAIR_ROUNDS}). The resolved tree is still in place in "
+        f"the worktree — NOTHING was rolled back. Apply the review's "
+        f"findings as a targeted repair: change only what the review "
+        f"names (plus what that change necessarily touches), leave the "
+        f"rest of the resolution exactly as it is, then report the "
+        f"repaired state again with set_resolution.\n\n"
+        f"=== intent review report (verdict: lost) ===\n"
+        f"{(review_report or '').strip()[:4000]}"
+    )
 
 
 class PipelineResolverLayer(CoreState):
@@ -178,9 +242,14 @@ class PipelineResolverLayer(CoreState):
         )
         task = self.manager.get(task_id)
         # A network-retry continues the current round in place instead of
-        # starting a new one (mirrors the tester's resume flag).
+        # starting a new one (mirrors the tester's resume flag). A
+        # repair round is the same continuation idea after a 'lost'
+        # intent-review verdict: the resolved tree stays, the review
+        # report is fed into the SAME transcript as a new user turn.
         resume_round = task_id in self._resolver_resume_round
         self._resolver_resume_round.discard(task_id)
+        repair_prompt = self._resolver_repair_round.pop(task_id, None)
+        continuation_round = resume_round or repair_prompt is not None
         run: AgentRun[ResolverDeps, str] | None = None
         cancelled = False
         # Statistics: when the report turns out genuinely conflicted, the
@@ -294,7 +363,20 @@ class PipelineResolverLayer(CoreState):
                     task, f"Conflict resolver: {report.summary()}", kind="workflow"
                 )
                 return
-            if resume_round:
+            if repair_prompt is not None:
+                # The targeted-repair continuation: the resolution is
+                # still in the worktree, the review report rides in the
+                # prompt — say so, instead of the fresh-start text.
+                self._show_event(
+                    task,
+                    f"Conflict resolver: continuing the round with a "
+                    f"targeted repair (repair "
+                    f"{self._resolver_repair_count.get(task_id, 0)} of "
+                    f"{_MAX_REPAIR_ROUNDS}) — the intent review found "
+                    f"lost work, the resolution stays in the worktree.",
+                    kind="workflow",
+                )
+            elif resume_round:
                 # A network-retry continues the interrupted round in place
                 # (resume via `resumable_history`) — say so, instead of the
                 # fresh-start text that made consecutive 429 retries look
@@ -316,14 +398,20 @@ class PipelineResolverLayer(CoreState):
             reached_agent = True
 
             # -- the agent round -----------------------------------------------------
-            if not resume_round:
+            if not continuation_round:
+                # A FRESH round on a (re)deployed conflict: a new
+                # prepare/triage means a new conflict — the repair budget
+                # resets (the counter counts repairs per conflict, not
+                # per round).
+                self._resolver_repair_count.pop(task_id, None)
                 task.resolver_messages.append([])
                 # The round's dirty-paths baseline (the scope guard,
                 # c3b17718): everything dirty NOW predates the agent —
                 # the merge's own staging plus pre-existing untracked
-                # files. Kept across scheduled retries, so a resume round
-                # still counts the interrupted attempt's own edits as its
-                # own; popped when the round concludes.
+                # files. Kept across scheduled retries and repair
+                # continuations, so a continuation round still counts the
+                # interrupted attempt's own edits as its own; popped when
+                # the round concludes.
                 baseline = await asyncio.to_thread(dirty_paths, root)
                 self._resolver_round_baseline[task_id] = baseline
                 # A fresh round starts with a clean threshold-livelock
@@ -355,20 +443,26 @@ class PipelineResolverLayer(CoreState):
                 report,
                 root,
             )
-            text: str | None = (
-                None
-                if resume_round
-                and task.resolver_messages
-                and task.resolver_messages[-1]
-                else prompt
-            )
+            # Which turn the agent gets: a fresh round re-sends the full
+            # assignment; a network-retry resume replays the stored
+            # transcript with no new text; a repair round appends the
+            # review report to the SAME transcript (task.resolver_messages
+            # [-1]) as a new user turn — the point-fix continues in place.
+            has_transcript = bool(task.resolver_messages and task.resolver_messages[-1])
+            repair_continuation = repair_prompt is not None and has_transcript
+            if repair_continuation:
+                text: str | None = repair_prompt
+            elif resume_round and has_transcript:
+                text = None
+            else:
+                text = prompt
             live_tokens: int | None = None
             view = NodeStreamView(
                 self, task_id, record_tps=False, follow=False, track_dirty=False
             )
             while True:
                 history: list[Any] | None = None
-                if text is None:
+                if text is None or repair_continuation:
                     history = resumable_history(task.resolver_messages[-1])
                 paused = False
                 async with agent.iter(
@@ -518,8 +612,11 @@ class PipelineResolverLayer(CoreState):
             else:
                 # -- the verification funnel -------------------------------------------
                 outcome = await self._verify_resolution(task, root, report, deps)
-            await self._apply_resolver_outcome(task, root, base, outcome, triage_paths)
-            concluded = True
+            repaired = await self._apply_resolver_outcome(
+                task, root, base, outcome, triage_paths
+            )
+            if not repaired:
+                concluded = True
         except asyncio.CancelledError:
             cancelled = True
             self._persist_resolver_messages(task, run)
@@ -751,14 +848,20 @@ class PipelineResolverLayer(CoreState):
         base: str,
         outcome: ResolverOutcome,
         paths: list[str],
-    ) -> None:
-        """Commit a fully verified resolution — or restore the pristine
-        conflict and mark the task needs_human. `paths` are the resolved
-        conflict paths (the triage report's files — the same set the
-        funnel verified): they are staged here (`git add`) because the
+    ) -> bool:
+        """Commit a fully verified resolution — schedule a targeted repair
+        round on an actionable 'lost' review verdict — or restore the
+        pristine conflict and mark the task needs_human. `paths` are the
+        resolved conflict paths (the triage report's files — the same set
+        the funnel verified): they are staged here (`git add`) because the
         resolver agent never touches the index, and `finish` refuses
         while unmerged entries remain (the bcd4a7ad incident: a fully
-        verified resolution lost to an unstaged index)."""
+        verified resolution lost to an unstaged index).
+
+        Returns True when a repair round was scheduled INSTEAD of the
+        rollback: the resolution stays in the worktree, the review report
+        continues the SAME resolver transcript, and the caller must treat
+        its invocation as UNconcluded (the logical round continues)."""
         branch = self.task_env.branch(task.id)
         if outcome.verdict == "resolved":
             staged, stage_msg = await asyncio.to_thread(stage_resolved, root, paths)
@@ -787,10 +890,39 @@ class PipelineResolverLayer(CoreState):
                     f"{outcome.summary()}",
                     kind="workflow",
                 )
-                return
+                return False
             outcome.review_report = (
                 f"the concluding commit failed: {msg}\n{outcome.review_report}"
             )
+        # The repair fork (before any rollback): a 'lost' review verdict
+        # that NAMES its finding gets a bounded number of targeted repair
+        # rounds — the ~20-minute resolution is not thrown away over a
+        # one-line fix the reviewer itself described (the review report
+        # continues the SAME resolver transcript; the FULL funnel re-runs
+        # afterwards). 'unsure', a scope expansion, a vague/empty report
+        # and a spent budget all keep the old rollback.
+        repair = self._plan_repair(task, outcome, paths)
+        if repair is not None:
+            # A stale needs_human from an earlier round must not make the
+            # finally-block wipe the repair schedule the moment it was
+            # set (the a6a6df25 class).
+            task.needs_human = False
+            task.touch()
+            self.manager.storage.save(task)
+            self._resolver_repair_round[task.id] = repair
+            self._resolver_retry_at[task.id] = time.monotonic() + _REPAIR_RETRY_DELAY_S
+            self._schedule_pipeline_timer(_REPAIR_RETRY_DELAY_S, self._retry_resolver)
+            self._show_event(
+                task,
+                f"Automatic conflict resolution FAILED the intent review — "
+                f"a lost change was named. Repair round "
+                f"{self._resolver_repair_count.get(task.id, 0)} of "
+                f"{_MAX_REPAIR_ROUNDS} continues the resolution in the "
+                f"worktree (nothing is rolled back); the full funnel "
+                f"re-runs afterwards.\n{outcome.summary()}",
+                kind="workflow",
+            )
+            return True
         # Anything short of a full pass: nothing committed, conflict
         # restored, human takes over.
         restored = await asyncio.to_thread(
@@ -824,6 +956,34 @@ class PipelineResolverLayer(CoreState):
             kind="workflow",
         )
         self._suggest_conflict_screen(task)
+        return False
+
+    def _plan_repair(
+        self, task: Task, outcome: ResolverOutcome, paths: list[str]
+    ) -> str | None:
+        """The repair-eligibility fork: the repair prompt when the round
+        qualifies for a targeted repair round, None for the rollback.
+        Qualification (ALL of it): the round did not conclude successfully
+        (a commit-machinery failure after an 'intact' verdict rolls back —
+        the tree is fine, the git state is not), no scope expansion, the
+        review verdict is exactly 'lost' ('unsure' is not a finding), the
+        report names something concrete, and the per-conflict repair
+        budget is not spent. Incrementing the counter is deliberate:
+        scheduling the round spends it."""
+        if outcome.verdict == "resolved" or outcome.committed:
+            return None
+        if outcome.scope_violations:
+            return None
+        if outcome.review_verdict != "lost":
+            return None
+        report_text = (outcome.review_report or "").strip()
+        if not _review_report_actionable(report_text, paths):
+            return None
+        used = self._resolver_repair_count.get(task.id, 0)
+        if used >= _MAX_REPAIR_ROUNDS:
+            return None
+        self._resolver_repair_count[task.id] = used + 1
+        return _build_repair_prompt(report_text, used + 1)
 
     async def _give_up_to_human(self, task: Task, root: Path | None, base: str) -> None:
         """The last-resort path (repeated failures): restore the pristine

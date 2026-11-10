@@ -694,6 +694,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._resolver_net_count: dict[str, int] = {}
         self._resolver_resume_round: set[str] = set()
         self._resolver_round_baseline: dict[str, set[str]] = {}
+        # Targeted-repair continuation of a lost-intent-review verdict
+        # (task id -> repair prompt) and the per-conflict repair counter
+        # (budget 2, reset on a fresh prepare/triage). See state.py /
+        # pipeline_resolver._apply_resolver_outcome.
+        self._resolver_repair_round: dict[str, str] = {}
+        self._resolver_repair_count: dict[str, int] = {}
         self._resolver_compaction_failed: set[str] = set()
         self._resolver_hard_limit_exhausted: set[str] = set()
         self._resolver_hard_limit_compactions: dict[str, int] = {}

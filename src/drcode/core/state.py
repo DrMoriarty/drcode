@@ -335,9 +335,11 @@ class CoreState:
         deps: ResolverDeps,
     ) -> Any: ...
 
+    # Returns True when a targeted repair round was scheduled instead of
+    # the rollback (the caller's invocation stays UNconcluded).
     async def _apply_resolver_outcome(
         self, task: Task, root: Path, base: str, outcome: Any, paths: list[str]
-    ) -> None: ...
+    ) -> bool: ...
 
     async def _give_up_to_human(self, task: Task, root: Path, base: str) -> None: ...
 
@@ -500,6 +502,18 @@ class CoreState:
     # files, never the resolver's work — kept across the round's
     # scheduled retries, popped when the round concludes.
     _resolver_round_baseline: dict[str, set[str]]
+    # The pending targeted-repair continuation of a resolver round (the
+    # lost-intent-review repair): task id -> the repair prompt (the review
+    # report + point-fix instructions). Set by _apply_resolver_outcome when
+    # a 'lost' verdict carries a concrete, actionable finding — the
+    # resolved worktree is NOT rolled back; the next invocation continues
+    # the SAME round transcript (task.resolver_messages[-1]) with this
+    # prompt. Popped when the repair invocation starts.
+    _resolver_repair_round: dict[str, str]
+    # Repair rounds already spent per conflict (budget: _MAX_REPAIR_ROUNDS):
+    # incremented per repair, reset when a FRESH round deploys/re-detects
+    # the conflict (a new prepare/triage) — a rollback starts a clean slate.
+    _resolver_repair_count: dict[str, int]
     # Compaction-failure bookkeeping of the resolver rounds — separate
     # from the agent/tester sets so a broken summarizer seen by one role
     # never disables another role's gate.

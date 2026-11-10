@@ -6,8 +6,8 @@ from datetime import datetime
 from typing import Any
 
 from rich.text import Text
+from textual import events
 from textual.containers import VerticalScroll
-from textual.geometry import Size
 from textual.timer import Timer
 from textual.widgets import Static
 
@@ -38,10 +38,6 @@ from ..core.blocks import (
     streamable_markdown as _streamable_markdown,
 )
 
-# Trailing rows below the viewport edge that still count as "tracking the
-# chat tail" (see ChatLog.watch_virtual_size and _chat_at_bottom).
-_SCROLL_FOLLOW_THRESHOLD = 4
-
 
 class ChatLog(VerticalScroll):
     """The chat-history scroll (#chat-log).
@@ -60,24 +56,31 @@ class ChatLog(VerticalScroll):
     cost low (recompose of ~40 lines per frame).
     """
 
-    # Live-follow mode of the chunked drain (a split fat live write mounting
-    # in chunks — see chat_timeline._write_chat): while True, every growth of
-    # the virtual size keeps the tail on screen — but only for a reader who
-    # was tracking it before the growth. Armed by the drain's seed tick, it
-    # stays armed past the drain end (the last chunk's layout may land after
-    # the drain chain finished) and disarms itself per growth for any reader
-    # who is no longer at the tail; a history rebuild turns it off.
-    auto_follow: bool = False
+    # Anchored by construction (Textual's Widget.anchor mechanism): the
+    # compositor pins the log to its bottom on every arrange while the
+    # anchor is held, so content growth — streamed deltas, chunked drains,
+    # plain mounts — keeps the tail on screen with no per-delta scrolling
+    # and no races against stale max_scroll_y. Any user scroll (keyboard,
+    # wheel, scrollbar) releases the anchor; scrolling back to the bottom
+    # restores it (watch_scroll_y → _check_anchor).
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.anchor(True)
 
-    def watch_virtual_size(self, old_size: Size, new_size: Size) -> None:
-        if self.auto_follow:
-            # Was the reader at the bottom BEFORE this growth? (The offset is
-            # still the pre-growth one at watcher time.) A same-tick
-            # scroll_end can't do this check: max_scroll_y is stale until the
-            # layout pass that this watcher fires in.
-            old_max = max(0, old_size.height - self.container_size.height)
-            if self.scroll_offset.y >= old_max - _SCROLL_FOLLOW_THRESHOLD:
-                self.scroll_end(animate=False)
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        super()._on_mouse_scroll_down(event)
+        # A wheel-down AT the bottom scrolls nowhere: _scroll_to has already
+        # released the anchor, but watch_scroll_y never fires (the position
+        # did not change) — re-run the restore check, or following would
+        # silently die on the very gesture the user makes to confirm it.
+        self._check_anchor()
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        super()._on_mouse_scroll_up(event)
+        # Symmetric no-op for the reader at the bottom (scroll-up from the
+        # bottom always moves, so this is only belt-and-braces) — and it
+        # keeps the pair's behaviour uniform.
+        self._check_anchor()
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)

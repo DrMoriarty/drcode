@@ -205,10 +205,6 @@ class CoreState:
 
     def _invalidate_chat_delta(self) -> None: ...
 
-    def _chat_at_bottom(self) -> bool: ...
-
-    def _stream_follow(self) -> None: ...
-
     def _tool_call_started(
         self,
         run_key: tuple[str, str, int],
@@ -667,7 +663,6 @@ class CoreState:
     # counters (consecutive under-threshold gate observations; see
     # _threshold_observation).
     _threshold_under_obs: dict[str, int]
-    _last_follow: float
     _chat_epoch: int
 
     # -- chat batch drain ---------------------------------------------------
@@ -678,11 +673,6 @@ class CoreState:
     # the monotonic stamp of the last emitted stall event (throttle).
     _chat_drain_rekicks: int
     _chat_drain_diag_at: float
-    # Scroll policy of the running drain: a history rebuild always lands on
-    # the latest entry (True); a drain seeded by a split fat live write
-    # follows the tail only while the reader is already at the bottom
-    # (False — checked per chunk, see _drain_chat_batch).
-    _chat_batch_follow: bool
     # Answers picked by CLICKING a package question's options (question
     # index → option text): rendered into the chat input as one line per
     # question and submitted together on Enter (see action_pick_option).

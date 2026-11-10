@@ -265,7 +265,6 @@ class PipelineAgentRunLayer(CoreState):
                             self,
                             task_id,
                             record_tps=True,
-                            follow=True,
                             track_dirty=True,
                         )
                         synced_epoch = self._chat_epoch

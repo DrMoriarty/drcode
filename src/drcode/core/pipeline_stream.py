@@ -7,15 +7,18 @@ in place, surviving mid-node `view_task()` re-renders (a wiped view is
 detected via the block's `stream_epoch` and the already-streamed text is
 carried over).
 
-The two loops differ only in three switches:
+The two loops differ only in two switches:
 
 - `record_tps` — the agent feeds the header's live tok/s estimate, the
   tester does not;
-- `follow` — the agent keeps the chat tail pinned while the user is at
-  the bottom (`_chat_at_bottom`/`_stream_follow`);
 - `track_dirty` — the agent notes "content was produced off-screen" in
   `view_dirty` (the end-of-turn re-render then goes through the delta
   path); the tester re-renders unconditionally at the round's end.
+
+Tail following is not the pipeline's business: the open chat log is
+anchored (Textual's `Widget.anchor`), so the compositor keeps the tail
+on screen while the streamed blocks grow and a user scroll simply
+releases the anchor.
 """
 
 from __future__ import annotations
@@ -67,13 +70,11 @@ class NodeStreamView:
         task_id: str,
         *,
         record_tps: bool,
-        follow: bool,
         track_dirty: bool,
     ) -> None:
         self._layer = layer
         self.task_id = task_id
         self._record_tps = record_tps
-        self._follow = follow
         self._track_dirty = track_dirty
         self.view_dirty = False
         self._reasoning: StreamBlock | None = None
@@ -171,13 +172,9 @@ class NodeStreamView:
             self._append(block, content)
 
     def _append(self, block: StreamBlock, content: str) -> None:
-        """Append to a mounted block, following the chat tail when the
-        open view is pinned to the bottom (agent runs only)."""
-        layer = self._layer
-        viewed = layer.viewed_id == self.task_id
-        if self._track_dirty and not viewed:
+        """Append to a mounted block. No scrolling: the anchored chat log
+        (see ChatLog) keeps the tail on screen for a reader at the bottom
+        and stays put for a reader scrolled up."""
+        if self._track_dirty and self._layer.viewed_id != self.task_id:
             self.view_dirty = True
-        follow = layer._chat_at_bottom() if viewed and self._follow else False
         block.append(content)
-        if follow:
-            layer._stream_follow()

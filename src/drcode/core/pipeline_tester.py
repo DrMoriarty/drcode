@@ -459,14 +459,13 @@ class PipelineTesterLayer(CoreState):
                 # must not be polluted with the tester's.
                 live_tokens: int | None = None
                 # The shared streaming renderer (see pipeline_stream): the
-                # tester variant records no tok/s, does not pin the chat
-                # tail and does not track off-screen dirtiness (the round
-                # re-renders from the transcript at its end).
+                # tester variant records no tok/s and does not track
+                # off-screen dirtiness (the round re-renders from the
+                # transcript at its end).
                 view = NodeStreamView(
                     self,
                     task_id,
                     record_tps=False,
-                    follow=False,
                     track_dirty=False,
                 )
                 while True:

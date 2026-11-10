@@ -44,7 +44,6 @@ from drcode.task_search import TaskHit
 from drcode.tui.app import DrCodeApp
 from drcode.tui.blocks import AssistantBlock, UserBlock
 from drcode.tui.chat_timeline import (
-    _SCROLL_FOLLOW_THRESHOLD,
     _full_escape,
     _split_agent_marker,
     _split_chat_text,
@@ -988,9 +987,10 @@ async def test_fat_live_write_follows_tail_only_at_bottom(app: DrCodeApp) -> Non
             if not app._chat_batching:
                 break
         assert not app._chat_batching
-        # The reader never scrolled: the tail is being followed.
-        await pilot.pause()  # let the deferred post-layout scroll_end land
-        assert log.scroll_offset.y >= log.max_scroll_y - _SCROLL_FOLLOW_THRESHOLD
+        # The reader never scrolled: the anchored log keeps tracking the
+        # tail across the chunked mounts.
+        await pilot.pause()
+        assert log.scroll_offset.y >= log.max_scroll_y
 
         # Now a second fat write with the reader scrolling up after its
         # first chunk: the remaining chunks must not yank the view down.

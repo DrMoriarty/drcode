@@ -885,9 +885,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # _threshold_observation). One dict for all three layers: a task
         # runs at most one of them at a time.
         self._threshold_under_obs: dict[str, int] = {}
-        # Monotonic stamp of the last coalesced follow-the-tail scroll while
-        # streaming (see _stream_follow).
-        self._last_follow = 0.0
         # Bumped by every view_task(): the streaming loop compares it with
         # each block's stream_epoch to detect that a mid-node re-render
         # orphaned the live blocks and they must be re-mounted.
@@ -903,11 +900,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # mid-drain bumps the epoch and the remaining stale chunks are
         # dropped instead of mounting into the new view's log.
         self._chat_batch_epoch = 0
-        # Scroll policy of the running drain: a history rebuild always lands
-        # on the latest entry (True); a drain seeded by a split fat live
-        # write follows the tail only while the reader is already at the
-        # bottom (False — checked per chunk, see _drain_chat_batch).
-        self._chat_batch_follow = True
         # monotonic() stamp of the last drain-chunk progress: the 1 s poll
         # watchdog (_poll_chat_drain) re-kicks a drain whose reschedule
         # chain died or starved (see chat_view._schedule_drain).

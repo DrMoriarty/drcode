@@ -536,9 +536,7 @@ class PipelineResolverLayer(CoreState):
             else:
                 text = prompt
             live_tokens: int | None = None
-            view = NodeStreamView(
-                self, task_id, record_tps=False, follow=False, track_dirty=False
-            )
+            view = NodeStreamView(self, task_id, record_tps=False, track_dirty=False)
             while True:
                 history: list[Any] | None = None
                 if text is None or repair_continuation:

@@ -33,7 +33,6 @@ from ..models import (
     TaskStatus,
 )
 from .blocks import (
-    _SCROLL_FOLLOW_THRESHOLD,
     AssistantBlock,
     ReasoningBlock,
     ToolCallBlock,
@@ -376,6 +375,11 @@ class ChatTimelineLayer(DrCodeState):
             return
         self.viewed_id = task_id
         task = self.manager.get(task_id)
+        # Opening a task always lands on the latest entry: re-arm the log's
+        # anchor right after the wipe (while the log is still empty), so the
+        # compositor pins the mounting chunks to the bottom — including the
+        # last chunk's layout pass, which the drain chain may outpace.
+        self.chat_log.anchor(True)
         # Wipe marker for the streaming loop: any block created before this
         # point belongs to a dead view and must be re-mounted on the next
         # delta (its accumulated content is carried over, so the live text
@@ -629,33 +633,6 @@ class ChatTimelineLayer(DrCodeState):
             self._rendered_clarification = task.clarification
         return timeline
 
-    def _chat_at_bottom(self) -> bool:
-        """True when the reader is tracking the chat tail (auto-scroll follows).
-
-        Allows a small threshold of trailing rows below the viewport edge:
-        markdown reflow can suddenly add a couple of lines and a fresh model
-        chunk arrives at the same time, so the tail edge jumps below the
-        visible area. A 1-line tolerance would then falsely report "not at
-        bottom" and stop following the tail; within this threshold we still
-        treat the reader as tracking the tail.
-
-        Tolerance absorbs rounding of fractional scroll offsets.
-        """
-        log = self.chat_log
-        return log.scroll_offset.y >= log.max_scroll_y - _SCROLL_FOLLOW_THRESHOLD
-
-    def _stream_follow(self) -> None:
-        """Keep the chat tail visible while streaming, coalesced to ~10 Hz.
-
-        Called per streamed delta; each scroll_end schedules a refresh+scroll
-        pass over the (growing) chat log — doing that per delta saturates the
-        event loop and makes keyboard/mouse input unresponsive.
-        """
-        now = time.monotonic()
-        if now - self._last_follow >= 0.1:
-            self._last_follow = now
-            self.chat_log.call_after_refresh(self.chat_log.scroll_end, animate=False)
-
     # -- tool-call spinners ------------------------------------------------------
 
     def _tool_call_started(
@@ -710,9 +687,10 @@ class ChatTimelineLayer(DrCodeState):
     ) -> None:
         """Mount one block to the chat log.
 
-        Scrolls to the end only when the user is already looking at the
-        bottom: a scrolled-up reader must not be yanked down by new tool
-        calls / reasoning blocks arriving while the agent runs.
+        No scrolling here: the log is anchored (ChatLog.__init__ /
+        view_task's wipe), so the compositor keeps the tail on screen for
+        a reader at the bottom; a reader scrolled up has released the
+        anchor and is never yanked down.
 
         While batching (view_task's history rebuild and its chunked drain),
         the block is only collected — _flush_chat_batch() mounts the
@@ -773,16 +751,13 @@ class ChatTimelineLayer(DrCodeState):
             self._chat_has_content = True
         elif parts is not None:
             try:
-                # Seed the chunked drain with the parts (live-follow mode):
-                # subsequent live writes keep appending to _chat_batch and
-                # ride along, so block order is preserved. The drain's
-                # epoch guard drops the tail on a mid-append view switch.
+                # Seed the chunked drain with the parts: subsequent live
+                # writes keep appending to _chat_batch and ride along, so
+                # block order is preserved. The drain's epoch guard drops
+                # the tail on a mid-append view switch. The anchored log
+                # keeps the tail on screen for a reader at the bottom and
+                # leaves a scrolled-up reader alone — no follow switch.
                 self._chat_batch.extend(parts)
-                self._chat_batch_follow = False
-                # The ChatLog watcher keeps the tail on screen while the
-                # chunks grow the log — but only while the reader is
-                # tracking it (decided per growth, pre-growth position).
-                self.chat_log.auto_follow = True
                 self._chat_batch_epoch = self._chat_epoch
                 self._chat_batching = True
                 self._chat_drain_at = time.monotonic()
@@ -793,10 +768,7 @@ class ChatTimelineLayer(DrCodeState):
             self._chat_has_content = True
         else:
             try:
-                follow = self._chat_at_bottom()
                 self.chat_log.mount(widget)
-                if follow:
-                    self.chat_log.scroll_end(animate=False)
             except NoMatches:
                 # Teardown race: a worker streaming into the open chat (a
                 # tester verdict, an agent delta, an event line) can hit an
@@ -819,10 +791,6 @@ class ChatTimelineLayer(DrCodeState):
         last chunk — and ride along with the remaining chunks.
         """
         self._chat_batching = True
-        self._chat_batch_follow = True
-        # A rebuild drain is not live-follow: its final scroll_end is
-        # explicit (always lands on the latest entry).
-        self.chat_log.auto_follow = False
         self._chat_batch_epoch = self._chat_epoch
         self._chat_drain_at = time.monotonic()
         self._drain_chat_batch()
@@ -849,7 +817,6 @@ class ChatTimelineLayer(DrCodeState):
             if self._chat_batching and self._chat_batch_epoch == epoch:
                 self._chat_batching = False
                 self._chat_batch.clear()
-                self.chat_log.auto_follow = False
             return
         chunk: list[Widget] = []
         cost = 0
@@ -867,29 +834,16 @@ class ChatTimelineLayer(DrCodeState):
             del self._chat_batch[0]
         try:
             if chunk:
-                # The live-follow scroll (split fat write) is driven by the
-                # ChatLog's virtual-size watcher (auto_follow): a same-tick
-                # scroll_end computes against the stale max_scroll_y (the
-                # chunk's virtual size arrives with the layout pass), and a
-                # deferred one still races the layout — the watcher fires
-                # exactly when the growth lands and re-checks the reader's
-                # position against the PRE-growth size.
+                # No follow logic here either: the anchored log keeps the
+                # tail on screen as the chunks grow the virtual size (the
+                # compositor pins the scroll position at each arrange —
+                # a same-tick scroll_end would compute against the stale
+                # max_scroll_y, the very race the anchor removes).
                 self.chat_log.mount(*chunk)
             if self._chat_batch:
                 self._schedule_drain(self._chat_epoch)
             else:
                 self._chat_batching = False
-                if self._chat_batch_follow:
-                    # Opening a task always lands on the latest entry
-                    # (previously this happened implicitly because every
-                    # mount scrolled to the end).
-                    self.chat_log.scroll_end(animate=False)
-                # else: a live-follow drain — the ChatLog watcher kept the
-                # tail on screen while the chunks grew the log and stays
-                # armed: the last chunk's layout may land after this tick
-                # (the drain chain outruns it). It disarms itself for any
-                # reader who is no longer at the tail; the next rebuild
-                # (_flush_chat_batch) turns it off explicitly.
         except NoMatches:
             # Teardown race: the drain chain (call_later / the timer
             # fallback) can fire into an already-parsed-away DOM —
@@ -897,13 +851,11 @@ class ChatTimelineLayer(DrCodeState):
             # _poll_activity's NoMatches catch).
             self._chat_batching = False
             self._chat_batch.clear()
-            self.chat_log.auto_follow = False
         except Exception:
             # Never leave batching stuck on: later live writes would be
             # silently swallowed.
             self._chat_batching = False
             self._chat_batch.clear()
-            self.chat_log.auto_follow = False
             raise
 
     def _schedule_drain(self, epoch: int) -> None:

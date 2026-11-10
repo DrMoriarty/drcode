@@ -258,6 +258,14 @@ class Task(BaseModel):
     # generated never gets it re-derived (TaskManager.create / edit_task
     # derive titles for tasks the agent has not seen yet anyway).
     title_generated: bool = False
+    # True when the title arrived EXPLICITLY at creation (a non-empty title
+    # argument: the agents' create_bug_report / create_feature_request
+    # tools, the GitHub Issues import, a goal's title) and must never be
+    # overwritten by the title generator. False for the derived first-line
+    # fallback (TaskManager.create / edit_task) — those remain eligible for
+    # generation. Tasks created before the flag existed default to False:
+    # their exactly-once generation already ran via `title_generated`.
+    title_explicit: bool = False
     kind: TaskKind = TaskKind.FEATURE
     status: TaskStatus = TaskStatus.QUEUED
     verification: VerificationStatus | None = None

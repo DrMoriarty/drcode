@@ -105,6 +105,16 @@ _MAX_RESOLVER_ATTEMPTS = 5
 _MAX_RESOLVER_NETWORK_ATTEMPTS = NETWORK_RETRIES * 3
 # Base of the capped exponential backoff between attempts (5, 10, 20 ... s).
 _RETRY_BASE_DELAY_S = 5.0
+# The intent-preservation review's OWN retry budget (the #9c3236e8 class):
+# an infrastructure failure of the CHEAP reviewer pass used to be silently
+# treated as an 'unsure' verdict — rolling back tens of minutes of resolver
+# work over one dropped HTTP call. Retryable failures (429s, transport
+# errors — see `_is_retryable_network_error`) now get a small budget of
+# their own with the same capped exponential backoff, NOT spending the
+# round's `_MAX_RESOLVER_ATTEMPTS`; a deterministic context-overflow 400
+# (or any other non-retryable error) goes straight to 'unsure' as before —
+# replaying the same oversized review prompt is guaranteed the same 400.
+_MAX_REVIEW_ATTEMPTS = 3
 
 
 # -- intent-preservation review (level 3 of the funnel) ------------------------------
@@ -781,37 +791,12 @@ class PipelineResolverLayer(CoreState):
             prompt = _review_chunk_prompt(
                 task, report, outcome.agent_report, chunk, index, len(chunks)
             )
-            try:
-                result = await reviewer.run(
-                    prompt,
-                    deps=rdeps,
-                    usage_limits=UsageLimits(request_limit=self.config.request_limit),
-                )
-                self._record_session_usage(
-                    result.usage,
-                    AgentRole.RESOLVER,
-                    self.resolved_model_key(AgentRole.RESOLVER),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 - a failed review blocks the commit
-                results.append(
-                    (
-                        "unsure",
-                        (
-                            f"chunk {index + 1}/{len(chunks)}: the reviewer pass "
-                            f"failed ({type(e).__name__}: {e}) — treated as unsure"
-                        ),
-                    )
-                )
-                break
-            rverdict = rdeps.verdicts[-1] if rdeps.verdicts else None
-            results.append(
-                (
-                    rverdict.label if rverdict else "unsure",
-                    rverdict.report if rverdict else "",
-                )
+            label, chunk_report, stop = await self._run_reviewer_pass(
+                task, prompt, reviewer, rdeps, index + 1, len(chunks)
             )
+            results.append((label, chunk_report))
+            if stop:
+                break
         outcome.review_verdict, outcome.review_report = aggregate_review_verdicts(
             results
         )
@@ -820,6 +805,111 @@ class PipelineResolverLayer(CoreState):
         if outcome.review_verdict == "intact":
             outcome.verdict = "resolved"
         return outcome
+
+    async def _run_reviewer_pass(
+        self,
+        task: Task,
+        prompt: str,
+        reviewer: Agent[Any, str],
+        rdeps: ResolverDeps,
+        chunk_index: int,
+        chunk_total: int,
+    ) -> tuple[str, str, bool]:
+        """One intent-review chunk's reviewer pass with its own retry
+        budget: retryable failures (429s, transport errors) are retried
+        IN PLACE with the same capped exponential backoff as the round —
+        the expensive resolver round must not die to one dropped HTTP
+        call in the cheap tail — while a deterministic context-overflow
+        400 or any other non-retryable error goes straight to an 'unsure'
+        verdict (replaying the same oversized prompt is guaranteed the
+        same 400). Returns (label, report, stop): `stop` is True when the
+        pass failed terminally, so the remaining chunks must not be
+        reviewed either (a failure of this class will not heal itself on
+        them, and the folded verdict already blocks the commit)."""
+        failures: list[str] = []
+        result = None
+        prefix = f"chunk {chunk_index}/{chunk_total}: "
+        for attempt in range(1, _MAX_REVIEW_ATTEMPTS + 1):
+            try:
+                result = await reviewer.run(
+                    prompt,
+                    deps=rdeps,
+                    usage_limits=UsageLimits(request_limit=self.config.request_limit),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - a failed review blocks the commit
+                failure = f"{type(e).__name__}: {e}"
+                failures.append(failure)
+                if _is_context_overflow_error(e):
+                    # Deterministic: every replay of the same prompt is
+                    # guaranteed the same 400 — do not burn the budget.
+                    self._show_event(
+                        task,
+                        f"Intent review failed with a context overflow "
+                        f"({failure}) — retrying cannot help, the round is "
+                        "treated as unsure.",
+                        kind="workflow",
+                    )
+                    return (
+                        "unsure",
+                        prefix
+                        + f"the reviewer pass failed with a context "
+                        f"overflow ({failure}) — retrying cannot help, "
+                        "treated as unsure",
+                        True,
+                    )
+                if not _is_retryable_network_error(e):
+                    self._show_event(
+                        task,
+                        f"Intent review failed ({failure}) — the error is "
+                        "not transient, the round is treated as unsure.",
+                        kind="workflow",
+                    )
+                    return (
+                        "unsure",
+                        prefix + f"the reviewer pass failed ({failure}) — treated as unsure",
+                        True,
+                    )
+                if attempt >= _MAX_REVIEW_ATTEMPTS:
+                    self._show_event(
+                        task,
+                        f"Intent review failed {attempt} times "
+                        f"(last: {failure}) — retries exhausted, the round "
+                        "is treated as unsure.",
+                        kind="workflow",
+                    )
+                    return (
+                        "unsure",
+                        prefix
+                        + f"the reviewer pass failed {attempt} times "
+                        f"({'; '.join(failures)}) — retries exhausted, "
+                        "treated as unsure",
+                        True,
+                    )
+                delay = min(_RETRY_BASE_DELAY_S * 2 ** (attempt - 1), 300)
+                self._show_event(
+                    task,
+                    f"Intent review failed ({failure}) — retrying in "
+                    f"{int(delay)} s (attempt "
+                    f"{attempt + 1}/{_MAX_REVIEW_ATTEMPTS})",
+                    kind="workflow",
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+        assert result is not None  # the loop only exits via break or return
+        self._record_session_usage(
+            result.usage,
+            AgentRole.RESOLVER,
+            self.resolved_model_key(AgentRole.RESOLVER),
+        )
+        rverdict = rdeps.verdicts[-1] if rdeps.verdicts else None
+        return (
+            rverdict.label if rverdict else "unsure",
+            rverdict.report if rverdict else "",
+            False,
+        )
 
     async def _apply_resolver_outcome(
         self,

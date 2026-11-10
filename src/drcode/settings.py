@@ -469,7 +469,9 @@ class ProjectSettings(BaseModel):
     # first-line-of-the-prompt title untouched. Generation is exactly-once
     # per task lifetime (the `Task.title_generated` stamp, set on success
     # only): a re-activation never re-generates, a failed one keeps the old
-    # title and lets the NEXT activation retry. Tasks that never reach the
+    # title and lets the NEXT activation retry. Explicit author titles
+    # (`Task.title_explicit` — the agents' report tools, the GitHub import,
+    # a goal's title) are skipped entirely. Tasks that never reach the
     # agent (hold / draft / queued) keep the derived title — the generator
     # runs only in the agent-run worker.
     generate_task_titles: bool = False

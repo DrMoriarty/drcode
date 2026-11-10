@@ -27,7 +27,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import RequestUsage
 
 from drcode import agent_model, eviction
-from drcode.agent_tools import _mark_unneeded
+from drcode.agent_tools import _fmt_approx_tokens, _mark_unneeded
 from drcode.compaction import (
     _atomic_groups,
     chunk_history_for_summary,
@@ -242,7 +242,71 @@ def test_mark_unneeded_defaults_to_last_result(manager: Any) -> None:
     result = _mark_unneeded(cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))))
     assert task.marked_unneeded == ["c2"]
     assert "no longer needed" in result
+    assert "Marked:" in result
+    assert "total pending" in result
     assert "Nothing is removed right now" in result
+    assert "1/3 of the context window" in result
+
+
+def test_mark_unneeded_reports_token_figures(manager: Any) -> None:
+    """The answer carries the ≈estimate of what THIS call marked and the
+    ≈total of ALL pending marks — chars/4, the same accounting the
+    pipeline gate uses."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    big_a, big_b = "y" * 4000, "z" * 800
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", big_a),
+        tool_call_msg("c2", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c2", "grep_search", big_b),
+        tool_call_msg("c3", "mark_unneeded", {}),
+    ]
+    ctx = cast(Any, FakeCtx(messages, FakeDeps(manager, task.id)))
+    result = _mark_unneeded(ctx)
+    # The most recent result (c2) was marked; the total is just it so far.
+    assert f"Marked: ~{_fmt_approx_tokens(estimate_tokens(big_b))} ≈tokens" in result
+    assert f"total pending ≈{_fmt_approx_tokens(estimate_tokens(big_b))}" in result
+
+    # A second call marks c1 too: the new figure covers only c1, the
+    # total covers both pending marks.
+    ctx.messages = [
+        *messages,
+        tool_return_msg("c3", "mark_unneeded", result),
+        tool_call_msg("c4", "mark_unneeded", {}),
+    ]
+    result2 = _mark_unneeded(ctx, paths=["a.py"])
+    total = estimate_tokens(big_a) + estimate_tokens(big_b)
+    assert f"Marked: ~{_fmt_approx_tokens(estimate_tokens(big_a))} ≈tokens" in result2
+    assert f"total pending ≈{_fmt_approx_tokens(total)}" in result2
+
+
+def test_mark_unneeded_pending_figures_skip_stubs(manager: Any) -> None:
+    """Already-evicted marks weigh zero in the total — the figure mirrors
+    `eviction.marked_tokens`, not the raw length of the mark list."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    big = "y" * 4000
+    stub = eviction.evicted_stub("read_file", {"path": "a.py"})
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", stub),  # already evicted earlier
+        tool_call_msg("c2", "read_file", {"path": "b.py"}),
+        tool_return_msg("c2", "read_file", big),
+        tool_call_msg("c3", "mark_unneeded", {}),
+    ]
+    task.marked_unneeded = ["c1"]
+    result = _mark_unneeded(cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))))
+    assert task.marked_unneeded == ["c1", "c2"]
+    assert f"Marked: ~{_fmt_approx_tokens(estimate_tokens(big))} ≈tokens" in result
+    assert f"total pending ≈{_fmt_approx_tokens(estimate_tokens(big))}" in result
+
+
+def test_fmt_approx_tokens() -> None:
+    assert _fmt_approx_tokens(0) == "0"
+    assert _fmt_approx_tokens(420) == "420"
+    assert _fmt_approx_tokens(4200) == "4.2k"
+    assert _fmt_approx_tokens(18000) == "18k"
 
 
 def test_mark_unneeded_path_selector(manager: Any) -> None:

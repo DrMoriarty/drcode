@@ -32,7 +32,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
-from . import tools
+from . import eviction, tools
 from .merge_resolver import _project_python, _venv_env, _worktree_pythonpath_env
 from .models import (
     Goal,
@@ -48,6 +48,7 @@ from .models import (
 )
 from .service_events import log_service_event
 from .task_env import WORKTREES_SUBDIR, branch_for
+from .transcript import serialize_messages
 
 if TYPE_CHECKING:
     from .agent_build import AgentDeps, TesterDeps
@@ -721,6 +722,14 @@ def _call_label(part: ToolCallPart) -> str:
     return part.tool_name
 
 
+def _fmt_approx_tokens(n: int) -> str:
+    """A short ≈figure for a token count: "420" below a thousand, "4.2k"
+    above (the trailing ".0" is trimmed — 18000 renders as "18k")."""
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
+
+
 def _mark_unneeded(
     ctx: RunContext[AgentDeps],
     paths: list[str] | None = None,
@@ -820,7 +829,15 @@ def _mark_unneeded(
     marked = deduped
     task = ctx.deps.manager.get(ctx.deps.task_id)
     new_ids = [call_id for call_id, _ in marked if call_id not in task.marked_unneeded]
+    # ≈token accounting (chars/4, the same convention the eviction gates
+    # use): what THIS call's marks weigh and what ALL pending marks weigh
+    # together — the model sees the payoff of marking in numbers, not just
+    # in words. `marked_tokens` over the serialized transcript is exactly
+    # the input the pipeline gate compares against a third of the window.
+    serialized = serialize_messages(messages)
+    new_tokens = eviction.marked_tokens(serialized, new_ids)
     task.marked_unneeded.extend(new_ids)
+    pending_tokens = eviction.marked_tokens(serialized, task.marked_unneeded)
     task.touch()
     ctx.deps.manager.storage.save(task)
     lines = [f"Marked {len(marked)} tool result(s) as no longer needed:"]
@@ -828,6 +845,10 @@ def _mark_unneeded(
     if misses:
         lines.append("Not marked:")
         lines.extend(f"- {miss}" for miss in misses)
+    lines.append(
+        f"Marked: ~{_fmt_approx_tokens(new_tokens)} ≈tokens; "
+        f"total pending ≈{_fmt_approx_tokens(pending_tokens)}."
+    )
     lines.append(
         "Nothing is removed right now — the pipeline will collapse the "
         "marked results (together with the other marked results, in one "

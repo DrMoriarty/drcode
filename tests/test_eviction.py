@@ -255,7 +255,7 @@ def test_mark_unneeded_path_selector(manager: Any) -> None:
         tool_return_msg("c2", "read_file", "content b"),
     ]
     _mark_unneeded(
-        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))), path="a.py"
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))), paths=["a.py"]
     )
     assert task.marked_unneeded == ["c1"]
 
@@ -267,9 +267,10 @@ def test_mark_unneeded_unknown_path_retries(manager: Any) -> None:
         tool_call_msg("c1", "read_file", {"path": "a.py"}),
         tool_return_msg("c1", "read_file", "content a"),
     ]
-    with pytest.raises(ValueError, match="No completed tool result"):
+    with pytest.raises(ValueError, match="Nothing matched"):
         _mark_unneeded(
-            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))), path="zzz.py"
+            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+            paths=["zzz.py"],
         )
     # No completed tool result at all — nothing to mark.
     with pytest.raises(ValueError, match="no completed tool result"):
@@ -306,6 +307,155 @@ def test_mark_unneeded_survives_save_load(project_root: Path) -> None:
     # A fresh store over the same project reads the mark back.
     tasks = {t.id: t for t in Storage(project_root).load_all()}
     assert tasks[task.id].marked_unneeded == ["c1"]
+
+
+def test_mark_unneeded_batch_paths(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+        tool_call_msg("c2", "read_file", {"path": "b.py"}),
+        tool_return_msg("c2", "read_file", "content b"),
+        tool_call_msg("c3", "read_file", {"path": "a.py"}),
+        tool_return_msg("c3", "read_file", "content a again"),
+    ]
+    result = _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+        paths=["a.py", "b.py"],
+    )
+    # The MOST RECENT completed call per path; insertion order preserved.
+    assert task.marked_unneeded == ["c3", "c2"]
+    assert "read_file(path='a.py')" in result
+    assert "read_file(path='b.py')" in result
+
+
+def test_mark_unneeded_batch_partial_miss_lists_errors(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    result = _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+        paths=["a.py", "zzz.py"],
+    )
+    # The hit is kept, the miss is reported — the call does not fail.
+    assert task.marked_unneeded == ["c1"]
+    assert "read_file(path='a.py')" in result
+    assert "Not marked" in result
+    assert "zzz.py" in result
+
+
+def test_mark_unneeded_batch_total_miss_raises(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    with pytest.raises(ValueError, match="zzz.py"):
+        _mark_unneeded(
+            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+            paths=["zzz.py", "yyy.py"],
+        )
+    assert task.marked_unneeded == []
+
+
+def test_mark_unneeded_tool_name_selector(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c1", "grep_search", ["hit1"]),
+        tool_call_msg("c2", "read_file", {"path": "a.py"}),
+        tool_return_msg("c2", "read_file", "content a"),
+        tool_call_msg("c3", "grep_search", {"pattern": "y"}),
+        tool_return_msg("c3", "grep_search", ["hit2"]),
+        tool_call_msg("c4", "grep_search", {"pattern": "z"}),  # no return yet
+    ]
+    result = _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+        tool_name="grep_search",
+    )
+    # Every COMPLETED grep result, in chronological order; the pending
+    # c4 is untouched, the read_file result is untouched.
+    assert task.marked_unneeded == ["c1", "c3"]
+    assert "grep_search(pattern='x')" in result
+    assert "grep_search(pattern='y')" in result
+
+
+def test_mark_unneeded_tool_name_and_paths_combined(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c1", "grep_search", ["hit1"]),
+        tool_call_msg("c2", "read_file", {"path": "a.py"}),
+        tool_return_msg("c2", "read_file", "content a"),
+        tool_call_msg("c3", "read_file", {"path": "b.py"}),
+        tool_return_msg("c3", "read_file", "content b"),
+    ]
+    result = _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+        paths=["a.py"],
+        tool_name="grep_search",
+    )
+    # c2 via paths, c1 via tool_name (paths first); b.py (c3) stays
+    # unmarked.
+    assert task.marked_unneeded == ["c2", "c1"]
+    assert "Not marked" not in result
+
+
+def test_mark_unneeded_tool_name_never_marks_itself(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+        tool_call_msg("c2", "mark_unneeded", {}),
+        tool_return_msg("c2", "mark_unneeded", "Marked: ..."),
+    ]
+    # A total miss (the only requested target is mark_unneeded itself)
+    # is a ModelRetry, like any other full miss.
+    with pytest.raises(ValueError, match="never evictable"):
+        _mark_unneeded(
+            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+            tool_name="mark_unneeded",
+        )
+    assert task.marked_unneeded == []
+
+
+def test_mark_unneeded_batch_dedupes_overlapping_selectors(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    _mark_unneeded(
+        cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+        paths=["a.py"],
+        tool_name="read_file",
+    )
+    # The same call is reachable through both selectors — one mark.
+    assert task.marked_unneeded == ["c1"]
+
+
+def test_mark_unneeded_unknown_tool_name_reports_miss(manager: Any) -> None:
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "content a"),
+    ]
+    with pytest.raises(ValueError, match="no_such_tool"):
+        _mark_unneeded(
+            cast(Any, FakeCtx(messages, FakeDeps(manager, task.id))),
+            tool_name="no_such_tool",
+        )
+    assert task.marked_unneeded == []
 
 
 # -- pipeline gates -------------------------------------------------------------------
@@ -454,7 +604,7 @@ async def test_live_run_pauses_evicts_and_resumes(
     )
     scripted.steps = [
         tool_response("read_file", {"path": "notes.txt"}, call_id="c1"),
-        tool_response("mark_unneeded", {"path": "notes.txt"}, call_id="c2"),
+        tool_response("mark_unneeded", {"paths": ["notes.txt"]}, call_id="c2"),
         text_response("done reading"),
     ]
 

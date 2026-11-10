@@ -371,14 +371,18 @@ def build_agent(
         )
 
     @agent.tool
-    async def mark_unneeded(ctx: RunContext[AgentDeps], path: str = "") -> str:
-        """Mark a tool result you no longer need: at the next batched
-        context unloading its content collapses to a short stub (nothing
-        is removed now). Without arguments marks the most recent tool
-        result; pass path="..." for the most recent call made with that
-        path. Call it right after the tool being marked; re-run the tool
-        if you need the content again."""
-        return await _run_tool(_mark_unneeded, ctx, path)
+    async def mark_unneeded(
+        ctx: RunContext[AgentDeps],
+        paths: list[str] | None = None,
+        tool_name: str = "",
+    ) -> str:
+        """Mark tool result(s) you no longer need: at the next batched
+        unloading their contents collapse to stubs (nothing is removed
+        now). Selectors combine: paths=["a.py"] — most recent result
+        per path; tool_name="grep_search" — all completed results of
+        that tool; no args — the most recent result. Misses are listed
+        in the answer."""
+        return await _run_tool(_mark_unneeded, ctx, paths, tool_name)
 
     # Muting-file tools are barriers: pydantic-ai runs tool calls of one
     # model response in parallel, so two concurrent edits of the same file

@@ -21,7 +21,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
@@ -687,83 +687,155 @@ def _returned_call_ids(messages: list[ModelMessage]) -> dict[str, str]:
     return returns
 
 
-def _call_path_arg(part: ToolCallPart) -> str | None:
-    """The `path` argument of a tool call (None when it has none) — the
-    args ride in the sibling part of the same ModelResponse, which is what
-    makes the path-based selector possible (the model never has to quote
-    tool_call_ids)."""
+def _call_args(part: ToolCallPart) -> dict[str, Any] | None:
+    """The parsed args dict of a tool call (None when unparsable)."""
     args = part.args
     if isinstance(args, str):
         try:
             args = json.loads(args)
         except ValueError:
             return None
-    if not isinstance(args, dict):
+    return args if isinstance(args, dict) else None
+
+
+def _call_path_arg(part: ToolCallPart) -> str | None:
+    """The `path` argument of a tool call (None when it has none) — the
+    args ride in the sibling part of the same ModelResponse, which is what
+    makes the path-based selector possible (the model never has to quote
+    tool_call_ids)."""
+    args = _call_args(part)
+    if not args:
         return None
     path = args.get("path")
     return path if isinstance(path, str) and path.strip() else None
 
 
-def _mark_unneeded(ctx: RunContext[AgentDeps], path: str = "") -> str:
+def _call_label(part: ToolCallPart) -> str:
+    """A short human/model-readable identification of a tool call: the
+    tool name plus, when present, its path/pattern argument."""
+    args = _call_args(part) or {}
+    for key in ("path", "pattern", "query", "url", "command"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return f"{part.tool_name}({key}={value.strip()!r})"
+    return part.tool_name
+
+
+def _mark_unneeded(
+    ctx: RunContext[AgentDeps],
+    paths: list[str] | None = None,
+    tool_name: str = "",
+) -> str:
     """Record "this tool result's content is no longer needed" marks.
 
     Nothing is removed at mark time — the pipeline collapses all marked
-    results in one batch later (see drcode.eviction). Two selectors:
+    results in one batch later (see drcode.eviction). Selectors, freely
+    combinable in one call:
 
-    - ``path`` given: the most recent tool call whose `path` argument
-      matches (read_file re-reads included) — the read the agent just
-      decided against;
-    - ``path`` empty: the most recent completed tool result (the "read it,
-      extracted what I needed, moving on" case).
+    - ``paths`` given: for EACH listed path, the most recent tool call
+      whose `path` argument matches (read_file re-reads included) —
+      marks a whole reading session in one shot;
+    - ``tool_name`` given: EVERY completed result of that tool (the
+      "the grep hits are stale now" case); ``mark_unneeded`` itself is
+      never a target — its own results are one-liners;
+    - nothing given: the most recent completed tool result (the "read
+      it, extracted what I needed, moving on" case).
 
-    Raises ValueError (→ ModelRetry) when nothing matches, so the model
-    corrects itself instead of silently marking nothing."""
+    Per-item misses (a path with no completed result, an unknown tool
+    name) are listed in the answer instead of failing the call; the call
+    raises ValueError (→ ModelRetry) only when NOTHING matched at all,
+    so the model corrects itself instead of silently marking nothing."""
     messages: list[ModelMessage] = list(ctx.messages)
     returns = _returned_call_ids(messages)
-    marked_id: str | None = None
-    marked_name: str | None = None
-    if path.strip():
-        wanted = path.strip()
-        for call_id, part in reversed(_tool_calls_by_id(messages).items()):
+    calls = _tool_calls_by_id(messages)
+    marked: list[tuple[str, str]] = []  # (tool_call_id, label)
+    misses: list[str] = []
+
+    def mark_path(wanted: str) -> None:
+        for call_id, part in reversed(calls.items()):
             if _call_path_arg(part) != wanted:
                 continue
             if call_id not in returns:
                 continue
-            marked_id, marked_name = call_id, part.tool_name
-            break
-        if marked_id is None:
-            raise ValueError(
-                f"No completed tool result for path {wanted!r} in this "
-                "session — mark_unneeded(path=...) marks the most recent "
-                "tool call made with that exact path (and it must have a "
-                "result already). Omit the argument to mark the most "
-                "recent tool result instead."
+            marked.append((call_id, _call_label(part)))
+            return
+        misses.append(
+            f"{wanted!r}: no completed tool result for this path in this "
+            "session (paths mark the most recent tool call made with that "
+            "exact path, and it must have a result already)"
+        )
+
+    def mark_tool(wanted: str) -> None:
+        if wanted == "mark_unneeded":
+            misses.append(
+                "'mark_unneeded': its own results are never evictable "
+                "targets (they are one-liners)"
             )
-    else:
+            return
+        pairs = [
+            (call_id, _call_label(calls[call_id]))
+            for call_id, name in returns.items()
+            if name == wanted and call_id in calls
+        ]
+        if not pairs:
+            misses.append(
+                f"{wanted!r}: no completed tool results of this tool in this session"
+            )
+            return
+        marked.extend(pairs)
+
+    # Per-item misses land in the answer, not in a raise; paths are
+    # deduped preserving order, then the tool selector runs.
+    seen: set[str] = set()
+    for wanted in paths or []:
+        wanted = wanted.strip()
+        if wanted and wanted not in seen:
+            seen.add(wanted)
+            mark_path(wanted)
+    wanted_tool = tool_name.strip()
+    if wanted_tool:
+        mark_tool(wanted_tool)
+    if not marked and misses:
+        raise ValueError("Nothing matched — " + "; ".join(misses))
+    if not marked:
         # The most recent completed result that is not a mark_unneeded
         # call of this very session (its own results are never evictable
         # targets — they are one-liners anyway).
         for call_id, name in reversed(returns.items()):
             if name == "mark_unneeded":
                 continue
-            marked_id, marked_name = call_id, name
+            marked.append((call_id, name))
             break
-        if marked_id is None:
+        if not marked:
             raise ValueError("There is no completed tool result to mark yet.")
-    assert marked_id is not None
+    assert marked
+    # A call reachable through two selectors (path + tool_name) is one
+    # mark, not two — dedupe preserving first-mention order.
+    deduped: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    for call_id, label in marked:
+        if call_id not in seen_ids:
+            seen_ids.add(call_id)
+            deduped.append((call_id, label))
+    marked = deduped
     task = ctx.deps.manager.get(ctx.deps.task_id)
-    if marked_id not in task.marked_unneeded:
-        task.marked_unneeded.append(marked_id)
+    new_ids = [call_id for call_id, _ in marked if call_id not in task.marked_unneeded]
+    task.marked_unneeded.extend(new_ids)
     task.touch()
     ctx.deps.manager.storage.save(task)
-    return (
-        f"Marked: the result of {marked_name} is no longer needed. Nothing "
-        "is removed right now — the pipeline will collapse it (together "
-        "with the other marked results, in one batch) at the next context "
-        "unloading: when ≈1/3 of the context window is marked, or just "
-        "before a full compaction. The stub left in place of the content "
-        "will say how to re-run the tool."
+    lines = [f"Marked {len(marked)} tool result(s) as no longer needed:"]
+    lines.extend(f"- {label}" for _, label in marked)
+    if misses:
+        lines.append("Not marked:")
+        lines.extend(f"- {miss}" for miss in misses)
+    lines.append(
+        "Nothing is removed right now — the pipeline will collapse the "
+        "marked results (together with the other marked results, in one "
+        "batch) at the next context unloading: when ≈1/3 of the context "
+        "window is marked, or just before a full compaction. The stub "
+        "left in place of the content will say how to re-run the tool."
     )
+    return "\n".join(lines)
 
 
 def _retry_failed_here(deps: TesterDeps, report: str) -> str:

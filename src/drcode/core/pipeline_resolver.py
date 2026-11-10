@@ -294,12 +294,24 @@ class PipelineResolverLayer(CoreState):
                     task, f"Conflict resolver: {report.summary()}", kind="workflow"
                 )
                 return
-            self._show_event(
-                task,
-                f"Conflict resolver: {len(report.remaining)} conflicted "
-                f"file(s) — starting an automatic resolution round.",
-                kind="workflow",
-            )
+            if resume_round:
+                # A network-retry continues the interrupted round in place
+                # (resume via `resumable_history`) — say so, instead of the
+                # fresh-start text that made consecutive 429 retries look
+                # like full resolver restarts.
+                self._show_event(
+                    task,
+                    f"Conflict resolver: resuming after a network error — "
+                    f"{len(report.remaining)} conflicted file(s) left.",
+                    kind="workflow",
+                )
+            else:
+                self._show_event(
+                    task,
+                    f"Conflict resolver: {len(report.remaining)} conflicted "
+                    f"file(s) — starting an automatic resolution round.",
+                    kind="workflow",
+                )
             round_t0 = time.monotonic()
             reached_agent = True
 

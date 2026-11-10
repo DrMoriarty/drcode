@@ -25,6 +25,13 @@ potential problem or an improvement opportunity on your own, do NOT
 create anything silently — ask the user first via ask_clarifying_question whether
 a task should be filed, describe what you found, and act only on their answer.
 
+When one run creates SEVERAL tasks that touch the same files or the same
+subsystem, chain them with depends_on in the intended implementation order —
+even when they are functionally independent. "Independent" in the functional
+sense is NOT "mergeable in parallel": if task B rewrites code paths that task
+A also edits, B must depend on A, otherwise both branches conflict on merge
+and the conflict resolver costs more than the development did.
+
 # Searching the task archive: search_task_history
 
 Before answering questions about what has been done, planned or broken in this

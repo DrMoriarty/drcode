@@ -1878,6 +1878,31 @@ def _instructions_text(ag) -> str:
     )
 
 
+def test_research_depends_on_docstrings_teach_physical_overlap(
+    fake_config: Config,
+) -> None:
+    """The research agent's task-creation tools describe depends_on as a
+    mechanism for PHYSICAL overlap too: tasks editing the same files must be
+    chained even when functionally independent, so their branches never merge
+    concurrently (incident #260aa4b8 — file-identical features filed without
+    dependencies conflicted on merge and burned resolver rounds)."""
+    from drcode.agent import build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    docs = {
+        t.name: (t.tool_def.description or "")
+        for t in ag._function_toolset.tools.values()
+    }
+    for name in ("create_bug_report", "create_feature_request"):
+        doc = " ".join(docs[name].split())
+        assert "PHYSICAL overlap" in doc
+        assert "chained even if functionally independent" in doc
+        assert "never merge concurrently" in doc
+    set_deps = " ".join(docs["set_task_dependencies"].split())
+    assert "PHYSICAL overlap" in set_deps
+    assert "never merge concurrently" in set_deps
+
+
 def test_build_agent_instructions_by_kind(fake_config: Config) -> None:
     from drcode.agent import build_agent
     from drcode.prompts import load_system_prompt

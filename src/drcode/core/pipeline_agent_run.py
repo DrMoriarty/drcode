@@ -93,16 +93,27 @@ class PipelineAgentRunLayer(CoreState):
         """Generate the task's title from its description with the model
         serving the task (project setting ``generate_task_titles``).
 
-        Exactly-once semantics come from ``task.title_generated``: set only
-        on SUCCESS, so a re-activation never re-generates a generated title
-        and a failed one keeps the first-line title while the NEXT
-        activation may retry — one bounded attempt per activation, never a
-        loop within a run, and never fatal for the run itself. A task with
-        nothing queued (an unfinished resume) has no description to name it
-        from and is skipped silently. Tasks that never reach this worker
-        (hold / draft / queued) keep the title derived at creation/edit.
+        Only DERIVED titles are rewritten: a title that arrived explicitly
+        at creation (``task.title_explicit`` — the agents' report tools,
+        the GitHub import, a goal's title) is skipped — generating over it
+        would replace a deliberate name with a paraphrase of the
+        description (and spend a model call on it).
+
+        Exactly-once semantics for derived titles come from
+        ``task.title_generated``: set only on SUCCESS, so a re-activation
+        never re-generates a generated title and a failed one keeps the
+        first-line title while the NEXT activation may retry — one bounded
+        attempt per activation, never a loop within a run, and never fatal
+        for the run itself. A task with nothing queued (an unfinished
+        resume) has no description to name it from and is skipped
+        silently. Tasks that never reach this worker (hold / draft /
+        queued) keep the title derived at creation/edit.
         """
-        if not self.settings.generate_task_titles or task.title_generated:
+        if (
+            not self.settings.generate_task_titles
+            or task.title_explicit
+            or task.title_generated
+        ):
             return
         description = self.manager.editable_condition(task.id)
         if not description:

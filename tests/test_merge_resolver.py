@@ -831,6 +831,41 @@ def test_restore_conflict_returns_pristine_state(repo: Path) -> None:
     assert report2 is not None and report2.conflicted
 
 
+def test_restore_conflict_discards_edits_outside_the_merge(repo: Path) -> None:
+    """The 9c3236e8 incident: `git merge --abort` resets only the paths
+    the merge itself touched — the resolver's edits OUTSIDE that set (a
+    post-resolution fix to a path the merge never touched, an untracked
+    scope violation) survived the rollback as uncommitted changes and
+    blocked the next merge. The per-task worktree must come back with
+    NOTHING but the redeployed conflict."""
+    wt = _task_worktree(repo, "t1")
+    (wt / "helper.py").write_text("helper\n")
+    _run(wt, "add", "-A")
+    _run(wt, "commit", "-qm", "task work")
+    (wt / "app.py").write_text("task\nb\n")
+    _run(wt, "commit", "-qam", "task edit")
+    (repo / "app.py").write_text("main\nb\n")
+    _run(repo, "commit", "-qam", "main edit")
+    report = mr.prepare(repo, "t1", wt, "main")
+    assert report.ok and report.conflicted
+    # The failed attempt: app.py half-resolved, helper.py (a path the
+    # merge never touched) given a post-resolution fix, plus an
+    # untracked out-of-scope file.
+    (wt / "app.py").write_text("half resolved\n")
+    (wt / "helper.py").write_text("post-resolution compile fix\n")
+    (wt / "foreign.py").write_text("x\n")
+    assert mr.restore_conflict(repo, "t1", wt, "main", extra_paths=["foreign.py"])
+    # Only the pristine conflict is left: markers back, the out-of-merge
+    # edits gone, the worktree clean apart from the unmerged path.
+    assert "<<<<<<<" in (wt / "app.py").read_text(encoding="utf-8")
+    assert (wt / "helper.py").read_text(encoding="utf-8") == "helper\n"
+    assert not (wt / "foreign.py").exists()
+    assert me.unmerged_paths(wt) == ["app.py"]
+    status = _run(wt, "status", "--porcelain", check=False).stdout
+    dirty = [ln for ln in status.splitlines() if not ln.startswith("UU ")]
+    assert not dirty, dirty
+
+
 def test_conclude_commits_and_makes_base_fast_forward(repo: Path) -> None:
     wt, _report = _conflicted_repo(repo, "t1")
     (wt / "app.py").write_text("task\nmain\nb\n")

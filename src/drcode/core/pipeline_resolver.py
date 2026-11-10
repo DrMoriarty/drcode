@@ -1095,17 +1095,30 @@ class PipelineResolverLayer(CoreState):
         # Anything short of a full pass: nothing committed, conflict
         # restored, human takes over.
         restored = await asyncio.to_thread(
-            restore_conflict, self.project_root, task.id, root, base
+            restore_conflict,
+            self.project_root,
+            task.id,
+            root,
+            base,
+            outcome.scope_violations,
         )
         task.needs_human = True
         task.touch()
         self.manager.storage.save(task)
-        note = (
-            ""
+        # The rollback claim must match reality: only a verified-clean
+        # restore may say "untouched" — a failed one leaves the worktree
+        # possibly carrying uncommitted resolver edits (the 9c3236e8
+        # incident: "the conflict is back untouched" next to a
+        # could-not-rollback note, while 6 dirty files blocked the merge).
+        tail = (
+            " — NOTHING was committed, the pristine conflict is back in "
+            "the worktree, a human must take over."
             if restored
             else (
-                " (the worktree could not be rolled back cleanly — inspect "
-                "it by hand before resolving)"
+                " — NOTHING was committed, but the worktree could NOT be "
+                "rolled back cleanly: uncommitted resolver edits may remain "
+                "in it alongside the conflict; inspect it by hand and clean "
+                "it up before resolving."
             )
         )
         # A scope-expansion rejection never reached the funnel — the
@@ -1119,9 +1132,7 @@ class PipelineResolverLayer(CoreState):
         )
         self._show_event(
             task,
-            f"{headline}{note} — "
-            f"NOTHING was committed, the conflict is back untouched in the "
-            f"worktree, a human must take over.\n{outcome.summary()}",
+            f"{headline}{tail}\n{outcome.summary()}",
             kind="workflow",
         )
         self._suggest_conflict_screen(task)
@@ -1169,18 +1180,21 @@ class PipelineResolverLayer(CoreState):
         task.needs_human = True
         task.touch()
         self.manager.storage.save(task)
-        note = (
-            ""
+        tail = (
+            " — the pristine conflict is back in the worktree, a human "
+            "must take over."
             if restored
             else (
-                " (the worktree could not be rolled back cleanly — inspect it by hand)"
+                " — the worktree could NOT be rolled back cleanly: "
+                "uncommitted resolver edits may remain in it alongside the "
+                "conflict; inspect it by hand and clean it up before "
+                "resolving."
             )
         )
         self._show_event(
             task,
             f"Automatic conflict resolution abandoned after repeated "
-            f"failures{note} — the conflict is untouched in the worktree, "
-            f"a human must take over.",
+            f"failures{tail}",
             kind="workflow",
         )
         self._suggest_conflict_screen(task)

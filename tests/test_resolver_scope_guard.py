@@ -165,9 +165,11 @@ async def test_scope_guard_rejects_out_of_scope_edit(
         # gained no merge commit.
         assert env.unmerged_commits(task.id) == 1
         assert "<<<<<<<" in (wt / "shared.txt").read_text()
-        # The foreign edit was NOT committed either (it survives in the
-        # worktree — but now with a named trace in the events).
-        assert (wt / "foreign.py").read_text() == "x\n"
+        # The foreign edit was NOT committed — and the rollback cleans
+        # the named scope violation out of the worktree (the 9c3236e8
+        # incident: surviving resolver edits blocked the next merge);
+        # the trace lives on in the events.
+        assert not (wt / "foreign.py").exists()
 
 
 async def test_error_round_leaves_named_trace(

@@ -28,9 +28,10 @@ round that must be deterministic —
   the verdicts fold (`aggregate_review_verdicts`); the single-payload
   form is the unknown-window fallback;
 - `restore_conflict` — roll a FAILED attempt back to the pristine
-  conflicted state (abort + re-run the reversed merge), so a human always
-  takes over exactly the conflict the engine deployed — never a
-  half-resolved tree;
+  conflicted state (abort + hard reset of the per-task worktree + re-run
+  the reversed merge), so a human always takes over exactly the conflict
+  the engine deployed — never a half-resolved tree with the resolver's
+  out-of-merge edits still in it;
 - `conclude` — commit the verified resolution (`merge_engine.finish`);
   the merge into the base branch becomes a fast-forward.
 
@@ -1147,7 +1148,11 @@ def conclude(worktree: Path, message: str) -> tuple[bool, str]:
 
 
 def restore_conflict(
-    project_root: Path, task_id: str, worktree: Path, base_branch: str
+    project_root: Path,
+    task_id: str,
+    worktree: Path,
+    base_branch: str,
+    extra_paths: Iterable[str] = (),
 ) -> bool:
     """Roll a FAILED attempt back to the PRISTINE conflicted state: abort
     the in-progress merge (the resolver's edits are discarded — a failed
@@ -1156,9 +1161,28 @@ def restore_conflict(
     with fresh zdiff3 markers and a fresh triage. rerere has not recorded
     anything at this point (nothing was committed), so the redeploy is
     faithful. Returns True when the worktree again holds the parked
-    conflict."""
-    if merge_engine.in_progress(worktree):
+    conflict.
+
+    `git merge --abort` resets only the paths the merge itself touched —
+    the resolver's edits OUTSIDE that set (scope expansion, post-
+    resolution fixes to already-resolved paths) survive it as uncommitted
+    changes and then block the next merge / pollute the parked conflict
+    (the 9c3236e8 incident). The worktree is per-task — nothing but the
+    parked conflict and the resolver's own round may live there — so
+    after the abort the tracked state is hard-reset to the branch tip
+    and untracked leftovers are cleaned from the conflicted paths and
+    `extra_paths` (the round's scope violations, when the caller knows
+    them)."""
+    unmerged = (
+        merge_engine.unmerged_paths(worktree)
+        if merge_engine.in_progress(worktree)
+        else []
+    )
+    if unmerged:
         merge_engine.abort(worktree)
+    _git("reset", "--hard", cwd=worktree)
+    for path in {*unmerged, *extra_paths}:
+        _git("clean", "-fd", "--", path, cwd=worktree)
     report = prepare(project_root, task_id, worktree, base_branch)
     return bool(report.ok and report.conflicted)
 

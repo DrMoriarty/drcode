@@ -54,10 +54,17 @@ def _git(root: Path, *args: str) -> None:
 @pytest.fixture
 def git_root(project_root: Path) -> Path:
     """A project root that is a real git repository with one commit."""
+    from drcode.gitignore import GITIGNORE_ENTRIES
+
     _git(project_root, "init", "-q")
     _git(project_root, "config", "user.email", "test@example.com")
     _git(project_root, "config", "user.name", "Test")
-    (project_root / ".gitignore").write_text(".drcode/tasks/\n.drcode/worktrees/\n")
+    # Exactly the private subset drcode's gitignore enforcement would
+    # write (gitignore.GITIGNORE_ENTRIES): a missing entry would be
+    # APPENDED at app start, leaving the tracked .gitignore modified —
+    # dirt outside .drcode/ that would block the hook layer's service
+    # commit under test.
+    (project_root / ".gitignore").write_text("\n".join(GITIGNORE_ENTRIES) + "\n")
     (project_root / "README.md").write_text("hello")
     _git(project_root, "add", "-A")
     _git(project_root, "commit", "-q", "-m", "init")
@@ -597,6 +604,130 @@ async def test_successful_hook_merge_clears_hook_merge_failed(
     assert not task.hook_merge_failed
     reloaded = TaskManager(app.project_root).get(task.id)
     assert not reloaded.hook_merge_failed
+
+
+# -- .drcode/-only dirt is auto-committed before an accept hook -----------------------
+
+
+def _git_out(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _git_log_count(root: Path) -> int:
+    return int(_git_out(root, "rev-list", "--count", "HEAD").strip())
+
+
+def _porcelain(root: Path) -> str:
+    return subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def _tracked_goal_file(app: DrCodeApp) -> Path:
+    """A git-tracked goal file (the team shares the roadmap) plus a
+    lifecycle mutation that leaves it dirty — the bibisco-ng scenario."""
+    goal = app.manager.goals.create("Roadmap: async core")
+    path = app.project_root / ".drcode" / "goals" / f"{goal.id}.json"
+    _git(app.project_root, "add", str(path))
+    _git(app.project_root, "commit", "-q", "-m", "track the goal file")
+    # A lifecycle mutation (an auto-transition of the goal state) dirties
+    # the tracked file.
+    data = json.loads(path.read_text())
+    data["status"] = "done"
+    path.write_text(json.dumps(data))
+    return path
+
+
+async def test_drcode_only_dirt_autocommitted_before_accept_hook(
+    app_env: DrCodeApp,
+) -> None:
+    """When every dirty path lies under .drcode/ the hook layer commits
+    the tracked dirt as one service commit BEFORE on_accepted runs — the
+    hook's `git merge` into the shared checkout must not abort on a
+    dirty tree (the bibisco-ng scenario). Untracked files stay untracked."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    goal_path = _tracked_goal_file(app)
+    before = _git_log_count(app.project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+
+    events = "\n".join(event_texts(task))
+    assert "chore(drcode): project state update" in events
+    assert "on_accepted:\nmerged" in events  # the hook ran after the commit
+    assert _git_log_count(app.project_root) == before + 1
+    message = _git_out(app.project_root, "log", "-1", "--format=%s").strip()
+    assert message == "chore(drcode): project state update"
+    tracked = json.loads(goal_path.read_text())
+    assert tracked["status"] == "done"  # committed, not reverted
+    # The lifecycle sidecar is gitignored (the mask took effect); other
+    # untracked .drcode files stay untracked — never swept into the
+    # service commit.
+    porcelain = _porcelain(app.project_root)
+    assert f"{goal_path.stem}.state.json" not in porcelain
+    assert "?? .drcode/workflow.py" in porcelain
+
+
+async def test_dirt_outside_drcode_blocks_the_autocommit(app_env: DrCodeApp) -> None:
+    """Any dirty path outside .drcode/ means the user's own work —
+    nothing is committed and the tree stays as it is (the hook then
+    behaves exactly as before)."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    _tracked_goal_file(app)
+    readme = app.project_root / "README.md"
+    readme.write_text("user's uncommitted work")
+    before = _git_log_count(app.project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+
+    assert _git_log_count(app.project_root) == before  # no service commit
+    assert "chore(drcode)" not in "\n".join(event_texts(task))
+    assert " M README.md" in _porcelain(app.project_root)
+    assert " M .drcode/goals/" in _porcelain(app.project_root)
+
+
+async def test_untracked_drcode_files_never_committed(app_env: DrCodeApp) -> None:
+    """Untracked files under .drcode/ are never swept into the service
+    commit — only already-tracked modifications are."""
+    app = app_env
+    _workflow_file(
+        app.project_root, "def on_accepted(task):\n    return {'text': 'merged'}\n"
+    )
+    app.workflow = load_hooks(app.project_root)
+    task = finished_task(app)
+    notes = app.project_root / ".drcode" / "notes.txt"
+    notes.write_text("machine state")
+    before = _git_log_count(app.project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._run_accepted_hook(task)
+        await pilot.pause()
+
+    assert _git_log_count(app.project_root) == before
+    assert "?? .drcode/" in _porcelain(app.project_root)
+    assert "on_accepted:\nmerged" in "\n".join(event_texts(task))
 
 
 async def test_failed_hook_merge_counts_in_unmerged_completed_ids(

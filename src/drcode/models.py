@@ -456,10 +456,11 @@ class Task(BaseModel):
     # agent's create_* goal_id parameter) or by the user's explicit
     # header assign/unlink links (TaskManager.link_goal/unlink_goal)
     # — nothing else moves a task between goals. The goal's completion
-    # service event ("цель Y: n/m задач завершено") counts over the goal's
-    # linked_task_ids, which this field mirrors; a deleted goal id is
-    # tolerated at load time (the event writer just skips it), like a
-    # deleted depends_on id.
+    # service event ("цель Y: n/m задач завершено") counts over the tasks
+    # whose goal_id points at the goal (the link lives ONLY here — the
+    # goal side is derived dynamically, see drcode.models.Goal); a deleted
+    # goal id is tolerated at load time (the event writer just skips it),
+    # like a deleted depends_on id.
     goal_id: str | None = None
 
     @property
@@ -648,13 +649,17 @@ class Goal(BaseModel):
     # GoalStore.create/update) — a deleted parent id is tolerated at load
     # time, exactly like depends_on of tasks.
     parent_id: str | None = None
-    # Ids of tasks created with a reference to this goal (create_bug_report /
-    # create_feature_request `goal_id`, the new-task form): the completion
-    # service event "цель Y: n/m задач завершено" counts over this list.
-    # A re-queued completed task keeps its link; a task moves between goals
-    # only through the user's explicit Link/Unlink palette commands (the
-    # agent's create_* tools set the reference at creation only).
-    linked_task_ids: list[str] = Field(default_factory=list)
+    # The link to tasks is deliberately NOT persisted here: it is derived
+    # dynamically from Task.goal_id (the single source of truth, scanned by
+    # TaskManager.goal_progress / _goal_progress_event / the read_goal
+    # tool). A persisted back-list made the goal file mutate on every
+    # task create/link/unlink — and the goal files live under git-tracked
+    # territory in team projects, so the lifecycle state had to leave the
+    # file (see GoalStore's sidecar below). A re-queued completed task
+    # keeps its link (the field is never cleared on completion); a task
+    # moves between goals only through the user's explicit Link/Unlink
+    # palette commands (the agent's create_* tools set the reference at
+    # creation only).
     # Sibling order stamp (like Task.queue_seq for the queue): the position
     # among goals sharing the same parent_id. Assigned on creation
     # (GoalStore.create), bumped by the GoalScreen's Ctrl+Up/Down

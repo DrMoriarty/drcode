@@ -480,16 +480,16 @@ def _read_goal(deps: AgentDeps, goal_id: str) -> str:
     if children:
         lines.append("\nSub-goals:")
         lines.extend(f"- {c.summary_line()}" for c in children)
-    if goal.linked_task_ids:
+    linked = sorted(
+        (t for t in deps.manager.tasks.values() if t.goal_id == goal.id),
+        key=lambda t: t.created_at,
+    )
+    if linked:
         lines.append("\nLinked tasks:")
-        for tid in goal.linked_task_ids:
-            t = deps.manager.tasks.get(tid)
-            if t is None:
-                lines.append(f"- #{tid} (deleted)")
-            else:
-                lines.append(
-                    f"- #{tid} ({t.kind.value}, {t.status.value}): {t.title_display}"
-                )
+        for t in linked:
+            lines.append(
+                f"- #{t.id} ({t.kind.value}, {t.status.value}): {t.title_display}"
+            )
     return "\n".join(lines)
 
 

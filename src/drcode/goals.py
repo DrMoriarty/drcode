@@ -7,9 +7,21 @@ deliberately few goals (months-long roadmap items, a handful per project),
 so no indexing or in-memory caching layer is needed: the store keeps them in
 a plain dict loaded at startup, mirroring `TaskManager.tasks`.
 
-The store knows nothing about tasks or the agent layer — linking is the
-TaskManager's job (`create(goal_id=...)` appends to `linked_task_ids`);
-the store only persists and looks up goals.
+Two files per goal, split by mutability:
+
+- `<id>.json` — the roadmap content (title/description/notes/type/
+  parent/order). Team projects track it in git, so it changes ONLY on an
+  explicit roadmap edit (create, the user's/agent's update, ordering).
+- `<id>.state.json` — the volatile lifecycle state (`status`,
+  `updated_at`), gitignored (see GITIGNORE_ENTRIES). Auto-transitions
+  (the task-completion auto-done, the done-goal reactivation) and any
+  other status/touch mutation land here, so the tracked file never goes
+  dirty on its own. On load the sidecar overrides the main file; a
+  missing sidecar is seeded from whatever the main file carries.
+
+The store knows nothing about tasks or the agent layer — the link to
+tasks lives solely on the task side (`task.goal_id`); the store only
+persists and looks up goals.
 """
 
 from __future__ import annotations
@@ -17,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -24,6 +37,16 @@ from pydantic import ValidationError
 from .config import PROJECT_STATE_DIRNAME
 from .gitignore import ensure_drcode_gitignored
 from .models import Goal, GoalStatus, GoalType
+
+# Suffix of the volatile-state sidecar (gitignored, see GITIGNORE_ENTRIES).
+_STATE_SUFFIX = ".state.json"
+# Fields of Goal that never enter the (possibly git-tracked) main file:
+# the lifecycle state lives in the sidecar only.
+_VOLATILE_FIELDS: set[str] = {"status", "updated_at"}
+# Keys old goal files carried that this build no longer writes into the
+# main file. Their presence in a loaded file marks it for the one-time
+# migration: the sidecar is seeded from them and they are stripped.
+_LEGACY_MAIN_KEYS = frozenset({"linked_task_ids", "updated_at", "status"})
 
 
 class GoalStore:
@@ -39,13 +62,48 @@ class GoalStore:
         ensure_drcode_gitignored(project_root)
         self.goals: dict[str, Goal] = {g.id: g for g in self.load_all()}
 
+    def _state_path(self, goal_id: str) -> Path:
+        return self.goals_dir / f"{goal_id}{_STATE_SUFFIX}"
+
+    def _overlay_state(self, goal: Goal) -> None:
+        """Apply the sidecar's lifecycle state over the goal freshly
+        parsed from the main file (the sidecar wins — it is the write
+        target of every status/touch mutation). A missing or corrupted
+        sidecar is silently ignored: the main file's snapshot applies."""
+        try:
+            raw = json.loads(self._state_path(goal.id).read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        status = raw.get("status")
+        if isinstance(status, str):
+            try:
+                goal.status = GoalStatus(status)
+            except ValueError:
+                pass
+        updated = raw.get("updated_at")
+        if isinstance(updated, str):
+            try:
+                goal.updated_at = datetime.fromisoformat(updated)
+            except ValueError:
+                pass
+
     def _load_one(self, path: Path) -> Goal | None:
         """Parse a single goal file; None on failure. Same resilience
         contract as Storage.load_one: a corrupted file is renamed to
         `.json.bak`, an unreadable/vanished file is silently skipped —
-        startup and the agent tools run on the UI/pipeline hot paths."""
+        startup and the agent tools run on the UI/pipeline hot paths.
+
+        Also the migration point: a file carrying legacy keys
+        (`linked_task_ids`, `updated_at`, `status` — written by older
+        builds that kept the whole lifecycle state in the tracked file)
+        loads fine (the model ignores unknown fields), gets its sidecar
+        seeded from the parsed state and is rewritten ONCE without the
+        stale keys — an expected one-time diff the user commits."""
         try:
-            return Goal.model_validate(json.loads(path.read_text()))
+            raw = json.loads(path.read_text())
+            goal = Goal.model_validate(raw)
         except (json.JSONDecodeError, ValidationError):
             try:
                 os.replace(path, path.with_suffix(".json.bak"))
@@ -54,19 +112,28 @@ class GoalStore:
             return None
         except OSError:
             return None
+        if not isinstance(raw, dict):
+            raw = {}
+        self._overlay_state(goal)
+        legacy = _LEGACY_MAIN_KEYS.intersection(raw)
+        if legacy or not self._state_path(goal.id).exists():
+            # Seed the sidecar (missing, or taking over the legacy state).
+            self._write_state(goal)
+        if legacy:
+            self._rewrite_main(path, goal)
+        return goal
 
     def load_all(self) -> list[Goal]:
-        goals = [
-            g
-            for g in (self._load_one(p) for p in sorted(self.goals_dir.glob("*.json")))
-            if g is not None
+        paths = [
+            p
+            for p in sorted(self.goals_dir.glob("*.json"))
+            if not p.name.endswith(_STATE_SUFFIX)
         ]
+        goals = [g for g in (self._load_one(p) for p in paths) if g is not None]
         goals.sort(key=lambda g: g.created_at)
         return goals
 
-    def save(self, goal: Goal) -> None:
-        path = self.goals_dir / f"{goal.id}.json"
-        data = goal.model_dump_json(indent=2)
+    def _atomic_write(self, path: Path, data: str) -> None:
         # The state dir can vanish mid-session (deleted externally):
         # recreate instead of crashing the caller.
         self.goals_dir.mkdir(parents=True, exist_ok=True)
@@ -79,9 +146,57 @@ class GoalStore:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    @staticmethod
+    def _main_text(goal: Goal) -> str:
+        """The tracked file's content: the roadmap fields only — the
+        lifecycle state (status/updated_at) never lands here, so an
+        auto-transition never dirties a team's checkout."""
+        payload = goal.model_dump(mode="json", exclude=_VOLATILE_FIELDS)
+        return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+    def _write_state(self, goal: Goal) -> None:
+        payload = {
+            "status": goal.status.value,
+            "updated_at": goal.updated_at.isoformat(),
+        }
+        self._atomic_write(
+            self._state_path(goal.id),
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def _rewrite_main(self, path: Path, goal: Goal) -> None:
+        self._atomic_write(path, self._main_text(goal))
+
+    def save(self, goal: Goal) -> None:
+        """Persist a goal in full: the roadmap part into the tracked
+        `<id>.json`, the lifecycle state into the gitignored sidecar.
+        The explicit-edit path (create/update/move/reparent) — an
+        auto-transition must go through `update_status`/`save_state`
+        and leave the tracked file untouched."""
+        self._atomic_write(self.goals_dir / f"{goal.id}.json", self._main_text(goal))
+        self._write_state(goal)
+
+    def save_state(self, goal: Goal) -> None:
+        """Persist ONLY the volatile lifecycle state (the sidecar) — the
+        tracked goal file is not touched."""
+        self._write_state(goal)
+
+    def update_status(self, goal_id: str, status: GoalStatus) -> Goal:
+        """Apply a status change as a VOLATILE mutation: the in-memory
+        status and `updated_at` are stamped and only the sidecar is
+        rewritten. This is the auto-transition path (task-completion
+        auto-done, done-goal reactivation) — a tracked goal file never
+        changes here."""
+        goal = self.get(goal_id)
+        goal.status = status
+        goal.touch()
+        self.save_state(goal)
+        return goal
+
     def delete(self, goal_id: str) -> None:
         self.goals.pop(goal_id, None)
         (self.goals_dir / f"{goal_id}.json").unlink(missing_ok=True)
+        self._state_path(goal_id).unlink(missing_ok=True)
 
     # -- lookups -------------------------------------------------------------
 
@@ -217,6 +332,9 @@ class GoalStore:
             setattr(goal, key, value)
         goal.touch()
         self.save(goal)
+        # A status-only update rewrites the tracked file byte-for-byte
+        # (status lives in the sidecar) — no git dirt from a lifecycle
+        # click; a real roadmap edit is the user's explicit change.
         return goal
 
     @staticmethod

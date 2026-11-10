@@ -364,21 +364,17 @@ class TaskManager:
         """Completion listener closing the goal-planning loop: a task with a
         goal reference appends the "цель Y: n/m задач завершено" service
         event to ITS OWN chat log (human-facing, never fed to the model).
-        n = completed tasks linked to the goal, m = all tasks ever linked
-        (append-only list — a re-queued completed task keeps its link and
-        counts once, by identity). The goal may have been deleted while its
-        tasks lived: then the link is dangling and the event is skipped —
-        the deletion was a deliberate user act, not a data problem."""
+        n = completed tasks linked to the goal, m = all LIVE tasks linked
+        (scanned over `task.goal_id` — a deleted task drops out of both
+        numbers). The goal may have been deleted while its tasks lived:
+        then the link is dangling and the event is skipped — the deletion
+        was a deliberate user act, not a data problem."""
         goal = self.goals.goals.get(task.goal_id) if task.goal_id else None
         if goal is None:
             return
-        total = len(goal.linked_task_ids)
-        done = sum(
-            1
-            for tid in goal.linked_task_ids
-            if (t := self.tasks.get(tid)) is not None
-            and t.status is TaskStatus.COMPLETED
-        )
+        linked = [t for t in self.tasks.values() if t.goal_id == goal.id]
+        total = len(linked)
+        done = sum(1 for t in linked if t.status is TaskStatus.COMPLETED)
         task.events.append(
             TaskEvent(
                 kind="goals",
@@ -423,7 +419,9 @@ class TaskManager:
         DONE/ARCHIVED are left as is."""
         linked = sum(1 for t in self.tasks.values() if t.goal_id == goal.id)
         subs = len(self.goals.descendant_ids(goal.id))
-        self.goals.update(goal.id, status=GoalStatus.DONE)
+        # Auto-transition: the volatile lifecycle state goes to the
+        # gitignored sidecar only — the tracked goal file stays untouched.
+        self.goals.update_status(goal.id, GoalStatus.DONE)
         if linked and subs:
             detail = f"все {linked} связанных задач и все {subs} суб-целей завершено"
         elif subs:
@@ -587,12 +585,9 @@ class TaskManager:
         task.depends_on = cleaned_deps
         if goal_id is not None:
             task.goal_id = goal_id
-            # Append-only link: the goal's progress counter counts over this
-            # list; a re-queued completed task keeps its link.
+            # The link lives ONLY on the task side (task.goal_id) — the
+            # goal's counters derive it dynamically, nothing to append.
             goal = self.goals.get(goal_id)
-            goal.linked_task_ids.append(task.id)
-            goal.touch()
-            self.goals.save(goal)
             # A freshly created task is by definition not COMPLETED yet:
             # assigning it to a done goal re-opens the goal.
             self._goal_reactivate_if_done(goal, task)
@@ -856,7 +851,8 @@ class TaskManager:
             return
         if task.status is TaskStatus.COMPLETED:
             return
-        self.goals.update(goal.id, status=GoalStatus.ACTIVE)
+        # Auto-transition: sidecar only (the tracked goal file stays put).
+        self.goals.update_status(goal.id, GoalStatus.ACTIVE)
         task.events.append(
             TaskEvent(
                 kind="goals",
@@ -868,7 +864,7 @@ class TaskManager:
         self.storage.save(task)
         parent = self.goals.goals.get(goal.parent_id) if goal.parent_id else None
         while parent is not None and parent.status is GoalStatus.DONE:
-            self.goals.update(parent.id, status=GoalStatus.ACTIVE)
+            self.goals.update_status(parent.id, GoalStatus.ACTIVE)
             task.events.append(
                 TaskEvent(
                     kind="goals",
@@ -885,42 +881,29 @@ class TaskManager:
     def link_goal(self, task_id: str, goal_id: str) -> Task:
         """Attach a task to a goal (the header's "+ assign"/"✏"
         links). An unknown goal id raises ValueError (the caller
-        surfaces it); a previous link is replaced (the old goal's list
-        loses the id), an identical link is a no-op. The link is kept
-        two-sided: `task.goal_id` (the mirror the counters scan) and the
-        goal's append-only `linked_task_ids`."""
+        surfaces it); a previous link is replaced, an identical link is
+        a no-op. The link lives ONLY on the task side (`task.goal_id`) —
+        the goal's counters scan it dynamically, so nothing is written
+        to the goal file here."""
         task = self.get(task_id)
         if goal_id not in self.goals:
             raise ValueError(f"unknown goal id: {goal_id}")
         if task.goal_id == goal_id:
             return task
-        if task.goal_id and (old := self.goals.goals.get(task.goal_id)):
-            old.linked_task_ids = [t for t in old.linked_task_ids if t != task_id]
-            old.touch()
-            self.goals.save(old)
         task.goal_id = goal_id
         task.touch()
         self.storage.save(task)
         goal = self.goals.get(goal_id)
-        if task_id not in goal.linked_task_ids:
-            goal.linked_task_ids.append(task_id)
-            goal.touch()
-            self.goals.save(goal)
         self._goal_reactivate_if_done(goal, task)
         return task
 
     def unlink_goal(self, task_id: str) -> Task:
         """Detach the task from its goal (the header's "✕"
-        fragment): both sides of the link are cleared; unlinking a task
-        without a goal is a no-op."""
+        fragment): the link is cleared; unlinking a task without a goal
+        is a no-op."""
         task = self.get(task_id)
         if not task.goal_id:
             return task
-        goal = self.goals.goals.get(task.goal_id)
-        if goal is not None:
-            goal.linked_task_ids = [t for t in goal.linked_task_ids if t != task_id]
-            goal.touch()
-            self.goals.save(goal)
         task.goal_id = None
         task.touch()
         self.storage.save(task)

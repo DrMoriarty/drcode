@@ -62,7 +62,6 @@ def test_goal_model_defaults() -> None:
     assert g.type is GoalType.IDEA
     assert g.status is GoalStatus.ACTIVE
     assert g.parent_id is None
-    assert g.linked_task_ids == []
     assert g.description == ""
 
 
@@ -157,6 +156,89 @@ def test_goal_store_delete(project_root: Path) -> None:
     store.delete(goal.id)
     assert goal.id not in store.goals
     assert not (project_root / ".drcode" / "goals" / f"{goal.id}.json").exists()
+    assert not (project_root / ".drcode" / "goals" / f"{goal.id}.state.json").exists()
+
+
+def test_goal_store_status_lives_in_gitignored_sidecar(project_root: Path) -> None:
+    store = GoalStore(project_root)
+    goal = store.create("roadmap item")
+    store.update(goal.id, status=GoalStatus.DONE, description="shipped")
+
+    main_data = json.loads(
+        (project_root / ".drcode" / "goals" / f"{goal.id}.json").read_text()
+    )
+    assert main_data["description"] == "shipped"
+    # The tracked file carries the roadmap only — no lifecycle state.
+    for key in ("status", "updated_at", "linked_task_ids"):
+        assert key not in main_data
+    state_data = json.loads(
+        (project_root / ".drcode" / "goals" / f"{goal.id}.state.json").read_text()
+    )
+    assert state_data["status"] == "done"
+
+    reloaded = GoalStore(project_root)
+    assert reloaded.get(goal.id).status is GoalStatus.DONE
+
+
+def test_goal_store_auto_status_leaves_tracked_file_untouched(
+    project_root: Path,
+) -> None:
+    store = GoalStore(project_root)
+    goal = store.create("auto done target")
+    main_path = project_root / ".drcode" / "goals" / f"{goal.id}.json"
+    before = main_path.read_text()
+
+    store.update_status(goal.id, GoalStatus.DONE)
+    assert main_path.read_text() == before  # the tracked file did not move
+    assert store.get(goal.id).status is GoalStatus.DONE
+    reloaded = GoalStore(project_root)
+    assert reloaded.get(goal.id).status is GoalStatus.DONE
+
+
+def test_goal_store_migrates_legacy_file_once(project_root: Path) -> None:
+    goals_dir = project_root / ".drcode" / "goals"
+    goals_dir.mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "id": "legacy01",
+        "title": "Old roadmap",
+        "description": "",
+        "notes": "",
+        "type": "goal",
+        "status": "done",
+        "parent_id": None,
+        "linked_task_ids": ["deadbeef"],
+        "order": None,
+        "created_at": "2024-01-01T00:00:00",
+        "updated_at": "2024-06-01T00:00:00",
+    }
+    path = goals_dir / "legacy01.json"
+    path.write_text(json.dumps(legacy))
+
+    store = GoalStore(project_root)
+    goal = store.get("legacy01")
+    assert goal.title == "Old roadmap"
+    # The sidecar is seeded from the legacy file's own state.
+    assert goal.status is GoalStatus.DONE
+    state = json.loads((goals_dir / "legacy01.state.json").read_text())
+    assert state["status"] == "done"
+    assert state["updated_at"] == "2024-06-01T00:00:00"
+    # The one-time rewrite stripped the stale keys — an expected one-off
+    # diff the user commits.
+    data = json.loads(path.read_text())
+    for key in ("status", "updated_at", "linked_task_ids"):
+        assert key not in data
+    # Idempotent: the next load does not touch the file again.
+    mtime = path.stat().st_mtime_ns
+    again = GoalStore(project_root)
+    assert again.get("legacy01").status is GoalStatus.DONE
+    assert path.stat().st_mtime_ns == mtime
+
+
+def test_goal_state_sidecar_is_gitignored(project_root: Path) -> None:
+    (project_root / ".git").mkdir()  # GoalStore.__init__ ensures the mask
+    store = GoalStore(project_root)
+    store.create("tracked roadmap")
+    assert ".drcode/goals/*.state.json" in (project_root / ".gitignore").read_text()
 
 
 # -- TaskManager integration -----------------------------------------------------
@@ -167,10 +249,13 @@ def test_manager_create_links_task_to_goal(manager, project_root: Path) -> None:
     task = manager.create("migrate storage", "do it", goal_id=goal.id)
 
     assert task.goal_id == goal.id
-    assert goal.linked_task_ids == [task.id]
-    # Persisted on both sides.
-    reloaded = GoalStore(project_root)
-    assert task.id in reloaded.get(goal.id).linked_task_ids
+    # The link lives only on the task side — the goal's counters derive
+    # it dynamically; the tracked goal file stays untouched by the link.
+    assert manager.goal_progress(goal) == (0, 1)
+    goal_data = json.loads(
+        (project_root / ".drcode" / "goals" / f"{goal.id}.json").read_text()
+    )
+    assert "linked_task_ids" not in goal_data
     loaded_task = json.loads(
         (project_root / ".drcode" / "tasks" / f"{task.id}.json").read_text()
     )
@@ -227,7 +312,6 @@ def test_requeued_completed_task_keeps_goal_link_and_counts_once(manager) -> Non
     manager.send(task.id, "one more thing")
     assert task.status is TaskStatus.QUEUED
     assert task.goal_id == goal.id
-    assert goal.linked_task_ids == [task.id]
     manager.mark_done(task.id)
     events = [e.text for e in task.events if e.kind == "goals"]
     # Two progress events (one per completion) plus the auto-done line the
@@ -695,7 +779,7 @@ async def test_create_bug_report_links_goal(
     created = [t for t in manager.all_tasks() if t.id not in before]
     assert len(created) == 1
     assert created[0].goal_id == goal.id
-    assert created[0].id in manager.goals.get(goal.id).linked_task_ids
+    assert manager.goal_progress(goal) == (0, 1)
     assert created[0].kind is TaskKind.BUG
 
 

@@ -24,7 +24,9 @@ from pathlib import Path
 # The private subset: per-task transcripts (may contain proprietary code
 # and conversation), settings (tokens), sync bookkeeping (machine state),
 # the task-archive search index (machine state), merge-conflict triage
-# reports and pending push notifications.
+# reports, pending push notifications and the goals' volatile lifecycle
+# sidecars (the tracked goal files carry only the roadmap content —
+# auto-transitions must never dirty a team's checkout).
 GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/tasks/",
     ".drcode/settings.json",
@@ -34,6 +36,7 @@ GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/merge_reports/",
     ".drcode/stats.json",
     ".drcode/pending_notifications.json",
+    ".drcode/goals/*.state.json",
 )
 
 # Spellings of the legacy whole-directory entry older drcode versions

@@ -9,6 +9,7 @@ unmerged-work reminder and the research completion finalization.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -295,6 +296,111 @@ class PipelineHooksLayer(CoreState):
         )
         return True
 
+    # The service commit clearing `.drcode/`-only dirt before an accept
+    # hook's merge (see _commit_drcode_state). The hook scripts typically
+    # `git merge drcode/<id>` into the main checkout — a dirty checkout
+    # (goal files and friends mutated by the lifecycle) would abort the
+    # merge and park the task with hook_merge_failed.
+    _DRCODE_STATE_COMMIT_MESSAGE = "chore(drcode): project state update"
+
+    @staticmethod
+    def _porcelain_path(line: str) -> str:
+        """The path part of a `git status --porcelain` line (XY + space +
+        path), unquoted when git escaped it."""
+        path = line[3:]
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        # A rename entry reads "old -> new": the new path is what matters.
+        return path.split(" -> ", 1)[-1]
+
+    def _commit_drcode_state(self, task: Task) -> str | None:
+        """Clear the project checkout's `.drcode/`-only dirt with one
+        service commit before an accept hook runs (the guard for team
+        projects that track `.drcode/goals/*.json` in git: a lifecycle
+        mutation there would otherwise abort the hook's `git merge` and
+        park the task with `hook_merge_failed`).
+
+        Rules — deliberately narrow:
+        - ONLY when every dirty path lies under `.drcode/`; any dirt
+          outside it is the user's work — nothing is committed and the
+          hook proceeds (or fails) exactly as before;
+        - only ALREADY-TRACKED paths are staged (`git diff --name-only
+          HEAD -- .drcode/`); untracked files are left for the user to
+          commit deliberately;
+        - commit under the caller's `_accept_hook_lock` (mutual
+          exclusivity of finalizations), skipped while a merge is in
+          progress;
+        - fail-open: any git failure yields a warning announcement, never
+          an exception — the hook then behaves as it always did.
+
+        Returns the service-event text (None when there was nothing to
+        do) — the CALLER shows it: this method runs in a worker thread
+        and must not touch the Textual UI. Blocking git — call through
+        asyncio.to_thread."""
+        root = self.project_root
+        if not (root / ".git").exists() or merge_in_progress(root):
+            return None
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        try:
+            status = git("status", "--porcelain")
+            if status.returncode != 0 or not status.stdout.strip():
+                return None
+            dirty = [self._porcelain_path(line) for line in status.stdout.splitlines()]
+            if any(not path.startswith(".drcode/") for path in dirty):
+                return None
+            # Tracked modifications under .drcode/ (staged or not);
+            # untracked files never appear here — they stay untouched.
+            tracked = git(
+                "diff", "--name-only", "HEAD", "--", ".drcode/"
+            ).stdout.splitlines()
+            if not tracked:
+                return None
+            staged = git("add", "--", *tracked)
+            if staged.returncode != 0:
+                return (
+                    "Could not stage .drcode/ state before the hook merge "
+                    f"(continuing as is): {staged.stderr.strip()}"
+                )
+            committed = git(
+                "commit",
+                "-m",
+                self._DRCODE_STATE_COMMIT_MESSAGE,
+                "--",
+                *tracked,
+            )
+            if committed.returncode == 0:
+                return (
+                    ".drcode/-only dirt committed before the hook merge "
+                    f"({self._DRCODE_STATE_COMMIT_MESSAGE}): "
+                    f"{', '.join(tracked)}"
+                )
+            return (
+                "Could not commit .drcode/ state before the hook merge "
+                f"(continuing as is): {committed.stderr.strip()}"
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return (
+                "Could not commit .drcode/ state before the hook merge "
+                f"(continuing as is): {e}"
+            )
+
+    async def _autocommit_drcode_state(self, task: Task) -> None:
+        """The event-loop half of _commit_drcode_state: run the blocking
+        git in a worker thread, then announce the outcome as a service
+        event (UI work belongs on the event loop)."""
+        text = await asyncio.to_thread(self._commit_drcode_state, task)
+        if text:
+            self._show_event(task, text, kind="workflow")
+
     async def _run_accepted_hook(self, task: Task) -> None:
         """`on_accepted` after an accept verdict (merge the PR, delete the
         branch, …). Its text goes to the service-event log. Never fatal.
@@ -316,6 +422,9 @@ class PipelineHooksLayer(CoreState):
         if await self._guard_wrong_fork_merge(task, "on_accepted"):
             return
         async with self._accept_hook_lock:
+            # The .drcode/-only dirt (goal lifecycle mutations and friends)
+            # must not abort the hook's merge into the shared checkout.
+            await self._autocommit_drcode_state(task)
             cwd, wt = self._hook_env(task)
             result = await workflow.call("on_accepted", task, cwd=cwd, worktree=wt)
             self._record_hook_merge_outcome(task, result)
@@ -354,6 +463,9 @@ class PipelineHooksLayer(CoreState):
         if await self._guard_wrong_fork_merge(task, "on_research_accepted"):
             return
         async with self._accept_hook_lock:
+            # The .drcode/-only dirt (goal lifecycle mutations and friends)
+            # must not abort the hook's merge into the shared checkout.
+            await self._autocommit_drcode_state(task)
             project: dict[str, Any] = {"path": str(self.project_root)}
             if self.task_env.available:
                 project["base_branch"] = await asyncio.to_thread(

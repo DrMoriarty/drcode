@@ -451,8 +451,9 @@ def _list_goals(deps: AgentDeps, include_done: bool = False) -> str:
 
 def _read_goal(deps: AgentDeps, goal_id: str) -> str:
     """Full goal details for the research agent: description (untruncated),
-    decomposition (parent/children), linked tasks with their live status.
-    Raises ValueError (→ ModelRetry via _run_tool) on an unknown id."""
+    the detailed notes, decomposition (parent/children), linked tasks with
+    their live status. Raises ValueError (→ ModelRetry via _run_tool) on an
+    unknown id."""
     try:
         goal = deps.manager.goals.get(goal_id.strip())
     except KeyError:
@@ -465,6 +466,8 @@ def _read_goal(deps: AgentDeps, goal_id: str) -> str:
     ]
     if goal.description.strip():
         lines += ["", "Description:", goal.description.strip()]
+    if goal.notes.strip():
+        lines += ["", "Notes:", goal.notes.strip()]
     if goal.parent_id is not None:
         parent = store.goals.get(goal.parent_id)
         label = (
@@ -518,18 +521,24 @@ def _create_goal(
     deps: AgentDeps,
     title: str,
     description: str = "",
+    notes: str = "",
     goal_type: str = GoalType.IDEA.value,
     parent_id: str | None = None,
 ) -> str:
     """Agent-side goal creation (research role only).
 
-    Raises ValueError (→ ModelRetry via _run_tool) for a bad type or an
-    unknown parent id. Every agent-made change is logged as a service event
-    in the task's chat — never silent."""
+    `description` is the SHORT 1–2-line summary injected into the system
+    prompt (trimmed to _GOAL_PROMPT_CAP=160 chars there); `notes` is the
+    detailed free-form (markdown) description the agent reads ONLY via
+    read_goal — it never enters the system prompt. Raises ValueError
+    (→ ModelRetry via _run_tool) for a bad type or an unknown parent id.
+    Every agent-made change is logged as a service event in the task's
+    chat — never silent."""
     parsed_type = _parse_goal_type(goal_type)
     goal = deps.manager.goals.create(
         title,
         description=description,
+        notes=notes,
         parent_id=parent_id,
         origin="agent",
     )
@@ -553,6 +562,7 @@ def _update_goal(
     *,
     title: str | None = None,
     description: str | None = None,
+    notes: str | None = None,
     goal_type: str | None = None,
     status: str | None = None,
     parent_id: str | None = None,
@@ -560,10 +570,13 @@ def _update_goal(
     """Agent-side partial goal update (research role only).
 
     Only the explicitly passed fields change; `parent_id=""` detaches the
-    goal from its parent. Raises ValueError (→ ModelRetry via _run_tool)
-    for an unknown goal id, bad enum values, unknown parent or a cycle in
-    the decomposition. The change is logged as a service event — never
-    silent."""
+    goal from its parent. `description` is the SHORT 1–2-line summary that
+    enters the system prompt (trimmed to 160 chars there); `notes` is the
+    detailed free-form (markdown) description the agent reads ONLY via
+    read_goal — it never enters the system prompt. Raises ValueError
+    (→ ModelRetry via _run_tool) for an unknown goal id, bad enum values,
+    unknown parent or a cycle in the decomposition. The change is logged
+    as a service event — never silent."""
     goal_id = goal_id.strip()
     if goal_id not in deps.manager.goals:
         raise ValueError(f"unknown goal id: {goal_id}")
@@ -575,6 +588,9 @@ def _update_goal(
     if description is not None:
         fields["description"] = description.strip()
         changes.append("описание")
+    if notes is not None:
+        fields["notes"] = notes.strip()
+        changes.append("заметки")
     if goal_type is not None:
         parsed_type = _parse_goal_type(goal_type)
         fields["type"] = parsed_type
@@ -593,7 +609,7 @@ def _update_goal(
     if not fields:
         raise ValueError(
             "update_goal: nothing to change — pass at least one field "
-            "(title, description, goal_type, status, parent_id)."
+            "(title, description, notes, goal_type, status, parent_id)."
         )
     goal = deps.manager.goals.update(goal_id, **fields)
     log_service_event(

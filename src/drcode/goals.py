@@ -155,6 +155,7 @@ class GoalStore:
         title: str,
         *,
         description: str = "",
+        notes: str = "",
         parent_id: str | None = None,
         origin: str = "user",
     ) -> Goal:
@@ -162,12 +163,17 @@ class GoalStore:
         an existing goal (ValueError otherwise — the TUI form and the agent
         tool both surface it). The type is not taken here: a freshly
         captured item starts as an IDEA (the capture form asks for the
-        title only; classification is refined later via update_goal)."""
+        title only; classification is refined later via update_goal).
+        `description` is the short 1–2-line summary injected into the
+        system prompt; `notes` is the detailed free-form description the
+        agent reads via read_goal — it never enters the prompt."""
         cleaned_parent = parent_id.strip() if parent_id else None
         if cleaned_parent and cleaned_parent not in self.goals:
             raise ValueError(f"unknown parent goal id: {cleaned_parent}")
         goal = Goal(
-            title=title.strip() or "Untitled goal", description=description.strip()
+            title=title.strip() or "Untitled goal",
+            description=description.strip(),
+            notes=notes.strip(),
         )
         goal.parent_id = cleaned_parent or None
         goal.order = self._next_order(goal.parent_id)

@@ -737,11 +737,12 @@ def build_agent(
 
         @agent.tool
         async def read_goal(ctx: RunContext[AgentDeps], goal_id: str) -> str:
-            """Read ONE goal in full: the complete description, its parent
-            and sub-goals (the decomposition), and every linked task with
-            its live status/kind. `goal_id` is the short id from the goals
-            block or list_goals. Use it before planning against a goal —
-            the system prompt only carries a 1–2-line description excerpt."""
+            """Read ONE goal in full: the complete description, the detailed
+            notes, its parent and sub-goals (the decomposition), and every
+            linked task with its live status/kind. `goal_id` is the short id
+            from the goals block or list_goals. Use it before planning
+            against a goal — the system prompt only carries a 1–2-line
+            description excerpt; the full detail lives in `notes`."""
             return await _run_tool(_read_goal, ctx.deps, goal_id)
 
         @agent.tool(sequential=True)
@@ -749,20 +750,32 @@ def build_agent(
             ctx: RunContext[AgentDeps],
             title: str,
             description: str = "",
+            notes: str = "",
             goal_type: str = "idea",
             parent_id: str | None = None,
         ) -> str:
             """Create a product goal in the registry (available only to you,
             the research agent). Use ONLY when the user explicitly asked for
             it or picked it in a clarification answer — never silently.
-            `title` is required; `description` (optional) states what and
-            why; `goal_type` is "idea" (a captured thought), "goal" (an
-            approved direction) or "milestone" (a decomposable checkpoint —
-            give it sub-goals via parent_id); `parent_id` (optional) makes
-            the new goal a sub-goal of an existing one (decomposition).
+            `title` is required; `description` is the SHORT 1–2-line summary
+            of what and why — it enters the system prompt and gets trimmed
+            to ~160 characters there, so keep it brief; `notes` (optional)
+            is the detailed free-form description (markdown allowed) — the
+            agent reads it back ONLY via read_goal, it never enters the
+            system prompt, so put all the detail here; `goal_type` is
+            "idea" (a captured thought), "goal" (an approved direction) or
+            "milestone" (a decomposable checkpoint — give it sub-goals via
+            parent_id); `parent_id` (optional) makes the new goal a sub-goal
+            of an existing one (decomposition).
             Every creation is logged into the chat's service events."""
             return await _run_tool(
-                _create_goal, ctx.deps, title, description, goal_type, parent_id
+                _create_goal,
+                ctx.deps,
+                title,
+                description,
+                notes,
+                goal_type,
+                parent_id,
             )
 
         @agent.tool(sequential=True)
@@ -771,13 +784,18 @@ def build_agent(
             goal_id: str,
             title: str | None = None,
             description: str | None = None,
+            notes: str | None = None,
             goal_type: str | None = None,
             status: str | None = None,
             parent_id: str | None = None,
         ) -> str:
             """Update ONE goal's fields (only the ones you pass change):
-            `title`, `description`, `goal_type` (idea/goal/milestone),
-            `status` (active/done/archived) or `parent_id` (decomposition —
+            `title`, `description` (the SHORT 1–2-line summary that enters
+            the system prompt, trimmed to ~160 chars there — keep it
+            brief), `notes` (the detailed free-form description (markdown)
+            the agent reads ONLY via read_goal — it never enters the
+            system prompt), `goal_type` (idea/goal/milestone), `status`
+            (active/done/archived) or `parent_id` (decomposition —
             pass "" to detach from the parent). Available only to you, the
             research agent; use ONLY when the user asked for it or picked
             the change in a clarification answer (e.g. after they chose a
@@ -790,6 +808,7 @@ def build_agent(
                 goal_id,
                 title=title,
                 description=description,
+                notes=notes,
                 goal_type=goal_type,
                 status=status,
                 parent_id=parent_id,

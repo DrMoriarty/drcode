@@ -558,6 +558,9 @@ def build_agent(
             search_task_history output) the new task must wait for — it is not
             promoted until every listed task is COMPLETED and, under worktree
             isolation, its drcode/<id> branch is merged into the base branch.
+            depends_on is also for PHYSICAL overlap: tasks editing the same
+            files must be chained even if functionally independent, so their
+            branches never merge concurrently.
             Optional `goal_id`: the id of a product goal (see the goals block)
             this bug fix serves — the task joins that goal's progress count.
             The returned id lets you chain subsequent creations on it."""
@@ -592,6 +595,9 @@ def build_agent(
             search_task_history output) the new task must wait for — it is not
             promoted until every listed task is COMPLETED and, under worktree
             isolation, its drcode/<id> branch is merged into the base branch.
+            depends_on is also for PHYSICAL overlap: tasks editing the same
+            files must be chained even if functionally independent, so their
+            branches never merge concurrently.
             Optional `goal_id`: the id of a product goal (see the goals block)
             this feature serves — the task joins that goal's progress count.
             The returned id lets you chain subsequent creations on it."""
@@ -620,7 +626,10 @@ def build_agent(
             isolation, its drcode/<id> branch is merged into the base branch.
             Use it to link a task to an older one that existed before this
             run; for a task you create yourself, prefer the depends_on
-            parameter of create_bug_report/create_feature_request."""
+            parameter of create_bug_report/create_feature_request.
+            Dependencies also cover PHYSICAL overlap: a task editing the
+            same files as another must wait for it even if functionally
+            independent, so their branches never merge concurrently."""
             return await _run_tool(_set_task_dependencies, ctx.deps, task_id, deps)
 
         # The commit tool follows the project's research git policy:

@@ -242,6 +242,27 @@ def test_research_prompt_initiative_boundary() -> None:
     assert "~5–10-word imperative label" in research
 
 
+def test_research_prompt_teaches_dependency_chaining() -> None:
+    """The research prompt carries the physical-overlap rule next to the
+    task-creation block: several created tasks touching the same files are
+    chained with depends_on in implementation order even when functionally
+    independent — "independent" is not "mergeable in parallel" (#260aa4b8:
+    three file-identical features filed without deps conflicted on merge,
+    the resolver cost more than the development)."""
+    from drcode.prompts import RESEARCH_SYSTEM_PROMPT
+
+    research = " ".join(RESEARCH_SYSTEM_PROMPT.split())
+    assert "chain them with depends_on" in research
+    assert "even when they are functionally independent" in research
+    assert 'is NOT "mergeable in parallel"' in research
+    assert "conflict on merge" in research
+    # The rule sits in the task-creation section (next to the STRICT RULE
+    # about when a task may be created at all), not in some other block.
+    assert research.index("STRICT RULE: create a task only") < research.index(
+        "chain them with depends_on"
+    )
+
+
 def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
     """The coding agents' prompts (bug/feature) carry the same rule next to
     their ask_clarifying_question mention: options keep requested work

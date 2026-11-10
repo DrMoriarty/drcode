@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic_ai import Agent
 
+import drcode.core.pipeline_resolver as pr
+from drcode import merge_resolver as mr
+from drcode.agent import ResolutionVerdict, ResolverDeps
+from drcode.config import Config
 from drcode.models import TaskKind
 from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment
@@ -159,3 +164,118 @@ async def test_retry_survives_stale_needs_human(
             what="second retry announcement",
         )
         assert app._resolver_net_count.get(task.id) == 2
+
+
+# -- window-aware chunked intent review (the review funnel's level 3) -----------------
+
+
+class _FakeReviewer:
+    """Stands in for `build_resolver_reviewer_agent`: records its prompts
+    and reports a scripted verdict per chunk (no model calls)."""
+
+    def __init__(self, labels: list[str], reports: list[str]) -> None:
+        self._labels = labels
+        self._reports = reports
+        self.prompts: list[str] = []
+
+    async def run(self, prompt: str, deps: Any = None, usage_limits: Any = None) -> Any:
+        index = len(self.prompts)
+        self.prompts.append(prompt)
+        deps.verdicts.append(
+            ResolutionVerdict(
+                resolved=self._labels[index] == "intact",
+                report=self._reports[index],
+                label=self._labels[index],
+            )
+        )
+        return SimpleNamespace(usage=None)
+
+
+@pytest.fixture
+def conflicted_two_files(isolated: Path) -> Any:
+    """A task whose branch diverged from the base in TWO files with large
+    differing content — enough for the window-aware review to split into
+    two chunks under a small budget."""
+    manager = TaskManager(isolated)
+    task = manager.create("Fix the conflicts", "fix the conflicts")
+    task.kind = TaskKind.BUG
+    manager.storage.save(task)
+    env = TaskEnvironment(
+        isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+    )
+    wt, _ = env.ensure_root(task.id)
+    for name in ("left.txt", "right.txt"):
+        (wt / name).write_text(
+            "".join(f"task line {i:03d}\n" for i in range(400)) + f"shared {name}\n"
+        )
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-q", "-m", "task work")
+    for name in ("left.txt", "right.txt"):
+        (isolated / name).write_text(
+            "".join(f"base line {i:03d}\n" for i in range(400)) + f"shared {name}\n"
+        )
+    _git(isolated, "add", "-A")
+    _git(isolated, "commit", "-q", "-m", "base work")
+    return task, wt
+
+
+async def test_review_chunking_aggregates_verdicts(
+    isolated: Path,
+    conflicted_two_files: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The intent review is window-aware: a small reviewer window splits
+    the two-file review into two chunk prompts, and a 'lost' chunk folds
+    the aggregate verdict to 'lost' (the commit is blocked)."""
+    task, wt = conflicted_two_files
+    # Park the real conflict (the engine's reversed merge)...
+    report = mr.prepare(isolated, task.id, wt, "main")
+    assert report.ok and report.conflicted
+    # ...and "resolve" it by hand: the union of both sides, no markers —
+    # levels 1-2 of the funnel pass (no .py files, no tests/ dir).
+    for name in ("left.txt", "right.txt"):
+        (wt / name).write_text("task line 000\nbase line 000\nshared " + name + "\n")
+
+    # A small reviewer window (with a shrunk overhead reserve) forces the
+    # two ~11k-char file diffs into two chunks under the ~14.7k-char budget.
+    monkeypatch.setattr(mr, "_REVIEW_OVERHEAD_TOKENS", 400)
+    fake_cfg = Config(
+        project_root=isolated,
+        model="mock-model",
+        api_key="mock-key",
+        max_context_tokens=5000,
+    )
+
+    fake = _FakeReviewer(
+        ["lost", "intact"],
+        ["left.txt: the base-side notification wiring was dropped", "clean"],
+    )
+    monkeypatch.setattr(
+        pr, "build_resolver_reviewer_agent", lambda config, root=None: fake
+    )
+
+    app = DrCodeApp(isolated)
+    app.resolved_config = lambda role: fake_cfg  # type: ignore[method-assign]
+
+    deps = ResolverDeps(
+        root=wt, manager=app.manager, task_id=task.id, scratch=wt / ".s"
+    )
+    deps.verdicts.append(
+        ResolutionVerdict(resolved=True, report="wove both sides", label="resolved")
+    )
+    outcome = await app._verify_resolution(task, wt, report, deps)
+
+    # One reviewer prompt per chunk, each scoped to its own file.
+    assert len(fake.prompts) == 2
+    assert "Review chunk 1/2" in fake.prompts[0] and "left.txt" in fake.prompts[0]
+    assert "Review chunk 2/2" in fake.prompts[1] and "right.txt" in fake.prompts[1]
+    assert "judge ONLY" in fake.prompts[0]
+    # Any 'lost' chunk → the aggregate verdict is 'lost', with the chunk
+    # map and the losing chunk's report in the funnel output.
+    assert outcome.review_verdict == "lost"
+    assert "review split into 2 chunks" in outcome.review_report
+    assert "wiring was dropped" in outcome.review_report
+    # A lost review blocks the auto-commit.
+    assert outcome.verdict == "needs-human"
+    assert not outcome.committed

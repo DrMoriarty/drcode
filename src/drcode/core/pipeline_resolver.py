@@ -17,7 +17,11 @@ The funnel (all of it must pass before anything is committed):
 3. the project's test suite in the resolved tree;
 4. the intent-preservation review: a read-only reviewer pass receives
    diff(resolved, ours) and diff(resolved, theirs) and answers whether a
-   piece of either side was lost (the #6c065401 incident class).
+   piece of either side was lost (the #6c065401 incident class). The
+   review is window-aware: the diff budget derives from the reviewer
+   model's context window and a many-file conflict is reviewed in
+   several self-contained chunks whose verdicts fold (any 'lost' →
+   'lost', else any 'unsure' → 'unsure').
 
 Before the funnel a SCOPE GUARD rejects the round outright when the
 worktree carries changes outside the triage report's paths (the
@@ -67,6 +71,8 @@ from ..core.usage import (
 from ..merge_engine import MergeReport, in_progress, remove_report, report_path
 from ..merge_resolver import (
     ResolverOutcome,
+    ReviewChunk,
+    aggregate_review_verdicts,
     build_agent_context,
     conclude,
     dirty_paths,
@@ -74,7 +80,8 @@ from ..merge_resolver import (
     out_of_scope_changes,
     prepare,
     restore_conflict,
-    review_diffs,
+    review_char_budget,
+    review_diff_chunks,
     run_test_suite,
     stage_resolved,
 )
@@ -98,6 +105,66 @@ _MAX_RESOLVER_ATTEMPTS = 5
 _MAX_RESOLVER_NETWORK_ATTEMPTS = NETWORK_RETRIES * 3
 # Base of the capped exponential backoff between attempts (5, 10, 20 ... s).
 _RETRY_BASE_DELAY_S = 5.0
+
+
+# -- intent-preservation review (level 3 of the funnel) ------------------------------
+
+
+def _review_chunk_prompt(
+    task: Task,
+    report: MergeReport,
+    agent_report: str,
+    chunk: ReviewChunk,
+    index: int,
+    total: int,
+) -> str:
+    """One reviewer prompt for one chunk. A single-chunk review keeps the
+    historical shape; a multi-chunk one names the chunk's file scope
+    explicitly — the reviewer must judge ONLY its chunk (the remaining
+    conflicted files are reviewed in their own chunks and the verdicts
+    fold in the pipeline)."""
+    lines = [f"Task #{task.id}: {task.title}"]
+    if total > 1:
+        lines.append(
+            f"Review chunk {index + 1}/{total} — judge ONLY these files: "
+            + ", ".join(chunk.paths)
+        )
+    lines.append(f"Conflicted files: {', '.join(f.path for f in report.files)}")
+    lines.append("")
+    lines.append("The resolver's own report of what it did:")
+    lines.append(agent_report[:4000])
+    lines.append("")
+    lines.append(
+        f"=== diff(resolved, ours) — changes relative to the task "
+        f"branch {report.branch} ==="
+    )
+    lines.append(chunk.ours or "(no differences)")
+    lines.append("")
+    lines.append(
+        f"=== diff(resolved, theirs) — changes relative to the base "
+        f"branch {report.base_branch} ==="
+    )
+    lines.append(chunk.theirs or "(no differences)")
+    lines.append("")
+    if total > 1:
+        lines.append(
+            "Deliver your verdict with set_review — scope: only the "
+            "chunk's files named above (the remaining conflicted files "
+            "are reviewed in separate chunks)."
+        )
+    else:
+        lines.append("Deliver your verdict with set_review.")
+    return "\n".join(lines)
+
+
+def _review_chunk_map(chunks: list[ReviewChunk]) -> str:
+    """Header of a multi-chunk review report: which chunk covered which
+    files — the service-event reader must be able to reconstruct the
+    scope behind every per-chunk verdict."""
+    lines = [f"review split into {len(chunks)} chunks:"]
+    for i, chunk in enumerate(chunks):
+        lines.append(f"  chunk {i + 1}: {', '.join(chunk.paths)}")
+    return "\n".join(lines) + "\n\n"
 
 
 class PipelineResolverLayer(CoreState):
@@ -689,57 +756,67 @@ class PipelineResolverLayer(CoreState):
         outcome.tests = await asyncio.to_thread(run_test_suite, root)
         if not outcome.tests.ok and not outcome.tests.skipped:
             return outcome
-        # Level 3: intent-preservation review.
-        ours_diff, theirs_diff = await asyncio.to_thread(
-            review_diffs,
+        # Level 3: intent-preservation review — window-aware and chunked.
+        # The diff budget derives from the reviewer model's context window
+        # (the legacy REVIEW_DIFF_CHAR_CAP is only the unknown-window
+        # fallback); when the diffs still overflow it, the review runs once
+        # per chunk of conflicted paths and the verdicts fold: any 'lost'
+        # chunk → 'lost', else any 'unsure' → 'unsure', else 'intact'.
+        cfg = self.resolved_config(AgentRole.RESOLVER)
+        chunks = await asyncio.to_thread(
+            review_diff_chunks,
             root,
             [f.path for f in report.files],
+            review_char_budget(cfg.max_context_tokens),
         )
-        reviewer = build_resolver_reviewer_agent(
-            self.resolved_config(AgentRole.RESOLVER), root=root
-        )
+        reviewer = build_resolver_reviewer_agent(cfg, root=root)
         rdeps = ResolverDeps(
             root=root,
             manager=self.manager,
             task_id=task.id,
             scratch=scratch_dir(task.id),
         )
-        prompt = (
-            f"Task #{task.id}: {task.title}\n"
-            f"Conflicted files: {', '.join(f.path for f in report.files)}\n\n"
-            f"The resolver's own report of what it did:\n"
-            f"{outcome.agent_report[:4000]}\n\n"
-            f"=== diff(resolved, ours) — changes relative to the task "
-            f"branch {report.branch} ===\n"
-            f"{ours_diff or '(no differences)'}\n\n"
-            f"=== diff(resolved, theirs) — changes relative to the base "
-            f"branch {report.base_branch} ===\n"
-            f"{theirs_diff or '(no differences)'}\n\n"
-            f"Deliver your verdict with set_review."
+        results: list[tuple[str, str]] = []
+        for index, chunk in enumerate(chunks):
+            prompt = _review_chunk_prompt(
+                task, report, outcome.agent_report, chunk, index, len(chunks)
+            )
+            try:
+                result = await reviewer.run(
+                    prompt,
+                    deps=rdeps,
+                    usage_limits=UsageLimits(request_limit=self.config.request_limit),
+                )
+                self._record_session_usage(
+                    result.usage,
+                    AgentRole.RESOLVER,
+                    self.resolved_model_key(AgentRole.RESOLVER),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - a failed review blocks the commit
+                results.append(
+                    (
+                        "unsure",
+                        (
+                            f"chunk {index + 1}/{len(chunks)}: the reviewer pass "
+                            f"failed ({type(e).__name__}: {e}) — treated as unsure"
+                        ),
+                    )
+                )
+                break
+            rverdict = rdeps.verdicts[-1] if rdeps.verdicts else None
+            results.append(
+                (
+                    rverdict.label if rverdict else "unsure",
+                    rverdict.report if rverdict else "",
+                )
+            )
+        outcome.review_verdict, outcome.review_report = aggregate_review_verdicts(
+            results
         )
-        try:
-            result = await reviewer.run(
-                prompt,
-                deps=rdeps,
-                usage_limits=UsageLimits(request_limit=self.config.request_limit),
-            )
-            self._record_session_usage(
-                result.usage,
-                AgentRole.RESOLVER,
-                self.resolved_model_key(AgentRole.RESOLVER),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - a failed review blocks the commit
-            outcome.review_verdict = "unsure"
-            outcome.review_report = (
-                f"the reviewer pass failed ({type(e).__name__}: {e}) — "
-                "treated as unsure"
-            )
-            return outcome
-        rverdict = rdeps.verdicts[-1] if rdeps.verdicts else None
-        outcome.review_verdict = rverdict.label if rverdict else "unsure"
-        outcome.review_report = rverdict.report if rverdict else ""
+        if len(chunks) > 1:
+            outcome.review_report = _review_chunk_map(chunks) + outcome.review_report
         if outcome.review_verdict == "intact":
             outcome.verdict = "resolved"
         return outcome

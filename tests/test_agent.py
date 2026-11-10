@@ -546,6 +546,44 @@ def test_unwrap_summary_envelope_json_without_summary_key() -> None:
     assert unwrap_summary_envelope(text) == text
 
 
+def test_unwrap_summary_envelope_unclosed_fence() -> None:
+    # Truncated output: opening ```json fence without the closing one —
+    # the leading fence line is still stripped.
+    text = '```json\n{"summary": "## Goal\\n- Verify x"}'
+    assert unwrap_summary_envelope(text) == "## Goal\n- Verify x"
+
+
+def test_unwrap_summary_envelope_unclosed_fence_broken_json() -> None:
+    # The #9c3236e8 case: unclosed fence AND invalid JSON — unescaped double
+    # quotes inside the "summary" value. Soft shape-match recovers the text.
+    raw = '```json\n{"summary": "## Goal\\n- Moved to "raw" bag\\n- Then "done" again"}'
+    assert (
+        unwrap_summary_envelope(raw)
+        == '## Goal\n- Moved to "raw" bag\n- Then "done" again'
+    )
+
+
+def test_unwrap_summary_envelope_broken_json_no_fence() -> None:
+    # Same broken envelope without any fence: still recovered.
+    raw = '{"summary": "line one\\nquote "here" stays"}'
+    assert unwrap_summary_envelope(raw) == 'line one\nquote "here" stays'
+
+
+def test_unwrap_summary_envelope_closed_fence_still_unwrapped() -> None:
+    # Regression guard: the closed-fence path keeps working after the
+    # unclosed-fence change.
+    text = '```json\n{"summary": "## Goal\\n- Verify x"}\n```'
+    assert unwrap_summary_envelope(text) == "## Goal\n- Verify x"
+    assert unwrap_summary_envelope("```\n## Goal\n- x\n```") == "## Goal\n- x"
+
+
+def test_unwrap_summary_envelope_broken_envelope_non_summary_passthrough() -> None:
+    # A broken (unparsable) object that is NOT the summary envelope shape
+    # must not be silently mangled.
+    raw = '{"title": "quoted "text" here"}'
+    assert unwrap_summary_envelope(raw) == raw
+
+
 def test_render_history_for_summary() -> None:
     data = serialize_messages(
         [

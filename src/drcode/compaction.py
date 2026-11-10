@@ -11,6 +11,7 @@ history and returns a summary string.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic_ai import Agent
@@ -655,6 +656,56 @@ def compacted_messages(
     return preserved + serialize_messages([request])
 
 
+# Shape of a {"summary": "<text>"} envelope whose value is not strict JSON
+# (e.g. unescaped double quotes inside the string): match the value up to the
+# LAST quote before the closing brace instead of failing on the first one.
+_BROKEN_SUMMARY_ENVELOPE_RE = re.compile(
+    r'^\{\s*"summary"\s*:\s*"(.*)"\s*\}\s*$', re.DOTALL
+)
+
+_STANDARD_JSON_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": "\b",
+    "f": "\f",
+}
+
+_JSON_ESCAPE_RE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)", re.DOTALL)
+
+
+def _decode_json_escapes(raw: str) -> str:
+    """Decode the standard JSON escapes the model actually emits in a
+    string value (\\n, \\", \\\\, plus \\uXXXX and friends). Unknown or lone
+    sequences are kept verbatim — a soft fallback must never destroy data."""
+
+    def _sub(match: re.Match[str]) -> str:
+        seq = match.group(1)
+        if seq[0] == "u":
+            return chr(int(seq[1:], 16))
+        return _STANDARD_JSON_ESCAPES.get(seq, "\\" + seq)
+
+    return _JSON_ESCAPE_RE.sub(_sub, raw)
+
+
+def _recover_broken_summary_envelope(text: str) -> str | None:
+    """Soft fallback for a {"summary": "<text>"} envelope that strict JSON
+    parsing rejected (unescaped quotes inside the value): extract the value
+    between the opening quote and the LAST quote before the closing brace
+    and decode its standard escapes. None when the text is not that shape."""
+
+    match = _BROKEN_SUMMARY_ENVELOPE_RE.match(text)
+    if match is None:
+        return None
+    value = _decode_json_escapes(match.group(1)).strip()
+    if not value:
+        return None
+    return value
+
+
 def unwrap_summary_envelope(text: str) -> str:
     """Normalize a summarizer output: undo the formatting envelope when the
     model ignored the markdown template.
@@ -666,12 +717,16 @@ def unwrap_summary_envelope(text: str) -> str:
     <previous-summary> anchor of the next compaction (the envelope then
     travels along the whole anchor chain), and bloats every resumed round.
 
-    Undo, in order: strip a leading/trailing markdown fence around the WHOLE
-    text (inner fences stay untouched); if what remains parses as a JSON
-    object, return its "summary" field when it is a string, else its single
-    string-valued field. Anything else — plain markdown, non-dict JSON, an
-    object with several string fields and no "summary" — passes through
-    unchanged.
+    Undo, in order: strip a leading markdown fence line (``` or ```json/
+    ```markdown) — the closing fence too when present, but a truncated
+    output with the opening fence alone is stripped as well; if what remains
+    parses as a JSON object, return its "summary" field when it is a string,
+    else its single string-valued field. Strict parsing fails on envelopes
+    the model emitted with unescaped quotes inside the "summary" value
+    (invalid JSON by construction); those are recovered by a soft shape
+    match ({"summary": "<text>"}) with the standard JSON escapes decoded.
+    Anything else — plain markdown, non-dict JSON, an object with several
+    string fields and no "summary" — passes through unchanged.
     """
     stripped = text.strip()
     if not stripped:
@@ -679,13 +734,20 @@ def unwrap_summary_envelope(text: str) -> str:
     fenced = False
     if stripped.startswith("```"):
         lines = stripped.splitlines()
-        # Opening fence (``` or ```json/```markdown) + closing fence only.
-        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
-            stripped = "\n".join(lines[1:-1]).strip()
+        if len(lines) >= 2:
+            # Opening fence (``` or ```json/```markdown); the closing fence
+            # only when present — a truncated envelope is still fenced.
+            if lines[-1].strip().startswith("```"):
+                stripped = "\n".join(lines[1:-1]).strip()
+            else:
+                stripped = "\n".join(lines[1:]).strip()
             fenced = True
     try:
         data = json.loads(stripped)
     except ValueError:
+        recovered = _recover_broken_summary_envelope(stripped)
+        if recovered is not None:
+            return recovered
         # Not JSON: keep the fence-stripped text when a fence was removed,
         # otherwise pass the output through unchanged.
         return stripped if fenced else text

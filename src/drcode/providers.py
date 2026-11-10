@@ -17,8 +17,9 @@ connection (the json layers no longer provide its model fields — see
 2. A project-level selection of the model per agent role (coding / research /
    tester / compaction) stored under the optional `models` key of
    `<project>/.drcode/drcode.json`: either a catalog reference of the form
-   `"<provider-name>/<model-id>"` (neither provider names nor model ids may
-   contain `/`) or the string `"custom"` — use the per-role free-form model
+   `"<provider-name>/<model-id>"` (provider names must not contain `/`;
+   model ids may — a reference is always split at the FIRST slash) or the
+   string `"custom"` — use the per-role free-form model
    stored under the sibling `custom_models[role]` key (all six connection
    fields: model/base_url/api_key/health_check_url/max_context_tokens/
    max_tokens). A `null` / absent slot means "use the user-level default".
@@ -108,8 +109,9 @@ def user_models_file() -> Path:
 
 def _reject_slash(value: str) -> str:
     """Shared validator body: `/` is the separator of the
-    "<provider>/<model-id>" reference format and is forbidden in both
-    halves."""
+    "<provider>/<model-id>" reference format and is forbidden in provider
+    NAMES (its head). Model ids may contain `/` — a reference is split at
+    the first slash, so the id is everything after it."""
     if "/" in value:
         raise ValueError("must not contain '/'")
     return value
@@ -118,8 +120,9 @@ def _reject_slash(value: str) -> str:
 class ModelEntry(BaseModel):
     """One model of a provider: its id at the provider plus the token caps."""
 
-    # Unique id at the provider, e.g. "qwen3-coder-30b"; must not contain
-    # "/" (it is the tail of the "<provider>/<model-id>" reference format).
+    # Unique id at the provider, e.g. "qwen3-coder-30b"; may contain "/"
+    # (it is the tail of the "<provider>/<model-id>" reference format,
+    # which is split at the FIRST slash).
     id: str
     # Context window of the model, tokens: drives the context-fill display
     # and the compaction threshold. Gateways rarely report it — when
@@ -135,11 +138,6 @@ class ModelEntry(BaseModel):
     # the model–context–compaction-limit triple is one indivisible unit:
     # assigning the model to an agent role brings all three with it.
     compaction_threshold: int | None = None
-
-    @field_validator("id")
-    @classmethod
-    def _id_no_slash(cls, value: str) -> str:
-        return _reject_slash(value)
 
 
 class Provider(BaseModel):
@@ -273,13 +271,14 @@ def _read_json(path: Path) -> dict[str, object]:
 
 def _parse_ref(value: object) -> ModelRef | None:
     """Parse one `models[role]` / `defaults[role]` slot: "provider/model"
-    (string, exactly one "/"), a {"provider": …, "model": …} object
-    (legacy), or None."""
+    (string — provider = the head up to the FIRST slash, model = the rest,
+    slashes allowed), a {"provider": …, "model": …} object (legacy), or
+    None."""
     if value is None:
         return None
     if isinstance(value, str):
         provider, sep, model = value.partition("/")
-        if not sep or not provider or not model or "/" in model:
+        if not sep or not provider or not model:
             return None
         return ModelRef(provider=provider, model=model)
     if isinstance(value, dict):
@@ -545,9 +544,7 @@ def _provider_from_flat(
     """Build one provider/model from a legacy flat-config dict (the model
     keys of an old drcode.json), or None when it describes no model."""
     model = str(data.get("model") or "").strip()
-    if not model or "/" in model:
-        # Nothing (usable) described — or a model id with "/", which the
-        # reference format forbids.
+    if not model:
         return None
     base_url = str(data.get("base_url") or "").strip() or str(
         Config.model_fields["base_url"].default

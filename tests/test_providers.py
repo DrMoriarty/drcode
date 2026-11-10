@@ -20,6 +20,7 @@ from drcode.providers import (
     Provider,
     UserModelsConfig,
     UserModelsStore,
+    _parse_ref,
     load_project_custom_models,
     load_project_model_refs,
     load_project_model_slots,
@@ -931,16 +932,66 @@ def test_seed_skipped_without_project_or_flat(project_root: Path) -> None:
 
 
 def test_provider_and_model_names_reject_slash() -> None:
-    """Neither provider names nor model ids may contain '/': it is the
-    separator of the "provider/model" reference format."""
+    """Provider NAMES must not contain '/' (the head of the
+    "provider/model" reference format); model ids MAY — a reference is
+    split at the first slash, so the id keeps the rest verbatim."""
     with pytest.raises(ValidationError):
         Provider(name="a/b", base_url="http://x/v1")
-    with pytest.raises(ValidationError):
-        ModelEntry(id="a/b")
-    # A valid pair passes.
+    # A model id with slashes is legal now.
+    ModelEntry(id="a/b")
     Provider(
         name="openrouter", base_url="http://x/v1", models=[ModelEntry(id="llama-3")]
     )
+
+
+def test_parse_ref_splits_at_first_slash() -> None:
+    """The reference format is parsed at the FIRST slash: provider = the
+    head, model = the whole tail (slashes allowed)."""
+    ref = _parse_ref("prov/deepseek/deepseek-v4-flash-0731")
+    assert ref == ModelRef(provider="prov", model="deepseek/deepseek-v4-flash-0731")
+    assert str(ref) == "prov/deepseek/deepseek-v4-flash-0731"
+    # Degenerate forms still fail.
+    assert _parse_ref("no-slash") is None
+    assert _parse_ref("/model") is None
+    assert _parse_ref("prov/") is None
+
+
+def test_composite_model_id_roundtrip_and_key(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """A model id with '/' survives a catalog save/load roundtrip and
+    `resolve_model_key` reassembles the full reference."""
+    COMPOSITE = "deepseek/deepseek-v4-flash-0731"
+    cfg = UserModelsConfig(
+        providers=[
+            Provider(
+                name="prov",
+                base_url="http://prov/v1",
+                models=[ModelEntry(id=COMPOSITE, max_context_tokens=131072)],
+            )
+        ],
+        defaults={AgentRole.CODING: ModelRef(provider="prov", model=COMPOSITE)},
+    )
+    UserModelsStore().save(cfg)
+    loaded = UserModelsStore().load()
+    assert loaded == cfg
+    assert loaded.providers[0].models[0].id == COMPOSITE
+    assert loaded.defaults[AgentRole.CODING] == ModelRef(
+        provider="prov", model=COMPOSITE
+    )
+    # Project slot with the composite id roundtrips through the json too.
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="prov", model=COMPOSITE)
+    )
+    slots = load_project_model_slots(project_root)
+    assert slots[AgentRole.TESTER] == ModelRef(provider="prov", model=COMPOSITE)
+    # Both key paths assemble "<provider>/<composite-id>".
+    config = make_config(project_root)
+    assert resolve_model_key(config, AgentRole.CODING) == f"prov/{COMPOSITE}"
+    assert resolve_model_key(config, AgentRole.TESTER) == f"prov/{COMPOSITE}"
+    resolved = resolve(config, AgentRole.TESTER)
+    assert resolved.model == COMPOSITE
+    assert resolved.base_url == "http://prov/v1"
 
 
 # -- user catalog store ----------------------------------------------------------

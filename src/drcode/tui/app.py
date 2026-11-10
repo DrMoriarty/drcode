@@ -92,7 +92,6 @@ from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem
 from .state import LiveTailEntry
 from .sync_output import (
-    ANSWER_TIMEOUT,
     apply_sync_output_override,
     sync_output_off_reason,
     sync_output_should_be_off,
@@ -440,12 +439,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # The UI seam of the core pipeline (toasts, timers, workers, chat
         # blocks) — the pipeline layers call nothing Textual directly.
         self.host = TextualHost(self)
-        # Startup diagnostics for the effective DEC 2026 state (see
-        # _start_sync_mode_report): bookkeeping only — the state itself
-        # lives in App._sync_available and sync_output.py's decision
-        # functions and is never duplicated here.
-        self._sync_status_announced = False
-        self._sync_no_answer_timer: Timer | None = None
         # Resolve once: a relative or symlinked root would leak into storage,
         # git and the tool sandbox (tools compare resolved paths against it).
         project_root = Path(project_root).resolve()
@@ -1086,60 +1079,22 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         super()._on_terminal_supports_synchronized_output(message)
         # The terminal answered the probe "yes": the effective state is
         # final (this very answer is what makes textual flip
-        # _sync_available above) — report it and retire the no-answer
-        # timeout instead of letting it fire a stale "off" toast later.
-        self._announce_sync_mode(True, "")
+        # _sync_available above). App-log diagnostic only — the startup
+        # toast was retired, a silent log line is enough.
+        self.log("Synchronized output (DEC 2026): on")
 
-    def _announce_sync_mode(self, available: bool, reason: str) -> None:
-        """One-time startup report of the effective DEC 2026 sync state.
-
-        The reason is always part of the text — it IS the diagnostic
-        value (which branch of the priority matrix produced this state,
-        see tui/sync_output.py). Idempotent: whichever branch resolves
-        the state first (_start_sync_mode_report or the message handler)
-        wins, later calls are ignored and the no-answer timeout, when
-        still pending, is retired with it.
-        """
-        if self._sync_status_announced:
-            return
-        self._sync_status_announced = True
-        if self._sync_no_answer_timer is not None:
-            self._sync_no_answer_timer.stop()
-            self._sync_no_answer_timer = None
-        text = (
-            "Synchronized output (DEC 2026): on"
-            if available
-            else f"Synchronized output (DEC 2026): off ({reason})"
-        )
-        self.notify(text, title="Terminal", timeout=8)
-        self.log(text)
-
-    def _start_sync_mode_report(self) -> None:
-        """Resolve and announce the effective sync state at startup.
-
-        (a) The probe was never sent (sync_output.py forces the mode
-        off — explicit opt-out or the iTerm2 default): the state is
-        final right now, announce immediately. (b) The probe went out:
-        the terminal's DECRQM answer reports through
-        _on_terminal_supports_synchronized_output; exactly ONE timeout
-        (:data:`ANSWER_TIMEOUT`, ~1 s) covers the "terminal never
-        answered" case — no waiting forever, no extra timers.
-        """
+    def _log_sync_mode_state(self) -> None:
+        """Startup diagnostic for the DEC 2026 synchronized-output mode
+        (see tui/sync_output.py): when the mode is forced off by a branch
+        of the priority matrix whose outcome is known without asking the
+        terminal (explicit opt-out, iTerm2 default), the reason goes to
+        the app log ONLY — never a toast. When the probe goes out instead
+        (reason None), the effective state is logged by
+        _on_terminal_supports_synchronized_output on the terminal's
+        DECRQM 2026 answer."""
         reason = sync_output_off_reason()
         if reason is not None:
-            self._announce_sync_mode(False, reason)
-            return
-        if not self._sync_status_announced:
-            self._sync_no_answer_timer = self.set_timer(
-                ANSWER_TIMEOUT, self._sync_no_answer_timeout
-            )
-
-    def _sync_no_answer_timeout(self) -> None:
-        """The probe went out but no DECRQM 2026 answer arrived in time:
-        count the mode as off (textual's own default for a silent
-        terminal) and say so with the reason attached."""
-        self._sync_no_answer_timer = None
-        self._announce_sync_mode(False, "no terminal answer")
+            self.log(f"Synchronized output (DEC 2026): off ({reason})")
 
     def _notify_error(self, text: str) -> None:
         """Delivery failures of the notifications module, surfaced in-app.
@@ -1372,12 +1327,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # (purge/demotion) does not re-create tasks — wiring on mount is
         # quiet by construction.
         self.manager.add_creation_listener(self.notifier.bug_report_created)
-        # One-shot startup diagnostics for the DEC 2026 synchronized-output
-        # mode (see tui/sync_output.py): the effective state, with the
-        # reason, as a toast + app-log line — either immediately (the probe
-        # was never sent) or on the terminal's answer / the no-answer
-        # timeout.
-        self._start_sync_mode_report()
+        # Startup diagnostic for the DEC 2026 synchronized-output mode
+        # (see tui/sync_output.py): app-log line only, no toast.
+        self._log_sync_mode_state()
         if self._purged_tasks:
             # The startup cleanup removed something — say so, so deleted
             # history never "silently vanishes".

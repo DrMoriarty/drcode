@@ -800,6 +800,81 @@ def test_eviction_hint_skips_latest_exchange_only(manager: Any) -> None:
     assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
 
 
+def test_eviction_hint_frozen_while_active(manager: Any) -> None:
+    """Prefix-cache regression: while the hint is up, the SYSTEM-zone text
+    must be byte-identical from request to request — the live fill figure
+    and the candidate list are a frozen snapshot, NOT recomputed per
+    request (a changing block invalidates the server-side prefix cache
+    from the very top; on a local llama.cpp slot that is a full prompt
+    reprocess per request). Here the fill grows and a candidate gets
+    marked between the two requests — the text must not move."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    big = "y" * 8000
+    messages = hint_transcript(last_exchange_big=False)
+    # A second old heavy return, so marking c1 still leaves candidates.
+    messages.extend(
+        [
+            ModelResponse(
+                parts=[TextPart("again")],
+                usage=RequestUsage(input_tokens=21_000, output_tokens=8),
+            ),
+            tool_call_msg("c3", "read_file", {"path": "src/more.py"}),
+            tool_return_msg("c3", "read_file", big),
+        ]
+    )
+    ctx = cast(Any, FakeCtx(messages, FakeDeps(manager, task.id)))
+    first = eviction_dynamic_instructions(ctx, max_context_tokens=30_000)
+    assert first is not None
+    # Next request: more history, higher fill, c1 already marked (c3 stays).
+    messages.append(
+        ModelResponse(
+            parts=[TextPart("more")],
+            usage=RequestUsage(input_tokens=25_000, output_tokens=8),
+        )
+    )
+    task.marked_unneeded = ["c1"]
+    second = eviction_dynamic_instructions(ctx, max_context_tokens=30_000)
+    assert second is not None and second == first
+    assert "83%" not in second  # the fill snapshot is not re-taken (would be 83%)
+    assert "70%" in second  # the frozen figure from the first active request
+    # The frozen text replays from the manager cache (per task).
+    assert manager._eviction_hints[task.id] == first
+
+
+def test_eviction_hint_cleared_when_conditions_stop_holding(manager: Any) -> None:
+    """The frozen text is dropped when the conditions stop holding: no
+    candidates left (everything marked and collapsed) or the fill fell
+    back below the threshold — after which a re-qualifying request
+    generates a FRESH text (a new snapshot), not the stale frozen one."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = hint_transcript(last_exchange_big=False)
+    ctx = cast(Any, FakeCtx(messages, FakeDeps(manager, task.id)))
+    first = eviction_dynamic_instructions(ctx, max_context_tokens=30_000)
+    assert first is not None
+    # Everything marked (and collapsed to stubs): no candidates left.
+    task.marked_unneeded = ["c1"]
+    messages[2] = tool_return_msg(
+        "c1", "read_file", eviction.evicted_stub("read_file", {"path": "a.py"})
+    )
+    assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
+    assert task.id not in manager._eviction_hints
+    # A heavier candidate re-appears → a fresh text (a new snapshot).
+    task.marked_unneeded = []
+    messages[2] = tool_return_msg("c1", "read_file", "z" * 12000)
+    second = eviction_dynamic_instructions(ctx, max_context_tokens=30_000)
+    assert second is not None and second != first
+    assert manager._eviction_hints[task.id] == second
+    # Fill falls below the threshold → cleared again.
+    messages.append(
+        ModelResponse(
+            parts=[TextPart("more")],
+            usage=RequestUsage(input_tokens=10_000, output_tokens=8),
+        )
+    )
+    assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
+    assert task.id not in manager._eviction_hints
+
+
 def test_eviction_hint_registered_on_coding_agent(
     manager: Any, fake_config: Any
 ) -> None:

@@ -161,6 +161,14 @@ class TaskManager:
         # Observers of task creation (create()) — e.g. the voice
         # announcements hook for tester-created bug reports.
         self._creation_listeners: list[Callable[[Task, str], None]] = []
+        # Frozen eviction-hint texts (agent_tools.eviction_dynamic_instructions),
+        # keyed by task id: a dynamic-instructions block lives in the SYSTEM
+        # zone of the prompt, so its text must stay byte-identical between
+        # the requests of an activation — any divergence invalidates the
+        # server-side prefix cache from the very top (on a local llama.cpp
+        # slot that is a full prompt reprocess per request). Cleared by the
+        # hint itself when the conditions stop holding.
+        self._eviction_hints: dict[str, str] = {}
         # Serializes reload_new_tasks(): it runs both on the app thread
         # (the periodic disk poll) and on worker threads (promote_next in
         # the run's finally-blocks) — two concurrent scans must not load

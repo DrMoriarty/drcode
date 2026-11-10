@@ -27,7 +27,11 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import RequestUsage
 
 from drcode import agent_model, eviction
-from drcode.agent_tools import _fmt_approx_tokens, _mark_unneeded
+from drcode.agent_tools import (
+    _fmt_approx_tokens,
+    _mark_unneeded,
+    eviction_dynamic_instructions,
+)
 from drcode.compaction import (
     _atomic_groups,
     chunk_history_for_summary,
@@ -693,3 +697,126 @@ async def test_live_run_pauses_evicts_and_resumes(
     assert "read_file" in stub_part["content"]
     assert task.marked_unneeded == []
     load_messages(task.messages)  # API-valid
+
+
+# -- eviction nudge: dynamic-instructions hook --------------------------------------
+
+
+@pytest.fixture
+def fake_config() -> Any:
+    from drcode.config import Config
+
+    return Config(project_root=Path.cwd(), model="test-model", api_key="sk-test")
+
+
+def hint_transcript(last_exchange_big: bool) -> list[Any]:
+    """prompt → big read c1 → small grep c2 (freshest exchange), with a
+    usage-bearing text response between them so the fill is ≈20k of a 30k
+    window. `last_exchange_big` makes the FRESH c2 return heavy too."""
+    big = "y" * 8000  # 2000 ≈tokens — exactly the candidate threshold
+    return [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "src/big.py"}),
+        tool_return_msg("c1", "read_file", big),
+        ModelResponse(
+            parts=[TextPart("noted")],
+            usage=RequestUsage(input_tokens=20_000, output_tokens=8),
+        ),
+        tool_call_msg("c2", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c2", "grep_search", big if last_exchange_big else "hits"),
+    ]
+
+
+def test_eviction_hint_silent_below_half_window(manager: Any) -> None:
+    """Condition (a) unmet — fill below ~1/2 of the window: no reminder,
+    however heavy the unmarked old returns are."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = hint_transcript(last_exchange_big=False)
+    messages[3] = ModelResponse(  # drop the fill to ≈10k of 30k
+        parts=[TextPart("noted")],
+        usage=RequestUsage(input_tokens=10_000, output_tokens=8),
+    )
+    ctx = cast(Any, FakeCtx(messages, FakeDeps(manager, task.id)))
+    assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
+
+
+def test_eviction_hint_names_candidates_and_volume(manager: Any) -> None:
+    """Both conditions met: the reminder carries the ≈total of the
+    candidates, a per-result label (the same label format mark_unneeded's
+    answer uses) and points at mark_unneeded's selectors and the exact
+    numbers source (context_status)."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    big = "y" * 8000
+    ctx = cast(
+        Any,
+        FakeCtx(
+            hint_transcript(last_exchange_big=False),
+            FakeDeps(manager, task.id),
+        ),
+    )
+    hint = eviction_dynamic_instructions(ctx, max_context_tokens=30_000)
+    assert hint is not None
+    # Only c1 is a candidate: the fresh c2 return is small.
+    assert f"≈{_fmt_approx_tokens(estimate_tokens(big))} ≈tokens" in hint
+    assert "read_file(path='src/big.py')" in hint
+    assert "mark_unneeded" in hint
+    assert "paths=" in hint
+    assert "tool_name=" in hint
+    assert "context_status" in hint
+
+
+def test_eviction_hint_skips_marked_and_fresh_returns(manager: Any) -> None:
+    """Condition (b) unmet — nothing to point at: the heavy old return is
+    already marked, and the fresh (latest-exchange) heavy return is not a
+    candidate by design, so the hook stays silent despite a full context."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    task.marked_unneeded = ["c1"]
+    ctx = cast(
+        Any,
+        FakeCtx(
+            hint_transcript(last_exchange_big=True),
+            FakeDeps(manager, task.id),
+        ),
+    )
+    assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
+
+
+def test_eviction_hint_skips_latest_exchange_only(manager: Any) -> None:
+    """A heavy return in the FRESHEST exchange alone never triggers the
+    nudge — the model has not had a turn to act on it yet."""
+    task = manager.create("docs", "read things", kind=TaskKind.RESEARCH)
+    messages = [
+        user_msg("read things"),
+        tool_call_msg("c1", "read_file", {"path": "a.py"}),
+        tool_return_msg("c1", "read_file", "small"),
+        ModelResponse(
+            parts=[TextPart("noted")],
+            usage=RequestUsage(input_tokens=20_000, output_tokens=8),
+        ),
+        tool_call_msg("c2", "grep_search", {"pattern": "x"}),
+        tool_return_msg("c2", "grep_search", "y" * 8000),
+    ]
+    ctx = cast(Any, FakeCtx(messages, FakeDeps(manager, task.id)))
+    assert eviction_dynamic_instructions(ctx, max_context_tokens=30_000) is None
+
+
+def test_eviction_hint_registered_on_coding_agent(
+    manager: Any, fake_config: Any
+) -> None:
+    """build_agent registers the hook as dynamic instructions; the tester
+    agent gets none (no mark_unneeded tool there)."""
+    from drcode import agent as agent_mod
+    from drcode.agent import build_agent, build_tester_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    assert any(
+        part.dynamic
+        and getattr(part.instruction, "__name__", "") == "_eviction_hint_instructions"
+        for part in ag._instructions
+    )
+    tester = build_tester_agent(fake_config)
+    assert not any(
+        getattr(part.instruction, "__name__", "") == "_eviction_hint_instructions"
+        for part in tester._instructions
+    )
+    assert agent_mod.eviction_dynamic_instructions is eviction_dynamic_instructions

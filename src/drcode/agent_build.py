@@ -41,6 +41,7 @@ from .agent_tools import (
     _todo_update,
     _track_edited_file,
     _update_goal,
+    eviction_dynamic_instructions,
     goals_dynamic_instructions,
     load_agents_md,
     todo_dynamic_instructions,
@@ -330,6 +331,22 @@ def build_agent(
     # visible to its next request. For non-research tasks and empty
     # registries it yields None (excluded from the request).
     agent.instructions(goals_dynamic_instructions)
+
+    # The eviction nudge rides the same dynamic-instructions pattern: on
+    # EVERY request it measures the live context fill and scans for heavy
+    # unmarked old tool returns, and reminds the model about mark_unneeded
+    # (with the real figures) only when the fill is above ~half the window
+    # AND candidates exist — a standing prompt block went unnoticed for
+    # entire runs, a figure-bearing nudge at the right moment does not.
+    # Below the threshold or without candidates it yields None (excluded
+    # from the request). Coding agent only: the tester/resolver agents
+    # have no mark_unneeded tool, so no reminder is registered there.
+    def _eviction_hint_instructions(ctx: RunContext[AgentDeps]) -> str | None:
+        return eviction_dynamic_instructions(
+            ctx, max_context_tokens=config.max_context_tokens
+        )
+
+    agent.instructions(_eviction_hint_instructions)
 
     # All blocking tools run in a worker thread (or as asyncio subprocesses
     # for run_bash): called inline they would stall the event loop, which

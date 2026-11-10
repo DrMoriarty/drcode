@@ -20,6 +20,7 @@ import json
 import re
 import shlex
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,7 +49,7 @@ from .models import (
 )
 from .service_events import log_service_event
 from .task_env import WORKTREES_SUBDIR, branch_for
-from .transcript import serialize_messages
+from .transcript import ctx_context_tokens, estimate_tokens, serialize_messages
 
 if TYPE_CHECKING:
     from .agent_build import AgentDeps, TesterDeps
@@ -72,6 +73,7 @@ __all__ = [
     "_todo_update",
     "_track_edited_file",
     "_update_goal",
+    "eviction_dynamic_instructions",
     "goals_dynamic_instructions",
     "goals_instructions",
     "load_agents_md",
@@ -855,6 +857,137 @@ def _mark_unneeded(
         "batch) at the next context unloading: when ≈1/3 of the context "
         "window is marked, or just before a full compaction. The stub "
         "left in place of the content will say how to re-run the tool."
+    )
+    return "\n".join(lines)
+
+
+# -- eviction nudge: dynamic-instructions hint -----------------------------------
+#
+# A standing prompt block about mark_unneeded went unnoticed by models for
+# entire runs (0 calls in ~59 archived runs): advice is only heard when it
+# is relevant. These constants + `eviction_dynamic_instructions` turn the
+# advice into a per-request nudge instead, injected ONLY when the context
+# is actually getting full AND the transcript still holds heavy unmarked
+# tool returns — with the real figures in the text.
+
+# The nudge fires only ABOVE this fraction of the window (1/2): below it
+# the dead weight rides along cheaply and a reminder would be noise. (The
+# pipeline's own eviction gate sits lower, at EVICTION_WINDOW_FRACTION —
+# the nudge is the earlier, advisory layer.)
+EVICT_HINT_FILL_FRACTION = 2
+
+# A tool-return is a nudge candidate only when it is at least this heavy
+# (≈tokens, chars/4 — the same accounting the eviction gates use):
+# smaller results are not worth a mark's wording.
+EVICT_HINT_MIN_RESULT_TOKENS = 2000
+
+# How many top candidates the nudge lists by label; the rest are summed
+# into the total figure only.
+EVICT_HINT_MAX_LISTED = 5
+
+
+def _eviction_candidates(
+    messages: list[ModelMessage], marked: Iterable[str]
+) -> list[tuple[str, str, int]]:
+    """Heavy, not-yet-marked, not-yet-evicted OLD tool returns, oldest
+    first, as (tool_call_id, label, ≈tokens) triples.
+
+    A candidate is a completed tool-return whose ≈token weight (chars/4)
+    reaches `EVICT_HINT_MIN_RESULT_TOKENS` and whose content is still live
+    (no eviction stub). Excluded: everything already on
+    `Task.marked_unneeded`, `mark_unneeded`'s own results (one-liners, and
+    never evictable targets), and the returns of the transcript's LAST
+    model exchange (the ids of its tool calls) — the freshest results,
+    which the model has not had a turn to act on yet, are not "old" by any
+    reading."""
+    marked_set = set(marked)
+    fresh: set[str] = set()
+    for msg in reversed(messages):
+        if isinstance(msg, ModelResponse):
+            fresh = {
+                part.tool_call_id
+                for part in msg.parts
+                if isinstance(part, ToolCallPart)
+            }
+            break
+    calls = _tool_calls_by_id(messages)
+    candidates: list[tuple[str, str, int]] = []
+    for msg in messages:
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in msg.parts:
+            if not isinstance(part, ToolReturnPart):
+                continue
+            call_id = part.tool_call_id
+            if call_id in marked_set or call_id in fresh:
+                continue
+            if part.tool_name == "mark_unneeded":
+                continue
+            if eviction.is_evicted_stub(part.content):
+                continue
+            tokens = estimate_tokens(eviction._return_text(part.content))
+            if tokens < EVICT_HINT_MIN_RESULT_TOKENS:
+                continue
+            call = calls.get(call_id)
+            label = _call_label(call) if call is not None else part.tool_name
+            candidates.append((call_id, label, tokens))
+    return candidates
+
+
+def eviction_dynamic_instructions(
+    ctx: RunContext[AgentDeps], *, max_context_tokens: int
+) -> str | None:
+    """Dynamic-instructions nudge about `mark_unneeded` (coding agent only,
+    same pattern as `todo_dynamic_instructions`): on EVERY model request it
+    measures the live context fill (`ctx_context_tokens`, the exact
+    usage-based figure `context_status` reports) and scans the transcript
+    for heavy unmarked old tool returns; only when BOTH the fill is above
+    ~1/2 of the window AND candidates exist does it return a short reminder
+    naming the total ≈volume and the per-result selectors. Otherwise None —
+    nothing rides on the request. Purely advisory: it never marks anything
+    and never touches the pipeline gates."""
+    window = max_context_tokens
+    if window <= 0:
+        return None
+    tokens = ctx_context_tokens(ctx) or 0
+    if tokens * EVICT_HINT_FILL_FRACTION <= window:
+        return None
+    task = ctx.deps.manager.get(ctx.deps.task_id)
+    candidates = _eviction_candidates(list(ctx.messages), task.marked_unneeded)
+    if not candidates:
+        return None
+    total = sum(weight for _, _, weight in candidates)
+    pct = round(tokens * 100 / window)
+    lines = [
+        "# Context eviction hint",
+        "",
+        (
+            f"Context fill is at {pct}% of the window, and ≈"
+            f"{_fmt_approx_tokens(total)} ≈tokens of that are large "
+            f"unmarked tool results (≥{_fmt_approx_tokens(EVICT_HINT_MIN_RESULT_TOKENS)} "
+            "≈tokens each, older than the latest exchange):"
+        ),
+        "",
+    ]
+    for _, label, weight in candidates[:EVICT_HINT_MAX_LISTED]:
+        lines.append(f"- {label} — ≈{_fmt_approx_tokens(weight)} ≈tokens")
+    if len(candidates) > EVICT_HINT_MAX_LISTED:
+        lines.append(f"- … and {len(candidates) - EVICT_HINT_MAX_LISTED} more")
+    lines.extend(
+        [
+            "",
+            (
+                "If some of these are no longer needed, mark them with "
+                'mark_unneeded: paths=["src/x.py"] marks the most recent '
+                'result per path, tool_name="grep_search" marks every '
+                "completed result of a tool, no args marks the most recent "
+                "result — selectors combine in one call. Nothing is removed "
+                "at mark time: the pipeline collapses marked results in one "
+                "batch later (at ≈1/3 of the window marked, or right before "
+                "a full compaction). context_status reports the exact "
+                "current fill numbers."
+            ),
+        ]
     )
     return "\n".join(lines)
 

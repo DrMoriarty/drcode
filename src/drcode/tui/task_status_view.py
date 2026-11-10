@@ -250,7 +250,7 @@ class TaskStatusLayer(DrCodeState):
                 # only, the id means nothing to the user (the click target
                 # still carries it).
                 f"[magenta][@click=app.open_goals('{goal.id}')]goal: "
-                f"◆ {escape(goal.title_display)}[/]"
+                f"◆ {escape(goal.title_display)}[/][/]"
             )
         elif task.goal_id:
             # Dangling link (the goal was deleted): no title to show and
@@ -267,7 +267,7 @@ class TaskStatusLayer(DrCodeState):
             # distinct from the cyan deps and the magenta goal).
             branch = f"drcode/{task.id}"
             bits.append(
-                f"[@click=app.copy_task_branch('{branch}')][deepskyblue]branch: {branch}[/]"
+                f"[@click=app.copy_task_branch('{branch}')][deepskyblue]branch: {branch}[/][/]"
             )
         # Round counters (dev / test / resolve) — one per started round:
         # dev = user prompts of the dev transcript (the initial assignment,

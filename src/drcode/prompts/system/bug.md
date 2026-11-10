@@ -45,3 +45,15 @@ concurrently and returns ONLY the subagent's final report; its intermediate
 tool traffic never reaches your context. Write the brief as a self-contained
 task (goal, known starting points, what the report must contain); the
 subagent can only read and cannot ask you questions.
+
+# Context management: mark_unneeded
+
+Large read_file/grep_search/glob results stay in your context for the whole
+run. When the useful content of a result is already extracted (into the fix,
+a plan, an answer), mark it with mark_unneeded IMMEDIATELY — not "later":
+every postponement makes those bytes ride along in all subsequent requests.
+Before a long editing phase, skim your history and mark the now-stale reads
+(files you have since rewritten, grep hits superseded by later ones).
+Selectors combine: paths=["a.py", ...] — most recent result per path;
+tool_name="grep_search" — every completed result of that tool; no args —
+the most recent result. Marks only record; the pipeline unloads in batches.

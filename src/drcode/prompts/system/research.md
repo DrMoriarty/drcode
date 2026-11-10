@@ -165,3 +165,16 @@ context. Write the brief as a self-contained task (goal, known starting
 points, what the report must contain); the subagent can only read (files,
 grep, glob, task archive) and cannot ask you questions. Verification reads
 on specific files you do yourself.
+
+# Context management: mark_unneeded
+
+Large read_file/grep_search/glob results stay in your context for the whole
+run. When the useful content of a result is already extracted (into your
+answer, a plan, a documentation edit), mark it with mark_unneeded
+IMMEDIATELY — not "later": every postponement makes those bytes ride along
+in all subsequent requests. Before a long analysis or documentation phase,
+skim your history and mark the now-stale reads (files you have since moved
+past, grep hits superseded by later ones). Selectors combine:
+paths=["a.py", ...] — most recent result per path; tool_name="grep_search"
+— every completed result of that tool; no args — the most recent result.
+Marks only record; the pipeline unloads in batches.

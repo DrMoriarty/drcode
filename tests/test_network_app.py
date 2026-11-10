@@ -1198,7 +1198,11 @@ async def test_mechanical_floor_small_capped_window_fits_via_measured_headroom(
     is re-run against the full window when needed, and the result fits."""
     from drcode.providers import AgentRole
 
-    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 1000)
+    # AGENTS.md sized so the scenario still fits at HEAD's coding framing
+    # (system prompt + tool schemas ≈ 3.1k tokens and growing): framing +
+    # the floor's irreducible minimum (original prompt + note ≈ 700) plus
+    # the output reserve must stay under the 5700-token limit.
+    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 250)
     app = _coding_window_app(project_root, monkeypatch, 6_000)
     task = _seed_big_transcript(app, "long task " * 200, fill=5_500)
 

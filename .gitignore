@@ -24,3 +24,4 @@ wheels/
 .drcode/stats.json
 .drcode/search_index.json
 .drcode/pending_notifications.json
+.drcode/goals/*.state.json

@@ -198,6 +198,29 @@ class ResolverDeps:
     verdicts: list[ResolutionVerdict] = field(default_factory=list)
 
 
+def _recent_tasks_output(
+    project_root: Path, limit: int, kind: str | None, exclude_task_id: str | None
+) -> str:
+    """The recent_tasks tool body: newest-created archive hits as compact
+    lines. Runs inside _run_tool (worker thread) — both the archive read
+    and the mergedness annotation are blocking. An unknown `kind` raises
+    ValueError here and comes back to the model as a ModelRetry prompt,
+    same as in search_task_history."""
+    hits = task_search.recent_tasks(
+        project_root, limit, kind=kind, exclude_task_id=exclude_task_id
+    )
+    # Mergedness needs blocking git calls — only worth it for short outputs.
+    task_search.annotate_unmerged(project_root, hits)
+    lines = [task_search.format_hit_line(hit) for hit in hits]
+    if not lines:
+        return (
+            "No tasks in the project archive yet."
+            if kind is None
+            else f"No {kind} tasks in the project archive yet."
+        )
+    return "\n".join(lines)
+
+
 def _validated_goal_id(ctx: RunContext[AgentDeps], goal_id: str | None) -> str | None:
     """Normalize the optional `goal_id` of the create_* tools.
 
@@ -740,6 +763,38 @@ def build_agent(
                 exclude_task_id=ctx.deps.task_id,
                 status=status,
                 kind=kind,
+            )
+
+        @agent.tool
+        async def recent_tasks(
+            ctx: RunContext[AgentDeps],
+            limit: int = 10,
+            kind: str | None = None,
+        ) -> str:
+            """Return the project's most recently CREATED tasks (ALL statuses:
+            queued, hold, active, testing, completed, clarification), newest
+            first — no keywords needed. Use it when you want recent context
+            ("what was worked on in the last days?", "find that recent bug")
+            without knowing the words to search for; for pinpoint search by
+            words or by a task id, use search_task_history instead. Optional
+            `kind` narrows the list to bug/feature/research. `limit` caps the
+            output (default 10, hard maximum 50). Output is one compact line
+            per task — id, status/kind, verification label, an "unmerged"
+            marker when the task's drcode/<id> branch still holds unmerged
+            commits (only computed for short lists), date, title and a short
+            snippet of its first user prompt — ordered strictly by creation
+            time, not by completion. Your own task is excluded. To dig into a
+            listed task, read_file its transcript
+            <project>/.drcode/tasks/<id>.transcript.json."""
+            # Same main-checkout rule as search_task_history above: under
+            # worktree isolation ctx.deps.root is the task's worktree — the
+            # archive lives in the manager's storage root.
+            return await _run_tool(
+                _recent_tasks_output,
+                ctx.deps.manager.storage.root,
+                limit,
+                kind,
+                ctx.deps.task_id,
             )
 
         # Goal-registry tools (stage A passive registry + stage B planning):

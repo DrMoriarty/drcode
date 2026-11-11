@@ -334,9 +334,13 @@ async def test_repair_budget_exhaustion_rolls_back(
         await pilot.pause()
         live = app.manager.get(task.id)
         app._maybe_start_resolver(task.id)
+        # The whole 6-step script (3 reviews + 2 repairs + the funnel work
+        # between them) is observed through THIS single wait — give it an
+        # explicit budget; the 30 s default expires under parallel load.
         await wait_until(
             lambda: any("human must take over" in t for t in event_texts(live)),
             pilot,
+            timeout=120,
             what="the final human hand-off",
         )
         assert live.needs_human

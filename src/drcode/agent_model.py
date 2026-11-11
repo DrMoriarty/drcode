@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 from openai import AsyncOpenAI
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -213,7 +214,19 @@ def build_model(config: Config):
         # same reason).
         max_retries=0,
     )
-    return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
+    # Строгие OpenAI-совместимые шлюзы (vLLM) отвергают запрос с больше чем
+    # одним ведущим `system`-сообщением: "System message must be at the
+    # beginning." (400). pydantic-ai по умолчанию превращает каждый
+    # instruction-part (статические instructions + динамические: чек-лист
+    # задач, roadmap goals, подсказка mark_unneeded) в ОТДЕЛЬНОЕ ведущее
+    # system-сообщение и склеивает их только при профиле
+    # openai_chat_supports_multiple_system_messages=False — задаём его явно
+    # (дефолтный профиль рассчитан на OpenAI, который терпит несколько).
+    return OpenAIChatModel(
+        config.model,
+        provider=OpenAIProvider(openai_client=client),
+        profile=OpenAIModelProfile(openai_chat_supports_multiple_system_messages=False),
+    )
 
 
 # -- model auto-discovery ------------------------------------------------------

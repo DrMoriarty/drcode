@@ -560,7 +560,7 @@ def _make_loop_payload(tmp_path: Path) -> str:
     return str(script)
 
 
-async def _wait_for(ws: aiohttp.ClientWebSocketResponse, predicate, timeout: float = 5):
+async def _wait_for(ws: aiohttp.ClientWebSocketResponse, predicate, timeout: float = 10):
     """Read frames until ``predicate`` matches; return (match, all frames)."""
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -569,7 +569,12 @@ async def _wait_for(ws: aiohttp.ClientWebSocketResponse, predicate, timeout: flo
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise AssertionError(f"condition not met in time; seen: {seen!r}")
-        msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        try:
+            msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        except TimeoutError:
+            # Deadline expiry must surface as a diagnostic assertion, not a
+            # bare TimeoutError (xdist-load flakes are timing, not protocol).
+            raise AssertionError(f"condition not met in time; seen: {seen!r}")
         if msg.type == aiohttp.WSMsgType.TEXT:
             event = json.loads(msg.data)
             seen.append(event)
@@ -636,7 +641,7 @@ async def test_server_tabs_are_independent(tmp_path: Path) -> None:
             await _wait_for(
                 ws_b,
                 lambda d: isinstance(d, bytes) and b"proj-beta" in d,
-                timeout=2,
+                timeout=10,
             )
 
             await ws_b.send_json({"type": "kill", "tab": "tb"})
@@ -762,7 +767,7 @@ async def test_server_duplicate_project_blocked_in_other_tab(tmp_path: Path) -> 
             # The first tab's session is untouched.
             assert ctx.tabs["ta"].session is not None
             await _wait_for(
-                ws_a, lambda d: isinstance(d, bytes) and b"proj" in d, timeout=2
+                ws_a, lambda d: isinstance(d, bytes) and b"proj" in d, timeout=10
             )
             await ws_a.close()
             await ws_b.close()

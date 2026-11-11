@@ -94,10 +94,33 @@ async def _run_bash_logged(
 #    and can crash the whole run when a degenerate batch refuses 20 calls at
 #    once against retries=10).
 #
+# 3. DEGRADATION DETECTION (passive — execution behavior is untouched): when
+#    a batch crosses a pathology heuristic, a "Warning:" service event is
+#    logged (shown in the chat, never fed to the model) so the user sees the
+#    model degrading instead of just a long silence. Two triggers: a single
+#    (tool_name, args) pair arriving DEGENERATE_IDENTICAL_THRESHOLD+ times in
+#    one batch, and a total batch size over DEGENERATE_BATCH_SIZE. The
+#    arrivals are counted at the TOP of call_tool, BEFORE the dedup/limit
+#    branches — after the guards a 31-call twins storm would look like one
+#    innocent call, and the pathology would be invisible.
+#
 # The guard is UI-neutral and hooks ONE seam: a WrapperToolset around the
 # agent's own function toolset.
 
 DEFAULT_TOOL_BATCH_LIMIT = 8
+
+# Degradation-detection heuristics (see the section comment above): a single
+# (tool_name, args) pair arriving this many times in ONE batch, or a total
+# batch size over this line, means the model is almost certainly stuck in a
+# degenerate parallel-batch loop (the observed mimo-v2.6-flash pathology ran
+# up to 32 calls per response, the protocol cap).
+DEGENERATE_IDENTICAL_THRESHOLD = 3
+DEGENERATE_BATCH_SIZE = 16
+
+# At most this many "N identical <tool> calls" clauses go into one event
+# (sorted by count) — a pathology spanning many tools must not spam a
+# wall of text into the chat.
+_MAX_IDENTICAL_NOTES = 3
 
 _BATCH_LIMIT_RESULT_PREFIX = "Batch limit exceeded"
 
@@ -145,6 +168,11 @@ class BatchGuard:
         self._executed = 0
         self._duplicates = 0
         self._refused = 0
+        # ORIGINAL-batch bookkeeping, counted at the top of call_tool before
+        # the dedup/limit branches touch anything (the degradation event must
+        # describe the model's actual output, not what survived the guards).
+        self._arrivals: dict[tuple[str, str], int] = {}
+        self._batch_size = 0
 
     async def call_tool(
         self,
@@ -156,9 +184,11 @@ class BatchGuard:
     ) -> Any:
         run_step = getattr(ctx, "run_step", 0) or 0
         if run_step != self._run_step:
-            self._rollover(ctx)
+            self._flush_batch(ctx)
             self._run_step = run_step
         key = (name, _args_fingerprint(tool_args))
+        self._arrivals[key] = self._arrivals.get(key, 0) + 1
+        self._batch_size += 1
         future = self._futures.get(key)
         if future is not None:
             # Exact twin of a call in this batch: same result content, own
@@ -182,36 +212,73 @@ class BatchGuard:
         future.set_result((True, result))
         return result
 
-    def _rollover(self, ctx: Any) -> None:
-        """A new batch started: flush the previous batch's stats into the
-        service-event log (best effort — deps without a manager, like the
-        subagent's, are skipped) and reset the counters."""
-        if self._duplicates or self._refused:
-            notes = []
-            if self._duplicates:
-                notes.append(
-                    f"{self._duplicates} duplicate tool call(s) in one response "
-                    "answered from cache without re-execution"
-                )
-            if self._refused:
-                notes.append(
-                    f"{self._refused} tool call(s) refused: batch limit "
-                    f"({self.limit} per response)"
-                )
-            deps = getattr(ctx, "deps", None)
-            if (
-                deps is not None
-                and hasattr(deps, "manager")
-                and hasattr(deps, "task_id")
-            ):
-                try:
-                    log_service_event(deps, "tool-batch", "; ".join(notes))
-                except Exception:  # noqa: BLE001, S110 - stats never fatal
-                    pass
+    def _degradation_notes(self) -> list[str]:
+        """Pathology heuristics over the ORIGINAL batch (arrival counts, i.e.
+        what the model actually issued — not what survived dedup/limiting).
+        Offending keys are aggregated per tool name (max count): the observed
+        pathology also repeats the same grep with permuted alternatives —
+        several keys of one tool, reported as one clause."""
+        notes: list[str] = []
+        by_tool: dict[str, int] = {}
+        for (name, _fingerprint), count in self._arrivals.items():
+            if count >= DEGENERATE_IDENTICAL_THRESHOLD:
+                by_tool[name] = max(by_tool.get(name, 0), count)
+        offenders = sorted(
+            ((count, name) for name, count in by_tool.items()),
+            reverse=True,
+        )
+        for count, name in offenders[:_MAX_IDENTICAL_NOTES]:
+            notes.append(f"model issued {count} identical {name} calls in one batch")
+        if len(offenders) > _MAX_IDENTICAL_NOTES:
+            notes.append(
+                f"and {len(offenders) - _MAX_IDENTICAL_NOTES} more tools with "
+                "identical-call storms"
+            )
+        if self._batch_size > DEGENERATE_BATCH_SIZE:
+            notes.append(
+                f"a single response carried {self._batch_size} tool calls "
+                f"(sanity threshold {DEGENERATE_BATCH_SIZE})"
+            )
+        return notes
+
+    def _flush_batch(self, ctx: Any) -> None:
+        """The batch ended: flush its stats into the service-event log (best
+        effort — deps without a manager, like the subagent's, are skipped)
+        and reset the counters. Degenerate batches prepend a "Warning:" note
+        computed from the ORIGINAL batch, so the pathology stays visible no
+        matter how hard the execution guards collapsed it."""
+        degenerate = self._degradation_notes()
+        notes = list(degenerate)
+        if self._duplicates:
+            notes.append(
+                f"{self._duplicates} duplicate tool call(s) in one response "
+                "answered from cache without re-execution"
+            )
+        if self._refused:
+            notes.append(
+                f"{self._refused} tool call(s) refused: batch limit "
+                f"({self.limit} per response)"
+            )
+        self._reset_batch()
+        if not notes:
+            return
+        deps = getattr(ctx, "deps", None)
+        if deps is not None and hasattr(deps, "manager") and hasattr(deps, "task_id"):
+            text = "; ".join(notes)
+            if degenerate:
+                text = f"Warning: {text} — possible model degradation"
+            try:
+                log_service_event(deps, "tool-batch", text)
+            except Exception:  # noqa: BLE001, S110 - stats never fatal
+                pass
+
+    def _reset_batch(self) -> None:
         self._futures.clear()
         self._executed = 0
         self._duplicates = 0
         self._refused = 0
+        self._arrivals.clear()
+        self._batch_size = 0
 
 
 _AgentDepsT = TypeVar("_AgentDepsT")
@@ -245,6 +312,15 @@ class BatchGuardToolset(WrapperToolset[_AgentDepsT]):
         tool: Any,
     ) -> Any:
         return await self.guard.call_tool(name, tool_args, ctx, self.wrapped, tool)
+
+    async def for_run_step(self, ctx: Any) -> Any:
+        """Flush the finished batch at the step boundary. pydantic-ai calls
+        `for_run_step` before EVERY model request — including the one that
+        follows the run's LAST tool-call batch (a text-only final response
+        triggers no further `call_tool`, so the call_tool-side rollover alone
+        would silently drop that batch's stats)."""
+        self.guard._flush_batch(ctx)
+        return await super().for_run_step(ctx)
 
 
 def attach_batch_guard(agent: Any, limit: int) -> None:

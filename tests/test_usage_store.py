@@ -119,6 +119,19 @@ def test_role_prefix_survives_empty_model_id(tmp_path: Path) -> None:
     assert set(next(iter(store.load().values()))) == {"coding"}
 
 
+def test_composite_model_id_key_roundtrip(tmp_path: Path) -> None:
+    """A composite model id ("provider/vendor/model") makes the usage key
+    carry multiple slashes — the key is stored verbatim and never parsed
+    back: record + load keep it intact."""
+    target = tmp_path / "usage.json"
+    store = UsageStore(path=target)
+    store.record(AgentRole.CODING, "prov/deepseek/deepseek-v4-0731", _usage(input=10))
+    day = next(iter(store.load()))
+    days = store.load()[day]
+    assert set(days) == {"coding/prov/deepseek/deepseek-v4-0731"}
+    assert days["coding/prov/deepseek/deepseek-v4-0731"]["input"] == 10
+
+
 # -- corrupt / foreign data is skipped, never fatal --------------------------------
 
 

@@ -339,8 +339,11 @@ def build_agent(
     # AND candidates exist — a standing prompt block went unnoticed for
     # entire runs, a figure-bearing nudge at the right moment does not.
     # Below the threshold or without candidates it yields None (excluded
-    # from the request). Coding agent only: the tester/resolver agents
-    # have no mark_unneeded tool, so no reminder is registered there.
+    # from the request). While active, the text is frozen per activation
+    # (cached on the manager): a byte that moves in the system zone would
+    # invalidate the server-side prefix cache on every request. Coding
+    # agent only: the tester/resolver agents have no mark_unneeded tool,
+    # so no reminder is registered there.
     def _eviction_hint_instructions(ctx: RunContext[AgentDeps]) -> str | None:
         return eviction_dynamic_instructions(
             ctx, max_context_tokens=config.max_context_tokens

@@ -567,9 +567,6 @@ class ModelCatalogScreen(ModalScreen[None]):
         provider = self._provider()
         assert provider is not None
         new_id = self.query_one("#mc-model-id", Input).value.strip() or entry.id
-        if "/" in new_id:
-            self._status("✗ model id must not contain '/'")
-            return
         caps = self._parse_caps()
         if caps is None:
             return
@@ -627,9 +624,6 @@ class ModelCatalogScreen(ModalScreen[None]):
         model_id = self.query_one("#mc-model-id", Input).value.strip()
         if not model_id:
             self._status("Enter a model id to add.")
-            return
-        if "/" in model_id:
-            self._status("✗ model id must not contain '/'")
             return
         if any(m.id == model_id for m in provider.models):
             self._status(f"✗ model '{model_id}' already exists")

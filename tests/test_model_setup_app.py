@@ -279,9 +279,12 @@ async def test_row_selection_fills_editor_and_update_remove(tmp_path: Path) -> N
         assert screen.query_one("#mc-pct", Input).value == ""
 
 
-async def test_slash_rejected_in_provider_and_model_names(tmp_path: Path) -> None:
+async def test_slash_rejected_in_provider_name_and_allowed_in_model_id(
+    tmp_path: Path,
+) -> None:
     """'/' is the provider/model reference separator: the catalog screen
-    refuses it both in the provider name and in the model id."""
+    refuses it in the provider name; a model id with slashes is legal
+    (the reference is split at the first slash)."""
     store = UserModelsStore(tmp_path / "models.json")
     store.save(
         UserModelsConfig(
@@ -295,18 +298,21 @@ async def test_slash_rejected_in_provider_and_model_names(tmp_path: Path) -> Non
         screen = pilot.app.screen
         assert isinstance(screen, ModelCatalogScreen)
         status = screen.query_one("#mc-status")
-        # Provider name with a slash.
+        # Provider name with a slash is still rejected.
         screen.query_one("#mc-name", Input).value = "a/b"
         await pilot.click("#mc-save")
         await pilot.pause()
         assert "provider name must not contain '/'" in str(status.render())
-        # Model id with a slash (Add model path).
+        # Model id with slashes (Add model path) succeeds now.
         screen.query_one("#mc-name", Input).value = "p"
-        screen.query_one("#mc-model-id", Input).value = "x/y"
+        screen.query_one("#mc-model-id", Input).value = "deepseek/deepseek-v4-0731"
         await pilot.click("#mc-model-add")
         await pilot.pause()
-        assert "model id must not contain '/'" in str(status.render())
-        assert [m.id for m in screen.catalog.providers[0].models] == ["m"]
+        assert "✗" not in str(status.render())
+        assert [m.id for m in screen.catalog.providers[0].models] == [
+            "m",
+            "deepseek/deepseek-v4-0731",
+        ]
 
 
 async def test_duplicate_provider_name_rejected(tmp_path: Path) -> None:

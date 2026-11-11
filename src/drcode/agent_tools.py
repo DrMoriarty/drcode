@@ -928,7 +928,11 @@ def _mark_unneeded(
 # is relevant. These constants + `eviction_dynamic_instructions` turn the
 # advice into a per-request nudge instead, injected ONLY when the context
 # is actually getting full AND the transcript still holds heavy unmarked
-# tool returns — with the real figures in the text.
+# tool returns — with the real figures in the text. The text is FROZEN
+# while the hint is active (per-task cache on the manager): the block
+# rides in the SYSTEM zone, and a changing text there would invalidate
+# the server-side prefix cache on every request (see the function
+# docstring for the llama.cpp arithmetic).
 
 # The nudge fires only ABOVE this fraction of the window (1/2): below it
 # the dead weight rides along cheaply and a reminder would be noise. (The
@@ -1005,17 +1009,43 @@ def eviction_dynamic_instructions(
     ~1/2 of the window AND candidates exist does it return a short reminder
     naming the total ≈volume and the per-result selectors. Otherwise None —
     nothing rides on the request. Purely advisory: it never marks anything
-    and never touches the pipeline gates."""
+    and never touches the pipeline gates.
+
+    The text is FROZEN while the hint is active (cached per task on
+    `TaskManager._eviction_hints`): a dynamic-instructions block lives in
+    the SYSTEM zone of the prompt, and any byte of divergence there
+    invalidates the server-side prefix cache from the very top — on a
+    local llama.cpp slot every request would then reprocess the whole
+    history (minutes at slow prompt processing). The fill figure and the
+    candidate list are therefore a snapshot from the moment the hint
+    turned active; they go stale on purpose (the mark_unneeded tool
+    results and context_status carry the live numbers), and the frozen
+    text is dropped as soon as the conditions stop holding: no candidates
+    left (everything marked and collapsed) or the fill fell back below
+    the threshold. Carrying the frozen text across activations of the
+    same task is deliberate — a stable system zone keeps the prefix
+    cache valid across the activation boundary too."""
     window = max_context_tokens
     if window <= 0:
         return None
     tokens = ctx_context_tokens(ctx) or 0
-    if tokens * EVICT_HINT_FILL_FRACTION <= window:
-        return None
     task = ctx.deps.manager.get(ctx.deps.task_id)
+    hints: dict[str, str] = ctx.deps.manager._eviction_hints
+    if tokens * EVICT_HINT_FILL_FRACTION <= window:
+        hints.pop(task.id, None)
+        return None
+    frozen = hints.get(task.id)
+    # The liveness gate (not the text) is recomputed per request: when the
+    # candidates are gone — everything marked and collapsed away — the
+    # hint must disappear instead of pointing at ghosts forever.
     candidates = _eviction_candidates(list(ctx.messages), task.marked_unneeded)
     if not candidates:
+        hints.pop(task.id, None)
         return None
+    if frozen is not None:
+        # Byte-stable replay: the system zone must not change from request
+        # to request while the hint is up (prefix-cache preservation).
+        return frozen
     total = sum(weight for _, _, weight in candidates)
     pct = round(tokens * 100 / window)
     lines = [
@@ -1049,7 +1079,9 @@ def eviction_dynamic_instructions(
             ),
         ]
     )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    hints[task.id] = text
+    return text
 
 
 def _retry_failed_here(deps: TesterDeps, report: str) -> str:

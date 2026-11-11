@@ -102,7 +102,7 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
         assert isinstance(screen, AgentChainsScreen)
         coding = _group_list(screen, AgentRole.CODING)
         texts = [str(option.prompt) for option in coding.options]
-        assert texts == ["1. alpha/m1  ← primary", "2. beta/m3"]
+        assert texts == ["1. alpha/m1", "2. beta/m3"]
         header = screen.query_one("#ac-role-coding", Static)
         assert "2/3" in str(header.render())
         # Other roles start empty.
@@ -212,7 +212,7 @@ async def test_add_to_chain_and_save(tmp_path: Path) -> None:
         screen.query_one("#ac-add-coding", Button).press()
         await pilot.pause()
         texts = [str(o.prompt) for o in _group_list(screen, AgentRole.CODING).options]
-        assert texts == ["1. alpha/m1  ← primary", "2. alpha/m2"]
+        assert texts == ["1. alpha/m1", "2. alpha/m2"]
         assert "added to coding" in _status(screen)
         await pilot.click("#ac-save")
         await pilot.pause()
@@ -335,7 +335,7 @@ async def test_remove_from_chain(tmp_path: Path) -> None:
         await pilot.pause()
         assert "removed" in _status(screen)
         texts = [str(o.prompt) for o in coding.options]
-        assert texts == ["1. alpha/m2  ← primary"]
+        assert texts == ["1. alpha/m2"]
 
 
 async def test_save_drops_emptied_chain(tmp_path: Path) -> None:

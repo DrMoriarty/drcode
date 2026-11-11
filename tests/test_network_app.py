@@ -195,6 +195,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         research_git: Any = None,
         subagent_limit: int = 0,
         task_id: Any = None,
+        eviction_hint: bool = False,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
@@ -202,6 +203,8 @@ async def test_research_task_builds_agent_with_research_role_config(
             kwargs["research_git"] = research_git
         if task_id is not None:
             kwargs["task_id"] = task_id
+        if eviction_hint:
+            kwargs["eviction_hint"] = eviction_hint
         return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)

@@ -970,9 +970,34 @@ class TaskManager:
 
         Returns the moved task, or None when the move is impossible: the
         task is not queued, it is already at the corresponding edge of the
-        queue, or the swap would cross the bug block (bug reports always
-        run first — hold a bug with set_hold if it must wait).
+        queue, the swap would cross the bug block (bug reports always run
+        first — hold a bug with set_hold if it must wait) or the
+        dependency-blocked tier (a blocked task sinks below every runnable
+        one no matter the stamps — a swap across that boundary cannot be
+        reproduced by the queued() sort and would snap right back, looking
+        like a no-op).
         """
+        task = self.tasks.get(task_id)
+        j = self._move_target(task_id, up=up)
+        if task is None or j is None:
+            return None
+        order = self.queued()
+        i = order.index(task)
+        order[i], order[j] = order[j], order[i]
+        task.touch()
+        self._apply_manual_order(order)
+        return task
+
+    def can_move_in_queue(self, task_id: str, *, up: bool) -> bool:
+        """Whether move_in_queue would actually move the task (the same
+        gates, nothing mutated) — the footer's check_action twin."""
+        return self._move_target(task_id, up=up) is not None
+
+    def _move_target(self, task_id: str, *, up: bool) -> int | None:
+        """Index in queued() the task would move to, or None when the move
+        is impossible (see move_in_queue). Shared by move_in_queue and
+        can_move_in_queue so the footer's visibility gates can never drift
+        from the action's refusals."""
         task = self.tasks.get(task_id)
         if task is None or task.status is not TaskStatus.QUEUED:
             return None
@@ -983,10 +1008,12 @@ class TaskManager:
             return None
         if (order[j].kind is TaskKind.BUG) != (task.kind is TaskKind.BUG):
             return None
-        order[i], order[j] = order[j], order[i]
-        task.touch()
-        self._apply_manual_order(order)
-        return task
+        # A blocked task always sinks below every runnable one (the first
+        # key element), so a swap across the blocked/unblocked boundary is
+        # unreproducible: the stamps would be re-sorted straight back.
+        if self._status_blocked(order[j]) != self._status_blocked(task):
+            return None
+        return j
 
     def delete(self, task_id: str) -> None:
         """Remove the task entirely: from memory and from disk storage.

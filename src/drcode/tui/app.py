@@ -1876,19 +1876,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # Only a queued (not yet started) task can be re-typed.
             return task is not None and task.status is TaskStatus.QUEUED
         if action in ("move_task_up", "move_task_down"):
-            # Manual reordering works on queued tasks only; the binding is
-            # hidden while the task sits at the corresponding edge of the
-            # queue or at the bug-block boundary (bugs always run first).
+            # Manual reordering works on queued tasks only. The finer
+            # impossibility cases (queue edge, bug-block boundary,
+            # dependency-blocked tier) are deliberately NOT hidden here:
+            # a falsy check_action also SUPPRESSES the key dispatch
+            # (App.run_action), and a Ctrl+Up/Down that dies without a
+            # trace reads as "the sorting is broken" — the action itself
+            # toasts the reason instead (see _move_viewed_task).
             if task is None or task.status is not TaskStatus.QUEUED:
                 return False
             order = self.manager.queued()
-            if len(order) < 2 or task not in order:
-                return False
-            i = order.index(task)
-            j = i - 1 if action == "move_task_down" else i + 1
-            if not 0 <= j < len(order):
-                return False
-            return (order[j].kind is TaskKind.BUG) == (task.kind is TaskKind.BUG)
+            return len(order) >= 2 and task in order
         if action == "edit_task":
             # Only a held task or a draft can be edited: the editor merges
             # the held task's text and comments (a draft's composition is

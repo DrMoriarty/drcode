@@ -333,6 +333,59 @@ def test_move_cannot_cross_bug_block(manager: TaskManager) -> None:
     assert manager.queued() == [bug, bug2, a]
 
 
+def test_move_cannot_cross_blocked_tier(manager: TaskManager) -> None:
+    """A dependency-blocked task sinks below every runnable one regardless
+    of the queue stamps — a swap across that boundary can never be
+    reproduced by queued() and used to snap straight back, looking like a
+    dead footer button (the "sorting is broken" report)."""
+    a = manager.create("a", "x")
+    dep = manager.create("dep", "x")
+    blocked = manager.create("blocked", "x")
+    blocked.depends_on = [dep.id]
+    manager._apply_manual_order([a, dep, blocked])
+    assert manager.queued() == [a, dep, blocked]
+
+    # Moving the blocked task down (over `dep`) and the runnable task up
+    # (over `blocked`) would both be undone by the blocked tier — refused.
+    assert manager.move_in_queue(blocked.id, up=False) is None
+    assert manager.move_in_queue(dep.id, up=True) is None
+    assert manager.queued() == [a, dep, blocked]
+
+    # Moves within a tier keep working — and visibly change the order.
+    b = manager.create("b", "x")
+    # queued(): [a, dep, b, blocked] — a fresh runnable task lands above
+    # the blocked sink, by stamp; moving b up would cross into the sink.
+    assert manager.queued() == [a, dep, b, blocked]
+    assert manager.move_in_queue(b.id, up=False) is b
+    assert manager.queued() == [a, b, dep, blocked]
+    blocked2 = manager.create("blocked2", "x")
+    blocked2.depends_on = [dep.id]
+    # queued(): [a, b, dep, blocked, blocked2] — the blocked sink keeps
+    # stamp order among its own.
+    assert manager.move_in_queue(blocked2.id, up=False) is blocked2
+    assert manager.queued() == [a, b, dep, blocked2, blocked]
+
+
+def test_can_move_in_queue_mirrors_move_in_queue(manager: TaskManager) -> None:
+    a = manager.create("a", "x")
+    b = manager.create("b", "x")
+    bug = manager.create("bug", "x", kind=TaskKind.BUG)
+    dep = manager.create("dep", "x")
+    blocked = manager.create("blocked", "x")
+    blocked.depends_on = [dep.id]
+    # queued(): [bug, a, b, dep, blocked]
+    assert manager.can_move_in_queue(a.id, up=True)  # swap with b
+    assert not manager.can_move_in_queue(a.id, up=False)  # bug block below
+    assert manager.can_move_in_queue(b.id, up=True)
+    assert manager.can_move_in_queue(b.id, up=False)
+    assert not manager.can_move_in_queue(dep.id, up=True)  # blocked tier above
+    assert manager.can_move_in_queue(dep.id, up=False)
+    assert not manager.can_move_in_queue(blocked.id, up=True)  # queue edge
+    assert not manager.can_move_in_queue(blocked.id, up=False)  # blocked tier
+    assert not manager.can_move_in_queue(bug.id, up=True)  # bug block above
+    assert not manager.can_move_in_queue(bug.id, up=False)  # queue edge
+
+
 def test_move_repositions_answered_clarification_marker(
     manager: TaskManager,
 ) -> None:

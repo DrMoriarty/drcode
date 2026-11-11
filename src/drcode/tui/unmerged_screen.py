@@ -160,6 +160,10 @@ class UnmergedListScreen(ModalScreen[None]):
         self._busy_label: str | None = None
         self._busy_started: float | None = None
         self._busy_timer: Timer | None = None
+        # The title's loading spinner: while the initial (silent) branch
+        # sweep runs, the title line animates — the dialog paints empty,
+        # the git sweep can take seconds.
+        self._title_timer: Timer | None = None
         self._spinner_frame = 0
 
     # -- composition ----------------------------------------------------------
@@ -242,6 +246,48 @@ class UnmergedListScreen(ModalScreen[None]):
         )
         frame = _SPINNER_FRAMES[self._spinner_frame]
         footer.update(f"[{frame}] {self._busy_label}…  ({_fmt_seconds(elapsed)})")
+
+    # -- the title's loading spinner (silent refreshes) --------------------------
+
+    def _start_title_spinner(self) -> None:
+        """A silent (automatic) refresh begins: the title line shows the
+        same braille spinner as the footer's busy line — the dialog is
+        on screen with an empty list while the git sweep runs."""
+        if self._title_timer is None:
+            self._spinner_frame = 0
+            self._title_timer = self.set_interval(
+                _SPINNER_INTERVAL, self._tick_title_spinner
+            )
+            self._render_title_loading()
+
+    def _tick_title_spinner(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        self._render_title_loading()
+
+    def _render_title_loading(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            title = self.query_one("#unmerged-title", Static)
+        except NoMatches:
+            return
+        frame = _SPINNER_FRAMES[self._spinner_frame]
+        title.update(f"{frame} Loading branches…")
+
+    def _stop_title_spinner(self) -> None:
+        """The sweep is over: the plain title returns. Safe for a late
+        worker after the screen was dismissed (unmount stops the timer,
+        the query is guarded)."""
+        if self._title_timer is not None:
+            self._title_timer.stop()
+            self._title_timer = None
+        if not self.is_mounted:
+            return
+        try:
+            title = self.query_one("#unmerged-title", Static)
+        except NoMatches:
+            return
+        title.update("Unmerged task branches")
 
     # -- state ------------------------------------------------------------------
 
@@ -331,16 +377,22 @@ class UnmergedListScreen(ModalScreen[None]):
 
     @work(exclusive=True, group="unmerged-refresh")
     async def _refresh_entries(self, show_busy: bool = False) -> None:
-        # The explicit r press gets the busy spinner (the git sweep can
-        # take seconds); the automatic refreshes (on resume, after a
-        # land) stay silent — the user did not press anything.
+        # The explicit r press gets the busy footer spinner (the git
+        # sweep can take seconds); the automatic refreshes (on resume,
+        # after a land) stay silent in the footer — but still animate the
+        # title while the branches load, the dialog paints with an empty
+        # list until the sweep is done.
         if show_busy:
             self._show_busy("refreshing")
+        else:
+            self._start_title_spinner()
         try:
             await self._run_refresh()
         finally:
             if show_busy:
                 self._end_busy()
+            else:
+                self._stop_title_spinner()
 
     async def _run_refresh(self) -> None:
         sel = self._selected()

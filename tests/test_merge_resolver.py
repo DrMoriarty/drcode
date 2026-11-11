@@ -1088,6 +1088,27 @@ def test_build_repair_prompt_carries_finding_and_budget() -> None:
     assert "NOTHING was rolled back" in prompt
     assert "set_resolution" in prompt
     assert "mainwindow.cpp lost the wiring" in prompt
+    # The scope guard stays in force across repair rounds — stated in
+    # the prompt, not only enforced.
+    assert "SCOPE LIMIT" in prompt
+
+
+def test_build_mechanical_repair_prompt_carries_checks_and_scope() -> None:
+    from drcode.core.pipeline_resolver import _build_mechanical_repair_prompt
+
+    checks = [
+        mr.CheckResult(name="ruff check", ok=False, output="F401 unused import 'json'"),
+        mr.CheckResult(name="compile (py_compile of tracked .py files)", ok=False),
+    ]
+    prompt = _build_mechanical_repair_prompt(checks, 2)
+    assert "repair round 2 of 2" in prompt
+    assert "NOTHING was rolled back" in prompt
+    assert "set_resolution" in prompt
+    assert "SCOPE LIMIT" in prompt
+    assert "ruff check" in prompt
+    assert "F401 unused import 'json'" in prompt
+    # A check without captured output still names the check itself.
+    assert "(no output captured)" in prompt
 
 
 def test_out_of_scope_changes_tracks_and_ignores(repo: Path) -> None:

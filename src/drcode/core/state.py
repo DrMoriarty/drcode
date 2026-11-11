@@ -600,13 +600,15 @@ class CoreState:
     # files, never the resolver's work — kept across the round's
     # scheduled retries, popped when the round concludes.
     _resolver_round_baseline: dict[str, set[str]]
-    # The pending targeted-repair continuation of a resolver round (the
-    # lost-intent-review repair): task id -> the repair prompt (the review
-    # report + point-fix instructions). Set by _apply_resolver_outcome when
-    # a 'lost' verdict carries a concrete, actionable finding — the
-    # resolved worktree is NOT rolled back; the next invocation continues
-    # the SAME round transcript (task.resolver_messages[-1]) with this
-    # prompt. Popped when the repair invocation starts.
+    # The pending targeted-repair continuation of a resolver round: task
+    # id -> the repair prompt (the failing checks' output or the review
+    # report + point-fix instructions). Set by _apply_resolver_outcome
+    # when a CONCRETE failure follows a successful agent claim — a failed
+    # mechanical check / test suite, or a 'lost' review verdict with an
+    # actionable finding — the resolved worktree is NOT rolled back; the
+    # next invocation continues the SAME round transcript
+    # (task.resolver_messages[-1]) with this prompt. Popped when the
+    # repair invocation starts.
     _resolver_repair_round: dict[str, str]
     # Repair rounds already spent per conflict (budget: _MAX_REPAIR_ROUNDS):
     # incremented per repair, reset when a FRESH round deploys/re-detects

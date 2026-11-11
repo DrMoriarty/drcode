@@ -157,16 +157,19 @@ async def test_dynamic_instructions_yield_single_leading_system_message(
     """Regression (task #83431cb3): strict vLLM gateways reject requests with
     more than one leading `system` message ("System message must be at the
     beginning." — 400). pydantic-ai turns every instruction-part (the static
-    task prompt in `build_agent` plus the DYNAMIC instructions: the todo
-    checklist, the goals roadmap, the mark_unneeded hint) into its own
-    leading system message and merges them into one only when the model
-    profile sets openai_chat_supports_multiple_system_messages=False —
-    `build_model` must therefore always build with that profile.
+    task prompt in `build_agent` plus the DYNAMIC instructions: the goals
+    roadmap, the mark_unneeded hint) into its own leading system message and
+    merges them into one only when the model profile sets
+    openai_chat_supports_multiple_system_messages=False — `build_model` must
+    therefore always build with that profile.
 
-    Asserted on the real request body captured through a mock transport:
-    a feature agent whose checklist is non-empty (so the dynamic todo
-    instruction actually fires) sends exactly one leading system message,
-    and it carries both the static and the dynamic content."""
+    The todo checklist is deliberately NOT among them anymore (#a0a55d3d):
+    it rides the request TAIL (TodoTailModel), so a mid-run checklist
+    mutation never invalidates the cached leading prefix. Asserted on the
+    real request body captured through a mock transport: a feature agent
+    whose checklist is non-empty sends exactly one leading system message
+    carrying only the static prompt, while the checklist arrives in the
+    trailing message."""
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -184,9 +187,14 @@ async def test_dynamic_instructions_yield_single_leading_system_message(
 
     monkeypatch.setattr(agent_model, "AsyncOpenAI", factory)
 
-    ag = build_agent(make_config(), kind=TaskKind.FEATURE, root=project_root)
     task = manager.create("t", "feature brief", kind=TaskKind.FEATURE)
     task.todos = [TodoItem(text="step one")]
+    ag = build_agent(
+        make_config(),
+        kind=TaskKind.FEATURE,
+        root=project_root,
+        todo_supplier=lambda: agent_mod.todo_instructions(manager.get(task.id)),
+    )
     deps = AgentDeps(
         root=project_root,
         manager=manager,
@@ -205,11 +213,16 @@ async def test_dynamic_instructions_yield_single_leading_system_message(
             leading.append(msg)
         else:
             break
-    # Exactly ONE leading system message (static + dynamic instructions merged).
+    # Exactly ONE leading system message — the todo tail is not a system
+    # message and adds nothing here.
     assert len(leading) == 1
-    # It carries BOTH the static task prompt and the dynamic checklist —
-    # nothing was dropped by the merge.
-    assert "step one" in leading[0]["content"]
+    # The leading zone carries the static task prompt (with AGENTS.md) and
+    # NOT the checklist — a checklist byte must never sit in the cached
+    # prefix.
+    assert "todo_create" in leading[0]["content"]
+    assert "step one" not in leading[0]["content"]
+    # The checklist rides the LAST message of the request instead.
+    assert "step one" in str(messages[-1])
 
 
 async def test_streamed_roundtrip_and_per_request_user_agent_override() -> None:

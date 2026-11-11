@@ -9,15 +9,18 @@ soft gate and the TUI panel rendering.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ModelRequest
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.models.wrapper import WrapperModel
 
 from drcode import agent as agent_mod
 from drcode.agent import AgentDeps
+from drcode.agent_model import TodoTailModel
 from drcode.config import Config
 from drcode.models import Task, TaskKind, TaskStatus, TodoItem
 from drcode.storage import Storage
@@ -190,7 +193,7 @@ def test_render_todos_numbered() -> None:
     assert text == "1. [x] a\n2. [ ] b"
 
 
-# -- context injection ----------------------------------------------------------
+# -- tail injection (request tail, NOT leading instructions) ---------------------
 
 
 class _CreateThenFinishModel(TestModel):
@@ -211,71 +214,242 @@ class _CreateThenFinishModel(TestModel):
         return super().gen_tool_args(tool_def)
 
 
-async def test_dynamic_instructions_reflect_state_within_activation(
-    manager, fake_config: Config
-) -> None:
-    """Regression (#fbb0d9fe): a checklist created at the start of an
-    activation must be visible in the instructions of the LATER model
-    requests of the SAME activation. Run-level `instructions=` froze the
-    (empty) state at `agent.iter` start, so the reminder never appeared;
-    dynamic instructions are recomputed per request."""
-    from pydantic_ai import capture_run_messages
+class _CapturingModel(WrapperModel):
+    """Records the message list every wrapped request actually receives —
+    the wire boundary the TodoTailModel injection must show up at."""
 
+    def __init__(self, wrapped):  # type: ignore[no-untyped-def]
+        super().__init__(wrapped)
+        self.seen: list[list] = []
+
+    async def request(self, messages, model_settings, model_request_parameters):  # type: ignore[no-untyped-def]
+        self.seen.append(list(messages))
+        return await self.wrapped.request(
+            messages, model_settings, model_request_parameters
+        )
+
+    @asynccontextmanager
+    async def request_stream(  # type: ignore[no-untyped-def]
+        self, messages, model_settings, model_request_parameters, run_context=None
+    ):
+        self.seen.append(list(messages))
+        async with self.wrapped.request_stream(
+            messages, model_settings, model_request_parameters, run_context
+        ) as response_stream:
+            yield response_stream
+
+
+def _tail_text(seen_request: list) -> str:
+    """The injected tail: the LAST message of one recorded request must be
+    a ModelRequest whose text parts carry the checklist block."""
+    from pydantic_ai.messages import UserPromptPart
+
+    last = seen_request[-1]
+    assert isinstance(last, ModelRequest)
+    return "\n".join(
+        part.content
+        for part in last.parts
+        if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+    )
+
+
+def _wire_supplier(manager, task_id: str):  # type: ignore[no-untyped-def]
+    return lambda: agent_mod.todo_instructions(manager.get(task_id))
+
+
+async def _run_once(
+    ag,
+    deps,
+    inner,
+    supplier,
+    prompt: str = "do the work",
+    *,
+    stream_nodes: bool = False,
+) -> None:
+    """One agent turn through the wrapped model. With stream_nodes=True the
+    model-request nodes are consumed via node.stream() — the same streaming
+    path the pipeline uses, i.e. model.request_stream."""
+    from pydantic_ai import Agent
+
+    model = TodoTailModel(inner, supplier)
+    async with ag.iter(prompt, model=model, deps=deps) as run:
+        async for node in run:
+            if stream_nodes and Agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as node_stream:
+                    async for _event in node_stream:
+                        pass
+
+
+async def test_todo_tail_reflects_state_within_activation(
+    manager, fake_config: Config, project_root: Path
+) -> None:
+    """Regression (#fbb0d9fe / #a0a55d3d): a checklist created at the start
+    of an activation must be visible on the LATER model requests of the
+    SAME activation, and it must ride the request TAIL — as the LAST
+    message — never the leading system zone, where a mutation would blow
+    away the server-side prefix cache."""
     from drcode.agent import build_agent
 
-    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
     task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
-    deps = _deps(manager, task, Path.cwd())
+    # The deps root is the agent's WRITABLE root: always a tmp dir — TestModel
+    # auto-issues tool calls (write_file etc.) against it, a real cwd would
+    # let them land in the checkout.
+    deps = _deps(manager, task, project_root)
+    inner = _CapturingModel(_CreateThenFinishModel())
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    supplier = _wire_supplier(manager, task.id)
 
-    with capture_run_messages() as messages:
-        async with ag.iter(
-            "do the work", model=_CreateThenFinishModel(), deps=deps
-        ) as run:
-            async for _node in run:
-                pass
+    await _run_once(ag, deps, inner, supplier)
 
-    model_requests = [m for m in messages if isinstance(m, ModelRequest)]
-    assert len(model_requests) >= 2
-    # Before todo_create: no live checklist block (the static prompt
-    # section about todo_create / todo_update is always there).
-    assert "# Task checklist (current state)" not in (
-        model_requests[0].instructions or ""
-    )
-    assert "explore code" not in (model_requests[0].instructions or "")
-    # After todo_create, same activation: the live state rides on the request.
-    final = model_requests[-1].instructions or ""
-    assert "# Task checklist (current state)" in final
-    assert "1. [ ] explore code" in final
-    assert "3 of 3 items are unchecked" in final
-    # The dynamic instructions never touch the persisted transcript.
+    assert len(inner.seen) >= 2
+    # Before todo_create: no checklist block in the request tail.
+    assert "Task checklist (current state)" not in _tail_text(inner.seen[0])
+    # After todo_create, same activation: the live state rides the LAST
+    # message of the request.
+    final_tail = _tail_text(inner.seen[-1])
+    assert "# Task checklist (current state)" in final_tail
+    assert "1. [ ] explore code" in final_tail
+    assert "3 of 3 items are unchecked" in final_tail
+
+
+async def test_todo_tail_absent_from_leading_zone(
+    manager, fake_config: Config, project_root: Path
+) -> None:
+    """Structural cache guarantee: on the wire-level message list the block
+    appears ONLY in the trailing message — every leading message (system /
+    instructions / history) is clean."""
+    from drcode.agent import build_agent
+
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    # Tmp writable root: TestModel auto-issues tool calls against deps.root.
+    deps = _deps(manager, task, project_root)
+    agent_mod._todo_create(deps, ["write tests", "add module", "run linters"])
+    inner = _CapturingModel(TestModel(custom_output_text="ok"))
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+
+    await _run_once(ag, deps, inner, _wire_supplier(manager, task.id))
+
+    wire_request = inner.seen[0]
+    for msg in wire_request[:-1]:
+        assert "Task checklist (current state)" not in str(msg)
+    assert "Task checklist (current state)" in str(wire_request[-1])
+
+
+async def test_todo_tail_live_after_update_and_never_persisted(
+    manager, fake_config: Config, project_root: Path
+) -> None:
+    """The supplier re-reads the task per REQUEST: a todo_update executed
+    mid-activation is visible to the next request's tail; and the injected
+    synthetic message never lands in the persisted transcript."""
+    from drcode.agent import build_agent
+
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    # Tmp writable root: TestModel auto-issues tool calls against deps.root.
+    deps = _deps(manager, task, project_root)
+    agent_mod._todo_create(deps, ["write tests", "add module", "run linters"])
+    inner = _CapturingModel(TestModel(custom_output_text="ok"))
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    supplier = _wire_supplier(manager, task.id)
+
+    # One request with the initial state...
+    await _run_once(ag, deps, inner, supplier)
+    assert "1. [ ] write tests" in _tail_text(inner.seen[0])
+    # ...then update the checklist and make ONE more request: the tail
+    # carries the fresh state on the very next request.
+    agent_mod._todo_update(deps, [1], done=True)
+    inner.seen.clear()
+    await _run_once(ag, deps, inner, supplier, prompt="continue")
+    tail = _tail_text(inner.seen[-1])
+    assert "1. [x] write tests" in tail
+    assert "2 of 3 items are unchecked" in tail
+    # The transcript stays clean: the tail never touches it.
     stored = manager.get(task.id).messages
-    assert all("Task checklist (current state)" not in json.dumps(m) for m in stored)
+    assert all("Task checklist (current state)" not in str(m) for m in stored)
 
 
-def test_dynamic_instructions_hook_direct(manager, fake_config: Config) -> None:
-    """The registered hook recomputes from the CURRENT task state: None
-    before todo_create, the live list after it."""
-    from pydantic_ai import RunContext
-    from pydantic_ai.usage import RunUsage
-
-    from drcode.agent import _todo_create, build_agent
-
-    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
-    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
-    deps = _deps(manager, task, Path.cwd())
-    ctx = RunContext(deps=deps, model=TestModel(), usage=RunUsage())
-
-    # The hook IS registered as dynamic instructions on the built agent.
-    assert any(
-        part.instruction is agent_mod.todo_dynamic_instructions and part.dynamic
-        for part in ag._instructions
+async def test_todo_tail_model_semantics() -> None:
+    """Wrapper-level contract, no agent involved: None supplier → the
+    wrapped model gets EXACTLY the original list; a block → appended as
+    one synthetic trailing ModelRequest, and the caller's list object is
+    never mutated (the injection must not leak into the run state)."""
+    from pydantic_ai.messages import (
+        ModelMessage,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
     )
-    assert agent_mod.todo_dynamic_instructions(ctx) is None
-    _todo_create(deps, ["write tests", "add module", "run linters"])
-    text = agent_mod.todo_dynamic_instructions(ctx)
-    assert text is not None
-    assert "1. [ ] write tests" in text
-    assert "todo_update" in text
+    from pydantic_ai.models import Model
+
+    class _EchoModel(Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[ModelMessage] | None = None
+
+        @property
+        def model_name(self) -> str:
+            return "echo"
+
+        @property
+        def system(self) -> str:
+            return "test"
+
+        async def request(  # type: ignore[no-untyped-def]
+            self, messages, model_settings, model_request_parameters
+        ):
+            self.seen = list(messages)
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+    echo = _EchoModel()
+    model = TodoTailModel(echo, lambda: None)
+    msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hi")])]
+    await model.request(msgs, None, None)  # type: ignore[arg-type]
+    assert echo.seen == msgs
+
+    echo2 = _EchoModel()
+    model2 = TodoTailModel(echo2, lambda: "BLOCK")
+    await model2.request(msgs, None, None)  # type: ignore[arg-type]
+    assert echo2.seen is not None
+    assert len(echo2.seen) == 2
+    assert echo2.seen[0] is msgs[0]
+    assert "BLOCK" in _tail_text(echo2.seen)
+    # The caller's list was not mutated.
+    assert len(msgs) == 1
+
+
+def test_build_agent_wraps_model_only_with_supplier(fake_config: Config) -> None:
+    """The tail wrapper is installed exactly when a supplier is wired, and
+    stays a pass-through design elsewhere (tester/resolver/estimation)."""
+    from drcode.agent import build_agent
+
+    assert isinstance(
+        build_agent(fake_config, todo_supplier=lambda: None).model, TodoTailModel
+    )
+    assert not isinstance(build_agent(fake_config).model, TodoTailModel)
+
+
+async def test_todo_tail_streaming_request(
+    manager, fake_config: Config, project_root: Path
+) -> None:
+    """The streaming path (the pipeline streams every node) injects the
+    tail too: the wrapped model's request_stream sees the trailing block."""
+    from drcode.agent import build_agent
+
+    task = manager.create("feature", "brief", kind=TaskKind.FEATURE)
+    # Tmp writable root: TestModel auto-issues tool calls against deps.root.
+    agent_mod._todo_create(
+        _deps(manager, task, project_root), ["a first", "a second", "a third"]
+    )
+    inner = _CapturingModel(TestModel(custom_output_text="ok"))
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    await _run_once(
+        ag,
+        _deps(manager, task, project_root),
+        inner,
+        _wire_supplier(manager, task.id),
+        stream_nodes=True,
+    )
+    assert inner.seen
+    assert "1. [ ] a first" in _tail_text(inner.seen[0])
 
 
 def test_todo_create_result_reminds_to_update(manager, tmp_path) -> None:

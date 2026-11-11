@@ -51,7 +51,6 @@ from .agent_tools import (
     goals_dynamic_instructions,
     goals_instructions,
     load_agents_md,
-    todo_dynamic_instructions,
     todo_instructions,
 )
 from .compaction import (
@@ -220,7 +219,6 @@ __all__ = [
     "subagent_limit_for",
     "task_search",
     "tester_verdict_issued",
-    "todo_dynamic_instructions",
     "todo_instructions",
     "tools",
     "unwrap_summary_envelope",

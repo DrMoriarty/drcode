@@ -1922,6 +1922,30 @@ async def test_sidebar_shows_task_statuses(app: DrCodeApp) -> None:
         assert items
 
 
+async def test_sidebar_testing_section_mirrors_tester_pick_order(
+    app: DrCodeApp,
+) -> None:
+    """Several TESTING tasks: the section reads as the actual tester queue
+    (`_next_testing` precedence — bugs first, within a kind oldest first)
+    reversed, so the next-to-be-tested task sits just above the currently
+    tested one at the bottom of the section."""
+    feat_old = app.manager.create("feat old", "p")
+    feat_new = app.manager.create("feat new", "p")
+    bug_old = app.manager.create("bug old", "p", kind=TaskKind.BUG)
+    bug_new = app.manager.create("bug new", "p", kind=TaskKind.BUG)
+    for t in (feat_old, feat_new, bug_old, bug_new):
+        t.status = TaskStatus.TESTING
+    # The tester is working on the oldest bug (its actual pick).
+    app._tester_task_id = bug_old.id
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        sections = dict(app._sidebar_sections())
+        testing_ids = [t.id for t in sections["TESTING"]]
+        # Pick order: bug_old, bug_new, feat_old, feat_new — reversed for
+        # display, current tester task (bug_old) pinned to the bottom.
+        assert testing_ids == [feat_new.id, feat_old.id, bug_new.id, bug_old.id]
+
+
 async def test_sidebar_click_opens_task_and_cancels_new_task(app: DrCodeApp) -> None:
     """A plain click on a sidebar task opens it, leaving the new-task form."""
     task = app.manager.create("clickable", "")

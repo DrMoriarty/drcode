@@ -61,8 +61,10 @@ class HeaderLayer(DrCodeState):
                 self.run_agent(task_id)
             else:
                 # Cancelled/re-queued while waiting: drop the stale outage
-                # state (it would keep _outage_active latched).
+                # state (it would keep _outage_active latched) and the
+                # retry-resume marker (the task's next start is genuine).
                 self._agent_net_count.pop(task_id, None)
+                self._agent_retry_resumes.discard(task_id)
         for task_id in [
             tid
             for tid, c in self._tester_net_count.items()

@@ -927,6 +927,11 @@ class PipelineAgentRunLayer(CoreState):
             )
         if self._agent_generations.get(task_id) == generation:
             self._drop_stream_preview(task_id, generation)
+        # Whatever re-enters run_agent from here (the retry timer, or the
+        # outage probe ticks once the gateway answers TCP) is an IN-PLACE
+        # resume: the task keeps its ACTIVE status, so the resumed run
+        # must not repeat the "Model:" line (see _emit_run_model_event).
+        self._agent_retry_resumes.add(task_id)
         # The request node died mid-flight: the consumed prompt is already
         # in the transcript with the consumption stamp (the completion
         # bookkeeping that backdates it was skipped) — correct it before
@@ -1146,9 +1151,12 @@ class PipelineAgentRunLayer(CoreState):
         task.status = TaskStatus.QUEUED
         self._agent_failed.add(task_id)
         # No live run means no retry can be in flight — drop any stale
-        # network bookkeeping or the outage latch would hold the session.
+        # network bookkeeping or the outage latch would hold the session
+        # (and the retry-resume marker would silence the model line of
+        # the task's next genuine start).
         self._agent_net_count.pop(task_id, None)
         self._agent_net_retry_at.pop(task_id, None)
+        self._agent_retry_resumes.discard(task_id)
         self.manager.storage.save(task)
         # The transition happened outside the manager — report it to the
         # status observers (notifications) explicitly.

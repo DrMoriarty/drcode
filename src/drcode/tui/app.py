@@ -730,6 +730,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # the task ACTIVE and is retried after a backoff delay.
         self._agent_net_count: dict[str, int] = {}
         self._agent_net_retry_at: dict[str, float] = {}
+        # Task ids whose next run start is an in-place network-retry resume
+        # (set by _agent_turn_network_error, consumed by
+        # _emit_run_model_event — such resumes repeat no "Model:" line).
+        self._agent_retry_resumes: set[str] = set()
         # Total network-retry backoffs this session (the per-task dict above
         # holds only the current retry budgets); shown in the expanded
         # header.

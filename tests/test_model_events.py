@@ -2,12 +2,14 @@
 
 Chat-only bookkeeping (never the model context), three cases:
 
-1. EVERY agent-run start logs ``Model: <key>`` — including the automatic
-   re-entry of the in-place network retry;
+1. every run start that follows a STATUS transition logs
+   ``Model: <key>`` (first activation, re-entry after a queue demotion)
+   — the in-place resume of a network retry does NOT repeat the line
+   (the task never changed status, the model is unchanged);
 2. when the effective model of the serving role changed since the
    task's previous attempt, the run-start wording reports the switch
-   (e.g. after a failed attempt demoted the task and the user picked a
-   different model);
+   (even on a retry resume — e.g. the user picked a different model
+   while the retry was pending);
 3. a manual model change while a run is in flight logs a
    ``Model changed: …`` event into the running task's chat, honestly
    saying the current run keeps the old model.
@@ -138,12 +140,12 @@ async def test_run_start_event_and_switch_after_model_change(
     assert "Model switched: local-swap/m-one → m-two" in texts
 
 
-async def test_run_start_event_repeats_when_model_unchanged(
+async def test_run_start_event_not_repeated_by_retry_resume(
     app: DrCodeApp, scripted: ScriptedState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two run starts on the same model (the second one the in-place
-    network retry's automatic re-entry into run_agent): both log the
-    plain event, neither is worded as a switch."""
+    """A run start on the same model logs the plain event once; the
+    in-place network retry's re-entry into run_agent (no status change,
+    same model) stays silent."""
     fired: list[Callable[[], Any]] = []
 
     def fire_later(delay: float, callback: Callable[[], Any]) -> None:
@@ -161,7 +163,7 @@ async def test_run_start_event_repeats_when_model_unchanged(
             what="research run completed after the in-place retry",
         )
     texts = event_texts(task)
-    assert texts.count("Model: local-swap/m-one") == 2
+    assert texts.count("Model: local-swap/m-one") == 1
     assert not any("Model switched" in t for t in texts)
 
 

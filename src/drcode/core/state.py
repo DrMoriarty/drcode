@@ -146,9 +146,14 @@ class CoreState:
 
     def _emit_run_model_event(self, task: Task, role: AgentRole) -> None:
         """Run-start service event naming the model the agent's run is
-        served by. Fires on EVERY run start (including the automatic
-        resume of a demoted/unfinished attempt); when the task's previous
-        run started on a different key, the wording says so.
+        served by. Fires on every run start that follows a STATUS
+        transition (first activation, re-entry after a queue demotion)
+        — but NOT on the in-place resume of a network retry (the task
+        never changed status, the model line would only repeat — see
+        `_agent_retry_resumes`). When the task's previous run started on
+        a different key (the user picked another model in the meantime),
+        the wording says so — a switch is reported even on a retry
+        resume.
 
         A task whose key has no entry yet (first run of the session —
         the dict above is session-scoped and not persisted) always gets
@@ -161,8 +166,14 @@ class CoreState:
         self._last_agent_model_keys[task.id] = key
         if previous and previous != key:
             self._show_event(task, f"Model switched: {previous} → {key}")
-        else:
-            self._show_event(task, f"Model: {key}")
+            self._agent_retry_resumes.discard(task.id)
+            return
+        if task.id in self._agent_retry_resumes:
+            # An in-place network-retry resume: no status change, the
+            # model is unchanged — the plain line would only repeat.
+            self._agent_retry_resumes.discard(task.id)
+            return
+        self._show_event(task, f"Model: {key}")
 
     def _emit_manual_model_change_events(self, before: dict[AgentRole, str]) -> None:
         """Manual model-change events: the user picked a different model
@@ -617,6 +628,11 @@ class CoreState:
     _agent_dead: set[str]
     _agent_net_count: dict[str, int]
     _agent_net_retry_at: dict[str, float]
+    # Task ids whose NEXT run start is the in-place resume of a scheduled
+    # network retry (set by _agent_turn_network_error, consumed by
+    # _emit_run_model_event): such a resume never changed the task's
+    # status, so the plain "Model:" line is suppressed there. Session-only.
+    _agent_retry_resumes: set[str]
     _net_retries_total: int
     # Failed-queue deadlock escape (see PipelineLayer._promote_failed_queue):
     # how many rescue rounds have fired this session and the earliest

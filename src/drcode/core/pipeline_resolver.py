@@ -950,8 +950,7 @@ class PipelineResolverLayer(CoreState):
                     )
                     return (
                         "unsure",
-                        prefix
-                        + f"the reviewer pass failed with a context "
+                        prefix + f"the reviewer pass failed with a context "
                         f"overflow ({failure}) — retrying cannot help, "
                         "treated as unsure",
                         True,
@@ -965,7 +964,8 @@ class PipelineResolverLayer(CoreState):
                     )
                     return (
                         "unsure",
-                        prefix + f"the reviewer pass failed ({failure}) — treated as unsure",
+                        prefix
+                        + f"the reviewer pass failed ({failure}) — treated as unsure",
                         True,
                     )
                 if attempt >= _MAX_REVIEW_ATTEMPTS:
@@ -978,8 +978,7 @@ class PipelineResolverLayer(CoreState):
                     )
                     return (
                         "unsure",
-                        prefix
-                        + f"the reviewer pass failed {attempt} times "
+                        prefix + f"the reviewer pass failed {attempt} times "
                         f"({'; '.join(failures)}) — retries exhausted, "
                         "treated as unsure",
                         True,
@@ -1179,8 +1178,7 @@ class PipelineResolverLayer(CoreState):
         task.touch()
         self.manager.storage.save(task)
         tail = (
-            " — the pristine conflict is back in the worktree, a human "
-            "must take over."
+            " — the pristine conflict is back in the worktree, a human must take over."
             if restored
             else (
                 " — the worktree could NOT be rolled back cleanly: "
@@ -1191,8 +1189,7 @@ class PipelineResolverLayer(CoreState):
         )
         self._show_event(
             task,
-            f"Automatic conflict resolution abandoned after repeated "
-            f"failures{tail}",
+            f"Automatic conflict resolution abandoned after repeated failures{tail}",
             kind="workflow",
         )
         self._suggest_conflict_screen(task)

@@ -3062,6 +3062,58 @@ async def test_project_model_dialog_slot_missing_from_user_catalog(
         )
 
 
+async def test_project_model_dialog_favorites_sorted_first(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """Catalog models with favorite levels 1..3 sit above the
+    non-favorites (tier order, original order within each tier); the
+    non-catalog tail options (custom / Custom… / User default) stay at
+    the bottom."""
+    from drcode.providers import (
+        ModelEntry,
+        Provider,
+        UserModelsConfig,
+        UserModelsStore,
+    )
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    catalog = UserModelsConfig(
+        providers=[
+            Provider(
+                name="local-swap",
+                base_url="http://localhost:8080/v1",
+                models=[
+                    ModelEntry(id="plain-a"),
+                    ModelEntry(id="fav2-b", favorite=2),
+                    ModelEntry(id="fav1-a", favorite=1),
+                    ModelEntry(id="plain-b"),
+                    ModelEntry(id="fav3", favorite=3),
+                    ModelEntry(id="fav1-b", favorite=1),
+                ],
+            )
+        ]
+    )
+    UserModelsStore().save(catalog)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        values = [str(v) for _, v in _pms_select(dialog, AgentRole.CODING)._options]
+        assert values == [
+            "local-swap/fav1-a",
+            "local-swap/fav1-b",
+            "local-swap/fav2-b",
+            "local-swap/fav3",
+            "local-swap/plain-a",
+            "local-swap/plain-b",
+            "__custom__",
+            "__user_default__",
+        ]
+
+
 async def test_project_model_dialog_custom_slot_without_saved_entry(
     app: DrCodeApp, project_root: Path
 ) -> None:

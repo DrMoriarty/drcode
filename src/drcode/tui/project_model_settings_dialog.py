@@ -240,13 +240,16 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     def _model_options(self, role: AgentRole) -> list[tuple[str, object]]:
         """The model Select options of one role: catalog models
         (as "provider/model" strings — Select values must be hashable;
-        the user-level default and the effective slot are marked), the
-        saved/draft custom model, "Custom…" and "User default" (always —
-        the reset exists for every role)."""
+        the user-level default and the effective slot are marked; sorted
+        favorites-first — level 1, then 2, then 3, then the non-favorites,
+        the original order kept within each group), the saved/draft
+        custom model, "Custom…" and "User default" (always — the reset
+        exists for every role)."""
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
         options: list[tuple[str, object]] = []
+        catalog_options: list[tuple[int, str, object]] = []
         for provider in catalog.providers:
             for entry in provider.models:
                 ref = f"{provider.name}/{entry.id}"
@@ -255,7 +258,10 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                     label += " (default)"
                 if slot is not None and ref == str(slot):
                     label += " (current)"
-                options.append((label, ref))
+                # 0 = not a favorite — sorts after the 1..3 tiers.
+                catalog_options.append((entry.favorite or 4, label, ref))
+        catalog_options.sort(key=lambda item: item[0])
+        options.extend((label, ref) for _, label, ref in catalog_options)
         if isinstance(slot, ModelRef) and str(slot) not in {
             value for _, value in options
         }:

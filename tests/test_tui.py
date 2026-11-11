@@ -3032,6 +3032,57 @@ async def test_project_model_dialog_form_and_apply(
         assert settings_store.load().role_max_tokens == {"tester": 24576}
 
 
+async def test_project_model_dialog_slot_missing_from_user_catalog(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """A project slot referencing a provider absent from THIS machine's
+    user catalog (settings committed to git, cloned elsewhere) must not
+    crash the dialog with InvalidSelectValueError: the dialog opens and
+    the slot stays selectable as "(not in user catalog)"."""
+    from drcode.providers import ModelRef, set_project_model
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="api-copilot.x5.ru", model="x5-airun-small-thinking"),
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        select = _pms_select(dialog, AgentRole.CODING)
+        assert select.value == "api-copilot.x5.ru/x5-airun-small-thinking"
+        assert any(
+            "not in user catalog" in str(prompt) for prompt, _ in select._options
+        )
+
+
+async def test_project_model_dialog_custom_slot_without_saved_entry(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """A "custom" slot whose custom_models[role] entry is missing must
+    not crash the dialog either."""
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    (project_root / ".drcode").mkdir(parents=True, exist_ok=True)
+    (project_root / ".drcode" / "drcode.json").write_text(
+        json.dumps({"models": {"tester": "custom"}})
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        assert _pms_select(dialog, AgentRole.TESTER).value == "custom"
+
+
 async def test_project_model_dialog_reset_to_user_default(
     app: DrCodeApp, project_root: Path
 ) -> None:

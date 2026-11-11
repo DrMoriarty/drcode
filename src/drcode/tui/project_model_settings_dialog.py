@@ -256,12 +256,25 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 if slot is not None and ref == str(slot):
                     label += " (current)"
                 options.append((label, ref))
+        if isinstance(slot, ModelRef) and str(slot) not in {
+            value for _, value in options
+        }:
+            # A catalog reference whose provider/model is missing from THIS
+            # machine's user catalog (project settings committed to git and
+            # cloned elsewhere): without an option carrying the slot value
+            # the Select constructor raises InvalidSelectValueError. Keep
+            # the draft slot selectable instead of crashing.
+            options.append((f"{slot} (not in user catalog)", str(slot)))
         custom = self._customs.get(role)
         if custom is not None:
             label = f"Custom: {custom.model}"
             if slot == "custom":
                 label += " (current)"
             options.append((label, "custom"))
+        elif slot == "custom":
+            # A "custom" slot whose saved custom_models[role] entry is
+            # missing/invalid: same missing-value hazard as above.
+            options.append(("Custom: <no saved model>", "custom"))
         options.append(("Custom…", _CUSTOM_NEW))
         reset = "User default"
         if slot is None:

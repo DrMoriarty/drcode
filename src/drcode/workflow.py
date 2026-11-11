@@ -780,7 +780,9 @@ class WorkflowHooks:
         extra: dict[str, Any] | None = None,
     ) -> HookResult:
         """Run one hook: `python -c <bootstrap> <script>` in a subprocess
-        with cwd = project root (or the task's worktree — see below); the
+        (from a frozen bundle: `<drcode binary> --run-hook <script>` —
+        sys.executable is the binary, not an interpreter) with cwd =
+        project root (or the task's worktree — see below); the
         bootstrap imports the script, feeds it the JSON payload on stdin
         and prints the hook's return value as a JSON object. The script
         itself never has to write dispatch code — it just defines the hook
@@ -823,12 +825,21 @@ class WorkflowHooks:
             payload["git"]["commit"] = commit
         if extra:
             payload.update(extra)
+        # In a frozen (PyInstaller) bundle sys.executable is the drcode
+        # binary itself, not a python interpreter: `binary -c <bootstrap>`
+        # would be ignored by the entry stub, fall through main() into a
+        # second TUI instance in the hook's cwd and die by the timeout
+        # without ever running the hook. The frozen binary understands the
+        # hidden --run-hook flag instead (drcode.__init__.main ->
+        # drcode.hook_runner, the in-binary twin of _BOOTSTRAP below).
+        argv: list[str]
+        if getattr(sys, "frozen", False):
+            argv = [sys.executable, "--run-hook", str(self.script)]
+        else:
+            argv = [sys.executable, "-c", _BOOTSTRAP, str(self.script)]
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-c",
-                _BOOTSTRAP,
-                str(self.script),
+                *argv,
                 cwd=cwd or self.project_root,
                 env=sanitized_env(),
                 stdin=asyncio.subprocess.PIPE,

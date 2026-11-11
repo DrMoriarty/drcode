@@ -196,6 +196,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         subagent_limit: int = 0,
         task_id: Any = None,
         eviction_hint: bool = False,
+        todo_supplier: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
@@ -205,6 +206,8 @@ async def test_research_task_builds_agent_with_research_role_config(
             kwargs["task_id"] = task_id
         if eviction_hint:
             kwargs["eviction_hint"] = eviction_hint
+        if todo_supplier is not None:
+            kwargs["todo_supplier"] = todo_supplier
         return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
@@ -3167,6 +3170,95 @@ def test_context_overflow_classifier_matches_rejected_error_alias() -> None:
         ModelRequestRejectedError(400, "invalid tool schema")
     )
     assert not _is_context_overflow_error(ModelRequestRejectedError(500, overflow))
+
+
+def test_deterministic_rejection_classifier() -> None:
+    """HTTP 400 whose body matches a known deterministic-rejection marker
+    (the #83431cb3 incident: 'System message must be at the beginning.')
+    classifies as a deterministic request rejection; other bodies, other
+    statuses and transport errors do not — and it stays separate from the
+    context-overflow predicate (which gates the mechanical compaction)."""
+    from drcode.core.usage import (
+        _is_context_overflow_error,
+        _is_deterministic_request_rejection,
+    )
+
+    class ModelRequestRejectedError(Exception):
+        def __init__(self, status_code: int, body: str) -> None:
+            super().__init__(body)
+            self.status_code = status_code
+            self.body = body
+
+        def __str__(self) -> str:
+            return f"status_code: {self.status_code}, body: {self.body}"
+
+    assert _is_deterministic_request_rejection(
+        http_error(400, "System message must be at the beginning.")
+    )
+    # Duck-typed alias classes match too.
+    assert _is_deterministic_request_rejection(
+        ModelRequestRejectedError(400, "system message must be at the beginning")
+    )
+    # Other 400 bodies, other statuses, transport errors: not rejections.
+    assert not _is_deterministic_request_rejection(
+        http_error(400, "invalid tool schema")
+    )
+    assert not _is_deterministic_request_rejection(
+        http_error(500, "System message must be at the beginning.")
+    )
+    assert not _is_deterministic_request_rejection(
+        http_error(429, "System message must be at the beginning.")
+    )
+    assert not _is_deterministic_request_rejection(api_error("Connection error."))
+    # Non-context rejections never trip the overflow classifier either.
+    assert not _is_context_overflow_error(
+        http_error(400, "System message must be at the beginning.")
+    )
+
+
+async def test_deterministic_rejection_failure_is_never_rescued(
+    net_app: DrCodeApp, scripted: ScriptedState, instant_timers: list[float]
+) -> None:
+    """A 400 'System message must be at the beginning.' is deterministic
+    (the #83431cb3 carousel): the task is marked dead on the first
+    failure, the failed-queue rescue escape never lifts it back (no more
+    than one attempt per task), and the chat event names the real cause
+    instead of claiming a context-window overflow."""
+    task = net_app.manager.create("bad gateway", "do something", kind=TaskKind.RESEARCH)
+    scripted.steps = [http_error(400, "System message must be at the beginning.")]
+    overflow_notified: list[str] = []
+    rejected_notified: list[str] = []
+    net_app.notifier.task_context_overflow = overflow_notified.append  # type: ignore[method-assign]
+    net_app.notifier.task_request_rejected = rejected_notified.append  # type: ignore[method-assign]
+
+    async with net_app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: (
+                task.status is TaskStatus.QUEUED
+                and task.id in net_app._agent_dead
+                and task.id in net_app._agent_failed
+            ),
+            pilot,
+            what="task demoted and marked dead",
+        )
+        await pilot.pause()
+        # The deadlock escape must NOT fire for a dead-only queue: the
+        # old carousel (activate → 400 → rescue → activate, ~20 rounds)
+        # is gone — one attempt, then nothing.
+        assert net_app._failed_queue_rounds == 0
+        assert instant_timers == []
+        net_app._advance()
+        await pilot.pause()
+        assert len(scripted.calls) == 1
+
+    assert rejected_notified == [task.title]
+    assert overflow_notified == []
+    texts = event_texts(task)
+    assert any("deterministically rejects this request" in t for t in texts)
+    assert any("manual intervention" in t for t in texts)
+    # The context-overflow wording must not leak into the non-context case.
+    assert not any("exceeds the model's context window" in t for t in texts)
 
 
 def _tester_window_app(project_root: Path, window: int) -> DrCodeApp:

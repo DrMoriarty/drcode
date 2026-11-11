@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App
 from textual.widgets import Button, Input, OptionList, Static
 
@@ -111,9 +112,60 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
         right = _right_list(screen)
         labels = [option.id for option in right.options]
         assert labels == ["ref:alpha/m2", "ref:alpha/m1", "ref:beta/m3"]
-        first_prompt = str(right.options[0].prompt)
-        assert "•" in first_prompt and "alpha/m2" in first_prompt
+        first_prompt = right.options[0].prompt
+        assert isinstance(first_prompt, Text)
+        assert "•" in first_prompt.plain and "alpha/m2" in first_prompt.plain
+        # Only the glyph carries the favorite color: a single styled span
+        # over the "• " prefix — the name itself stays uncolored.
+        assert [(s.start, s.end, s.style) for s in first_prompt.spans] == [
+            (2, 4, "bold red")
+        ]
         assert "•" not in str(right.options[1].prompt)
+        non_favorite = right.options[1].prompt
+        assert isinstance(non_favorite, Text)
+        assert not non_favorite.spans
+
+
+async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
+    """Long provider/model names are middle-truncated — in the right
+    catalog list and in the per-agent group lists alike — so an option
+    never wraps onto a second line."""
+    long_id = "a-very-long-model-identifier-that-would-wrap-in-a-narrow-column"
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="alpha",
+                    base_url="http://a/v1",
+                    models=[ModelEntry(id=long_id)],
+                )
+            ]
+        )
+    )
+    catalog = store.load()
+    catalog.defaults[AgentRole.CODING] = [ModelRef(provider="alpha", model=long_id)]
+    store.save(catalog)
+    async with _Host(store).run_test(size=(110, 40)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, AgentChainsScreen)
+        right = _right_list(screen)
+        label = str(right.options[0].prompt)
+        # Fits the list width (scrollbar allowance included) and keeps
+        # BOTH ends visible around the ellipsis.
+        assert len(label) <= right.size.width - 2
+        assert "…" in label
+        assert label.startswith("  alpha/a-very-long")
+        assert label.endswith("column")
+        # Same treatment in the per-agent chain list ("N. " prefix).
+        group_label = str(_group_list(screen, AgentRole.CODING).options[0].prompt)
+        group = _group_list(screen, AgentRole.CODING)
+        assert len(group_label) <= group.size.width - 2
+        assert "…" in group_label
+        assert group_label.startswith("1. alpha/a-very-")
+        assert group_label.endswith("-a-narrow-column")
 
 
 async def test_filter_narrows_model_list(tmp_path: Path) -> None:

@@ -83,7 +83,6 @@ __all__ = [
     "goals_dynamic_instructions",
     "goals_instructions",
     "load_agents_md",
-    "todo_dynamic_instructions",
     "todo_instructions",
 ]
 
@@ -669,19 +668,27 @@ def _update_goal(
 
 
 def todo_instructions(task: Task) -> str | None:
-    """The task's current checklist state as an instruction block (feature
-    tasks with a non-empty list only — nothing else has todo tools or a
+    """The task's current checklist state as a prompt block (feature tasks
+    with a non-empty list only — nothing else has todo tools or a
     checklist).
 
-    This is the key anti-"forgot the list" measure. It is injected as
-    DYNAMIC instructions (see `todo_dynamic_instructions`), so it is
-    recomputed for EVERY model request of every activation: the model sees
-    the live list state on the very first request after a `todo_create`
-    call within the same uninterrupted run, not only after a restart or a
-    compaction. A synthetic user message would pile up one stale copy per
-    activation in the persisted transcript; instructions never touch the
-    transcript. The list itself lives in `task.todos`; if it were only
-    prompt material, an interrupted attempt or a compaction could drop it."""
+    This is the key anti-"forgot the list" measure. The block is injected
+    at the TAIL of every model request of the coding agent (a synthetic
+    last message, see `agent_model.TodoTailModel` — the pipeline supplies
+    the live supplier at activation), recomputed from the task's CURRENT
+    state: the model sees the live list on the very first request after a
+    `todo_create`/`todo_update` call within the same uninterrupted run,
+    not only after a restart or a compaction.
+
+    Deliberately the TAIL, not dynamic instructions: those render into the
+    leading system messages, and a mid-activation checklist mutation there
+    would invalidate the server-side prefix cache almost entirely (the
+    #a0a55d3d incident). The tail wrapper copies the outgoing request and
+    appends the block as a synthetic message — the injected copy never
+    reaches the persisted transcript (the "instructions never touch the
+    transcript" rule). The list itself lives in `task.todos`; if it were
+    only prompt material, an interrupted attempt or a compaction could
+    drop it."""
     if task.kind is not TaskKind.FEATURE or not task.todos:
         return None
     unchecked = len(task.unchecked_todos)
@@ -701,16 +708,6 @@ def todo_instructions(task: Task) -> str | None:
         ),
     ]
     return "\n".join(lines)
-
-
-def todo_dynamic_instructions(ctx: RunContext[AgentDeps]) -> str | None:
-    """Dynamic instructions hook: recompute the checklist block from the
-    task's CURRENT state for every model request. Registered on the coding
-    agent in `build_agent` — pydantic-ai evaluates it per request, so a
-    checklist created (or updated) mid-activation is visible to the next
-    request of the same run, which run-level `instructions=` (frozen at
-    `agent.iter` start) could never achieve."""
-    return todo_instructions(ctx.deps.manager.get(ctx.deps.task_id))
 
 
 def load_agents_md(root: Path) -> str:
@@ -1001,8 +998,8 @@ def _eviction_candidates(
 def eviction_dynamic_instructions(
     ctx: RunContext[AgentDeps], *, max_context_tokens: int
 ) -> str | None:
-    """Dynamic-instructions nudge about `mark_unneeded` (coding agent only,
-    same pattern as `todo_dynamic_instructions`): on EVERY model request it
+    """Dynamic-instructions nudge about `mark_unneeded` (coding agent only):
+    on EVERY model request it
     measures the live context fill (`ctx_context_tokens`, the exact
     usage-based figure `context_status` reports) and scans the transcript
     for heavy unmarked old tool returns; only when BOTH the fill is above

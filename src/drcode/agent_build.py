@@ -44,7 +44,6 @@ from .agent_tools import (
     eviction_dynamic_instructions,
     goals_dynamic_instructions,
     load_agents_md,
-    todo_dynamic_instructions,
 )
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
@@ -294,6 +293,7 @@ def build_agent(
     subagent_limit: int = 0,
     task_id: str | None = None,
     eviction_hint: bool = False,
+    todo_supplier: Callable[[], str | None] | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -324,9 +324,24 @@ def build_agent(
     activation) registers the mark_unneeded nudge as a dynamic instruction;
     at False (the default) the instruction is not registered at all — no
     per-request fill measurement, no transcript scan, zero overhead.
+
+    `todo_supplier` (wired by the pipeline at activation, live-reading the
+    task) wraps the model in `agent_model.TodoTailModel`: the feature task's
+    checklist state rides on EVERY model request as a synthetic TAIL
+    message, recomputed from `task.todos` at request time — so a list
+    created or updated mid-activation is seen by the next request of the
+    same run. Deliberately NOT dynamic instructions: those render into the
+    leading system messages, and a mid-activation checklist mutation there
+    would invalidate the server-side prefix cache almost entirely (the
+    #a0a55d3d incident). The tail instead only ever invalidates the small
+    trailing zone. For non-feature tasks, empty lists and taskless builds
+    (schema estimation) the supplier yields None and the wrapper passes the
+    request through untouched.
     """
     scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config)
+    if todo_supplier is not None:
+        model = agent_model.TodoTailModel(model, todo_supplier)
     instructions = load_system_prompt(
         kind, project_root=root, research_git=research_git
     )
@@ -347,13 +362,13 @@ def build_agent(
         },
         retries=10,
     )
-    # Dynamic instructions: the feature task's checklist state rides on
-    # EVERY model request (recomputed from `task.todos` at request time),
-    # so a list created or updated mid-activation is seen by the next
-    # request of the same run — run-level `instructions=` freezes at
-    # `agent.iter` start and would miss exactly that. For non-feature
-    # tasks and empty lists it yields None (excluded from the request).
-    agent.instructions(todo_dynamic_instructions)
+    # The feature task's checklist does NOT ride here: dynamic instructions
+    # render into the LEADING system messages of every request, so a
+    # todo_create/todo_update mid-activation would move the request
+    # divergence point to the top of the dialogue and blow away the
+    # server-side prefix cache (the #a0a55d3d production incident). The
+    # live block is injected at the TAIL of each request instead — see the
+    # `todo_supplier` parameter above (the pipeline wires it at activation).
     # Same dynamic-instructions pattern for the research role's roadmap:
     # the compact active-goals block rides on EVERY model request (recomputed
     # from `manager.goals`), so a goal the agent creates/updates mid-run is
@@ -542,9 +557,9 @@ def build_agent(
     # and the tester get NO todo tools — this structurally prevents the
     # one-item-list-on-a-small-bugfix anti-pattern. The list lives on the
     # task (`task.todos`, persisted by storage) and is injected into the
-    # model context on every request by the dynamic instructions hook
-    # (`todo_dynamic_instructions`, registered above), so an abandoned
-    # stale list cannot go unnoticed either. Both tools run through
+    # model context on every request as a synthetic TAIL message (the
+    # `todo_supplier` wired at activation — see `agent_model.TodoTailModel`),
+    # so an abandoned stale list cannot go unnoticed either. Both tools run through
     # _run_tool so the fixable ValueErrors below become ModelRetry
     # prompts for the model.
     if kind is TaskKind.FEATURE:

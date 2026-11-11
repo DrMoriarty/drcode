@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import json
 import ssl
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -36,6 +42,76 @@ EXTRA_HEADERS = {"User-Agent": USER_AGENT}
 # /chat/completions через extra_body (pydantic-ai ModelSettings);
 # строгие OpenAI-совместимые серверы могут отвергнуть неизвестное поле.
 CACHE_PROMPT_SETTINGS: ModelSettings = {"extra_body": {"cache_prompt": True}}
+
+
+class TodoTailModel(WrapperModel):
+    """Trailing-injection wrapper: appends the task's CURRENT checklist block
+    as a synthetic last message of EVERY outgoing request.
+
+    Why a tail and not dynamic instructions: pydantic-ai renders dynamic
+    instructions into the LEADING system messages, so any mutation of the
+    block (todo_create / todo_update mid-activation) moves the request
+    divergence point to the top of the dialogue and invalidates the
+    server-side prefix cache almost entirely (production incident #a0a55d3d:
+    four todo mutations re-read the whole ~34k-token context at full price,
+    ~65% of the run's bill). A trailing block sits AFTER the whole history:
+    mutating it only re-reads a few tokens of the tail.
+
+    The block is injected at REQUEST time — `request` and `request_stream`
+    both copy the outgoing message list and append one synthetic
+    `ModelRequest` (a user message) carrying the fresh block. Reading the
+    supplier per request is what keeps the list live mid-activation: a
+    todo_update executed in the current run is visible to the very next
+    model request of that run.
+
+    The synthetic message is never persisted: pydantic-ai passes the model
+    a shallow copy of the run's message history, and this wrapper copies
+    again before appending — the run state and therefore the stored
+    transcript (the "instructions never touch the transcript" rule, see
+    `todo_instructions`) stay clean.
+
+    Note: appending one more user message after the history (even after a
+    tool-return turn) is universally valid for OpenAI-compatible wire
+    formats; no leading system zone is touched.
+    """
+
+    def __init__(self, wrapped: Model, todo_block: Callable[[], str | None]) -> None:
+        super().__init__(wrapped)
+        self._todo_block = todo_block
+
+    def _messages_with_tail(self, messages: list[ModelMessage]) -> list[ModelMessage]:
+        """A copy of the outgoing messages with the fresh checklist block
+        appended as the LAST message (None supplier result → unchanged)."""
+        block = self._todo_block()
+        if block is None:
+            return messages
+        return [
+            *messages,
+            ModelRequest(parts=[UserPromptPart(content=block)]),
+        ]
+
+    async def request(self, messages, model_settings, model_request_parameters):  # type: ignore[no-untyped-def]
+        return await self.wrapped.request(
+            self._messages_with_tail(messages),
+            model_settings,
+            model_request_parameters,
+        )
+
+    @asynccontextmanager
+    async def request_stream(  # type: ignore[override]
+        self,
+        messages: list[ModelMessage],
+        model_settings: Any,
+        model_request_parameters: ModelRequestParameters,
+        run_context: Any = None,
+    ) -> AsyncGenerator[StreamedResponse]:
+        async with self.wrapped.request_stream(
+            self._messages_with_tail(messages),
+            model_settings,
+            model_request_parameters,
+            run_context,
+        ) as response_stream:
+            yield response_stream
 
 
 def _candidate_urls(base_url: str, health_check_url: str) -> list[tuple[str, bool]]:
@@ -213,7 +289,19 @@ def build_model(config: Config):
         # same reason).
         max_retries=0,
     )
-    return OpenAIChatModel(config.model, provider=OpenAIProvider(openai_client=client))
+    # Строгие OpenAI-совместимые шлюзы (vLLM) отвергают запрос с больше чем
+    # одним ведущим `system`-сообщением: "System message must be at the
+    # beginning." (400). pydantic-ai по умолчанию превращает каждый
+    # instruction-part (статические instructions + динамические: чек-лист
+    # задач, roadmap goals, подсказка mark_unneeded) в ОТДЕЛЬНОЕ ведущее
+    # system-сообщение и склеивает их только при профиле
+    # openai_chat_supports_multiple_system_messages=False — задаём его явно
+    # (дефолтный профиль рассчитан на OpenAI, который терпит несколько).
+    return OpenAIChatModel(
+        config.model,
+        provider=OpenAIProvider(openai_client=client),
+        profile=OpenAIModelProfile(openai_chat_supports_multiple_system_messages=False),
+    )
 
 
 # -- model auto-discovery ------------------------------------------------------

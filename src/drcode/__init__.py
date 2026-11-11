@@ -194,6 +194,16 @@ def main() -> None:
 
     args = sys.argv[1:]
 
+    # Frozen-bundle hook runner (hidden flag, deliberately not in --help):
+    # in a frozen app sys.executable is the drcode binary itself, so
+    # WorkflowHooks.call spawns hooks as `<binary> --run-hook <script>`
+    # instead of `python -c <bootstrap>`. Must be recognized before any
+    # heavy import and before the TUI fallback at the bottom of main().
+    if "--run-hook" in args:
+        from .hook_runner import run as _run_hook
+
+        raise SystemExit(_run_hook())
+
     # Cheap flags first: they must not pay for the heavy imports below.
     if "--help" in args or "-h" in args:
         _print_help()

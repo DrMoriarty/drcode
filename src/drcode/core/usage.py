@@ -71,27 +71,62 @@ _CONTEXT_OVERFLOW_MARKERS = (
 )
 
 
+def _http_status_of(e: BaseException) -> int | None:
+    """Duck-typed HTTP status of a model-call exception: the ``status_code``
+    attribute, with the "status_code: N" prefix of the rendered message as
+    the fallback. pydantic-ai releases surface the same gateway error under
+    differently named classes (e.g. ``ModelRequestRejectedError`` — the
+    #f425b421 carousel slipped past an isinstance-on-ModelHTTPError check
+    for exactly that reason), all of them carrying ``status_code``."""
+    text = str(e)
+    status = getattr(e, "status_code", None)
+    if status is None:
+        match = re.search(r"status_code:\s*(\d+)", text)
+        status = int(match.group(1)) if match else None
+    return status
+
+
 def _is_context_overflow_error(e: BaseException) -> bool:
     """Deterministic model failure: HTTP 400 whose body says the request
     exceeds the model's context window. Unlike transport errors and 429s
     this cannot succeed on retry — the transcript must shrink (mechanical
     compaction) or the task must be handled manually.
 
-    The 400 is matched duck-typed on the exception's ``status_code``
-    attribute (with the "status_code: N" prefix of the rendered message as
-    the fallback) instead of ``isinstance(e, ModelHTTPError)``: pydantic-ai
-    releases surface the same gateway 400 under differently named classes
-    (e.g. ``ModelRequestRejectedError`` — the #f425b421 carousel slipped
-    past the isinstance check for exactly that reason), all of them
-    carrying ``status_code``. The overflow markers decide the rest."""
+    The 400 is matched via :func:`_http_status_of`; the overflow markers
+    decide the rest. Gates ONLY the context machinery (mechanical
+    compaction in the agent/tester/resolver rounds and in the summarizer)
+    — do not extend it with non-overflow 400s, they belong to
+    :func:`_is_deterministic_request_rejection` instead."""
     text = str(e)
     if not any(marker in text.lower() for marker in _CONTEXT_OVERFLOW_MARKERS):
         return False
-    status = getattr(e, "status_code", None)
-    if status is None:
-        match = re.search(r"status_code:\s*(\d+)", text)
-        status = int(match.group(1)) if match else None
-    return status == 400
+    return _http_status_of(e) == 400
+
+
+# Body/message fragments identifying OTHER deterministic request
+# rejections: HTTP 400s the gateway is guaranteed to repeat for the same
+# request no matter how often it is retried — the request itself is
+# structurally unacceptable to that model/gateway (e.g. system-message
+# placement rules, the #83431cb3 carousel: 20 rescue rounds of the same
+# guaranteed "System message must be at the beginning."). Matched
+# case-insensitively against str(error); extend only with failures that
+# are deterministic by nature and never with other status codes (429/5xx
+# stay transient).
+_DETERMINISTIC_REJECTION_MARKERS = ("system message must be at the beginning",)
+
+
+def _is_deterministic_request_rejection(e: BaseException) -> bool:
+    """Deterministic model failure other than a context overflow: an
+    HTTP 400 whose body matches a known deterministic-rejection marker
+    (see ``_DETERMINISTIC_REJECTION_MARKERS``). The same request is
+    rejected on every attempt — requeueing and rescuing the task would
+    only loop it through the error. Deliberately narrow (exact-400 +
+    known markers): any other 400 keeps the ordinary transient-failure
+    path."""
+    if _http_status_of(e) != 400:
+        return False
+    text = str(e).lower()
+    return any(marker in text for marker in _DETERMINISTIC_REJECTION_MARKERS)
 
 
 def _in_outage(attempt: int) -> bool:

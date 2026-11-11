@@ -45,6 +45,7 @@ from ..core.usage import (
     NETWORK_RETRIES,
     _in_outage,
     _is_context_overflow_error,
+    _is_deterministic_request_rejection,
     _is_retryable_network_error,
     _network_retry_delay,
 )
@@ -522,6 +523,15 @@ class PipelineAgentRunLayer(CoreState):
             # eviction_hint setting): read at activation, so a settings
             # toggle applies to the next activation of each task.
             eviction_hint=self.settings.eviction_hint,
+            # The live checklist tail (agent_model.TodoTailModel): the
+            # supplier re-reads the task per REQUEST, so a todo_create /
+            # todo_update executed mid-run is visible to that run's next
+            # model request — the same liveness the old dynamic-instructions
+            # hook provided, but injected at the request TAIL so a checklist
+            # mutation never invalidates the cached leading prefix (the
+            # #a0a55d3d production incident). Non-feature tasks and empty
+            # lists yield None (pass-through).
+            todo_supplier=partial(self._todo_tail_block, task_id),
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         return root, agent, workflow_instructions, subagent_gate
@@ -987,8 +997,9 @@ class PipelineAgentRunLayer(CoreState):
         transcript, mark the attempt unfinished and demote the task back
         to the queue (excluded from promotion for the session via
         `_agent_failed`, so a dead gateway can't loop the queue). A
-        deterministic context-overflow additionally marks the task dead
-        (the failed-queue rescue must never lift it back)."""
+        deterministic failure (context overflow, or another known request
+        rejection) additionally marks the task dead (the failed-queue
+        rescue must never lift it back)."""
         # Persist the failure even for a superseded run: it happened, and
         # the human must be able to see it.
         self._show_event(task, f"{type(error).__name__}: {error}")
@@ -1028,6 +1039,25 @@ class PipelineAgentRunLayer(CoreState):
                 "compaction).",
             )
             self.notifier.task_context_overflow(task.title)
+        elif _is_deterministic_request_rejection(error):
+            # Deterministic failure of a different kind: the gateway
+            # rejects the request itself (e.g. system-message placement
+            # rules — the #83431cb3 carousel), so every retry of the same
+            # history is guaranteed the same 400. Mark the task dead —
+            # the failed-queue rescue must never lift it back into
+            # development — and tell the user what manual fix is needed.
+            self._agent_dead.add(task_id)
+            self._show_event(
+                task,
+                "The model deterministically rejects this "
+                "request (HTTP 400): the same request is "
+                "refused on every attempt, retrying cannot "
+                "help. The task needs manual intervention — "
+                "fix the model/gateway configuration for "
+                "this project (e.g. switch the model), or "
+                "delete the task.",
+            )
+            self.notifier.task_request_rejected(task.title)
         self.manager.storage.save(task)
         # The transition happened outside the manager — report it to the
         # status observers (notifications) explicitly.

@@ -11,9 +11,13 @@ the "Model settings…" palette ("Agent model chains…").
 
 Layout: RIGHT — every model of the whole catalog (all providers),
 favorites highlighted with the same tier glyphs/colors as the catalog
-table's Favorites column, with a case-insensitive substring filter above
+table's Favorites column (the color on the GLYPH only — the model name
+stays uncolored), labels middle-truncated to the list width so long ids
+never wrap, with a case-insensitive substring filter above
 (model and/or provider name). LEFT — one group per agent role, each
-holding the role's selected references in chain order. Order is the
+holding the role's selected references in chain order (long names
+middle-truncated the same way; the primary is simply the first entry —
+no extra marker). Order is the
 insertion order on purpose: no internal re-sorting, reordering is done
 by removing and re-adding (at most three entries).
 
@@ -28,10 +32,11 @@ from __future__ import annotations
 from typing import ClassVar, cast
 
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
@@ -46,20 +51,59 @@ from ..providers import (
     UserModelsConfig,
     UserModelsStore,
 )
-from .model_setup_app import _FAVORITE_GLYPHS, _model_sort_key
+from .model_setup_app import (
+    _FAVORITE_GLYPHS,
+    _model_sort_key,
+    _truncate_middle,
+)
+
+# Cells reserved for the vertical scrollbar of an OptionList, so a label
+# never wraps onto a second line (it is middle-truncated instead — same
+# approach as the catalog table's model id column).
+_SCROLLBAR_ALLOWANCE = 2
+# Fallback label widths, used before the first layout pass (widget size
+# is still 0): roughly the CSS width of the lists minus the prefix.
+_FALLBACK_RIGHT_WIDTH = 50
+_FALLBACK_GROUP_WIDTH = 42
 
 
-def _model_label(entry: ModelEntry, provider_name: str) -> Text:
+class _FittingOptionList(OptionList):
+    """OptionList that reports its own width changes to the screen:
+    `events.Resize` does NOT bubble (see `_ModelTable` in
+    `model_setup_app`), but the labels are middle-truncated to the list's
+    current width, so a terminal resize must trigger a re-render."""
+
+    class WidthChanged(Message):
+        """Posted when the list's size changed and the labels it holds
+        should be re-fitted."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.post_message(self.WidthChanged())
+
+
+def _label_width(option_list: OptionList, fallback: int) -> int:
+    """Usable character width for one option line of `option_list`
+    (minus the scrollbar allowance; `fallback` before the first layout)."""
+    width = option_list.size.width
+    if not width:
+        return fallback
+    return max(8, width - _SCROLLBAR_ALLOWANCE)
+
+
+def _model_label(entry: ModelEntry, provider_name: str, name_width: int) -> Text:
     """One right-hand list line: the favorite tier glyph (same shapes and
     colors as the catalog table's Favorites column — единообразие with the
-    catalog screen) followed by "provider/model". Non-favorites get a
-    blank prefix so the columns line up."""
+    catalog screen) followed by "provider/model". ONLY the glyph carries
+    the tier color (a span, not the base style — otherwise Rich would
+    paint the whole line); the name stays uncolored and is
+    middle-truncated to `name_width` so long ids never wrap."""
+    name = _truncate_middle(f"{provider_name}/{entry.id}", name_width)
     glyph = _FAVORITE_GLYPHS.get(entry.favorite)
     if glyph is None:
-        line = Text("  ")
-    else:
-        line = Text(f"{glyph.plain} ", style=glyph.style)
-    line.append(f"{provider_name}/{entry.id}")
+        return Text(f"  {name}")
+    line = Text("  ")
+    line.append(f"{glyph.plain} ", style=glyph.style)
+    line.append(name)
     return line
 
 
@@ -196,7 +240,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
                             yield Button(
                                 "Del", id=f"ac-del-{role.value}", classes="ac-del"
                             )
-                        yield OptionList(
+                        yield _FittingOptionList(
                             id=f"ac-list-{role.value}", classes="ac-group-list"
                         )
                 with Vertical(id="ac-right"):
@@ -204,7 +248,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
                         id="ac-filter",
                         placeholder="filter models… (substring, matches model and/or provider name)",
                     )
-                    yield OptionList(id="ac-models")
+                    yield _FittingOptionList(id="ac-models")
             yield Static("", id="ac-status")
             with Horizontal(id="ac-footer"):
                 yield Static(
@@ -235,30 +279,52 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
 
     def _refresh_right(self) -> None:
         option_list = self.query_one("#ac-models", OptionList)
+        # Remember the highlighted option (a refit-width rebuild — e.g. the
+        # first layout pass or a terminal resize — must not silently drop
+        # the user's picked model; a filtered-out one legitimately does).
+        highlighted_id: str | None = None
+        if option_list.highlighted is not None and option_list.highlighted < len(
+            option_list.options
+        ):
+            highlighted_id = option_list.options[option_list.highlighted].id
         option_list.clear_options()
         needle = self._filter_text.casefold()
+        # The glyph prefix ("❶ " / two spaces) occupies 2 cells before the
+        # "provider/model" name.
+        name_width = _label_width(option_list, _FALLBACK_RIGHT_WIDTH) - 2
         for provider, entry in self._all_models():
             if needle and needle not in f"{provider.name} {entry.id}".casefold():
                 continue
             option_list.add_option(
                 Option(
-                    _model_label(entry, provider.name),
+                    _model_label(entry, provider.name, name_width),
                     id=f"ref:{provider.name}/{entry.id}",
                 )
             )
         # The rebuild drops the highlight — the picked model must not
         # survive invisibly (Add would use a stale, unlisted entry).
         self._selected_ref = None
+        if highlighted_id is not None:
+            for index, option in enumerate(option_list.options):
+                if option.id == highlighted_id:
+                    option_list.highlighted = index  # re-fires the handler
+                    break
 
     def _refresh_group(self, role: AgentRole) -> None:
         refs = self.chains.get(role, [])
         option_list = self.query_one(f"#ac-list-{role.value}", OptionList)
+        prev_highlight = option_list.highlighted
         option_list.clear_options()
+        # "N. " occupies 3 cells before the "provider/model" name; the
+        # name is middle-truncated so long ids never wrap.
+        name_width = _label_width(option_list, _FALLBACK_GROUP_WIDTH) - 3
         for index, ref in enumerate(refs):
-            suffix = "  ← primary" if index == 0 else ""
+            name = _truncate_middle(str(ref), name_width)
             option_list.add_option(
-                Option(f"{index + 1}. {ref}{suffix}", id=f"{role.value}:{index}")
+                Option(f"{index + 1}. {name}", id=f"{role.value}:{index}")
             )
+        if prev_highlight is not None and prev_highlight < len(refs):
+            option_list.highlighted = prev_highlight
         self.query_one(f"#ac-role-{role.value}", Static).update(
             f"{role.value} · {len(refs)}/{MAX_ROLE_DEFAULTS}"
         )
@@ -284,6 +350,13 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+    @on(_FittingOptionList.WidthChanged)
+    def _lists_resized(self) -> None:
+        """A list's width changed (e.g. terminal resize): re-fit the
+        middle-truncated labels of every list."""
+        self._refresh_right()
+        self._refresh_all_groups()
 
     # -- right-hand model list --------------------------------------------------
 

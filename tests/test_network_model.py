@@ -11,7 +11,9 @@ User-Agent override).
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -19,8 +21,11 @@ from openai import AsyncOpenAI
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
+from drcode import agent as agent_mod
 from drcode import agent_model
+from drcode.agent import AgentDeps, build_agent
 from drcode.config import Config
+from drcode.models import TaskKind, TodoItem
 from drcode.version import APP_VERSION
 from tests.network_mocks import (
     completion_payload,
@@ -141,6 +146,83 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
 def test_build_model_default_base_url_is_openai() -> None:
     model = agent_model.build_model(make_config(base_url="https://api.openai.com/v1"))
     assert str(model.client.base_url).rstrip("/").endswith("/v1")
+
+
+# -- leading system-message merge (strict OpenAI-compatible gateways) -------------
+
+
+async def test_dynamic_instructions_yield_single_leading_system_message(
+    manager, project_root, monkeypatch
+) -> None:
+    """Regression (task #83431cb3): strict vLLM gateways reject requests with
+    more than one leading `system` message ("System message must be at the
+    beginning." — 400). pydantic-ai turns every instruction-part (the static
+    task prompt in `build_agent` plus the DYNAMIC instructions: the goals
+    roadmap, the mark_unneeded hint) into its own leading system message and
+    merges them into one only when the model profile sets
+    openai_chat_supports_multiple_system_messages=False — `build_model` must
+    therefore always build with that profile.
+
+    The todo checklist is deliberately NOT among them anymore (#a0a55d3d):
+    it rides the request TAIL (TodoTailModel), so a mid-run checklist
+    mutation never invalidates the cached leading prefix. Asserted on the
+    real request body captured through a mock transport: a feature agent
+    whose checklist is non-empty sends exactly one leading system message
+    carrying only the static prompt, while the checklist arrives in the
+    trailing message."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=completion_payload("ok"))
+
+    real_cls = agent_model.AsyncOpenAI
+
+    def factory(**kwargs: object) -> AsyncOpenAI:
+        kwargs["http_client"] = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        kwargs["max_retries"] = 0
+        return real_cls(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(agent_model, "AsyncOpenAI", factory)
+
+    task = manager.create("t", "feature brief", kind=TaskKind.FEATURE)
+    task.todos = [TodoItem(text="step one")]
+    ag = build_agent(
+        make_config(),
+        kind=TaskKind.FEATURE,
+        root=project_root,
+        todo_supplier=lambda: agent_mod.todo_instructions(manager.get(task.id)),
+    )
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+    await ag.run("hi", deps=deps)
+
+    body = seen["body"]
+    # cache_prompt keeps working under the profile change — not disabled.
+    assert body["cache_prompt"] is True
+    messages = body["messages"]
+    leading = []
+    for msg in messages:
+        if msg["role"] == "system":
+            leading.append(msg)
+        else:
+            break
+    # Exactly ONE leading system message — the todo tail is not a system
+    # message and adds nothing here.
+    assert len(leading) == 1
+    # The leading zone carries the static task prompt (with AGENTS.md) and
+    # NOT the checklist — a checklist byte must never sit in the cached
+    # prefix.
+    assert "todo_create" in leading[0]["content"]
+    assert "step one" not in leading[0]["content"]
+    # The checklist rides the LAST message of the request instead.
+    assert "step one" in str(messages[-1])
 
 
 async def test_streamed_roundtrip_and_per_request_user_agent_override() -> None:

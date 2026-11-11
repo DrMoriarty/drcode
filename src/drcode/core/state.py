@@ -80,7 +80,14 @@ class CoreState:
         tester / compaction): project `models[role]` > user-level default >
         the flat config. The research role falls back to the coding model
         when nothing is selected for it (`providers.resolve_effective`).
-        Cached until invalidated."""
+        Cached until invalidated. A PINNED resolution (the availability
+        aware choice of the latest run start, see `_pin_resolution`)
+        outranks the cache — every consumer of this method (usage
+        accounting, compaction gates, header) must see the model the run
+        actually uses."""
+        pinned = self._pinned_resolutions.get(role)
+        if pinned is not None:
+            return pinned[0]
         cached = self._resolved_configs.get(role)
         if cached is None:
             cached = resolve_model_config(self.config, role)
@@ -92,18 +99,34 @@ class CoreState:
         catalog's "<provider>/<model-id>" format (bare id for custom
         models and the env override — they carry no provider name; empty
         when nothing is selected). Cached alongside `resolved_config`,
-        invalidated with it."""
+        invalidated with it; a pinned run-start availability choice
+        outranks the cache (see `_pin_resolution`)."""
+        pinned = self._pinned_resolutions.get(role)
+        if pinned is not None:
+            return pinned[1]
         cached = self._resolved_model_keys.get(role)
         if cached is None:
             cached = resolve_model_key(self.config, role)
             self._resolved_model_keys[role] = cached
         return cached
 
+    def _pin_resolution(self, role: AgentRole, resolution: Any) -> None:
+        """Pin the FACTUAL run-start resolution (an
+        `providers.AvailableResolution`) of a role: from now on
+        `resolved_config` / `resolved_model_key` return the model the run
+        actually uses (after the availability fallback), not the
+        theoretical one. Re-pinned at every run start — a provider that
+        came back (or went down) is picked up on the next start, so the
+        pin never goes stale between runs. Cleared together with the
+        caches on any config/catalog change."""
+        self._pinned_resolutions[role] = (resolution.config, resolution.model_key)
+
     def invalidate_resolved_configs(self) -> None:
         """Drop the cached per-role resolutions (after any change to the
         flat config, the project model slots or the user catalog)."""
         self._resolved_configs.clear()
         self._resolved_model_keys.clear()
+        self._pinned_resolutions.clear()
 
     # -- per-task agent-model event bookkeeping ------------------------------
     # The effective model key each task's agent last STARTED a run on
@@ -192,6 +215,10 @@ class CoreState:
 
     _resolved_configs: dict[AgentRole, Config]
     _resolved_model_keys: dict[AgentRole, str]
+    # The factual run-start availability resolution per role
+    # (role → (Config, model key); see `_pin_resolution`). Assigned in
+    # the app's __init__ alongside the caches above.
+    _pinned_resolutions: dict[AgentRole, tuple[Config, str]]
 
     # -- layer protocol (implemented in the UI layers) -----------------------
     # Signatures are Any-typed where the implementations handle widgets: the

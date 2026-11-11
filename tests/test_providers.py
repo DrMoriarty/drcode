@@ -169,9 +169,9 @@ def test_resolve_custom_slot_max_tokens_none_keeps_flat(
 def test_resolve_user_default_when_project_slot_absent(
     project_root: Path, catalog: UserModelsConfig
 ) -> None:
-    catalog.defaults[AgentRole.COMPACTION] = ModelRef(
-        provider="local-swap", model="small"
-    )
+    catalog.defaults[AgentRole.COMPACTION] = [
+        ModelRef(provider="local-swap", model="small")
+    ]
     UserModelsStore().save(catalog)
     config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
     resolved = resolve(config, AgentRole.COMPACTION)
@@ -185,7 +185,9 @@ def test_resolve_dangling_project_ref_falls_through_to_default(
     set_project_model(
         project_root, AgentRole.TESTER, ModelRef(provider="gone", model="x")
     )
-    catalog.defaults[AgentRole.TESTER] = ModelRef(provider="local-swap", model="small")
+    catalog.defaults[AgentRole.TESTER] = [
+        ModelRef(provider="local-swap", model="small")
+    ]
     UserModelsStore().save(catalog)
     config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
     assert resolve(config, AgentRole.TESTER).model == "small"
@@ -430,7 +432,9 @@ def test_model_key_catalog_slot_and_default(
         AgentRole.CODING,
         ModelRef(provider="local-swap", model="qwen3-coder-30b"),
     )
-    catalog.defaults[AgentRole.TESTER] = ModelRef(provider="local-swap", model="small")
+    catalog.defaults[AgentRole.TESTER] = [
+        ModelRef(provider="local-swap", model="small")
+    ]
     UserModelsStore().save(catalog)
     config = make_config(project_root)
     assert resolve_model_key(config, AgentRole.CODING) == "local-swap/qwen3-coder-30b"
@@ -463,7 +467,7 @@ def test_model_key_dangling_ref_falls_through(
     set_project_model(
         project_root, AgentRole.TESTER, ModelRef(provider="gone", model="x")
     )
-    catalog.defaults[AgentRole.TESTER] = ModelRef(provider="cloud", model="cloud-m")
+    catalog.defaults[AgentRole.TESTER] = [ModelRef(provider="cloud", model="cloud-m")]
     UserModelsStore().save(catalog)
     config = make_config(project_root)
     assert resolve_model_key(config, AgentRole.TESTER) == "cloud/cloud-m"
@@ -696,9 +700,9 @@ def test_migrate_user_config_creates_catalog_with_role_defaults(
         ModelEntry(id="qwen3-coder-30b", max_context_tokens=131072, max_tokens=4096)
     ]
     for role in AgentRole:
-        assert catalog.defaults[role] == ModelRef(
-            provider="localhost", model="qwen3-coder-30b"
-        )
+        assert catalog.defaults[role] == [
+            ModelRef(provider="localhost", model="qwen3-coder-30b")
+        ]
     # ...and the flat model keys are gone from the user drcode.json, while
     # the non-provider settings survive.
     data = json.loads(config_module.USER_CONFIG_FILE.read_text())
@@ -970,15 +974,15 @@ def test_composite_model_id_roundtrip_and_key(
                 models=[ModelEntry(id=COMPOSITE, max_context_tokens=131072)],
             )
         ],
-        defaults={AgentRole.CODING: ModelRef(provider="prov", model=COMPOSITE)},
+        defaults={AgentRole.CODING: [ModelRef(provider="prov", model=COMPOSITE)]},
     )
     UserModelsStore().save(cfg)
     loaded = UserModelsStore().load()
     assert loaded == cfg
     assert loaded.providers[0].models[0].id == COMPOSITE
-    assert loaded.defaults[AgentRole.CODING] == ModelRef(
-        provider="prov", model=COMPOSITE
-    )
+    assert loaded.defaults[AgentRole.CODING] == [
+        ModelRef(provider="prov", model=COMPOSITE)
+    ]
     # Project slot with the composite id roundtrips through the json too.
     set_project_model(
         project_root, AgentRole.TESTER, ModelRef(provider="prov", model=COMPOSITE)
@@ -1003,31 +1007,33 @@ def test_store_save_load_roundtrip(user_config_dir: Path) -> None:
         providers=[
             Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
         ],
-        defaults={AgentRole.CODING: ModelRef(provider="p", model="m")},
+        defaults={AgentRole.CODING: [ModelRef(provider="p", model="m")]},
     )
     store.save(cfg)
     loaded = UserModelsStore().load()
     assert loaded == cfg
-    assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
+    assert loaded.defaults[AgentRole.CODING] == [ModelRef(provider="p", model="m")]
     assert UserModelsStore().last_warning is None
 
 
-def test_store_defaults_saved_as_strings(user_config_dir: Path) -> None:
-    """Each defaults slot is persisted as one "provider/model" string."""
+def test_store_defaults_saved_as_string_lists(user_config_dir: Path) -> None:
+    """Each defaults slot is persisted as a list of "provider/model"
+    strings (the ordered primary + fallback chain)."""
     store = UserModelsStore()
     cfg = UserModelsConfig(
         providers=[
             Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
         ],
-        defaults={AgentRole.CODING: ModelRef(provider="p", model="m")},
+        defaults={AgentRole.CODING: [ModelRef(provider="p", model="m")]},
     )
     store.save(cfg)
     data = json.loads(store.path.read_text())
-    assert data["defaults"]["coding"] == "p/m"
+    assert data["defaults"]["coding"] == ["p/m"]
 
 
-def test_store_loads_string_defaults(user_config_dir: Path) -> None:
-    """The persisted string form parses back into ModelRef slots."""
+def test_store_loads_legacy_string_defaults(user_config_dir: Path) -> None:
+    """The LEGACY single-string per-slot form parses back into a
+    one-element ordered chain (backwards-compatible load)."""
     store = UserModelsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
     store.path.write_text(
@@ -1041,8 +1047,10 @@ def test_store_loads_string_defaults(user_config_dir: Path) -> None:
         )
     )
     loaded = UserModelsStore().load()
-    assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
-    assert loaded.defaults[AgentRole.TESTER] is None
+    assert loaded.defaults[AgentRole.CODING] == [ModelRef(provider="p", model="m")]
+    # A null slot reads as "no chain".
+    assert loaded.defaults.get(AgentRole.TESTER) is None
+    assert loaded.role_refs(AgentRole.TESTER) == []
     assert UserModelsStore().last_warning is None
 
 
@@ -1064,7 +1072,7 @@ def test_store_loads_legacy_object_defaults(user_config_dir: Path) -> None:
         )
     )
     loaded = UserModelsStore().load()
-    assert loaded.defaults[AgentRole.CODING] == ModelRef(provider="p", model="m")
+    assert loaded.defaults[AgentRole.CODING] == [ModelRef(provider="p", model="m")]
     assert UserModelsStore().last_warning is None
 
 

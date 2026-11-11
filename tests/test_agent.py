@@ -1838,6 +1838,23 @@ def test_search_task_history_tool_only_for_research(fake_config: Config) -> None
     assert "search_task_history" not in _tool_names(tester)
 
 
+def test_recent_tasks_tool_only_for_research(fake_config: Config) -> None:
+    """recent_tasks sits in the same research-only block as
+    search_task_history: coding agents, the tester and the conflict
+    resolver never see it."""
+    from drcode.agent import build_agent, build_resolver_agent, build_tester_agent
+
+    research = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    assert "recent_tasks" in _tool_names(research)
+    for kind in (TaskKind.FEATURE, TaskKind.BUG):
+        ag = build_agent(fake_config, kind=kind)
+        assert "recent_tasks" not in _tool_names(ag)
+    tester = build_tester_agent(fake_config)
+    assert "recent_tasks" not in _tool_names(tester)
+    resolver = build_resolver_agent(fake_config, root=Path("/tmp/whatever"))
+    assert "recent_tasks" not in _tool_names(resolver)
+
+
 def test_research_prompt_documents_task_search() -> None:
     from drcode.agent import RESEARCH_SYSTEM_PROMPT
 

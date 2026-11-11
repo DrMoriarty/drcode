@@ -1000,3 +1000,123 @@ def test_find_similar_open_bugs_ranks_title_matches_first(project_root: Path) ->
         project_root, task_search.dedup_keywords("ruff format debt in six files")
     )
     assert [h.task_id for h in hits] == [title_match.id, prompt_match.id]
+
+
+# -- recent_tasks (keyword-free recency view) ---------------------------------
+
+
+def test_recent_tasks_orders_by_created_at_newest_first(project_root: Path) -> None:
+    """Strictly by CREATION time — completed_at must not promote an older
+    completed task above a fresher unfinished one."""
+    from datetime import UTC, datetime, timedelta
+
+    base = datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
+    oldest = _task(
+        title="old finished",
+        created_at=base,
+        completed_at=base + timedelta(days=30),  # completed LATE
+    )
+    middle = _task(title="middle open", created_at=base + timedelta(days=5))
+    newest = _task(
+        title="newest finished",
+        created_at=base + timedelta(days=10),
+        completed_at=base + timedelta(days=11),
+    )
+    for t in (newest, middle, oldest):  # write in reverse to beat filename order
+        _write_task(project_root, t)
+
+    hits = task_search.recent_tasks(project_root)
+    assert [h.task_id for h in hits] == [newest.id, middle.id, oldest.id]
+
+
+def test_recent_tasks_unparsable_created_at_sorts_last(project_root: Path) -> None:
+    """A corrupted stamp sorts at the very end (same tolerance as _recency),
+    deterministically broken by the id."""
+    broken = _task(title="broken stamp")
+    _write_task(project_root, broken)
+    good = _task(title="good stamp")
+    _write_task(project_root, good)
+    # Corrupt the created_at AFTER the save (Storage would reject garbage).
+    path = project_root / ".drcode" / "tasks" / f"{broken.id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["created_at"] = "not-a-date"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    task_search.clear_archive_cache(project_root)
+
+    hits = task_search.recent_tasks(project_root)
+    assert [h.task_id for h in hits] == [good.id, broken.id]
+
+
+def test_recent_tasks_kind_filter_and_validation(project_root: Path) -> None:
+    import pytest
+
+    bug = _task(title="bug one", kind=TaskKind.BUG)
+    research = _task(title="research one", kind=TaskKind.RESEARCH)
+    feature = _task(title="feature one", kind=TaskKind.FEATURE)
+    for t in (bug, research, feature):
+        _write_task(project_root, t)
+
+    hits = task_search.recent_tasks(project_root, kind="bug")
+    assert [h.task_id for h in hits] == [bug.id]
+    assert all(h.kind == "bug" for h in hits)
+    # An unknown filter is the search contract: ValueError -> ModelRetry.
+    with pytest.raises(ValueError, match="kind"):
+        task_search.recent_tasks(project_root, kind="spike")
+
+
+def test_recent_tasks_limit_clamped(project_root: Path) -> None:
+    """The cap is MAX_RESULTS from either side: a bigger ask is truncated,
+    a zero/negative one yields the single newest task instead of nothing."""
+    ids = []
+    for i in range(task_search.MAX_RESULTS + 5):
+        t = _task(title=f"numbered {i}")
+        ids.append(t.id)
+        _write_task(project_root, t)
+
+    assert len(task_search.recent_tasks(project_root)) == task_search.MAX_RESULTS
+    assert len(task_search.recent_tasks(project_root, 3)) == 3
+    assert len(task_search.recent_tasks(project_root, 0)) == 1
+    assert len(task_search.recent_tasks(project_root, -7)) == 1
+    assert (
+        len(task_search.recent_tasks(project_root, 10_000)) == task_search.MAX_RESULTS
+    )
+
+
+def test_recent_tasks_excludes_own_task(project_root: Path) -> None:
+    own = _task(title="my own research run", kind=TaskKind.RESEARCH)
+    other = _task(title="another task", kind=TaskKind.RESEARCH)
+    _write_task(project_root, own)
+    _write_task(project_root, other)
+
+    hits = task_search.recent_tasks(project_root, exclude_task_id=own.id)
+    assert [h.task_id for h in hits] == [other.id]
+
+
+def test_recent_tasks_hit_shape_matches_search(project_root: Path) -> None:
+    """The same TaskHit fields the search fills: first prompt (capped) as
+    the snippet, status/kind, date, verification marker; unmerged stays
+    None — annotate_unmerged is the caller's opt-in."""
+    from datetime import UTC, datetime
+
+    task = _task(
+        title="shape check",
+        status=TaskStatus.COMPLETED,
+        verification=VerificationStatus.PASSED,
+        created_at=datetime(2024, 3, 4, 5, 6, 7, tzinfo=UTC),
+        messages=[{"parts": [{"part_kind": "user-prompt", "content": "x " * 200}]}],
+    )
+    _write_task(project_root, task)
+
+    (hit,) = task_search.recent_tasks(project_root)
+    assert hit.task_id == task.id
+    assert hit.status == "completed"
+    assert hit.kind == "feature"
+    assert hit.verification == "passed"
+    assert hit.date == "2024-03-04"
+    assert hit.snippet.startswith("x x x")
+    assert hit.snippet.endswith("…")
+    assert hit.unmerged is None
+    # And the shared formatter produces the search's one-line format.
+    line = task_search.format_hit_line(hit)
+    assert line.startswith(f"#{task.id} [completed/feature] passed 2024-03-04")
+    assert line.endswith(hit.snippet)

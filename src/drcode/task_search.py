@@ -32,6 +32,9 @@ This module gives the model a deliberately COMPACT view instead:
   explicit "no exact AND match" preamble — better a ranked fuzzy answer
   than a bare refusal;
 - ranking: by the number of keyword occurrences, ties broken newest-first;
+- a keyword-free sibling, `recent_tasks`: the N most recently CREATED tasks
+  (optional kind filter) for the "what was worked on lately" question that
+  has no words to match;
 - one output line per task: id, status/kind, verification + unmerged
   markers, date, title and a snippet around the most informative keyword
   occurrence (capped); never a transcript excerpt. The mergedness marker
@@ -908,6 +911,96 @@ def search_tasks(
     return _hits_from(matches, variants, limit)
 
 
+def format_hit_line(hit: TaskHit) -> str:
+    """One compact output line for a hit — the format `search` and the
+    `recent_tasks` agent tool both speak: id, status/kind, verification and
+    unmerged-branch markers, date, title and the hit's snippet."""
+    title = hit.title
+    # A long title is as much a context hazard as a long snippet —
+    # cap it to keep every line within the compact-output budget.
+    if len(title) > SNIPPET_MAX:
+        title = title[:SNIPPET_MAX] + "…"
+    markers = [m for m in (hit.verification,) if m]
+    if hit.status == TaskStatus.COMPLETED.value and hit.unmerged:
+        markers.append("unmerged")
+    marker_text = (" " + " ".join(markers)) if markers else ""
+    return (
+        f"#{hit.task_id} [{hit.status}/{hit.kind}]"
+        f"{marker_text} {hit.date} {title} — {hit.snippet}"
+    )
+
+
+def _created_recency(data: dict[str, Any]) -> float:
+    """Creation timestamp for the newest-first ordering (0 when unparsable).
+
+    Unlike `_recency` this NEVER looks at `completed_at`: `recent_tasks`
+    ranks by creation time, so a completed task must not jump ahead of a
+    fresher unfinished one.
+    """
+    stamp = data.get("created_at") or ""
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def recent_tasks(
+    project_root: Path,
+    limit: int = MAX_RESULTS,
+    *,
+    kind: str | None = None,
+    exclude_task_id: str | None = None,
+) -> list[TaskHit]:
+    """The archive's most recently CREATED tasks, newest first.
+
+    The keyword-free counterpart of `search_tasks`: when the caller wants
+    "what was worked on lately" there are no words to match, so the records
+    are simply ordered by `created_at` (descending; an unparsable stamp
+    sorts last, like `_recency` treats it) and capped to `limit` — clamped
+    into [1, MAX_RESULTS] so a runaway model cannot bloat its own context.
+    Optional `kind` filter (bug/feature/research, validated — unknown
+    values raise ValueError); `exclude_task_id` drops the caller's own task
+    (it is by construction among the newest). The snippet is the capped
+    first user prompt (no keywords to build a match snippet around), and
+    `unmerged` is NOT filled — the marker needs blocking git calls, callers
+    opt in via `annotate_unmerged` (short lists, off the event loop).
+    Built on `load_archive`, so the incremental cache and the persistent
+    on-disk index are reused for free. BLOCKING file I/O: callers on an
+    event loop must run it in a worker thread.
+    """
+    kind = _validate_choice(kind, TaskKind, "kind")
+    limit = max(1, min(limit, MAX_RESULTS))
+    candidates: list[tuple[float, str, dict[str, Any]]] = []
+    for task_id, data, _fields in load_archive(project_root):
+        if kind is not None and data.get("kind") != kind:
+            continue
+        if exclude_task_id is not None and task_id == exclude_task_id:
+            continue
+        candidates.append((_created_recency(data), task_id, data))
+    # Sort key starts with the recency float so ties (unparsable stamps
+    # clustering at 0.0) fall back to the id — deterministic output.
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    hits: list[TaskHit] = []
+    for _rec, task_id, data in candidates[:limit]:
+        hits.append(
+            TaskHit(
+                task_id=task_id,
+                title=" ".join(str(data.get("title") or "").split()),
+                status=str(data.get("status") or ""),
+                kind=str(data.get("kind") or ""),
+                first_prompt=_first_prompt(data),
+                snippet=first_prompt_snippet(_first_prompt(data)),
+                score=0,
+                date=_date(data),
+                verification=_verification_marker(data),
+                unfinished=bool(data.get("unfinished")),
+                hook_merge_failed=bool(data.get("hook_merge_failed")),
+                last_error_event=_last_error_event(data),
+            )
+        )
+    return hits
+
+
 def search(
     project_root: Path,
     keywords: list[str],
@@ -966,19 +1059,7 @@ def search(
     # Mergedness needs blocking git calls — only worth it for short outputs.
     annotate_unmerged(project_root, hits)
     for hit in hits:
-        title = hit.title
-        # A long title is as much a context hazard as a long snippet —
-        # cap it to keep every line within the compact-output budget.
-        if len(title) > SNIPPET_MAX:
-            title = title[:SNIPPET_MAX] + "…"
-        markers = [m for m in (hit.verification,) if m]
-        if hit.status == TaskStatus.COMPLETED.value and hit.unmerged:
-            markers.append("unmerged")
-        marker_text = (" " + " ".join(markers)) if markers else ""
-        lines.append(
-            f"#{hit.task_id} [{hit.status}/{hit.kind}]"
-            f"{marker_text} {hit.date} {title} — {hit.snippet}"
-        )
+        lines.append(format_hit_line(hit))
     if total > len(hits):
         lines.append(f"...and {total - len(hits)} more — refine the query.")
     if fallback and not hits:

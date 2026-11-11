@@ -379,11 +379,42 @@ class TaskLifecycleLayer(DrCodeState):
         if task is None or task.status is not TaskStatus.QUEUED:
             return
         if self.manager.move_in_queue(task.id, up=up) is None:
+            # Every refusal must explain itself: the check_action gate
+            # lets the dispatch through on purpose (a falsy gate would
+            # kill the key press SILENTLY — App.run_action never runs the
+            # action), so this is the only place the user learns why the
+            # move did not happen.
+            order = self.manager.queued()
+            i = order.index(task) if task in order else -1
+            j = i + 1 if up else i - 1
+            if i == -1 or not 0 <= j < len(order):
+                reason = (
+                    "the task is already farthest from execution"
+                    if up
+                    else "the task is already next to run"
+                )
+            elif (order[j].kind is TaskKind.BUG) != (task.kind is TaskKind.BUG):
+                reason = (
+                    "bug reports always run first — the swap would cross"
+                    " the bug block (hold the bug with Ctrl+H to postpone it)"
+                )
+            else:
+                reason = (
+                    "the task waits for its dependencies — blocked tasks"
+                    " run only after every runnable one"
+                )
+            self.notify(
+                reason,
+                title="Move " + ("up" if up else "down"),
+                severity="warning",
+                timeout=6,
+            )
             return
         self.refresh_sidebar()
         self._refocus_sidebar_task(task.id)
-        # The Move up/Move down footer buttons hide at the queue edges and
-        # at the bug-block boundary — re-evaluate the visible bindings.
+        # The Move up/Move down footer entries reflect the queued/not state
+        # only (impossible moves toast instead) — still re-evaluate them:
+        # the task may have left the queue edge with this very move.
         self.refresh_bindings()
 
     # -- dependencies (depends_on gate) ----------------------------------------

@@ -98,23 +98,33 @@ class PipelineCoreLayer(CoreState):
 
 
 
-        The injection itself is DYNAMIC now: `build_agent` registers
+        The injection point is the TAIL of every model request now (a
 
-        `agent.todo_dynamic_instructions`, which pydantic-ai recomputes
+        synthetic last message via `agent_model.TodoTailModel`, wired by
 
-        from the task's current state for EVERY model request. That fixed
+        `_prepare_agent_run` through `build_agent(todo_supplier=...)`):
 
-        the #fbb0d9fe class of failures: run-level `instructions=` was
+        pydantic-ai recomputes the supplier from the task's current state
 
-        frozen at `agent.iter` start, so a checklist created (or updated)
+        for EVERY request, so a checklist created (or updated) mid-activation
 
-        mid-activation was invisible to the remaining requests of that
+        is visible to the remaining requests of that run — the liveness the
 
-        run. The alias stays for tests and the state protocol; the
+        old leading dynamic-instructions hook provided, minus the prefix-cache
 
-        pipeline itself no longer passes run-level instructions."""
+        invalidation it caused (#a0a55d3d). The alias stays for tests and
+
+        the state protocol."""
 
         return todo_instructions(task)
+
+    def _todo_tail_block(self, task_id: str) -> str | None:
+        """The live supplier handed to `build_agent(todo_supplier=...)` at
+        activation: re-reads the task from the manager for EVERY model
+        request, so the tail block always mirrors the CURRENT checklist
+        state. None for non-feature tasks and empty lists (the wrapper
+        then passes the request through untouched)."""
+        return todo_instructions(self.manager.get(task_id))
 
     def _todo_completion_warning(self, task: Task) -> None:
         """Completion soft gate: when a task leaves development with

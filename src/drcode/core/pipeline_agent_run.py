@@ -523,6 +523,15 @@ class PipelineAgentRunLayer(CoreState):
             # eviction_hint setting): read at activation, so a settings
             # toggle applies to the next activation of each task.
             eviction_hint=self.settings.eviction_hint,
+            # The live checklist tail (agent_model.TodoTailModel): the
+            # supplier re-reads the task per REQUEST, so a todo_create /
+            # todo_update executed mid-run is visible to that run's next
+            # model request — the same liveness the old dynamic-instructions
+            # hook provided, but injected at the request TAIL so a checklist
+            # mutation never invalidates the cached leading prefix (the
+            # #a0a55d3d production incident). Non-feature tasks and empty
+            # lists yield None (pass-through).
+            todo_supplier=partial(self._todo_tail_block, task_id),
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         return root, agent, workflow_instructions, subagent_gate

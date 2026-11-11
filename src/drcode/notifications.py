@@ -610,6 +610,20 @@ class Notifier:
             priority=Priority.HIGH,
         )
 
+    def task_request_rejected(self, task_title: str) -> None:
+        """A task's run died with a deterministic non-context request
+        rejection (an HTTP 400 the gateway repeats for the same request on
+        every attempt): retrying cannot help — the model/gateway setup
+        needs fixing, or the task must be deleted."""
+        self.notify(
+            self._title("task needs manual intervention"),
+            f"Task “{task_title}”: the model rejects the request "
+            f"deterministically (HTTP 400) — retrying cannot help. Fix "
+            f"the model/gateway configuration or delete the task.",
+            tags=["warning"],
+            priority=Priority.HIGH,
+        )
+
     def pipeline_busy(self) -> None:
         """A run started (development or testing): reset the settled-state
         dedup so the next idle transition notifies again."""

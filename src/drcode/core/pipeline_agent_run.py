@@ -481,6 +481,10 @@ class PipelineAgentRunLayer(CoreState):
             # descriptions (no literal <task-id> placeholder for the model
             # to copy verbatim into a path argument).
             task_id=task_id,
+            # The eviction-hint nudge is opt-in (the project's
+            # eviction_hint setting): read at activation, so a settings
+            # toggle applies to the next activation of each task.
+            eviction_hint=self.settings.eviction_hint,
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         return root, agent, workflow_instructions, subagent_gate

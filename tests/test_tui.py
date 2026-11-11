@@ -3358,6 +3358,9 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             "#ts-git-research",
             "#ts-retention",
             "#ts-keep-awake",
+            "#ts-agent-drafts",
+            "#ts-generate-titles",
+            "#ts-eviction-hint",
         ):
             assert dialog.query_one(selector)
         assert dialog.query_one("#ts-verification", Select).value is (
@@ -3478,6 +3481,43 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
             Verification.NONE
         )
         assert events == ["advance", "keepawake"]
+
+
+async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None:
+    """The eviction-hint switch edits a draft copy and persists on Apply;
+    the dialog's field copy includes it too."""
+    from textual.widgets import Button, Switch
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+
+        # Default off; toggling updates only the draft.
+        switch = dialog.query_one("#ts-eviction-hint", Switch)
+        assert switch.value is False
+        assert app.settings.eviction_hint is False
+        switch.value = True
+        await pilot.pause()
+        assert app.settings.eviction_hint is False
+
+        # Apply persists the flag; reopening shows it on.
+        dialog.query_one("#ts-apply", Button).press()
+        await pilot.pause()
+        assert app.settings.eviction_hint is True
+        assert ProjectSettingsStore(app.project_root).load().eviction_hint is True
+
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+        assert dialog.query_one("#ts-eviction-hint", Switch).value is True
 
 
 async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:

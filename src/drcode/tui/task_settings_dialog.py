@@ -103,6 +103,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.subagents_researcher = src.subagents_researcher
     dst.agent_creates_drafts = src.agent_creates_drafts
     dst.generate_task_titles = src.generate_task_titles
+    dst.eviction_hint = src.eviction_hint
     dst.worktree_removal = src.worktree_removal
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
@@ -389,6 +390,13 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     classes="ts-label",
                 )
                 yield Switch(value=d.generate_task_titles, id="ts-generate-titles")
+                yield Label(
+                    "Context-eviction hint — remind the model about "
+                    "mark_unneeded when the context fill passes ~half its "
+                    "window (useful only on some setups)",
+                    classes="ts-label",
+                )
+                yield Switch(value=d.eviction_hint, id="ts-eviction-hint")
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -559,6 +567,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if titles_switch.value != d.generate_task_titles:
             with self.prevent(Switch.Changed):  # same staleness rule
                 titles_switch.value = d.generate_task_titles
+        eviction_switch = self.query_one("#ts-eviction-hint", Switch)
+        if eviction_switch.value != d.eviction_hint:
+            with self.prevent(Switch.Changed):  # same staleness rule
+                eviction_switch.value = d.eviction_hint
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -579,6 +591,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-keep-awake": d.keep_awake != o.keep_awake,
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
+            "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
@@ -795,6 +808,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _generate_titles_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.generate_task_titles:
             self._draft.generate_task_titles = event.value
+            self._refresh()
+
+    @on(Switch.Changed, "#ts-eviction-hint")
+    def _eviction_hint_changed(self, event: Switch.Changed) -> None:
+        if event.value != self._draft.eviction_hint:
+            self._draft.eviction_hint = event.value
             self._refresh()
 
     @on(Button.Pressed, ".ts-fix")

@@ -1279,7 +1279,9 @@ def test_term_js_started_refreshes_recents() -> None:
     without the refresh a newly opened project appears in the welcome
     screen's recents only after an app restart."""
     js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
-    started = js[js.index('event.event === "started"') : js.index('event.event === "exited"')]
+    started = js[
+        js.index('event.event === "started"') : js.index('event.event === "exited"')
+    ]
     assert "loadRecents()" in started
 
 

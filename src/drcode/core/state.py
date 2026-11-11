@@ -105,6 +105,68 @@ class CoreState:
         self._resolved_configs.clear()
         self._resolved_model_keys.clear()
 
+    # -- per-task agent-model event bookkeeping ------------------------------
+    # The effective model key each task's agent last STARTED a run on
+    # (task id → "<provider>/<model-id>"; a session-scoped dict, never
+    # persisted): lets the run-start event report a model SWITCH between
+    # attempts (e.g. after a request-limit demotion the user picked a
+    # different model) instead of a bare model line. Assigned in the
+    # app's __init__ alongside the resolution caches above.
+    _last_agent_model_keys: dict[str, str]
+
+    def _snapshot_model_keys(self) -> dict[AgentRole, str]:
+        """The cached per-role model keys as they resolve RIGHT NOW —
+        the "before" half of a manual model change (the caller invalidates
+        the caches right after and passes the snapshot to
+        `_emit_manual_model_change_events`)."""
+        return {role: self.resolved_model_key(role) for role in AgentRole}
+
+    def _emit_run_model_event(self, task: Task, role: AgentRole) -> None:
+        """Run-start service event naming the model the agent's run is
+        served by. Fires on EVERY run start (including the automatic
+        resume of a demoted/unfinished attempt); when the task's previous
+        run started on a different key, the wording says so.
+
+        A task whose key has no entry yet (first run of the session —
+        the dict above is session-scoped and not persisted) always gets
+        the plain "Model: <key>" line. Like every service event this goes
+        to `task.events` — shown in the chat, never fed to the model."""
+        key = self.resolved_model_key(role)
+        if not key:
+            return
+        previous = self._last_agent_model_keys.get(task.id)
+        self._last_agent_model_keys[task.id] = key
+        if previous and previous != key:
+            self._show_event(task, f"Model switched: {previous} → {key}")
+        else:
+            self._show_event(task, f"Model: {key}")
+
+    def _emit_manual_model_change_events(self, before: dict[AgentRole, str]) -> None:
+        """Manual model-change events: the user picked a different model
+        for a role while a task's agent run is in flight. The current run
+        keeps the model it was built with — the event says the change
+        applies from the next run. `before` is the snapshot taken before
+        `invalidate_resolved_configs()`; the "after" half is resolved
+        fresh here. Only roles whose effective key actually changed and
+        only tasks with a LIVE agent run (the dev agent, `_agent_runs`)
+        of that role get an event."""
+        for role in AgentRole:
+            old = before.get(role) or ""
+            new = self.resolved_model_key(role)
+            if not old or not new or old == new:
+                continue
+            for task in self.manager.active_tasks():
+                if task.id not in self._agent_runs:
+                    continue
+                if self._task_role(task) is not role:
+                    continue
+                self._show_event(
+                    task,
+                    f"Model changed: {old} → {new} "
+                    "(the current run keeps the old model; "
+                    "the change applies from the next run)",
+                )
+
     def _zombie_active_ids(self) -> set[str]:
         """ACTIVE tasks no live run owns and nothing legitimately pauses:
         not in the run registry, not an unfinished attempt (abort /

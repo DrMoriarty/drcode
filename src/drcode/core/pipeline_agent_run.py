@@ -183,6 +183,12 @@ class PipelineAgentRunLayer(CoreState):
                     "available.",
                 )
                 return
+            # Service event naming the model this run is served by (and a
+            # model switch when the previous attempt started on a
+            # different one — see _emit_run_model_event). Fires on EVERY
+            # run start, including the automatic resume of a demoted or
+            # unfinished attempt.
+            self._emit_run_model_event(task, role)
             # Agent-generated task title (project setting
             # generate_task_titles): on the FIRST activation only, before
             # the run loop consumes the pending input — so the user sees

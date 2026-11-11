@@ -98,6 +98,7 @@ class ModelSelectionLayer(DrCodeState):
     ) -> None:
         if result is None:
             return  # ESC / Cancel — nothing persisted.
+        model_keys_before = self._snapshot_model_keys()
         try:
             # New/changed free-form custom models first: set_project_custom_
             # model stores the entry AND activates it ("custom" slot).
@@ -134,6 +135,7 @@ class ModelSelectionLayer(DrCodeState):
         if merged != stored:
             self.settings_store.save(self.settings)
         self.invalidate_resolved_configs()
+        self._emit_manual_model_change_events(model_keys_before)
         self.refresh_connection()
         self.refresh_status()
         self._advance()
@@ -168,7 +170,9 @@ class ModelSelectionLayer(DrCodeState):
         )
 
     def _model_catalog_done(self, _result: object) -> None:
+        model_keys_before = self._snapshot_model_keys()
         self.invalidate_resolved_configs()
+        self._emit_manual_model_change_events(model_keys_before)
         self.refresh_connection()
 
     def role_model_label(self, role: AgentRole) -> str:
@@ -228,6 +232,7 @@ class ModelSelectionLayer(DrCodeState):
     def action_set_role_model(self, role: AgentRole, ref: ModelRef | None) -> None:
         """Persist one role's model choice into the project's
         drcode.json ("models" key) and apply it live."""
+        model_keys_before = self._snapshot_model_keys()
         try:
             set_project_model(self.project_root, role, ref)
         except OSError as e:
@@ -239,6 +244,7 @@ class ModelSelectionLayer(DrCodeState):
             )
             return
         self.invalidate_resolved_configs()
+        self._emit_manual_model_change_events(model_keys_before)
         self.refresh_connection()
         label = f"{ref.provider}/{ref.model}" if ref else "user default"
         self.notify(
@@ -252,6 +258,7 @@ class ModelSelectionLayer(DrCodeState):
         "Custom: <model-id>"): only the `models[role]` slot flips back to
         "custom" — the stored custom model is reused as-is, no re-entry."""
         customs = load_project_custom_models(self.project_root)
+        model_keys_before = self._snapshot_model_keys()
         if role not in customs:
             # Broken/missing custom_models[role] (a slot pointing at it is
             # treated as "nothing selected"): never silently rewritten —
@@ -275,6 +282,7 @@ class ModelSelectionLayer(DrCodeState):
             )
             return
         self.invalidate_resolved_configs()
+        self._emit_manual_model_change_events(model_keys_before)
         self.refresh_connection()
         self.notify(
             f"{role.value} model: {customs[role].model}",
@@ -308,6 +316,7 @@ class ModelSelectionLayer(DrCodeState):
     ) -> None:
         if setup is None:
             return
+        model_keys_before = self._snapshot_model_keys()
         try:
             set_project_custom_model(
                 self.project_root, role, custom_entry_from_setup(setup)
@@ -321,6 +330,7 @@ class ModelSelectionLayer(DrCodeState):
             )
             return
         self.invalidate_resolved_configs()
+        self._emit_manual_model_change_events(model_keys_before)
         self.refresh_connection()
         self.refresh_status()
         self._advance()

@@ -292,9 +292,14 @@ class SidebarLayer(DrCodeState):
         )
         active = by_status.get(TaskStatus.ACTIVE, [])
         testing = by_status.get(TaskStatus.TESTING, [])
-        # Normally one task is being tested; if several are stuck in
-        # TESTING, the one the tester is working on goes to the bottom of
+        # Mirror the tester's pick order (`_next_testing`): bugs first,
+        # within each kind oldest `created_at` first — then reverse so the
+        # section reads as a queue like QUEUE: the next-to-be-tested task
+        # sits just above the currently tested one, the queue tail at the
+        # top. The task the tester is working on goes to the bottom of
         # the section (closest to the pipeline's exit into COMPLETED).
+        testing.sort(key=lambda t: (t.kind is not TaskKind.BUG, t.created_at))
+        testing.reverse()
         testing_active_id = self._tester_task_id
         testing = [t for t in testing if t.id != testing_active_id] + [
             t for t in testing if t.id == testing_active_id

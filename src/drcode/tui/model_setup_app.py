@@ -54,6 +54,23 @@ from ..providers import (
 
 _PROBE_TIMEOUT = 15.0
 
+# Fixed width of the "model id" table column: long ids are middle-truncated
+# so the context / compaction-limit columns stay on screen.
+_MODEL_ID_COL_WIDTH = 42
+
+
+def _truncate_middle(text: str, width: int = _MODEL_ID_COL_WIDTH) -> str:
+    """Shorten a long model id by cutting out its middle (keeping the
+    beginning and the end), so a fixed-width column still hints at both
+    the namespace and the actual model name."""
+    if len(text) <= width:
+        return text
+    keep = width - 1  # one cell for the ellipsis
+    head = (keep + 1) // 2
+    tail = keep - head
+    return f"{text[:head]}…{text[len(text) - tail :]}"
+
+
 _ROLES: tuple[AgentRole, ...] = (
     AgentRole.CODING,
     AgentRole.RESEARCH,
@@ -97,6 +114,10 @@ class ModelCatalogScreen(ModalScreen[None]):
     /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
        border-inclusive height:3 would pad every field with 2 blank rows. */
     #mc-name, #mc-url, #mc-key { height: 1; }
+    /* Blank lines between the provider fields so they don't run together
+       (the key row needs no bottom margin — the button row below already
+       carries margin-top). */
+    #mc-name, #mc-url { margin-bottom: 1; }
     .mc-btnrow {
         height: auto;
         margin-top: 1;
@@ -112,12 +133,17 @@ class ModelCatalogScreen(ModalScreen[None]):
         height: 8;
         margin-top: 1;
     }
-    #mc-model-row { height: auto; }
+    /* Blank line between the model table and the editor fields. */
+    #mc-model-row { height: auto; margin-top: 1; }
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
     #mc-roles { height: auto; margin-top: 1; }
     #mc-roles Select { width: 1fr; height: auto; }
+    .mc-role-label {
+        margin-top: 1;
+        color: $text-muted;
+    }
     #mc-footer {
         height: auto;
         margin-top: 1;
@@ -174,8 +200,13 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Delete", id="mc-del-provider")
                     with Vertical(id="mc-roles"):
                         for role in _ROLES:
+                            # The agent name sits on its own line above the
+                            # select: with a value picked, the select's
+                            # collapsed label shows only the model ref, so
+                            # without the label the slot would be anonymous.
+                            yield Static(role.value, classes="mc-role-label")
                             yield Select(
-                                [(f"{role.value}: (none)", "")],
+                                [("(none)", "")],
                                 prompt=f"{role.value}:",
                                 id=f"mc-role-{role.value}",
                                 allow_blank=True,
@@ -300,14 +331,18 @@ class ModelCatalogScreen(ModalScreen[None]):
     def _refresh_models(self) -> None:
         table = self.query_one("#mc-models", DataTable)
         table.clear(columns=True)
-        table.add_columns("model id", "context", "compact limit")
+        table.add_column("model id", width=_MODEL_ID_COL_WIDTH)
+        table.add_columns("context", "compact limit")
         provider = self._provider()
         if provider is None:
             return
-        for entry in provider.models:
+        # Display order is alphabetical regardless of how the entries sit
+        # in the catalog (fetch appends, so the stored order is discovery
+        # order — the sorted view is what the user scans).
+        for entry in sorted(provider.models, key=lambda m: m.id):
             pct = entry.compaction_threshold
             table.add_row(
-                entry.id,
+                _truncate_middle(entry.id),
                 str(entry.max_context_tokens),
                 "inherit" if pct is None else f"{pct}%",
                 key=entry.id,
@@ -321,9 +356,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         ]
         for role in _ROLES:
             select = self.query_one(f"#mc-role-{role.value}", Select)
-            # The role is part of every label: one compact row of three
-            # selects shows which slot is which even with a value picked.
-            select.set_options([(f"{role.value}: (none)", "")] + model_refs)
+            # The role is named by the Static label above the select; the
+            # blank option is just "(none)".
+            select.set_options([("(none)", "")] + model_refs)
             ref = self.catalog.defaults.get(role)
             select.value = f"{ref.provider}/{ref.model}" if ref else ""
 

@@ -878,12 +878,13 @@ def test_eviction_hint_cleared_when_conditions_stop_holding(manager: Any) -> Non
 def test_eviction_hint_registered_on_coding_agent(
     manager: Any, fake_config: Any
 ) -> None:
-    """build_agent registers the hook as dynamic instructions; the tester
-    agent gets none (no mark_unneeded tool there)."""
+    """build_agent registers the hook as dynamic instructions with the
+    eviction_hint setting ON; the tester agent gets none (no
+    mark_unneeded tool there)."""
     from drcode import agent as agent_mod
     from drcode.agent import build_agent, build_tester_agent
 
-    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE, eviction_hint=True)
     assert any(
         part.dynamic
         and getattr(part.instruction, "__name__", "") == "_eviction_hint_instructions"
@@ -895,3 +896,34 @@ def test_eviction_hint_registered_on_coding_agent(
         for part in tester._instructions
     )
     assert agent_mod.eviction_dynamic_instructions is eviction_dynamic_instructions
+
+
+def test_eviction_hint_absent_by_default(manager: Any, fake_config: Any) -> None:
+    """The default (eviction_hint=False) registers no hint instruction at
+    all: nothing rides the requests, nothing scans the transcript."""
+    from drcode.agent import build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.FEATURE)
+    assert not any(
+        getattr(part.instruction, "__name__", "") == "_eviction_hint_instructions"
+        for part in ag._instructions
+    )
+
+
+def test_eviction_hint_defaults_off_in_settings(project_root: Any) -> None:
+    """ProjectSettings.eviction_hint defaults to False (opt-in feature)."""
+    from drcode.settings import ProjectSettings
+
+    assert ProjectSettings().eviction_hint is False
+
+
+def test_eviction_hint_setting_persisted(project_root: Any) -> None:
+    """The flag round-trips through the project settings store, so a
+    toggle applies to the next activation of each task."""
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(eviction_hint=True))
+    assert ProjectSettingsStore(project_root).load().eviction_hint is True
+    store.save(ProjectSettings(eviction_hint=False))
+    assert ProjectSettingsStore(project_root).load().eviction_hint is False

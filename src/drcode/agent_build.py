@@ -270,6 +270,7 @@ def build_agent(
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
     task_id: str | None = None,
+    eviction_hint: bool = False,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -295,6 +296,11 @@ def build_agent(
     `task_id` (the task being served, known at activation) bakes the real
     scratch-directory path into the write tools' descriptions; without it
     the descriptions keep the literal `<task-id>` placeholder.
+
+    `eviction_hint` (the project's eviction_hint setting, chosen at
+    activation) registers the mark_unneeded nudge as a dynamic instruction;
+    at False (the default) the instruction is not registered at all — no
+    per-request fill measurement, no transcript scan, zero overhead.
     """
     scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config)
@@ -341,15 +347,22 @@ def build_agent(
     # Below the threshold or without candidates it yields None (excluded
     # from the request). While active, the text is frozen per activation
     # (cached on the manager): a byte that moves in the system zone would
-    # invalidate the server-side prefix cache on every request. Coding
-    # agent only: the tester/resolver agents have no mark_unneeded tool,
-    # so no reminder is registered there.
-    def _eviction_hint_instructions(ctx: RunContext[AgentDeps]) -> str | None:
-        return eviction_dynamic_instructions(
-            ctx, max_context_tokens=config.max_context_tokens
-        )
+    # invalidate the server-side prefix cache on every request. Registered
+    # ONLY when the project's eviction_hint setting is on — the flag is
+    # read at agent build time (task activation), so flipping it applies
+    # to the NEXT activation of each task, not the running one. At the
+    # default False the instruction is not registered at all: it never
+    # rides a request and never scans the transcript (zero overhead).
+    # Coding agent only: the tester/resolver agents have no mark_unneeded
+    # tool, so no reminder is registered there.
+    if eviction_hint:
 
-    agent.instructions(_eviction_hint_instructions)
+        def _eviction_hint_instructions(ctx: RunContext[AgentDeps]) -> str | None:
+            return eviction_dynamic_instructions(
+                ctx, max_context_tokens=config.max_context_tokens
+            )
+
+        agent.instructions(_eviction_hint_instructions)
 
     # All blocking tools run in a worker thread (or as asyncio subprocesses
     # for run_bash): called inline they would stall the event loop, which

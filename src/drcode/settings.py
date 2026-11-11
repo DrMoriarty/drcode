@@ -475,6 +475,17 @@ class ProjectSettings(BaseModel):
     # agent (hold / draft / queued) keep the derived title — the generator
     # runs only in the agent-run worker.
     generate_task_titles: bool = False
+    # Context-eviction hint (advisory nudge about mark_unneeded): when on,
+    # the coding agent gets a dynamic instruction that, once the live
+    # context fill passes ~half the model window, reminds the model of the
+    # mark_unneeded tool with the real figures (see
+    # agent_tools.eviction_dynamic_instructions). Off (the default): the
+    # instruction is not registered at all — nothing rides the requests
+    # and nothing scans the transcript. Off by default because the nudge
+    # is useful only on some setups (e.g. llama.cpp prefix-cache-friendly
+    # frozen texts, no big old tool returns); leaving it out keeps the
+    # request framing minimal everywhere else.
+    eviction_hint: bool = False
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

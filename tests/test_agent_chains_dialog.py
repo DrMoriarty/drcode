@@ -112,8 +112,8 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
         labels = [option.id for option in right.options]
         assert labels == ["ref:alpha/m2", "ref:alpha/m1", "ref:beta/m3"]
         first_prompt = str(right.options[0].prompt)
-        assert "❶" in first_prompt and "alpha/m2" in first_prompt
-        assert "❶" not in str(right.options[1].prompt)
+        assert "•" in first_prompt and "alpha/m2" in first_prompt
+        assert "•" not in str(right.options[1].prompt)
 
 
 async def test_filter_narrows_model_list(tmp_path: Path) -> None:

@@ -2,12 +2,14 @@
 
 Runs the screen headlessly via textual's pilot: provider add/edit, model
 addition, context-size editing, favorites (click cycling, sorting,
-persistence, re-discovery survival) and the save path.
+persistence, re-discovery survival), the model-name filter and the save
+path.
 """
 
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -21,11 +23,22 @@ from drcode.providers import (
     UserModelsConfig,
     UserModelsStore,
 )
-from drcode.tui.model_setup_app import ModelCatalogScreen
+from drcode.tui.model_setup_app import (
+    _FAVORITE_COL_WIDTH,
+    _FAVORITE_GLYPHS,
+    ModelCatalogApp,
+    ModelCatalogScreen,
+)
 
 
 class _Host(App):
     """Minimal host pushing the catalog screen (mirrors both entry points)."""
+
+    # Mirror the standalone app's compact form geometry: the screen's CSS
+    # is written against 1-line borderless Inputs/Buttons (as the main TUI
+    # provides) — with textual's default 3-line bordered widgets every
+    # vertical-budget assertion measures a layout that never ships.
+    CSS = ModelCatalogApp.CSS
 
     def __init__(
         self, store: UserModelsStore, project_root: Path | None = None
@@ -648,3 +661,120 @@ async def test_screen_not_seeded_from_project_when_catalog_exists(
         screen = pilot.app.screen
         assert isinstance(screen, ModelCatalogScreen)
         assert screen.catalog.providers == []
+
+
+# -- favorites glyph width -----------------------------------------------------------
+
+
+def test_favorite_glyphs_uniform_single_cell() -> None:
+    """All favorite glyphs render as ONE terminal cell so the Favorites
+    column lines up. The old tier-1 ❶ was a dingbat that came back from
+    the terminal's fallback font FULLWIDTH (two cells) while ★/✚ stayed at
+    one — a jagged column. The test pins the invariant: no glyph may be
+    double-width by class (W/F), and the tier-1 dot must live in the
+    basic punctuation range (U+0000–U+20FF) that every terminal/font
+    renders halfwidth — never a symbol-block character."""
+    for glyph in _FAVORITE_GLYPHS.values():
+        assert len(glyph.plain) == 1
+        assert unicodedata.east_asian_width(glyph.plain) not in ("W", "F")
+        assert glyph.cell_len == 1
+    assert ord(_FAVORITE_GLYPHS[1].plain) < 0x2100
+    # The column keeps one spare cell of padding next to the glyph.
+    assert _FAVORITE_COL_WIDTH >= 2
+
+
+# -- model filter --------------------------------------------------------------------
+
+
+def visible_ids(table: DataTable) -> set[str | None]:
+    """The ids (row keys) currently shown by the model table."""
+    return {key.value for key in table.rows}
+
+
+async def test_model_filter_restricts_table_rows(tmp_path: Path) -> None:
+    """The filter field above the table restricts the rows to models whose
+    id contains the typed substring (case-insensitive); clearing it shows
+    every model again."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[
+                        ModelEntry(id="gpt-4o"),
+                        ModelEntry(id="gpt-4.1"),
+                        ModelEntry(id="Claude-Sonnet"),
+                    ],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        table = screen.query_one("#mc-models", DataTable)
+        flt = screen.query_one("#mc-model-filter", Input)
+        flt.focus()
+        await pilot.press("g", "p", "t")
+        await pilot.pause()
+        assert visible_ids(table) == {"gpt-4o", "gpt-4.1"}
+        # Case-insensitive substring: uppercase needle matches.
+        flt.value = "SONNET"
+        await pilot.pause()
+        assert visible_ids(table) == {"Claude-Sonnet"}
+        # A substring from the middle of the id matches too.
+        flt.value = "4.1"
+        await pilot.pause()
+        assert visible_ids(table) == {"gpt-4.1"}
+        # No match → empty table, no rows, editor untouched.
+        flt.value = "zzz"
+        await pilot.pause()
+        assert visible_ids(table) == set()
+        # Clearing the filter restores every model.
+        flt.value = ""
+        await pilot.pause()
+        assert visible_ids(table) == {"gpt-4o", "gpt-4.1", "Claude-Sonnet"}
+
+
+async def test_model_filter_persists_across_provider_switch(tmp_path: Path) -> None:
+    """The filter keeps applying when another provider is selected — the
+    new provider's models are filtered by the same substring."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="a",
+                    base_url="http://a/v1",
+                    models=[ModelEntry(id="alpha-1")],
+                ),
+                Provider(
+                    name="b",
+                    base_url="http://b/v1",
+                    models=[ModelEntry(id="beta-1")],
+                ),
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        table = screen.query_one("#mc-models", DataTable)
+        flt = screen.query_one("#mc-model-filter", Input)
+        flt.value = "beta"
+        await pilot.pause()
+        # Provider "a" has no matching model.
+        assert visible_ids(table) == set()
+        # Switch to provider "b" (second option in the providers list).
+        screen.query_one("#mc-providers", OptionList).focus()
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        assert visible_ids(table) == {"beta-1"}
+        # And the filter applies to the fresh provider immediately.
+        flt.value = "alpha"
+        await pilot.pause()
+        assert visible_ids(table) == set()

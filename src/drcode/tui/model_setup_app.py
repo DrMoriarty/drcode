@@ -17,7 +17,7 @@ click or arrow keys — no double click needed) fills the editor line below
 it with the model's id, context size and compaction limit; "Update" writes
 the edited values back to the selected model, "Add model" creates a new
 model from the same fields, "Remove" deletes it. A click on a row's
-Favorites cell cycles its favorite level (empty → ❶ → ★ → ✚ → empty);
+Favorites cell cycles its favorite level (empty → • → ★ → ✚ → empty);
 favorites sort to the top of the table, tier by tier. Binding models to
 agent roles does NOT happen here: it lives in its own dialog, opened from
 this screen's "Assign agents…" button.
@@ -71,14 +71,20 @@ _SCROLLBAR_ALLOWANCE = 2
 # The Favorites column sits FIRST in the model table (index 0) — the
 # click target must be visible without scrolling a wide id column.
 _FAVORITE_COLUMN_INDEX = 0
-_FAVORITE_COL_WIDTH = 3
+_FAVORITE_COL_WIDTH = 2
 
 # Favorite level → cell glyph. Each level is a DIFFERENT shape AND color so
-# the tiers are tellable apart at a glance: ❶ (filled circle, red),
-# ★ (five-pointed star, yellow), ✚ (cross, cyan). 0 = not a favorite
-# (empty cell).
+# the tiers are tellable apart at a glance: • (dot, red), ★ (five-pointed
+# star, yellow), ✚ (cross, cyan). 0 = not a favorite (empty cell).
+#
+# All glyphs must render as ONE terminal cell so the column lines up:
+# the old ❶ is East-Asian-AMBIGUOUS width and took TWO cells in terminals
+# whose font widens it, while ★/✚ stayed at one cell there — a jagged
+# column. • (U+2022) is unambiguously narrow in every terminal/font, and
+# ✚ is East-Asian Neutral (likewise never widened); only ★ remains
+# ambiguous-width, which real terminals keep at one cell.
 _FAVORITE_GLYPHS: dict[int, Text] = {
-    1: Text("❶", style="bold red"),
+    1: Text("•", style="bold red"),
     2: Text("★", style="bold yellow"),
     3: Text("✚", style="bold cyan"),
 }
@@ -190,7 +196,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         text-style: bold;
     }
     #mc-main {
-        height: 1fr;
+        /* auto, NOT 1fr: the block is a fixed stack of 1-line inputs and
+           a 3-line button row; a fr share SMALLER than that content made
+           the button row spill out of the block and overlap whatever was
+           placed below it (the filter field / model table). */
+        height: auto;
     }
     #mc-left { width: 34; margin-right: 2; height: auto; }
     #mc-providers { height: 6; margin-top: 1; }
@@ -219,8 +229,10 @@ class ModelCatalogScreen(ModalScreen[None]):
         margin-top: 1;
         color: $text-muted;
     }
-    /* The model table spans the full width of the modal (it lives outside
+    /* The model-name filter sits on its own row right above the model
+       table, which spans the full width of the modal (both live outside
        the two-column block) and grows with the modal height. */
+    #mc-model-filter { width: 100%; height: 1; margin-top: 1; }
     #mc-models {
         width: 100%;
         height: 1fr;
@@ -264,6 +276,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         )
         self._current: str | None = None
         self._selected_model: str | None = None
+        # Model-table filter (a case-insensitive substring of the model
+        # id); persists across provider switches until edited or cleared.
+        self._model_filter: str = ""
         # Current width of the fitted "model id" column (see _fit_id_width).
         self._model_id_width: int = _MODEL_ID_COL_WIDTH
         # Set while removing a model: the table rebuild queues a
@@ -306,8 +321,12 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Check connection", id="mc-check")
                         yield Button("Fetch models", id="mc-fetch")
                     yield Static("", id="mc-status")
-            # The model table and its editor live OUTSIDE the two-column
-            # block: the table spans the full width of the modal.
+            # The model filter and the model table live OUTSIDE the
+            # two-column block: the table spans the full width of the modal.
+            yield Input(
+                id="mc-model-filter",
+                placeholder="filter models by name (substring, case-insensitive)",
+            )
             yield _ModelTable(id="mc-models", cursor_type="row")
             with Horizontal(id="mc-model-row"):
                 yield Input(id="mc-model-id", placeholder="model id")
@@ -322,8 +341,9 @@ class ModelCatalogScreen(ModalScreen[None]):
             yield Static(
                 "esc — close without saving · model table: click or arrow "
                 "keys select a row and fill the editor; a click on the "
-                "Favorites cell cycles the favorite level (empty → ❶ → "
-                "★ → ✚), favorites sort to the top; Update writes the "
+                "Favorites cell cycles the favorite level (empty → • → "
+                "★ → ✚), favorites sort to the top; the field above the "
+                "table filters models by name; Update writes the "
                 "edited id/context/limit back, Add model creates a new "
                 "model from the same fields, Remove deletes it",
                 id="mc-hint",
@@ -399,10 +419,23 @@ class ModelCatalogScreen(ModalScreen[None]):
                     option_list.highlighted = index
                     break
 
+    def _displayed_entries(self) -> list[ModelEntry]:
+        """The current provider's models in display order, restricted to
+        the filter field: only entries whose id contains the filter value
+        as a case-insensitive substring (an empty filter shows all)."""
+        provider = self._provider()
+        if provider is None:
+            return []
+        entries = sorted(provider.models, key=_model_sort_key)
+        needle = self._model_filter.strip().casefold()
+        if needle:
+            entries = [e for e in entries if needle in e.id.casefold()]
+        return entries
+
     def _refresh_models(self, keep_row: str | None = None) -> None:
         table = self.query_one("#mc-models", _ModelTable)
         provider = self._provider()
-        entries = sorted(provider.models, key=_model_sort_key) if provider else []
+        entries = self._displayed_entries()
         ctx_w, pct_w = _column_widths(entries)
         id_w = self._fit_id_width(table, ctx_w, pct_w)
         self._model_id_width = id_w
@@ -430,8 +463,10 @@ class ModelCatalogScreen(ModalScreen[None]):
             # Keep the toggled row under the cursor: swallow the reset
             # highlight queued by the rebuild, then re-highlight the row
             # (its RowHighlighted refills the editor with its values).
-            self._suppress_highlight = True
-            table.move_cursor(row=table.get_row_index(keep_row), scroll=False)
+            visible = {key.value for key in table.rows}
+            if keep_row in visible:  # else hidden by the filter — let it go
+                self._suppress_highlight = True
+                table.move_cursor(row=table.get_row_index(keep_row), scroll=False)
 
     def _fit_id_width(self, table: _ModelTable, ctx_w: int, pct_w: int) -> int:
         """Width of the "model id" column: whatever the modal width leaves
@@ -456,10 +491,18 @@ class ModelCatalogScreen(ModalScreen[None]):
         table = self.query_one("#mc-models", _ModelTable)
         if not table.size.width:
             return
-        provider = self._provider()
-        ctx_w, pct_w = _column_widths(provider.models if provider else [])
+        # Measure against the FILTERED entries — the same set the table
+        # shows (a filter hides wide ids, the free width belongs to them).
+        ctx_w, pct_w = _column_widths(self._displayed_entries())
         if self._fit_id_width(table, ctx_w, pct_w) != self._model_id_width:
             self._refresh_models(keep_row=self._selected_model)
+
+    @on(Input.Changed, "#mc-model-filter")
+    def _model_filter_changed(self, event: Input.Changed) -> None:
+        """Re-render the model table on every keystroke, restricted to the
+        models whose id contains the filter substring."""
+        self._model_filter = event.value
+        self._refresh_models(keep_row=self._selected_model)
 
     def _load_form(self, name: str | None) -> None:
         self._current = name

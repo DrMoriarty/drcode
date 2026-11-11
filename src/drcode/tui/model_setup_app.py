@@ -56,9 +56,17 @@ from ..providers import (
 
 _PROBE_TIMEOUT = 15.0
 
-# Fixed width of the "model id" table column: long ids are middle-truncated
-# so the context / compaction-limit columns stay on screen.
+# Fallback width of the "model id" table column (used before the first
+# layout pass): long ids are middle-truncated so the context /
+# compaction-limit columns stay on screen. After layout the column is
+# re-fitted so the table fills the FULL width of the modal — the id
+# column absorbs whatever space the fixed columns leave free.
 _MODEL_ID_COL_WIDTH = 42
+_MIN_ID_COL_WIDTH = 16
+_MAX_ID_COL_WIDTH = 80
+# Cells always reserved for the (potential) vertical scrollbar, so the
+# columns never overflow into a horizontal scrollbar.
+_SCROLLBAR_ALLOWANCE = 2
 
 # The Favorites column sits FIRST in the model table (index 0) — the
 # click target must be visible without scrolling a wide id column.
@@ -97,6 +105,24 @@ def _truncate_middle(text: str, width: int = _MODEL_ID_COL_WIDTH) -> str:
     return f"{text[:head]}…{text[len(text) - tail :]}"
 
 
+def _column_widths(entries: list[ModelEntry]) -> tuple[int, int]:
+    """Rendered widths of the fixed table columns: the widest of the
+    header label and the cell values ("context", "compact limit")."""
+    ctx_w = max([len("context")] + [len(str(e.max_context_tokens)) for e in entries])
+    pct_w = max(
+        [len("compact limit")]
+        + [
+            len(
+                "inherit"
+                if e.compaction_threshold is None
+                else f"{e.compaction_threshold}%"
+            )
+            for e in entries
+        ]
+    )
+    return ctx_w, pct_w
+
+
 class _ModelTable(DataTable):
     """Model table whose Favorites column is clickable: a click on a cell
     of that column cycles the row's favorite level instead of only
@@ -109,6 +135,16 @@ class _ModelTable(DataTable):
         def __init__(self, model_id: str) -> None:
             self.model_id = model_id
             super().__init__()
+
+    class RefitRequested(Message):
+        """Posted when the table's own size changed (first layout or a
+        terminal resize) and the id column should be re-fitted to the
+        available width."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        # events.Resize does NOT bubble, so the screen cannot observe the
+        # table's layout directly — translate it into a bubbling message.
+        self.post_message(self.RefitRequested())
 
     async def _on_click(self, event: events.Click) -> None:
         meta = event.style.meta
@@ -162,10 +198,16 @@ class ModelCatalogScreen(ModalScreen[None]):
     /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
        border-inclusive height:3 would pad every field with 2 blank rows. */
     #mc-name, #mc-url, #mc-key { height: 1; }
+    /* Push the provider fields down so the Check connection / Fetch models
+       row sits on ONE height with the Add / Delete row of the providers
+       pane: that row's top = title (1) + list margin (1) + list (6) +
+       button-row margin (1) = 3 blank rows above it, mirrored here. */
     /* Blank lines between the provider fields so they don't run together
        (the key row needs no bottom margin — the button row below already
-       carries margin-top). */
-    #mc-name, #mc-url { margin-bottom: 1; }
+       carries margin-top). NOTE: margins must be declared in ONE rule per
+       widget — a later longhand rule resets the earlier one's sides. */
+    #mc-name { margin-top: 3; margin-bottom: 1; }
+    #mc-url { margin-bottom: 1; }
     .mc-btnrow {
         height: auto;
         margin-top: 1;
@@ -177,8 +219,12 @@ class ModelCatalogScreen(ModalScreen[None]):
         margin-top: 1;
         color: $text-muted;
     }
+    /* The model table spans the full width of the modal (it lives outside
+       the two-column block) and grows with the modal height. */
     #mc-models {
-        height: 8;
+        width: 100%;
+        height: 1fr;
+        min-height: 8;
         margin-top: 1;
     }
     /* Blank line between the model table and the editor fields. */
@@ -186,14 +232,15 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
+    #mc-assign-agents { margin-top: 1; }
     #mc-footer {
         height: auto;
         margin-top: 1;
         align-horizontal: right;
     }
     #mc-hint {
-        width: 1fr;
-        padding: 1 2 1 2;
+        width: 100%;
+        padding: 1 2 0 2;
         color: $text-disabled;
     }
     """
@@ -217,6 +264,8 @@ class ModelCatalogScreen(ModalScreen[None]):
         )
         self._current: str | None = None
         self._selected_model: str | None = None
+        # Current width of the fitted "model id" column (see _fit_id_width).
+        self._model_id_width: int = _MODEL_ID_COL_WIDTH
         # Set while removing a model: the table rebuild queues a
         # RowHighlighted event for the next row, which must not refill the
         # editor (Remove always ends with empty inputs).
@@ -257,28 +306,31 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Check connection", id="mc-check")
                         yield Button("Fetch models", id="mc-fetch")
                     yield Static("", id="mc-status")
-                    yield _ModelTable(id="mc-models", cursor_type="row")
-                    with Horizontal(id="mc-model-row"):
-                        yield Input(id="mc-model-id", placeholder="model id")
-                        yield Input(id="mc-ctx", placeholder="context tokens")
-                        yield Input(
-                            id="mc-pct", placeholder="compact % (empty = inherit)"
-                        )
-                    with Horizontal(classes="mc-btnrow"):
-                        yield Button("Update", id="mc-model-update")
-                        yield Button("Remove", id="mc-model-del")
-                        yield Button("Add model", id="mc-model-add")
+            # The model table and its editor live OUTSIDE the two-column
+            # block: the table spans the full width of the modal.
+            yield _ModelTable(id="mc-models", cursor_type="row")
+            with Horizontal(id="mc-model-row"):
+                yield Input(id="mc-model-id", placeholder="model id")
+                yield Input(id="mc-ctx", placeholder="context tokens")
+                yield Input(id="mc-pct", placeholder="compact % (empty = inherit)")
+            with Horizontal(classes="mc-btnrow"):
+                yield Button("Update", id="mc-model-update")
+                yield Button("Remove", id="mc-model-del")
+                yield Button("Add model", id="mc-model-add")
+            # Just below the model buttons, its own row.
+            yield Button("Assign agents…", id="mc-assign-agents")
+            yield Static(
+                "esc — close without saving · model table: click or arrow "
+                "keys select a row and fill the editor; a click on the "
+                "Favorites cell cycles the favorite level (empty → ❶ → "
+                "★ → ✚), favorites sort to the top; Update writes the "
+                "edited id/context/limit back, Add model creates a new "
+                "model from the same fields, Remove deletes it",
+                id="mc-hint",
+            )
+            # The very last row: Save pinned to the modal's bottom-right
+            # corner (kept out of the wrapping hint block for that).
             with Horizontal(id="mc-footer"):
-                yield Static(
-                    "esc — close without saving · model table: click or arrow "
-                    "keys select a row and fill the editor; a click on the "
-                    "Favorites cell cycles the favorite level (empty → ❶ → "
-                    "★ → ✚), favorites sort to the top; Update writes the "
-                    "edited id/context/limit back, Add model creates a new "
-                    "model from the same fields, Remove deletes it",
-                    id="mc-hint",
-                )
-                yield Button("Assign agents…", id="mc-assign-agents")
                 yield Button("Save", variant="primary", id="mc-save")
 
     # -- helpers ------------------------------------------------------------
@@ -349,31 +401,65 @@ class ModelCatalogScreen(ModalScreen[None]):
 
     def _refresh_models(self, keep_row: str | None = None) -> None:
         table = self.query_one("#mc-models", _ModelTable)
+        provider = self._provider()
+        entries = sorted(provider.models, key=_model_sort_key) if provider else []
+        ctx_w, pct_w = _column_widths(entries)
+        id_w = self._fit_id_width(table, ctx_w, pct_w)
+        self._model_id_width = id_w
         table.clear(columns=True)
         table.add_column("Favorites", width=_FAVORITE_COL_WIDTH)
-        table.add_column("model id", width=_MODEL_ID_COL_WIDTH)
+        table.add_column("model id", width=id_w)
         table.add_columns("context", "compact limit")
-        provider = self._provider()
-        if provider is None:
-            return
         # Display order: favorite tiers 1 → 2 → 3 first, then the rest;
         # alphabetical inside each group. This is the VIEW order only —
         # the stored catalog order (discovery order) is never rewritten.
-        for entry in sorted(provider.models, key=_model_sort_key):
+        for entry in entries:
             pct = entry.compaction_threshold
             table.add_row(
                 _FAVORITE_GLYPHS.get(entry.favorite, Text("")),
-                _truncate_middle(entry.id),
+                _truncate_middle(entry.id, id_w),
                 str(entry.max_context_tokens),
                 "inherit" if pct is None else f"{pct}%",
                 key=entry.id,
             )
-        if keep_row is not None and any(m.id == keep_row for m in provider.models):
+        if (
+            keep_row is not None
+            and provider is not None
+            and any(m.id == keep_row for m in provider.models)
+        ):
             # Keep the toggled row under the cursor: swallow the reset
             # highlight queued by the rebuild, then re-highlight the row
             # (its RowHighlighted refills the editor with its values).
             self._suppress_highlight = True
             table.move_cursor(row=table.get_row_index(keep_row), scroll=False)
+
+    def _fit_id_width(self, table: _ModelTable, ctx_w: int, pct_w: int) -> int:
+        """Width of the "model id" column: whatever the modal width leaves
+        free after the fixed columns, so the model list fills the FULL
+        width of the modal. Falls back to the fixed default before the
+        first layout pass (when the table has no size yet)."""
+        available = table.size.width
+        if not available:
+            return _MODEL_ID_COL_WIDTH
+        return max(
+            _MIN_ID_COL_WIDTH,
+            min(
+                available - _SCROLLBAR_ALLOWANCE - _FAVORITE_COL_WIDTH - ctx_w - pct_w,
+                _MAX_ID_COL_WIDTH,
+            ),
+        )
+
+    @on(_ModelTable.RefitRequested)
+    def _refit_models(self) -> None:
+        """The table was (re)laid out: re-fit the model id column so the
+        model list keeps filling the full modal width."""
+        table = self.query_one("#mc-models", _ModelTable)
+        if not table.size.width:
+            return
+        provider = self._provider()
+        ctx_w, pct_w = _column_widths(provider.models if provider else [])
+        if self._fit_id_width(table, ctx_w, pct_w) != self._model_id_width:
+            self._refresh_models(keep_row=self._selected_model)
 
     def _load_form(self, name: str | None) -> None:
         self._current = name
@@ -753,6 +839,23 @@ class ModelCatalogApp(App[None]):
     """Standalone debug app: just the catalog screen."""
 
     TITLE = "drcode models"
+
+    # Mirror the main TUI's compact form geometry (DrCodeApp.CSS): without
+    # it the borderless 1-line Buttons/Inputs the screen's CSS assumes turn
+    # back into 3-line bordered widgets and the button rows misalign.
+    CSS = """
+    Button, Input, Switch, Checkbox, RadioButton, RadioSet, OptionList,
+    Select > SelectCurrent {
+        border: none !important;
+    }
+    Input {
+        height: 1;
+        padding: 0 1;
+    }
+    OptionList {
+        padding: 0;
+    }
+    """
 
     def on_mount(self) -> None:
         # The catalog screen is the whole UI here: dismissing it (esc) is

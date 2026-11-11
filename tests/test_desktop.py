@@ -560,7 +560,9 @@ def _make_loop_payload(tmp_path: Path) -> str:
     return str(script)
 
 
-async def _wait_for(ws: aiohttp.ClientWebSocketResponse, predicate, timeout: float = 10):
+async def _wait_for(
+    ws: aiohttp.ClientWebSocketResponse, predicate, timeout: float = 10
+):
     """Read frames until ``predicate`` matches; return (match, all frames)."""
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout

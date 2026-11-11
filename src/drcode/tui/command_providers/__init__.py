@@ -21,6 +21,7 @@ from .merge import MergeCommandsProvider
 from .models import ProjectModelSettingsCommandProvider, role_model_options_provider
 from .settings import (
     WORKFLOW_PRESETS,
+    AgentChainsCommandProvider,
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
     GitResearchOptionsProvider,
@@ -53,6 +54,7 @@ from .themes import ThemeOptionsProvider
 
 __all__ = [
     "WORKFLOW_PRESETS",
+    "AgentChainsCommandProvider",
     "CommandEntry",
     "CommandListProvider",
     "DependencyCommandsProvider",

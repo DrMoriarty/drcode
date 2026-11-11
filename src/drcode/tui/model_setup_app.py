@@ -717,11 +717,24 @@ class ModelCatalogScreen(ModalScreen[None]):
 
     @on(Button.Pressed, "#mc-assign-agents")
     def _open_agent_binding(self) -> None:
-        """Entry point of the model→agent binding dialog (its own modal
-        screen, a dependent task): until it lands, say so instead of
-        silently doing nothing."""
+        """Open the agent model chains dialog (its own modal screen): the
+        ordered per-role fallback lists of the user catalog. The dialog
+        edits THIS screen's in-memory catalog object, so its unsaved
+        provider edits stay authoritative; its own Save persists both."""
+        from .agent_chains_dialog import AgentChainsScreen
+
+        if not self._commit_form():
+            return
+        self.app.push_screen(
+            AgentChainsScreen(store=self.store, catalog=self.catalog),
+            self._agent_chains_done,
+        )
+
+    def _agent_chains_done(self, _result: object) -> None:
         self._status(
-            "ℹ binding models to agents moves to its own dialog (not implemented yet)"
+            f"ℹ agent chains saved to {self.store.path}"
+            if _result
+            else "agent chains dialog closed without saving"
         )
 
     @on(Button.Pressed, "#mc-save")

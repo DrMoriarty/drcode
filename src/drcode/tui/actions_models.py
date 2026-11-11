@@ -27,7 +27,9 @@ from ..providers import (
     set_project_custom_model,
     set_project_model,
 )
+from .agent_chains_dialog import AgentChainsScreen
 from .command_providers import (
+    AgentChainsCommandProvider,
     ModelCatalogCommandProvider,
     ModelSettingsPalette,
     ProjectModelSettingsCommandProvider,
@@ -60,10 +62,11 @@ def custom_entry_from_setup(setup: ModelSetup) -> CustomModelEntry:
 class ModelSelectionLayer(DrCodeState):
     def action_open_model_settings(self) -> None:
         """Open the "Model settings…" sub-menu: the provider catalog
-        editor and the single "Project model settings…" entry (the
-        per-role model/max_tokens form). Runs as the callback of a
-        palette entry — the palette has already dismissed itself by the
-        time this executes, so pushing the sub-palette is safe."""
+        editor, the agent model chains editor and the single "Project
+        model settings…" entry (the per-role model/max_tokens form).
+        Runs as the callback of a palette entry — the palette has already
+        dismissed itself by the time this executes, so pushing the
+        sub-palette is safe."""
         if isinstance(self.screen, CommandPalette):
             return
         self.push_screen(
@@ -71,11 +74,26 @@ class ModelSelectionLayer(DrCodeState):
                 id="--model-settings-palette",
                 providers=[
                     ModelCatalogCommandProvider,
+                    AgentChainsCommandProvider,
                     ProjectModelSettingsCommandProvider,
                 ],
                 placeholder="Model settings…",
             )
         )
+
+    # -- agent model chains dialog ----------------------------------------------
+
+    def action_open_agent_chains(self) -> None:
+        """Open the agent model chains editor (the ordered per-role
+        fallback lists of the user-level catalog) as a modal screen.
+        Runs as the callback of a palette entry — the palette has already
+        dismissed itself by the time this executes, so pushing the dialog
+        is safe. The dialog itself invalidates the per-role resolutions
+        on save (it may also be opened from inside the provider catalog
+        screen, where no app-level callback runs)."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(AgentChainsScreen())
 
     # -- project model settings dialog ----------------------------------------
 

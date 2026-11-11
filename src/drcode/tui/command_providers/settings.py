@@ -294,6 +294,7 @@ class ModelSettingsPalette(SettingsPalette):
     # scoped to this sub-menu.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Provider catalog…",
+        "Agent model chains…",
         "Project model settings…",
     )
 
@@ -387,6 +388,25 @@ class ModelCatalogCommandProvider(CommandListProvider):
                 "Edit the user-level catalog of OpenAI-compatible providers "
                 "and their models (auto-discovery, context sizes, per-role "
                 "defaults) — stored in ~/.config/drcode/models.json",
+            ),
+        ]
+
+
+class AgentChainsCommandProvider(CommandListProvider):
+    """The single "Agent model chains…" entry of the "Model settings…"
+    sub-menu: opens the per-role ordered fallback chains editor (up to 3
+    catalog models per agent role, user-level models.json)."""
+
+    def _commands(self) -> list[CommandEntry]:
+        app = cast("DrCodeApp", self.app)
+        return [
+            CommandEntry(
+                "Agent model chains…",
+                app.action_open_agent_chains,
+                "Ordered model chains per agent role (coding / research / "
+                "tester / compaction / resolver) — first entry is the "
+                "role's primary model, the rest are availability fallbacks; "
+                "stored in ~/.config/drcode/models.json",
             ),
         ]
 

@@ -3331,12 +3331,14 @@ async def test_project_model_dialog_invalid_max_tokens_blocks_apply(
 async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
     """The main Settings menu collapses all model-related entries into one
     "Model settings…" item, which opens the sub-menu with the provider
-    catalog editor and the single "Project model settings…" entry (the
-    per-role model/max_tokens form — it replaced the per-role picker
-    entries)."""
+    catalog editor, the agent model chains editor and the single "Project
+    model settings…" entry (the per-role model/max_tokens form — it
+    replaced the per-role picker entries)."""
     from textual.command import CommandList
 
+    from drcode.tui.agent_chains_dialog import AgentChainsScreen
     from drcode.tui.command_providers import (
+        AgentChainsCommandProvider,
         ModelCatalogCommandProvider,
         ModelSettingsCommandProvider,
         ModelSettingsPalette,
@@ -3383,19 +3385,31 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         ]
         assert names == [
             "Provider catalog…",
+            "Agent model chains…",
             "Project model settings…",
         ]
-        # Sub-menu providers: the catalog editor plus the form entry,
-        # nothing else (project preferences stay in the main menu).
+        # Sub-menu providers: the catalog editor, the chains editor and
+        # the form entry, nothing else (project preferences stay in the
+        # main menu).
         form = ProjectModelSettingsCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [(c.name, c.callback) for c in form] == [
             ("Project model settings…", app.action_open_project_model_settings)
         ]
         catalog = ModelCatalogCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [c.name for c in catalog] == ["Provider catalog…"]
-        # The form entry opens the per-role modal dialog.
+        chains = AgentChainsCommandProvider(palette)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [(c.name, c.callback) for c in chains] == [
+            ("Agent model chains…", app.action_open_agent_chains)
+        ]
+        # The chains entry opens the per-role chains modal.
         await pilot.press("escape")
         await pilot.pause()
+        app.action_open_agent_chains()
+        await pilot.pause()
+        assert isinstance(app.screen, AgentChainsScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        # The form entry opens the per-role modal dialog.
         app.action_open_project_model_settings()
         await pilot.pause()
         assert isinstance(app.screen, ProjectModelSettingsDialog)

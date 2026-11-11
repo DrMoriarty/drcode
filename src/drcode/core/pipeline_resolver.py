@@ -36,13 +36,17 @@ base branch then becomes a fast-forward. Any failure rolls the worktree
 back to the PRISTINE conflicted state, marks the task `needs_human` and
 logs the full report into the service events; nothing is ever committed.
 
-The one bounded exception: an intent review that finds a CONCRETE loss
-(verdict 'lost' with an actionable report) schedules up to
-`_MAX_REPAIR_ROUNDS` targeted repair rounds — the resolution stays in
-the worktree, the review report continues the SAME round transcript
-(the coding agent's reject-rework pattern), and the FULL funnel re-runs
-after the fix. A spent budget, 'unsure', a scope expansion or a vague
-report all keep the rollback.
+The one bounded exception: a CONCRETE, named failure while the resolver
+agent had reported success schedules up to `_MAX_REPAIR_ROUNDS` targeted
+repair rounds — the resolution stays in the worktree and the SAME round
+transcript continues (the coding agent's reject-rework pattern) with a
+repair turn, then the FULL funnel re-runs. Two failure classes qualify:
+an intent review that finds a concrete loss (verdict 'lost' with an
+actionable report) and a mechanical-funnel failure (compile / ruff /
+pyright / the test suite — the check names and their output are fed
+back verbatim). Both share ONE repair budget per conflict; a spent
+budget, 'unsure', a scope expansion, a run that never claimed success
+or a vague review report all keep the rollback.
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ from ..core.usage import (
 )
 from ..merge_engine import MergeReport, in_progress, remove_report, report_path
 from ..merge_resolver import (
+    CheckResult,
     ResolverOutcome,
     ReviewChunk,
     aggregate_review_verdicts,
@@ -166,8 +171,51 @@ def _build_repair_prompt(review_report: str, number: int) -> str:
         f"names (plus what that change necessarily touches), leave the "
         f"rest of the resolution exactly as it is, then report the "
         f"repaired state again with set_resolution.\n\n"
+        f"{_REPAIR_SCOPE_RULE}"
         f"=== intent review report (verdict: lost) ===\n"
         f"{(review_report or '').strip()[:4000]}"
+    )
+
+
+# Shared tail of EVERY repair prompt: the scope guard stays in force
+# across repair rounds — a repair that wanders outside the conflicted
+# set is rejected outright (and its foreign edits would be silently
+# unverified), so the limit is stated in the prompt, not only enforced.
+_REPAIR_SCOPE_RULE = (
+    "SCOPE LIMIT: change ONLY files that belong to the conflicted set "
+    "this resolution already covers — editing anything outside it is "
+    "rejected outright by the scope guard and rolls the whole resolution "
+    "back. If a finding cannot be fixed inside that set, say so in "
+    "set_resolution instead of expanding the scope.\n\n"
+)
+
+
+def _build_mechanical_repair_prompt(checks: list[CheckResult], number: int) -> str:
+    """The mechanical-failure repair turn, fed into the SAME resolver
+    transcript like the 'lost'-review one: the funnel's compile / ruff /
+    pyright / test-suite level failed on the resolved tree while the
+    agent had reported success — the failing checks' names and output
+    (already collected in `outcome.checks`/`outcome.tests`) are fed back
+    verbatim for a point fix."""
+    blocks = []
+    for c in checks:
+        output = (c.output or "").strip()
+        blocks.append(
+            f"=== {c.name} — FAILED ===\n"
+            + (output[:4000] if output else "(no output captured)")
+        )
+    detail = "\n\n".join(blocks)
+    return (
+        f"The verification funnel REJECTED your resolution: the mechanical "
+        f"verification failed on the resolved tree (repair round {number} "
+        f"of {_MAX_REPAIR_ROUNDS}). The resolved tree is still in place in "
+        f"the worktree — NOTHING was rolled back. Fix the failures below "
+        f"as a targeted repair: change only what the failing checks point "
+        f"at (plus what that change necessarily touches), leave the rest "
+        f"of the resolution exactly as it is, then report the repaired "
+        f"state again with set_resolution.\n\n"
+        f"{_REPAIR_SCOPE_RULE}"
+        f"{detail}"
     )
 
 
@@ -444,15 +492,16 @@ class PipelineResolverLayer(CoreState):
                 return
             if repair_prompt is not None:
                 # The targeted-repair continuation: the resolution is
-                # still in the worktree, the review report rides in the
-                # prompt — say so, instead of the fresh-start text.
+                # still in the worktree, the failure report (mechanical
+                # checks or the intent review) rides in the prompt — say
+                # so, instead of the fresh-start text.
                 self._show_event(
                     task,
                     f"Conflict resolver: continuing the round with a "
                     f"targeted repair (repair "
                     f"{self._resolver_repair_count.get(task_id, 0)} of "
-                    f"{_MAX_REPAIR_ROUNDS}) — the intent review found "
-                    f"lost work, the resolution stays in the worktree.",
+                    f"{_MAX_REPAIR_ROUNDS}) — the verification funnel "
+                    f"failed, the resolution stays in the worktree.",
                     kind="workflow",
                 )
             elif resume_round:
@@ -1060,15 +1109,30 @@ class PipelineResolverLayer(CoreState):
             outcome.review_report = (
                 f"the concluding commit failed: {msg}\n{outcome.review_report}"
             )
-        # The repair fork (before any rollback): a 'lost' review verdict
-        # that NAMES its finding gets a bounded number of targeted repair
-        # rounds — the ~20-minute resolution is not thrown away over a
-        # one-line fix the reviewer itself described (the review report
-        # continues the SAME resolver transcript; the FULL funnel re-runs
-        # afterwards). 'unsure', a scope expansion, a vague/empty report
-        # and a spent budget all keep the old rollback.
+        # The repair fork (before any rollback): a CONCRETE, named failure
+        # while the agent had reported success gets a bounded number of
+        # targeted repair rounds — the ~20-minute resolution is not thrown
+        # away over a one-line fix (a failed mechanical check whose output
+        # names the fix, or a 'lost' review report describing the lost
+        # work). The report continues the SAME resolver transcript; the
+        # FULL funnel re-runs afterwards. 'unsure', a scope expansion, a
+        # run that never claimed success, a vague/empty report and a spent
+        # budget all keep the old rollback.
         repair = self._plan_repair(task, outcome, paths)
         if repair is not None:
+            failed_checks = [c for c in outcome.checks if not c.ok and not c.skipped]
+            tests_failed = (
+                outcome.tests is not None
+                and not outcome.tests.ok
+                and not outcome.tests.skipped
+            )
+            if failed_checks or tests_failed:
+                names = ", ".join(c.name for c in failed_checks)
+                if tests_failed:
+                    names = f"{names}, test suite" if names else "test suite"
+                reason = f"the mechanical verification failed ({names})"
+            else:
+                reason = "the intent review named a lost change"
             # A stale needs_human from an earlier round must not make the
             # finally-block wipe the repair schedule the moment it was
             # set (the a6a6df25 class).
@@ -1080,9 +1144,8 @@ class PipelineResolverLayer(CoreState):
             self._schedule_pipeline_timer(_REPAIR_RETRY_DELAY_S, self._retry_resolver)
             self._show_event(
                 task,
-                f"Automatic conflict resolution FAILED the intent review — "
-                f"a lost change was named. Repair round "
-                f"{self._resolver_repair_count.get(task.id, 0)} of "
+                f"Automatic conflict resolution FAILED — {reason}. Repair "
+                f"round {self._resolver_repair_count.get(task.id, 0)} of "
                 f"{_MAX_REPAIR_ROUNDS} continues the resolution in the "
                 f"worktree (nothing is rolled back); the full funnel "
                 f"re-runs afterwards.\n{outcome.summary()}",
@@ -1143,21 +1206,42 @@ class PipelineResolverLayer(CoreState):
         Qualification (ALL of it): the round did not conclude successfully
         (a commit-machinery failure after an 'intact' verdict rolls back —
         the tree is fine, the git state is not), no scope expansion, the
-        review verdict is exactly 'lost' ('unsure' is not a finding), the
-        report names something concrete, and the per-conflict repair
-        budget is not spent. Incrementing the counter is deliberate:
-        scheduling the round spends it."""
+        agent actually claimed 'resolved' (a run that never claimed
+        success has no resolution worth repairing), a CONCRETE failure to
+        fix — either a failed mechanical check / test suite (their names
+        and output feed the repair turn verbatim) or an intent-review
+        verdict of exactly 'lost' ('unsure' is not a finding) whose
+        report names something concrete — and the per-conflict repair
+        budget is not spent. Mechanical and review repairs SHARE the one
+        budget (no separate infinite pocket for either class — the
+        endless-retry-loop comment at _MAX_REPAIR_ROUNDS). Incrementing
+        the counter is deliberate: scheduling the round spends it."""
         if outcome.verdict == "resolved" or outcome.committed:
             return None
         if outcome.scope_violations:
             return None
+        if not outcome.agent_resolved:
+            return None
+        used = self._resolver_repair_count.get(task.id, 0)
+        if used >= _MAX_REPAIR_ROUNDS:
+            return None
+        failed_checks = [c for c in outcome.checks if not c.ok and not c.skipped]
+        tests_failed = (
+            outcome.tests is not None
+            and not outcome.tests.ok
+            and not outcome.tests.skipped
+        )
+        if failed_checks or tests_failed:
+            checks = failed_checks
+            if tests_failed:
+                assert outcome.tests is not None
+                checks = [*checks, outcome.tests]
+            self._resolver_repair_count[task.id] = used + 1
+            return _build_mechanical_repair_prompt(checks, used + 1)
         if outcome.review_verdict != "lost":
             return None
         report_text = (outcome.review_report or "").strip()
         if not _review_report_actionable(report_text, paths):
-            return None
-        used = self._resolver_repair_count.get(task.id, 0)
-        if used >= _MAX_REPAIR_ROUNDS:
             return None
         self._resolver_repair_count[task.id] = used + 1
         return _build_repair_prompt(report_text, used + 1)

@@ -274,7 +274,9 @@ async def test_repair_round_fixes_lost_work_and_commits(
         live = app.manager.get(task.id)
         app._maybe_start_resolver(task.id)
         await wait_until(
-            lambda: any("FAILED the intent review" in t for t in event_texts(live)),
+            lambda: any(
+                "the intent review named a lost change" in t for t in event_texts(live)
+            ),
             pilot,
             what="the repair-fork announcement",
         )
@@ -420,6 +422,181 @@ async def test_vague_lost_report_never_repairs(
         assert live.needs_human
         assert "targeted repair" not in "\n".join(event_texts(live))
         assert app._resolver_repair_count.get(task.id) is None
+
+
+# -- the mechanical-failure repair fork (checks share the lost-review budget) --------
+
+
+def _always_failing_checks(name: str = "ruff check", output: str = "F401") -> Any:
+    """A mechanical_checks stand-in whose every call fails (for the
+    budget-exhaustion test)."""
+    return lambda root, paths: [
+        CheckResult(name=name, ok=False, output=output),
+        CheckResult(name="pyright", ok=True, skipped=True),
+    ]
+
+
+def _failing_once_checks() -> Any:
+    """A mechanical_checks stand-in that fails only its FIRST call (the
+    initial funnel), then passes (the post-repair re-run)."""
+    calls = {"n": 0}
+
+    def fake(root: Path, paths: list[str]) -> list[CheckResult]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [
+                CheckResult(
+                    name="ruff check",
+                    ok=False,
+                    output=(
+                        "tests/test_agent_chains_dialog.py: F401 unused import 'json'"
+                    ),
+                ),
+                CheckResult(name="pyright", ok=True, skipped=True),
+            ]
+        return [
+            CheckResult(name="ruff check", ok=True),
+            CheckResult(name="pyright", ok=True, skipped=True),
+        ]
+
+    return fake
+
+
+async def test_mechanical_failure_schedules_repair_round(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed mechanical check (compile / ruff / pyright) after a
+    successful agent claim schedules a repair round INSTEAD of the
+    rollback: the failing checks' names and output are fed into the SAME
+    transcript, the full funnel re-runs, and a clean pass commits."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = (
+        _resolve_steps()
+        + _repair_steps()
+        + _review_steps("intact", "both sides present")
+    )
+    app = _repair_app(isolated, task, monkeypatch, state)
+    monkeypatch.setattr(pr, "mechanical_checks", _failing_once_checks())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any(
+                "mechanical verification failed" in t for t in event_texts(live)
+            ),
+            pilot,
+            what="the mechanical-repair announcement",
+        )
+        assert "Repair round 1 of 2" in "\n".join(event_texts(live))
+        assert not live.needs_human
+        await wait_until(
+            lambda: any("targeted repair" in t for t in event_texts(live)),
+            pilot,
+            what="the repair continuation event",
+        )
+        await wait_until(
+            lambda: any("verified and committed" in t for t in event_texts(live)),
+            pilot,
+            what="the committed resolution",
+        )
+        assert not live.needs_human
+        # ONE round entry: the repair turn rides in task.resolver_messages[-1],
+        # and the failing check's name + output reached the agent.
+        assert len(live.resolver_messages) == 1
+        blob = json.dumps(live.resolver_messages[-1])
+        assert "ruff check" in blob
+        assert "F401" in blob
+        assert "SCOPE LIMIT" in blob
+        assert app._resolver_repair_count.get(task.id) == 1
+        assert not app._resolver_repair_round
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert not me.in_progress(wt)
+        assert (wt / "shared.txt").read_text() == "merged\n"
+
+
+async def test_mechanical_failure_budget_exhaustion_rolls_back(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistently failing mechanical check spends the SAME per-conflict
+    repair budget (2, shared with the 'lost'-review class) and then keeps
+    the old behavior: restore + needs_human — no separate endless budget."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = _resolve_steps() + _repair_steps() + _repair_steps()
+    app = _repair_app(isolated, task, monkeypatch, state)
+    monkeypatch.setattr(pr, "mechanical_checks", _always_failing_checks())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("human must take over" in t for t in event_texts(live)),
+            pilot,
+            timeout=120,
+            what="the final human hand-off",
+        )
+        assert live.needs_human
+        assert app._resolver_repair_count.get(task.id) == 2
+        assert not app._resolver_repair_round
+        texts = "\n".join(event_texts(live))
+        assert "Repair round 1 of 2" in texts
+        assert "Repair round 2 of 2" in texts
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert "<<<<<<<" in (wt / "shared.txt").read_text()
+
+
+async def test_agent_not_resolved_never_repairs(
+    isolated: Path,
+    conflicted_task: Any,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run whose agent never claimed success (set_resolution resolved
+    False) goes straight to the rollback — no repair round even when the
+    mechanical checks would also fail."""
+    task = conflicted_task
+    state = ScriptedState()
+    state.steps = [
+        tool_response("set_resolution", {"resolved": False, "report": "cannot fix"}),
+        text_response("gave up"),
+    ]
+    app = _repair_app(isolated, task, monkeypatch, state)
+    monkeypatch.setattr(pr, "mechanical_checks", _always_failing_checks())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any("human must take over" in t for t in event_texts(live)),
+            pilot,
+            what="the human hand-off",
+        )
+        assert live.needs_human
+        assert "targeted repair" not in "\n".join(event_texts(live))
+        assert app._resolver_repair_count.get(task.id) is None
+        assert not app._resolver_repair_round
+        env = TaskEnvironment(
+            isolated, ProjectSettings(task_isolation=TaskIsolation.WORKTREE)
+        )
+        wt = env.worktree_path(task.id)
+        assert "<<<<<<<" in (wt / "shared.txt").read_text()
 
 
 # -- window-aware chunked intent review (the review funnel's level 3) -----------------

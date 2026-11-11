@@ -7,7 +7,8 @@ picks a CONCRETE task and acts on it without opening the per-task
 conflict screen first. Exactly one candidate never reaches this screen
 (`action_open_merge` opens the ConflictScreen directly, as before).
 
-Each row shows the task (id, title), its `drcode/<id>` branch and the
+Each row shows the task (kind letter F/B/R, id, title), its
+`drcode/<id>` branch (deepskyblue, the header's branch color) and the
 merge state (computed fresh on every refresh — never from a cached
 snapshot, the user acts the moment the list paints):
 
@@ -48,6 +49,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from rich.markup import escape
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -59,6 +61,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from .. import merge_engine, merge_resolver
 from ..merge_engine import is_fast_forward
+from ..models import TaskKind
 from ..task_env import WorktreeUnavailable
 from .merge.stages import _fmt_seconds
 
@@ -88,6 +91,7 @@ class _Entry:
     branch: str
     kind: str
     base: str
+    task_kind: TaskKind | None = None
 
     @property
     def state_label(self) -> str:
@@ -287,6 +291,7 @@ class UnmergedListScreen(ModalScreen[None]):
                 branch=branch,
                 kind="conflict",
                 base=base,
+                task_kind=task.kind,
             )
         if report is not None and report.ok and not report.conflicted:
             if report.fast_forward is True:
@@ -305,6 +310,7 @@ class UnmergedListScreen(ModalScreen[None]):
             branch=branch,
             kind=kind,
             base=base,
+            task_kind=task.kind,
         )
 
     def _collect_entries(self, task_ids: list[str]) -> list[_Entry]:
@@ -358,21 +364,40 @@ class UnmergedListScreen(ModalScreen[None]):
             # nothing left to paint.
             pass
 
+    # The kind letter of a row (F/B/R), the same colors the sidebar uses
+    # for the task kinds. Always shown: this screen itself only opens
+    # when MORE than one branch is ready to merge.
+    _KIND_LETTER: ClassVar[dict[TaskKind, str]] = {
+        TaskKind.BUG: "[red]B[/]",
+        TaskKind.RESEARCH: "[yellow]R[/]",
+    }
+
+    @classmethod
+    def _kind_letter(cls, kind: TaskKind | None) -> str:
+        if kind is None:
+            return ""
+        return f"{cls._KIND_LETTER.get(kind, '[green]F[/]')} "
+
     def _render_rows(self, selected: str | None = None) -> None:
         list_view = self.list_view
         list_view.clear()
+        # markup=True on both rows: the kind letter and the deepskyblue
+        # branch are painted via Rich markup — every dynamic fragment
+        # (title, branch, state label) goes through escape() so literal
+        # [brackets] in commit subjects never trip the parser.
         for entry in self._entries:
             marker = "❯" if entry.task_id == selected else " "
+            kind_letter = self._kind_letter(entry.task_kind)
             list_view.append(
                 ListItem(
                     Label(
-                        f"{marker} #{entry.task_id}  {entry.title}",
-                        markup=False,
+                        f"{marker} {kind_letter}#{entry.task_id}  "
+                        f"{escape(entry.title)}",
                         classes="unmerged-row-title",
                     ),
                     Label(
-                        f"    {entry.branch} · {entry.state_label}",
-                        markup=False,
+                        f"    [deepskyblue]{escape(entry.branch)}[/] · "
+                        f"{escape(entry.state_label)}",
                         classes="unmerged-row-state",
                     ),
                 )

@@ -187,7 +187,7 @@ class ModelSelectionLayer(DrCodeState):
         if slot == "custom":
             custom = load_project_custom_models(self.project_root).get(role)
             return custom.model if custom is not None else "not set"
-        ref = UserModelsStore().load().defaults.get(role)
+        ref = UserModelsStore().load().default_ref(role)
         if ref is not None:
             return f"{ref.provider}/{ref.model}"
         if role in (AgentRole.RESEARCH, AgentRole.RESOLVER):

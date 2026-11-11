@@ -244,7 +244,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         saved/draft custom model, "Custom…" and "User default" (always —
         the reset exists for every role)."""
         catalog = UserModelsStore().load()
-        user_default = catalog.defaults.get(role)
+        user_default = catalog.default_ref(role)
         slot = self._slots[role]
         options: list[tuple[str, object]] = []
         for provider in catalog.providers:

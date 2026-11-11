@@ -289,8 +289,8 @@ class ModelCatalogScreen(ModalScreen[None]):
             # same provider.
             old = provider.name
             provider.name = name
-            for ref in self.catalog.defaults.values():
-                if ref is not None and ref.provider == old:
+            for ref in self.catalog.all_refs():
+                if ref.provider == old:
                     ref.provider = name
             self._current = name
             # The role selects list "provider/model" options: rebuild them
@@ -359,7 +359,7 @@ class ModelCatalogScreen(ModalScreen[None]):
             # The role is named by the Static label above the select; the
             # blank option is just "(none)".
             select.set_options([("(none)", "")] + model_refs)
-            ref = self.catalog.defaults.get(role)
+            ref = self.catalog.default_ref(role)
             select.value = f"{ref.provider}/{ref.model}" if ref else ""
 
     def _load_form(self, name: str | None) -> None:
@@ -435,9 +435,11 @@ class ModelCatalogScreen(ModalScreen[None]):
             p for p in self.catalog.providers if p.name != provider.name
         ]
         for role in _ROLES:
-            ref = self.catalog.defaults.get(role)
-            if ref is not None and ref.provider == provider.name:
-                self.catalog.defaults.pop(role, None)
+            refs = self.catalog.defaults.get(role)
+            if refs:
+                self.catalog.defaults[role] = [
+                    r for r in refs if r.provider != provider.name
+                ]
         self._current = (
             self.catalog.providers[0].name if self.catalog.providers else None
         )
@@ -614,12 +616,8 @@ class ModelCatalogScreen(ModalScreen[None]):
             # same model.
             old = entry.id
             entry.id = new_id
-            for ref in self.catalog.defaults.values():
-                if (
-                    ref is not None
-                    and ref.provider == provider.name
-                    and ref.model == old
-                ):
+            for ref in self.catalog.all_refs():
+                if ref.provider == provider.name and ref.model == old:
                     ref.model = new_id
             self._selected_model = new_id
         if ctx != entry.max_context_tokens:
@@ -693,9 +691,9 @@ class ModelCatalogScreen(ModalScreen[None]):
             if value:
                 provider_name, _, model_id = value.partition("/")
                 ref = ModelRef(provider=provider_name, model=model_id)
-                self.catalog.defaults[role] = ref
+                self.catalog.set_default(role, ref)
             else:
-                self.catalog.defaults.pop(role, None)
+                self.catalog.set_default(role, None)
         try:
             self.store.save(self.catalog)
         except OSError as e:

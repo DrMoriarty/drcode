@@ -59,7 +59,9 @@ def catalog() -> None:
                     models=[ModelEntry(id="m-one"), ModelEntry(id="m-two")],
                 )
             ],
-            defaults={AgentRole.CODING: ModelRef(provider="local-swap", model="m-one")},
+            defaults={
+                AgentRole.CODING: [ModelRef(provider="local-swap", model="m-one")]
+            },
         )
     )
 

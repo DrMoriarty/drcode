@@ -34,13 +34,30 @@ Resolution precedence for a role (`resolve`):
    project `.env` files flow through the ordinary Config layering and do
    NOT trigger this branch).
 2. the project `models[role]` slot (catalog reference or `"custom"`);
-3. `UserModelsConfig.defaults[role]`;
+3. the user-level ordered chain `UserModelsConfig.defaults[role]` — the
+   PRIMARY model (the historical single default) first, then the
+   availability fallbacks in order; the first reference that resolves to
+   a catalog provider wins;
 4. nothing — the role resolves to "model not set" (an empty `model` in the
    returned config): the header shows "not configured" and the pipeline
    stays idle. The flat config's model fields are deliberately NOT a
    fallback anymore; on startup `migrate_user_config` /
    `migrate_project_config` move any legacy flat keys into the catalog /
    project custom models and remove them from the json files.
+
+A reference resolves to its provider in two steps (`_match_ref`): the
+exact `<provider>/<model-id>` match first; when the named provider does
+not exist on this machine, a match BY MODEL ID across the catalog —
+project drcode.json files stay portable between machines whose user
+catalogs name the same gateways differently. No notification is emitted
+for such a cross-provider match: it is a legitimate way of working, not
+an anomaly.
+
+`resolve` stays a SYNCHRONOUS, pure config resolution (network-free).
+Availability-aware selection — probing each candidate provider's health
+endpoint at run start and taking the first AVAILABLE candidate by
+priority — is the separate async `resolve_available` (see below); the
+pipeline applies it once per run start, never mid-run.
 
 Independently of the model connection, a per-role OUTPUT cap is overlaid
 on the result of every path (including the env shortcut): the project
@@ -62,14 +79,18 @@ back to the `.bak` copy of the previous version and only ever warns.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import os
 import shutil
+import ssl
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
+import httpx
 from pydantic import BaseModel, ValidationError, field_serializer, field_validator
 
 from . import config as _config
@@ -81,6 +102,7 @@ from .config import (
 )
 from .gitignore import ensure_drcode_gitignored
 from .settings import ProjectSettingsStore
+from .version import APP_VERSION
 
 # User-level catalog file, next to the user-level drcode.json. The
 # directory is read dynamically from the config module (not bound at
@@ -138,6 +160,21 @@ class ModelEntry(BaseModel):
     # the model–context–compaction-limit triple is one indivisible unit:
     # assigning the model to an agent role brings all three with it.
     compaction_threshold: int | None = None
+    # Favorite level: 0 = not a favorite, 1..3 = favorite priority tier.
+    # The MEANING of the tiers is the user's own (cheap/expensive,
+    # fast/quality — any criterion); drcode only uses the ordering: the
+    # availability fallback chain of a role is built from favorite models
+    # first (see the role-default lists and `resolve_available`), and the
+    # catalog UI (a separate task) will sort favorites to the top. Stored
+    # on the model entry in the user-level models.json.
+    favorite: int = 0
+
+    @field_validator("favorite")
+    @classmethod
+    def _favorite_range(cls, value: int) -> int:
+        if not 0 <= value <= 3:
+            raise ValueError("favorite must be 0..3 (0 = not a favorite)")
+        return value
 
 
 class Provider(BaseModel):
@@ -217,35 +254,98 @@ class CustomModelEntry(BaseModel):
         return value
 
 
+# Maximum length of a role's ordered user-level reference list: the
+# primary model plus up to two availability fallbacks. The list lives on
+# the user level because the three availability tiers (works behind a
+# VPN / works without a VPN, needs the internet / works offline, local)
+# are a property of the USER'S MACHINE, not of any project.
+MAX_ROLE_DEFAULTS = 3
+
+
+def _normalize_role_refs(value: object) -> list[ModelRef]:
+    """Normalize one persisted defaults slot into an ordered ModelRef list.
+
+    Accepts the CURRENT list form (strings "provider/model" and/or
+    `{"provider": …, "model": …}` objects), the LEGACY single-ref forms
+    (the same string or object, or an already-parsed ModelRef) and
+    None/absent (= no default). Unparsable items are dropped silently;
+    the list is capped at `MAX_ROLE_DEFAULTS` entries.
+    """
+    items: list[object]
+    if isinstance(value, (str, dict, ModelRef)):
+        # Legacy single-ref slot (or a list forgotten by an old writer).
+        items = [value]
+    elif isinstance(value, list):
+        items = list(value)
+    else:
+        return []
+    refs: list[ModelRef] = []
+    for item in items:
+        ref = item if isinstance(item, ModelRef) else _parse_ref(item)
+        if ref is not None and ref not in refs:
+            refs.append(ref)
+        if len(refs) >= MAX_ROLE_DEFAULTS:
+            break
+    return refs
+
+
 class UserModelsConfig(BaseModel):
     """The whole user-level catalog as persisted in models.json."""
 
     providers: list[Provider] = []
-    # Per-role fallback when the project does not pin a model itself.
-    # Persisted as one string per slot, "provider/model" (null = no
-    # default); the string form is parsed back into a ModelRef on load.
-    defaults: dict[AgentRole, ModelRef | None] = {}
+    # Per-role ordered fallback chain for when the project does not pin a
+    # model itself: defaults[role][0] is the PRIMARY model of the role
+    # (the historical single default), the remaining entries are
+    # availability fallbacks tried in order (see `resolve_available`).
+    # Persisted as a list of "provider/model" strings per role; the
+    # LEGACY single-string form ("defaults": {"coding": "p/m"}) is
+    # normalized on load into a one-element list.
+    defaults: dict[AgentRole, list[ModelRef]] = {}
 
     @field_validator("defaults", mode="before")
     @classmethod
     def _parse_default_slots(cls, value: object) -> object:
-        """Accept the persisted per-slot string "provider/model" (and the
-        legacy `{"provider": …, "model": …}` object) instead of ModelRef."""
+        """Accept the persisted per-role list (and the legacy single-ref
+        string / `{"provider": …, "model": …}` object / null) instead of
+        the list-of-ModelRef in-memory form."""
         if not isinstance(value, dict):
             return value
-        return {
-            key: slot if isinstance(slot, ModelRef) else _parse_ref(slot)
-            for key, slot in value.items()
-        }
+        normalized = {key: _normalize_role_refs(slot) for key, slot in value.items()}
+        # Empty chains are absence: don't keep null/empty slots around.
+        return {key: refs for key, refs in normalized.items() if refs}
 
     @field_serializer("defaults", when_used="json")
     def _serialize_default_slots(
-        self, value: dict[AgentRole, ModelRef | None]
-    ) -> dict[str, str | None]:
+        self, value: dict[AgentRole, list[ModelRef]]
+    ) -> dict[str, list[str]]:
         return {
-            role.value: (str(ref) if ref is not None else None)
-            for role, ref in value.items()
+            role.value: [str(ref) for ref in refs]
+            for role, refs in value.items()
+            if refs
         }
+
+    def role_refs(self, role: AgentRole) -> list[ModelRef]:
+        """The role's ordered reference chain (empty when unset)."""
+        return list(self.defaults.get(role, ()))
+
+    def default_ref(self, role: AgentRole) -> ModelRef | None:
+        """The role's PRIMARY reference (the historical single default)."""
+        refs = self.defaults.get(role)
+        return refs[0] if refs else None
+
+    def set_default(self, role: AgentRole, ref: ModelRef | None) -> None:
+        """Set (ref) or clear (None) the role's PRIMARY reference — the
+        single-slot API the catalog screen used before the ordered lists;
+        it replaces the whole chain of the role."""
+        if ref is None:
+            self.defaults.pop(role, None)
+        else:
+            self.defaults[role] = [ref]
+
+    def all_refs(self) -> list[ModelRef]:
+        """Every reference of every role, roles in enum order (used by the
+        catalog UI to keep references pointing at renamed providers/models)."""
+        return [ref for role in AgentRole for ref in self.role_refs(role)]
 
 
 # -- project-level selection (.drcode/drcode.json "models" key) --------------
@@ -695,6 +795,50 @@ def resolve(config: Config, role: AgentRole) -> Config:
     return _apply_role_max_tokens(_resolve_connection(config, role), role)
 
 
+def _match_ref(catalog: UserModelsConfig, ref: ModelRef) -> Provider | None:
+    """Resolve a reference to a catalog provider.
+
+    1. The exact provider-name match: the provider whose name is the
+       reference's head wins even when it does not list the model id
+       (a hand-entered reference to an unlisted model stays usable — the
+       historical behavior).
+    2. When the named provider does not exist on THIS machine, match BY
+       MODEL ID across the catalog (catalog order): the portable way for
+       a project drcode.json committed to git to keep working on machines
+       whose user catalog names the same gateway differently. Legitimate,
+       never notified.
+    """
+    provider = next((p for p in catalog.providers if p.name == ref.provider), None)
+    if provider is not None:
+        return provider
+    return next(
+        (p for p in catalog.providers if any(m.id == ref.model for m in p.models)),
+        None,
+    )
+
+
+def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config:
+    """Write the provider's connection (and the catalog entry's token
+    caps, when one is listed) over `config`."""
+    update: dict[str, object] = {
+        "model": ref.model,
+        "base_url": provider.base_url,
+        "api_key": provider.api_key,
+        "health_check_url": provider.health_check_url,
+    }
+    entry = next((m for m in provider.models if m.id == ref.model), None)
+    if entry is not None:
+        update["max_context_tokens"] = entry.max_context_tokens
+        if entry.max_tokens is not None:
+            update["max_tokens"] = entry.max_tokens
+        # The compaction limit rides with the model: an entry-level
+        # value overrides the flat config, None keeps it (project/user
+        # setting).
+        if entry.compaction_threshold is not None:
+            update["compaction_threshold"] = entry.compaction_threshold
+    return config.model_copy(update=update)
+
+
 def _resolve_connection(config: Config, role: AgentRole) -> Config:
     """Resolve the role's model CONNECTION (without the per-role
     max_tokens overlay) — the body of the historical `resolve`."""
@@ -707,33 +851,13 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
     project_root = config._project_root
     catalog = UserModelsStore().load()
 
-    def apply_provider(ref: ModelRef, provider: Provider) -> Config:
-        update: dict[str, object] = {
-            "model": ref.model,
-            "base_url": provider.base_url,
-            "api_key": provider.api_key,
-            "health_check_url": provider.health_check_url,
-        }
-        entry = next((m for m in provider.models if m.id == ref.model), None)
-        if entry is not None:
-            update["max_context_tokens"] = entry.max_context_tokens
-            if entry.max_tokens is not None:
-                update["max_tokens"] = entry.max_tokens
-            # The compaction limit rides with the model: an entry-level
-            # value overrides the flat config, None keeps it (project/user
-            # setting).
-            if entry.compaction_threshold is not None:
-                update["compaction_threshold"] = entry.compaction_threshold
-        return config.model_copy(update=update)
-
-    # 2. Project-level selection: a catalog reference (the provider must
-    #    still exist — a dangling reference falls through) or the role's
-    #    custom model.
+    # 2. Project-level selection: a catalog reference (resolved via the
+    #    exact → cross-provider id match) or the role's custom model.
     slot = load_project_model_slots(project_root).get(role)
     if isinstance(slot, ModelRef):
-        provider = next((p for p in catalog.providers if p.name == slot.provider), None)
+        provider = _match_ref(catalog, slot)
         if provider is not None:
-            return apply_provider(slot, provider)
+            return _apply_provider(config, slot, provider)
     elif slot == "custom":
         custom = load_project_custom_models(project_root).get(role)
         if custom is not None:
@@ -748,12 +872,13 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
                 update["max_tokens"] = custom.max_tokens
             return config.model_copy(update=update)
 
-    # 3. User-level default.
-    ref = catalog.defaults.get(role)
-    if ref is not None:
-        provider = next((p for p in catalog.providers if p.name == ref.provider), None)
+    # 3. The user-level ordered chain: primary first, then the availability
+    #    fallbacks; the first reference resolving to a catalog provider
+    #    wins (dangling ones fall through to the next candidate).
+    for ref in catalog.role_refs(role):
+        provider = _match_ref(catalog, ref)
         if provider is not None:
-            return apply_provider(ref, provider)
+            return _apply_provider(config, ref, provider)
 
     # 4. Nothing selected for this role: "model not set".
     return config.model_copy(update={"model": ""})
@@ -767,12 +892,17 @@ def resolve_model_key(config: Config, role: AgentRole) -> str:
     name). Empty when nothing is selected for the role.
 
     Mirrors `resolve`/`resolve_effective` precedence — env override, the
-    project slot (a dangling catalog reference falls through to the user
-    default, same as `_resolve_connection`), the user-level default —
-    including the research/resolver fallback to the coding model. Feeds
-    the TUI's usage-accounting key ("<role>/<model-id>", see
+    project slot (exact → cross-provider id match, same as
+    `_resolve_connection`), the user-level ordered chain — including the
+    research/resolver fallback to the coding model. The provider name in
+    the key is the one the reference ACTUALLY resolved to (after a
+    cross-provider id match), not the one written in the slot. Feeds the
+    TUI's usage-accounting key ("<role>/<model-id>", see
     `drcode.usage_store`); kept in sync with `_resolve_connection` by
-    construction (same walk, same fall-throughs).
+    construction (same walk, same fall-throughs). Note: this is the
+    THEORETICAL resolution — after an availability fallback at run start
+    the pipeline pins the factually chosen key over it (see
+    `resolve_available`).
     """
     resolved = resolve(config, role)
     if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
@@ -784,18 +914,17 @@ def resolve_model_key(config: Config, role: AgentRole) -> str:
     project_root = config._project_root
     slot = load_project_model_slots(project_root).get(role)
     if isinstance(slot, ModelRef):
-        provider = next((p for p in catalog.providers if p.name == slot.provider), None)
+        provider = _match_ref(catalog, slot)
         if provider is not None:
-            return f"{slot.provider}/{slot.model}"
+            return f"{provider.name}/{slot.model}"
     elif slot == "custom":
         custom = load_project_custom_models(project_root).get(role)
         if custom is not None:
             return custom.model
-    ref = catalog.defaults.get(role)
-    if ref is not None:
-        provider = next((p for p in catalog.providers if p.name == ref.provider), None)
+    for ref in catalog.role_refs(role):
+        provider = _match_ref(catalog, ref)
         if provider is not None:
-            return f"{ref.provider}/{ref.model}"
+            return f"{provider.name}/{ref.model}"
     return resolved.model
 
 
@@ -816,6 +945,184 @@ def resolve_effective(config: Config, role: AgentRole) -> Config:
     if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
         return resolve(config, AgentRole.CODING)
     return resolved
+
+
+# -- availability-aware resolution (run start) ---------------------------------
+
+# Per-probe timeout, seconds: every candidate provider of a role's chain is
+# probed IN PARALLEL with this timeout, so the total run-start delay is
+# bounded by ONE timeout — never the sum over the chain. Short on purpose:
+# a hanging health endpoint must not stall the run start.
+AVAILABILITY_PROBE_TIMEOUT = 2.5
+
+
+def _probe_ssl_verify() -> ssl.SSLContext | bool:
+    """System certificate store when available (same rationale as
+    `agent_model._ssl_verify` — duplicated here because agent_model imports
+    this module, not the other way round)."""
+    try:
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        return True
+
+
+async def provider_available(
+    provider: Provider, *, timeout: float = AVAILABILITY_PROBE_TIMEOUT
+) -> bool:
+    """Probe one provider's availability via a cheap GET.
+
+    Endpoint: the cached `health_check_url` when the provider defines one,
+    else the canonical OpenAI-compatible `{base_url}/models`. Any answer
+    below 500 (except 401/403 — an auth failure is a configuration error,
+    not a reachability signal) counts as available; a transport error or a
+    5xx means unavailable.
+
+    Graceful degrade for providers WITHOUT a cached health endpoint: an
+    unreachable /models probe is not proof of unavailability (some
+    gateways only serve /chat/completions), so such a provider is assumed
+    available and the run's own network-retry layer deals with a dead
+    endpoint. A provider with a health_check_url that does not answer IS
+    unavailable (that is the whole point of caching a verified endpoint).
+    Never raises.
+    """
+    base = provider.base_url.strip()
+    if not base:
+        return False
+    health = provider.health_check_url.strip()
+    url = health or f"{base.rstrip('/')}/models"
+    headers = {"User-Agent": f"drcode/{APP_VERSION}"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, verify=_probe_ssl_verify()
+        ) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError:
+        return not health
+    if resp.status_code in (401, 403):
+        return False
+    return resp.status_code < 500
+
+
+def _availability_candidates(
+    config: Config, role: AgentRole
+) -> list[tuple[ModelRef, Provider]]:
+    """The role's ordered candidate chain: the project slot reference
+    (when one is set) first, then the user-level ordered list (primary +
+    availability fallbacks). Duplicate references dropped; each reference
+    matched to its provider via `_match_ref`; references resolving to no
+    provider are dropped."""
+    catalog = UserModelsStore().load()
+    refs: list[ModelRef] = []
+    slot = load_project_model_slots(config._project_root).get(role)
+    if isinstance(slot, ModelRef):
+        refs.append(slot)
+    for ref in catalog.role_refs(role):
+        if ref not in refs:
+            refs.append(ref)
+    out: list[tuple[ModelRef, Provider]] = []
+    for ref in refs:
+        provider = _match_ref(catalog, ref)
+        if provider is not None:
+            out.append((ref, provider))
+    return out
+
+
+class AvailableResolution(NamedTuple):
+    """The outcome of an availability-aware run-start resolution."""
+
+    # The connection to serve the run with (already overlaid with the
+    # role's max_tokens override, same as `resolve`).
+    config: Config
+    # Usage-accounting key of the FACTUALLY chosen model
+    # ("<provider>/<model-id>", bare id for custom/env).
+    model_key: str
+    # True when the chosen provider answered its availability probe — or
+    # when no probing applied (env override, custom slot, empty chain).
+    # False means the whole candidate chain was probed and every provider
+    # is unreachable.
+    available: bool
+    # Providers probed and found unreachable, in chain priority order
+    # (empty when nothing was probed or everything answered).
+    unavailable: list[str]
+
+
+async def _resolve_available_chain(
+    config: Config, role: AgentRole, *, timeout: float
+) -> AvailableResolution:
+    """Availability-aware resolution over the role's candidate chain
+    (env/custom shortcuts already handled by the caller)."""
+    theoretical_config = resolve(config, role)
+    theoretical_key = resolve_model_key(config, role)
+    # A "custom" project slot pins one exact connection: the user-level
+    # chain (built for availability portability) is deliberately not
+    # consulted — and no probing either.
+    if load_project_model_slots(config._project_root).get(role) == "custom":
+        return AvailableResolution(theoretical_config, theoretical_key, True, [])
+    candidates = _availability_candidates(config, role)
+    if not candidates:
+        return AvailableResolution(theoretical_config, theoretical_key, True, [])
+    # Distinct providers in chain-priority order — the availability TIER
+    # is the provider as a whole, so two references on one provider are
+    # probed (and judged) together.
+    unique: dict[str, Provider] = {}
+    for _, provider in candidates:
+        unique.setdefault(provider.name, provider)
+    names = list(unique)
+    results = await asyncio.gather(
+        *(provider_available(p, timeout=timeout) for p in unique.values())
+    )
+    up = {name for name, ok in zip(names, results) if ok}
+    down = [name for name in names if name not in up]
+    chosen = next(((r, p) for r, p in candidates if p.name in up), None)
+    if chosen is None:
+        # Every candidate is unreachable: degrade — hand back the
+        # theoretical primary with the failure list (never crash; the
+        # caller decides whether to start anyway).
+        return AvailableResolution(theoretical_config, theoretical_key, False, down)
+    ref, provider = chosen
+    cfg = _apply_role_max_tokens(_apply_provider(config, ref, provider), role)
+    return AvailableResolution(cfg, f"{provider.name}/{ref.model}", True, down)
+
+
+async def resolve_available(
+    config: Config, role: AgentRole, *, timeout: float = AVAILABILITY_PROBE_TIMEOUT
+) -> AvailableResolution:
+    """Resolve the role's model with availability taken into account —
+    the async step the pipeline applies ONCE at every run start (never
+    mid-run: there is no fallback inside a run, only between attempts).
+
+    Semantics:
+
+    1. `DRCODE_MODEL` / `DRCODE_BASE_URL` env — no probing, no fallback
+       chain: the env layer wins over everything exactly as before.
+    2. A "custom" project slot — the project pinned one exact connection;
+       no alternatives are consulted (the user-level chain exists for
+       availability portability, which a pinned custom connection
+       deliberately opts out of).
+    3. Otherwise the candidate chain (project reference first, then the
+       user-level primary and fallbacks) is probed in parallel and the
+       FIRST AVAILABLE candidate by priority wins; its provider name (not
+       the reference's — a cross-provider id match may have been used)
+       names the model key.
+    4. RESEARCH/RESOLVER with nothing usable fall back to the CODING
+       chain (the `resolve_effective` inheritance, availability edition).
+
+    All probes run concurrently with a short per-probe timeout: the
+    run-start delay is bounded by one timeout, not the chain length.
+    Failures degrade (an `available=False` resolution), never raise.
+    """
+    if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
+        return AvailableResolution(
+            resolve(config, role), resolve_model_key(config, role), True, []
+        )
+    result = await _resolve_available_chain(config, role, timeout=timeout)
+    if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not result.config.is_ready:
+        return await resolve_available(config, AgentRole.CODING, timeout=timeout)
+    return result
 
 
 # -- one-time migrations of legacy flat configs --------------------------------
@@ -848,7 +1155,7 @@ def migrate_user_config() -> bool:
         if flat is not None:
             catalog = UserModelsConfig(providers=[flat])
             ref = ModelRef(provider=flat.name, model=flat.models[0].id)
-            catalog.defaults = dict.fromkeys(AgentRole, ref)
+            catalog.defaults = {role: [ref] for role in AgentRole}
             try:
                 store.save(catalog)
             except OSError:

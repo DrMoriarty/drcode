@@ -2670,7 +2670,7 @@ def _write_user_catalog(
         ]
     )
     if with_default:
-        catalog.defaults[role] = ModelRef(provider="local-swap", model=model_id)
+        catalog.defaults[role] = [ModelRef(provider="local-swap", model=model_id)]
     UserModelsStore().save(catalog)
 
 

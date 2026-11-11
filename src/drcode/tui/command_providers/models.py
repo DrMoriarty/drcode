@@ -58,7 +58,7 @@ def role_model_options_provider(role: AgentRole) -> type[CommandListProvider]:
             slot = slots.get(role)
             current_ref = slot if isinstance(slot, ModelRef) else None
             current_custom = slot == "custom"
-            user_default = catalog.defaults.get(role)
+            user_default = catalog.default_ref(role)
             commands: list[CommandEntry] = []
             for provider in catalog.providers:
                 for entry in provider.models:

@@ -947,6 +947,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # model id) of the resolved configs, cached with them — see
         # `resolved_model_key`.
         self._resolved_model_keys: dict[AgentRole, str] = {}
+        # Factual run-start availability resolutions (see
+        # `CoreState._pin_resolution`), pinned over the caches above.
+        self._pinned_resolutions: dict[AgentRole, tuple[Config, str]] = {}
         # The model key each task's agent last started a run on (session
         # bookkeeping for the run-start / manual-change model events — see
         # `CoreState._emit_run_model_event`).

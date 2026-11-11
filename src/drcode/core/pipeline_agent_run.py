@@ -49,7 +49,7 @@ from ..core.usage import (
     _network_retry_delay,
 )
 from ..models import PendingInput, Task, TaskKind, TaskStatus
-from ..providers import AgentRole
+from ..providers import AgentRole, resolve_available
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
@@ -183,6 +183,37 @@ class PipelineAgentRunLayer(CoreState):
                     "available.",
                 )
                 return
+            # Availability-aware model choice for THIS run (probed once per
+            # run start, never mid-run): the candidate chain (project slot,
+            # then the user-level primary + fallbacks) is probed in
+            # parallel and the first reachable provider wins. The factual
+            # choice is pinned over the resolution caches so every
+            # consumer below (usage accounting, compaction gates, events)
+            # sees the model the run actually uses.
+            resolution = await resolve_available(self.config, role)
+            if resolution.unavailable and not resolution.available:
+                # Every candidate provider is unreachable: degrade —
+                # announce and start on the theoretical primary anyway;
+                # the run's own network-retry/outage layer handles the
+                # dead endpoints (a silent pause here would look like a
+                # zombie run to the watchdog).
+                self._show_event(
+                    task,
+                    "Provider(s) unreachable: "
+                    + ", ".join(resolution.unavailable)
+                    + f" — starting on {resolution.model_key or 'the configured model'} anyway.",
+                )
+            else:
+                self._pin_resolution(role, resolution)
+                if resolution.unavailable:
+                    # A fallback (or a cross-provider match) is serving the
+                    # run: name the unavailable providers once.
+                    self._show_event(
+                        task,
+                        "Provider(s) unavailable: "
+                        + ", ".join(resolution.unavailable)
+                        + f" — using {resolution.model_key} for this run.",
+                    )
             # Service event naming the model this run is served by (and a
             # model switch when the previous attempt started on a
             # different one — see _emit_run_model_event). Fires on EVERY

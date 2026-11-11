@@ -91,7 +91,7 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         entry = data["providers"][0]["models"][0]
         assert entry["id"] == "my-model"
         assert entry["max_context_tokens"] == 131072
-        assert data["defaults"]["coding"] == "p/my-model"
+        assert data["defaults"]["coding"] == ["p/my-model"]
 
 
 async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""Model-catalog editor: providers, auto-discovered models, role defaults.
+"""Model-catalog editor: providers and their models.
 
 Edits the user-level catalog (`~/.config/drcode/models.json`, see
 `drcode.providers`) — the only UI that writes that file, so no manual JSON
@@ -11,14 +11,16 @@ editing is ever needed. Two entry points share this one screen:
 
 Per provider: name / base URL / API key editing with a live connection
 check (`probe_model`), one-click model auto-discovery (`fetch_models`,
-existing entries keep their manual edits, new ones are appended) and an
-editable model table: selecting a row (single click or arrow keys — no
-double click needed) fills the editor line below it with the model's id,
-context size and compaction limit; "Update" writes the edited values back
-to the selected model, "Add model" creates a new model from the same
-fields, "Remove" deletes it. Per agent role (coding /
-research / tester / compaction) a default model can be picked from the catalog —
-used when the project does not pin its own.
+existing entries keep their manual edits — favorites included — and new
+ones are appended) and an editable model table: selecting a row (single
+click or arrow keys — no double click needed) fills the editor line below
+it with the model's id, context size and compaction limit; "Update" writes
+the edited values back to the selected model, "Add model" creates a new
+model from the same fields, "Remove" deletes it. A click on a row's
+Favorites cell cycles its favorite level (empty → ❶ → ★ → ✚ → empty);
+favorites sort to the top of the table, tier by tier. Binding models to
+agent roles does NOT happen here: it lives in its own dialog, opened from
+this screen's "Assign agents…" button.
 
 When models.json does not exist yet but a legacy flat config (user-level
 drcode.json) or the project's `custom_models` describe models, the screen
@@ -32,20 +34,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar
 
-from textual import on
+from rich.text import Text
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..agent import ModelFetchError, fetch_models, probe_model
 from ..providers import (
     USER_MODELS_FILENAME,
-    AgentRole,
     ModelEntry,
-    ModelRef,
     Provider,
     UserModelsConfig,
     UserModelsStore,
@@ -57,6 +59,30 @@ _PROBE_TIMEOUT = 15.0
 # Fixed width of the "model id" table column: long ids are middle-truncated
 # so the context / compaction-limit columns stay on screen.
 _MODEL_ID_COL_WIDTH = 42
+
+# The Favorites column sits FIRST in the model table (index 0) — the
+# click target must be visible without scrolling a wide id column.
+_FAVORITE_COLUMN_INDEX = 0
+_FAVORITE_COL_WIDTH = 3
+
+# Favorite level → cell glyph. Each level is a DIFFERENT shape AND color so
+# the tiers are tellable apart at a glance: ❶ (filled circle, red),
+# ★ (five-pointed star, yellow), ✚ (cross, cyan). 0 = not a favorite
+# (empty cell).
+_FAVORITE_GLYPHS: dict[int, Text] = {
+    1: Text("❶", style="bold red"),
+    2: Text("★", style="bold yellow"),
+    3: Text("✚", style="bold cyan"),
+}
+
+# Display-order rank of a favorite level: tiers 1 → 2 → 3 first, then
+# everything else; alphabetical inside each group (the pre-favorites
+# display order).
+_FAVORITE_TIER_RANK = {1: 0, 2: 1, 3: 2}
+
+
+def _model_sort_key(entry: ModelEntry) -> tuple[int, str]:
+    return (_FAVORITE_TIER_RANK.get(entry.favorite, 3), entry.id)
 
 
 def _truncate_middle(text: str, width: int = _MODEL_ID_COL_WIDTH) -> str:
@@ -71,13 +97,35 @@ def _truncate_middle(text: str, width: int = _MODEL_ID_COL_WIDTH) -> str:
     return f"{text[:head]}…{text[len(text) - tail :]}"
 
 
-_ROLES: tuple[AgentRole, ...] = (
-    AgentRole.CODING,
-    AgentRole.RESEARCH,
-    AgentRole.TESTER,
-    AgentRole.COMPACTION,
-    AgentRole.RESOLVER,
-)
+class _ModelTable(DataTable):
+    """Model table whose Favorites column is clickable: a click on a cell
+    of that column cycles the row's favorite level instead of only
+    selecting the row. Everything else behaves like a plain DataTable with
+    a row cursor."""
+
+    class FavoriteClicked(Message):
+        """Posted when a Favorites cell is clicked."""
+
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            super().__init__()
+
+    async def _on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        row = meta.get("row")
+        if (
+            isinstance(row, int)
+            and row >= 0  # -1 is the header row
+            and meta.get("column") == _FAVORITE_COLUMN_INDEX
+            and 0 <= row < len(self.ordered_rows)
+        ):
+            self.move_cursor(row=row, scroll=False)
+            self.post_message(
+                self.FavoriteClicked(self.ordered_rows[row].key.value or "")
+            )
+            event.stop()
+            return
+        await super()._on_click(event)
 
 
 class ModelCatalogScreen(ModalScreen[None]):
@@ -138,12 +186,6 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
-    #mc-roles { height: auto; margin-top: 1; }
-    #mc-roles Select { width: 1fr; height: auto; }
-    .mc-role-label {
-        margin-top: 1;
-        color: $text-muted;
-    }
     #mc-footer {
         height: auto;
         margin-top: 1;
@@ -198,19 +240,6 @@ class ModelCatalogScreen(ModalScreen[None]):
                     with Horizontal(classes="mc-btnrow"):
                         yield Button("+ Add", id="mc-add")
                         yield Button("Delete", id="mc-del-provider")
-                    with Vertical(id="mc-roles"):
-                        for role in _ROLES:
-                            # The agent name sits on its own line above the
-                            # select: with a value picked, the select's
-                            # collapsed label shows only the model ref, so
-                            # without the label the slot would be anonymous.
-                            yield Static(role.value, classes="mc-role-label")
-                            yield Select(
-                                [("(none)", "")],
-                                prompt=f"{role.value}:",
-                                id=f"mc-role-{role.value}",
-                                allow_blank=True,
-                            )
                 with Vertical(id="mc-right"):
                     yield Input(
                         id="mc-name", placeholder="provider name, e.g. local-swap"
@@ -228,7 +257,7 @@ class ModelCatalogScreen(ModalScreen[None]):
                         yield Button("Check connection", id="mc-check")
                         yield Button("Fetch models", id="mc-fetch")
                     yield Static("", id="mc-status")
-                    yield DataTable(id="mc-models", cursor_type="row")
+                    yield _ModelTable(id="mc-models", cursor_type="row")
                     with Horizontal(id="mc-model-row"):
                         yield Input(id="mc-model-id", placeholder="model id")
                         yield Input(id="mc-ctx", placeholder="context tokens")
@@ -242,11 +271,14 @@ class ModelCatalogScreen(ModalScreen[None]):
             with Horizontal(id="mc-footer"):
                 yield Static(
                     "esc — close without saving · model table: click or arrow "
-                    "keys select a row and fill the editor; Update writes the "
+                    "keys select a row and fill the editor; a click on the "
+                    "Favorites cell cycles the favorite level (empty → ❶ → "
+                    "★ → ✚), favorites sort to the top; Update writes the "
                     "edited id/context/limit back, Add model creates a new "
                     "model from the same fields, Remove deletes it",
                     id="mc-hint",
                 )
+                yield Button("Assign agents…", id="mc-assign-agents")
                 yield Button("Save", variant="primary", id="mc-save")
 
     # -- helpers ------------------------------------------------------------
@@ -285,7 +317,8 @@ class ModelCatalogScreen(ModalScreen[None]):
             self._status(f"✗ provider '{name}' already exists")
             return False
         if name != provider.name:
-            # Rename: keep the role-default references pointing at the
+            # Rename: keep the stored role-default references (edited in
+            # the separate agent-binding dialog, not here) pointing at the
             # same provider.
             old = provider.name
             provider.name = name
@@ -293,20 +326,6 @@ class ModelCatalogScreen(ModalScreen[None]):
                 if ref.provider == old:
                     ref.provider = name
             self._current = name
-            # The role selects list "provider/model" options: rebuild them
-            # so the renamed provider is addressable without a reopen —
-            # but keep the (possibly not yet saved) user's picks, renaming
-            # the ones that referenced the old provider name.
-            picks = {
-                role: str(self.query_one(f"#mc-role-{role.value}", Select).value or "")
-                for role in _ROLES
-            }
-            self._refresh_roles()
-            for role, value in picks.items():
-                if value:
-                    if value.startswith(f"{old}/"):
-                        value = f"{name}/{value.partition('/')[2]}"
-                    self.query_one(f"#mc-role-{role.value}", Select).value = value
         provider.base_url = url
         provider.api_key = key
         return True
@@ -328,39 +347,33 @@ class ModelCatalogScreen(ModalScreen[None]):
                     option_list.highlighted = index
                     break
 
-    def _refresh_models(self) -> None:
-        table = self.query_one("#mc-models", DataTable)
+    def _refresh_models(self, keep_row: str | None = None) -> None:
+        table = self.query_one("#mc-models", _ModelTable)
         table.clear(columns=True)
+        table.add_column("Favorites", width=_FAVORITE_COL_WIDTH)
         table.add_column("model id", width=_MODEL_ID_COL_WIDTH)
         table.add_columns("context", "compact limit")
         provider = self._provider()
         if provider is None:
             return
-        # Display order is alphabetical regardless of how the entries sit
-        # in the catalog (fetch appends, so the stored order is discovery
-        # order — the sorted view is what the user scans).
-        for entry in sorted(provider.models, key=lambda m: m.id):
+        # Display order: favorite tiers 1 → 2 → 3 first, then the rest;
+        # alphabetical inside each group. This is the VIEW order only —
+        # the stored catalog order (discovery order) is never rewritten.
+        for entry in sorted(provider.models, key=_model_sort_key):
             pct = entry.compaction_threshold
             table.add_row(
+                _FAVORITE_GLYPHS.get(entry.favorite, Text("")),
                 _truncate_middle(entry.id),
                 str(entry.max_context_tokens),
                 "inherit" if pct is None else f"{pct}%",
                 key=entry.id,
             )
-
-    def _refresh_roles(self) -> None:
-        model_refs = [
-            (f"{provider.name}/{entry.id}", f"{provider.name}/{entry.id}")
-            for provider in self.catalog.providers
-            for entry in provider.models
-        ]
-        for role in _ROLES:
-            select = self.query_one(f"#mc-role-{role.value}", Select)
-            # The role is named by the Static label above the select; the
-            # blank option is just "(none)".
-            select.set_options([("(none)", "")] + model_refs)
-            ref = self.catalog.default_ref(role)
-            select.value = f"{ref.provider}/{ref.model}" if ref else ""
+        if keep_row is not None and any(m.id == keep_row for m in provider.models):
+            # Keep the toggled row under the cursor: swallow the reset
+            # highlight queued by the rebuild, then re-highlight the row
+            # (its RowHighlighted refills the editor with its values).
+            self._suppress_highlight = True
+            table.move_cursor(row=table.get_row_index(keep_row), scroll=False)
 
     def _load_form(self, name: str | None) -> None:
         self._current = name
@@ -382,7 +395,6 @@ class ModelCatalogScreen(ModalScreen[None]):
             self._current = self.catalog.providers[0].name
         self._refresh_providers()
         self._load_form(self._current)
-        self._refresh_roles()
         if self.store.last_warning:
             # Re-assert after _load_form (it clears the status line).
             self._status(f"⚠ {self.store.last_warning}")
@@ -434,7 +446,10 @@ class ModelCatalogScreen(ModalScreen[None]):
         self.catalog.providers = [
             p for p in self.catalog.providers if p.name != provider.name
         ]
-        for role in _ROLES:
+        # Drop the role-default references (edited in the separate
+        # agent-binding dialog, not here) that pointed at the deleted
+        # provider — never leave dangling refs in the catalog.
+        for role in list(self.catalog.defaults):
             refs = self.catalog.defaults.get(role)
             if refs:
                 self.catalog.defaults[role] = [
@@ -444,7 +459,6 @@ class ModelCatalogScreen(ModalScreen[None]):
             self.catalog.providers[0].name if self.catalog.providers else None
         )
         self._refresh_providers()
-        self._refresh_roles()
         self._load_form(self._current)
 
     # -- connection check / model discovery --------------------------------------
@@ -501,12 +515,14 @@ class ModelCatalogScreen(ModalScreen[None]):
             except ModelFetchError as e:
                 self._status(f"✗ fetch failed: {e}")
                 return
+            # Existing entries are NEVER replaced (only fresh ids are
+            # appended), so the user's manual edits — favorite levels
+            # included — survive a re-discovery untouched.
             existing = {m.id for m in provider.models}
             fresh = [e for e in entries if e.id not in existing]
             provider.models.extend(fresh)
             self._refresh_models()
             self._refresh_providers()
-            self._refresh_roles()
             self._status(f"✓ fetched {len(entries)} models ({len(fresh)} new)")
         finally:
             self._busy = False
@@ -546,6 +562,27 @@ class ModelCatalogScreen(ModalScreen[None]):
         self._select_model(event.row_key.value)
         if self._current_model_entry() is not None:
             self.query_one("#mc-model-id", Input).focus()
+
+    @on(_ModelTable.FavoriteClicked)
+    def _favorite_clicked(self, event: _ModelTable.FavoriteClicked) -> None:
+        self._toggle_favorite(event.model_id)
+
+    def _toggle_favorite(self, model_id: str) -> None:
+        """Cycle the model's favorite level: 0 → 1 → 2 → 3 → 0, then
+        re-render the table (favorites re-sort to the top)."""
+        provider = self._provider()
+        entry = (
+            next((m for m in provider.models if m.id == model_id), None)
+            if provider is not None
+            else None
+        )
+        if entry is None:
+            return
+        entry.favorite = (entry.favorite + 1) % 4
+        self._refresh_models(keep_row=entry.id)
+        level = entry.favorite
+        note = "not a favorite" if level == 0 else f"favorite level {level}"
+        self._status(f"✓ {entry.id}: {note}")
 
     def _current_model_entry(self) -> ModelEntry | None:
         provider = self._provider()
@@ -624,7 +661,6 @@ class ModelCatalogScreen(ModalScreen[None]):
             entry.max_context_tokens = ctx
         entry.compaction_threshold = pct
         self._refresh_models()
-        self._refresh_roles()
         limit = f"{pct}% of context" if pct is not None else "inherits"
         self._status(f"✓ {entry.id}: context {ctx}, compaction {limit}")
 
@@ -637,7 +673,6 @@ class ModelCatalogScreen(ModalScreen[None]):
             return
         provider.models = [m for m in provider.models if m.id != entry.id]
         self._refresh_models()
-        self._refresh_roles()
         self._selected_model = None
         # The rebuild queues a RowHighlighted for the next row — swallow
         # it, so Remove always ends with empty editor inputs.
@@ -675,25 +710,24 @@ class ModelCatalogScreen(ModalScreen[None]):
         self._selected_model = model_id
         self._refresh_models()
         self._refresh_providers()
-        self._refresh_roles()
         limit = f"{pct}% of context" if pct is not None else "inherits"
         self._status(f"✓ added {model_id}: context {ctx}, compaction {limit}")
 
-    # -- role defaults & save -------------------------------------------------------
+    # -- agent binding & save ---------------------------------------------------------
+
+    @on(Button.Pressed, "#mc-assign-agents")
+    def _open_agent_binding(self) -> None:
+        """Entry point of the model→agent binding dialog (its own modal
+        screen, a dependent task): until it lands, say so instead of
+        silently doing nothing."""
+        self._status(
+            "ℹ binding models to agents moves to its own dialog (not implemented yet)"
+        )
 
     @on(Button.Pressed, "#mc-save")
     def _save(self) -> None:
         if not self._commit_form():
             return
-        for role in _ROLES:
-            select = self.query_one(f"#mc-role-{role.value}", Select)
-            value = str(select.value or "")
-            if value:
-                provider_name, _, model_id = value.partition("/")
-                ref = ModelRef(provider=provider_name, model=model_id)
-                self.catalog.set_default(role, ref)
-            else:
-                self.catalog.set_default(role, None)
         try:
             self.store.save(self.catalog)
         except OSError as e:

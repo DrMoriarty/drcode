@@ -1,7 +1,8 @@
 """Smoke tests for the model-catalog screen (drcode.tui.model_setup_app).
 
 Runs the screen headlessly via textual's pilot: provider add/edit, model
-addition, context-size editing, role-default persistence and the save path.
+addition, context-size editing, favorites (click cycling, sorting,
+persistence, re-discovery survival) and the save path.
 """
 
 from __future__ import annotations
@@ -9,8 +10,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from textual.app import App
-from textual.widgets import DataTable, Input, OptionList, Select
+from textual.widgets import DataTable, Input, OptionList
 
 from drcode.providers import (
     AgentRole,
@@ -82,16 +84,15 @@ async def test_add_and_edit_model_context(tmp_path: Path) -> None:
         await pilot.click("#mc-model-add")
         await pilot.pause()
         assert screen._selected_model == "my-model"
-        # Save with the model picked as the coding default.
-        select = screen.query_one("#mc-role-coding", Select)
-        select.value = "p/my-model"
         await pilot.click("#mc-save")
         await pilot.pause()
         data = json.loads(path.read_text())
         entry = data["providers"][0]["models"][0]
         assert entry["id"] == "my-model"
         assert entry["max_context_tokens"] == 131072
-        assert data["defaults"]["coding"] == ["p/my-model"]
+        # Role defaults are NOT edited on this screen anymore (the
+        # agent-binding dialog owns them): saving must not write any.
+        assert data.get("defaults", {}) == {}
 
 
 async def test_add_and_edit_model_compaction_threshold(tmp_path: Path) -> None:
@@ -277,6 +278,162 @@ async def test_row_selection_fills_editor_and_update_remove(tmp_path: Path) -> N
         assert screen.query_one("#mc-model-id", Input).value == ""
         assert screen.query_one("#mc-ctx", Input).value == ""
         assert screen.query_one("#mc-pct", Input).value == ""
+
+
+# -- favorites ----------------------------------------------------------------------
+
+
+async def test_favorite_cell_click_cycles_level(tmp_path: Path) -> None:
+    """A click on a row's Favorites cell cycles that row's favorite level
+    0 → 1 → 2 → 3 → 0 (the glyph column is the first table column)."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        status = screen.query_one("#mc-status")
+        # Header occupies y=0; x=1 is inside the first (Favorites) column.
+        await pilot.click("#mc-models", offset=(1, 1))
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].favorite == 1
+        assert "favorite level 1" in str(status.render())
+        await pilot.click("#mc-models", offset=(1, 1))
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].favorite == 2
+        await pilot.click("#mc-models", offset=(1, 1))
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].favorite == 3
+        await pilot.click("#mc-models", offset=(1, 1))
+        await pilot.pause()
+        assert screen.catalog.providers[0].models[0].favorite == 0
+        assert "not a favorite" in str(status.render())
+
+
+async def test_favorites_sort_to_top_tier_by_tier(tmp_path: Path) -> None:
+    """Display order: tier 1, tier 2, tier 3, then non-favorites;
+    alphabetical inside each group. The stored catalog order is never
+    rewritten."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[
+                        ModelEntry(id="a"),
+                        ModelEntry(id="b", favorite=3),
+                        ModelEntry(id="c"),
+                        ModelEntry(id="d", favorite=1),
+                        ModelEntry(id="e", favorite=2),
+                        ModelEntry(id="f", favorite=1),
+                    ],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        table = screen.query_one("#mc-models", DataTable)
+        indices = {
+            mid: table.get_row_index(mid) for mid in ("a", "b", "c", "d", "e", "f")
+        }
+        ranked = sorted(indices, key=lambda mid: indices[mid])
+        # Tier 1: d, f (alphabetical) · tier 2: e · tier 3: b · rest: a, c.
+        assert ranked == ["d", "f", "e", "b", "a", "c"]
+        # The catalog's stored order is untouched.
+        assert [m.id for m in screen.catalog.providers[0].models] == list("abcdef")
+
+
+async def test_favorite_level_saved_to_catalog(tmp_path: Path) -> None:
+    """Favorite levels ride along the screen's normal Save path."""
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[ModelEntry(id="m-a"), ModelEntry(id="m-b")],
+                )
+            ]
+        )
+    )
+    path = tmp_path / "models.json"
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        screen._toggle_favorite("m-b")  # 0 → 1
+        screen._toggle_favorite("m-b")  # 1 → 2
+        await pilot.pause()
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        models = {
+            m["id"]: m["favorite"]
+            for m in json.loads(path.read_text())["providers"][0]["models"]
+        }
+        assert models == {"m-a": 0, "m-b": 2}
+
+
+async def test_refetch_preserves_favorites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-discovery appends only fresh ids: the existing entries (their
+    manual edits AND favorite levels) are never replaced."""
+
+    async def fake_fetch_models(*args: object, **kwargs: object):
+        return [
+            ModelEntry(id="m-a"),
+            ModelEntry(id="m-b"),
+            ModelEntry(id="m-new"),
+        ]
+
+    monkeypatch.setattr("drcode.tui.model_setup_app.fetch_models", fake_fetch_models)
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[
+                        ModelEntry(id="m-a", favorite=2),
+                        ModelEntry(id="m-b"),
+                    ],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        await pilot.click("#mc-fetch")
+        await pilot.pause()
+        models = {m.id: m.favorite for m in screen.catalog.providers[0].models}
+        assert models == {"m-a": 2, "m-b": 0, "m-new": 0}
+
+
+async def test_assign_agents_button_present(tmp_path: Path) -> None:
+    """The model→agent binding dialog is a separate screen; this one only
+    carries its entry-point button (no role selects anymore)."""
+    store = UserModelsStore(tmp_path / "models.json")
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        assert screen.query("#mc-assign-agents")  # entry point exists
+        assert not screen.query("Select")  # no role editors on this screen
 
 
 async def test_slash_rejected_in_provider_name_and_allowed_in_model_id(

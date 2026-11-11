@@ -426,6 +426,10 @@ def _footer_text(screen: UnmergedListScreen) -> str:
     return str(screen.query_one("#unmerged-footer", Static).content)
 
 
+def _title_text(screen: UnmergedListScreen) -> str:
+    return str(screen.query_one("#unmerged-title", Static).content)
+
+
 async def test_busy_spinner_replaces_and_restores_footer(
     isolated: Path,
     configured_env: None,
@@ -528,6 +532,61 @@ async def test_refresh_shows_busy_spinner_while_git_runs(
         )
         assert screen._busy is False
         assert len(screen._entries) == 2  # rows recomputed, screen alive
+
+
+async def test_title_shows_spinner_while_initial_load_runs(
+    isolated: Path,
+    configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The silent initial sweep (on push/resume) animates the title
+    line — the dialog paints with an empty list while the git sweep
+    runs — and the plain title is back when the rows arrive."""
+    manager = TaskManager(isolated)
+    t1 = _completed_task(manager, "Fix one")
+    t2 = _completed_task(manager, "Fix two")
+    _unmerged_branch(isolated, t1, "ONE")
+    _unmerged_branch(isolated, t2, "TWO")
+    app = DrCodeApp(isolated)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.view_task(t1)
+        # Slow the git sweep down BEFORE the screen opens so the initial
+        # (silent) load is observable.
+        original = UnmergedListScreen._collect_entries
+
+        def slow_collect(
+            self: UnmergedListScreen, task_ids: list[str]
+        ) -> list:
+            time.sleep(0.4)
+            return original(self, task_ids)
+
+        monkeypatch.setattr(UnmergedListScreen, "_collect_entries", slow_collect)
+        await pilot.press("ctrl+m")
+        await wait_until(
+            lambda: (
+                isinstance(app.screen, UnmergedListScreen)
+                and "Loading branches…" in _title_text(app.screen)
+            ),
+            pilot=pilot,
+            what="loading spinner in the title",
+        )
+        screen = app.screen
+        assert isinstance(screen, UnmergedListScreen)
+        assert screen._title_timer is not None
+        # The animation tick advances the spinner frame.
+        frame_before = screen._spinner_frame
+        screen._tick_title_spinner()
+        assert screen._spinner_frame != frame_before
+        await wait_until(
+            lambda: (
+                len(screen._entries) == 2
+                and _title_text(screen) == "Unmerged task branches"
+            ),
+            pilot=pilot,
+            what="title restored after the load",
+        )
+        assert screen._title_timer is None
 
 
 async def test_land_spins_through_phases_and_restores_footer(

@@ -8,7 +8,9 @@ network anywhere) — same style as tests/network_mocks.py."""
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -711,6 +713,77 @@ def test_hook_timeout_constant_is_bounded() -> None:
     # A hook call blocks the pipeline (sync review) — it must never hang
     # forever, even though CI waits are legitimate.
     assert 0 < HOOK_TIMEOUT <= 3600
+
+
+# -- frozen bundle: hooks via the binary's hidden --run-hook flag --------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="exec stub needs a POSIX shebang")
+async def test_hook_frozen_binary_uses_run_hook_flag(
+    project_root: Path,
+    manager: TaskManager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Regression (bibisco-ng #a0a55d3d): in a frozen bundle sys.executable
+    is the drcode binary, which ignores `-c <bootstrap>` and used to boot a
+    second TUI in the hook's cwd — the hook then hung until HOOK_TIMEOUT and
+    on_review failed closed forever. The frozen path must spawn
+    `<binary> --run-hook <script>` and the call must succeed through a
+    binary that understands ONLY that flag."""
+    stub = tmp_path / "drcode-binary"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "if '--run-hook' in sys.argv:\n"
+        "    from drcode.hook_runner import run\n"
+        "    raise SystemExit(run())\n"
+        "# without the flag the frozen binary used to start the TUI here\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(stub))
+    make_script(project_root, REVIEW_ACCEPT_SCRIPT)
+    hooks = make_hooks(project_root)
+    result = await hooks.call("on_review", manager.create("t", ""))
+    assert result.ok, result.error
+    assert result.output == {"verdict": "accept"}
+
+
+def test_run_hook_cli_flag_processes_payload(
+    project_root: Path, tmp_path: Path
+) -> None:
+    """`<python> -m drcode --run-hook <script>` (the frozen spawn path via
+    main()) reads the JSON payload from stdin and prints the hook result."""
+    script = make_script(project_root, ECHO_SCRIPT)
+    payload = json.dumps(
+        {"hook": "on_task_start", "task": {"id": "x", "title": "t"}, "git": {}}
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "drcode", "--run-hook", str(script)],
+        check=False,
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)
+    assert output["seen"]["hook"] == "on_task_start"
+
+
+def test_run_hook_flag_is_hidden_from_help(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["drcode", "--help"])
+    monkeypatch.setattr("drcode._install_stderr_filter", lambda: None)
+    from drcode import main as drcode_main
+
+    drcode_main()
+    assert "--run-hook" not in capsys.readouterr().out
 
 
 # -- prompts: git-workflow rules -------------------------------------------------------

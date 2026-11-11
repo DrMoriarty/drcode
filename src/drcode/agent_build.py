@@ -58,7 +58,12 @@ from .service_events import log_service_event
 from .settings import GitPolicy
 from .subagents import SubagentGate, run_delegate_tool
 from .task_manager import TaskManager
-from .tool_runtime import _run_bash_logged, _run_tool, _run_tool_logged
+from .tool_runtime import (
+    _run_bash_logged,
+    _run_tool,
+    _run_tool_logged,
+    attach_batch_guard,
+)
 from .transcript import _context_status, ctx_context_tokens
 
 __all__ = [
@@ -362,6 +367,10 @@ def build_agent(
         },
         retries=10,
     )
+    # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
+    # wrapped around the agent's own function toolset so every registered
+    # tool funnels through it. Config value; 0 disables.
+    attach_batch_guard(agent, config.tool_batch_limit)
     # The feature task's checklist does NOT ride here: dynamic instructions
     # render into the LEADING system messages of every request, so a
     # todo_create/todo_update mid-activation would move the request
@@ -1070,6 +1079,8 @@ def build_tester_agent(
         },
         retries=10,
     )
+    # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
+    attach_batch_guard(agent, config.tool_batch_limit)
 
     @agent.tool
     async def read_file(
@@ -1426,6 +1437,8 @@ def build_resolver_agent(
         },
         retries=10,
     )
+    # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
+    attach_batch_guard(agent, config.tool_batch_limit)
     _resolver_shared_tools(agent, config)
 
     @agent.tool(
@@ -1570,6 +1583,8 @@ def build_resolver_reviewer_agent(
         },
         retries=10,
     )
+    # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
+    attach_batch_guard(agent, config.tool_batch_limit)
     _resolver_shared_tools(agent, config)
 
     @agent.tool

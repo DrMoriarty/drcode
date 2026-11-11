@@ -40,7 +40,7 @@ from . import task_search, tools
 from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
 from .providers import AgentRole
 from .service_events import log_service_event
-from .tool_runtime import _run_tool
+from .tool_runtime import _run_tool, attach_batch_guard
 
 if TYPE_CHECKING:
     from .agent import AgentDeps
@@ -116,6 +116,9 @@ def build_subagent_agent(config: Config, *, root: Path) -> Agent[SubagentDeps, s
         # Short runs: fewer retries than the parent agents keep.
         retries=3,
     )
+    # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
+    # a subagent with four read tools can degenerate just like a parent.
+    attach_batch_guard(agent, config.tool_batch_limit)
 
     @agent.tool
     async def read_file(

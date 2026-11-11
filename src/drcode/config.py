@@ -160,6 +160,17 @@ class Config(BaseSettings):
     # the cap entirely. The counter is per run: a new user message starts
     # from zero again.
     request_limit: int | None = 500
+    # Cap on tool calls executed per ONE model response (a "batch"): the
+    # first `tool_batch_limit` distinct calls of a response run, the rest get
+    # a plain tool result telling the model to re-issue them. Exact
+    # duplicates (same tool + same args) within one response execute only
+    # once — the twins get the same result under their own tool_call_ids.
+    # Both defenses reset on every model response: repeating the same call in
+    # a LATER response is legitimate (e.g. re-reading a file after an edit)
+    # and always executes. Guards against degenerate parallel batches some
+    # models emit (xiaomi/mimo-v2.6-flash: 31 identical greps in one answer).
+    # 0 disables the guard entirely.
+    tool_batch_limit: int = 8
 
     def __init__(self, project_root: Path | None = None, **data: object) -> None:
         # Scaffold the user config dir (idempotent, no-op when it exists)

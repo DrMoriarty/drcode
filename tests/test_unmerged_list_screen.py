@@ -555,9 +555,7 @@ async def test_title_shows_spinner_while_initial_load_runs(
         # (silent) load is observable.
         original = UnmergedListScreen._collect_entries
 
-        def slow_collect(
-            self: UnmergedListScreen, task_ids: list[str]
-        ) -> list:
+        def slow_collect(self: UnmergedListScreen, task_ids: list[str]) -> list:
             time.sleep(0.4)
             return original(self, task_ids)
 

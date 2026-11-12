@@ -33,6 +33,7 @@ from drcode.providers import (
     Provider,
     UserModelsConfig,
     UserModelsStore,
+    resolve_available,
     set_project_custom_model,
 )
 from drcode.tui.app import DrCodeApp
@@ -259,3 +260,92 @@ async def test_manual_change_through_custom_model_dialog(
     assert len(changed) == 1
     assert changed[0].startswith("Model changed: local-swap/m-one → m-two")
     assert "next run" in changed[0]
+
+
+async def test_mid_run_model_change_keeps_serving_window_gates(
+    project_root: Path,
+) -> None:
+    """Incident #cca920d5: a run serving on model A (window 1000) keeps A
+    after the user switches the coding model to B (window 100000) mid-run.
+
+    The run-start pin must survive `invalidate_resolved_configs()` for a
+    role with a live run: the compaction gates measure through
+    `resolved_config`, and a mid-run pin drop let them resolve B's huge
+    window — both gates went silent at 124–129k of a 131k window and the
+    next request died deterministically on A's context-overflow 400.
+    """
+    UserModelsStore().save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="local-swap",
+                    base_url="http://localhost:8080/v1",
+                    models=[
+                        ModelEntry(id="m-one", max_context_tokens=1000),
+                        ModelEntry(id="m-big", max_context_tokens=100_000),
+                    ],
+                )
+            ],
+            defaults={
+                AgentRole.CODING: [ModelRef(provider="local-swap", model="m-one")]
+            },
+        )
+    )
+    app = DrCodeApp(project_root)
+    task = _bare_active_task(app, "docs")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # The run started on m-one: the factual run-start resolution is
+        # pinned (the custom project slot path — no probing, like
+        # _run_agent_worker does).
+        set_project_custom_model(
+            app.project_root,
+            AgentRole.CODING,
+            CustomModelEntry(
+                model="m-one",
+                base_url="http://localhost:8080/v1",
+                max_context_tokens=1000,
+            ),
+        )
+        app.invalidate_resolved_configs()
+        resolution = await resolve_available(app.config, AgentRole.CODING)
+        app._pin_resolution(AgentRole.CODING, resolution)
+        app._agent_runs[task.id] = 1
+        assert app.resolved_config(AgentRole.CODING).max_context_tokens == 1000
+
+        # Fill 90% of A's window: the threshold gate fires...
+        assert app._fill_over_threshold(900, [], AgentRole.CODING) == 900
+        # ...and the hard-limit gate fires past 97%.
+        assert app._fill_over_hard_limit(980, [], AgentRole.CODING) == 980
+
+        # Mid-run the user switches the coding model to the big one (the
+        # same write the Settings pickers do).
+        set_project_custom_model(
+            app.project_root,
+            AgentRole.CODING,
+            CustomModelEntry(
+                model="m-big",
+                base_url="http://localhost:8080/v1",
+                max_context_tokens=100_000,
+            ),
+        )
+        app.invalidate_resolved_configs()
+        # The pin SURVIVES for the live role: the gates keep measuring
+        # against the serving model's window and still fire.
+        assert app.resolved_config(AgentRole.CODING).max_context_tokens == 1000
+        assert app._fill_over_threshold(900, [], AgentRole.CODING) == 900
+        assert app._fill_over_hard_limit(980, [], AgentRole.CODING) == 980
+
+        # The change is still announced — naming the model the NEXT run
+        # picks up (resolved fresh, bypassing the surviving pin).
+        app._emit_manual_model_change_events(app._snapshot_model_keys())
+        changed = [t for t in event_texts(task) if t.startswith("Model changed:")]
+        assert len(changed) == 1
+        assert changed[0].startswith("Model changed: m-one → m-big")
+
+        # Run over: with no live run of the role left, the stale pin is
+        # dropped — between runs the resolution reflects the current
+        # configuration again.
+        app._agent_runs.pop(task.id)
+        app._drop_run_pin_if_idle(AgentRole.CODING)
+        assert app.resolved_config(AgentRole.CODING).max_context_tokens == 100_000

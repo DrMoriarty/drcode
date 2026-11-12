@@ -118,15 +118,63 @@ class CoreState:
         theoretical one. Re-pinned at every run start — a provider that
         came back (or went down) is picked up on the next start, so the
         pin never goes stale between runs. Cleared together with the
-        caches on any config/catalog change."""
+        caches on any config/catalog change — EXCEPT for a role with a
+        live agent run, whose pin survives until the run ends (see
+        `invalidate_resolved_configs`)."""
         self._pinned_resolutions[role] = (resolution.config, resolution.model_key)
+
+    def _live_pin_roles(self) -> set[AgentRole]:
+        """Roles currently served by a live dev-agent run: the roles of
+        the tasks registered in `_agent_runs`. A run keeps the model it
+        was built with (the agent is constructed at run start), so its
+        pin must outlive a config invalidation — the run's gauges
+        (compaction/eviction gates, fill status) measure through
+        `resolved_config` and would otherwise silently switch to the
+        newly selected model mid-run (incident #cca920d5)."""
+        runs = getattr(self, "_agent_runs", None)
+        if not runs:
+            return set()
+        roles: set[AgentRole] = set()
+        for task_id in runs:
+            try:
+                task = self.manager.get(task_id)
+            except (AttributeError, KeyError):
+                continue
+            roles.add(self._task_role(task))
+        return roles
+
+    def _drop_run_pin_if_idle(self, role: AgentRole) -> None:
+        """Drop the role's run-start pin once no live dev run of the
+        role remains (called from the run worker's teardown): between
+        runs the resolution must again reflect the CURRENT configuration
+        — the pin is re-created at the next run start anyway. Another
+        live run of the same role (parallel slots) keeps the pin."""
+        if not self._pinned_resolutions.get(role):
+            return
+        if role in self._live_pin_roles():
+            return
+        self._pinned_resolutions.pop(role, None)
 
     def invalidate_resolved_configs(self) -> None:
         """Drop the cached per-role resolutions (after any change to the
-        flat config, the project model slots or the user catalog)."""
+        flat config, the project model slots or the user catalog).
+
+        The run-start pin of a role with a LIVE agent run survives: the
+        run keeps serving on the model it was built with, so dropping
+        its pin mid-run would let the run's gauges resolve the NEW
+        model and silently skip the old model's compaction hard limit
+        until the next request is deterministically rejected (incident
+        #cca920d5). The surviving pin is dropped when the run ends
+        (`_drop_run_pin_if_idle`)."""
         self._resolved_configs.clear()
         self._resolved_model_keys.clear()
-        self._pinned_resolutions.clear()
+        live = self._live_pin_roles()
+        if not live:
+            self._pinned_resolutions.clear()
+            return
+        for role in list(self._pinned_resolutions):
+            if role not in live:
+                del self._pinned_resolutions[role]
 
     # -- per-task agent-model event bookkeeping ------------------------------
     # The effective model key each task's agent last STARTED a run on
@@ -181,12 +229,15 @@ class CoreState:
         keeps the model it was built with — the event says the change
         applies from the next run. `before` is the snapshot taken before
         `invalidate_resolved_configs()`; the "after" half is resolved
-        fresh here. Only roles whose effective key actually changed and
-        only tasks with a LIVE agent run (the dev agent, `_agent_runs`)
-        of that role get an event."""
+        fresh here — deliberately BYPASSING the run-start pin, which
+        survives the invalidation for roles with a live run (the event
+        must name the model the NEXT run will pick up). Only roles
+        whose effective key actually changed and only tasks with a LIVE
+        agent run (the dev agent, `_agent_runs`) of that role get an
+        event."""
         for role in AgentRole:
             old = before.get(role) or ""
-            new = self.resolved_model_key(role)
+            new = resolve_model_key(self.config, role)
             if not old or not new or old == new:
                 continue
             for task in self.manager.active_tasks():

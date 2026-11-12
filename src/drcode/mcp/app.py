@@ -48,7 +48,7 @@ SERVER_NAME = "drcode"
 HEALTH_PAYLOAD: dict[str, bool] = {"ok": True}
 
 
-def build_server(*, instructions: str | None = None):
+def build_server(*, instructions: str | None = None, bus=None):
     """Build the SDK server instance (no tools yet — infrastructure only).
 
     Kept as a function rather than a module-level singleton: the SDK
@@ -56,6 +56,12 @@ def build_server(*, instructions: str | None = None):
     lifespan, so one process could legitimately host several (the tests
     do). `version` comes from the single source of truth so a client can
     tell builds apart.
+
+    `bus` is the `SubscriptionBus` the server's `subscriptions/listen`
+    fan-out runs on (§5). The default `None` lets the SDK build its own
+    in-memory bus — fine for a server nobody publishes to; the read
+    surface (`wiring.ReadSurface`) passes its own so the event bridge
+    holds the very instance the notifications go out on.
     """
     from mcp.server.mcpserver import MCPServer
 
@@ -67,6 +73,7 @@ def build_server(*, instructions: str | None = None):
         # would spam the TUI's stderr for something the service events
         # already report in human terms.
         log_level="WARNING",
+        subscriptions=bus,
     )
 
 

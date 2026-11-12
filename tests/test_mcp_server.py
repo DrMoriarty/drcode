@@ -22,6 +22,7 @@ fixed port (every server here binds `127.0.0.1:0`).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -29,6 +30,8 @@ import subprocess
 import sys
 import threading
 from collections.abc import Iterator
+from contextlib import asynccontextmanager
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -835,6 +838,43 @@ async def test_smoke_client_is_refused_without_the_token(
         service.stop()
 
 
+async def test_read_surface_answers_over_the_real_socket(
+    project_root: Path, events: list[str], read_surface, manager
+) -> None:
+    """§8 smoke for the read block: the REAL socket, the read tools.
+
+    The service factory builds the very surface the TUI would build; the
+    client reads `.drcode/mcp.json` for the token (like a real agent) and
+    calls `list_tasks` against live manager state.
+    """
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+
+    service = _service(project_root, events, lambda: read_surface.server)
+    try:
+        assert service.start() is True
+        # The loop property lives exactly as long as the server thread.
+        assert service.loop is not None
+        manager.create("Socket task", "over the real socket")
+        published = load_endpoint(project_root)
+        assert published is not None
+        headers = {"Authorization": f"Bearer {published.token}"}
+        async with httpx2.AsyncClient(headers=headers) as http_client:
+            transport = streamable_http_client(published.url, http_client=http_client)
+            async with Client(transport) as client:
+                tools = await client.list_tools()
+                assert "list_tasks" in [tool.name for tool in tools.tools]
+                result = await client.call_tool("list_tasks", {})
+        assert result.is_error is False
+        assert "Socket task" in result.content[0].text  # type: ignore[union-attr]
+        assert f"#{manager.all_tasks()[0].id}" in result.content[0].text  # type: ignore[union-attr]
+    finally:
+        service.stop()
+    assert service.loop is None
+    assert not endpoint_path(project_root).exists()
+
+
 # -- UI surface (§6): the state strings, without mounting a whole TUI --------
 
 
@@ -925,3 +965,521 @@ def test_the_token_is_never_rendered() -> None:
         for text in (_status_text(stub), _header_text(stub)):
             assert "token" not in text.lower()
             assert TOKEN not in text
+
+
+# -- the read surface (§5/§7): tools, resources, the event bridge -------------
+#
+# Everything below runs IN-PROCESS: the full guarded ASGI stack is driven
+# through an ASGI transport (no socket), with the SDK's own Streamable HTTP
+# client on top — the same client a real external agent would use. The
+# TaskManager is the conftest `manager` over a tmp project, so every tool
+# contract is checked against live state, not fixtures of strings.
+
+
+@pytest.fixture
+def read_surface(manager, tmp_path: Path):
+    """A ReadSurface over the tmp manager (usage store on a tmp file)."""
+    from drcode.mcp.wiring import ReadSurface
+    from drcode.usage_store import UsageStore
+
+    return ReadSurface(manager, usage_store=UsageStore(path=tmp_path / "usage.json"))
+
+
+@asynccontextmanager
+async def mcp_client(surface, *, headers=None):
+    """A connected SDK client over the in-process ASGI transport.
+
+    `surface` is a `wiring.ReadSurface`; `.asgi()` builds a FRESH guarded
+    app per session because the SDK's session manager is single-use. The
+    app's lifespan (the session manager) runs around the block, an
+    `httpx2.ASGITransport` answers the HTTP half and
+    `streamable_http_client` negotiates the MCP session — no socket
+    anywhere, exactly the §8 testing prescription.
+    """
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+
+    app = surface.asgi(TOKEN)
+    async with app.router.lifespan_context(app):
+        transport = httpx2.ASGITransport(app=app)
+        async with (
+            httpx2.AsyncClient(
+                transport=transport, base_url=BASE_URL, headers=headers or _auth()
+            ) as http,
+            Client(
+                streamable_http_client(BASE_URL + MCP_PATH, http_client=http)
+            ) as client,
+        ):
+            yield client
+
+
+async def call_text(client, name: str, arguments: dict | None = None) -> str:
+    """Call one tool, assert a non-error answer, return the text content."""
+    result = await client.call_tool(name, arguments or {})
+    assert result.is_error is False, getattr(result.content[0], "text", "")
+    return result.content[0].text  # type: ignore[union-attr]
+
+
+async def call_text_error(client, name: str, arguments: dict) -> str:
+    """Call one tool, assert the §4 isError contract, return the message."""
+    result = await client.call_tool(name, arguments)
+    assert result.is_error is True
+    return result.content[0].text  # type: ignore[union-attr]
+
+
+# -- the tool list ------------------------------------------------------------
+
+
+async def test_the_read_tools_are_listed(read_surface) -> None:
+    """The server advertises exactly the nine read tools of §7, in order."""
+    from drcode.mcp.tools import READ_TOOLS
+
+    async with mcp_client(read_surface) as client:
+        tools = await client.list_tools()
+        assert [tool.name for tool in tools.tools] == list(READ_TOOLS)
+
+
+# -- list_tasks ----------------------------------------------------------------
+
+
+async def test_list_tasks_rows_and_filters(read_surface, manager) -> None:
+    """Compact rows: `#id [status/kind] title — markers`, filters applied."""
+    plain = manager.create("Plain feature", "do the thing")
+    held = manager.create("Held bug", "fix the crash", kind="bug", hold=True)
+    async with mcp_client(read_surface) as client:
+        text = await call_text(client, "list_tasks")
+    lines = text.splitlines()
+    assert lines[0].startswith("2 task(s)")
+    assert f"#{plain.id} [queued/feature] Plain feature" in lines[1]
+    assert f"#{held.id} [hold/bug] Held bug" in lines[2]
+    # The held task carries the documented markers: hold + one queued input.
+    assert "hold" in lines[2]
+    assert "input=1" in lines[2]
+    # The plain task's only marker is its one queued input message.
+    assert lines[1].endswith("— input=1")
+    assert "hold" not in lines[1]
+    # A status filter narrows to the matching tasks only.
+    async with mcp_client(read_surface) as client:
+        held_only = await call_text(
+            client, "list_tasks", {"status": "hold", "kind": "bug"}
+        )
+    assert held_only.startswith("1 task(s) (status=hold, kind=bug)")
+    assert held.id in held_only and plain.id not in held_only
+
+
+async def test_list_tasks_limit_and_unknown_filter(read_surface, manager) -> None:
+    manager.create("First", "one")
+    manager.create("Second", "two")
+    async with mcp_client(read_surface) as client:
+        capped = await call_text(client, "list_tasks", {"limit": 1})
+        assert capped.startswith("2 task(s), showing the first 1")
+        assert "...and 1 more" in capped
+        message = await call_text_error(client, "list_tasks", {"status": "banana"})
+        assert "unknown status" in message and "banana" in message
+
+
+# -- get_task ------------------------------------------------------------------
+
+
+async def test_get_task_full_metadata_contract(read_surface, manager) -> None:
+    """JSON body: metadata + skeleton + events + clarification, NO transcript."""
+    from drcode.models import Clarification
+
+    task = manager.create("Detailed", "the whole prompt")
+    task.clarification = Clarification.single("Which variant?", options=["A", "B"])
+    manager.storage.save(task)
+    async with mcp_client(read_surface) as client:
+        raw = await call_text(client, "get_task", {"task_id": task.id})
+    payload = json.loads(raw)
+    assert payload["id"] == task.id
+    assert payload["title"] == "Detailed"
+    assert payload["status"] == "queued"
+    assert payload["kind"] == "feature"
+    assert payload["hold"] is False
+    assert payload["verification"] is None
+    # The pending input is structural: count + the verbatim text.
+    assert payload["pending_input"]["count"] == 1
+    assert payload["pending_input"]["items"][0]["text"] == "the whole prompt"
+    # The clarification package comes through structurally.
+    assert payload["clarification"]["questions"][0]["question"] == "Which variant?"
+    assert payload["clarification"]["questions"][0]["options"] == ["A", "B"]
+    # Cheap fields every consumer needs.
+    assert payload["blocking_dependencies"] == []
+    assert payload["events"]["total"] == 0
+    assert payload["skeleton"]["prompts"] == []
+    # THE hard rule of the layer: no transcript field is ever exposed.
+    assert "messages" not in payload and "tester_messages" not in payload
+
+
+async def test_get_task_unknown_id_is_an_error_with_known_ids(
+    read_surface, manager
+) -> None:
+    task = manager.create("Known", "known")
+    async with mcp_client(read_surface) as client:
+        message = await call_text_error(client, "get_task", {"task_id": "nope"})
+    assert "unknown task id" in message and "nope" in message
+    assert f"#{task.id}" in message  # the hint names real ids
+
+
+# -- search_tasks --------------------------------------------------------------
+
+
+async def test_search_tasks_finds_the_archive(read_surface, manager) -> None:
+    needle = manager.create("Needle task", "the grawlixquuzz story")
+    manager.create("Other task", "something else entirely")
+    async with mcp_client(read_surface) as client:
+        text = await call_text(client, "search_tasks", {"keywords": "grawlixquuzz"})
+    assert f"#{needle.id}" in text
+    assert "Other task" not in text
+
+
+async def test_search_tasks_rejects_empty_keywords(read_surface) -> None:
+    async with mcp_client(read_surface) as client:
+        message = await call_text_error(client, "search_tasks", {"keywords": "  , "})
+    assert "at least one non-empty word" in message
+
+
+# -- get_queue -----------------------------------------------------------------
+
+
+async def test_get_queue_order_and_blockers(read_surface, manager) -> None:
+    first = manager.create("First", "the dependency")
+    second = manager.create("Second", "depends on first", depends_on=[first.id])
+    async with mcp_client(read_surface) as client:
+        text = await call_text(client, "get_queue")
+    lines = text.splitlines()
+    assert lines[0].startswith("queue: 2 task(s)")
+    # The dependency sink rule: the blocker is promoted first.
+    assert lines[1].startswith(f"1. #{first.id}")
+    assert lines[2].startswith(f"2. #{second.id}")
+    assert f"blocked by #{first.id}" in lines[2]
+    assert "blocked by" not in lines[1]
+
+
+# -- goals ---------------------------------------------------------------------
+
+
+async def test_goals_list_and_get_contract(read_surface, manager) -> None:
+    goal = manager.goals.create("The Roadmap", description="where this goes")
+    task = manager.create("Linked task", "works on the roadmap", goal_id=goal.id)
+    async with mcp_client(read_surface) as client:
+        listing = await call_text(client, "list_goals")
+        raw = await call_text(client, "get_goal", {"goal_id": goal.id})
+    assert f"#{goal.id}" in listing
+    assert "0/1 tasks" in listing  # live progress: the linked task is not done
+    payload = json.loads(raw)
+    assert payload["id"] == goal.id
+    assert payload["title"] == "The Roadmap"
+    assert payload["description"] == "where this goes"
+    assert payload["progress"] == {"done": 0, "total": 1}
+    assert payload["complete"] is False
+    assert [entry["id"] for entry in payload["tasks"]] == [task.id]
+    async with mcp_client(read_surface) as client:
+        message = await call_text_error(client, "get_goal", {"goal_id": "missing"})
+    assert "unknown goal id" in message
+
+
+# -- stats / usage -------------------------------------------------------------
+
+
+async def test_get_stats_contract(read_surface, manager) -> None:
+    manager.create("Counted", "the created counter moves")
+    async with mcp_client(read_surface) as client:
+        text = await call_text(client, "get_stats")
+    lines = text.splitlines()
+    # The fixed header names every column; the day rows and the total follow.
+    assert lines[0].split() == [
+        "day",
+        "created",
+        "completed",
+        "cancelled",
+        "failed",
+        "dev_avg",
+        "testing_avg",
+        "resolver_avg",
+    ]
+    assert "total (last 14 days)" in text
+
+
+async def test_get_usage_contract(read_surface, manager) -> None:
+    # One recorded day (today, so any window that includes "now" finds it)
+    # straight into the injected store's file.
+    store = read_surface.view._usage_store
+    today = date.today().isoformat()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "days": {
+                    today: {
+                        "coding/test-model": {
+                            "requests": 2,
+                            "input": 100,
+                            "output": 40,
+                            "cache_read": 7,
+                            "cache_write": 0,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    async with mcp_client(read_surface) as client:
+        text = await call_text(client, "get_usage", {"days": 30})
+    assert f"{today} coding/test-model requests=2 input=100 output=40" in text
+    assert "total (last 30 days): requests=2 input=100 output=40" in text
+
+
+async def test_get_usage_empty_window(read_surface, manager) -> None:
+    async with mcp_client(read_surface) as client:
+        empty = await call_text(client, "get_usage", {"days": 3})
+    assert "no model calls recorded in the last 3 day(s)" in empty
+
+
+# -- check_file_overlaps -------------------------------------------------------
+
+
+async def test_check_file_overlaps_contract(read_surface, manager) -> None:
+    manager.create("Alpha work", "implement src/alpha.py properly")
+    async with mcp_client(read_surface) as client:
+        text = await call_text(
+            client, "check_file_overlaps", {"text": "refactor src/alpha.py"}
+        )
+        clean = await call_text(
+            client, "check_file_overlaps", {"text": "touch src/unrelated.py"}
+        )
+        no_paths = await call_text(
+            client, "check_file_overlaps", {"text": "no paths here at all"}
+        )
+    assert f"#{manager.all_tasks()[0].id}" in text
+    assert "src/alpha.py" in text
+    assert "no unfinished task mentions" in clean
+    assert "No path-like tokens" in no_paths
+    # A declared dependency is excluded from the report — it IS the mitigation.
+    async with mcp_client(read_surface) as client:
+        declared = await call_text(
+            client,
+            "check_file_overlaps",
+            {
+                "text": "refactor src/alpha.py",
+                "depends_on": [manager.all_tasks()[0].id],
+            },
+        )
+    assert "no unfinished task mentions" in declared
+
+
+# -- resources: same bodies as the tools (§7) ----------------------------------
+
+
+async def test_resources_are_listed(read_surface) -> None:
+    from drcode.mcp.resources import QUEUE_URI, STATS_URI, TASK_URI_TEMPLATE
+
+    async with mcp_client(read_surface) as client:
+        listed = await client.list_resources()
+        templates = await client.list_resource_templates()
+    uris = {str(resource.uri) for resource in listed.resources}
+    assert QUEUE_URI in uris and STATS_URI in uris
+    assert any(
+        template.uri_template == TASK_URI_TEMPLATE
+        for template in templates.resource_templates
+    )
+
+
+async def test_resource_bodies_equal_the_tool_output(read_surface, manager) -> None:
+    from mcp.types import TextResourceContents
+
+    first = manager.create("First", "the dependency")
+    manager.create("Second", "depends on first", depends_on=[first.id])
+    from drcode.mcp.resources import QUEUE_URI, task_uri
+
+    async with mcp_client(read_surface) as client:
+        resource = await client.read_resource(QUEUE_URI)
+        tool_text = await call_text(client, "get_queue")
+        task_resource = await client.read_resource(task_uri(first.id))
+        task_tool_text = await call_text(client, "get_task", {"task_id": first.id})
+    # The subscription story and the polling story CANNOT drift: the
+    # resource body is byte-identical with the matching tool answer. The
+    # contents union (text|blob) narrows with isinstance — every resource
+    # here is registered with a str return, so TextResourceContents it is.
+    queue_body = resource.contents[0]
+    task_body = task_resource.contents[0]
+    assert isinstance(queue_body, TextResourceContents)
+    assert isinstance(task_body, TextResourceContents)
+    assert queue_body.text == tool_text
+    assert task_body.text == task_tool_text
+    assert json.loads(task_body.text)["id"] == first.id
+
+
+async def test_unknown_task_resource_is_not_found(read_surface) -> None:
+    from drcode.mcp.resources import task_uri
+
+    async with mcp_client(read_surface) as client:
+        with pytest.raises(Exception, match="unknown task id"):
+            await client.read_resource(task_uri("nope"))
+
+
+# -- the event bridge (§5): routing + coalescing --------------------------------
+#
+# NOTE: the listen stream is a NEVER-ENDING SSE response, which the in-process
+# `httpx2.ASGITransport` cannot stream (it waits for the response body to
+# end) — so the subscription tests run the SDK's DIRECT in-memory client
+# (`Client(server, mode="2026-07-28")`, no HTTP at all). The server-side path
+# under test — bus → listen handler → typed events — is identical; the HTTP
+# surface itself is covered by the transport tests above and the #22b76acf
+# suite (a real socket smoke test included).
+
+
+@asynccontextmanager
+async def direct_client(surface):
+    """A connected SDK client speaking to the server in-process."""
+    from mcp import Client
+
+    async with Client(surface.server, mode="2026-07-28") as client:
+        yield client
+
+
+async def drain(sub, count: int, *, timeout: float = 5.0):
+    """Collect `count` resource-updated events from a listen stream."""
+    events = []
+    async with asyncio.timeout(timeout):
+        async for event in sub:
+            events.append(event)
+            if len(events) >= count:
+                break
+    return events
+
+
+async def test_bridge_routes_and_coalesces(read_surface, manager) -> None:
+    """Burst on one task → ONE notification per URI; only affected URIs."""
+    from drcode.mcp.resources import QUEUE_URI, goal_uri, task_uri
+
+    goal = manager.goals.create("Bridge goal")
+    watched = manager.create("Watched", "watched", goal_id=goal.id)
+    other = manager.create("Other", "other")
+    loop = asyncio.get_running_loop()
+    read_surface.start_notifications(loop, window=0.05)
+
+    async with (
+        direct_client(read_surface) as client,
+        client.listen(
+            resource_subscriptions=[
+                task_uri(watched.id),
+                task_uri(other.id),
+                QUEUE_URI,
+                goal_uri(goal.id),
+            ]
+        ) as sub,
+    ):
+        # Burst: three status transitions of the SAME task inside the
+        # coalescing window — one task notification, one queue.
+        manager.set_hold(watched.id, on=True)
+        manager.set_hold(watched.id, on=False)
+        manager.set_hold(watched.id, on=True)
+        # The other task's change must NOT touch the watched task's URI
+        # or the goal's — only its own URI (the queue joins the same batch).
+        manager.set_hold(other.id, on=True)
+        events = await drain(sub, 4)
+    uris = [str(event.uri) for event in events]
+    from collections import Counter
+
+    counts = Counter(uris)
+    # Coalesced burst: exactly ONE per distinct URI, despite 4 transitions.
+    assert counts == Counter(
+        {
+            task_uri(watched.id): 1,
+            QUEUE_URI: 1,
+            task_uri(other.id): 1,
+            goal_uri(goal.id): 1,
+        }
+    )
+
+
+async def test_bridge_does_not_wake_unaffected_subscribers(
+    read_surface, manager
+) -> None:
+    """A subscriber of ONE task's URI hears nothing about other tasks."""
+    from drcode.mcp.resources import task_uri
+
+    watched = manager.create("Watched", "watched")
+    bystander = manager.create("Bystander", "bystander")
+    loop = asyncio.get_running_loop()
+    read_surface.start_notifications(loop, window=0.05)
+
+    async with (
+        direct_client(read_surface) as client,
+        client.listen(resource_subscriptions=[task_uri(watched.id)]) as sub,
+    ):
+        # The bystander's transitions must not produce ANY event.
+        manager.set_hold(bystander.id, on=True)
+        manager.set_hold(bystander.id, on=False)
+        # Long enough to cover the coalescing window plus slack.
+        await asyncio.sleep(0.3)
+        got_during_noise = await drain_without_events(sub)
+        assert got_during_noise is True  # nothing arrived
+        # Now the watched task changes: exactly one event arrives.
+        manager.set_hold(watched.id, on=True)
+        events = await drain(sub, 1)
+    assert [str(event.uri) for event in events] == [task_uri(watched.id)]
+
+
+async def drain_without_events(sub, *, quiet: float = 0.1) -> bool:
+    """True when NO event arrives within `quiet` seconds (negative test)."""
+    try:
+        async with asyncio.timeout(quiet):
+            async for _event in sub:
+                return False
+    except TimeoutError:
+        return True
+    return True  # pragma: no cover - the iterator ended without events
+
+
+async def test_bridge_completing_a_task_notifies_stats(read_surface, manager) -> None:
+    """§5 routing: the transition INTO COMPLETED adds `drcode://stats`."""
+    from drcode.mcp.resources import QUEUE_URI, STATS_URI, task_uri
+
+    task = manager.create("Finishing", "finishing", kind="research")
+    loop = asyncio.get_running_loop()
+    read_surface.start_notifications(loop, window=0.05)
+
+    async with (
+        direct_client(read_surface) as client,
+        client.listen(
+            resource_subscriptions=[task_uri(task.id), STATS_URI, QUEUE_URI]
+        ) as sub,
+    ):
+        manager.mark_done(task.id)  # research → COMPLETED directly
+        events = await drain(sub, 3)
+    uris = {str(event.uri) for event in events}
+    assert uris == {task_uri(task.id), STATS_URI, QUEUE_URI}
+
+
+async def test_bridge_is_detached_on_stop(read_surface, manager) -> None:
+    """stop_notifications removes the listeners: the manager stops feeding."""
+    task = manager.create("Detached", "detached")
+    loop = asyncio.new_event_loop()
+    try:
+        read_surface.start_notifications(loop, window=0.01)
+        assert read_surface.bridge is not None
+        read_surface.stop_notifications()
+        assert read_surface.bridge is None and read_surface.router is None
+        # A transition AFTER the detach reaches nothing and must not raise.
+        manager.set_hold(task.id, on=True)
+    finally:
+        loop.close()
+
+
+def test_the_router_never_raises_on_a_closed_loop(manager) -> None:
+    """Scheduling onto a dead loop is logged, never raised (§5 contract)."""
+    from drcode.mcp.bridge import EventBridge, LoopPublisher, NotificationRouter
+
+    loop = asyncio.new_event_loop()
+    router = NotificationRouter(loop, LoopPublisher(None), window=0.01)
+    bridge = EventBridge(router)
+    loop.close()
+    # The listeners are sync and must not raise even on a dead loop.
+    bridge._on_status(manager.create("Zombie", "zombie"), None, None, "user")
+    bridge._on_removal("ghost")
+    router.close()

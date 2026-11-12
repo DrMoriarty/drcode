@@ -40,6 +40,7 @@ precondition for the TUI to run.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import threading
@@ -108,6 +109,12 @@ class McpService:
         self._thread: threading.Thread | None = None
         self._socket: socket.socket | None = None
         self._endpoint: McpEndpoint | None = None
+        # The event loop of the server thread (set once the thread runs its
+        # own loop instead of letting asyncio.run create a hidden one). The
+        # event bridge (§5) publishes on it, so the TUI needs it after
+        # start() — by then the loop is alive (the healthz wait guarantees
+        # the request handlers are already serving on it).
+        self._loop: asyncio.AbstractEventLoop | None = None
         # pid of another live instance serving this project, when we were
         # refused (the TUI shows it and explains why nothing is exposed).
         self._foreign_pid: int | None = None
@@ -137,6 +144,19 @@ class McpService:
     def foreign_pid(self) -> int | None:
         """The pid of the other instance that owns the endpoint, if any."""
         return self._foreign_pid
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        """The server thread's event loop while a server of ours runs.
+
+        The event bridge's notifications must be published ON the loop the
+        SDK's listen streams live on — this is it. None before the first
+        start and after the shutdown, so callers can treat it as "the
+        server's loop, if one is serving".
+        """
+        if not self.running:
+            return None
+        return self._loop
 
     @property
     def endpoint_file(self) -> str:
@@ -185,8 +205,8 @@ class McpService:
         port = sock.getsockname()[1]
         server = self._serve(app, sock)
         thread = threading.Thread(
-            target=server.run,
-            kwargs={"sockets": [sock]},
+            target=self._serve_loop,
+            args=(server, sock),
             name="drcode-mcp",
             daemon=True,
         )
@@ -314,6 +334,29 @@ class McpService:
             timeout_graceful_shutdown=2,
         )
         return uvicorn.Server(config)
+
+    def _serve_loop(self, server, sock: socket.socket) -> None:
+        """The server thread's body: OWN the loop instead of `Server.run`'s
+        hidden `asyncio.run`.
+
+        `Server.run()` would create the loop invisibly and close it without
+        telling anyone; the event bridge needs the very loop object to
+        publish on (`loop`), so the thread runs the same
+        `loop.run_until_complete(server.serve(...))` sequence explicitly
+        and records the loop while it lives.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            loop.run_until_complete(server.serve(sockets=[sock]))
+        finally:
+            self._loop = None
+            asyncio.set_event_loop(None)
+            try:
+                loop.close()
+            except RuntimeError:  # pragma: no cover - defensive
+                pass
 
     def _cleanup_failed_start(self) -> None:
         """Undo whatever a half-done start did (never raises)."""

@@ -548,8 +548,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # one-server-per-project rule; the TUI only reconciles it via
         # _sync_mcp_server (startup, the Settings toggle, teardown) and
         # renders its state in the statusbar/header. Every lifecycle step
-        # reports through the event sink wired on mount.
-        self.mcp_service = McpService(project_root)
+        # reports through the event sink wired on mount. The server
+        # factory builds the read surface (§5/§7: tools + resources +
+        # event bridge) fresh per start — the surface is stored on
+        # `_mcp_surface` so the bridge can be attached to the manager
+        # once the server loop is alive, and detached on stop.
+        self._mcp_surface = None
+        self.mcp_service = McpService(
+            project_root, server_factory=self._build_mcp_server
+        )
         # The "queue empty" / "pipeline blocked" notifications are sent only
         # on state transitions; the very first pipeline evaluation after
         # startup only primes the state (a cold start on an empty queue
@@ -1333,6 +1340,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             )
         self.refresh_status()
 
+    def _build_mcp_server(self):
+        """The `McpService` server factory: a fresh read surface per start.
+
+        An SDK server is per-instance state (tool manager, session
+        manager), so every start builds a new one over the live manager.
+        The surface is kept on `self._mcp_surface` for the bridge
+        attach/detach in `_sync_mcp_server` / teardown.
+        """
+        from drcode.mcp.wiring import ReadSurface
+
+        surface = ReadSurface(self.manager)
+        self._mcp_surface = surface
+        return surface.server
+
     def _sync_mcp_server(self) -> None:
         """Reconcile the MCP server with the `mcp_enabled` setting.
 
@@ -1343,14 +1364,34 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         anything; the refusal path (another instance already serves this
         project, §3) is reported through the event sink and leaves
         `mcp_service.running` False, which the UI renders honestly.
+
+        On top of the service lifecycle this attaches/detaches the event
+        bridge (§5): listening while the server runs, detached the moment
+        it stops — a dead server thread must keep receiving no manager
+        events.
         """
         self.mcp_service.set_event_sink(self._mcp_event)
+        surface = self._mcp_surface
+        if surface is not None and not self.settings.mcp_enabled:
+            # Detach BEFORE the thread dies (the toggle-off path; the
+            # startup path has no surface yet and the no-op is free).
+            surface.stop_notifications()
         try:
-            self.mcp_service.apply(self.settings.mcp_enabled)
+            running = self.mcp_service.apply(self.settings.mcp_enabled)
         finally:
             # The statusbar / header indicator follows the REAL state, not
             # the setting: a refused instance is "off" with a reason.
             self.refresh_status()
+        if running:
+            surface = self._mcp_surface
+            loop = self.mcp_service.loop
+            if surface is not None and loop is not None:
+                try:
+                    surface.start_notifications(loop)
+                except Exception as e:  # noqa: BLE001 - notifications are an optimization
+                    self._mcp_event(
+                        f"MCP: event bridge not attached: {type(e).__name__}: {e}"
+                    )
 
     def on_unmount(self) -> None:
         # Clear the tab title so "DrCode — <project>" doesn't stick around
@@ -1365,8 +1406,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # (§6): should_exit + a bounded join, so the listening socket is
         # released before the process exits. `stop()` is idempotent, never
         # raises, and leaves a descriptor owned by another pid alone. The
-        # event sink is detached first — the chat is going away, and the
-        # shutdown line would only race the teardown.
+        # event bridge is detached and the sink cleared first — the chat
+        # is going away, and the shutdown line would only race the
+        # teardown.
+        surface = self._mcp_surface
+        if surface is not None:
+            surface.stop_notifications()
         self.mcp_service.set_event_sink(None)
         self.mcp_service.stop()
 

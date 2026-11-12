@@ -61,8 +61,30 @@ class TaskStatusLayer(DrCodeState):
         statusbar.update(
             f" active: {who}   queue: {queue_len}   testing: {testing_len}   "
             f"agent: {state}   tester: {tester}{esc}   model: {model} "
+            f"{self._mcp_status_text()}"
         )
         self.refresh_task_status()
+
+    def _mcp_status_text(self) -> str:
+        """The statusbar's MCP field (design doc §6: "MCP :51234").
+
+        Shows the REAL server state, never the setting: `off` with the
+        setting disabled, `:PORT` while our server runs, `busy` when
+        another instance serves this project (§3 — our own server is
+        deliberately not started then), and `error` when the setting is on
+        but nothing came up. The TOKEN is never rendered — the endpoint
+        file's path is the only detail the UI offers (§6).
+        """
+        service = getattr(self, "mcp_service", None)
+        if service is None:  # pragma: no cover - pre-init render
+            return "mcp: off "
+        if service.running:
+            return f"mcp: :{service.port} "
+        if not self.settings.mcp_enabled:
+            return "mcp: off "
+        if service.foreign_pid is not None:
+            return "mcp: busy "
+        return "mcp: error "
 
     def refresh_task_status(self) -> None:
         # The footer mirrors the state check_action() gates on (viewed task,

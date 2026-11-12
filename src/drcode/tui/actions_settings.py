@@ -534,6 +534,26 @@ class SettingsLayer(DrCodeState):
             timeout=4,
         )
 
+    def action_toggle_mcp_enabled(self) -> None:
+        """Settings command: whether the embedded MCP server runs
+        (docs/mcp-server-design.md §2).
+
+        Hot switch: enabling starts the server right away (ephemeral
+        loopback port, endpoint published in `.drcode/mcp.json`),
+        disabling shuts it down and removes our descriptor. Both report
+        through `_sync_mcp_server`, which also owns the "already served
+        by another instance" refusal — the setting is persisted either
+        way (the user's choice is never silently rewritten)."""
+        self.settings.mcp_enabled = not self.settings.mcp_enabled
+        self.settings_store.save(self.settings)
+        self._sync_mcp_server()
+        state = "on" if self.settings.mcp_enabled else "off"
+        self.notify(
+            f"MCP server: {state}",
+            title="Project settings",
+            timeout=4,
+        )
+
     def _task_isolation_label(self) -> str:
         """The Settings-entry label of the task-isolation setting: the
         option's own label, plus the dormant marker when worktree is

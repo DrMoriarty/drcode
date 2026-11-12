@@ -35,6 +35,7 @@ from ..config import Config
 from ..core.usage import SessionTokenUsage
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
+from ..mcp import McpService
 from ..models import (
     Clarification,
     PendingInput,
@@ -541,6 +542,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # periodic tick (see on_mount); released at teardown. The busy
         # detection and the platform backends live in drcode.keepawake.
         self.keepawake = KeepAwake()
+        # Embedded MCP server (docs/mcp-server-design.md): inert until the
+        # `mcp_enabled` project setting is on. It owns the uvicorn daemon
+        # thread, the endpoint descriptor `.drcode/mcp.json` and the
+        # one-server-per-project rule; the TUI only reconciles it via
+        # _sync_mcp_server (startup, the Settings toggle, teardown) and
+        # renders its state in the statusbar/header. Every lifecycle step
+        # reports through the event sink wired on mount.
+        self.mcp_service = McpService(project_root)
         # The "queue empty" / "pipeline blocked" notifications are sent only
         # on state transitions; the very first pipeline evaluation after
         # startup only primes the state (a cold start on an empty queue
@@ -1299,6 +1308,50 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 file=sys.stderr,
             )
 
+    def _mcp_event(self, text: str) -> None:
+        """Service-event sink of the embedded MCP server (never fatal).
+
+        The MCP package reports start/stop/refusal as plain lines, from
+        whatever thread triggered the step (a hot toggle runs on the app
+        thread, but a start is slow enough that a future caller may push
+        it to a worker). Surfaced as a toast: MCP events are app-level,
+        not task-level, so they belong in the chat's event stream only
+        when a task is open — the toast is what the user sees from
+        anywhere. The token is never part of these lines (§6)."""
+        print(f"drcode: {text}", file=sys.stderr)
+        if not self.is_running:
+            return
+        try:
+            if self._on_app_thread():
+                self.notify(text, title="MCP server", timeout=8)
+            else:
+                self.call_from_thread(self.notify, text, title="MCP server", timeout=8)
+        except Exception as e:  # noqa: BLE001 - the toast is best-effort
+            print(
+                f"drcode: mcp notice failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+        self.refresh_status()
+
+    def _sync_mcp_server(self) -> None:
+        """Reconcile the MCP server with the `mcp_enabled` setting.
+
+        The single entry point of the server's lifecycle: called on mount
+        (startup, §6), by the Settings toggle (hot start/stop, §2) and by
+        the Task-settings dialog's atomic apply. `McpService.apply` is
+        idempotent and never raises, so a mismatched state cannot wedge
+        anything; the refusal path (another instance already serves this
+        project, §3) is reported through the event sink and leaves
+        `mcp_service.running` False, which the UI renders honestly.
+        """
+        self.mcp_service.set_event_sink(self._mcp_event)
+        try:
+            self.mcp_service.apply(self.settings.mcp_enabled)
+        finally:
+            # The statusbar / header indicator follows the REAL state, not
+            # the setting: a refused instance is "off" with a reason.
+            self.refresh_status()
+
     def on_unmount(self) -> None:
         # Clear the tab title so "DrCode — <project>" doesn't stick around
         # in the terminal after the app has exited.
@@ -1308,6 +1361,14 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # idempotent and thread-safe; the periodic tick stops calling it
         # with the DOM gone).
         self.keepawake.stop()
+        # Stop the embedded MCP server and drop OUR endpoint descriptor
+        # (§6): should_exit + a bounded join, so the listening socket is
+        # released before the process exits. `stop()` is idempotent, never
+        # raises, and leaves a descriptor owned by another pid alone. The
+        # event sink is detached first — the chat is going away, and the
+        # shutdown line would only race the teardown.
+        self.mcp_service.set_event_sink(None)
+        self.mcp_service.stop()
 
     async def on_event(self, event: events.Event) -> None:
         # Any raw user input (a key press, a click) dismisses the sticky
@@ -1521,6 +1582,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # project has none (the setup-dialog path offers it too,
             # right after the settings are saved).
             self._maybe_offer_agents_md()
+        # Embedded MCP server (§6): started on mount when the project
+        # setting is on. Deliberately AFTER the pipeline's first
+        # _advance() — the server's whole point is mutating a live
+        # pipeline, and starting it against a half-initialised app would
+        # export an endpoint that answers before the gate is ready. The
+        # call is a no-op when the setting is off (no socket is bound).
+        self._sync_mcp_server()
 
     @property
     def chat_input(self) -> ChatInput:

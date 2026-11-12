@@ -30,6 +30,7 @@ from pathlib import Path
 GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/tasks/",
     ".drcode/settings.json",
+    ".drcode/mcp.json",
     ".drcode/github_state.json",
     ".drcode/search_index.json",
     ".drcode/worktrees/",

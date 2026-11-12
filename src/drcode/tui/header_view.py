@@ -230,8 +230,28 @@ class HeaderLayer(DrCodeState):
     def _header_stats_text(self) -> str:
         """The expanded header's bottom line: the TTS-announcements and
         ntfy push-notification switches, followed by the GitHub
-        integration status."""
-        return f"{self._header_tts_text()} | {self._header_notifications_text()} | {self._header_github_text()}"
+        integration status and the embedded MCP server state."""
+        return (
+            f"{self._header_tts_text()} | {self._header_notifications_text()} | "
+            f"{self._header_github_text()} | {self._header_mcp_text()}"
+        )
+
+    def _header_mcp_text(self) -> str:
+        """Embedded MCP server status for the expanded header (design doc
+        §6): off / the live endpoint / busy (another instance serves this
+        project) / error. The TOKEN is never rendered anywhere in the UI —
+        the endpoint file's path is the only detail offered, and it is
+        what a client reads the secret from (mode 0600)."""
+        service = getattr(self, "mcp_service", None)
+        if service is None:  # pragma: no cover - pre-init render
+            return "MCP: off"
+        if service.running:
+            return f"MCP: on | 127.0.0.1:{service.port}/mcp"
+        if not self.settings.mcp_enabled:
+            return "MCP: off"
+        if service.foreign_pid is not None:
+            return f"MCP: other instance (pid {service.foreign_pid})"
+        return f"MCP: on but not serving | {service.endpoint_file}"
 
     def _header_tts_text(self) -> str:
         """TTS-announcements status for the expanded header's bottom line:

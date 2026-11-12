@@ -661,6 +661,17 @@ class TaskSettingsEntriesProvider(CommandListProvider):
                 "and kills the runs (project setting; does not stop "
                 "the lid-closed clamshell sleep)",
             ),
+            CommandEntry(
+                f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
+                app.action_toggle_mcp_enabled,
+                "Expose this live TUI to external AI agents over "
+                "Streamable HTTP on an ephemeral loopback port — they "
+                "then drive tasks through the same pipeline as your own "
+                "clicks. The port, the bearer token and the owning pid "
+                "are published in .drcode/mcp.json (mode 0600, never "
+                "shown in the UI); toggling starts/stops the server "
+                "immediately (project setting)",
+            ),
         ]
 
 

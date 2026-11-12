@@ -107,6 +107,10 @@ class DrCodeState(CoreState, App[None]):
 
     def action_show_ctx_dialog(self) -> None: ...
 
+    # -- MCP server (implemented in DrCodeApp, see drcode.mcp) ----------------
+
+    def _sync_mcp_server(self) -> None: ...
+
     # -- clipboard (implemented in DrCodeApp) ---------------------------------
 
     def _copy_with_fallback(self, text: str) -> None: ...

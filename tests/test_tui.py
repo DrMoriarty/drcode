@@ -3568,6 +3568,8 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Worktree snapshot: {app.settings.worktree_snapshot.label}",
             f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
             f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
+            f"Web fetch (research): {app.settings.web_fetch_mode.label}",
+            "Web fetch hosts…",
             f"Verification: {app.settings.verification.label}",
             f"Max development rounds: {app.settings.max_dev_rounds}",
             f"Nudge stalled agent after: {app.settings.stall_nudge.label}",

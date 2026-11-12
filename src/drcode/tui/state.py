@@ -36,7 +36,7 @@ from textual.widgets import ListView, Static
 from ..core.state import CoreState
 from ..models import Task, TaskEvent
 from ..providers import AgentRole
-from ..settings import CompletedRetention
+from ..settings import CompletedRetention, WebFetchMode
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
 from .command_providers import WorkflowPreset
 from .github_dialog import GitHubSetup
@@ -275,6 +275,12 @@ class DrCodeState(CoreState, App[None]):
     def action_change_subagents_coder(self) -> None: ...
 
     def action_change_subagents_researcher(self) -> None: ...
+
+    def action_set_web_fetch_mode(self, mode: WebFetchMode) -> None: ...
+
+    def action_change_web_fetch_mode(self) -> None: ...
+
+    def action_edit_web_fetch_hosts(self) -> None: ...
 
     def _task_isolation_label(self) -> str: ...
 

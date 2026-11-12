@@ -51,6 +51,7 @@ from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
 from ..transcript import estimate_tokens
+from ..web_fetch import web_fetch_policy_for
 from .state import CoreState
 
 # Hard-limit compaction level (percent of max_context_tokens): the last
@@ -384,6 +385,9 @@ class PipelineCompactionLayer(CoreState):
                     root=root,
                     research_git=research_git,
                     subagent_limit=subagent_limit_for(self.settings, role),
+                    # The research agent's web_fetch schema is part of the
+                    # framing whenever the tool is registered for this role.
+                    research_web_fetch=web_fetch_policy_for(self.settings, role),
                 )
         except Exception:  # noqa: BLE001 - a measurement gap must not kill compaction
             return None

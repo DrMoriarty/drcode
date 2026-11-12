@@ -181,6 +181,116 @@ def subagents_label(count: int) -> str:
     return "1 subagent" if count == 1 else f"{count} subagents"
 
 
+class WebFetchMode(str, enum.Enum):
+    """Whether the RESEARCH agent may read web pages (project setting).
+
+    The research agent gets a structured `web_fetch` tool instead of the
+    uncontrolled `curl`/`wget` inside run_bash — the tool is the only place
+    an outbound HTTP request is policy-checked, SSRF-guarded, size-capped
+    and wrapped in an explicit "this is untrusted content" frame (see
+    `drcode.web_fetch`). The coding agent, the tester and the resolver
+    never get it.
+
+    OFF (the default): the tool is not registered at all — the agent never
+    sees it. ALLOWLIST: only hosts from `web_fetch_allow_hosts` (and their
+    subdomains) may be fetched; an EMPTY allow list makes the tool useless
+    (every fetch is refused with a hint to configure the hosts) — that is
+    on purpose, the safe mode must never silently allow everything.
+    ALL: every public host is fetchable except `web_fetch_block_hosts`
+    (which wins over the allow list too) — the SSRF guard always applies,
+    in every mode.
+    """
+
+    OFF = "off"
+    ALLOWLIST = "allowlist"
+    ALL = "all"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        if self is WebFetchMode.ALLOWLIST:
+            return "allowlist"
+        if self is WebFetchMode.ALL:
+            return "all hosts"
+        return "off"
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the research agent gets the web_fetch tool at all."""
+        return self is not WebFetchMode.OFF
+
+    @property
+    def description(self) -> str:
+        """One-line explanation shown in the Settings palette."""
+        if self is WebFetchMode.ALLOWLIST:
+            return (
+                "The research agent may read ONLY the hosts from the web-fetch "
+                "allow list (and their subdomains)."
+            )
+        if self is WebFetchMode.ALL:
+            return (
+                "The research agent may read any public web host (the block "
+                "list and the private-network guard still apply)."
+            )
+        return "The research agent gets no web access tool at all."
+
+
+WEB_FETCH_MODE_OPTIONS: tuple[WebFetchMode, ...] = (
+    WebFetchMode.OFF,
+    WebFetchMode.ALLOWLIST,
+    WebFetchMode.ALL,
+)
+
+
+def normalize_host_entry(value: str) -> str:
+    """Normalize one host entry of `web_fetch_allow_hosts`/`_block_hosts`.
+
+    Accepts a bare host ("example.com"), a host with a port
+    ("example.com:8080"), a pasted URL ("https://docs.example.com/guide")
+    and an IPv6 literal ("[::1]"); returns the lowercased bare host
+    without a trailing dot, or "" for junk. Deliberately shared with
+    `drcode.web_fetch`, which matches URL hosts against these entries the
+    same way (settings.py must not import web_fetch — that would be a
+    cycle).
+    """
+    text = value.strip()
+    if not text:
+        return ""
+    # A pasted URL: keep the authority part only.
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    text = text.rsplit("@", 1)[-1]  # drop userinfo
+    if text.startswith("["):  # IPv6 literal (optionally with a port)
+        text = text[1:].split("]", 1)[0]
+    elif text.count(":") == 1:  # host:port
+        text = text.split(":", 1)[0]
+    text = text.strip().lower().removesuffix(".")
+    if not text or any(c.isspace() for c in text):
+        return ""
+    return text
+
+
+def _normalized_hosts(value: object) -> object:
+    """Field validator body of the web-fetch host lists (mode="before"):
+    accepts a JSON list, a comma/space/newline-separated string, drops
+    junk entries and duplicates while keeping the user's order. Junk must
+    never invalidate the WHOLE settings file (a typo there would silently
+    reset every other preference — see `ProjectSettingsStore.load`)."""
+    if isinstance(value, str):
+        raw = value.replace(",", " ").replace("\n", " ").split()
+    elif isinstance(value, list | tuple):
+        raw = [str(item) for item in value]
+    else:
+        return value
+    cleaned: list[str] = []
+    for item in raw:
+        host = normalize_host_entry(item)
+        if host and host not in cleaned:
+            cleaned.append(host)
+    return cleaned
+
+
 class EscAbort(str, enum.Enum):
     """How ESC stops a running agent/tester (project setting).
 
@@ -449,6 +559,25 @@ class ProjectSettings(BaseModel):
     # The same cap for the RESEARCH agent's runs (its resolved model
     # serves the subagents; the counter is per parent run/generation).
     subagents_researcher: int = 0
+    # Web access of the RESEARCH agent (WebFetchMode docstring): off (no
+    # tool), allowlist (only web_fetch_allow_hosts + their subdomains) or
+    # all (every public host). The structured `web_fetch` tool replaces
+    # the uncontrolled `curl` inside run_bash: it is GET-only, SSRF-guarded
+    # (private/loopback/link-local/metadata addresses are refused), size-
+    # and time-capped, and every result is framed as untrusted content.
+    # Only the research role gets the tool — the coding agent, the tester
+    # and the resolver never do.
+    web_fetch_mode: WebFetchMode = WebFetchMode.OFF
+    # Hosts the research agent may fetch in allowlist mode (allowlist mode
+    # MEANS an entry here — with an empty list every fetch is refused with
+    # a hint to configure the hosts). Entries are normalized
+    # (normalize_host_entry): a bare host or a URL is accepted; a listed
+    # host also matches its subdomains.
+    web_fetch_allow_hosts: list[str] = Field(default_factory=list)
+    # Hosts the research agent must NEVER fetch (wins over the allow list
+    # and over the "all hosts" mode). The private-network / metadata-address
+    # guard of `drcode.web_fetch` applies in every mode regardless.
+    web_fetch_block_hosts: list[str] = Field(default_factory=list)
     # Agent-created task drafts: when on, the agents' task-creation tools
     # (research: create_bug_report / create_feature_request, tester:
     # create_bug_report) do NOT queue the new task — it is created in the
@@ -620,6 +749,14 @@ class ProjectSettings(BaseModel):
             and int(v) > 0
         }
 
+    @field_validator("web_fetch_allow_hosts", "web_fetch_block_hosts", mode="before")
+    @classmethod
+    def _clean_host_lists(cls, value: object) -> object:
+        """Normalize the web-fetch host lists (`_normalized_hosts`): a
+        hand-edited settings.json may carry a comma-separated string, a
+        pasted URL or junk — none of it may invalidate the WHOLE file."""
+        return _normalized_hosts(value)
+
     @field_validator("compaction_resume_min_tokens", mode="before")
     @classmethod
     def _clean_compaction_resume_min_tokens(cls, value: object) -> object:
@@ -725,6 +862,51 @@ def task_settings_hints(
                 ),
                 fix=lambda s: setattr(s.git_policy, "tester", GitPolicy.OFF),
                 fix_label="Set Git (tester): off",
+            )
+        )
+
+    # -- web fetch of the research agent --------------------------------------
+    if (
+        draft.web_fetch_mode is WebFetchMode.ALLOWLIST
+        and not draft.web_fetch_allow_hosts
+    ):
+        hints.append(
+            SettingsHint(
+                severity="conflict",
+                text=(
+                    "Web fetch: allowlist mode with an EMPTY allow list — "
+                    "every web_fetch call of the research agent is refused "
+                    "until at least one host is allowed."
+                ),
+                fix=lambda s: setattr(s, "web_fetch_mode", WebFetchMode.ALL),
+                fix_label="Allow all hosts",
+            )
+        )
+    if (
+        draft.web_fetch_mode is not WebFetchMode.OFF
+        and draft.web_fetch_allow_hosts
+        and draft.web_fetch_mode is WebFetchMode.ALL
+    ):
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    "Web fetch: the allow list is unused while the mode is "
+                    f"{WebFetchMode.ALL.label} — every public host is "
+                    "fetchable; the list takes effect in allowlist mode."
+                ),
+            )
+        )
+    if draft.web_fetch_mode is WebFetchMode.OFF and (
+        draft.web_fetch_allow_hosts or draft.web_fetch_block_hosts
+    ):
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    "Web fetch: the host lists are parked — web fetch is off, "
+                    "so the research agent has no web tool at all."
+                ),
             )
         )
 

@@ -53,6 +53,7 @@ from ..core.usage import (
 from ..models import PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole, resolve_available
 from ..tools import scratch_dir
+from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
 
@@ -233,6 +234,7 @@ class PipelineAgentRunLayer(CoreState):
                 agent,
                 workflow_instructions,
                 subagent_gate,
+                web_fetch_gate,
             ) = await self._prepare_agent_run(task, task_id, role, generation)
             # Pre-run forced compaction (project setting
             # compaction_resume_min_tokens): when the task waited long
@@ -299,6 +301,10 @@ class PipelineAgentRunLayer(CoreState):
                                     u, _role, self.resolved_model_key(_role)
                                 )
                             ),
+                            # The research agent's web_fetch budget/policy
+                            # for THIS run (None = the tool is not
+                            # registered, see _prepare_agent_run).
+                            web_fetch_gate=web_fetch_gate,
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -475,11 +481,18 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         role: AgentRole,
         generation: int,
-    ) -> tuple[Path, Agent[AgentDeps, str], str | None, SubagentGate | None]:
+    ) -> tuple[
+        Path,
+        Agent[AgentDeps, str],
+        str | None,
+        SubagentGate | None,
+        WebFetchGate | None,
+    ]:
         """Register the run and assemble everything the turn loop needs:
         the (worktree) root the tools run in, the built agent, the
-        on_task_start hook's instructions for the first prompt and the
-        run's subagent gate (None when delegation is off)."""
+        on_task_start hook's instructions for the first prompt, the run's
+        subagent gate (None when delegation is off) and the run's web-fetch
+        gate (None unless this is a RESEARCH task with web fetch enabled)."""
         self._agent_runs[task_id] = generation
         self._agent_failed.discard(task_id)
         self._agent_dead.discard(task_id)
@@ -529,12 +542,20 @@ class PipelineAgentRunLayer(CoreState):
         # subagents_coder for coding); 0 = the tool is not registered at
         # all and the gate stays None.
         subagent_limit = subagent_limit_for(self.settings, role)
+        # Managed web reading (project setting web_fetch_mode): RESEARCH
+        # only — web_fetch_policy_for returns None for every other role, so
+        # the tool is not registered there at all. Read at activation, so a
+        # settings change reaches the next run of each task.
+        web_fetch_policy = web_fetch_policy_for(self.settings, role)
         agent = build_agent(
             self.resolved_config(role),
             kind=task.kind,
             root=root,
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit,
+            # The research agent's web_fetch tool (SSRF-guarded, capped,
+            # framed as untrusted content): None when the mode is off.
+            research_web_fetch=web_fetch_policy,
             # The real scratch path is baked into the write tools'
             # descriptions (no literal <task-id> placeholder for the model
             # to copy verbatim into a path argument).
@@ -562,7 +583,13 @@ class PipelineAgentRunLayer(CoreState):
             ),
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
-        return root, agent, workflow_instructions, subagent_gate
+        # One gate per activation: it carries the run's policy AND the
+        # fetch budget, so a superseded run's gate dies with it (the same
+        # reasoning as the subagent gate).
+        web_fetch_gate = (
+            WebFetchGate(web_fetch_policy) if web_fetch_policy is not None else None
+        )
+        return root, agent, workflow_instructions, subagent_gate, web_fetch_gate
 
     async def _consume_turn_input(
         self,

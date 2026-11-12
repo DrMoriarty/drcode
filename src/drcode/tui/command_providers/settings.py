@@ -591,11 +591,12 @@ class TaskSettingsEntriesProvider(CommandListProvider):
                 app.action_change_web_fetch_mode,
                 "Whether the RESEARCH agent may read web pages through "
                 "its structured web_fetch tool (off / allowlist / all "
-                "hosts) — replaces the unmanaged curl in run_bash: "
+                "hosts) — external requests from run_bash are refused "
+                "for every role either way (bash stays local-only): "
                 "GET-only, private and metadata addresses refused, size- "
                 "capped, HTML reduced to text and every result framed as "
                 "untrusted content. The coding agent, the tester and the "
-                "resolver never get it (project setting)",
+                "resolver never get the tool (project setting)",
             ),
             CommandEntry(
                 "Web fetch hosts…",

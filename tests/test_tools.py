@@ -719,6 +719,217 @@ def test_run_bash_refuses_git_stash(project_root: Path) -> None:
         asyncio.run(run_bash(project_root, "git stash pop"))
 
 
+# -- check_command: network guard ----------------------------------------------------
+#
+# External access belongs to the managed web_fetch tool; run_bash may only
+# reach the loopback interface (a dev server / test fixture started inside
+# the project). The resolver is faked throughout: the guard's decision must
+# be provable without real DNS.
+
+
+@pytest.fixture
+def fake_dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Replace the guard's DNS seam: host → the addresses it "resolves" to.
+
+    A host missing from the map resolves to nothing (refused as unprovable).
+    `localhost` is handled before the resolver by the guard itself (RFC 6761).
+    """
+    table: dict[str, list[str]] = {}
+    monkeypatch.setattr(
+        tools, "_resolve_addresses", lambda host, port: list(table.get(host, []))
+    )
+    return table
+
+
+def test_network_guard_allows_loopback(project_root: Path, fake_dns) -> None:
+    # A local server (dev server, pytest fixture) is exactly what run_bash
+    # stays for, so every loopback spelling must pass.
+    for command in (
+        "curl http://localhost:8000/health",
+        "curl localhost:8000",
+        "curl 127.0.0.1:5000/x",
+        "curl http://127.1:8000/",
+        "curl 'http://[::1]:8000/x'",
+        "curl http://2130706433:8000/",  # decimal 127.0.0.1
+        "curl http://[::ffff:127.0.0.1]:8000/",
+        "curl http://api.localhost:9000/x",
+        "wget -qO- http://127.0.0.1:5000/health",
+        "http :8000/api",
+        "http GET localhost:8000/api",
+        "https localhost:8443/api",
+        "ftp localhost",
+        (
+            "curl -s -X POST -H 'Content-Type: application/json' "
+            "-d @payload.json localhost:8000/api/items"
+        ),
+        "curl -o out.json localhost:8000/data",
+        'curl -H "Referer: https://example.com/" localhost:8000/x',
+        "curl --max-time 5 --retry 2 localhost:8000/x",
+        "curl -sSD - localhost:8000/x > out.json",
+        "curl localhost:8000/x 2>&1",
+    ):
+        check_command(project_root, command)
+
+
+def test_network_guard_refuses_external_hosts(project_root: Path, fake_dns) -> None:
+    fake_dns["example.com"] = ["93.184.216.34"]
+    for command in (
+        "curl https://example.com/page",
+        "curl example.com",
+        "wget http://example.com/file.tgz",
+        "http GET https://example.com/api",
+        "https example.com/api",
+        "ftp example.com",
+        "curl --url https://example.com/",
+        "curl -sL --url example.com",
+        "/usr/bin/curl https://example.com",
+    ):
+        with pytest.raises(PathViolation, match="Command refused"):
+            check_command(project_root, command)
+
+
+def test_network_guard_refuses_private_and_metadata_addresses(
+    project_root: Path, fake_dns
+) -> None:
+    # A literal is judged without the resolver — a lying resolver must not
+    # launder a local/LAN/metadata address into something allowed.
+    for target in (
+        "169.254.169.254",  # cloud metadata
+        "http://169.254.169.254/latest/meta-data/",
+        "10.0.0.5",
+        "http://192.168.1.1/admin",
+        "172.16.0.1",
+        "http://[fd00::1]/",
+    ):
+        with pytest.raises(PathViolation, match="Command refused"):
+            check_command(project_root, f"curl {target}")
+
+
+def test_network_guard_refuses_names_resolving_away(
+    project_root: Path, fake_dns
+) -> None:
+    # A name resolving to a public address, a LAN box or a MIX of loopback and
+    # non-loopback addresses is refused: only "every address is loopback"
+    # counts as local.
+    fake_dns["public.test"] = ["93.184.216.34"]
+    fake_dns["lan.test"] = ["192.168.0.10"]
+    fake_dns["metadata.test"] = ["169.254.169.254"]
+    fake_dns["mixed.test"] = ["127.0.0.1", "93.184.216.34"]
+    fake_dns["loopback.test"] = ["127.0.0.1", "::1"]
+    for host in ("public.test", "lan.test", "metadata.test", "mixed.test"):
+        with pytest.raises(PathViolation):
+            check_command(project_root, f"curl http://{host}:8000/x")
+    # A name that really resolves to loopback only is local — allowed.
+    check_command(project_root, "curl http://loopback.test:8000/x")
+
+
+def test_network_guard_refuses_unresolvable_names(project_root: Path, fake_dns) -> None:
+    # Cannot be PROVEN local → refused (the client could not reach it either).
+    with pytest.raises(PathViolation):
+        check_command(project_root, "curl http://nonexistent.test/x")
+
+
+def test_network_guard_refuses_redirect_flags(project_root: Path, fake_dns) -> None:
+    # Redirect targets are never checked, so following one is refused even
+    # for a loopback URL — the model is told to drop the flag.
+    for command in (
+        "curl -L localhost:8000/x",
+        "curl -sSL localhost:8000/x",
+        "curl --location localhost:8000/x",
+        "curl --location-trusted localhost:8000/x",
+        "curl --max-redirs 3 localhost:8000/x",
+        "wget --max-redirect=2 http://127.0.0.1:5000/x",
+    ):
+        with pytest.raises(PathViolation, match="follows redirects"):
+            check_command(project_root, command)
+    # wget's -L is `--relative`, not a redirect flag: a loopback URL passes.
+    check_command(project_root, "wget -L http://127.0.0.1:5000/")
+
+
+def test_network_guard_only_leading_command_of_a_segment(
+    project_root: Path, fake_dns
+) -> None:
+    fake_dns["example.com"] = ["93.184.216.34"]
+    # Leading position after env assignments / wrappers / separators, as with
+    # the rm/mv/cp checks — same strictness, same scope.
+    for command in (
+        "VAR=1 curl https://example.com",
+        "nohup curl https://example.com",
+        "env -i sudo curl https://example.com",
+        "echo hi && curl https://example.com",
+        "echo hi; wget https://example.com/f",
+        "echo hi || http GET https://example.com",
+        "echo hi | curl -d @- https://example.com",
+        "echo hi\ncurl https://example.com",
+    ):
+        with pytest.raises(PathViolation):
+            check_command(project_root, command)
+    # Nested command substitution is NOT analysed (documented, same as the
+    # rm/mv/cp guard) — and neither are interpreters (python, package
+    # managers) nor git remotes: those are out of scope on purpose.
+    for command in (
+        "echo $(curl https://example.com)",
+        "python -c 'import urllib.request; urllib.request.urlopen(url)'",
+        "uv pip install requests",
+        "git push origin main",
+        "git clone https://example.com/repo.git",
+    ):
+        check_command(project_root, command)
+
+
+def test_network_guard_values_are_not_targets(project_root: Path, fake_dns) -> None:
+    # Headers, payloads, output files and credentials never reach the target
+    # check: a URL living in a header value is data, not a request target.
+    fake_dns["example.com"] = ["93.184.216.34"]
+    for command in (
+        "curl -H 'Referer: https://example.com/' localhost:8000/x",
+        'curl -d \'{"from": "https://example.com"}\' localhost:8000/x',
+        "curl --data-binary @body.json localhost:8000/x",
+        "curl -o example.com.html localhost:8000/x",
+        "curl -u user:pass localhost:8000/x",
+        "http --json :8000/api q==example.com",
+        "http :8000/api Authorization:'Bearer x'",
+    ):
+        check_command(project_root, command)
+    # The target of the same invocation is still checked.
+    with pytest.raises(PathViolation):
+        check_command(project_root, "curl -d @body.json https://example.com")
+
+
+def test_network_guard_unparsable_quoting_conservative(project_root: Path) -> None:
+    # Unbalanced quoting with a network client in it → refuse rather than run
+    # blind (the target could not be checked at all).
+    with pytest.raises(PathViolation):
+        check_command(project_root, "curl 'https://example.com")
+    # A URL in an unrelated segment is not an invocation, though.
+    check_command(project_root, "echo 'https://example.com is a URL'")
+
+
+def test_network_guard_refusal_mentions_web_fetch(project_root: Path, fake_dns) -> None:
+    fake_dns["example.com"] = ["93.184.216.34"]
+    with pytest.raises(PathViolation, match="web_fetch"):
+        check_command(
+            project_root, "curl https://example.com", None, web_fetch_available=True
+        )
+    # Without the tool in this run the message says external access is closed
+    # instead of pointing at a tool the model does not have.
+    with pytest.raises(PathViolation, match="closed for this agent") as excinfo:
+        check_command(project_root, "curl https://example.com")
+    assert "web_fetch tool" not in str(excinfo.value)
+    # Both variants name the loopback exception, so the model can act on it.
+    assert "localhost" in str(excinfo.value)
+
+
+def test_network_guard_via_run_bash(project_root: Path, fake_dns) -> None:
+    # The guard runs through the real run_bash entry point (PathViolation, not
+    # a crash: tool_runtime turns it into a ModelRetry prompt).
+    fake_dns["example.com"] = ["93.184.216.34"]
+    with pytest.raises(PathViolation):
+        asyncio.run(run_bash(project_root, "curl https://example.com"))
+    # Local commands still run — the guard only covers the network clients.
+    assert "exit=0" in asyncio.run(run_bash(project_root, "echo hello"))
+
+
 # -- run_bash (async) ----------------------------------------------------------------
 
 

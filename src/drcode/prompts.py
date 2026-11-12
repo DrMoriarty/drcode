@@ -16,7 +16,13 @@ from pathlib import Path
 
 from .models import TaskKind
 from .settings import GitPolicy
-from .workflow import load_git_workflow
+from .workflow import (
+    CODER_INSTRUCTIONS_FILE,
+    RESEARCHER_INSTRUCTIONS_FILE,
+    TESTER_INSTRUCTIONS_FILE,
+    load_git_workflow,
+    load_role_instructions,
+)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # System prompts for the coding/tester agents live here (one `.md` file each).
@@ -87,6 +93,12 @@ _NEVER_COMMIT_RE = re.compile(r"\s*Never commit to\s+git unless explicitly asked
 # appended to a system prompt.
 GIT_WORKFLOW_HEADER = "Git workflow (project rules)"
 
+# Header under which the per-role instruction fragment
+# (`.drcode/instructions/<role>.md` — coder/researcher/tester, see
+# drcode.workflow) is appended to a system prompt. Unlike the git-workflow
+# layer this is a pure ADDITION: nothing is removed from the base prompt.
+ROLE_INSTRUCTIONS_HEADER = "Project instructions (per-role)"
+
 
 def _project_prompt_override(project_root: Path | None, name: str) -> str | None:
     """A project-local override of a bundled system prompt:
@@ -100,20 +112,29 @@ def _project_prompt_override(project_root: Path | None, name: str) -> str | None
         return None
 
 
-def _join_components(base: str, git_workflow: str | None) -> str:
-    """Append the git-workflow rules to a base prompt (the single place the
-    two components of any system prompt are composed)."""
-    if git_workflow is None:
-        return base
-    return f"{base}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
+def _join_components(
+    base: str,
+    git_workflow: str | None,
+    role_instructions: str | None = None,
+) -> str:
+    """Append the git-workflow rules and the per-role instructions fragment
+    to a base prompt (the single place the components of any system prompt
+    are composed). Order: base -> git workflow -> role instructions (the
+    project's AGENTS.md is appended later by `drcode.agent`)."""
+    if git_workflow is not None:
+        base = f"{base}\n\n# {GIT_WORKFLOW_HEADER}\n\n{git_workflow}"
+    if role_instructions is not None:
+        base = f"{base}\n\n# {ROLE_INSTRUCTIONS_HEADER}\n\n{role_instructions}"
+    return base
 
 
 def load_system_prompt_components(
     kind: TaskKind,
     project_root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
-) -> tuple[str, str | None]:
-    """(base prompt, git workflow or None) for a coding task of the given kind.
+) -> tuple[str, str | None, str | None]:
+    """(base prompt, git workflow or None, role instructions or None) for a
+    coding task of the given kind.
 
     The base prompt is the (possibly project-overridden) template with the
     ``{project_path}`` placeholder substituted and — when the project ships
@@ -124,10 +145,15 @@ def load_system_prompt_components(
     `research_git_local.md`, each overridable project-locally by the same
     name in `.drcode/prompts/`), OFF adds nothing — the research agent then
     has no commit step at all. The second element is the workflow text to
-    append under `GIT_WORKFLOW_HEADER` (None when there is none). Note the
-    base prompt does NOT include the project's AGENTS.md: that appendage is
-    assembled by `drcode.agent.build_agent` (see `load_agents_md`).
-    `load_system_prompt` joins the two components; consumers that must
+    append under `GIT_WORKFLOW_HEADER` (None when there is none). The third
+    element is the per-role instruction fragment
+    (`.drcode/instructions/coder.md` for FEATURE/BUG, `researcher.md` for
+    RESEARCH — see `drcode.workflow`) to append under
+    `ROLE_INSTRUCTIONS_HEADER` (None when the file is absent/blank; a pure
+    addition, nothing is replaced). Note the base prompt does NOT include
+    the project's AGENTS.md: that appendage is assembled by
+    `drcode.agent.build_agent` (see `load_agents_md`).
+    `load_system_prompt` joins the three components; consumers that must
     account for the parts separately (the context-layout estimate in the
     TUI) use this directly.
     """
@@ -135,6 +161,11 @@ def load_system_prompt_components(
         TaskKind.FEATURE: "feature.md",
         TaskKind.BUG: "bug.md",
         TaskKind.RESEARCH: "research.md",
+    }[kind]
+    instructions_file = {
+        TaskKind.FEATURE: CODER_INSTRUCTIONS_FILE,
+        TaskKind.BUG: CODER_INSTRUCTIONS_FILE,
+        TaskKind.RESEARCH: RESEARCHER_INSTRUCTIONS_FILE,
     }[kind]
     template = _project_prompt_override(project_root, name) or (
         SYSTEM_PROMPTS_DIR / name
@@ -153,16 +184,24 @@ def load_system_prompt_components(
     git_workflow = load_git_workflow(project_root)
     if git_workflow is not None:
         template = _NEVER_COMMIT_RE.sub("", template)
-    return _substitute_project_path(template, project_root), git_workflow
+    role_instructions = load_role_instructions(project_root, instructions_file)
+    return (
+        _substitute_project_path(template, project_root),
+        git_workflow,
+        role_instructions,
+    )
 
 
 def load_tester_prompt_components(
     allow_commit: bool = True,
     project_root: Path | None = None,
     allow_push: bool = True,
-) -> tuple[str, str | None]:
-    """(base prompt, git workflow or None) for the QA tester — the component
-    counterpart of `load_system_prompt_components`."""
+) -> tuple[str, str | None, str | None]:
+    """(base prompt, git workflow or None, role instructions or None) for
+    the QA tester — the component counterpart of
+    `load_system_prompt_components` (the tester fragment is
+    `.drcode/instructions/tester.md`, shared by all three git-policy
+    templates)."""
     if not allow_commit:
         name = "tester_no_commit.md"
     elif not allow_push:
@@ -173,7 +212,12 @@ def load_tester_prompt_components(
         SYSTEM_PROMPTS_DIR / name
     ).read_text(encoding="utf-8")
     git_workflow = load_git_workflow(project_root)
-    return _substitute_project_path(template, project_root), git_workflow
+    role_instructions = load_role_instructions(project_root, TESTER_INSTRUCTIONS_FILE)
+    return (
+        _substitute_project_path(template, project_root),
+        git_workflow,
+        role_instructions,
+    )
 
 
 def load_system_prompt(
@@ -196,10 +240,15 @@ def load_system_prompt(
     When the project defines `.drcode/git-workflow.md` (team branching /
     commit / review rules), the bundled "Never commit to git" sentence is
     removed (the workflow file governs committing instead) and the workflow
-    text is appended under a dedicated header.
+    text is appended under a dedicated header. When the project ships
+    `.drcode/instructions/coder.md` (FEATURE/BUG) or `researcher.md`
+    (RESEARCH), that fragment is appended last, under its own header — a
+    pure addition, nothing is replaced.
     """
-    base, git_workflow = load_system_prompt_components(kind, project_root, research_git)
-    return _join_components(base, git_workflow)
+    base, git_workflow, role_instructions = load_system_prompt_components(
+        kind, project_root, research_git
+    )
+    return _join_components(base, git_workflow, role_instructions)
 
 
 def load_tester_prompt(
@@ -221,12 +270,14 @@ def load_tester_prompt(
 
     When the project defines `.drcode/git-workflow.md`, its rules are
     appended: the tester must finalize the task according to the same team
-    process the coding agent follows.
+    process the coding agent follows. When the project ships
+    `.drcode/instructions/tester.md`, that fragment is appended last under
+    its own header — a pure addition.
     """
-    base, git_workflow = load_tester_prompt_components(
+    base, git_workflow, role_instructions = load_tester_prompt_components(
         allow_commit, project_root, allow_push
     )
-    return _join_components(base, git_workflow)
+    return _join_components(base, git_workflow, role_instructions)
 
 
 def load_resolver_prompt(project_root: Path | None = None) -> str:

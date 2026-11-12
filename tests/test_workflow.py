@@ -21,22 +21,28 @@ from drcode.agent import all_user_prompts
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.prompts import (
     GIT_WORKFLOW_HEADER,
+    ROLE_INSTRUCTIONS_HEADER,
     load_system_prompt,
     load_tester_prompt,
 )
 from drcode.task_manager import TaskManager
 from drcode.tui.app import DrCodeApp
 from drcode.workflow import (
+    CODER_INSTRUCTIONS_EXAMPLE_CONTENT,
+    CODER_INSTRUCTIONS_FILE,
     GIT_WORKFLOW_EXAMPLE_FILE,
     HOOK_NAMES,
     HOOK_TIMEOUT,
     MAX_REVIEW_REJECTIONS,
+    RESEARCHER_INSTRUCTIONS_EXAMPLE_CONTENT,
+    TESTER_INSTRUCTIONS_EXAMPLE_CONTENT,
     WORKFLOW_EXAMPLE_FILE,
     WorkflowHooks,
     describe_project_workflow,
     ensure_workflow_examples,
     load_git_workflow,
     load_hooks,
+    load_role_instructions,
 )
 from tests.network_mocks import (
     ScriptedState,
@@ -152,6 +158,17 @@ def test_examples_scaffolded_on_manager_init(project_root: Path) -> None:
         assert hook in text
     assert "workflow.py" in text
     assert "git-workflow.md" in git_ex.read_text(encoding="utf-8")
+    # The per-role instruction templates are scaffolded too, one per role.
+    instructions = project_root / ".drcode" / "instructions"
+    for content in (
+        CODER_INSTRUCTIONS_EXAMPLE_CONTENT,
+        RESEARCHER_INSTRUCTIONS_EXAMPLE_CONTENT,
+        TESTER_INSTRUCTIONS_EXAMPLE_CONTENT,
+    ):
+        assert "ACTIVATION" in content
+    assert (instructions / "coder.md.example").is_file()
+    assert (instructions / "researcher.md.example").is_file()
+    assert (instructions / "tester.md.example").is_file()
 
 
 def test_examples_not_overwritten(project_root: Path) -> None:
@@ -159,18 +176,24 @@ def test_examples_not_overwritten(project_root: Path) -> None:
     drcode.mkdir(parents=True, exist_ok=True)
     workflow_ex = drcode / WORKFLOW_EXAMPLE_FILE
     git_ex = drcode / GIT_WORKFLOW_EXAMPLE_FILE
+    instructions_dir = drcode / "instructions"
+    instructions_dir.mkdir(parents=True, exist_ok=True)
+    coder_ex = instructions_dir / "coder.md.example"
     workflow_ex.write_text("# my edits\n")
     git_ex.write_text("my rules\n")
+    coder_ex.write_text("my coder prefs\n")
     TaskManager(project_root)
     ensure_workflow_examples(project_root)  # direct repeat: still untouched
     assert workflow_ex.read_text(encoding="utf-8") == "# my edits\n"
     assert git_ex.read_text(encoding="utf-8") == "my rules\n"
+    assert coder_ex.read_text(encoding="utf-8") == "my coder prefs\n"
 
 
 def test_examples_do_not_activate_workflow(project_root: Path) -> None:
     ensure_workflow_examples(project_root)
     assert load_hooks(project_root) is None
     assert load_git_workflow(project_root) is None
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) is None
     assert describe_project_workflow(project_root) == "default"
 
 
@@ -826,6 +849,92 @@ def test_tester_prompt_with_git_workflow_appends_rules(project_root: Path) -> No
     )
     assert "Always rebase before push." in no_push_prompt
     assert GIT_WORKFLOW_HEADER in no_push_prompt
+
+
+# -- prompts: per-role instruction fragments -------------------------------------------
+
+
+def _write_instructions(project_root: Path, role_file: str, text: str) -> None:
+    instructions = project_root / ".drcode" / "instructions"
+    instructions.mkdir(parents=True, exist_ok=True)
+    (instructions / role_file).write_text(text, encoding="utf-8")
+
+
+def test_role_instructions_absent_by_default(project_root: Path) -> None:
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) is None
+    prompt = load_system_prompt(TaskKind.FEATURE, project_root=project_root)
+    assert ROLE_INSTRUCTIONS_HEADER not in prompt
+    tester_prompt = load_tester_prompt(True, project_root=project_root)
+    assert ROLE_INSTRUCTIONS_HEADER not in tester_prompt
+
+
+def test_role_instructions_load_semantics(project_root: Path) -> None:
+    # None without a root, None for a blank file, stripped content otherwise.
+    assert load_role_instructions(None, CODER_INSTRUCTIONS_FILE) is None
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) is None
+    _write_instructions(project_root, CODER_INSTRUCTIONS_FILE, "  \n")
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) is None
+    _write_instructions(project_root, CODER_INSTRUCTIONS_FILE, "  Be terse.  \n")
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) == "Be terse."
+
+
+def test_coder_instructions_pure_addition_feature_and_bug(
+    project_root: Path,
+) -> None:
+    drcode = project_root / ".drcode"
+    drcode.mkdir()
+    _write_instructions(project_root, CODER_INSTRUCTIONS_FILE, "Titles in Russian.")
+    for kind in (TaskKind.FEATURE, TaskKind.BUG):
+        prompt = load_system_prompt(kind, project_root=project_root)
+        assert ROLE_INSTRUCTIONS_HEADER in prompt
+        assert "Titles in Russian." in prompt
+        # Pure addition: the built-in commit rule stays, the git-workflow
+        # header is untouched, and the fragment sits AFTER the git block.
+        assert "Never commit to" in prompt
+        assert GIT_WORKFLOW_HEADER not in prompt
+
+
+def test_researcher_instructions_research_only(project_root: Path) -> None:
+    _write_instructions(
+        project_root, "researcher.md", "Docs changes go through git_commit_docs."
+    )
+    research = load_system_prompt(TaskKind.RESEARCH, project_root=project_root)
+    assert ROLE_INSTRUCTIONS_HEADER in research
+    assert "Docs changes go through git_commit_docs." in research
+    # The coder fragment must not leak into the research prompt and vice
+    # versa: researcher.md is unknown to the coding agent.
+    assert load_role_instructions(project_root, CODER_INSTRUCTIONS_FILE) is None
+
+
+def test_instructions_fragment_after_git_workflow(project_root: Path) -> None:
+    drcode = project_root / ".drcode"
+    drcode.mkdir()
+    (drcode / "git-workflow.md").write_text("Commit only on a feature branch.")
+    _write_instructions(project_root, CODER_INSTRUCTIONS_FILE, "Titles in Russian.")
+    prompt = load_system_prompt(TaskKind.FEATURE, project_root=project_root)
+    assert GIT_WORKFLOW_HEADER in prompt
+    assert "Commit only on a feature branch." in prompt
+    assert ROLE_INSTRUCTIONS_HEADER in prompt
+    assert "Titles in Russian." in prompt
+    assert prompt.index(GIT_WORKFLOW_HEADER) < prompt.index(ROLE_INSTRUCTIONS_HEADER)
+    # AGENTS.md is appended even later (in agent_build, not here) — the
+    # instructions fragment never displaces it.
+
+
+def test_tester_instructions_all_three_variants(project_root: Path) -> None:
+    _write_instructions(project_root, "tester.md", "Never approve flaky tests.")
+    for allow_commit, allow_push in ((True, True), (False, True), (True, False)):
+        prompt = load_tester_prompt(
+            allow_commit, project_root=project_root, allow_push=allow_push
+        )
+        assert ROLE_INSTRUCTIONS_HEADER in prompt
+        assert "Never approve flaky tests." in prompt
+
+
+def test_blank_instructions_file_adds_nothing(project_root: Path) -> None:
+    _write_instructions(project_root, CODER_INSTRUCTIONS_FILE, "\n\n")
+    prompt = load_system_prompt(TaskKind.FEATURE, project_root=project_root)
+    assert ROLE_INSTRUCTIONS_HEADER not in prompt
 
 
 def test_project_prompt_override_wins(project_root: Path) -> None:

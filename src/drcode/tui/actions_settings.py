@@ -39,7 +39,13 @@ from ..settings import (
     parallel_tasks_label,
     subagents_label,
 )
-from ..workflow import load_git_workflow
+from ..workflow import (
+    CODER_INSTRUCTIONS_FILE,
+    RESEARCHER_INSTRUCTIONS_FILE,
+    TESTER_INSTRUCTIONS_FILE,
+    load_git_workflow,
+    load_role_instructions,
+)
 from .command_providers import (
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
@@ -821,6 +827,17 @@ class SettingsLayer(DrCodeState):
                 f"{'present' if load_git_workflow(self.project_root) else 'not present'}"
             )
         ]
+        # Per-role instruction fragments: three lines, present/not present.
+        for role_file in (
+            CODER_INSTRUCTIONS_FILE,
+            RESEARCHER_INSTRUCTIONS_FILE,
+            TESTER_INSTRUCTIONS_FILE,
+        ):
+            present = load_role_instructions(self.project_root, role_file) is not None
+            parts.append(
+                f"Instructions: .drcode/instructions/{role_file} — "
+                f"{'present' if present else 'not present'}"
+            )
         hooks = self.workflow
         if hooks is None:
             parts.append("Hooks: .drcode/workflow.py — not present")

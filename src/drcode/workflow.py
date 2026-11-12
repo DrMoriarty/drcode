@@ -182,6 +182,15 @@ from .tools import (
 WORKFLOW_SCRIPT = "workflow.py"
 GIT_WORKFLOW_FILE = "git-workflow.md"
 
+# Per-role instruction fragments (`.drcode/instructions/<role>.md`): pure
+# ADDITIONS to the system prompts of the three in-scope roles (the conflict
+# resolver and the read-only subagents never receive them). Absent/blank
+# file = nothing is added, never fatal.
+INSTRUCTIONS_SUBDIR = "instructions"
+CODER_INSTRUCTIONS_FILE = "coder.md"  # coding agent: feature + bug tasks
+RESEARCHER_INSTRUCTIONS_FILE = "researcher.md"  # research tasks
+TESTER_INSTRUCTIONS_FILE = "tester.md"  # the QA tester (all git-policy variants)
+
 # Template files scaffolded on app start (never overwritten): the user
 # activates a workflow layer by renaming the template to the real name.
 WORKFLOW_EXAMPLE_FILE = "workflow.py.example"
@@ -615,20 +624,108 @@ GIT_WORKFLOW_EXAMPLE_CONTENT = """\
 - After development, push the branch and open a PR (`gh pr create`).
 """
 
+# Per-role instruction templates (`.drcode/instructions/<role>.md.example`):
+# ready-to-edit preference sheets, appended verbatim to the corresponding
+# role's system prompt under a dedicated header — a pure addition, nothing
+# is replaced. The conflict resolver and the read-only subagents never
+# receive them.
+CODER_INSTRUCTIONS_EXAMPLE_CONTENT = """\
+<!-- drcode per-role instructions for the CODING agent (template).
+
+     ACTIVATION: rename this file to `coder.md` (keep it in the project's
+     `.drcode/instructions/` directory) and edit the rules below. drcode
+     scaffolds this template on every start, but NEVER overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     coding agent's system prompt (feature and bug tasks alike) under a
+     dedicated header — nothing is replaced. Write plain prose
+     preferences: task hygiene, communication style, scope discipline —
+     the agent follows them literally. -->
+
+# Coding agent instructions
+
+## Goals and tasks
+
+- Link a task to a product goal via goal_id when the match is obvious;
+  never invent a goal for the sake of linking.
+- Task titles in Russian.
+- Never create tasks unless explicitly asked.
+- Questions about the code are answered directly, not turned into
+  research tasks.
+
+## Scope
+
+- Minimal diff by default; refactor only what the task requires.
+"""
+
+RESEARCHER_INSTRUCTIONS_EXAMPLE_CONTENT = """\
+<!-- drcode per-role instructions for the RESEARCH agent (template).
+
+     ACTIVATION: rename this file to `researcher.md` (keep it in the
+     project's `.drcode/instructions/` directory) and edit the rules
+     below. drcode scaffolds this template on every start, but NEVER
+     overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     research agent's system prompt under a dedicated header — nothing is
+     replaced. Write plain prose preferences — the agent follows them
+     literally. Note: the research agent's git behavior (committing docs
+     changes) is governed by the project's git policy and the
+     `.drcode/git-workflow.md` rules — keep these instructions consistent
+     with both, they never override either. -->
+
+# Research agent instructions
+
+## Goals and tasks
+
+- Link a task to a product goal via goal_id when the match is obvious;
+  never invent a goal for the sake of linking.
+- Task titles in Russian.
+- Never create tasks unless explicitly asked.
+- Questions about the code are answered directly, not turned into
+  research tasks.
+"""
+
+TESTER_INSTRUCTIONS_EXAMPLE_CONTENT = """\
+<!-- drcode per-role instructions for the TESTER (template).
+
+     ACTIVATION: rename this file to `tester.md` (keep it in the project's
+     `.drcode/instructions/` directory) and edit the rules below. drcode
+     scaffolds this template on every start, but NEVER overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     tester's system prompt under a dedicated header — nothing is
+     replaced. One fragment serves all three tester git-policy variants
+     (tester.md / tester_no_commit.md / tester_commit_no_push.md). Write
+     plain prose preferences — the tester follows them literally. -->
+
+# Tester instructions
+
+## Verification focus
+
+- Run the narrowest test selection that covers the change first; the
+  broad suite only for cross-module work.
+- Report flaky tests as such — do not silently retry them away.
+"""
+
 
 def ensure_workflow_examples(project_root: Path) -> None:
-    """Scaffold the two workflow templates in `<project>/.drcode/`.
+    """Scaffold the workflow templates in `<project>/.drcode/`.
 
     On every app start the project's `.drcode/` gets `workflow.py.example`
     and `git-workflow.md.example` — short, ready-to-edit templates that
-    document the user-activatable workflow features (hooks / git rules).
-    Existing files are NEVER overwritten (a user's edited template or an
-    already-renamed real file stays untouched; a real `workflow.py` /
-    `git-workflow.md` does not suppress the template — the pair is
-    independent documentation). Never raises: an unwritable project
-    directory just means no templates.
+    document the user-activatable workflow features (hooks / git rules) —
+    plus the per-role instruction templates
+    `.drcode/instructions/{coder,researcher,tester}.md.example` (the
+    `.drcode/instructions/` directory is created on demand). Existing files
+    are NEVER overwritten (a user's edited template or an already-renamed
+    real file stays untouched; a real `workflow.py` / `git-workflow.md` /
+    `<role>.md` does not suppress the template — the pair is independent
+    documentation). Never raises: an unwritable project directory just
+    means no templates.
     """
     drcode_dir = project_root / ".drcode"
+    instructions_dir = drcode_dir / INSTRUCTIONS_SUBDIR
     try:
         drcode_dir.mkdir(parents=True, exist_ok=True)
         for name, content in (
@@ -636,6 +733,22 @@ def ensure_workflow_examples(project_root: Path) -> None:
             (GIT_WORKFLOW_EXAMPLE_FILE, GIT_WORKFLOW_EXAMPLE_CONTENT),
         ):
             path = drcode_dir / name
+            if path.exists():
+                continue
+            path.write_text(content, encoding="utf-8")
+        instructions_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in (
+            (f"{CODER_INSTRUCTIONS_FILE}.example", CODER_INSTRUCTIONS_EXAMPLE_CONTENT),
+            (
+                f"{RESEARCHER_INSTRUCTIONS_FILE}.example",
+                RESEARCHER_INSTRUCTIONS_EXAMPLE_CONTENT,
+            ),
+            (
+                f"{TESTER_INSTRUCTIONS_FILE}.example",
+                TESTER_INSTRUCTIONS_EXAMPLE_CONTENT,
+            ),
+        ):
+            path = instructions_dir / name
             if path.exists():
                 continue
             path.write_text(content, encoding="utf-8")
@@ -927,6 +1040,24 @@ def load_git_workflow(project_root: Path | None) -> str | None:
     if project_root is None:
         return None
     path = project_root / ".drcode" / GIT_WORKFLOW_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    stripped = text.strip()
+    return stripped or None
+
+
+def load_role_instructions(project_root: Path | None, role_file: str) -> str | None:
+    """The project's per-role instruction fragment
+    `.drcode/instructions/<role_file>` (stripped), or None when the file is
+    absent or blank. Pure-addition prompt layer for the three in-scope
+    roles (coder / researcher / tester — see the file-name constants);
+    unlike `load_git_workflow` it replaces nothing. A missing or unreadable
+    file is never fatal: it just means no instructions for that role."""
+    if project_root is None or not role_file:
+        return None
+    path = project_root / ".drcode" / INSTRUCTIONS_SUBDIR / role_file
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):

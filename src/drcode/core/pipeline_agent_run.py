@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -233,6 +234,16 @@ class PipelineAgentRunLayer(CoreState):
                 workflow_instructions,
                 subagent_gate,
             ) = await self._prepare_agent_run(task, task_id, role, generation)
+            # Pre-run forced compaction (project setting
+            # compaction_resume_min_tokens): when the task waited long
+            # enough for the provider's prefix cache to burn out and its
+            # transcript is over the token threshold, compact it BEFORE
+            # the first turn's history is built — the cold re-read then
+            # happens over a compacted transcript. All other conditions
+            # (first activation, short idle, small fill) skip silently
+            # and the ordinary threshold gate below keeps working as
+            # before. Never fatal: the helper swallows its own failures.
+            await self._maybe_compact_after_idle(task)
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
             # once and is NEVER re-queued/re-sent. Each activation first
@@ -438,6 +449,15 @@ class PipelineAgentRunLayer(CoreState):
                 # record has served its purpose. (Guarded: a superseded run
                 # must not drop a newer run's record.)
                 self._consumed_prompts.pop(task_id, None)
+                # Stamp the moment the run stopped writing to the
+                # transcript (every exit path lands here: normal end,
+                # abort, failure, awaiting-clarification). The pre-run
+                # compaction gate measures its idle gap against this
+                # stamp — a superseded run must not re-stamp (it would
+                # shorten the pause the newer run's gate will see; the
+                # newer run re-stamps at its own end anyway).
+                task.last_run_end = datetime.now(UTC)
+                self.manager.storage.save(task)
             # A cancelled run (user abort, or a newer run taking over) must
             # not restart the pipeline: the abort stops everything until the
             # user acts, and the newer run advances on its own completion.

@@ -587,6 +587,20 @@ class ProjectSettings(BaseModel):
     # auto-derive from the terminal locale (LC_ALL/LC_MESSAGES/LANG, falling
     # back to the Python locale; anything non-Russian reads as English).
     voice_language: str = ""
+    # Pre-run compaction of a cold-resume transcript (project setting):
+    # a THRESHOLD IN TOKENS (not a percent). When a task is re-activated
+    # after its previous run ended ≥ 3 minutes ago (retry_here after the
+    # tester, out of awaiting-clarification, an unfinished resume — any
+    # path where the provider's prompt cache has long burned out) and the
+    # estimated context fill of its dev/research transcript EXCEEDS this
+    # value, the transcript is force-compacted BEFORE the first turn, so
+    # the cold re-read happens over a compact history instead of the full
+    # one (see core/pipeline_compaction._maybe_compact_after_idle).
+    # Values below 20000 (including the 0 default) keep the feature off —
+    # a threshold low enough to fire on healthy sessions would compact
+    # transcripts the ordinary threshold gate never touches, trading
+    # cache warmth for summarizer calls for nothing.
+    compaction_resume_min_tokens: int = 0
 
     @field_validator("role_max_tokens", mode="before")
     @classmethod
@@ -605,6 +619,18 @@ class ProjectSettings(BaseModel):
             and not isinstance(v, bool)
             and int(v) > 0
         }
+
+    @field_validator("compaction_resume_min_tokens", mode="before")
+    @classmethod
+    def _clean_compaction_resume_min_tokens(cls, value: object) -> object:
+        """Coerce junk to the disabled default instead of invalidating the
+        WHOLE settings file (a typo in settings.json must never strip the
+        other preferences — the wholesale default fallback of load() is
+        reserved for structural corruption). Negative values clamp to 0
+        (off); anything below 20000 stays persisted but means off."""
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return 0
+        return max(int(value), 0)
 
 
 # Valid keys of ProjectSettings.role_max_tokens: the AgentRole values

@@ -350,6 +350,19 @@ class Task(BaseModel):
     isolation_pinned: bool | None = None
     # Set while the agent is waiting for the user to answer a question.
     clarification: Clarification | None = None
+    # When the agent's last run STOPPED writing to this task's transcript
+    # (stamped in the run worker's finally: normal end, abort, failure,
+    # awaiting-clarification — any exit). The pre-run compaction gate
+    # (`compaction_resume_min_tokens`, see drcode.settings /
+    # core/pipeline_compaction._maybe_compact_after_idle) measures the
+    # idle gap against it: a run resuming ≥ 3 minutes later re-reads the
+    # transcript with a cold provider prefix cache, and a transcript over
+    # the threshold is compacted BEFORE that cold read. None = the task
+    # has never been run (first activation — nothing to compact yet);
+    # None for old task files (no migration needed). Superseded runs
+    # (a newer run of the same task took over) never stamp — the newer
+    # run re-stamps at its own end.
+    last_run_end: datetime | None = None
     # Service events (tester/agent failures, skips) with timestamps. Human
     # only: never serialized into the model context on resume.
     events: list[TaskEvent] = Field(default_factory=list)

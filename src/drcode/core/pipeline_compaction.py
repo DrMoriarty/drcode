@@ -99,6 +99,23 @@ _THRESHOLD_PROGRESS_OBS = 2
 # glue and per-message framing, so the trim aims a little below the window.
 _MECHANICAL_MARGIN_PCT = 5
 
+# Pre-run forced compaction (`compaction_resume_min_tokens`): the smallest
+# threshold in tokens the setting may have for the feature to be on at all
+# — anything below (including the 0 default) keeps it off. A threshold low
+# enough to fire on healthy sessions would compact transcripts the
+# ordinary threshold gate never touches, trading cache warmth for
+# summarizer calls for nothing.
+RESUME_COMPACTION_MIN_TOKENS = 20_000
+
+# Pre-run forced compaction: the minimum idle gap (seconds) since the
+# previous run stopped writing to the transcript before the gate may fire.
+# A provider's prompt cache survives minutes of idle at best — past this
+# the next request re-reads the whole transcript cold anyway, so paying
+# the summarizer to shrink it first cannot make anything worse. A constant,
+# deliberately not a setting: below it the cache is possibly still warm and
+# the ordinary threshold gate keeps working as before.
+RESUME_COMPACTION_MIN_IDLE_SECONDS = 180.0
+
 
 class _ChunkingImpossible(Exception):
     """The history cannot be chunked into map-reduce slices that fit the
@@ -1022,6 +1039,132 @@ class PipelineCompactionLayer(CoreState):
         self._live_ctx_tokens.pop(task.id, None)
         self._evicted_ctx_tokens.pop(task.id, None)
         self._show_event(task, event)
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+
+    async def _maybe_compact_after_idle(self, task: Task) -> None:
+        """Pre-run forced compaction of a cold-resume transcript (project
+        setting `compaction_resume_min_tokens`).
+
+        When a task is re-activated after its previous run ended ≥
+        RESUME_COMPACTION_MIN_IDLE_SECONDS ago (a retry_here fix round
+        after the tester, out of awaiting-clarification, an unfinished
+        resume — any path where the provider's prefix cache has long
+        burned out) and the estimated context fill of its dev/research
+        transcript EXCEEDS the configured token threshold, the transcript
+        is force-compacted BEFORE the first turn: the cold re-read then
+        happens over a compact history instead of the full one. Applied
+        to both roles alike — the fill is measured against the role
+        actually serving the transcript (`_task_role`).
+
+        One-shot, deliberately NOT the mid-run gate machinery: the
+        livelock counters (`_threshold_compactions` /
+        `_hard_limit_compactions`) are never touched and there is no
+        pause→compact→resume — the compaction runs inline before the
+        first turn, and the ordinary `_maybe_compact` gate continues to
+        guard the run from there. Never fatal: a summarizer failure is
+        logged and the run proceeds uncompressed; a failed summarizer is
+        not retried on every subsequent activation either (`_compaction_failed`
+        latches the degradation into "run without pre-run compaction"
+        until some later compaction succeeds).
+
+        Fired only when EVERY condition holds — a setting below
+        RESUME_COMPACTION_MIN_TOKENS, a shorter idle gap, a first-ever
+        activation (no previous run to have written the transcript) or a
+        fill at/below the threshold all skip the gate silently (the
+        cache may still be warm — the run starts as before)."""
+        threshold = self.settings.compaction_resume_min_tokens
+        if threshold < RESUME_COMPACTION_MIN_TOKENS:
+            return
+        if task.last_run_end is None:
+            # First activation: no previous run ever wrote this
+            # transcript — there is nothing a compaction could warm up.
+            return
+        idle = (datetime.now(UTC) - task.last_run_end).total_seconds()
+        if idle < RESUME_COMPACTION_MIN_IDLE_SECONDS:
+            return
+        if task.id in self._compaction_failed:
+            # The summarizer failed before: degrade to running without
+            # the pre-run compaction instead of repeating a futile
+            # (and delaying) attempt on every activation.
+            return
+        role = self._task_role(task)
+        tokens = self._apply_eviction_credit(
+            task.id, last_context_tokens(task.messages)
+        )
+        if not tokens or tokens <= threshold:
+            return
+        _, rest = split_original_prompts(task.messages)
+        if not any(not is_summary_message(m) for m in rest):
+            # Only the original prompt(s) plus a previous summary are
+            # left — compacting again would be a no-op.
+            return
+        # Honor the agent's remaining mark_unneeded marks before the
+        # summarizer is even considered (the forced half of the
+        # _maybe_compact pattern), then re-measure with the eviction
+        # credit applied — one unloading can pull the fill back under
+        # the threshold and spare the summarizer entirely.
+        self._maybe_evict_marked(task, force=True)
+        tokens = self._apply_eviction_credit(
+            task.id, last_context_tokens(task.messages)
+        )
+        if not tokens or tokens <= threshold:
+            return
+        minutes = int(idle // 60)
+        self._show_event(
+            task,
+            f"Idle {minutes} min — the prompt cache has expired; compacting "
+            f"history before the run (fill ≈{tokens} tokens)…",
+        )
+        old_messages = task.messages
+        try:
+            compacted = await self._compact_transcript(
+                old_messages,
+                summary_role=role,
+                task=task,
+                what="history",
+                checklist=(
+                    render_todos(task.todos)
+                    if task.kind is TaskKind.FEATURE and task.todos
+                    else None
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - compaction must not kill the run
+            self._compaction_failed.add(task.id)
+            self._show_event(
+                task,
+                f"Pre-run compaction failed: {type(e).__name__}: {e} — "
+                "continuing with the uncompressed history.",
+            )
+            return
+        new_messages, event, llm_failed, mechanical = compacted
+        if llm_failed:
+            self._compaction_failed.add(task.id)
+        else:
+            self._compaction_failed.discard(task.id)
+        self._archive_transcript_replacement(
+            task,
+            old_messages,
+            new_messages,
+            hard=False,
+            mechanical=mechanical,
+        )
+        task.messages = new_messages
+        task.touch()
+        self.manager.storage.save(task)
+        # The fill figures below are persisted-transcript estimates (no
+        # live reading exists at run start); the credit belongs to the
+        # old transcript — the summary was built from the lightened
+        # history, so drop it with the stale live reading.
+        self._live_ctx_tokens.pop(task.id, None)
+        self._evicted_ctx_tokens.pop(task.id, None)
+        after = last_context_tokens(task.messages)
+        self._show_event(
+            task,
+            f"{event} (pre-run compaction: ≈{tokens} → ≈{after} tokens).",
+        )
         if self.viewed_id == task.id:
             self.view_task(task.id)
 

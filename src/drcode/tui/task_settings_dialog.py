@@ -41,6 +41,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Input,
     Label,
     RadioButton,
     RadioSet,
@@ -105,6 +106,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
     dst.todo_tail = src.todo_tail
+    dst.compaction_resume_min_tokens = src.compaction_resume_min_tokens
     dst.worktree_removal = src.worktree_removal
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
@@ -406,6 +408,18 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     classes="ts-label",
                 )
                 yield Switch(value=d.todo_tail, id="ts-todo-tail")
+                yield Label(
+                    "Pre-run compaction threshold (tokens) — when a task "
+                    "resumes after ≥3 min idle (cache burnt out) and its "
+                    "transcript exceeds this fill, compact it before the "
+                    "first turn; below 20000 = off",
+                    classes="ts-label",
+                )
+                yield Input(
+                    value=str(d.compaction_resume_min_tokens),
+                    id="ts-compaction-resume",
+                    placeholder="0 = off (minimum 20000)",
+                )
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -584,6 +598,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if tail_switch.value != d.todo_tail:
             with self.prevent(Switch.Changed):  # same staleness rule
                 tail_switch.value = d.todo_tail
+        resume_input = self.query_one("#ts-compaction-resume", Input)
+        if resume_input.value != str(d.compaction_resume_min_tokens):
+            with self.prevent(Input.Changed):  # same staleness rule
+                resume_input.value = str(d.compaction_resume_min_tokens)
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -606,6 +624,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
             "#ts-todo-tail": d.todo_tail != o.todo_tail,
+            "#ts-compaction-resume": (
+                d.compaction_resume_min_tokens != o.compaction_resume_min_tokens
+            ),
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
@@ -834,6 +855,21 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _todo_tail_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.todo_tail:
             self._draft.todo_tail = event.value
+            self._refresh()
+
+    @on(Input.Changed, "#ts-compaction-resume")
+    def _compaction_resume_changed(self, event: Input.Changed) -> None:
+        """Parse the threshold field: empty/garbage keeps the previous
+        draft value (the user may be mid-typing — the placeholder names
+        the minimum), a number clamps to ≥ 0 (anything below 20000 is
+        persisted but means off — see the ProjectSettings docstring)."""
+        text = event.value.strip()
+        try:
+            value = max(int(text), 0) if text else 0
+        except ValueError:
+            return
+        if value != self._draft.compaction_resume_min_tokens:
+            self._draft.compaction_resume_min_tokens = value
             self._refresh()
 
     @on(Button.Pressed, ".ts-fix")

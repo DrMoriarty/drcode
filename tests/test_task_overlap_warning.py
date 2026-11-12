@@ -194,6 +194,17 @@ def test_depends_on_tasks_are_excluded(manager: TaskManager) -> None:
     assert overlaps == []
 
 
+def test_extra_exclude_ids_are_excluded(manager: TaskManager) -> None:
+    other = manager.create("First feature", "Edit src/drcode/merge_resolver.py")
+    overlaps = find_file_overlaps(
+        manager.tasks,
+        "Second feature editing src/drcode/merge_resolver.py",
+        exclude_id="nonexistent",
+        exclude_ids=[other.id],
+    )
+    assert overlaps == []
+
+
 def test_report_is_capped_to_top_tasks_and_files(manager: TaskManager) -> None:
     file_count = MAX_WARNED_FILES + 5
     many_files = " ".join(f"src/mod_{i}.py" for i in range(file_count))
@@ -295,6 +306,52 @@ def test_create_report_task_draft_also_warns(manager: TaskManager) -> None:
     assert task.status is TaskStatus.DRAFT
     assert "Warning:" in text
     assert f"#{running.id}" in text
+
+
+def test_research_run_does_not_warn_about_itself(manager: TaskManager) -> None:
+    """The #d6c7d687 incident: an ACTIVE research task filing a report
+    about the files it is currently studying got a file-overlap warning
+    naming its own task — its skeleton prompts/edited_files mention the
+    same paths by construction. The serving task must be excluded from
+    the scan when it is a research task."""
+    from drcode.agent_build import AgentDeps
+    from drcode.tools import scratch_dir
+
+    research = manager.create(
+        "Investigate models.json handling",
+        "Study how src/drcode/models.json is loaded and saved",
+        kind=TaskKind.RESEARCH,
+    )
+    research.status = TaskStatus.ACTIVE
+    research.edited_files.append("src/drcode/models.json")
+    deps = AgentDeps(
+        root=manager.storage.root,
+        manager=manager,
+        task_id=research.id,
+        scratch=scratch_dir(research.id),
+    )
+    task, text = agent_tools._create_report_task(
+        deps,
+        "models.json corruption",
+        "Saving src/drcode/models.json can wipe the provider catalog "
+        "when the store is default-constructed",
+        kind=TaskKind.BUG,
+        creator="research agent",
+    )
+    assert "Warning:" not in text
+    assert task.events == []
+    # A DIFFERENT unfinished task mentioning the same files still warns.
+    other = manager.create("Catalog rework", "Rework src/drcode/models.json loading")
+    _task2, text2 = agent_tools._create_report_task(
+        deps,
+        "models.json race",
+        "Concurrent writes to src/drcode/models.json can lose updates",
+        kind=TaskKind.BUG,
+        creator="research agent",
+    )
+    assert "Warning:" in text2
+    assert f"#{other.id}" in text2
+    assert f"#{research.id}" not in text2
 
 
 # --- integration: the headless CLI ---------------------------------------------

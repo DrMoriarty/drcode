@@ -273,11 +273,25 @@ def _file_overlap_warning(
     still a parameter it can pass on the next call. Never raises and
     never blocks: a scan failure must not fail a task creation."""
     try:
+        # The task the creating run itself serves (deps.task_id) is
+        # excluded when it is a research task: its description/skeleton
+        # almost always mentions the very files the report is about, so
+        # the scan would otherwise warn the run about itself (the
+        # #d6c7d687 incident). The tester path needs nothing here — the
+        # verified task is already listed in the new report's
+        # depends_on (agent_tools._retry-style creation).
+        extra_excluded: list[str] = []
+        # .tasks.get, not manager.get: the latter raises KeyError for an
+        # unknown id and deps.task_id may not even exist (test stand-ins).
+        current = deps.manager.tasks.get(deps.task_id)
+        if current is not None and current.kind is TaskKind.RESEARCH:
+            extra_excluded.append(current.id)
         overlaps = find_file_overlaps(
             deps.manager.tasks,
             f"{task.title}\n{description}",
             exclude_id=task.id,
             depends_on=task.depends_on,
+            exclude_ids=extra_excluded,
         )
     except Exception as e:  # noqa: BLE001 - a warning must never break creation
         print(

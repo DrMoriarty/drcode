@@ -132,19 +132,22 @@ def find_file_overlaps(
     *,
     exclude_id: str,
     depends_on: list[str] | None = None,
+    exclude_ids: list[str] | None = None,
 ) -> list[TaskFileOverlap]:
     """Unfinished tasks (any status but COMPLETED) whose description or
     tracked `edited_files` share path tokens with `description`.
 
     The new task never matches itself (`exclude_id`), tasks it already
     declared as `depends_on` are skipped (a declared dependency is
-    exactly the mitigation this scan recommends), and the result is
-    ordered deterministically: most overlapping files first, then the
-    task id."""
+    exactly the mitigation this scan recommends) — as are the extra
+    `exclude_ids` (e.g. the task the creating agent's own run serves:
+    a research run filing a report about the files it is studying must
+    not warn about itself), and the result is ordered deterministically:
+    most overlapping files first, then the task id."""
     new_tokens = extract_path_tokens(description)
     if not new_tokens:
         return []
-    excluded = {exclude_id, *(depends_on or [])}
+    excluded = {exclude_id, *(depends_on or []), *(exclude_ids or [])}
     overlaps: list[TaskFileOverlap] = []
     for task_id, task in tasks.items():
         if task_id in excluded or task.status is TaskStatus.COMPLETED:

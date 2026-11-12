@@ -530,8 +530,16 @@ class PipelineAgentRunLayer(CoreState):
             # hook provided, but injected at the request TAIL so a checklist
             # mutation never invalidates the cached leading prefix (the
             # #a0a55d3d production incident). Non-feature tasks and empty
-            # lists yield None (pass-through).
-            todo_supplier=partial(self._todo_tail_block, task_id),
+            # lists yield None (pass-through). Opt-in via the project's
+            # todo_tail setting: when off the model is not wrapped at all —
+            # no request modification whatsoever (the checklist still lives
+            # in task.todos and stays visible in the TUI). Read at
+            # activation, so a toggle applies to the next activation.
+            todo_supplier=(
+                partial(self._todo_tail_block, task_id)
+                if self.settings.todo_tail
+                else None
+            ),
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         return root, agent, workflow_instructions, subagent_gate

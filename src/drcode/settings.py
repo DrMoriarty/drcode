@@ -486,6 +486,16 @@ class ProjectSettings(BaseModel):
     # frozen texts, no big old tool returns); leaving it out keeps the
     # request framing minimal everywhere else.
     eviction_hint: bool = False
+    # Live todo tail (agent_model.TodoTailModel): when on, every model
+    # request of a feature-task run carries a synthetic TAIL message with
+    # the task's current checklist state (recomputed per request, see
+    # agent_build.build_agent). Off (the default): the model is NOT wrapped
+    # at all — no request modification whatsoever; the checklist still
+    # lives in task.todos and is visible in the TUI, the model just never
+    # receives it. Opt-in because the tail changes the request framing and
+    # costs tokens on every request, which some setups don't want. Read at
+    # activation, so a toggle applies to the next activation of each task.
+    todo_tail: bool = False
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

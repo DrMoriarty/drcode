@@ -427,6 +427,73 @@ def test_build_agent_wraps_model_only_with_supplier(fake_config: Config) -> None
     assert not isinstance(build_agent(fake_config).model, TodoTailModel)
 
 
+def test_todo_tail_defaults_off_in_settings(project_root: Path) -> None:
+    """ProjectSettings.todo_tail defaults to False (opt-in feature)."""
+    from drcode.settings import ProjectSettings
+
+    assert ProjectSettings().todo_tail is False
+
+
+def test_todo_tail_setting_persisted(project_root: Path) -> None:
+    """The flag round-trips through the project settings store, so a
+    toggle applies to the next activation of each task."""
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(todo_tail=True))
+    assert ProjectSettingsStore(project_root).load().todo_tail is True
+    store.save(ProjectSettings(todo_tail=False))
+    assert ProjectSettingsStore(project_root).load().todo_tail is False
+
+
+async def test_todo_tail_supplier_gated_by_setting(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline wires the todo supplier only when the project's
+    todo_tail setting is on: off (the default) the built agent's model is
+    never wrapped — no request modification whatsoever."""
+    from drcode import agent_model
+    from drcode.core import pipeline_agent_run
+    from drcode.models import TaskKind
+    from tests.network_mocks import ScriptedState, text_response, wait_until
+
+    monkeypatch.setenv("DRCODE_MODEL", "mock-model")
+    monkeypatch.setenv("DRCODE_API_KEY", "mock-key")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://127.0.0.1:1/v1")
+    state = ScriptedState()
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    supplied: list[object] = []
+    real_build_agent = pipeline_agent_run.build_agent
+
+    def spy_build_agent(config, **kwargs):  # type: ignore[no-untyped-def]
+        supplied.append(kwargs.get("todo_supplier"))
+        return real_build_agent(config, **kwargs)
+
+    monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
+
+    app = DrCodeApp(project_root)
+    app.settings.verification = app.settings.verification.__class__.NONE
+    app.manager.create("f", "build it", kind=TaskKind.FEATURE)
+    state.steps = [text_response("done")]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(lambda: len(supplied) == 1, pilot, what="agent built")
+        # Default off: no supplier passed at all.
+        assert supplied == [None]
+
+        # Toggle on (the dialog's Apply path): the NEXT activation wires
+        # the live supplier.
+        app.settings.todo_tail = True
+        second = app.manager.create("f2", "build more", kind=TaskKind.FEATURE)
+        state.steps = [text_response("done again")]
+        await pilot.pause()
+        app._advance()
+        await wait_until(lambda: len(supplied) == 2, pilot, what="second agent built")
+        assert callable(supplied[1])
+        # The supplier is the per-task partial over _todo_tail_block.
+        assert supplied[1].args == (second.id,)  # type: ignore[attr-defined]
+
+
 async def test_todo_tail_streaming_request(
     manager, fake_config: Config, project_root: Path
 ) -> None:

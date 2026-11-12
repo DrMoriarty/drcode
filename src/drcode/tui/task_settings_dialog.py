@@ -104,6 +104,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.agent_creates_drafts = src.agent_creates_drafts
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
+    dst.todo_tail = src.todo_tail
     dst.worktree_removal = src.worktree_removal
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
@@ -397,6 +398,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     classes="ts-label",
                 )
                 yield Switch(value=d.eviction_hint, id="ts-eviction-hint")
+                yield Label(
+                    "Live todo tail — attach the task's live checklist to "
+                    "every model request as a trailing message (off: the "
+                    "requests are never modified; the checklist stays in "
+                    "the TUI)",
+                    classes="ts-label",
+                )
+                yield Switch(value=d.todo_tail, id="ts-todo-tail")
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -571,6 +580,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if eviction_switch.value != d.eviction_hint:
             with self.prevent(Switch.Changed):  # same staleness rule
                 eviction_switch.value = d.eviction_hint
+        tail_switch = self.query_one("#ts-todo-tail", Switch)
+        if tail_switch.value != d.todo_tail:
+            with self.prevent(Switch.Changed):  # same staleness rule
+                tail_switch.value = d.todo_tail
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -592,6 +605,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
+            "#ts-todo-tail": d.todo_tail != o.todo_tail,
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
@@ -814,6 +828,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _eviction_hint_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.eviction_hint:
             self._draft.eviction_hint = event.value
+            self._refresh()
+
+    @on(Switch.Changed, "#ts-todo-tail")
+    def _todo_tail_changed(self, event: Switch.Changed) -> None:
+        if event.value != self._draft.todo_tail:
+            self._draft.todo_tail = event.value
             self._refresh()
 
     @on(Button.Pressed, ".ts-fix")

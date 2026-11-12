@@ -361,6 +361,59 @@ def test_child_environment_forces_terminal_caps() -> None:
     assert "COLUMNS" not in env and "LINES" not in env
 
 
+def test_child_environment_augments_gui_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GUI launches (Finder/Dock) give the process the bare OS PATH with
+    no shell profile sourced; child_environment() must append the standard
+    tool directories without reordering or duplicating what's there."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    env = child_environment()
+    entries = env["PATH"].split(os.pathsep)
+    # The user's entries survive, in order, at the front.
+    assert entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    # Standard directories that were missing are appended.
+    assert "/opt/homebrew/bin" in entries
+    assert "/usr/local/bin" in entries
+    # No entry appears twice.
+    assert len(entries) == len(set(entries))
+
+
+def test_child_environment_path_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Already-present directories are never duplicated."""
+    monkeypatch.setenv("HOME", "/home/tester")
+    rich = os.pathsep.join(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/tester/.local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+    )
+    monkeypatch.setenv("PATH", rich)
+    env = child_environment()
+    entries = env["PATH"].split(os.pathsep)
+    # Existing entries keep their order and their head position.
+    assert entries[:5] == rich.split(os.pathsep)
+    # No entry appears twice.
+    assert len(entries) == len(set(entries))
+
+
+def test_child_environment_path_expands_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/tester")
+    env = child_environment()
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[:2] == ["/usr/bin", "/bin"]
+    assert "/home/tester/.local/bin" in entries
+    assert "/home/tester/.cargo/bin" in entries
+
+
 def test_payload_argv() -> None:
     assert payload_argv("/bin/drcode") == ["/bin/drcode"]
     assert payload_argv("/bin/drcode", ["--flag"]) == ["/bin/drcode", "--flag"]

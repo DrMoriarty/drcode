@@ -25,9 +25,38 @@ from pathlib import Path
 
 # Forced child environment. Everything else is inherited from the shell
 # that launched the app (DISPLAY/WAYLAND_DISPLAY, SSH_AUTH_SOCK, PATH...).
+# PATH is special-cased below: a GUI launch has no shell to source it.
 _CHILD_ENV_OVERRIDES: dict[str, str] = {
     "TERM": "xterm-256color",
     "COLORTERM": "truecolor",
+}
+
+# Standard tool directories appended to a meagre PATH. When the app is
+# started from Finder/Dock/a .desktop launcher there is no parent shell,
+# so the inherited PATH is the OS default (on macOS just
+# /usr/bin:/bin:/usr/sbin:/sbin) and brew/uv/cargo tools become invisible
+# to the agents running inside the PTY. These are appended at the END —
+# never reordering or shadowing the parent's entries — and only those
+# not already present (idempotent). Missing directories are harmless in
+# PATH and are not checked for existence.
+_PLATFORM_PATH_DIRS: dict[str, list[str]] = {
+    "darwin": [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt/local/bin",  # MacPorts
+        "~/.local/bin",
+        "~/.cargo/bin",
+    ],
+    # Linux: /usr/local/bin and friends are usually already there from
+    # the distro default; the idempotent append costs nothing.
+    "linux": [
+        "~/.local/bin",
+        "~/.cargo/bin",
+        "/snap/bin",
+        "/usr/local/bin",
+    ],
 }
 
 # The PTY's line discipline strips these before the program sees them;
@@ -35,6 +64,18 @@ _CHILD_ENV_OVERRIDES: dict[str, str] = {
 _CHILD_ENV_UNSET = ("COLUMNS", "LINES")
 
 READ_CHUNK = 65536
+
+
+def _augment_path(path: str) -> str:
+    """Append missing standard tool directories to a PATH value."""
+    existing = path.split(os.pathsep)
+    seen = {entry for entry in existing if entry}
+    for raw in _PLATFORM_PATH_DIRS.get(sys.platform, []):
+        entry = os.path.expanduser(raw)
+        if entry not in seen:
+            existing.append(entry)
+            seen.add(entry)
+    return os.pathsep.join(part for part in existing if part)
 
 
 def child_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -45,6 +86,9 @@ def child_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     env.update(_CHILD_ENV_OVERRIDES)
     if not env.get("LANG"):
         env["LANG"] = "en_US.UTF-8"
+    # A GUI launch (Finder/Dock/.desktop) has no shell to source profile
+    # files, so PATH misses the usual tool directories — add them.
+    env["PATH"] = _augment_path(env.get("PATH", os.defpath))
     if extra:
         env.update(extra)
     return env

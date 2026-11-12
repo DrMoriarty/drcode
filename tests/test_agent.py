@@ -1060,6 +1060,61 @@ async def test_run_bash_logged_converts_violation(deps: AgentDeps) -> None:
     assert task.events[-1].kind == "permission"
 
 
+# -- bash network guard: the web_fetch availability seam -----------------------------
+#
+# check_command refuses external shell requests for every role; WHO gets the
+# refusal text decides only whether it points at web_fetch (research with the
+# fetch tool enabled) or says external access is closed (everyone else).
+
+
+def _fetch_gate() -> agent_mod.WebFetchGate:
+    return agent_mod.WebFetchGate(
+        agent_mod.WebFetchPolicy(
+            mode=agent_mod.web_fetch_policy(  # type: ignore[arg-type]
+                __import__(
+                    "drcode.settings", fromlist=["ProjectSettings"]
+                ).ProjectSettings()
+            ).mode
+        )
+    )
+
+
+def test_web_fetch_available_reads_the_deps_gate(deps: AgentDeps) -> None:
+    # No gate on plain coding deps → the model gets the "closed" wording.
+    assert agent_mod.web_fetch_available(deps) is False
+    with_gate = AgentDeps(
+        root=deps.root,
+        manager=deps.manager,
+        task_id=deps.task_id,
+        scratch=deps.scratch,
+        web_fetch_gate=_fetch_gate(),
+    )
+    assert agent_mod.web_fetch_available(with_gate) is True
+
+
+async def test_run_bash_logged_points_research_at_web_fetch(
+    deps: AgentDeps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal of a research run WITH web_fetch names the tool; the very
+    same command on coding deps is refused as "external access is closed"."""
+    research_deps = AgentDeps(
+        root=deps.root,
+        manager=deps.manager,
+        task_id=deps.task_id,
+        scratch=deps.scratch,
+        web_fetch_gate=_fetch_gate(),
+    )
+    with pytest.raises(ModelRetry, match="web_fetch tool instead"):
+        await agent_mod._run_bash_logged(
+            research_deps, deps.root, "curl https://example.com"
+        )
+    with pytest.raises(ModelRetry, match="closed for this agent"):
+        await agent_mod._run_bash_logged(deps, deps.root, "curl https://example.com")
+    # Both refusals land in the service-event log like any other violation.
+    task = deps.manager.get(deps.task_id)
+    assert [e.kind for e in task.events].count("permission") >= 2
+
+
 # -- tester git push -----------------------------------------------------------------
 
 

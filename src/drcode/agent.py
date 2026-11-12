@@ -108,6 +108,7 @@ from .tool_runtime import (
     _run_bash_logged,
     _run_tool,
     _run_tool_logged,
+    web_fetch_available,
 )
 from .transcript import (
     COMPACTION_RESUME_PREFIX,
@@ -252,6 +253,7 @@ __all__ = [
     "todo_instructions",
     "tools",
     "unwrap_summary_envelope",
+    "web_fetch_available",
     "web_fetch_policy",
     "web_fetch_policy_for",
 ]

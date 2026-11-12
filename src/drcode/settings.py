@@ -184,12 +184,13 @@ def subagents_label(count: int) -> str:
 class WebFetchMode(str, enum.Enum):
     """Whether the RESEARCH agent may read web pages (project setting).
 
-    The research agent gets a structured `web_fetch` tool instead of the
-    uncontrolled `curl`/`wget` inside run_bash — the tool is the only place
+    The research agent gets a structured `web_fetch` tool — the only place
     an outbound HTTP request is policy-checked, SSRF-guarded, size-capped
     and wrapped in an explicit "this is untrusted content" frame (see
-    `drcode.web_fetch`). The coding agent, the tester and the resolver
-    never get it.
+    `drcode.web_fetch`). run_bash is local-only regardless of this setting:
+    the bash network guard (`drcode.tools.check_command`) refuses external
+    requests of shell clients even when no `web_fetch` tool exists. The
+    coding agent, the tester and the resolver never get the tool.
 
     OFF (the default): the tool is not registered at all — the agent never
     sees it. ALLOWLIST: only hosts from `web_fetch_allow_hosts` (and their
@@ -561,12 +562,15 @@ class ProjectSettings(BaseModel):
     subagents_researcher: int = 0
     # Web access of the RESEARCH agent (WebFetchMode docstring): off (no
     # tool), allowlist (only web_fetch_allow_hosts + their subdomains) or
-    # all (every public host). The structured `web_fetch` tool replaces
-    # the uncontrolled `curl` inside run_bash: it is GET-only, SSRF-guarded
+    # all (every public host). The structured `web_fetch` tool is the only
+    # way an agent reads external pages: it is GET-only, SSRF-guarded
     # (private/loopback/link-local/metadata addresses are refused), size-
     # and time-capped, and every result is framed as untrusted content.
-    # Only the research role gets the tool — the coding agent, the tester
-    # and the resolver never do.
+    # run_bash is local-only regardless of this mode — the bash network
+    # guard refuses external requests of curl/wget/http/https/ftp even
+    # here, where the tool itself is unavailable. Only the research role
+    # gets the tool — the coding agent, the tester and the resolver never
+    # do.
     web_fetch_mode: WebFetchMode = WebFetchMode.OFF
     # Hosts the research agent may fetch in allowlist mode (allowlist mode
     # MEANS an entry here — with an empty list every fetch is refused with

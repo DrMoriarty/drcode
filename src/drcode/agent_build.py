@@ -111,6 +111,29 @@ def _scratch_desc(task_id: str | None) -> str:
     return str(tools.scratch_dir(task_id)) if task_id else "/tmp/drcode/<task-id>"
 
 
+def _network_desc(*, web_fetch_available: bool) -> str:
+    """The network half of a run_bash tool description.
+
+    External access belongs to the managed `web_fetch` tool, run_bash is
+    local-only — the model must know it BEFORE it tries `curl
+    https://example.com` and burns a round on the refusal (see the "bash
+    network guard" section in `drcode.tools`). An agent that has no
+    `web_fetch` tool in this run is told so plainly, so it does not go
+    looking for a replacement.
+    """
+    if web_fetch_available:
+        instead = "read web pages with the web_fetch tool, not from bash"
+    else:
+        instead = "there is no external network access in this run at all"
+    return (
+        "Network: external requests from bash are REFUSED (curl, wget, "
+        "http/https, ftp, and the redirect-following flags) — a shell "
+        "command may only reach the LOCAL machine: loopback addresses "
+        "(localhost, 127.0.0.0/8, ::1), e.g. a dev server or a test fixture "
+        f"started inside this project. For public pages {instead}."
+    )
+
+
 @dataclass
 class AgentDeps:
     """Dependencies for the coding agent: project root, task manager, task id.
@@ -574,7 +597,8 @@ def build_agent(
             "pass a\nlarger timeout for long-running commands (builds, test "
             "suites) —\nvalues above 3600 (60 minutes) are clamped to 3600.\n"
             "rm/mv/cp are only allowed with paths inside the project root or "
-            f"your\nscratch directory {scratch}."
+            f"your\nscratch directory {scratch}.\n"
+            f"{_network_desc(web_fetch_available=research_web_fetch is not None)}"
         )
     )
     async def run_bash(
@@ -1225,7 +1249,8 @@ def build_tester_agent(
             "pass a\nlarger timeout for long-running checks (full test "
             "suites, builds) —\nvalues above 3600 (60 minutes) are clamped "
             "to 3600.\nrm/mv/cp are only allowed with paths inside the "
-            f"project root or your\nscratch directory {scratch}."
+            f"project root or your\nscratch directory {scratch}.\n"
+            f"{_network_desc(web_fetch_available=False)}"
         )
     )
     async def run_bash(
@@ -1576,7 +1601,8 @@ def build_resolver_agent(
             "compiling a module) — NOT for committing, merging or\nthe full "
             "verification suite (the pipeline runs those checks itself\nand "
             "its verdict decides).\nrm/mv/cp are only allowed with paths "
-            f"inside the worktree or your\nscratch directory {scratch}."
+            f"inside the worktree or your\nscratch directory {scratch}.\n"
+            f"{_network_desc(web_fetch_available=False)}"
         )
     )
     async def run_bash(

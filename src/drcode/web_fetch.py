@@ -1,11 +1,15 @@
 """Managed web reading for the RESEARCH agent: the structured `web_fetch` tool.
 
 The research agent needs to read web pages (documentation, changelogs,
-issue threads), but `curl` inside `run_bash` is UNMANAGED: it can reach the
-cloud metadata service, follow a redirect into the LAN, pull a 500 MB
-tarball into the context, or hand a prompt-injection payload to the model
-with no framing at all. This module is the single place an outbound HTTP
-request of an agent goes through a policy:
+issue threads). A raw `curl` would be the wrong tool for it: an unmanaged
+shell client can reach the cloud metadata service, follow a redirect into
+the LAN, pull a 500 MB tarball into the context, or hand a
+prompt-injection payload to the model with no framing at all. External
+access therefore has exactly ONE path: this tool. run_bash is local-only —
+its network guard (`drcode.tools.check_command`) refuses external requests
+of curl/wget/http/https/ftp for every role, loopback excepted. This module
+is the single place an outbound HTTP request of an agent goes through a
+policy:
 
 - **GET only**, `http`/`https` only, port 80/443 only. No custom headers
   (`User-Agent`, `Accept`, `Accept-Language` are fixed), no cookies, no

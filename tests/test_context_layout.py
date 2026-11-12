@@ -153,8 +153,13 @@ def test_tool_schemas_follow_role_and_kind(project_root: Path) -> None:
     research = dict(coding_tool_schemas(config, TaskKind.RESEARCH, root=project_root))
     # todo — FEATURE only; create_* — RESEARCH only.
     assert "todo_create" in feature and "todo_create" not in bug
-    assert "create_bug_report" in research
-    assert "create_bug_report" not in feature and "create_bug_report" not in bug
+    for name in (
+        "create_bug_report",
+        "create_feature_request",
+        "create_research_task",
+    ):
+        assert name in research
+        assert name not in feature and name not in bug
     # Common tools everywhere; each entry carries name + docstring + schema.
     for tools in (feature, bug, research):
         assert "read_file" in tools and "run_bash" in tools

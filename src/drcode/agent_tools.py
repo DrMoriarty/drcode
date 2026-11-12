@@ -209,7 +209,8 @@ def _create_report_task(
     goal_id: str | None = None,
 ) -> tuple[Task, str]:
     """Shared body of the agents' task-creation tools (research:
-    create_bug_report / create_feature_request; tester: create_bug_report).
+    create_bug_report / create_feature_request / create_research_task;
+    tester: create_bug_report).
 
     Honors `deps.agent_creates_drafts`: the new task is then created in
     the DRAFT status — it never enters the queue by itself, the user must
@@ -231,7 +232,13 @@ def _create_report_task(
         depends_on=depends_on,
         goal_id=goal_id,
     )
-    label = "Bug report" if kind is TaskKind.BUG else "Feature request"
+    # Label of the tool-result text and queue placement per kind: a bug
+    # report joins the head of the queue, a feature request and a research
+    # task the tail (the ordinary TaskManager.create placement).
+    label = {
+        TaskKind.BUG: "Bug report",
+        TaskKind.RESEARCH: "Research task",
+    }.get(kind, "Feature request")
     if draft:
         task.events.append(
             TaskEvent(
@@ -673,7 +680,7 @@ def _create_goal(
     return (
         f"Goal #{goal.id} ({goal.type.value}) created: {goal.title_display}.\n"
         "Link the tasks that serve it via create_bug_report / "
-        "create_feature_request with goal_id."
+        "create_feature_request / create_research_task with goal_id."
     )
 
 

@@ -259,7 +259,8 @@ class Task(BaseModel):
     # derive titles for tasks the agent has not seen yet anyway).
     title_generated: bool = False
     # True when the title arrived EXPLICITLY at creation (a non-empty title
-    # argument: the agents' create_bug_report / create_feature_request
+    # argument: the agents' create_bug_report / create_feature_request /
+    # create_research_task
     # tools, the GitHub Issues import, a goal's title) and must never be
     # overwritten by the title generator. False for the derived first-line
     # fallback (TaskManager.create / edit_task) — those remain eligible for

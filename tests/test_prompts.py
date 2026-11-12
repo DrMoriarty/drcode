@@ -225,6 +225,7 @@ def test_research_prompt_initiative_boundary() -> None:
     assert "# Initiative boundary" in research
     assert "SEPARATE `proposals` parameter" in research
     assert "create_bug_report / create_feature_request" in research
+    assert "create_research_task" in research
     assert "at the implementer's discretion" in research
     # The old marker-text convention is DEAD: the phrase survives only as
     # an explicit ban, never as a positive instruction.
@@ -260,6 +261,32 @@ def test_research_prompt_teaches_dependency_chaining() -> None:
     # about when a task may be created at all), not in some other block.
     assert research.index("STRICT RULE: create a task only") < research.index(
         "chain them with depends_on"
+    )
+
+
+def test_research_prompt_teaches_task_decomposition() -> None:
+    """The research prompt offers create_research_task as the decomposition
+    tool: a branched investigation becomes separate research tasks (own
+    transcript, own context window, own slot) instead of one crammed
+    transcript. The STRICT RULE still governs it (explicit request or a
+    clarification answer), and the brief must be self-contained — a research
+    task is completed by its own agent's mark_done, no tester reviews it."""
+    from drcode.prompts import RESEARCH_SYSTEM_PROMPT
+
+    research = " ".join(RESEARCH_SYSTEM_PROMPT.split())
+    # The tool is listed in the task-creation block next to its siblings.
+    assert "create_research_task" in research
+    assert "does not have to be crammed into this one transcript" in research
+    assert "its own transcript, its own context window" in research
+    # The discipline is unchanged: no silent decomposition.
+    assert "The same STRICT RULE applies" in research
+    assert "asking via ask_clarifying_question" in research
+    # The self-contained brief requirement names the completion rule.
+    assert "mark_done" in research
+    assert "no tester reviews it" in research
+    # It rides the task-creation section, after the STRICT RULE sentence.
+    assert research.index("STRICT RULE: create a task only") < research.index(
+        "does not have to be crammed"
     )
 
 

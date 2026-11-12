@@ -9,7 +9,8 @@ Noticing the skew after the tasks are ACTIVE is too late:
 queue promotes a freshly created report within seconds.
 
 So the creation paths (the agents' create_bug_report /
-create_feature_request and the headless CLI) run this mechanical check:
+create_feature_request / create_research_task and the headless CLI) run
+this mechanical check:
 path-like tokens are extracted from the new task's description and
 compared against the descriptions (and the tracked `edited_files`) of
 every other unfinished task. A non-empty overlap is a WARNING, never a

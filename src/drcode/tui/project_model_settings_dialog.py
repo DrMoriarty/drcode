@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -53,6 +54,7 @@ from ..providers import (
     load_project_model_slots,
 )
 from ..settings import ProjectSettingsStore
+from .model_setup_app import _FAVORITE_GLYPHS
 from .setup_dialog import ModelSetup, ModelSetupDialog
 
 if TYPE_CHECKING:
@@ -237,18 +239,21 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
 
     # -- draft ---------------------------------------------------------------------
 
-    def _model_options(self, role: AgentRole) -> list[tuple[str, object]]:
+    def _model_options(self, role: AgentRole) -> list[tuple[Text | str, object]]:
         """The model Select options of one role: catalog models
-        (as "provider/model" strings — Select values must be hashable;
-        the user-level default and the effective slot are marked; sorted
-        favorites-first — level 1, then 2, then 3, then the non-favorites,
-        the original order kept within each group), the saved/draft
-        custom model, "Custom…" and "User default" (always — the reset
-        exists for every role)."""
+        (as "provider/model" prompts — Select values must be hashable and
+        are the plain "provider/model" strings; the user-level default and
+        the effective slot are marked; sorted favorites-first — level 1,
+        then 2, then 3, then the non-favorites, the original order kept
+        within each group; a favorite carries its tier glyph, same shapes
+        and colors as the catalog table's Favorites column, followed by a
+        two-space indent on the non-favorites so the names align), the
+        saved/draft custom model, "Custom…" and "User default" (always —
+        the reset exists for every role)."""
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
-        options: list[tuple[str, object]] = []
+        options: list[tuple[Text | str, object]] = []
         catalog_options: list[tuple[int, str, object]] = []
         for provider in catalog.providers:
             for entry in provider.models:
@@ -261,7 +266,18 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 # 0 = not a favorite — sorts after the 1..3 tiers.
                 catalog_options.append((entry.favorite or 4, label, ref))
         catalog_options.sort(key=lambda item: item[0])
-        options.extend((label, ref) for _, label, ref in catalog_options)
+        for favorite, label, ref in catalog_options:
+            # ONLY the glyph carries the tier color (a span, not the base
+            # style — same rule as the catalog table and the chains
+            # dialog); the model name stays uncolored.
+            glyph = _FAVORITE_GLYPHS.get(favorite)
+            if glyph is None:
+                prompt: Text | str = Text(f"  {label}")
+            else:
+                prompt = Text("  ")
+                prompt.append(f"{glyph.plain} ", style=glyph.style)
+                prompt.append(label)
+            options.append((prompt, ref))
         if isinstance(slot, ModelRef) and str(slot) not in {
             value for _, value in options
         }:

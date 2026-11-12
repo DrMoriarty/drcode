@@ -21,6 +21,7 @@ from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from rich.markup import render as render_markup
+from rich.text import Text
 from textual import events
 from textual.command import Command, CommandList
 from textual.css.query import NoMatches
@@ -3136,6 +3137,37 @@ async def test_project_model_dialog_favorites_sorted_first(
             "__custom__",
             "__user_default__",
         ]
+        # Favorites carry their tier glyph (same shapes/colors as the
+        # catalog table's Favorites column) before the model name; every
+        # catalog row starts with a two-space indent (same layout as the
+        # agent-chains dialog's right list).
+        prompts = [p for p, _ in _pms_select(dialog, AgentRole.CODING)._options]
+        plain = [str(p) for p in prompts]
+        assert plain[:4] == [
+            "  • local-swap/fav1-a",
+            "  • local-swap/fav1-b",
+            "  ★ local-swap/fav2-b",
+            "  ✚ local-swap/fav3",
+        ]
+        assert plain[4:6] == [
+            "  local-swap/plain-a",
+            "  local-swap/plain-b",
+        ]
+        glyphs = [
+            (p.spans[0].style, p.plain[2:4])
+            for p in prompts
+            if isinstance(p, Text) and p.spans
+        ]
+        assert glyphs == [
+            ("bold red", "• "),
+            ("bold red", "• "),
+            ("bold yellow", "★ "),
+            ("bold cyan", "✚ "),
+        ]
+        # The tail options stay plain strings, unindented (the slot here
+        # is unset, so "User default" is marked "(current)").
+        assert plain[-2] == "Custom…"
+        assert plain[-1].startswith("User default")
 
 
 async def test_project_model_dialog_custom_slot_without_saved_entry(

@@ -1855,6 +1855,98 @@ def test_recent_tasks_tool_only_for_research(fake_config: Config) -> None:
     assert "recent_tasks" not in _tool_names(resolver)
 
 
+def test_create_research_task_tool_only_for_research(fake_config: Config) -> None:
+    """create_research_task sits in the same research-only block as
+    create_bug_report / create_feature_request: the research agent may
+    DECOMPOSE a branched investigation into separate research tasks, while
+    coding agents (feature/bug work on their own task), the tester and the
+    resolver never see the tool."""
+    from drcode.agent import build_agent, build_resolver_agent, build_tester_agent
+
+    research = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    names = _tool_names(research)
+    assert "create_research_task" in names
+    # It never replaces the other two creation tools.
+    assert {"create_bug_report", "create_feature_request"} <= names
+    for kind in (TaskKind.FEATURE, TaskKind.BUG):
+        ag = build_agent(fake_config, kind=kind)
+        assert "create_research_task" not in _tool_names(ag)
+    tester = build_tester_agent(fake_config)
+    assert "create_research_task" not in _tool_names(tester)
+    resolver = build_resolver_agent(fake_config, root=Path("/tmp/whatever"))
+    assert "create_research_task" not in _tool_names(resolver)
+
+
+def test_create_research_task_docstring_discipline(fake_config: Config) -> None:
+    """The new tool teaches the same creation discipline as its neighbours:
+    only on an explicit user request (otherwise ask_clarifying_question),
+    depends_on for the physical chain, goal_id for a product goal."""
+    from drcode.agent import build_agent
+
+    ag = build_agent(fake_config, kind=TaskKind.RESEARCH)
+    desc = " ".join(
+        (
+            ag._function_toolset.tools["create_research_task"].tool_def.description
+            or ""
+        ).split()
+    )
+    assert "Use ONLY when the user explicitly asked for it" in desc
+    assert "ask_clarifying_question" in desc
+    assert "DECOMPOSE a branched investigation" in desc
+    assert "skips the tester entirely" in desc
+    assert "Optional `depends_on`" in desc
+    assert "Optional `goal_id`" in desc
+
+
+def test_create_research_task_creates_queued_research_task(
+    fake_config: Config, project_root: Path
+) -> None:
+    """End-to-end invocation of the new tool body: it creates a RESEARCH
+    task (never a feature), carries depends_on through to the task, appends
+    the dependency suffix to the tool result, links a goal and stays at the
+    tail of the queue."""
+    from drcode.agent import build_agent
+
+    manager = TaskManager(project_root)
+    serving = manager.create("research", "plan it", kind=TaskKind.RESEARCH)
+    dep = manager.create("dependency feature", "do dep")
+    goal = manager.goals.create("Roadmap item")
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=serving.id,
+        scratch=agent_mod.tools.scratch_dir(serving.id),
+    )
+    tool = build_agent(
+        fake_config, kind=TaskKind.RESEARCH, root=project_root
+    )._function_toolset.tools["create_research_task"]
+    ctx = cast("Any", SimpleNamespace(deps=deps))
+
+    text = cast(
+        "str",
+        tool.function(
+            ctx,
+            "Survey the merge engine",
+            "Study src/drcode/merge_engine.py and list the auto-resolver kinds",
+            [dep.id],
+            goal.id,
+        ),
+    )
+
+    created = [t for t in manager.all_tasks() if t.id not in {serving.id, dep.id}]
+    assert len(created) == 1
+    new = created[0]
+    assert new.kind is TaskKind.RESEARCH
+    assert new.depends_on == [dep.id]
+    assert new.goal_id == goal.id
+    assert f"Research task #{new.id}" in text
+    assert "created at the tail of the queue" in text
+    assert f" It waits for: #{dep.id}" in text
+    assert f"Linked to goal 'Roadmap item' ({goal.id})." in text
+    # The dependency sinks it below the runnable tasks (status half of the gate).
+    assert manager.queued().index(new) > manager.queued().index(dep)
+
+
 def test_research_prompt_documents_task_search() -> None:
     from drcode.agent import RESEARCH_SYSTEM_PROMPT
 
@@ -1910,7 +2002,11 @@ def test_research_depends_on_docstrings_teach_physical_overlap(
         t.name: (t.tool_def.description or "")
         for t in ag._function_toolset.tools.values()
     }
-    for name in ("create_bug_report", "create_feature_request"):
+    for name in (
+        "create_bug_report",
+        "create_feature_request",
+        "create_research_task",
+    ):
         doc = " ".join(docs[name].split())
         assert "PHYSICAL overlap" in doc
         assert "chained even if functionally independent" in doc
@@ -2339,6 +2435,45 @@ def test_create_report_task_full_by_default(project_root: Path) -> None:
         f"Bug report #{created.id} '{created.title}' created at the head of the queue."
         == (text)
     )
+
+
+def test_create_report_task_research_kind_label_and_placement(
+    project_root: Path,
+) -> None:
+    """The shared creation body knows the RESEARCH kind: the tool-result
+    text calls it a "Research task" (not a "Feature request") and places it
+    at the TAIL of the queue, like a feature — a research task is not a bug
+    report and must not jump the queue head."""
+    from drcode.agent_build import _create_report_task
+    from drcode.models import TaskKind, TaskStatus
+
+    manager = TaskManager(project_root)
+    task = manager.create("t", "x")
+    deps = agent_mod.AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+    created, text = _create_report_task(
+        deps,
+        "Survey the merge engine",
+        "Study src/drcode/merge_engine.py and report the auto-resolver kinds",
+        kind=TaskKind.RESEARCH,
+        creator="research agent",
+    )
+    assert created.kind is TaskKind.RESEARCH
+    assert created.status is TaskStatus.QUEUED
+    assert created in manager.queued()
+    assert created.events == []
+    assert (
+        f"Research task #{created.id} '{created.title}' created at the tail "
+        "of the queue."
+    ) == text
+    # It sits BEHIND an older feature task (tail placement), not at the head.
+    later = manager.create("Later feature", "do later")
+    assert manager.queued().index(created) < manager.queued().index(later)
+    assert manager.promote_next() is task  # created first → promoted first
 
 
 def test_create_report_task_draft_with_setting(project_root: Path) -> None:

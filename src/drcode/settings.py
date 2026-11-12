@@ -579,7 +579,8 @@ class ProjectSettings(BaseModel):
     # guard of `drcode.web_fetch` applies in every mode regardless.
     web_fetch_block_hosts: list[str] = Field(default_factory=list)
     # Agent-created task drafts: when on, the agents' task-creation tools
-    # (research: create_bug_report / create_feature_request, tester:
+    # (research: create_bug_report / create_feature_request /
+    # create_research_task, tester:
     # create_bug_report) do NOT queue the new task — it is created in the
     # DRAFT status and waits until the user opens it in the new-task
     # editor and finishes it (into the queue or on hold). The headless

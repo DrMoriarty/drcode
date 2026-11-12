@@ -288,7 +288,8 @@ class PipelineAgentRunLayer(CoreState):
                             # the parent itself emits nothing during the
                             # delegation tool call (see drcode.subagents).
                             activity=partial(self._touch_activity, task_id),
-                            # create_bug_report/create_feature_request
+                            # create_bug_report/create_feature_request/
+                            # create_research_task
                             # create DRAFT tasks when the setting is on
                             # (the user finishes them in the editor).
                             agent_creates_drafts=(self.settings.agent_creates_drafts),

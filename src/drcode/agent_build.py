@@ -126,7 +126,8 @@ class AgentDeps:
     parent itself emits nothing during the delegation.
 
     `agent_creates_drafts` mirrors the project setting: the research
-    agent's create_bug_report/create_feature_request tools then create
+    agent's create_bug_report/create_feature_request/create_research_task
+    tools then create
     DRAFT tasks the user must finish before they enter the queue.
 
     `record_usage`, when set, is called by the nested `delegate_research`
@@ -642,8 +643,12 @@ def build_agent(
 
     # Task-creation tools exist only for the research agent: coding
     # agents (feature/bug) work on their own task and must not spawn more;
-    # the research agent can file bug reports and feature requests on
-    # the user's behalf. Placement follows the ordinary queue rules via
+    # the research agent can file bug reports, feature requests and further
+    # research tasks on the user's behalf (the last one lets a branched
+    # investigation be DECOMPOSED instead of crammed into one transcript —
+    # a research task skips the tester and completes through mark_done,
+    # depends_on and worktree isolation apply to it exactly as to a coding
+    # task). Placement follows the ordinary queue rules via
     # TaskManager.create (bugs join the head of the bug block, everything
     # else the tail of the queue).
     if kind is TaskKind.RESEARCH:
@@ -719,6 +724,48 @@ def build_agent(
             )
             return text + _deps_suffix(feature) + _goal_suffix(ctx, feature)
 
+        @agent.tool
+        def create_research_task(
+            ctx: RunContext[AgentDeps],
+            title: str,
+            description: str,
+            depends_on: list[str] | None = None,
+            goal_id: str | None = None,
+        ) -> str:
+            """Create a RESEARCH task in the backlog — a separate
+            investigation or documentation assignment that runs later as its
+            own task. Use ONLY when the user explicitly asked for it — if you
+            think a study of your own could be split off, ask via
+            ask_clarifying_question whether a task should be filed. Use it to
+            DECOMPOSE a branched investigation instead of cramming everything
+            into this transcript: `title` is a short summary of the
+            investigation; `description` states the question to answer (or
+            the documentation to write), the starting points (files,
+            symbols) and what the result must contain. The new task skips the
+            tester entirely — it completes when that agent calls mark_done,
+            so give it a self-contained brief.
+            Optional `depends_on`: short task ids (as shown in the TUI and in
+            search_task_history output) the new task must wait for — it is not
+            promoted until every listed task is COMPLETED and, under worktree
+            isolation, its drcode/<id> branch is merged into the base branch.
+            depends_on is also for PHYSICAL overlap: tasks editing the same
+            files must be chained even if functionally independent, so their
+            branches never merge concurrently.
+            Optional `goal_id`: the id of a product goal (see the goals block)
+            this investigation serves — the task joins that goal's progress
+            count.
+            The returned id lets you chain subsequent creations on it."""
+            research, text = _create_report_task(
+                ctx.deps,
+                title,
+                description,
+                kind=TaskKind.RESEARCH,
+                creator="research agent",
+                depends_on=depends_on,
+                goal_id=_validated_goal_id(ctx, goal_id),
+            )
+            return text + _deps_suffix(research) + _goal_suffix(ctx, research)
+
         @agent.tool(sequential=True)
         async def set_task_dependencies(
             ctx: RunContext[AgentDeps], task_id: str, deps: list[str]
@@ -733,7 +780,8 @@ def build_agent(
             isolation, its drcode/<id> branch is merged into the base branch.
             Use it to link a task to an older one that existed before this
             run; for a task you create yourself, prefer the depends_on
-            parameter of create_bug_report/create_feature_request.
+            parameter of create_bug_report/create_feature_request/
+            create_research_task.
             Dependencies also cover PHYSICAL overlap: a task editing the
             same files as another must wait for it even if functionally
             independent, so their branches never merge concurrently."""

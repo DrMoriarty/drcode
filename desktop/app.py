@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import NoReturn
 
 try:  # package import (tests) or script import (PyInstaller / dev run)
     from . import fonts as fonts_mod
@@ -45,6 +46,34 @@ except ImportError as exc:  # pragma: no cover
 
 APP_TITLE = "DrCode"
 WINDOW_DEFAULTS = {"width": 1100, "height": 760, "min_size": (480, 320)}
+
+
+def _exit_process(code: int) -> NoReturn:
+    """End the process without waiting for pywebview's stuck threads.
+
+    pywebview runs every js_api call on a plain — NON-daemon — thread
+    (``webview/util.py:js_bridge_call``) and, once the method returns,
+    answers the page from that same thread with a blocking
+    ``Window.evaluate_js`` (a semaphore with no timeout). Closing the
+    last tab destroys the window while exactly such a round trip is in
+    flight: term.js calls ``close_window`` from its tab-close handler,
+    and the shell's ``on_clean_exit`` hook additionally calls
+    ``evaluate_js`` from the server thread. The destroyed webview never
+    invokes the completion handler, so those threads wait forever — and
+    interpreter shutdown JOINS non-daemon threads. The GUI loop returns
+    and the app keeps living as a window-less process: it sits in the
+    Dock/tray, ignores the OS quit request and needs a force kill.
+
+    Everything the shell owns (PTY sessions, the server loop) is already
+    torn down by ``main`` before this runs, so the leftover threads have
+    nothing left to do — leave hard instead of joining them.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001, S110 - flushing must never block exit
+            pass
+    os._exit(code)
 
 
 def _frozen_js_dir_candidates() -> list[str]:
@@ -349,4 +378,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_process(main())

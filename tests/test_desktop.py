@@ -1473,3 +1473,87 @@ def test_js_dir_shim_noop_when_not_frozen(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delattr(sys, "frozen", raising=False)
     app_mod._fix_frozen_pywebview_js()
     assert webview.util.get_js_dir is original
+
+
+# ---------------------------------------------------------------------------
+# app.py — process exit (last tab closed → the app must really terminate)
+# ---------------------------------------------------------------------------
+#
+# Closing the last tab destroys the window while pywebview is still
+# answering that very js_api call with a blocking evaluate_js. The window's
+# completion handler never fires, so the (NON-daemon) bridge thread waits
+# forever and interpreter shutdown — which joins non-daemon threads — hung:
+# the GUI loop ended but the process stayed alive, window-less, ignoring the
+# OS quit request until force-killed. Both entry points therefore end
+# through _exit_process, which must not depend on those threads.
+
+
+def test_exit_process_does_not_join_blocked_threads() -> None:
+    """_exit_process leaves immediately even with a non-daemon thread
+    parked forever (the pywebview bridge-thread situation)."""
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import sys, threading, time
+        sys.path.insert(0, {desktop!r})
+        import app as app_mod
+
+        stuck = threading.Event()
+        def block():
+            stuck.wait()          # never set: a thread shutdown would join
+        threading.Thread(target=block, name="stuck-bridge", daemon=False).start()
+        time.sleep(0.2)
+
+        app_mod._exit_process(7)
+        print("UNREACHABLE", flush=True)
+        """
+    ).format(desktop=str(DESKTOP_DIR))
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 7, proc.stderr
+    assert "UNREACHABLE" not in proc.stdout
+
+
+def test_entry_points_exit_hard() -> None:
+    """Both entry points go through _exit_process — a plain
+    `SystemExit(main())` returns into interpreter shutdown, which joins the
+    blocked pywebview threads and hangs the app."""
+    app_src = (DESKTOP_DIR / "app.py").read_text(encoding="utf-8")
+    assert "def _exit_process(code: int) -> NoReturn:" in app_src
+    assert "os._exit(code)" in app_src
+    tail = app_src[app_src.index('if __name__ == "__main__":') :]
+    assert "_exit_process(main())" in tail
+
+    main_src = (DESKTOP_DIR / "__main__.py").read_text(encoding="utf-8")
+    assert "from .app import _exit_process, main" in main_src
+    assert "_exit_process(main())" in main_src
+    # The hanging construct must be gone from this entry point.
+    assert "raise SystemExit(main())" not in main_src
+
+
+def test_exit_process_flushes_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Output written right before the close must reach the terminal."""
+    import io
+
+    import app as app_mod  # type: ignore[import-not-found]
+
+    fake_out, fake_err = io.StringIO(), io.StringIO()
+    fake_out.write("last words")
+    fake_err.write("last warning")
+    calls: list[int] = []
+    monkeypatch.setattr(sys, "stdout", fake_out)
+    monkeypatch.setattr(sys, "stderr", fake_err)
+    monkeypatch.setattr(app_mod.os, "_exit", lambda code: calls.append(code))
+
+    app_mod._exit_process(3)  # os._exit stubbed: no interpreter teardown here
+    assert calls == [3]
+    assert fake_out.getvalue() == "last words"
+    assert fake_err.getvalue() == "last warning"

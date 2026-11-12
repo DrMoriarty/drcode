@@ -15,6 +15,13 @@ dependencies = [
     # voice/client.py — must not rely on it arriving transitively
     # (pydantic-ai switched from httpx to httpx2 in newer releases).
     "httpx>=0.27",
+    # Embedded MCP server (`drcode.mcp`, docstring of docs/mcp-server-design.md
+    # §0): the official Model Context Protocol SDK — pydantic-v2-native and
+    # anyio-based, Streamable HTTP out of the box. It pulls starlette +
+    # uvicorn + sse-starlette (bundled explicitly in drcode.spec). The
+    # standalone `fastmcp` package is deliberately NOT a dependency: same
+    # SDK underneath, more transitive deps, sharper churn.
+    "mcp>=2.0",
     # Voice I/O (push-to-talk dictation + TTS announcements): sounddevice
     # needs the PortAudio library (bundled in its wheels; on Linux install
     # libportaudio2). numpy-free on purpose — the PCM16 buffers are handled

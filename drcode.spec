@@ -78,6 +78,23 @@ a = Analysis(
         "anyio._backends._asyncio",
         "sounddevice",
         *collect_submodules("textual.widgets"),
+        # Embedded MCP server (drcode.mcp, docs/mcp-server-design.md §0):
+        # the SDK imports its transports, the streamable-HTTP session
+        # manager and the uvicorn protocol classes lazily/behind string
+        # lookups (`uvicorn.Config` resolves the http/ws protocol class by
+        # dotted path; starlette mounts resolve routers at request time),
+        # so static analysis misses them exactly like textual's lazy
+        # widgets. Collect the whole trees — the server is a core
+        # dependency and a half-collected bundle fails at the first
+        # request instead of at import time.
+        "mcp",
+        *collect_submodules("mcp"),
+        "uvicorn",
+        *collect_submodules("uvicorn"),
+        "starlette",
+        *collect_submodules("starlette"),
+        "sse_starlette",
+        *collect_submodules("sse_starlette"),
     ],
     hookspath=[],
     hooksconfig={},

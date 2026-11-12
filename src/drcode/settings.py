@@ -559,6 +559,16 @@ class ProjectSettings(BaseModel):
     # The same cap for the RESEARCH agent's runs (its resolved model
     # serves the subagents; the counter is per parent run/generation).
     subagents_researcher: int = 0
+    # Embedded MCP server (docs/mcp-server-design.md): when on, the TUI
+    # exposes ITSELF to external AI agents over Streamable HTTP on an
+    # ephemeral loopback port — the live pipeline, not a headless copy,
+    # so mutations run through the same `_advance()` gate as the user's
+    # own clicks. Off (the default): no socket is bound at all. The
+    # endpoint (port + bearer token + owning pid) is published in
+    # `<project>/.drcode/mcp.json` (mode 0600 — the token is a secret and
+    # is never shown in the UI, only the file's path is). Toggling in
+    # Settings starts/stops the server immediately (hot switch).
+    mcp_enabled: bool = False
     # Web access of the RESEARCH agent (WebFetchMode docstring): off (no
     # tool), allowlist (only web_fetch_allow_hosts + their subdomains) or
     # all (every public host). The structured `web_fetch` tool replaces

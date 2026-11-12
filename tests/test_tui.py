@@ -3577,6 +3577,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             f"Git (research): {app.settings.git_policy.research.label}",
             f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
             "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
+            f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
         ] == [c.name for c in entries]
 
 

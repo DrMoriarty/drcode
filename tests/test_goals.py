@@ -525,18 +525,24 @@ def test_goal_tools_registered_only_for_research(fake_config: Config) -> None:
     names = _tool_names(build_agent(fake_config, kind=TaskKind.RESEARCH))
     assert {"list_goals", "read_goal", "create_goal", "update_goal"} <= names
 
+    # Coding agents get ONLY the narrowed read_goal of their own task's
+    # linked goal — never the registry tools.
     for ag in (
         build_agent(fake_config, kind=TaskKind.FEATURE),
         build_agent(fake_config, kind=TaskKind.BUG),
-        build_tester_agent(fake_config),
     ):
         tool_names = _tool_names(ag)
-        assert not tool_names & {
-            "list_goals",
-            "read_goal",
-            "create_goal",
-            "update_goal",
-        }
+        assert "read_goal" in tool_names
+        assert not tool_names & {"list_goals", "create_goal", "update_goal"}
+
+    # The tester is never goal-aware at all.
+    tester_names = _tool_names(build_tester_agent(fake_config))
+    assert not tester_names & {
+        "list_goals",
+        "read_goal",
+        "create_goal",
+        "update_goal",
+    }
 
 
 def test_list_goals_and_read_goal(manager, project_root: Path) -> None:
@@ -694,6 +700,67 @@ def test_goals_injection_truncates_long_description(
     # Context discipline: the block stays compact, the tail is not included.
     assert "word word" in block
     assert len(block) < 1200
+
+
+def test_goals_injection_coder_linked_goal(manager, project_root: Path) -> None:
+    goal = manager.goals.create(
+        "Async core",
+        description="the direction",
+        notes="detailed roadmap markdown",
+    )
+    feature = manager.create("feature", "brief", kind=TaskKind.FEATURE, goal_id=goal.id)
+    bug = manager.create("bug", "brief", kind=TaskKind.BUG, goal_id=goal.id)
+
+    for task in (feature, bug):
+        block = agent_mod.goals_dynamic_instructions(
+            _ctx(_deps(manager, task, project_root))
+        )
+        assert block is not None
+        assert "# Task goal" in block
+        assert goal.id in block and "Async core" in block
+        assert "the direction" in block  # short description in full
+        assert "read_goal" in block  # pointer to the detail tool
+        # Context discipline: the detailed notes stay behind read_goal.
+        assert "detailed roadmap markdown" not in block
+
+    # A coding task without a linked goal stays goal-free.
+    plain = manager.create("plain", "brief", kind=TaskKind.FEATURE)
+    assert (
+        agent_mod.goals_dynamic_instructions(_ctx(_deps(manager, plain, project_root)))
+        is None
+    )
+
+
+def test_read_linked_goal_returns_full_detail(manager, project_root: Path) -> None:
+    goal = manager.goals.create(
+        "Async core", description="the direction", notes="detailed notes body"
+    )
+    task = manager.create("migrate", "brief", kind=TaskKind.FEATURE, goal_id=goal.id)
+    deps = _deps(manager, task, project_root)
+
+    result = agent_mod._read_linked_goal(deps)
+    assert "the direction" in result
+    assert "detailed notes body" in result  # notes in full
+    assert goal.id in result
+
+
+def test_read_linked_goal_no_goal_retries(manager, project_root: Path) -> None:
+    task = manager.create("migrate", "brief", kind=TaskKind.FEATURE)
+    deps = _deps(manager, task, project_root)
+    with pytest.raises(ValueError, match="no linked goal"):
+        agent_mod._read_linked_goal(deps)
+
+
+def test_read_linked_goal_foreign_id_retries(manager, project_root: Path) -> None:
+    linked = manager.goals.create("linked goal")
+    foreign = manager.goals.create("foreign goal")
+    task = manager.create("migrate", "brief", kind=TaskKind.FEATURE, goal_id=linked.id)
+    deps = _deps(manager, task, project_root)
+
+    with pytest.raises(ValueError, match="does not match"):
+        agent_mod._read_linked_goal(deps, foreign.id)
+    # Explicitly passing the task's own id is fine.
+    assert linked.id in agent_mod._read_linked_goal(deps, linked.id)
 
 
 def test_goal_instructions_none_without_goals() -> None:

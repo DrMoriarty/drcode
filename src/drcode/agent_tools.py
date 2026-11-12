@@ -469,17 +469,56 @@ def goals_instructions(active: list[Goal]) -> str | None:
     return "\n".join(lines)
 
 
+def task_goal_block(goal: Goal) -> str:
+    """The compact per-task goal block injected into a coding agent's
+    dynamic instructions when its task has a linked goal (`task.goal_id`).
+
+    Context discipline mirrors goals_instructions: the `description` (the
+    short 1–2-line summary) enters the block IN FULL, but the detailed
+    `notes` markdown never does — that stays behind the read_goal tool,
+    which the coder's variant serves for exactly this one goal."""
+    lines = [
+        "# Task goal",
+        "",
+        "This task is linked to a product goal — keep the work aligned",
+        "with it (its id lets you reference the goal in the answer):",
+        "",
+        f"- #{goal.id} ({goal.type.value}, {goal.status.value}): {goal.title}",
+    ]
+    if goal.description.strip():
+        lines.append(f"  {goal.description.strip()}")
+    lines.append(
+        "\nFull details of this goal (the detailed `notes`, sub-goals, the"
+        "\nother linked tasks) are available via the read_goal tool — call"
+        "\nit with no arguments before planning against the goal."
+    )
+    return "\n".join(lines)
+
+
 def goals_dynamic_instructions(ctx: RunContext[AgentDeps]) -> str | None:
-    """Dynamic instructions hook for the research agent: recompute the
-    active-goals block from the manager's CURRENT goal state for every
-    model request (see goals_instructions). Registered on the coding agent
-    for all kinds — only research tasks get goals, everything else yields
-    None (structurally: coding agents and the tester are never goal-aware
-    on this stage)."""
+    """Dynamic instructions hook, registered on the coding agent for ALL
+    kinds and recomputed for every model request:
+
+    - RESEARCH tasks get the roadmap-wide active-goals block
+      (goals_instructions) — the task's own goal, if any, is visible
+      there already, so no per-task duplication.
+    - BUG/FEATURE tasks with a linked goal get the compact per-task
+      "Task goal" block (task_goal_block); without a linked goal they
+      yield None — a coding agent without a goal stays goal-free.
+      `task.goal_id` is fixed at activation, so the block is stable
+      within a run and the prefix cache is untouched.
+    """
     task = ctx.deps.manager.get(ctx.deps.task_id)
-    if task.kind is not TaskKind.RESEARCH:
+    if task.kind is TaskKind.RESEARCH:
+        return goals_instructions(ctx.deps.manager.goals.active())
+    if task.goal_id is None:
         return None
-    return goals_instructions(ctx.deps.manager.goals.active())
+    goal = ctx.deps.manager.goals.goals.get(task.goal_id)
+    if goal is None:
+        # Linked goal deleted mid-flight: degrade silently to no block
+        # (the link is stale metadata, never worth crashing a run).
+        return None
+    return task_goal_block(goal)
 
 
 def _list_goals(deps: AgentDeps, include_done: bool = False) -> str:
@@ -548,6 +587,31 @@ def _read_goal(deps: AgentDeps, goal_id: str) -> str:
                 f"- #{t.id} ({t.kind.value}, {t.status.value}): {t.title_display}"
             )
     return "\n".join(lines)
+
+
+def _read_linked_goal(deps: AgentDeps, goal_id: str | None = None) -> str:
+    """Body of the CODING agent's read_goal tool: the full detail of the
+    goal linked to THIS task — the same rendering as the research agent's
+    _read_goal (description, notes, decomposition, linked tasks), but
+    deliberately SCOPED. Without arguments it reads `task.goal_id`; an
+    explicitly passed goal_id must MATCH it. Raises ValueError (→
+    ModelRetry via _run_tool) when the task has no linked goal or when a
+    foreign goal id is passed — a coding agent never browses the goal
+    registry (no list_goals) and never reads other goals."""
+    task = deps.manager.get(deps.task_id)
+    if task.goal_id is None:
+        raise ValueError(
+            "this task has no linked goal — read_goal serves only the goal"
+            " attached to the current task (see the Task goal block); there"
+            " is no goal registry access from a coding task."
+        )
+    if goal_id is not None and goal_id.strip() and goal_id.strip() != task.goal_id:
+        raise ValueError(
+            f"goal_id {goal_id.strip()!r} does not match this task's linked"
+            f" goal ({task.goal_id}) — a coding agent can only read its own"
+            " task's goal (call read_goal with no arguments)."
+        )
+    return _read_goal(deps, task.goal_id)
 
 
 _GOAL_TYPES = ", ".join(t.value for t in GoalType)

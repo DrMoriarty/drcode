@@ -33,6 +33,7 @@ from .agent_tools import (
     _list_goals,
     _mark_unneeded,
     _read_goal,
+    _read_linked_goal,
     _retry_failed_here,
     _run_project_check,
     _set_task_dependencies,
@@ -373,11 +374,14 @@ def build_agent(
     # server-side prefix cache (the #a0a55d3d production incident). The
     # live block is injected at the TAIL of each request instead — see the
     # `todo_supplier` parameter above (the pipeline wires it at activation).
-    # Same dynamic-instructions pattern for the research role's roadmap:
-    # the compact active-goals block rides on EVERY model request (recomputed
-    # from `manager.goals`), so a goal the agent creates/updates mid-run is
-    # visible to its next request. For non-research tasks and empty
-    # registries it yields None (excluded from the request).
+    # Same dynamic-instructions pattern for the goals: RESEARCH tasks get
+    # the roadmap-wide active-goals block (a goal the agent creates/updates
+    # mid-run is visible to its next request); BUG/FEATURE tasks with a
+    # linked goal get the compact per-task "Task goal" block instead
+    # (`task.goal_id` is fixed at activation, so the block is stable within
+    # a run — the prefix cache is untouched). Everything else — non-research
+    # tasks without a goal, empty registries — yields None (excluded from
+    # the request).
     agent.instructions(goals_dynamic_instructions)
 
     # The eviction nudge rides the same dynamic-instructions pattern: on
@@ -590,6 +594,29 @@ def build_agent(
             IMMEDIATELY after finishing each item — before starting the next
             one."""
             return await _run_tool(_todo_update, ctx.deps, targets, done)
+
+    # Linked-goal awareness for coding agents (bug/feature): when the task
+    # has a linked goal (`task.goal_id`), the compact "Task goal" block
+    # rides the dynamic instructions (goals_dynamic_instructions above) and
+    # read_goal serves the full detail on demand. Deliberately NARROW: no
+    # list_goals / create_goal / update_goal — a coding agent sees exactly
+    # its own task's goal and nothing else of the registry (the tool body
+    # rejects a foreign goal_id with a ModelRetry).
+    if kind in (TaskKind.BUG, TaskKind.FEATURE):
+
+        @agent.tool(name="read_goal")
+        async def read_task_goal(
+            ctx: RunContext[AgentDeps], goal_id: str | None = None
+        ) -> str:
+            """Read the product goal LINKED TO THIS TASK in full: the complete
+            description, the detailed notes, its parent and sub-goals (the
+            decomposition), and every linked task with its live status. Takes
+            no arguments — it always reads this task's own goal (the one from
+            the "Task goal" block). Call it before planning against the goal:
+            the block in the instructions carries only the short description,
+            the full detail lives in `notes`. A coding agent cannot browse the
+            rest of the goal registry — only this one goal."""
+            return await _run_tool(_read_linked_goal, ctx.deps, goal_id)
 
     # Task-creation tools exist only for the research agent: coding
     # agents (feature/bug) work on their own task and must not spawn more;
@@ -817,8 +844,11 @@ def build_agent(
             )
 
         # Goal-registry tools (stage A passive registry + stage B planning):
-        # research-only — coding agents and the tester are never goal-aware
-        # on this stage. All four run through _run_tool so fixable
+        # the research agent gets the FULL registry access (list/read/
+        # create/update). Coding agents are goal-aware only through their
+        # own task's linked goal — the narrowed read_goal registered above;
+        # the tester is never goal-aware at all. All four run through
+        # _run_tool so fixable
         # ValueErrors (unknown id, bad type/status, decomposition cycle)
         # become ModelRetry prompts. Every mutation lands a service event
         # in the task's chat (log_service_event inside the tool bodies) —

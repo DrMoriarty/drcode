@@ -40,6 +40,7 @@ from .agent_tools import (
     _list_goals,
     _mark_unneeded,
     _read_goal,
+    _read_linked_goal,
     _retry_failed_here,
     _run_project_check,
     _set_task_dependencies,
@@ -51,6 +52,7 @@ from .agent_tools import (
     goals_dynamic_instructions,
     goals_instructions,
     load_agents_md,
+    task_goal_block,
     todo_instructions,
 )
 from .compaction import (
@@ -159,6 +161,7 @@ __all__ = [
     "_log_violation",
     "_mark_unneeded",
     "_read_goal",
+    "_read_linked_goal",
     "_retry_failed_here",
     "_run_bash_logged",
     "_run_project_check",
@@ -217,6 +220,7 @@ __all__ = [
     "slice_budget_tokens",
     "split_original_prompts",
     "subagent_limit_for",
+    "task_goal_block",
     "task_search",
     "tester_verdict_issued",
     "todo_instructions",

@@ -18,7 +18,6 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from . import agent_model
-from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
 from .config import Config
 from .prompts import load_compaction_prompts
 from .transcript import (
@@ -88,11 +87,7 @@ def build_compaction_agent(config: Config) -> Agent[None, str]:
     return Agent(
         agent_model.build_model(config),
         instructions=system_prompt,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
     )
 
 

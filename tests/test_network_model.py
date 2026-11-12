@@ -254,3 +254,69 @@ async def test_streamed_roundtrip_and_per_request_user_agent_override() -> None:
     assert run.result.output == "mock says hi"
     assert seen["ua"] == f"drcode/{APP_VERSION}"
     assert run.result.usage.input_tokens > 0
+
+
+# -- provider extra_body in model_settings ------------------------------------------
+
+
+def test_base_model_settings_merges_provider_extra_body() -> None:
+    """The provider's extra_body fields are MERGED into the cache-prompt
+    extra body — never a replacement (`cache_prompt` must survive)."""
+    settings = agent_model.base_model_settings(
+        make_config(provider_extra_body={"top_p": 0.5, "cache_prompt": False})
+    )
+    assert settings.get("extra_headers") == {"User-Agent": f"drcode/{APP_VERSION}"}
+    assert settings.get("max_tokens") == make_config().max_tokens
+    assert settings.get("extra_body") == {
+        "cache_prompt": False,  # provider value wins the merge
+        "top_p": 0.5,
+    }
+
+
+def test_base_model_settings_empty_extra_body_changes_nothing() -> None:
+    """Empty `provider_extra_body` = exactly the historical settings: no
+    extra key appears, the dict is unchanged."""
+    settings = agent_model.base_model_settings(make_config())
+    assert settings.get("extra_body") == {"cache_prompt": True}
+
+
+async def test_provider_extra_body_reaches_request_body(
+    manager, project_root, monkeypatch
+) -> None:
+    """End to end: an agent built over a config carrying the resolved
+    provider's extra_body sends those fields in the POST /chat/completions
+    body — alongside, not instead of, `cache_prompt`."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=completion_payload("ok"))
+
+    real_cls = agent_model.AsyncOpenAI
+
+    def factory(**kwargs: object) -> AsyncOpenAI:
+        kwargs["http_client"] = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        kwargs["max_retries"] = 0
+        return real_cls(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(agent_model, "AsyncOpenAI", factory)
+
+    task = manager.create("t", "feature brief", kind=TaskKind.FEATURE)
+    ag = build_agent(
+        make_config(provider_extra_body={"top_p": 0.5}),
+        kind=TaskKind.FEATURE,
+        root=project_root,
+    )
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+    await ag.run("hi", deps=deps)
+
+    body = seen["body"]
+    assert body["cache_prompt"] is True
+    assert body["top_p"] == 0.5

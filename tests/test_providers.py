@@ -70,6 +70,99 @@ def catalog(user_config_dir: Path) -> UserModelsConfig:
     return cfg
 
 
+# -- provider extra_body ------------------------------------------------------
+
+
+def test_provider_extra_body_roundtrip(user_config_dir: Path) -> None:
+    """`Provider.extra_body` survives a catalog save/load, and a provider
+    without the field serializes the visible default `{}` — so re-saving
+    the catalog through the UI never loses the hand-entered value and the
+    structure stays visible for hand editing."""
+    cfg = UserModelsConfig(
+        providers=[
+            Provider(
+                name="local-swap",
+                base_url="http://localhost:8080/v1",
+                extra_body={"cache_prompt": True},
+            ),
+            Provider(name="cloud", base_url="https://api.example.com/v1"),
+        ]
+    )
+    write_user_catalog(cfg, user_config_dir)
+
+    raw = json.loads((user_config_dir / "models.json").read_text())
+    by_name = {p["name"]: p for p in raw["providers"]}
+    assert by_name["local-swap"]["extra_body"] == {"cache_prompt": True}
+    assert by_name["cloud"]["extra_body"] == {}
+
+    loaded = UserModelsStore().load()
+    assert loaded.providers[0].extra_body == {"cache_prompt": True}
+    assert loaded.providers[1].extra_body == {}
+
+
+def test_provider_extra_body_must_be_an_object() -> None:
+    with pytest.raises(ValidationError):
+        Provider(name="p", base_url="http://x/v1", extra_body=[1, 2])  # type: ignore[arg-type]
+
+
+def test_resolve_carries_provider_extra_body(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """A catalog reference applies the provider's extra_body to the
+    resolved Config (`provider_extra_body`), alongside the connection."""
+    write_user_catalog(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="local-swap",
+                    base_url="http://localhost:8080/v1",
+                    api_key="key-1",
+                    extra_body={"top_p": 0.5},
+                    models=[ModelEntry(id="qwen3-coder-30b")],
+                )
+            ]
+        ),
+        user_config_dir,
+    )
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve(config, AgentRole.CODING)
+    assert resolved.provider_extra_body == {"top_p": 0.5}
+
+
+def test_resolve_custom_slot_has_no_provider_extra_body(
+    project_root: Path,
+) -> None:
+    """Project-level custom models deliberately carry no extra_body: the
+    feature is scoped to user-catalog providers only."""
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(model="custom-m", base_url="http://custom/v1"),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve(config, AgentRole.TESTER)
+    assert resolved.provider_extra_body == {}
+
+
+def test_provider_extra_body_never_read_from_json_layers(
+    project_root: Path,
+) -> None:
+    """`provider_extra_body` is a _PROVIDER_FIELDS member: no json layer of
+    Config provides it — the only writer is the catalog resolver."""
+    cfg_dir = project_root / ".drcode"
+    cfg_dir.mkdir()
+    (cfg_dir / "drcode.json").write_text(
+        json.dumps({"provider_extra_body": {"injected": True}})
+    )
+    config = make_config(project_root)
+    assert config.provider_extra_body == {}
+
+
 # -- resolve -----------------------------------------------------------------
 
 

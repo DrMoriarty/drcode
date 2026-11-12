@@ -36,8 +36,7 @@ from typing import TYPE_CHECKING
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.usage import UsageLimits
 
-from . import task_search, tools
-from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
+from . import agent_model, task_search, tools
 from .providers import AgentRole
 from .service_events import log_service_event
 from .tool_runtime import _run_tool, attach_batch_guard
@@ -108,11 +107,7 @@ def build_subagent_agent(config: Config, *, root: Path) -> Agent[SubagentDeps, s
         _build_subagent_model(config),
         instructions=_subagent_instructions(root),
         deps_type=SubagentDeps,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
         # Short runs: fewer retries than the parent agents keep.
         retries=3,
     )

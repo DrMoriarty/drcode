@@ -113,6 +113,7 @@ _PROVIDER_FIELDS: frozenset[str] = frozenset(
         "health_check_url",
         "max_context_tokens",
         "max_tokens",
+        "provider_extra_body",
     }
 )
 
@@ -144,6 +145,13 @@ class Config(BaseSettings):
     # generated." Set via DRCODE_MAX_TOKENS when the default doesn't match the
     # model; keep it at or below max_context_tokens.
     max_tokens: int = 8192
+    # Extra JSON fields merged into the body of EVERY request to the
+    # resolved provider's models (pydantic-ai ModelSettings `extra_body`).
+    # NEVER read from any json layer (see `_PROVIDER_FIELDS`): the value is
+    # written over a Config copy by `drcode.providers._apply_provider` from
+    # the provider's `extra_body` in the user-level catalog (models.json).
+    # Empty dict = nothing is added to the request bodies.
+    provider_extra_body: dict[str, Any] = {}
     # Context fill (percent of max_context_tokens) at which the agent's
     # history is compacted before the next turn: a tool-less summarizer
     # agent rewrites the transcript into a structured summary while the

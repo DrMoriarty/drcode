@@ -23,7 +23,6 @@ from __future__ import annotations
 from pydantic_ai import Agent
 
 from . import agent_model
-from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
 from .config import Config
 from .prompts import load_title_prompt
 
@@ -49,11 +48,7 @@ def build_title_agent(config: Config) -> Agent[None, str]:
     return Agent(
         agent_model.build_model(config),
         instructions=load_title_prompt(),
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
     )
 
 

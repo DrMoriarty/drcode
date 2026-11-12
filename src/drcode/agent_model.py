@@ -41,7 +41,32 @@ EXTRA_HEADERS = {"User-Agent": USER_AGENT}
 # повторные запросы с длинным общим префиксом. Уходит в тело POST
 # /chat/completions через extra_body (pydantic-ai ModelSettings);
 # строгие OpenAI-совместимые серверы могут отвергнуть неизвестное поле.
-CACHE_PROMPT_SETTINGS: ModelSettings = {"extra_body": {"cache_prompt": True}}
+# The dict form kept separately: merging provider extra-body fields over it
+# needs a plainly-typed dict[str, Any] (ModelSettings["extra_body"] is an
+# optional key of a wide union type — not directly copyable per pyright).
+CACHE_PROMPT_EXTRA_BODY: dict[str, Any] = {"cache_prompt": True}
+CACHE_PROMPT_SETTINGS: ModelSettings = {"extra_body": CACHE_PROMPT_EXTRA_BODY}
+
+
+def base_model_settings(config: Config) -> ModelSettings:
+    """The shared ModelSettings of every drcode agent: the neutral
+    User-Agent headers, the per-response token cap, the prompt-cache flag
+    and the resolved provider's `extra_body` fields.
+
+    The provider extra body (catalog `Provider.extra_body`, carried into
+    the resolved Config as `provider_extra_body` by the resolver) is MERGED
+    into the cache-prompt extra body — never a replacement: an empty dict
+    leaves the settings exactly as before (nothing is added)."""
+    settings: ModelSettings = {
+        "extra_headers": EXTRA_HEADERS,
+        "max_tokens": config.max_tokens,
+        **CACHE_PROMPT_SETTINGS,
+    }
+    provider_extra = config.provider_extra_body
+    if provider_extra:
+        # Merge OVER the cache-prompt flag: the provider's own values win.
+        settings["extra_body"] = {**CACHE_PROMPT_EXTRA_BODY, **provider_extra}
+    return settings
 
 
 class TodoTailModel(WrapperModel):

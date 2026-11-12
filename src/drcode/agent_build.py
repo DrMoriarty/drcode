@@ -23,7 +23,6 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.usage import RunUsage
 
 from . import agent_model, task_search, tools
-from .agent_model import CACHE_PROMPT_SETTINGS, EXTRA_HEADERS
 from .agent_tools import (
     _commit_tracked_files,
     _create_goal,
@@ -360,11 +359,7 @@ def build_agent(
         model,
         instructions=instructions,
         deps_type=AgentDeps,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
         retries=10,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
@@ -1072,11 +1067,7 @@ def build_tester_agent(
         model,
         instructions=instructions,
         deps_type=TesterDeps,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
         retries=10,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
@@ -1430,11 +1421,7 @@ def build_resolver_agent(
         model,
         instructions=instructions,
         deps_type=ResolverDeps,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
         retries=10,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
@@ -1576,11 +1563,7 @@ def build_resolver_reviewer_agent(
         model,
         instructions=load_resolver_reviewer_prompt(root),
         deps_type=ResolverDeps,
-        model_settings={
-            "extra_headers": EXTRA_HEADERS,
-            "max_tokens": config.max_tokens,
-            **CACHE_PROMPT_SETTINGS,
-        },
+        model_settings=agent_model.base_model_settings(config),
         retries=10,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).

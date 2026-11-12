@@ -87,7 +87,7 @@ import shutil
 import ssl
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -188,6 +188,13 @@ class Provider(BaseModel):
     # Cached verified availability endpoint (same idea as
     # Config.health_check_url): probed first on later availability checks.
     health_check_url: str = ""
+    # Extra JSON fields merged into the body of EVERY request to this
+    # provider's models (pydantic-ai ModelSettings `extra_body` → POST
+    # /chat/completions), e.g. {"cache_prompt": true} for vLLM or gateway
+    # routing knobs. Edited only by hand in models.json (no UI); merging
+    # into the requests happens in `agent_model.base_model_settings`.
+    # Must be a JSON object; empty = nothing is added.
+    extra_body: dict[str, Any] = {}
     models: list[ModelEntry] = []
 
     @field_validator("name")
@@ -825,6 +832,9 @@ def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config
         "base_url": provider.base_url,
         "api_key": provider.api_key,
         "health_check_url": provider.health_check_url,
+        # The provider-wide extra request-body fields ride with the
+        # connection (consumed by `agent_model.base_model_settings`).
+        "provider_extra_body": dict(provider.extra_body),
     }
     entry = next((m for m in provider.models if m.id == ref.model), None)
     if entry is not None:

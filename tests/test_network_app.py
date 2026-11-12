@@ -197,6 +197,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         task_id: Any = None,
         eviction_hint: bool = False,
         todo_supplier: Any = None,
+        research_web_fetch: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
@@ -208,6 +209,8 @@ async def test_research_task_builds_agent_with_research_role_config(
             kwargs["eviction_hint"] = eviction_hint
         if todo_supplier is not None:
             kwargs["todo_supplier"] = todo_supplier
+        if research_web_fetch is not None:
+            kwargs["research_web_fetch"] = research_web_fetch
         return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)

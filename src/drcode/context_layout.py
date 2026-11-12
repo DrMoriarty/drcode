@@ -54,6 +54,7 @@ from .transcript import (  # noqa: F401 - CHARS_PER_TOKEN is re-exported
     estimate_tokens,
     last_context_tokens,
 )
+from .web_fetch import WebFetchPolicy
 
 # `estimate_tokens` and `CHARS_PER_TOKEN` live in `transcript` now (shared
 # with the compaction module) and are re-exported here — the existing
@@ -162,11 +163,14 @@ def coding_tool_schemas(
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
+    research_web_fetch: WebFetchPolicy | None = None,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
-    no network, pure wiring). `research_git` and `subagent_limit` match
-    `build_agent` — pass the real setting, or the estimate misses (or
-    invents) the delegate_research schema."""
+    no network, pure wiring). `research_git`, `subagent_limit` and
+    `research_web_fetch` match `build_agent` — pass the real setting, or
+    the estimate misses (or invents) the delegate_research / web_fetch
+    schemas. `research_web_fetch` is the RESEARCH policy (None for every
+    other kind — see `web_fetch.web_fetch_policy_for`)."""
     return tool_schemas(
         build_agent(
             config,
@@ -174,6 +178,7 @@ def coding_tool_schemas(
             root=root,
             research_git=research_git,
             subagent_limit=subagent_limit,
+            research_web_fetch=research_web_fetch,
         )
     )
 
@@ -624,6 +629,7 @@ def task_reports(
     tester_allow_push: bool = True,
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
+    research_web_fetch: WebFetchPolicy | None = None,
 ) -> tuple[CtxReport | None, CtxReport | None, CtxReport | None, RunUsage, int]:
     """The per-agent transcript reports of one task plus its whole-task
     cumulative exact usage.
@@ -636,7 +642,10 @@ def task_reports(
     of `task.tester_messages` against `tester_config`; Resolver: the latest
     round of `task.resolver_messages` against `resolver_config` (the rounds
     are separate contexts — neither the tester nor the resolver ever sees
-    the development transcript). `*_live_tokens` carry the live in-run
+    the development transcript). `research_web_fetch` is the RESEARCH web
+    fetch policy (None when the role has no web_fetch tool), so the tool
+    schema is counted exactly when the run really carries it. `*_live_tokens`
+    carry the live in-run
     readings of the respective agents where one is running (they win over
     the persisted transcript, like the dev counter does).
     """
@@ -655,6 +664,7 @@ def task_reports(
                 root=project_root,
                 research_git=research_git,
                 subagent_limit=subagent_limit,
+                research_web_fetch=research_web_fetch,
             ),
             exact_tokens=live_tokens,
         )

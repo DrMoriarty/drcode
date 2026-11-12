@@ -24,6 +24,7 @@ from ..context_layout import (
 )
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from ..providers import AgentRole
+from ..web_fetch import web_fetch_policy_for
 from .ctx_dialog import ContextDialog
 from .state import DrCodeState, update_static_if_changed
 
@@ -445,6 +446,7 @@ class TaskStatusLayer(DrCodeState):
             tester_allow_push=self.settings.git_policy.tester.pushes,
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit_for(self.settings, role),
+            research_web_fetch=web_fetch_policy_for(self.settings, role),
         )
         agent, _ = self._agent_ctx(task)
         self.push_screen(

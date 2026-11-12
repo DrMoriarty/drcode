@@ -33,6 +33,7 @@ from ..settings import (
     StallNudge,
     TaskIsolation,
     Verification,
+    WebFetchMode,
     WorktreeRemoval,
     WorktreeSnapshot,
     parallel_tasks_label,
@@ -54,6 +55,7 @@ from .command_providers import (
     SubagentsResearcherOptionsProvider,
     ThemeOptionsProvider,
     VerificationOptionsProvider,
+    WebFetchModeOptionsProvider,
     WorkflowPreset,
     WorkflowPresetOptionsProvider,
     WorktreeRemovalOptionsProvider,
@@ -282,6 +284,55 @@ class SettingsLayer(DrCodeState):
                 placeholder="Search for options…",
             )
         )
+
+    def action_set_web_fetch_mode(self, mode: WebFetchMode) -> None:
+        """Settings command: whether the RESEARCH agent may read web pages
+        through its structured `web_fetch` tool (off / allowlist / all
+        hosts). Persisted per project (.drcode/settings.json); agents are
+        built per activation, so a change reaches the next run of each
+        task, never the in-flight one. Turning it off REGISTERS nothing —
+        the model does not see the tool at all."""
+        self.settings.web_fetch_mode = mode
+        self.settings_store.save(self.settings)
+        if mode is WebFetchMode.ALLOWLIST and not self.settings.web_fetch_allow_hosts:
+            self.notify(
+                "Web fetch: allowlist mode with an EMPTY allow list — every "
+                "fetch is refused until at least one host is added "
+                "(Task settings → web fetch hosts).",
+                title="Project settings",
+                severity="warning",
+                timeout=10,
+            )
+        else:
+            self.notify(
+                f"Web fetch (research): {mode.label}",
+                title="Project settings",
+                timeout=4,
+            )
+
+    def action_change_web_fetch_mode(self) -> None:
+        """Web-fetch-mode picker, opened from the "Web fetch (research)"
+        Settings entry. Same UX as the retention picker: the narrowed
+        SettingsPalette with the three modes; picking one applies it,
+        Escape dismisses without changing anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--web-fetch-mode-palette",
+                providers=[WebFetchModeOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
+
+    def action_edit_web_fetch_hosts(self) -> None:
+        """Open the task-settings dialog, where the web-fetch allow/block
+        host lists are edited (the palette has no free-text field — the
+        lists are comma-separated Inputs in the dialog, normalized on
+        Apply by `ProjectSettings` itself)."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.action_open_task_settings()
 
     def action_set_git_tester(self, policy: GitPolicy) -> None:
         """Settings command: what the tester may do to git after a passed

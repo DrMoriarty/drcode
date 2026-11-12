@@ -60,6 +60,7 @@ from ..settings import (
     STALL_NUDGE_OPTIONS,
     SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
+    WEB_FETCH_MODE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     WORKTREE_SNAPSHOT_OPTIONS,
     CompletedRetention,
@@ -69,9 +70,11 @@ from ..settings import (
     StallNudge,
     TaskIsolation,
     Verification,
+    WebFetchMode,
     WorktreeRemoval,
     WorktreeSnapshot,
     dev_rounds_label,
+    normalize_host_entry,
     parallel_tasks_label,
     subagents_label,
     task_settings_hints,
@@ -102,6 +105,9 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.parallel_tasks = src.parallel_tasks
     dst.subagents_coder = src.subagents_coder
     dst.subagents_researcher = src.subagents_researcher
+    dst.web_fetch_mode = src.web_fetch_mode
+    dst.web_fetch_allow_hosts = list(src.web_fetch_allow_hosts)
+    dst.web_fetch_block_hosts = list(src.web_fetch_block_hosts)
     dst.agent_creates_drafts = src.agent_creates_drafts
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
@@ -111,6 +117,23 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
     dst.keep_awake = src.keep_awake
+
+
+def _parse_host_list(text: str) -> list[str]:
+    """Parse a host-list Input into normalized entries.
+
+    Delegates the normalization to `drcode.settings.normalize_host_entry`
+    (the same function `ProjectSettings` runs on load) so a comma-, space-
+    or newline-separated field, a pasted URL or a `host:port` entry all end
+    up identical to what a hand-edited settings.json would produce —
+    duplicates drop out, junk is skipped, the user's order is kept.
+    """
+    hosts: list[str] = []
+    for chunk in text.replace(",", " ").replace("\n", " ").split():
+        host = normalize_host_entry(chunk)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
 
 
 class DialogScroll(VerticalScroll):
@@ -378,6 +401,37 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-subagents-researcher",
                         )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Research web fetch", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in WEB_FETCH_MODE_OPTIONS],
+                            value=d.web_fetch_mode,
+                            allow_blank=False,
+                            id="ts-web-fetch-mode",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label(
+                            "Web fetch allow list (comma-separated hosts)",
+                            classes="ts-label",
+                        )
+                        yield Input(
+                            value=", ".join(d.web_fetch_allow_hosts),
+                            id="ts-web-fetch-allow",
+                            placeholder="docs.example.com, github.com",
+                        )
+                yield Label(
+                    "Web fetch block list (comma-separated hosts) — always "
+                    "wins over the allow list and over the all-hosts mode; "
+                    "private and link-local addresses are refused in every "
+                    "mode",
+                    classes="ts-label",
+                )
+                yield Input(
+                    value=", ".join(d.web_fetch_block_hosts),
+                    id="ts-web-fetch-block",
+                    placeholder="(empty — nothing blocked)",
+                )
                 yield Label(
                     "Agent creates drafts — the agents' task-creation tools "
                     "(research: bug/feature, tester: bug) create DRAFT tasks; "
@@ -571,6 +625,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-snapshot", d.worktree_snapshot)
         self._set_select("#ts-subagents-coder", d.subagents_coder)
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
+        self._set_select("#ts-web-fetch-mode", d.web_fetch_mode)
         self._set_select("#ts-verification", d.verification)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
@@ -612,6 +667,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-subagents-researcher": (
                 d.subagents_researcher != o.subagents_researcher
             ),
+            "#ts-web-fetch-mode": d.web_fetch_mode is not o.web_fetch_mode,
+            "#ts-web-fetch-allow": d.web_fetch_allow_hosts != o.web_fetch_allow_hosts,
+            "#ts-web-fetch-block": d.web_fetch_block_hosts != o.web_fetch_block_hosts,
             "#ts-verification": d.verification is not o.verification,
             "#ts-dev-rounds": d.max_dev_rounds != o.max_dev_rounds,
             "#ts-nudge": d.stall_nudge is not o.stall_nudge,
@@ -641,12 +699,22 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             }
         if d.verification is Verification.NONE:
             dormant.add("#ts-git-tester")
+        # Web fetch off: the host lists park (their values are kept, never
+        # rewritten — the user's entries come back when the mode turns on).
+        if d.web_fetch_mode is WebFetchMode.OFF:
+            dormant |= {"#ts-web-fetch-allow", "#ts-web-fetch-block"}
+        elif d.web_fetch_mode is WebFetchMode.ALL:
+            # Block list still applies in the all-hosts mode; only the
+            # allow list is dormant there.
+            dormant.add("#ts-web-fetch-allow")
         for selector in (
             "#ts-start-branch",
             "#ts-parallel",
             "#ts-removal",
             "#ts-snapshot",
             "#ts-git-tester",
+            "#ts-web-fetch-allow",
+            "#ts-web-fetch-block",
         ):
             self.query_one(selector).set_class(selector in dormant, "ts-dormant")
 
@@ -770,6 +838,28 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             event.value != self._draft.subagents_researcher
         ):
             self._draft.subagents_researcher = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-web-fetch-mode")
+    def _web_fetch_mode_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, WebFetchMode) and (
+            event.value is not self._draft.web_fetch_mode
+        ):
+            self._draft.web_fetch_mode = event.value
+            self._refresh()
+
+    @on(Input.Changed, "#ts-web-fetch-allow")
+    def _web_fetch_allow_changed(self, event: Input.Changed) -> None:
+        hosts = _parse_host_list(event.value)
+        if hosts != self._draft.web_fetch_allow_hosts:
+            self._draft.web_fetch_allow_hosts = hosts
+            self._refresh()
+
+    @on(Input.Changed, "#ts-web-fetch-block")
+    def _web_fetch_block_changed(self, event: Input.Changed) -> None:
+        hosts = _parse_host_list(event.value)
+        if hosts != self._draft.web_fetch_block_hosts:
+            self._draft.web_fetch_block_hosts = hosts
             self._refresh()
 
     @on(Select.Changed, "#ts-verification")

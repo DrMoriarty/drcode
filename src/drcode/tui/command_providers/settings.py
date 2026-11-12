@@ -38,6 +38,7 @@ from ...settings import (
     STALL_NUDGE_OPTIONS,
     SUBAGENTS_OPTIONS,
     VERIFICATION_OPTIONS,
+    WEB_FETCH_MODE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     WORKTREE_SNAPSHOT_OPTIONS,
     GitPolicy,
@@ -585,6 +586,25 @@ class TaskSettingsEntriesProvider(CommandListProvider):
                 "is per run) — off removes the delegate_research tool "
                 "(project setting)",
             ),
+            CommandEntry(
+                f"Web fetch (research): {app.settings.web_fetch_mode.label}",
+                app.action_change_web_fetch_mode,
+                "Whether the RESEARCH agent may read web pages through "
+                "its structured web_fetch tool (off / allowlist / all "
+                "hosts) — replaces the unmanaged curl in run_bash: "
+                "GET-only, private and metadata addresses refused, size- "
+                "capped, HTML reduced to text and every result framed as "
+                "untrusted content. The coding agent, the tester and the "
+                "resolver never get it (project setting)",
+            ),
+            CommandEntry(
+                "Web fetch hosts…",
+                app.action_edit_web_fetch_hosts,
+                "Edit the web-fetch allow and block lists (the block list "
+                "always wins; an empty allow list in allowlist mode "
+                "refuses every host). A listed host also matches its "
+                "subdomains (project setting)",
+            ),
             # -- Testing --
             CommandEntry(
                 f"Verification: {app.settings.verification.label}",
@@ -899,6 +919,31 @@ class SubagentsResearcherOptionsProvider(CommandListProvider):
             )
             for count in SUBAGENTS_OPTIONS
         ]
+
+
+class WebFetchModeOptionsProvider(CommandListProvider):
+    """Options of the "Web fetch (research)" setting (off / allowlist /
+    all hosts).
+
+    Same selection-palette UX as RetentionOptionsProvider: pick an option
+    to apply it immediately, Escape keeps the current one. The active
+    option is marked with "(current)"; each entry's help text comes from
+    the mode itself (`WebFetchMode.description`), so the palette and the
+    task-settings dialog explain the modes identically.
+    """
+
+    def _commands(self) -> list[CommandEntry]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.web_fetch_mode
+        entries: list[CommandEntry] = []
+        for mode in WEB_FETCH_MODE_OPTIONS:
+            marked = _marked_option(
+                mode.label,
+                mode is current,
+                partial(app.action_set_web_fetch_mode, mode),
+            )
+            entries.append(marked._replace(help=mode.description))
+        return entries
 
 
 class StartBranchOptionsProvider(CommandListProvider):

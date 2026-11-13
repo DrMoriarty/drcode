@@ -13,15 +13,20 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+
 from ..agent import (
     GIANT_PROMPT_TOKENS,
     MECHANICAL_HEADROOM_TOKENS,
+    MODEL_SWITCH_NOTE_PREFIX,
     build_compaction_agent,
     build_compaction_prompt,
     build_reduce_prompt,
     build_resolver_agent,
     chunk_history_for_summary,
     compacted_messages,
+    drop_model_switch_notes,
+    ends_with_open_request,
     even_slice_budget,
     extract_previous_summary,
     is_summary_message,
@@ -32,8 +37,10 @@ from ..agent import (
     prompt_fits_context,
     prompt_fits_window,
     render_history_for_summary,
+    serialize_messages,
     slice_budget_tokens,
     split_original_prompts,
+    strip_thinking_parts,
     subagent_limit_for,
     tester_verdict_issued,
     unwrap_summary_envelope,
@@ -118,6 +125,34 @@ RESUME_COMPACTION_MIN_TOKENS = 20_000
 # deliberately not a setting: below it the cache is possibly still warm and
 # the ordinary threshold gate keeps working as before.
 RESUME_COMPACTION_MIN_IDLE_SECONDS = 180.0
+
+# Model-switch housekeeping (`_prepare_model_switch_transcript`): a dev
+# transcript is force-compacted on a model change only above this token
+# fill. On a small one the mechanical thinking-strip is enough — an LLM
+# summary there would only lose detail (and burn a call).
+MODEL_SWITCH_COMPACTION_MIN_TOKENS = RESUME_COMPACTION_MIN_TOKENS
+
+
+# The synthetic user message appended to a transcript when the next run
+# starts on a DIFFERENT model (see _prepare_model_switch_transcript): the
+# takeover briefing for the incoming model.
+def model_switch_note(old_key: str, new_key: str) -> str:
+    """The takeover briefing appended on a model switch.
+
+    Names both models factually: the incoming model must know it inherited
+    the task mid-way, not that the work above is its own. Rides behind
+    MODEL_SWITCH_NOTE_PREFIX (compaction machinery — summarized away on
+    the next compaction, never a user prompt for any user-side
+    extraction)."""
+    return (
+        f"{MODEL_SWITCH_NOTE_PREFIX} This task was worked on by another "
+        f"model ({old_key}) and you ({new_key}) are taking it over mid-way. "
+        "That model's reasoning traces were removed from this history; the "
+        "user prompts, tool calls and their results above are the factual "
+        "record of the work done so far. Treat them as the task's current "
+        "state and continue from there — do not redo steps that are already "
+        "recorded as done."
+    )
 
 
 class _ChunkingImpossible(Exception):
@@ -1159,22 +1194,49 @@ class PipelineCompactionLayer(CoreState):
             # Only the original prompt(s) plus a previous summary are
             # left — compacting again would be a no-op.
             return
-        # Honor the agent's remaining mark_unneeded marks before the
-        # summarizer is even considered (the forced half of the
-        # _maybe_compact pattern), then re-measure with the eviction
-        # credit applied — one unloading can pull the fill back under
-        # the threshold and spare the summarizer entirely.
+        # Honor the agent's remaining mark_unneeded marks, re-measure and
+        # run the summarizer — the shared execution tail (also used by the
+        # model-switch housekeeping below).
+        minutes = int(idle // 60)
+        await self._force_pre_run_compaction(
+            task,
+            role,
+            threshold,
+            f"Idle {minutes} min: the prompt cache has expired",
+        )
+
+    async def _force_pre_run_compaction(
+        self,
+        task: Task,
+        role: AgentRole,
+        threshold: int,
+        reason: str,
+    ) -> bool:
+        """Force-compact the dev transcript BEFORE a run's first turn — the
+        shared execution tail of the two pre-run gates (`_maybe_compact_after_idle`
+        and the model-switch housekeeping, `_prepare_model_switch_transcript`).
+
+        Honors the agent's remaining mark_unneeded marks first (one unloading
+        can pull the fill back under the threshold and spare the summarizer
+        entirely), re-measures with the eviction credit, announces with
+        `reason` naming the trigger and runs the LLM summarizer. A
+        summarizer failure latches `_compaction_failed` and degrades to an
+        uncompressed run — never fatal. Returns True when the transcript
+        was actually compacted."""
+        _, rest = split_original_prompts(task.messages)
+        if not any(not is_summary_message(m) for m in rest):
+            # Only the original prompt(s) plus a previous summary are
+            # left — compacting again would be a no-op.
+            return False
         self._maybe_evict_marked(task, force=True)
         tokens = self._apply_eviction_credit(
             task.id, last_context_tokens(task.messages)
         )
         if not tokens or tokens <= threshold:
-            return
-        minutes = int(idle // 60)
+            return False
         self._show_event(
             task,
-            f"Idle {minutes} min — the prompt cache has expired; compacting "
-            f"history before the run (fill ≈{tokens} tokens)…",
+            f"{reason} — compacting history before the run (fill ≈{tokens} tokens)…",
         )
         old_messages = task.messages
         try:
@@ -1198,7 +1260,7 @@ class PipelineCompactionLayer(CoreState):
                 f"Pre-run compaction failed: {type(e).__name__}: {e} — "
                 "continuing with the uncompressed history.",
             )
-            return
+            return False
         new_messages, event, llm_failed, mechanical = compacted
         if llm_failed:
             self._compaction_failed.add(task.id)
@@ -1214,10 +1276,10 @@ class PipelineCompactionLayer(CoreState):
         task.messages = new_messages
         task.touch()
         self.manager.storage.save(task)
-        # The fill figures below are persisted-transcript estimates (no
-        # live reading exists at run start); the credit belongs to the
-        # old transcript — the summary was built from the lightened
-        # history, so drop it with the stale live reading.
+        # The fill figures are persisted-transcript estimates (no live
+        # reading exists at run start); the credit belongs to the old
+        # transcript — the summary was built from the lightened history,
+        # so drop it with the stale live reading.
         self._live_ctx_tokens.pop(task.id, None)
         self._evicted_ctx_tokens.pop(task.id, None)
         after = last_context_tokens(task.messages)
@@ -1227,6 +1289,98 @@ class PipelineCompactionLayer(CoreState):
         )
         if self.viewed_id == task.id:
             self.view_task(task.id)
+        return True
+
+    async def _prepare_model_switch_transcript(
+        self, task: Task, role: AgentRole
+    ) -> None:
+        """Housekeeping for a model change BETWEEN this task's runs —
+        including a change across a drcode restart (the comparison key is
+        the PERSISTED `task.last_model_key`, stamped on every run start).
+
+        A transcript written by model A is a liability for model B: the
+        biggest source of damage is A's reasoning — pydantic-ai maps a
+        history ThinkingPart into each provider's native reasoning field
+        only for parts that came from that provider, and otherwise wraps
+        the foreign raw reasoning into the model's thinking tags
+        (` thinking` … `</think>`) inside the assistant content of the new
+        model's request. On every key mismatch:
+
+        1. the previous model's thinking parts are stripped MECHANICALLY
+           (no model call, `strip_thinking_parts`) — always;
+        2. a sufficiently large transcript (over
+           `MODEL_SWITCH_COMPACTION_MIN_TOKENS`) is additionally
+           force-compacted (the summarizer drops thinking parts by
+           construction and squeezes the rest) — a small one keeps its
+           detail: compacting it would only lose context and burn a call;
+        3. a synthetic takeover note (MODEL_SWITCH_NOTE_PREFIX) is added
+           when the run will actually make a model call, so the incoming
+           model knows it took the task over mid-way.
+
+        Stamps `task.last_model_key` with the new key and saves. Never
+        fatal: the compaction half degrades exactly like the idle gate."""
+        new_key = self.resolved_model_key(role)
+        if not new_key or task.last_model_key == new_key:
+            return
+        old_key = task.last_model_key
+        if not old_key or not task.messages:
+            # First run of the task / first run since the field existed /
+            # an empty transcript: nothing to clean — just stamp the key.
+            task.last_model_key = new_key
+            self.manager.storage.save(task)
+            return
+        cleaned, removed = strip_thinking_parts(task.messages)
+        if removed:
+            task.messages = cleaned
+        # Will this activation actually make a model call? Read BEFORE the
+        # compaction below: a compaction leaves the transcript ending with
+        # the synthetic summary request, and appending the takeover note to
+        # a run that had nothing to do would turn it into a spurious
+        # continuation turn (one wasted model call on an already-finished
+        # exchange). The strip above is already applied — it matches what
+        # the run will actually receive.
+        will_call = bool(task.pending_input) or ends_with_open_request(task.messages)
+        compacted = False
+        if task.id not in self._compaction_failed:
+            compacted = await self._force_pre_run_compaction(
+                task,
+                role,
+                MODEL_SWITCH_COMPACTION_MIN_TOKENS,
+                f"Model switch ({old_key} → {new_key})",
+            )
+        note_added = False
+        if will_call:
+            # The run will make a model call: brief the incoming model on
+            # the takeover. The note rides behind MODEL_SWITCH_NOTE_PREFIX
+            # (compaction machinery — summarized away, never a user
+            # prompt); as a trailing request it merges with the following
+            # prompt request or completes the open interrupted attempt.
+            # Notes of EARLIER switches (a run aborted right after one was
+            # written) are dropped first: they name a pair of models that
+            # no longer applies and would pile up in the merged request.
+            task.messages = drop_model_switch_notes(task.messages)
+            note = ModelRequest(
+                parts=[UserPromptPart(content=model_switch_note(old_key, new_key))]
+            )
+            task.messages = task.messages + serialize_messages([note])
+            note_added = True
+        task.last_model_key = new_key
+        task.touch()
+        self.manager.storage.save(task)
+        actions: list[str] = []
+        if removed:
+            actions.append(f"{removed} thinking part(s) removed")
+        if compacted:
+            actions.append("history compacted")
+        if note_added:
+            actions.append("takeover note added")
+        if actions:
+            self._show_event(
+                task,
+                f"Model-switch housekeeping: {'; '.join(actions)}.",
+            )
+            if not compacted and self.viewed_id == task.id:
+                self.view_task(task.id)
 
     def _archive_transcript_replacement(
         self,

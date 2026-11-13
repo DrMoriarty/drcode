@@ -23,6 +23,7 @@ from .prompts import load_compaction_prompts
 from .transcript import (
     COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
+    MODEL_SWITCH_NOTE_PREFIX,
     estimate_tokens,
     sanitized_messages,
     serialize_messages,
@@ -115,9 +116,16 @@ def _is_summary_part(part: dict[str, Any]) -> bool:
 def _is_resume_part(part: dict[str, Any]) -> bool:
     """Compaction-continuation note (a round resumed after a successful
     compaction was nudged with this instruction, see
-    drcode.core.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT)."""
+    drcode.core.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT) or a
+    model-switch note (the takeover briefing appended when the next run
+    starts on a different model, see
+    drcode.core.pipeline_compaction._prepare_model_switch_transcript).
+    Both are pipeline machinery: never preserved verbatim across
+    compactions, never counted as user prompts."""
     content = part.get("content")
-    return isinstance(content, str) and content.startswith(COMPACTION_RESUME_PREFIX)
+    return isinstance(content, str) and content.startswith(
+        (COMPACTION_RESUME_PREFIX, MODEL_SWITCH_NOTE_PREFIX)
+    )
 
 
 def _user_prompt_content(msg: dict[str, Any]) -> str | None:

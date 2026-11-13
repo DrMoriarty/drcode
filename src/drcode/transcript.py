@@ -42,6 +42,15 @@ COMPACTION_SUMMARY_PREFIX = "[context summary]"
 # summarized) and is not a user prompt for any user-side extraction.
 COMPACTION_RESUME_PREFIX = "[compaction note]"
 
+# Marker prefix of the synthetic user message appended to a transcript when
+# the NEXT run starts on a DIFFERENT model than the previous one (see
+# core/pipeline_compaction._prepare_model_switch_transcript): tells the
+# incoming model it is taking the task over mid-way. Like
+# COMPACTION_RESUME_PREFIX it is compaction machinery — never preserved
+# verbatim across compactions and not a user prompt for any user-side
+# extraction.
+MODEL_SWITCH_NOTE_PREFIX = "[model switch note]"
+
 # Conventional token-size assumption of the chars/4 estimate: ~4 characters
 # per token. Used by `estimate_tokens` here and re-exported by
 # `context_layout` (which labels every figure built from it with "≈").
@@ -231,6 +240,89 @@ def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
     return messages[:cut]
 
 
+def strip_thinking_parts(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove every thinking part from a serialized transcript (purely
+    mechanical, no model call).
+
+    A transcript written by model A carries A's reasoning as ThinkingParts
+    (serialized `part_kind == "thinking"`). When the next run starts on a
+    DIFFERENT model — a different provider especially — those parts are a
+    liability, not context: pydantic-ai maps a history ThinkingPart into each
+    provider's native reasoning field only when the part came from that same
+    provider, and otherwise falls back to wrapping the foreign raw reasoning
+    into the model's thinking tags (` thinking` … `</think>` by default, see
+    `_map_response_thinking_part` in pydantic-ai's openai chat model) — the
+    previous model's chain of thought then lands inside the assistant
+    content of the new model's request. The reasoning of a model that is no
+    longer serving the task has no value for the replacement anyway, so the
+    parts are dropped outright.
+
+    Returns (cleaned messages, number of parts removed). A response that
+    held NOTHING but thinking is dropped entirely: a ModelResponse with an
+    empty part list is not API-valid. Thinking-only responses carry no
+    tool calls, so dropping them cannot orphan a later tool result.
+    """
+    cleaned: list[dict[str, Any]] = []
+    removed = 0
+    for msg in messages:
+        parts = msg.get("parts") if isinstance(msg, dict) else None
+        if not isinstance(parts, list):
+            cleaned.append(msg)
+            continue
+        kept = [
+            p
+            for p in parts
+            if not (isinstance(p, dict) and p.get("part_kind") == "thinking")
+        ]
+        removed += len(parts) - len(kept)
+        if len(kept) == len(parts):
+            cleaned.append(msg)
+            continue
+        if not kept and (
+            msg.get("kind") == "response" or msg.get("role") == "response"
+        ):
+            # A thinking-only response: dropping the parts leaves an
+            # API-invalid empty response — drop the message instead.
+            continue
+        cleaned.append({**msg, "parts": kept})
+    return cleaned, removed
+
+
+def drop_model_switch_notes(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove every synthetic model-switch takeover note from a transcript.
+
+    Called right before a NEW note is appended: pydantic-ai merges adjacent
+    requests on resume, so notes of earlier switches can pile up in one
+    request (a run aborted right after its note was written leaves it
+    behind). All of them go stale with the next switch — the fresh note
+    names the current pair of models and supersedes the old ones. Requests
+    left without parts are dropped: an empty ModelRequest is not
+    API-valid."""
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        parts = msg.get("parts") if isinstance(msg, dict) else None
+        if not isinstance(parts, list):
+            cleaned.append(msg)
+            continue
+        kept = [
+            p
+            for p in parts
+            if not (
+                isinstance(p, dict)
+                and p.get("part_kind") == "user-prompt"
+                and isinstance(p.get("content"), str)
+                and p["content"].startswith(MODEL_SWITCH_NOTE_PREFIX)
+            )
+        ]
+        if len(kept) == len(parts):
+            cleaned.append(msg)
+        elif kept:
+            cleaned.append({**msg, "parts": kept})
+    return cleaned
+
+
 def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     """True when `text` is already the prompt of an unfinished attempt in the
     serialized transcript (possible only for legacy tasks whose interrupted
@@ -315,7 +407,11 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
                 if isinstance(content, str) and content.strip():
                     text = content.strip()
                     if text.startswith(
-                        (COMPACTION_SUMMARY_PREFIX, COMPACTION_RESUME_PREFIX)
+                        (
+                            COMPACTION_SUMMARY_PREFIX,
+                            COMPACTION_RESUME_PREFIX,
+                            MODEL_SWITCH_NOTE_PREFIX,
+                        )
                     ):
                         continue
                     prompts.append(text)
@@ -420,6 +516,13 @@ def extract_display(
                                     content[len(COMPACTION_SUMMARY_PREFIX) :].strip(),
                                 )
                             )
+                        elif content.startswith(MODEL_SWITCH_NOTE_PREFIX):
+                            # Synthetic model-switch note (compaction
+                            # machinery): rendered as its own separator
+                            # block, never as a user message. The briefing
+                            # body itself is long model-facing prose — the
+                            # chat shows only the fact, with no text.
+                            out.append((part_at, "note", ""))
                         else:
                             out.append((part_at, "user", content))
             continue
@@ -487,7 +590,9 @@ def user_prompt_texts(messages: list[dict[str, Any]]) -> list[str]:
     string; multimodal requests carry a list of content items (strings or
     {"text": ...} dicts) — their text is joined. Model responses, tool
     calls and tool results are ignored. Used by the archive search and the
-    skeleton builder.
+    skeleton builder. The synthetic model-switch takeover note is skipped
+    (pipeline machinery, not user input — indexing its boilerplate would
+    pollute the search index with the same text on every task).
     """
     texts: list[str] = []
     for message in messages:
@@ -500,6 +605,8 @@ def user_prompt_texts(messages: list[dict[str, Any]]) -> list[str]:
                 continue
             content = part.get("content")
             if isinstance(content, str):
+                if content.startswith(MODEL_SWITCH_NOTE_PREFIX):
+                    continue
                 texts.append(content)
             elif isinstance(content, list):
                 for item in content:

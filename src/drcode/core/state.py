@@ -203,14 +203,16 @@ class CoreState:
         the wording says so — a switch is reported even on a retry
         resume.
 
-        A task whose key has no entry yet (first run of the session —
-        the dict above is session-scoped and not persisted) always gets
-        the plain "Model: <key>" line. Like every service event this goes
-        to `task.events` — shown in the chat, never fed to the model."""
+        A task whose key has no entry yet in the session dict falls back to
+        the PERSISTED `task.last_model_key` (stamped on every run start) —
+        so a model change across a drcode restart is reported as a switch
+        too, not as a plain first "Model:" line. Like every service event
+        this goes to `task.events` — shown in the chat, never fed to the
+        model."""
         key = self.resolved_model_key(role)
         if not key:
             return
-        previous = self._last_agent_model_keys.get(task.id)
+        previous = self._last_agent_model_keys.get(task.id) or task.last_model_key
         self._last_agent_model_keys[task.id] = key
         if previous and previous != key:
             self._show_event(task, f"Model switched: {previous} → {key}")
@@ -461,6 +463,10 @@ class CoreState:
     async def _maybe_compact(self, task: Task) -> None: ...
 
     async def _maybe_compact_after_idle(self, task: Task) -> None: ...
+
+    async def _prepare_model_switch_transcript(
+        self, task: Task, role: AgentRole
+    ) -> None: ...
 
     async def _maybe_compact_tester_round(
         self, task: Task, live_tokens: int | None, *, force: bool = False

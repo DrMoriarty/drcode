@@ -1004,6 +1004,13 @@ class ChatTimelineLayer(DrCodeState):
             # agent continues from, not a user message).
             self._write_chat("[bold magenta]──── context compacted ────[/]")
             block = AssistantBlock(text)
+        elif role == "note":
+            # Synthetic pipeline note (the model-switch takeover briefing):
+            # a dim separator, no body — the note's prose is model-facing
+            # machinery, not chat content.
+            self._write_chat(
+                "[dim]──── model switched (task taken over) ────[/]", note=note
+            )
         elif role == "event":
             self._write_chat(f"[bold red]event ›[/] {text}", note=note)
         elif role == "system":

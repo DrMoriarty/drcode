@@ -115,9 +115,11 @@ from .tool_runtime import (
 from .transcript import (
     COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
+    MODEL_SWITCH_NOTE_PREFIX,
     _context_status,
     all_user_prompts,
     backdate_user_prompt,
+    drop_model_switch_notes,
     ends_with_open_request,
     extract_display,
     first_user_prompt,
@@ -129,6 +131,7 @@ from .transcript import (
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
+    strip_thinking_parts,
 )
 from .web_fetch import (
     FETCHES_PER_RUN,
@@ -156,6 +159,7 @@ __all__ = [
     "MAX_BYTES",
     "MAX_OUTPUT_CHARS",
     "MECHANICAL_HEADROOM_TOKENS",
+    "MODEL_SWITCH_NOTE_PREFIX",
     "RESEARCH_GIT_PROMPT_LOCAL",
     "RESEARCH_GIT_PROMPT_PUSH",
     "RESEARCH_SYSTEM_PROMPT",
@@ -213,6 +217,7 @@ __all__ = [
     "chunk_history_for_summary",
     "clean_generated_title",
     "compacted_messages",
+    "drop_model_switch_notes",
     "ends_with_open_request",
     "even_slice_budget",
     "eviction_dynamic_instructions",
@@ -250,6 +255,7 @@ __all__ = [
     "serialize_messages",
     "slice_budget_tokens",
     "split_original_prompts",
+    "strip_thinking_parts",
     "subagent_limit_for",
     "task_goal_block",
     "task_search",

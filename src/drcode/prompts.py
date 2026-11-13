@@ -310,8 +310,12 @@ def load_subagent_prompt(project_root: Path) -> str:
     (`delegate_research`, see drcode.subagents). The ``{project_path}``
     placeholder is replaced with the ROOT the parent agent works in (the
     task's worktree under isolation, else the project directory): the
-    subagent reads the same tree. A project may override the template
-    with ``<root>/.drcode/prompts/subagent.md``."""
+    subagent reads the same tree. ``{web_fetch_note}`` (left intact here)
+    is where `subagents._subagent_instructions` puts the inherited-
+    `web_fetch` sentence — empty when the subagent did not inherit the
+    tool, so the prompt never mentions a tool the model does not have.
+    A project may override the template with
+    ``<root>/.drcode/prompts/subagent.md``."""
     template = _project_prompt_override(project_root, "subagent.md") or (
         SYSTEM_PROMPTS_DIR / "subagent.md"
     ).read_text(encoding="utf-8")

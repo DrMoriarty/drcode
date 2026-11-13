@@ -388,9 +388,136 @@ def test_no_gate_returns_configuration_hint(
     assert "not configured" in out
 
 
+# -- inherited web_fetch ----------------------------------------------------------
+
+
+def test_delegate_inherits_web_fetch_from_parent_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """A RESEARCH parent run with a web-fetch gate passes the permission
+    on: the subagent agent gets the web_fetch tool and the SubagentDeps
+    carry the parent's manager plus the subagent's OWN gate (same policy,
+    smaller budget)."""
+    from drcode.subagents import SubagentDeps
+    from drcode.web_fetch import (
+        FETCHES_PER_RUN,
+        SUBAGENT_FETCHES_PER_RUN,
+        WebFetchGate,
+        WebFetchMode,
+        WebFetchPolicy,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_subagent_model(cfg, announce_wait=None):
+        return FunctionModel(
+            lambda messages, info: text_response("report with a fetched page")
+        )
+
+    monkeypatch.setattr("drcode.subagents._build_subagent_model", fake_subagent_model)
+    real_deps = SubagentDeps
+
+    def recording_deps(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_deps(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("drcode.subagents.SubagentDeps", recording_deps)
+
+    policy = WebFetchPolicy(mode=WebFetchMode.ALL)
+    task = manager.create("R", "research")
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=project_root / "scratch",
+        subagent_gate=SubagentGate(2),
+        web_fetch_gate=WebFetchGate(policy),
+    )
+
+    out = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+
+    assert "report with a fetched page" in out
+    assert captured["manager"] is manager
+    assert captured["parent_task_id"] == task.id
+    sub_gate = captured["web_fetch_gate"]
+    assert isinstance(sub_gate, WebFetchGate)
+    assert sub_gate.policy is policy  # the SAME policy object
+    assert sub_gate.limit == SUBAGENT_FETCHES_PER_RUN
+    assert sub_gate.limit < FETCHES_PER_RUN  # a share, never the full budget
+    # The built agent carried the tool too (build happened with the policy).
+    # captured via the gate: build_subagent_agent received web_fetch_policy.
+
+    # The parent's own gate is untouched by the delegation.
+    assert deps.web_fetch_gate is not None
+    assert deps.web_fetch_gate.used == 0
+
+
+def test_delegate_without_parent_gate_stays_network_free(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """A CODING parent (no web_fetch_gate on deps) delegates a subagent
+    with NO fetch tool and a gate-less SubagentDeps — network-free, as
+    before the inheritance existed."""
+    captured: dict[str, object] = {}
+    from drcode.subagents import SubagentDeps
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(
+            lambda messages, info: text_response("plain report")
+        ),
+    )
+    real_deps = SubagentDeps
+
+    def recording_deps(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_deps(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("drcode.subagents.SubagentDeps", recording_deps)
+
+    task = manager.create("T", "delegate me")
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=project_root / "scratch",
+        subagent_gate=SubagentGate(1),
+        # no web_fetch_gate — the CODING shape
+    )
+
+    out = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+
+    assert "plain report" in out
+    assert captured["manager"] is manager
+    assert captured["web_fetch_gate"] is None
+    # And the built agent had no web_fetch tool: the policy reached
+    # build_subagent_agent as None (recording via the gate above).
+
+
+def test_subagent_web_fetch_tool_registered_with_policy(
+    fake_config: Config,
+) -> None:
+    """build_subagent_agent with an inherited policy registers the fetch
+    tool; without one it does not (the tool list stays five + git)."""
+    from drcode.web_fetch import WebFetchMode, WebFetchPolicy
+
+    policy = WebFetchPolicy(mode=WebFetchMode.ALLOWLIST, allow_hosts=("example.com",))
+    ag = build_subagent_agent(fake_config, root=Path.cwd(), web_fetch_policy=policy)
+    names = _tool_names(ag)
+    assert "web_fetch" in names
+    assert "run_bash" not in names
+
+    ag_plain = build_subagent_agent(fake_config, root=Path.cwd())
+    assert "web_fetch" not in _tool_names(ag_plain)
+
+
 # -- the read-only git history tool ----------------------------------------------
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A tiny real git repo with two commits over one file."""
@@ -419,7 +546,9 @@ def test_subagent_gets_git_history_tool(fake_config: Config) -> None:
     desc = _description(ag, "git_history")
     assert "log" in desc and "blame" in desc and "show" in desc and "diff" in desc
     assert "read-only" in desc.lower()
-    # Still no shell and no fetch: the git tool is the ONLY addition.
+    # Still no shell, and no fetch at the default build (web_fetch is
+    # registered only when the INHERITED policy is passed — see the
+    # inheritance tests here and in test_web_fetch.py).
     assert "run_bash" not in names
     assert "web_fetch" not in names
 

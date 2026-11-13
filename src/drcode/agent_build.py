@@ -401,9 +401,11 @@ def build_agent(
     activation) registers the `web_fetch` tool — RESEARCH tasks ONLY, and
     only when the policy is enabled (mode off = no tool at all, the model
     never sees it). Coding/bug tasks ignore the argument entirely: they
-    never get the tool, and neither do `delegate_research` subagents —
-    network access is exercised on the parent, whose fetch budget
-    (`FETCHES_PER_RUN`) and host policy are enforced by `drcode.web_fetch`.
+    never get the tool. `delegate_research` subagents INHERIT the parent
+    run's permission when present (same host policy, their own smaller
+    budget — see `drcode.subagents.run_delegate_tool`); the parent's fetch
+    budget (`FETCHES_PER_RUN`) and host policy are enforced by
+    `drcode.web_fetch`.
 
     `announce_wait` (the pipeline's per-run slot-wait announcer) is
     forwarded to `agent_model.build_model`: when the provider's
@@ -1212,7 +1214,9 @@ def build_agent(
             call returns the subagent's final report (its intermediate tool
             traffic stays invisible to your context) plus a one-line usage
             summary. The subagent can only read: read_file, grep_search,
-            glob_files, search_task_archive — no writing, no shell.
+            glob_files, search_task_archive — no writing, no shell. When
+            YOUR run has web_fetch, the subagent inherits it (same host
+            policy, its own smaller fetch budget).
 
             WHY IT IS CHEAP: every file YOU read stays in your context until
             the end of the run and pushes you toward a compaction, which

@@ -50,8 +50,14 @@ explanation — a failed fetch never crashes the agent run (the model can fix
 the URL, try another host or continue without it).
 
 Scope: the tool is registered for the RESEARCH role only (never coding /
-tester / resolver, and never for `delegate_research` subagents — network
-policy is exercised on the parent).
+tester / resolver). A `delegate_research` subagent INHERITS the parent
+run's permission: only when the parent run is a RESEARCH run with an
+enabled policy does the subagent get the tool — same policy object (the
+allow/block host lists apply unchanged, the block list always wins) but
+its OWN smaller budget (`SUBAGENT_FETCHES_PER_RUN`, a share of
+FETCHES_PER_RUN), and the service events land in the parent task's log.
+A CODING parent or an off mode leaves the subagent network-free — see
+`drcode.subagents`.
 
 Residual risk (deliberately out of scope for this iteration): the resolved
 IP is NOT pinned for the actual connection — httpx resolves the host again
@@ -87,6 +93,7 @@ from .version import APP_VERSION
 if TYPE_CHECKING:
     from .agent import AgentDeps
     from .settings import ProjectSettings
+    from .subagents import SubagentDeps
 
 __all__ = [
     "FETCHES_PER_RUN",
@@ -94,6 +101,7 @@ __all__ = [
     "MAX_BYTES",
     "MAX_OUTPUT_CHARS",
     "MAX_REDIRECTS",
+    "SUBAGENT_FETCHES_PER_RUN",
     "TIMEOUT",
     "FetchedPage",
     "WebFetchError",
@@ -106,6 +114,7 @@ __all__ = [
     "run_web_fetch",
     "web_fetch_policy",
 ]
+
 
 # ---------------------------------------------------------------------------
 # Hard limits (no knobs on purpose: the agent cannot talk itself past them)
@@ -135,6 +144,12 @@ MAX_REDIRECTS = 5
 MAX_URL_CHARS = 2_000
 # How many fetches one activation of the research agent may do.
 FETCHES_PER_RUN = 12
+# How many fetches one delegate_research SUBAGENT run may do when it
+# INHERITS the parent's web-fetch permission (a RESEARCH parent with a
+# non-off mode — see drcode.subagents): a fixed share of the parent's
+# budget, on the subagent's own gate, so a delegation cannot drain the
+# parent run's allowance.
+SUBAGENT_FETCHES_PER_RUN = 4
 
 # Text-ish content types: everything else (images, PDFs, archives) is
 # refused with an explanation instead of being decoded into garbage.
@@ -871,8 +886,10 @@ def _event_summary(page: FetchedPage) -> str:
     )
 
 
-async def run_web_fetch(deps: AgentDeps, url: str) -> str:
-    """The body of the research agent's `web_fetch` tool.
+async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
+    """The body of the research agent's `web_fetch` tool (and of the
+    subagent's inherited copy — both dep shapes carry `web_fetch_gate`
+    and can log service events, so the body is shared unchanged).
 
     Enforces the per-run gate, runs the blocking fetch in a worker thread
     (`_run_tool`), logs a service event (URL/status/bytes — chat visibility,

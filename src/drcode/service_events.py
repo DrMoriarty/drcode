@@ -15,10 +15,11 @@ from .models import TaskEvent
 
 if TYPE_CHECKING:
     from .agent import AgentDeps, ResolverDeps, TesterDeps
+    from .subagents import SubagentDeps
 
 
 def log_service_event(
-    deps: AgentDeps | TesterDeps | ResolverDeps, kind: str, text: str
+    deps: AgentDeps | TesterDeps | ResolverDeps | SubagentDeps, kind: str, text: str
 ) -> None:
     """Persist a service event into the task's event log.
 

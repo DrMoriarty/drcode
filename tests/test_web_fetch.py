@@ -744,10 +744,22 @@ def test_tool_description_carries_budget_and_security_rules(
             break
 
 
-def test_subagents_never_get_the_tool(fake_config: Config) -> None:
-    """`delegate_research` subagents are read-only and network-free: the
-    parent exercises the policy, the subagent gets no fetch tool."""
-    from drcode.subagents import build_subagent_agent
+def test_subagents_inherit_the_tool_only_from_the_parent(
+    fake_config: Config,
+) -> None:
+    """`delegate_research` subagents INHERIT the managed web fetch: a
+    RESEARCH parent with an enabled policy passes it on (same host
+    policy, the subagent's own smaller budget); a CODING parent, an off
+    mode or a tool-less build leaves the subagent network-free. The
+    subagent never gets a shell either way."""
+    from drcode.subagents import (
+        SUBAGENT_FETCHES_PER_RUN,
+        build_subagent_agent,
+    )
+    from drcode.web_fetch import SUBAGENT_FETCHES_PER_RUN as _sanity
+
+    assert SUBAGENT_FETCHES_PER_RUN == _sanity
+    assert SUBAGENT_FETCHES_PER_RUN < FETCHES_PER_RUN
 
     policy = _policy(WebFetchMode.ALL)
     parent = build_agent(
@@ -759,9 +771,138 @@ def test_subagents_never_get_the_tool(fake_config: Config) -> None:
     assert "web_fetch" in _tool_names(parent)
     assert "delegate_research" in _tool_names(parent)
 
+    # Inherited: the tool exists, still no shell.
+    subagent = build_subagent_agent(
+        fake_config, root=Path.cwd(), web_fetch_policy=policy
+    )
+    assert "web_fetch" in _tool_names(subagent)
+    assert "run_bash" not in _tool_names(subagent)
+    # The description carries the subagent's own budget and the security
+    # framing — never the parent's FETCHES_PER_RUN number.
+    description = _description(subagent, "web_fetch")
+    assert str(SUBAGENT_FETCHES_PER_RUN) in description
+    assert "UNTRUSTED" in description
+
+    # Not inherited (CODING parent -> no gate): network-free as before.
     subagent = build_subagent_agent(fake_config, root=Path.cwd())
     assert "web_fetch" not in _tool_names(subagent)
     assert "run_bash" not in _tool_names(subagent)
+
+    # An explicitly-disabled policy behaves like None.
+    subagent = build_subagent_agent(
+        fake_config, root=Path.cwd(), web_fetch_policy=_policy(WebFetchMode.OFF)
+    )
+    assert "web_fetch" not in _tool_names(subagent)
+
+
+def test_subagent_prompt_mentions_web_fetch_only_when_inherited(
+    fake_config: Config,
+) -> None:
+    """The system prompt's tool list is dynamically truthful: the
+    inherited-web_fetch sentence appears exactly when the tool is
+    registered, never otherwise."""
+    from drcode.subagents import build_subagent_agent
+
+    def instructions(policy: WebFetchPolicy | None) -> str:
+        ag = build_subagent_agent(fake_config, root=Path.cwd(), web_fetch_policy=policy)
+        return "\n".join(
+            si.instruction for si in ag._instructions if isinstance(si.instruction, str)
+        )
+
+    with_policy = instructions(_policy(WebFetchMode.ALL))
+    assert "web_fetch is ALSO available" in with_policy
+
+    without = instructions(None)
+    assert "web_fetch" not in without
+    # The base tool list is intact in both shapes.
+    for text in (with_policy, without):
+        assert "read_file" in text and "git_history" in text
+
+
+def test_subagent_web_fetch_logs_into_the_parent_task(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """The subagent's inherited web_fetch shares the research agent's tool
+    body unchanged: the framed result, the plain-error handling — and the
+    service event lands in the PARENT task's log (SubagentDeps.manager +
+    parent_task_id)."""
+    from drcode.subagents import SubagentDeps
+    from drcode.web_fetch import FetchedPage
+
+    monkeypatch.setattr(
+        "drcode.web_fetch.fetch",
+        lambda url, policy: FetchedPage(
+            url=url,
+            status=200,
+            content_type="text/html",
+            bytes_read=42,
+            truncated=False,
+            text="the page body",
+        ),
+    )
+    task = manager.create("R", "research")
+    deps = SubagentDeps(
+        root=project_root,
+        storage_root=manager.storage.root,
+        parent_task_id=task.id,
+        manager=manager,
+        web_fetch_gate=WebFetchGate(ALLOW_ALL, limit=1),
+    )
+
+    out = asyncio.run(run_web_fetch(deps, "https://example.com/"))
+
+    assert TRUST_FRAME_HEADER in out
+    assert "the page body" in out
+    events = [e.text for e in manager.get(task.id).events]
+    assert any("web_fetch https://example.com/" in t for t in events)
+    assert any("HTTP 200" in t and "42 bytes" in t for t in events)
+
+
+def test_subagent_web_fetch_budget_is_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """The subagent's gate limits ITS fetches (SUBAGENT_FETCHES_PER_RUN by
+    default) and is independent of the parent's allowance: exactly that
+    many fetches succeed, then the plain refusal comes back."""
+    from drcode.subagents import SUBAGENT_FETCHES_PER_RUN, SubagentDeps
+    from drcode.web_fetch import FetchedPage
+
+    calls = {"count": 0}
+
+    def fake_fetch(url: str, policy: WebFetchPolicy) -> FetchedPage:
+        calls["count"] += 1
+        return FetchedPage(
+            url=url,
+            status=200,
+            content_type="text/html",
+            bytes_read=10,
+            truncated=False,
+            text="body",
+        )
+
+    monkeypatch.setattr("drcode.web_fetch.fetch", fake_fetch)
+    task = manager.create("R", "research")
+    deps = SubagentDeps(
+        root=project_root,
+        storage_root=manager.storage.root,
+        parent_task_id=task.id,
+        manager=manager,
+        web_fetch_gate=WebFetchGate(ALLOW_ALL, limit=SUBAGENT_FETCHES_PER_RUN),
+    )
+    for _ in range(SUBAGENT_FETCHES_PER_RUN):
+        assert asyncio.run(run_web_fetch(deps, "https://example.com/")).startswith(
+            "UNTRUSTED WEB CONTENT"
+        )
+    out = asyncio.run(run_web_fetch(deps, "https://example.com/"))
+    assert "budget exhausted" in out
+    # Exactly the subagent budget was spent — no more, no less.
+    assert calls["count"] == SUBAGENT_FETCHES_PER_RUN
+    assert deps.web_fetch_gate is not None
+    assert deps.web_fetch_gate.used == SUBAGENT_FETCHES_PER_RUN
 
 
 # -- settings --------------------------------------------------------------------

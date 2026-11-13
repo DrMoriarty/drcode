@@ -1,6 +1,6 @@
 {
   "models": {
     "coding": "api-copilot.x5.ru/x5-airun-large-thinking",
-    "research": "api-copilot.x5.ru/x5-airun-large-thinking"
+    "research": "api-copilot.x5.ru/x5-airun-code-large"
   }
 }

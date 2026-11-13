@@ -20,9 +20,10 @@ connection (the json layers no longer provide its model fields — see
    `"<provider-name>/<model-id>"` (provider names must not contain `/`;
    model ids may — a reference is always split at the FIRST slash) or the
    string `"custom"` — use the per-role free-form model
-   stored under the sibling `custom_models[role]` key (all six connection
+   stored under the sibling `custom_models[role]` key (all seven connection
    fields: model/base_url/api_key/health_check_url/max_context_tokens/
-   max_tokens). A `null` / absent slot means "use the user-level default".
+   max_tokens/max_parallel_requests). A `null` / absent slot means "use the
+   user-level default".
    A `"custom"` slot without a valid `custom_models[role]` entry is treated
    as "nothing selected" (the same as `null`).
 
@@ -72,9 +73,9 @@ the most specific layer, beating the catalog entry and the flat config:
   exposes it for the COMPACTION role only.
 
 The resolver returns a `config.model_copy(update={...})` so
-`agent_model.build_model(config)` keeps working unchanged — and so the
-network test-suite's `build_model` monkeypatching (signature `(config)`)
-is unaffected.
+`agent_model.build_model(config)` keeps working unchanged — `announce_wait`
+(the provider slot-wait announcer) is an optional second argument, so the
+historical single-argument call sites stay valid.
 
 The catalog deliberately does NOT ride on `Config`: `Config` is a flat
 BaseSettings whose corrupted json layer is silently skipped, which is the
@@ -200,7 +201,27 @@ class Provider(BaseModel):
     # into the requests happens in `agent_model.base_model_settings`.
     # Must be a JSON object; empty = nothing is added.
     extra_body: dict[str, Any] = {}
+    # Cap on CONCURRENT outgoing HTTP requests to this provider from THIS
+    # drcode process (0 = unlimited, the historical behavior). Providers
+    # commonly limit parallelism per CLIENT — regardless of the model — and
+    # answer the excess with 429s or stalled reads; the cap is therefore
+    # keyed by the provider (base_url + api_key), never by model or role.
+    # Every model call of every role served by the same connection draws
+    # from ONE process-wide pool of slots (see
+    # `agent_model.ThrottledModel`); the cap is per HTTP request, so a
+    # streaming response holds its slot until the stream is fully read.
+    # `probe_model` / `fetch_models` (cheap non-generating GETs) are
+    # deliberately exempt. Cross-process coordination (the desktop shell
+    # runs one process per tab) is out of scope on purpose.
+    max_parallel_requests: int = 0
     models: list[ModelEntry] = []
+
+    @field_validator("max_parallel_requests")
+    @classmethod
+    def _max_parallel_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_parallel_requests must be 0 (unlimited) or more")
+        return value
 
     @field_validator("name")
     @classmethod
@@ -257,12 +278,23 @@ class CustomModelEntry(BaseModel):
     max_context_tokens: int = 200_000
     # None = keep whatever the flat config / env provides.
     max_tokens: int | None = None
+    # Cap on concurrent HTTP requests to this connection (0 = unlimited);
+    # a custom model is its own connection, so it carries its own cap —
+    # see `Provider.max_parallel_requests`.
+    max_parallel_requests: int = 0
 
     @field_validator("model", "base_url")
     @classmethod
     def _required(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be empty")
+        return value
+
+    @field_validator("max_parallel_requests")
+    @classmethod
+    def _max_parallel_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_parallel_requests must be 0 (unlimited) or more")
         return value
 
 
@@ -856,6 +888,9 @@ def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config
         # The provider-wide extra request-body fields ride with the
         # connection (consumed by `agent_model.base_model_settings`).
         "provider_extra_body": dict(provider.extra_body),
+        # The provider-wide concurrency cap rides with the connection too
+        # (consumed by `agent_model.build_model`); 0 = unlimited.
+        "provider_max_parallel_requests": provider.max_parallel_requests,
     }
     entry = next((m for m in provider.models if m.id == ref.model), None)
     if entry is not None:
@@ -898,6 +933,9 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
                 "api_key": custom.api_key,
                 "health_check_url": custom.health_check_url,
                 "max_context_tokens": custom.max_context_tokens,
+                # A custom model is an independent connection: its own
+                # concurrency cap (0 = unlimited), never the catalog's.
+                "provider_max_parallel_requests": custom.max_parallel_requests,
             }
             if custom.max_tokens is not None:
                 update["max_tokens"] = custom.max_tokens

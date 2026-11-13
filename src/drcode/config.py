@@ -120,6 +120,7 @@ _PROVIDER_FIELDS: frozenset[str] = frozenset(
         "max_context_tokens",
         "max_tokens",
         "provider_extra_body",
+        "provider_max_parallel_requests",
         "request_timeout",
     }
 )
@@ -159,6 +160,17 @@ class Config(BaseSettings):
     # the provider's `extra_body` in the user-level catalog (models.json).
     # Empty dict = nothing is added to the request bodies.
     provider_extra_body: dict[str, Any] = {}
+    # Cap on CONCURRENT outgoing HTTP requests to the resolved provider's
+    # connection (0 = unlimited, the default). NEVER read from any json
+    # layer (see `_PROVIDER_FIELDS`): the value is written over a Config
+    # copy by `drcode.providers._apply_provider` from the provider's
+    # `max_parallel_requests` in the user-level catalog (models.json), or
+    # from the project's `custom_models[role].max_parallel_requests` when
+    # the role runs on a custom connection. Consumed by
+    # `agent_model.build_model`, which wraps the model in a
+    # `ThrottledModel` keyed by (base_url, api_key) — the same provider
+    # reached through different roles shares ONE pool of slots.
+    provider_max_parallel_requests: int = 0
     # Per-request read/write timeout (SECONDS) of the OpenAI client serving
     # this role's model; 0 (the default) = the OpenAI SDK default
     # (600 s read/write). Set only through the project's per-role override

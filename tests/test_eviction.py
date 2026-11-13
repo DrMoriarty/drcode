@@ -547,7 +547,9 @@ def app_small_ctx(
 @pytest.fixture
 def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     return state
 
 

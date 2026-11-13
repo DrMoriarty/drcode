@@ -84,7 +84,9 @@ def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     """The model layer of every agent drcode builds (coding, tester and
     compaction alike) is a FunctionModel consuming `state.steps`."""
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     return state
 
 
@@ -185,7 +187,9 @@ async def test_research_task_builds_agent_with_research_role_config(
     from drcode.providers import AgentRole, CustomModelEntry, set_project_custom_model
 
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     seen: list[tuple[str, str, str]] = []
     real_build_agent = pipeline_agent_run.build_agent
 
@@ -200,6 +204,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         eviction_hint: bool = False,
         todo_supplier: Any = None,
         research_web_fetch: Any = None,
+        announce_wait: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
@@ -213,6 +218,8 @@ async def test_research_task_builds_agent_with_research_role_config(
             kwargs["todo_supplier"] = todo_supplier
         if research_web_fetch is not None:
             kwargs["research_web_fetch"] = research_web_fetch
+        if announce_wait is not None:
+            kwargs["announce_wait"] = announce_wait
         return real_build_agent(config, **kwargs)
 
     monkeypatch.setattr(pipeline_agent_run, "build_agent", spy_build_agent)
@@ -827,7 +834,11 @@ async def test_compaction_failure_is_not_fatal(
     def failing(messages: list, info: Any) -> Any:
         raise api_error("Connection error.")
 
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: function_model(failing))
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg, announce_wait=None: function_model(failing),
+    )
     task = _seed_transcript(net_app_small_ctx, "long task " * 200)
 
     async with net_app_small_ctx.run_test() as pilot:
@@ -849,7 +860,9 @@ async def test_compaction_success_replaces_history(
     state = ScriptedState()
     state.steps = [text_response("THE SUMMARY BODY")]
     monkeypatch.setattr(
-        agent_model, "build_model", lambda cfg: function_model(state.fn)
+        agent_model,
+        "build_model",
+        lambda cfg, announce_wait=None: function_model(state.fn),
     )
     prompt = "long task " * 200
     task = _seed_transcript(net_app_small_ctx, prompt)
@@ -904,7 +917,9 @@ async def test_summarizer_always_streams(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+        lambda cfg, announce_wait=None: mock_openai_model(
+            _sse_summarizer(bodies, "THE SUMMARY BODY")
+        ),
     )
     recorded: list[tuple[Any, AgentRole]] = []
     orig_record = DrCodeApp._record_session_usage
@@ -946,7 +961,9 @@ async def test_summarizer_streamed_output_is_unwrapped(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: mock_openai_model(_sse_summarizer(bodies, envelope)),
+        lambda cfg, announce_wait=None: mock_openai_model(
+            _sse_summarizer(bodies, envelope)
+        ),
     )
     task = _seed_transcript(net_app_small_ctx, "long task " * 200)
 
@@ -1025,7 +1042,9 @@ async def test_giant_prompt_split_even_map_reduce(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+        lambda cfg, announce_wait=None: mock_openai_model(
+            _sse_summarizer(bodies, "THE SUMMARY BODY")
+        ),
     )
     task = _seed_giant_transcript(net_app_small_ctx)
 
@@ -1061,7 +1080,9 @@ async def test_giant_prompt_split_off_keeps_single_shot(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+        lambda cfg, announce_wait=None: mock_openai_model(
+            _sse_summarizer(bodies, "THE SUMMARY BODY")
+        ),
     )
     task = _seed_giant_transcript(net_app_small_ctx)
 
@@ -2147,7 +2168,9 @@ async def test_map_reduce_compaction_over_window(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: function_model(_routing_summarizer(map_prompts, calls)),
+        lambda cfg, announce_wait=None: function_model(
+            _routing_summarizer(map_prompts, calls)
+        ),
     )
 
     recorded: list[Any] = []
@@ -2205,7 +2228,7 @@ async def test_reduce_partials_hierarchical_on_overflow(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: function_model(_routing_summarizer([], calls)),
+        lambda cfg, announce_wait=None: function_model(_routing_summarizer([], calls)),
     )
     app = DrCodeApp(project_root)
     partials = ["p" * 60_000 for _ in range(3)]
@@ -2229,7 +2252,7 @@ async def test_reduce_partials_mechanical_trim_at_depth_cap(
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: function_model(_routing_summarizer([], calls)),
+        lambda cfg, announce_wait=None: function_model(_routing_summarizer([], calls)),
     )
     app = DrCodeApp(project_root)
     async with app.run_test() as pilot:

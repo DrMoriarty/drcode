@@ -57,7 +57,7 @@ def test_build_model_client_disables_silent_sdk_retries() -> None:
     nothing happening" hang): every failure must surface to drcode's own
     retry layer, which announces each attempt in the service events."""
     model = agent_model.build_model(make_config())
-    client = model.client
+    client = agent_model.openai_client_of(model)
     assert isinstance(client, AsyncOpenAI)
     assert client.max_retries == 0
 
@@ -67,7 +67,7 @@ def test_build_model_client_default_timeout_is_sdk_default() -> None:
     untouched (600 s read/write): only a configured per-role override may
     change the budget."""
     model = agent_model.build_model(make_config())
-    timeout = cast(httpx.Timeout, model.client.timeout)
+    timeout = cast(httpx.Timeout, agent_model.openai_client_of(model).timeout)
     default = cast(httpx.Timeout, agent_model.DEFAULT_TIMEOUT)
     assert timeout.read == default.read
     assert timeout.write == default.write
@@ -78,7 +78,7 @@ def test_build_model_client_applies_request_timeout() -> None:
     keep the SDK values): a slow-but-alive summarizer generation must not
     be cut off, and no request stalls forever either."""
     model = agent_model.build_model(make_config(request_timeout=900))
-    timeout = cast(httpx.Timeout, model.client.timeout)
+    timeout = cast(httpx.Timeout, agent_model.openai_client_of(model).timeout)
     default = cast(httpx.Timeout, agent_model.DEFAULT_TIMEOUT)
     assert timeout.read == 900.0
     assert timeout.write == 900.0
@@ -154,7 +154,7 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
     model = agent_model.build_model(make_config(api_key="sk-secret"))
 
     resp = asyncio.run(
-        model.client.chat.completions.create(
+        agent_model.openai_client_of(model).chat.completions.create(
             model="mock-model",
             messages=[{"role": "user", "content": "hi"}],
         )
@@ -169,7 +169,7 @@ def test_build_model_client_uses_configured_base_url_and_key(monkeypatch) -> Non
 
 def test_build_model_default_base_url_is_openai() -> None:
     model = agent_model.build_model(make_config(base_url="https://api.openai.com/v1"))
-    assert str(model.client.base_url).rstrip("/").endswith("/v1")
+    assert str(agent_model.openai_client_of(model).base_url).rstrip("/").endswith("/v1")
 
 
 # -- leading system-message merge (strict OpenAI-compatible gateways) -------------

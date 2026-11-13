@@ -80,6 +80,102 @@ async def test_add_provider_and_save(tmp_path: Path) -> None:
         assert provider["api_key"] == "secret"
 
 
+async def test_provider_max_parallel_requests_field(tmp_path: Path) -> None:
+    """The provider form edits the concurrency cap: it is written on save,
+    reloaded into the form, and an empty field means 0 (unlimited)."""
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.click("#mc-add")
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        assert screen.query_one("#mc-parallel", Input).value == ""
+        screen.query_one("#mc-name", Input).value = "capped"
+        screen.query_one("#mc-url", Input).value = "http://cap/v1"
+        screen.query_one("#mc-parallel", Input).value = "3"
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        assert (
+            json.loads(path.read_text())["providers"][0]["max_parallel_requests"] == 3
+        )
+        # Reloaded catalog → the form mirrors the stored value.
+        assert store.load().providers[0].max_parallel_requests == 3
+
+
+async def test_provider_max_parallel_requests_empty_means_unlimited(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.click("#mc-add")
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        screen.query_one("#mc-name", Input).value = "free"
+        screen.query_one("#mc-url", Input).value = "http://free/v1"
+        await pilot.click("#mc-save")
+        await pilot.pause()
+        assert (
+            json.loads(path.read_text())["providers"][0]["max_parallel_requests"] == 0
+        )
+
+
+async def test_provider_max_parallel_requests_rejects_junk(tmp_path: Path) -> None:
+    """A typo is reported on the status line, never silently dropped (and a
+    negative value would read as "unlimited" at the consumer)."""
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        await pilot.click("#mc-add")
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        screen.query_one("#mc-name", Input).value = "bad"
+        screen.query_one("#mc-url", Input).value = "http://bad/v1"
+        screen.query_one("#mc-parallel", Input).value = "lots"
+        assert screen._commit_form() is False
+        assert "max parallel requests" in str(screen.query_one("#mc-status").render())
+        screen.query_one("#mc-parallel", Input).value = "-1"
+        assert screen._commit_form() is False
+        assert not path.exists()
+
+
+async def test_provider_max_parallel_requests_form_roundtrip(tmp_path: Path) -> None:
+    """Switching away from a provider and back re-fills the field from the
+    stored catalog (the form is the editor, not the state)."""
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="capped",
+                    base_url="http://cap/v1",
+                    max_parallel_requests=5,
+                ),
+                Provider(name="free", base_url="http://free/v1"),
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        options = screen.query_one("#mc-providers", OptionList)
+        assert screen.query_one("#mc-parallel", Input).value == "5"
+        # Select the unlimited provider: the field clears (0 shows as empty).
+        assert screen._commit_form() is True
+        screen._load_form("free")
+        await pilot.pause()
+        assert screen.query_one("#mc-parallel", Input).value == ""
+        assert options is not None
+
+
 async def test_add_and_edit_model_context(tmp_path: Path) -> None:
     path = tmp_path / "models.json"
     store = UserModelsStore(path)

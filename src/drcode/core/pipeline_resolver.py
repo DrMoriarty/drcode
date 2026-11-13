@@ -555,6 +555,8 @@ class PipelineResolverLayer(CoreState):
                 # descriptions (no literal <task-id> placeholder for the
                 # model to copy verbatim into a path argument).
                 task_id=task_id,
+                # Provider slot-wait visibility (see _wait_announcer).
+                announce_wait=self._wait_announcer(task_id, AgentRole.RESOLVER),
             )
             deps = ResolverDeps(
                 root=root,
@@ -925,7 +927,12 @@ class PipelineResolverLayer(CoreState):
             [f.path for f in report.files],
             review_char_budget(cfg.max_context_tokens),
         )
-        reviewer = build_resolver_reviewer_agent(cfg, root=root)
+        reviewer = build_resolver_reviewer_agent(
+            cfg,
+            root=root,
+            # Provider slot-wait visibility (see _wait_announcer).
+            announce_wait=self._wait_announcer(task.id, AgentRole.RESOLVER),
+        )
         rdeps = ResolverDeps(
             root=root,
             manager=self.manager,

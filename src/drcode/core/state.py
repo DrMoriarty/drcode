@@ -316,6 +316,10 @@ class CoreState:
 
     def _todo_tail_block(self, task_id: str) -> str | None: ...
 
+    def _wait_announcer(
+        self, task_id: str | None, role: AgentRole
+    ) -> Callable[[int, int], None] | None: ...
+
     def _todo_completion_warning(self, task: Task) -> None: ...
 
     def _record_session_usage(

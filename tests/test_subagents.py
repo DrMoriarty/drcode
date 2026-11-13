@@ -105,7 +105,7 @@ def test_subagent_answer_reaches_parent(
     usage summary, logs spawn/finish service events and releases the slot."""
     monkeypatch.setattr(
         "drcode.subagents._build_subagent_model",
-        lambda cfg: FunctionModel(
+        lambda cfg, announce_wait=None: FunctionModel(
             lambda messages, info: text_response("findings: foo.py:10 does X")
         ),
     )
@@ -160,7 +160,7 @@ def test_parallel_calls_within_limit(
 
     monkeypatch.setattr(
         "drcode.subagents._build_subagent_model",
-        lambda cfg: FunctionModel(sub_fn),
+        lambda cfg, announce_wait=None: FunctionModel(sub_fn),
     )
     task = manager.create("T", "delegate me")
     gate = SubagentGate(2)
@@ -202,7 +202,7 @@ def test_parallel_calls_above_limit_gate_one(
 
     monkeypatch.setattr(
         "drcode.subagents._build_subagent_model",
-        lambda cfg: FunctionModel(sub_fn),
+        lambda cfg, announce_wait=None: FunctionModel(sub_fn),
     )
     task = manager.create("T", "delegate me")
     gate = SubagentGate(1)
@@ -243,7 +243,7 @@ def test_subagent_failure_is_plain_result(
 
     monkeypatch.setattr(
         "drcode.subagents._build_subagent_model",
-        lambda cfg: FunctionModel(boom),
+        lambda cfg, announce_wait=None: FunctionModel(boom),
     )
     task = manager.create("T", "delegate me")
     deps = _deps(project_root, manager, task.id, limit=2)

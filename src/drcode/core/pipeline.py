@@ -126,6 +126,41 @@ class PipelineCoreLayer(CoreState):
         then passes the request through untouched)."""
         return todo_instructions(self.manager.get(task_id))
 
+    def _wait_announcer(
+        self, task_id: str | None, role: AgentRole
+    ) -> Callable[[int, int], None] | None:
+        """The slot-wait announcer handed to `build_agent(announce_wait=...)`
+        at activation (and by every other model builder that serves a task).
+
+        Returned callable is invoked by `agent_model.ThrottledModel` while a
+        request has been queued for a provider slot for longer than
+        `THROTTLE_WAIT_ANNOUNCE_SECONDS`: without it a throttled request is
+        indistinguishable from a hung run — the "active, nothing happening"
+        confusion of incident #a2dc8424. It drops a service event into the
+        task's chat (never the model context), deduplicated per task and wait
+        so a long queue does not flood the log with identical lines.
+
+        None (no task, e.g. the title generator or the catalog probe) means
+        the wait stays silent — there is no chat to explain it in.
+        """
+        if task_id is None:
+            return None
+
+        def announce(limit: int, busy: int) -> None:
+            try:
+                task = self.manager.get(task_id)
+            except KeyError:  # deleted while its request was queued
+                return
+            self._show_event_once(
+                task,
+                f"Waiting for a free {role.value} provider slot "
+                f"({busy}/{limit} busy) — the provider's "
+                "max_parallel_requests cap is saturated; the request is "
+                "queued, not stuck.",
+            )
+
+        return announce
+
     def _todo_completion_warning(self, task: Task) -> None:
         """Completion soft gate: when a task leaves development with
 

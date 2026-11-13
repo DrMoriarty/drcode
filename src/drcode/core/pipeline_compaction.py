@@ -635,7 +635,12 @@ class PipelineCompactionLayer(CoreState):
         )
         return compacted_messages(messages, summary), event, False, False
 
-    async def _run_summarizer(self, prompt: str) -> str:
+    async def _run_summarizer(
+        self,
+        prompt: str,
+        task_id: str | None = None,
+        role: AgentRole = AgentRole.COMPACTION,
+    ) -> str:
         """One compaction model call: run the tool-less summarizer and
         record its usage into the session totals and the persistent
         per-day usage store like every other model call (under the
@@ -653,8 +658,16 @@ class PipelineCompactionLayer(CoreState):
         The call is STREAMED (`run_stream` + `get_output`): the transport's
         read-timeout then applies between chunks instead of to the whole
         response, so a long prefill plus a long summary no longer expires a
-        call that is actively generating (see the inline note)."""
-        agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
+        call that is actively generating (see the inline note).
+
+        `task_id` is only there for the slot-wait visibility: a summarizer
+        call queued behind the provider's max_parallel_requests cap reports
+        the wait as a service event in that task's chat (the compaction
+        rounds reuse the caller's role for the wording, hence `role`)."""
+        agent = build_compaction_agent(
+            self.resolved_config(AgentRole.COMPACTION),
+            announce_wait=self._wait_announcer(task_id, role),
+        )
         # Streaming on purpose: the OpenAI SDK read-timeout (default 600s)
         # measures time-to-full-response on a non-streaming call — prefill
         # of a multi-hundred-k-token transcript plus generation can exceed
@@ -683,23 +696,30 @@ class PipelineCompactionLayer(CoreState):
         checklist: str | None,
         depth: int = 0,
         facts: str | None = None,
+        task_id: str | None = None,
+        role: AgentRole = AgentRole.COMPACTION,
     ) -> str:
         """Merge the map step's partial summaries into the final structured
         summary. When the accumulated partials overflow the merge call, the
         partials are grouped into fitting batches and each batch is reduced
         first (hierarchical reduce, depth-capped); past the cap the payload
         is mechanically trimmed per partial so the merge call always
-        happens (the guaranteed floor — a bounded summary beats none)."""
+        happens (the guaranteed floor — a bounded summary beats none).
+
+        `task_id` / `role` only feed the slot-wait announcement (see
+        `_run_summarizer`) and are passed down to every nested call."""
         prompt = build_reduce_prompt(partials, template, checklist, facts)
         compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
         if prompt_fits_window(prompt, compaction_cfg) or not partials:
-            return await self._run_summarizer(prompt)
+            return await self._run_summarizer(prompt, task_id, role)
         if depth >= _MAX_REDUCE_DEPTH:
             trimmed = self._mechanically_trim_partials(
                 partials, compaction_cfg, checklist
             )
             return await self._run_summarizer(
-                build_reduce_prompt(trimmed, template, checklist, facts)
+                build_reduce_prompt(trimmed, template, checklist, facts),
+                task_id,
+                role,
             )
         # Hierarchical reduce: batch the partials so each batch's prompt
         # fits, reduce every batch, then merge the intermediates.
@@ -726,16 +746,28 @@ class PipelineCompactionLayer(CoreState):
                 partials, compaction_cfg, checklist
             )
             return await self._run_summarizer(
-                build_reduce_prompt(trimmed, template, checklist)
+                build_reduce_prompt(trimmed, template, checklist), task_id, role
             )
         intermediates = [
             await self._reduce_partials(
-                batch, template, checklist, depth + 1, facts=facts
+                batch,
+                template,
+                checklist,
+                depth + 1,
+                facts=facts,
+                task_id=task_id,
+                role=role,
             )
             for batch in batches
         ]
         return await self._reduce_partials(
-            intermediates, template, checklist, depth + 1, facts=facts
+            intermediates,
+            template,
+            checklist,
+            depth + 1,
+            facts=facts,
+            task_id=task_id,
+            role=role,
         )
 
     @staticmethod
@@ -830,7 +862,7 @@ class PipelineCompactionLayer(CoreState):
         if not giant_split and prompt_fits_context(
             prompt, system_prompt, compaction_cfg
         ):
-            return await self._run_summarizer(prompt)
+            return await self._run_summarizer(prompt, task.id, self._task_role(task))
         window_budget = slice_budget_tokens(
             compaction_cfg,
             anchor,
@@ -873,10 +905,19 @@ class PipelineCompactionLayer(CoreState):
                 await self._run_summarizer(
                     build_compaction_prompt(
                         running, chunk, template, checklist=checklist, facts=facts
-                    )
+                    ),
+                    task.id,
+                    self._task_role(task),
                 )
             )
-        return await self._reduce_partials(partials, template, checklist, facts=facts)
+        return await self._reduce_partials(
+            partials,
+            template,
+            checklist,
+            facts=facts,
+            task_id=task.id,
+            role=self._task_role(task),
+        )
 
     def _eviction_due(self, task: Task) -> bool:
         """Whether the agent-marked tool results have piled up enough to be

@@ -78,7 +78,9 @@ def app(project_root: Path, catalog: None) -> DrCodeApp:
 def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedState:
     """Every agent drcode builds consumes `state.steps` (no network)."""
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     return state
 
 

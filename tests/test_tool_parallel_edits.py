@@ -34,7 +34,9 @@ def scripted(monkeypatch):
     from tests.network_mocks import ScriptedState
 
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     return state
 
 

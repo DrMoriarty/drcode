@@ -163,6 +163,150 @@ def test_provider_extra_body_never_read_from_json_layers(
     assert config.provider_extra_body == {}
 
 
+# -- provider max_parallel_requests --------------------------------------------
+
+
+def test_provider_max_parallel_requests_roundtrip(user_config_dir: Path) -> None:
+    """`Provider.max_parallel_requests` survives a catalog save/load, and a
+    provider without it serializes the visible default 0 (unlimited) — the
+    same "never lose a hand-entered value on a UI re-save" rule as
+    extra_body."""
+    cfg = UserModelsConfig(
+        providers=[
+            Provider(
+                name="capped",
+                base_url="http://localhost:8080/v1",
+                max_parallel_requests=2,
+            ),
+            Provider(name="cloud", base_url="https://api.example.com/v1"),
+        ]
+    )
+    write_user_catalog(cfg, user_config_dir)
+
+    raw = json.loads((user_config_dir / "models.json").read_text())
+    by_name = {p["name"]: p for p in raw["providers"]}
+    assert by_name["capped"]["max_parallel_requests"] == 2
+    assert by_name["cloud"]["max_parallel_requests"] == 0
+
+    loaded = UserModelsStore().load()
+    assert loaded.providers[0].max_parallel_requests == 2
+    assert loaded.providers[1].max_parallel_requests == 0
+
+
+@pytest.mark.parametrize("bad", [-1, -100])
+def test_provider_max_parallel_requests_rejects_negatives(bad: int) -> None:
+    """Only 0 (unlimited) or a positive cap is storable — a negative value
+    would silently mean "unlimited" at the consumer."""
+    with pytest.raises(ValidationError):
+        Provider(name="p", base_url="http://x/v1", max_parallel_requests=bad)
+
+
+def test_custom_model_entry_max_parallel_requests_rejects_negatives() -> None:
+    with pytest.raises(ValidationError):
+        CustomModelEntry(model="m", base_url="http://x/v1", max_parallel_requests=-2)
+
+
+def test_resolve_carries_provider_max_parallel_requests(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """A catalog reference applies the provider's cap to the resolved
+    Config (`provider_max_parallel_requests`) — the value
+    `agent_model.build_model` reads to decide whether to wrap the model."""
+    write_user_catalog(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="local-swap",
+                    base_url="http://localhost:8080/v1",
+                    api_key="key-1",
+                    max_parallel_requests=3,
+                    models=[ModelEntry(id="qwen3-coder-30b")],
+                )
+            ]
+        ),
+        user_config_dir,
+    )
+    set_project_model(
+        project_root,
+        AgentRole.CODING,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve(config, AgentRole.CODING)
+    assert resolved.provider_max_parallel_requests == 3
+
+
+def test_resolve_cap_is_per_provider_not_per_model(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """Two models of one provider carry the SAME cap (the limit belongs to
+    the connection); a model of another provider keeps its own."""
+    write_user_catalog(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="capped",
+                    base_url="http://capped/v1",
+                    api_key="k",
+                    max_parallel_requests=2,
+                    models=[ModelEntry(id="a"), ModelEntry(id="b")],
+                ),
+                Provider(
+                    name="free",
+                    base_url="http://free/v1",
+                    api_key="k2",
+                    models=[ModelEntry(id="a")],
+                ),
+            ]
+        ),
+        user_config_dir,
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="capped", model="a")
+    )
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="capped", model="b")
+    )
+    set_project_model(
+        project_root, AgentRole.RESOLVER, ModelRef(provider="free", model="a")
+    )
+    assert resolve(config, AgentRole.CODING).provider_max_parallel_requests == 2
+    assert resolve(config, AgentRole.TESTER).provider_max_parallel_requests == 2
+    assert resolve(config, AgentRole.RESOLVER).provider_max_parallel_requests == 0
+
+
+def test_resolve_custom_slot_carries_its_own_cap(project_root: Path) -> None:
+    """A custom model is an independent connection: its own cap is applied,
+    and a role without one stays unlimited."""
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(
+            model="custom-m", base_url="http://custom/v1", max_parallel_requests=1
+        ),
+    )
+    config = make_config(project_root, model="flat-m", base_url="http://flat/v1")
+    resolved = resolve(config, AgentRole.TESTER)
+    assert resolved.provider_max_parallel_requests == 1
+    coding = resolve(config, AgentRole.CODING)
+    assert coding.provider_max_parallel_requests == 0
+
+
+def test_provider_max_parallel_requests_never_read_from_json_layers(
+    project_root: Path,
+) -> None:
+    """`provider_max_parallel_requests` is a _PROVIDER_FIELDS member: no json
+    layer of Config provides it — the catalog resolver is the only writer."""
+    cfg_dir = project_root / ".drcode"
+    cfg_dir.mkdir()
+    (cfg_dir / "drcode.json").write_text(
+        json.dumps({"provider_max_parallel_requests": 7})
+    )
+    config = make_config(project_root)
+    assert config.provider_max_parallel_requests == 0
+
+
 # -- resolve -----------------------------------------------------------------
 
 

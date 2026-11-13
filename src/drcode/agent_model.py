@@ -8,10 +8,13 @@ agent wiring in `agent.py` so the agent module stays an orchestrator.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import ssl
+import weakref
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -137,6 +140,225 @@ class TodoTailModel(WrapperModel):
             model_request_parameters,
             run_context,
         ) as response_stream:
+            yield response_stream
+
+
+# -- client-side provider throttling -------------------------------------------
+#
+# Providers commonly cap the number of CONCURRENT requests one client may
+# have open — regardless of the model — and answer the excess with HTTP 429
+# or a stalled read. drcode reaches one provider from several roles at once
+# (the coding run, the tester round, a compaction summarizer, the resolver,
+# a title generator, read-only subagents), so the cap has to be enforced
+# per CONNECTION, not per model, role or agent.
+#
+# The pool is process-local: `_THROTTLE_POOLS` maps the provider identity
+# `(base_url, api_key)` to one `_ThrottlePool` per event loop. Nothing is
+# shared between drcode processes (the desktop shell forks one process per
+# tab) on purpose — a cross-process limiter would need a lock file or a
+# broker and the failure modes of both are worse than the provider's 429s.
+#
+# A slot is held for ONE outgoing HTTP request: `request` releases it when
+# the response has arrived, `request_stream` when the stream is fully read
+# (that is exactly what "concurrent open requests" means to a provider).
+# Model calls are flat — a run never nests a model call inside another
+# model call (compaction, the reviewer pass and a subagent are all separate
+# top-level calls) — so the pool can never deadlock on itself.
+
+# How long a request may wait for a slot before the wait is ANNOUNCED (a
+# service event in the task's chat when the run can be identified). The
+# consumer of that visibility is the "active, nothing happening" confusion
+# of incident #a2dc8424: a queued request is otherwise indistinguishable
+# from a hung one.
+THROTTLE_WAIT_ANNOUNCE_SECONDS = 5.0
+# Repeats of the announcement while the wait continues: a long queue must
+# not look silent again.
+THROTTLE_WAIT_ANNOUNCE_EVERY = 30.0
+
+
+@dataclass
+class _ThrottlePool:
+    """The semaphore of one provider connection plus its live counters.
+
+    `sem` is the limiting semaphore; `busy` counts the slots currently
+    taken and `limit` is the configured cap, so the wait announcement can
+    say "waiting for provider slot: 3/3 busy".
+    """
+
+    sem: asyncio.Semaphore
+    limit: int
+    busy: int = 0
+
+
+# asyncio loop → {(base_url, api_key, limit) → pool}. Keyed BY the loop:
+# `asyncio.Semaphore` binds to the running loop, and tests (or a future
+# second loop) must not inherit a dead loop's semaphore. The loop object is
+# held weakly so a finished loop's pools do not outlive it.
+_THROTTLE_POOLS: weakref.WeakKeyDictionary[
+    Any, dict[tuple[str, str, int], _ThrottlePool]
+] = weakref.WeakKeyDictionary()
+
+
+def _throttle_pool(base_url: str, api_key: str, limit: int) -> _ThrottlePool:
+    """The process-wide pool of one provider connection at `limit`.
+
+    The key is the provider IDENTITY (base URL + key), never the model: two
+    roles on the same provider share the pool. A LIMIT CHANGE (the user
+    edits the catalog) gets its own pool — the configured cap is part of
+    the key, so a stale semaphore never lingers. Must be called from the
+    event loop the pool will be used on."""
+    loop = asyncio.get_running_loop()
+    pools = _THROTTLE_POOLS.setdefault(loop, {})
+    key = (base_url, api_key, limit)
+    pool = pools.get(key)
+    if pool is None:
+        pool = _ThrottlePool(sem=asyncio.Semaphore(limit), limit=limit)
+        pools[key] = pool
+    return pool
+
+
+def reset_throttle_pools() -> None:
+    """Forget every pooled semaphore (tests; also a clean slate after a
+    catalog change that alters a provider's cap mid-session)."""
+    _THROTTLE_POOLS.clear()
+
+
+async def _cancel_task(task: asyncio.Task[None] | None) -> None:
+    """Cancel `task` (when there is one) and wait for it to unwind.
+
+    Awaiting the cancelled watcher matters: `ThrottledModel` is a hot path
+    and a fire-and-forget cancellation would leave "Task was destroyed but
+    it is pending" noise (and a stray announcer running) behind. Shielded
+    against a second cancellation of the CALLER, which must not prevent
+    the cleanup. Never raises."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await asyncio.shield(task)
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 - cleanup
+        pass
+
+
+# Consumer of the slot-wait announcement: called with (limit, busy) while a
+# request is still queued. Wired by the model's builder (the pipeline passes
+# a per-run callable that logs a service event into the task's chat) and
+# never by the model itself — `agent_model` knows nothing about tasks.
+WaitAnnouncer = Callable[[int, int], None]
+
+
+class ThrottledModel(WrapperModel):
+    """Client-side concurrency limiter for one provider connection.
+
+    Wraps the model produced by `build_model` (the INNERMOST wrapper, so the
+    slot is taken as late as possible — after the checklist tail and any
+    other request shaping) and serializes outgoing HTTP requests through the
+    process-wide pool of the provider's `(base_url, api_key)`.
+
+    `limit <= 0` means unlimited: `build_throttled_model` then returns the
+    model unwrapped, so the zero-cost path has no wrapper at all.
+
+    `announce` (optional) is called when a request has been waiting for a
+    slot for `THROTTLE_WAIT_ANNOUNCE_SECONDS` — and every
+    `THROTTLE_WAIT_ANNOUNCE_EVERY` seconds after that — with the pool's
+    (limit, busy) pair. It runs on the event loop; a raising announcer must
+    never break the request (the call is guarded).
+
+    The pool is looked up on FIRST USE, inside the running event loop:
+    `build_model` is routinely called off-loop (the catalog screen's probe,
+    the context-layout report), where creating a semaphore would bind it to
+    a loop that never runs.
+    """
+
+    def __init__(
+        self,
+        wrapped: Model,
+        provider_key: tuple[str, str],
+        limit: int,
+        announce: WaitAnnouncer | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self._provider_key = provider_key
+        self._limit = limit
+        self._announce = announce
+        self._pool: _ThrottlePool | None = None
+
+    @property
+    def pool(self) -> _ThrottlePool:
+        """The shared pool of this connection (created on first use)."""
+        if self._pool is None:
+            base_url, api_key = self._provider_key
+            self._pool = _throttle_pool(base_url, api_key, self._limit)
+        return self._pool
+
+    # -- slot acquisition ---------------------------------------------------
+
+    @asynccontextmanager
+    async def _slot(self) -> AsyncGenerator[None]:
+        """Hold one provider slot for the duration of the block, announcing
+        a long wait (see the class docstring)."""
+        pool = self.pool
+        watcher: asyncio.Task[None] | None = None
+        if pool.sem.locked():
+            # The request is about to queue behind a full pool: announce
+            # the wait if it does not get a slot soon enough.
+            watcher = asyncio.create_task(self._announce_while_waiting())
+        try:
+            await pool.sem.acquire()
+        finally:
+            await _cancel_task(watcher)
+        pool.busy += 1
+        try:
+            yield
+        finally:
+            pool.busy -= 1
+            pool.sem.release()
+
+    async def _announce_while_waiting(self) -> None:
+        """Announce the queued request once it has waited long enough, then
+        repeat at a slower cadence while it is still queued."""
+        await asyncio.sleep(THROTTLE_WAIT_ANNOUNCE_SECONDS)
+        while True:
+            self._emit_announce()
+            await asyncio.sleep(THROTTLE_WAIT_ANNOUNCE_EVERY)
+
+    def _emit_announce(self) -> None:
+        if self._announce is None:
+            return
+        pool = self.pool
+        try:
+            self._announce(pool.limit, max(pool.busy, 1))
+        except Exception:  # noqa: BLE001, S110 - never break a run for a note
+            pass
+
+    # -- model interface ----------------------------------------------------
+
+    async def request(self, messages, model_settings, model_request_parameters):  # type: ignore[no-untyped-def]
+        async with self._slot():
+            return await self.wrapped.request(
+                messages, model_settings, model_request_parameters
+            )
+
+    @asynccontextmanager
+    async def request_stream(  # type: ignore[override]
+        self,
+        messages: list[ModelMessage],
+        model_settings: Any,
+        model_request_parameters: ModelRequestParameters,
+        run_context: Any = None,
+    ) -> AsyncGenerator[StreamedResponse]:
+        # The slot lives until the caller leaves the context manager, i.e.
+        # until the stream is fully consumed — the provider keeps counting
+        # the request as open for exactly as long.
+        async with (
+            self._slot(),
+            self.wrapped.request_stream(
+                messages,
+                model_settings,
+                model_request_parameters,
+                run_context,
+            ) as response_stream,
+        ):
             yield response_stream
 
 
@@ -313,7 +535,21 @@ def _client_timeout(config: Config) -> Any:
     )
 
 
-def build_model(config: Config):
+def build_model(config: Config, announce_wait: WaitAnnouncer | None = None):
+    """Build the OpenAI-compatible model of a resolved role config.
+
+    When the provider carries a concurrency cap
+    (`Config.provider_max_parallel_requests` > 0, from the catalog entry or
+    the project's custom model), the model is wrapped in a
+    `ThrottledModel`: every outgoing HTTP request of this connection — from
+    every role and every agent in this process — draws from one shared pool
+    of slots, so the provider never sees more parallel requests than it
+    allows. 0 = unlimited: the model is returned unwrapped (no overhead).
+
+    `announce_wait` is forwarded to the wrapper: it is called while a
+    request is queued for longer than `THROTTLE_WAIT_ANNOUNCE_SECONDS`, so
+    the pipeline can surface the wait in the task's chat.
+    """
     client = AsyncOpenAI(
         base_url=config.base_url,
         # Keyless gateways (local servers) still need a syntactically
@@ -348,11 +584,68 @@ def build_model(config: Config):
     # system-сообщение и склеивает их только при профиле
     # openai_chat_supports_multiple_system_messages=False — задаём его явно
     # (дефолтный профиль рассчитан на OpenAI, который терпит несколько).
-    return OpenAIChatModel(
-        config.model,
-        provider=OpenAIProvider(openai_client=client),
-        profile=OpenAIModelProfile(openai_chat_supports_multiple_system_messages=False),
+    return build_throttled_model(
+        OpenAIChatModel(
+            config.model,
+            provider=OpenAIProvider(openai_client=client),
+            profile=OpenAIModelProfile(
+                openai_chat_supports_multiple_system_messages=False
+            ),
+        ),
+        config,
+        announce_wait,
     )
+
+
+def build_throttled_model(
+    model: Model, config: Config, announce_wait: WaitAnnouncer | None = None
+) -> Model:
+    """Wrap `model` in a `ThrottledModel` when the resolved config asks for
+    a concurrency cap; return it unchanged at 0 (unlimited).
+
+    Applied INSIDE `build_model`, so the limiter is the INNERMOST wrapper
+    (the checklist tail and any other request-shaping wrapper sit outside
+    it): the slot is taken as late as possible and released as soon as the
+    transport is done. The pool is keyed by `(base_url, api_key)`: two
+    roles on one provider share it, two providers never do. The pool
+    itself is resolved lazily (on first use, inside the running event
+    loop) — `build_model` is routinely called off-loop (catalog screen
+    probes, context estimation)."""
+    limit = config.provider_max_parallel_requests
+    if limit <= 0:
+        return model
+    return ThrottledModel(
+        model,
+        provider_key=(config.base_url, config.api_key),
+        limit=limit,
+        announce=announce_wait,
+    )
+
+
+def unwrap_model(model: Model) -> Model:
+    """Strip drcode's request-shaping wrappers (`ThrottledModel`,
+    `TodoTailModel`) off `model` and return the underlying one.
+
+    Only the truly INNER model — the `OpenAIChatModel` with its
+    `AsyncOpenAI` client — carries the connection settings, so introspection
+    (tests reading `model.client`, a future diagnostics screen) must peel
+    the wrappers first. Unknown wrapper types are left alone: the outer
+    loop stops at the first model it does not recognise."""
+    while isinstance(model, (ThrottledModel, TodoTailModel)):
+        model = model.wrapped
+    return model
+
+
+def openai_client_of(model: Model) -> AsyncOpenAI:
+    """The `AsyncOpenAI` client behind `model` (wrappers peeled off).
+
+    Raises `TypeError` when the chain does not end at an
+    `OpenAIChatModel` — a caller asking for the client of a stubbed model
+    has a wiring bug, not a runtime condition to tolerate."""
+    inner = unwrap_model(model)
+    if not isinstance(inner, OpenAIChatModel):
+        raise TypeError(f"no OpenAI client behind {type(model).__name__}")
+    return inner.client
 
 
 # -- model auto-discovery ------------------------------------------------------

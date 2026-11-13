@@ -88,23 +88,37 @@ def subagent_limit_for(settings: ProjectSettings, role: AgentRole) -> int:
     return settings.subagents_coder
 
 
-def _build_subagent_model(config: Config):
+def _build_subagent_model(
+    config: Config, announce_wait: agent_model.WaitAnnouncer | None = None
+):
     """The subagent's model: the resolved config of the role serving the
     parent (CODING → the coding model, RESEARCH → the research model —
     `build_agent` receives exactly that config). Split into a helper so
-    the test-suite can stub it without touching the parent's wiring."""
+    the test-suite can stub it without touching the parent's wiring.
+
+    `announce_wait` rides along like everywhere else: a subagent request
+    queued behind the provider's `max_parallel_requests` cap reports the
+    wait in the PARENT's chat (it is the parent run that looks stalled)."""
     from . import agent_model
 
-    return agent_model.build_model(config)
+    return agent_model.build_model(config, announce_wait)
 
 
-def build_subagent_agent(config: Config, *, root: Path) -> Agent[SubagentDeps, str]:
+def build_subagent_agent(
+    config: Config,
+    *,
+    root: Path,
+    announce_wait: agent_model.WaitAnnouncer | None = None,
+) -> Agent[SubagentDeps, str]:
     """Build the read-only research subagent: the bundled `subagent.md`
     system prompt (project-overridable) and exactly four tools, all
     reading — no run_bash, no write tools, no ask_clarifying_question
-    (there is no user to answer a subagent)."""
+    (there is no user to answer a subagent).
+
+    `announce_wait` (the parent run's slot-wait announcer) is forwarded to
+    the model builder — see `_build_subagent_model`."""
     agent = Agent(
-        _build_subagent_model(config),
+        _build_subagent_model(config, announce_wait),
         instructions=_subagent_instructions(root),
         deps_type=SubagentDeps,
         model_settings=agent_model.base_model_settings(config),
@@ -181,6 +195,11 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
     mode — gate exhausted, model/network error, usage cap — comes back
     as a PLAIN tool result with an actionable explanation: the parent
     run must never crash because a subagent did.
+
+    The parent's slot-wait announcer (`deps.wait_announcer`, when the
+    pipeline wired one) is forwarded to the subagent's model, so a
+    subagent request queued behind the provider's concurrency cap reports
+    the wait in the parent task's chat.
     """
     gate = deps.subagent_gate
     if gate is None or gate.limit <= 0:
@@ -202,7 +221,9 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
         f"subagent spawned ({gate.active}/{gate.limit}): {label}",
     )
     try:
-        agent = build_subagent_agent(config, root=deps.root)
+        agent = build_subagent_agent(
+            config, root=deps.root, announce_wait=deps.wait_announcer
+        )
         subagent_deps = SubagentDeps(
             root=deps.root,
             storage_root=deps.manager.storage.root,

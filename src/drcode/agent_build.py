@@ -162,7 +162,12 @@ class AgentDeps:
     `web_fetch_gate` carries the research run's `web_fetch` budget and its
     policy (None = web fetch off: the tool is not even registered). It is
     set on the RESEARCH role's deps only — the coding/tester/resolver
-    agents have no `web_fetch` tool at all (see `drcode.web_fetch`)."""
+    agents have no `web_fetch` tool at all (see `drcode.web_fetch`).
+
+    `wait_announcer` is the run's provider slot-wait announcer (see
+    `agent_model.ThrottledModel`), forwarded to the nested
+    `delegate_research` subagent's model so ITS queued requests are
+    audible in the parent task's chat too. None = silent."""
 
     root: Path
     manager: TaskManager
@@ -173,6 +178,7 @@ class AgentDeps:
     agent_creates_drafts: bool = False
     record_usage: Callable[[RunUsage], None] | None = None
     web_fetch_gate: WebFetchGate | None = None
+    wait_announcer: agent_model.WaitAnnouncer | None = None
 
 
 @dataclass
@@ -337,6 +343,7 @@ def build_agent(
     eviction_hint: bool = False,
     todo_supplier: Callable[[], str | None] | None = None,
     research_web_fetch: WebFetchPolicy | None = None,
+    announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -388,9 +395,15 @@ def build_agent(
     never get the tool, and neither do `delegate_research` subagents —
     network access is exercised on the parent, whose fetch budget
     (`FETCHES_PER_RUN`) and host policy are enforced by `drcode.web_fetch`.
+
+    `announce_wait` (the pipeline's per-run slot-wait announcer) is
+    forwarded to `agent_model.build_model`: when the provider's
+    `max_parallel_requests` cap is saturated, a request queued for longer
+    than `agent_model.THROTTLE_WAIT_ANNOUNCE_SECONDS` reports the wait as a
+    service event instead of looking like a hung run.
     """
     scratch = _scratch_desc(task_id)
-    model = agent_model.build_model(config)
+    model = agent_model.build_model(config, announce_wait)
     if todo_supplier is not None:
         model = agent_model.TodoTailModel(model, todo_supplier)
     instructions = load_system_prompt(
@@ -1197,6 +1210,7 @@ def build_tester_agent(
     root: Path | None = None,
     review_gate: bool = False,
     task_id: str | None = None,
+    announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
@@ -1219,9 +1233,11 @@ def build_tester_agent(
     `task_id` (the verified task, known at activation) bakes the real
     scratch-directory path into run_bash's description; without it the
     description keeps the literal `<task-id>` placeholder.
+
+    `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
     scratch = _scratch_desc(task_id)
-    model = agent_model.build_model(config)
+    model = agent_model.build_model(config, announce_wait)
     instructions = load_tester_prompt(
         allow_commit, project_root=root, allow_push=allow_push
     )
@@ -1561,6 +1577,7 @@ def build_resolver_agent(
     *,
     root: Path | None = None,
     task_id: str | None = None,
+    announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the merge-conflict resolver agent.
 
@@ -1576,9 +1593,11 @@ def build_resolver_agent(
     `task_id` (the conflicted task, known at activation) bakes the real
     scratch-directory path into the write tools' descriptions; without it
     the descriptions keep the literal `<task-id>` placeholder.
+
+    `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
     scratch = _scratch_desc(task_id)
-    model = agent_model.build_model(config)
+    model = agent_model.build_model(config, announce_wait)
     instructions = load_resolver_prompt(root)
     if root is not None:
         agents_md = load_agents_md(root)
@@ -1719,6 +1738,7 @@ def build_resolver_reviewer_agent(
     config: Config,
     *,
     root: Path | None = None,
+    announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the intent-preservation reviewer of a resolved merge.
 
@@ -1727,8 +1747,10 @@ def build_resolver_reviewer_agent(
     whether a piece of either side was lost (the #6c065401 incident
     class). Reuses ResolverDeps (`root` = the resolved worktree); its
     verdict lands in the same `verdicts` list.
+
+    `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
-    model = agent_model.build_model(config)
+    model = agent_model.build_model(config, announce_wait)
     agent = Agent(
         model,
         instructions=load_resolver_reviewer_prompt(root),

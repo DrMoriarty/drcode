@@ -342,6 +342,8 @@ class PipelineTesterLayer(CoreState):
                 # (no literal <task-id> placeholder for the model to copy
                 # verbatim into a path argument).
                 task_id=task_id,
+                # Provider slot-wait visibility (see _wait_announcer).
+                announce_wait=self._wait_announcer(task_id, AgentRole.TESTER),
             )
             deps = TesterDeps(
                 root=root,

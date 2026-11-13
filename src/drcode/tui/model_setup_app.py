@@ -207,7 +207,7 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-right { width: 1fr; height: auto; }
     /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
        border-inclusive height:3 would pad every field with 2 blank rows. */
-    #mc-name, #mc-url, #mc-key { height: 1; }
+    #mc-name, #mc-url, #mc-key, #mc-parallel { height: 1; }
     /* Push the provider fields down so the Check connection / Fetch models
        row sits on ONE height with the Add / Delete row of the providers
        pane: that row's top = title (1) + list margin (1) + list (6) +
@@ -252,7 +252,11 @@ class ModelCatalogScreen(ModalScreen[None]):
     }
     #mc-hint {
         width: 100%;
-        padding: 1 2 0 2;
+        /* No top padding: the footer's own margin-top already separates
+           the hint from the Save row, and the catalog grew by one provider
+           field (max parallel requests) — every spare row keeps Save
+           inside a 56-row terminal. */
+        padding: 0 2 0 2;
         color: $text-disabled;
     }
     """
@@ -317,6 +321,10 @@ class ModelCatalogScreen(ModalScreen[None]):
                         password=True,
                         placeholder="API key (optional — leave empty if not needed)",
                     )
+                    yield Input(
+                        id="mc-parallel",
+                        placeholder=("max parallel requests (empty / 0 = unlimited)"),
+                    )
                     with Horizontal(classes="mc-btnrow"):
                         yield Button("Check connection", id="mc-check")
                         yield Button("Fetch models", id="mc-fetch")
@@ -339,13 +347,10 @@ class ModelCatalogScreen(ModalScreen[None]):
             # Just below the model buttons, its own row.
             yield Button("Assign agents…", id="mc-assign-agents")
             yield Static(
-                "esc — close without saving · model table: click or arrow "
-                "keys select a row and fill the editor; a click on the "
-                "Favorites cell cycles the favorite level (empty → • → "
-                "★ → ✚), favorites sort to the top; the field above the "
-                "table filters models by name; Update writes the "
-                "edited id/context/limit back, Add model creates a new "
-                "model from the same fields, Remove deletes it",
+                "esc — close without saving · Update / Add model / Remove "
+                "edit the table below (the Favorites cell cycles • → ★ → ✚); "
+                "max parallel requests caps concurrent calls per provider "
+                "(empty / 0 = unlimited)",
                 id="mc-hint",
             )
             # The very last row: Save pinned to the modal's bottom-right
@@ -374,6 +379,7 @@ class ModelCatalogScreen(ModalScreen[None]):
         name = self.query_one("#mc-name", Input).value.strip()
         url = self.query_one("#mc-url", Input).value.strip()
         key = self.query_one("#mc-key", Input).value.strip()
+        raw_parallel = self.query_one("#mc-parallel", Input).value.strip()
         if not name:
             self._status("✗ provider name must not be empty")
             return False
@@ -382,6 +388,16 @@ class ModelCatalogScreen(ModalScreen[None]):
             return False
         if not url:
             self._status("✗ base URL must not be empty")
+            return False
+        # Cap on concurrent requests: empty or 0 = unlimited. Parsed here so
+        # a typo is reported instead of being silently dropped.
+        try:
+            parallel = int(raw_parallel) if raw_parallel else 0
+        except ValueError:
+            self._status("✗ max parallel requests must be 0 (unlimited) or more")
+            return False
+        if parallel < 0:
+            self._status("✗ max parallel requests must be 0 (unlimited) or more")
             return False
         if name != provider.name and any(
             p.name == name for p in self.catalog.providers
@@ -400,6 +416,7 @@ class ModelCatalogScreen(ModalScreen[None]):
             self._current = name
         provider.base_url = url
         provider.api_key = key
+        provider.max_parallel_requests = parallel
         return True
 
     def _refresh_providers(self) -> None:
@@ -511,6 +528,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         self.query_one("#mc-name", Input).value = provider.name if provider else ""
         self.query_one("#mc-url", Input).value = provider.base_url if provider else ""
         self.query_one("#mc-key", Input).value = provider.api_key if provider else ""
+        self.query_one("#mc-parallel", Input).value = (
+            str(provider.max_parallel_requests)
+            if provider is not None and provider.max_parallel_requests > 0
+            else ""
+        )
         self._clear_model_inputs()
         self._refresh_models()
         self._status("")

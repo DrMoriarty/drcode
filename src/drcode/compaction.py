@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from pydantic_ai import Agent
@@ -76,17 +77,25 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
 
-def build_compaction_agent(config: Config) -> Agent[None, str]:
+def build_compaction_agent(
+    config: Config,
+    announce_wait: Callable[[int, int], None] | None = None,
+) -> Agent[None, str]:
     """Tool-less summarizer agent used to compact a task's history.
 
     System prompt and output structure come from the bundled compaction.txt
     / compaction.md templates; the conversation itself is passed as a
     plain-text user prompt (see build_compaction_prompt). No tools, no deps:
     the agent only reads the rendered transcript and returns the summary.
+
+    `announce_wait` (the pipeline's per-task slot-wait announcer) is
+    forwarded to `agent_model.build_model`, so a summarizer call queued
+    behind the provider's `max_parallel_requests` cap says so in the task's
+    chat instead of looking like a hung compaction.
     """
     system_prompt, _ = load_compaction_prompts()
     return Agent(
-        agent_model.build_model(config),
+        agent_model.build_model(config, announce_wait),
         instructions=system_prompt,
         model_settings=agent_model.base_model_settings(config),
     )

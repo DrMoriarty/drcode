@@ -461,7 +461,9 @@ async def test_todo_tail_supplier_gated_by_setting(
     monkeypatch.setenv("DRCODE_API_KEY", "mock-key")
     monkeypatch.setenv("DRCODE_BASE_URL", "http://127.0.0.1:1/v1")
     state = ScriptedState()
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     supplied: list[object] = []
     real_build_agent = pipeline_agent_run.build_agent
 

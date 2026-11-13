@@ -122,7 +122,11 @@ class PipelineAgentRunLayer(CoreState):
         if not description:
             return
         try:
-            agent = build_title_agent(self.resolved_config(role))
+            agent = build_title_agent(
+                self.resolved_config(role),
+                # Provider slot-wait visibility (see _wait_announcer).
+                announce_wait=self._wait_announcer(task.id, role),
+            )
             result = await agent.run(build_title_prompt(description))
             # The title call counts toward the session usage like every
             # other model call (under the task's serving role).
@@ -316,6 +320,9 @@ class PipelineAgentRunLayer(CoreState):
                             # for THIS run (None = the tool is not
                             # registered, see _prepare_agent_run).
                             web_fetch_gate=web_fetch_gate,
+                            # Provider slot-wait visibility for the nested
+                            # delegate_research runs (see _wait_announcer).
+                            wait_announcer=self._wait_announcer(task_id, role),
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -598,6 +605,11 @@ class PipelineAgentRunLayer(CoreState):
                 if self.settings.todo_tail
                 else None
             ),
+            # Provider slot-wait visibility: when the resolved provider's
+            # max_parallel_requests cap is saturated, a request queued for
+            # longer than agent_model.THROTTLE_WAIT_ANNOUNCE_SECONDS says so
+            # in the task's chat instead of looking like a hung run.
+            announce_wait=self._wait_announcer(task_id, role),
         )
         subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         # One gate per activation: it carries the run's policy AND the

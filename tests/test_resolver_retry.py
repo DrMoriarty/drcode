@@ -136,7 +136,10 @@ async def test_retry_survives_stale_needs_human(
     state.steps = [api_error(), api_error()]
 
     def fake_build_agent(
-        config: Any, root: Path | None = None, task_id: str | None = None
+        config: Any,
+        root: Path | None = None,
+        task_id: str | None = None,
+        announce_wait: Any = None,
     ) -> Agent[Any, str]:
         return Agent(state.model())
 
@@ -228,7 +231,9 @@ def _repair_app(
     """The scripted-model app for the repair tests: the real resolver and
     reviewer builders (both draw their model through agent_model.build_model),
     the background actors quiesced, the repair delay shrunk."""
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
     import drcode.core.pipeline_resolver as pr
 
     monkeypatch.setattr(pr, "build_resolver_agent", build_resolver_agent)
@@ -685,7 +690,7 @@ async def test_review_chunking_aggregates_verdicts(
         ["left.txt: the base-side notification wiring was dropped", "clean"],
     )
     monkeypatch.setattr(
-        pr, "build_resolver_reviewer_agent", lambda config, root=None: fake
+        pr, "build_resolver_reviewer_agent", lambda config, root=None, **_: fake
     )
 
     app = DrCodeApp(isolated)

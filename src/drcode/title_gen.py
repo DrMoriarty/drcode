@@ -37,16 +37,23 @@ TITLE_MAX_LEN = 60
 _DESCRIPTION_CAP = 6_000
 
 
-def build_title_agent(config: Config) -> Agent[None, str]:
+def build_title_agent(
+    config: Config, announce_wait: agent_model.WaitAnnouncer | None = None
+) -> Agent[None, str]:
     """Tool-less title generator over the task's serving role config.
 
     System prompt comes from the bundled ``title.txt`` template; the
     description is passed as a plain-text user prompt (see
     :func:`build_title_prompt`). No tools, no deps: the agent only reads
     the description and returns the title line.
+
+    ``announce_wait`` (the pipeline's per-task slot-wait announcer) is
+    forwarded to :func:`agent_model.build_model`, so a title call queued
+    behind the provider's ``max_parallel_requests`` cap says so in the
+    task's chat instead of looking like a stalled activation.
     """
     return Agent(
-        agent_model.build_model(config),
+        agent_model.build_model(config, announce_wait),
         instructions=load_title_prompt(),
         model_settings=agent_model.base_model_settings(config),
     )

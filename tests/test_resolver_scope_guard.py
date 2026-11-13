@@ -141,7 +141,9 @@ async def test_scope_guard_rejects_out_of_scope_edit(
         tool_response("set_resolution", {"resolved": True, "report": "wove both"}),
         text_response("done"),
     ]
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
 
     app = DrCodeApp(isolated)
     task = _finished_task(app)
@@ -192,7 +194,9 @@ async def test_error_round_leaves_named_trace(
         tool_response("write_file", {"path": "foreign.py", "content": "x\n"}),
         *([api_error()] * 3),
     ]
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
 
     app = DrCodeApp(isolated)
     task = _finished_task(app)
@@ -245,7 +249,9 @@ async def test_cancelled_round_leaves_named_trace(
         # scripted queue only types ordinary Exception steps.
         cast(Any, asyncio.CancelledError()),
     ]
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: state.model())
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg, announce_wait=None: state.model()
+    )
 
     app = DrCodeApp(isolated)
     task = _finished_task(app)

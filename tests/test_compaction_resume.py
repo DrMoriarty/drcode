@@ -10,6 +10,7 @@ untouched when any condition fails."""
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from drcode import agent_model
 from drcode.agent import is_summary_message, serialize_messages
 from drcode.models import TaskKind, TaskStatus
 from drcode.providers import AgentRole
+from drcode.transcript import last_context_tokens
 from drcode.tui.app import DrCodeApp
 from tests.network_mocks import (
     ScriptedState,
@@ -105,6 +107,35 @@ def _idle(app: DrCodeApp, task: Any, seconds: float) -> None:
     app.manager.storage.save(task)
 
 
+def _pre_run_fills(task: Any) -> tuple[int, int]:
+    """The (before, after) fill figures of the pre-run compaction event.
+
+    "after" must always be a real number: the compacted transcript carries
+    no usable usage (the LLM summarizer writes none at all; the mechanical
+    floor keeps the STALE responses whose usage describes the pre-compaction
+    size), so a usage-based reading reports `None` or the old fill."""
+    line = next(t for t in event_texts(task) if "pre-run compaction: ≈" in t)
+    assert "≈None" not in line, line
+    match = re.search(r"≈(\d+) → ≈(\d+) tokens", line)
+    assert match, line
+    return int(match.group(1)), int(match.group(2))
+
+
+def _tiny_compaction_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The COMPACTION role resolves with a window too small for even one
+    minimal map-reduce slice: `_ChunkingImpossible` forces the mechanical
+    floor (no summarizer call)."""
+    real = DrCodeApp.resolved_config
+
+    def resolved(self: DrCodeApp, role: AgentRole):  # type: ignore[no-untyped-def]
+        cfg = real(self, role)
+        if role is AgentRole.COMPACTION:
+            return cfg.model_copy(update={"max_context_tokens": 1000})
+        return cfg
+
+    monkeypatch.setattr(DrCodeApp, "resolved_config", resolved)
+
+
 # -- the gate fires ----------------------------------------------------------------
 
 
@@ -143,8 +174,40 @@ async def test_resume_compaction_fires_before_first_turn(
     texts = event_texts(task)
     assert any("compacting history before the run" in t for t in texts)
     assert any("pre-run compaction: ≈" in t and "→" in t for t in texts)
+    # The "after" fill is a real number and smaller than the "before" one:
+    # the summarized transcript carries no usage at all (verbatim prompts +
+    # one synthetic summary request), so a usage-based reading said `None`.
+    before, after = _pre_run_fills(task)
+    assert after < before
     # The run's own end re-stamped the transcript-write stamp.
     assert task.last_run_end is not None
+
+
+async def test_mechanical_pre_run_compaction_reports_shrunk_fill(
+    app: DrCodeApp, scripted: ScriptedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mechanical floor keeps the OLD responses (and their usage) at the
+    tail of the trimmed transcript: a usage-based "after" reported the fill
+    from BEFORE the compaction. The reported "after" is the real size of the
+    trimmed transcript."""
+    _tiny_compaction_window(monkeypatch)
+    app.settings.compaction_resume_min_tokens = 25_000
+    task = _seed_task(app, 711_046)
+    _idle(app, task, 200)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact_after_idle(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("Context compacted mechanically" in t for t in texts)
+    before, after = _pre_run_fills(task)
+    assert before == 711_046 + 8  # the seeded usage: input + output
+    # The stale usage is still the trimmed transcript's last response —
+    # exactly the value that used to be printed as the "after" fill.
+    assert last_context_tokens(task.messages) == before
+    assert after < before
 
 
 # -- the gate stays silent ----------------------------------------------------------

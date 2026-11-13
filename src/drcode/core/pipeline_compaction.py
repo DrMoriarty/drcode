@@ -1318,12 +1318,18 @@ class PipelineCompactionLayer(CoreState):
         task.touch()
         self.manager.storage.save(task)
         # The fill figures are persisted-transcript estimates (no live
-        # reading exists at run start); the credit belongs to the old
-        # transcript — the summary was built from the lightened history,
-        # so drop it with the stale live reading.
+        # reading exists at run start): `tokens` is the exact API usage of
+        # the old transcript's last response, `after` deliberately a
+        # chars/4 estimate of the compacted one — the summarizer's output
+        # carries no usage at all (a transcript of verbatim prompts + one
+        # synthetic summary request), and the mechanical floor keeps the
+        # STALE responses, whose usage describes the pre-compaction size.
+        # The credit belongs to the old transcript — the summary was built
+        # from the lightened history, so drop it with the stale live
+        # reading.
         self._live_ctx_tokens.pop(task.id, None)
         self._evicted_ctx_tokens.pop(task.id, None)
-        after = last_context_tokens(task.messages)
+        after = self._messages_estimate(task.messages)
         self._show_event(
             task,
             f"{event} (pre-run compaction: ≈{tokens} → ≈{after} tokens).",

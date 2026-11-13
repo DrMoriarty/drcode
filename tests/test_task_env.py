@@ -1729,3 +1729,279 @@ def test_ensure_root_submodule_init_without_event_log(
 
     assert note == ""
     assert (wt / "libs" / "sub" / "lib.txt").is_file()
+
+
+# -- node_modules provisioning in a fresh worktree -----------------------------------
+
+_PACKAGE_JSON = '{"name":"testproj","version":"0.0.0"}'
+_LOCK_BYTES = b'{"lockfileVersion":3,"packages":{}}'
+
+_PM_NAMES = {"npm", "pnpm", "yarn", "bun"}
+
+
+def _commit_package_files(
+    git_root: Path,
+    *,
+    package_json: bool = True,
+    lockfile: str | None = "package-lock.json",
+    lock_bytes: bytes = _LOCK_BYTES,
+) -> None:
+    """Track (and commit) the JS project files so a fresh worktree gets
+    them checked out — the provisioning step only sees tracked content.
+    node_modules stays gitignored (as in any real JS project) so a
+    pre-created one is never committed into the worktree."""
+    ignore = git_root / ".gitignore"
+    ignore.write_text(ignore.read_text() + "node_modules/\n")
+    if package_json:
+        (git_root / "package.json").write_text(_PACKAGE_JSON)
+    if lockfile is not None:
+        (git_root / lockfile).write_bytes(lock_bytes)
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "js project files")
+
+
+def _patch_pm_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    returncode: int = 0,
+    stderr: str = "",
+    side_effect=None,
+) -> list[tuple[list[str], Path | None]]:
+    """Intercept the package-manager launch inside
+    `_provision_node_modules` while letting every other subprocess.run
+    (the git plumbing of ensure_root itself) through to the real one.
+    Returns the recorded (cmd, cwd) calls."""
+    calls: list[tuple[list[str], Path | None]] = []
+    real_run = subprocess.run
+    module = subprocess
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] in _PM_NAMES:
+            calls.append((list(cmd), kwargs.get("cwd")))
+            if side_effect is not None:
+                return side_effect(cmd, *args, **kwargs)
+            return subprocess.CompletedProcess(cmd, returncode, "", stderr)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(module, "run", fake_run)
+    return calls
+
+
+def test_ensure_root_without_package_json_skips_provisioning(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a JS project: the step is a silent no-op — no node_modules
+    appears in the worktree, no event is emitted (even though the main
+    checkout happens to carry a node_modules directory)."""
+    (git_root / "node_modules").mkdir()
+    (git_root / "node_modules" / "lib.js").write_text("x")
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert not (wt / "node_modules").exists()
+    assert calls == []
+    assert not any("node_modules" in text for _, text in events)
+
+
+def test_ensure_root_node_modules_symlink_on_matching_lockfile(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast path: the main checkout's node_modules was built from the
+    SAME lockfile bytes — the fresh worktree gets a directory symlink to
+    it (never a copy), and no package manager is launched."""
+    (git_root / "node_modules").mkdir()
+    (git_root / "node_modules" / "lib.js").write_text("dep")
+    _commit_package_files(git_root)
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    nm = wt / "node_modules"
+    assert nm.is_symlink() and nm.is_dir()
+    assert (nm / "lib.js").read_text() == "dep"
+    assert nm.resolve() == (git_root / "node_modules").resolve()
+    assert calls == []  # no install ran
+    node_events = [text for _, text in events if "node_modules" in text]
+    assert len(node_events) == 1
+    assert "symlink" in node_events[0]
+
+
+def test_ensure_root_installs_when_lockfile_differs(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lockfile mismatch: the main checkout's tree is stale — the
+    dependencies are installed in the worktree itself via the package
+    manager pinned to the lockfile, never symlinked."""
+    (git_root / "node_modules").mkdir()
+    (git_root / "node_modules" / "lib.js").write_text("dep")
+    _commit_package_files(git_root)
+    # The user's checkout drifted ahead: a modified (uncommitted)
+    # lockfile whose tree no longer matches the committed one the
+    # worktree was checked out from.
+    (git_root / "package-lock.json").write_bytes(
+        b'{"lockfileVersion":3,"drifted":true}'
+    )
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert wt.is_dir()
+    # The worktree's node_modules was NOT symlinked to the stale tree —
+    # the (simulated) install ran there instead.
+    assert not (wt / "node_modules").is_symlink()
+    assert len(calls) == 1
+    cmd, cwd = calls[0]
+    assert cmd == ["npm", "ci"]
+    assert cwd == wt
+    node_events = [text for _, text in events if "node_modules" in text]
+    assert node_events == ["node_modules installed via npm ci"]
+
+
+def test_ensure_root_selects_package_manager_by_lockfile(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pnpm project (pnpm-lock.yaml) installs via
+    `pnpm install --frozen-lockfile` — the npm lockfile command never
+    fires even though package.json is present."""
+    _commit_package_files(
+        git_root, lockfile="pnpm-lock.yaml", lock_bytes=b"lockfileVersion: '9.0'\n"
+    )
+    env = TaskEnvironment(git_root, isolated_settings)
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    cmd, cwd = calls[0]
+    assert cmd == ["pnpm", "install", "--frozen-lockfile"]
+    assert cwd == wt
+    assert not (wt / "node_modules").is_symlink()
+
+
+def test_ensure_root_install_failure_is_never_fatal(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing install never fails the activation: the worktree stays
+    alive and the chat gets a `Warning:` service event with the return
+    code and the tail of stderr."""
+    _commit_package_files(git_root)
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(
+        monkeypatch, returncode=1, stderr="npm ERR! code E404\nnpm ERR! not found"
+    )
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert wt.is_dir()
+    assert len(calls) == 1
+    node_events = [text for _, text in events if "node_modules" in text]
+    assert len(node_events) == 1
+    assert node_events[0].startswith("Warning: node_modules install failed")
+    assert "exited with code 1" in node_events[0]
+    assert "npm ERR! not found" in node_events[0]
+
+
+def test_ensure_root_install_timeout_is_never_fatal(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung install surfaces as a `Warning:` service event after the
+    timeout cap — the activation itself must not fail or hang."""
+    _commit_package_files(git_root)
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+
+    def raise_timeout(cmd, *a, **kw):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=600)
+
+    calls = _patch_pm_run(monkeypatch, side_effect=raise_timeout)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert wt.is_dir()
+    assert len(calls) == 1
+    node_events = [text for _, text in events if "node_modules" in text]
+    assert len(node_events) == 1
+    assert node_events[0].startswith("Warning: node_modules install (npm) timed out")
+
+
+def test_ensure_root_without_lockfile_skips_install(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """package.json without any lockfile: nothing to pin an install to —
+    the step skips with a service-event note (a bare `npm install` is
+    deliberately never run)."""
+    _commit_package_files(git_root, lockfile=None)
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    assert calls == []  # no bare install
+    node_events = [text for _, text in events if "node_modules" in text]
+    assert len(node_events) == 1
+    assert "no package-manager lockfile" in node_events[0]
+    assert not (wt / "node_modules").exists()
+
+
+def test_ensure_root_existing_node_modules_not_overwritten(
+    git_root: Path,
+    isolated_settings: ProjectSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worktree that already HAS node_modules (e.g. committed by the
+    project) is never touched — no symlink, no install, no event."""
+    (git_root / "node_modules").mkdir()
+    (git_root / "node_modules" / "keep.txt").write_text("local state")
+    (git_root / "package.json").write_text(_PACKAGE_JSON)
+    (git_root / "package-lock.json").write_bytes(_LOCK_BYTES)
+    _git(git_root, "add", "-A")
+    _git(git_root, "commit", "-q", "-m", "js project with committed node_modules")
+    events: list[tuple[str, str]] = []
+    env = TaskEnvironment(git_root, isolated_settings)
+    env.event_log = lambda task_id, text: events.append((task_id, text))
+    calls = _patch_pm_run(monkeypatch)
+
+    wt, note = env.ensure_root("t1")
+
+    assert note == ""
+    nm = wt / "node_modules"
+    # The checked-out real directory survived as-is.
+    assert nm.is_dir() and not nm.is_symlink()
+    assert (nm / "keep.txt").read_text() == "local state"
+    assert calls == []
+    assert not any("node_modules" in text for _, text in events)

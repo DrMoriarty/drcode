@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ..models import TaskStatus
 from ..settings import WorktreeRemoval, WorktreeSnapshot
+from ..tools import child_priority_kwargs
 from ._common import (
     _COPY_FILE_LIMIT,
     _COPY_SKIP_DIRS,
@@ -509,6 +510,13 @@ class _WorktreeLifecycleMixin:
         # burn a manual `git submodule update --init` on every task in a
         # project with submodules.
         self._init_submodules(task_id, wt)
+        # node_modules: a fresh worktree never has it (gitignored in the
+        # main tree, deliberately excluded from the untracked copy — see
+        # _COPY_SKIP_DIRS), so committed symlink-style setups arrive
+        # broken and agents burned a manual `npm link`/install on every
+        # task in a JS project. Provision here (best effort, see
+        # _provision_node_modules).
+        self._provision_node_modules(task_id, wt)
         # The branch was just (re-)checked out here: this commit is the
         # baseline the smart snapshot gate measures the run's own commits
         # against (`worktree_snapshot: only-if-no-commits`). Deliberately
@@ -566,6 +574,169 @@ class _WorktreeLifecycleMixin:
         else:
             detail = out.strip() or f"git exited with code {code}"
             self.event_log(task_id, f"Warning: submodule init failed: {detail[:300]}")
+
+    # -- node_modules provisioning ----------------------------------------------
+
+    # Bounded wait for the package-manager install in a fresh worktree
+    # (seconds). Deliberately far above the git subprocess cap (120): a
+    # cold `npm ci` in a mid-size project routinely runs minutes. A
+    # timeout is a `Warning:` service event, never a failed activation.
+    NODE_MODULES_INSTALL_TIMEOUT = 600.0
+
+    # Tail of stderr kept for the failure service event — the actual
+    # reason lives at the END of npm/pnpm/yarn/bun output.
+    _INSTALL_STDERR_TAIL = 500
+
+    @classmethod
+    def _lockfile_plan(cls, wt: Path) -> tuple[str, list[str]] | None:
+        """The (lockfile name, install command) pair for the first known
+        package-manager lockfile found in the worktree root, or None when
+        the project has none. Checked in npm→pnpm→yarn→bun order."""
+        for name, cmd in (
+            ("package-lock.json", ["npm", "ci"]),
+            ("pnpm-lock.yaml", ["pnpm", "install", "--frozen-lockfile"]),
+            ("yarn.lock", ["yarn", "--immutable"]),
+            ("bun.lockb", ["bun", "install"]),
+            ("bun.lock", ["bun", "install"]),
+        ):
+            if (wt / name).is_file():
+                return name, cmd
+        return None
+
+    def _provision_node_modules(self, task_id: str, wt: Path) -> None:
+        """Provision `node_modules` in a freshly created worktree.
+
+        A new worktree never carries `node_modules`: it is gitignored in
+        the main tree and deliberately excluded from the untracked copy
+        (`_COPY_SKIP_DIRS` — its comment promises "re-create with the
+        package manager", which is exactly this step). Without it, a
+        symlink-style dependency layout (committed `src/ext/*.js`
+        symlinks into `node_modules`) arrives broken, and agents burned
+        a manual install or a symlink hand-run on every task.
+
+        The hybrid strategy (chosen in the grid-apps research task):
+
+        - no `package.json` in the worktree → not a JS project, silent
+          no-op (zero overhead for everyone else);
+        - `node_modules` already present in the worktree (committed
+          symlink or directory) → never touched;
+        - the main checkout HAS `node_modules` AND its lockfile is
+          byte-identical to the worktree's → symlink the whole directory
+          in (fast path — pnpm layouts with store-internal symlinks
+          resolve fine through a directory symlink, and nothing is ever
+          copied in either direction);
+        - lockfile mismatch, or no `node_modules` in the main checkout →
+          install in the worktree itself, pinned to the lockfile
+          (`npm ci` / `pnpm install --frozen-lockfile` /
+          `yarn --immutable` / `bun install`);
+        - NO lockfile at all → nothing to pin the install to: skip with
+          a service-event note (a bare `npm install` would resolve
+          whatever is current today — the agent decides, as before).
+
+        Best effort by contract, same as `_init_submodules`: every
+        failure (missing binary, timeout, non-zero exit, even a failed
+        symlink) leaves the worktree as-is and reports a `Warning:`
+        service event — the agent provisions manually, like it did
+        before this step existed. Blocking subprocess — the caller
+        (`_ensure_root_locked`) runs under the activation lock."""
+        try:
+            self._provision_node_modules_inner(task_id, wt)
+        except (OSError, subprocess.SubprocessError) as e:
+            if self.event_log is not None:
+                self.event_log(
+                    task_id,
+                    f"Warning: node_modules provisioning failed: "
+                    f"{type(e).__name__}: {e}"[:500],
+                )
+
+    def _provision_node_modules_inner(self, task_id: str, wt: Path) -> None:
+        """The body of `_provision_node_modules` — exceptions propagate to
+        its never-fatal wrapper."""
+        if not (wt / "package.json").is_file():
+            return
+        nm = wt / "node_modules"
+        if nm.is_symlink() or nm.exists():
+            # Already there (a committed symlink or directory): not ours
+            # to replace — a real directory may hold a deliberate local
+            # state, a symlink means somebody already provisioned.
+            return
+        plan = self._lockfile_plan(wt)
+        if plan is None:
+            if self.event_log is not None:
+                self.event_log(
+                    task_id,
+                    "node_modules not provisioned: no package-manager "
+                    "lockfile (package-lock.json / pnpm-lock.yaml / "
+                    "yarn.lock / bun.lockb) in the project — install "
+                    "dependencies manually if needed",
+                )
+            return
+        lockfile, cmd = plan
+        main_nm = self.project_root / "node_modules"
+        if main_nm.is_dir():
+            try:
+                main_lock = (self.project_root / lockfile).read_bytes()
+                wt_lock = (wt / lockfile).read_bytes()
+            except OSError:
+                main_lock = wt_lock = b""  # fall through to the install
+            if main_lock and main_lock == wt_lock:
+                # Fast path: the main checkout's dependency tree was
+                # built from exactly this lockfile — share it by
+                # reference. A directory symlink, never a copy: pnpm's
+                # node_modules is full of symlinks into its global store
+                # and does not survive being dragged file-by-file.
+                try:
+                    nm.symlink_to(main_nm, target_is_directory=True)
+                except OSError as e:
+                    if self.event_log is not None:
+                        self.event_log(
+                            task_id,
+                            f"Warning: node_modules symlink to the main "
+                            f"checkout failed: {e}"[:500],
+                        )
+                    return
+                if self.event_log is not None:
+                    self.event_log(
+                        task_id,
+                        f"node_modules provisioned: symlink to the main "
+                        f"checkout (lockfile {lockfile} matches)",
+                    )
+                return
+        # Slow path: dependencies are installed in the worktree itself,
+        # strictly per lockfile. Only the OUTCOME reaches the chat (the
+        # full stream would be noise); on failure the tail of stderr —
+        # where npm-family tools print the actual reason.
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=wt,
+                capture_output=True,
+                text=True,
+                timeout=self.NODE_MODULES_INSTALL_TIMEOUT,
+                check=False,
+                **child_priority_kwargs(),
+            )
+        except subprocess.TimeoutExpired:
+            if self.event_log is not None:
+                self.event_log(
+                    task_id,
+                    f"Warning: node_modules install ({cmd[0]}) timed out "
+                    f"after {int(self.NODE_MODULES_INSTALL_TIMEOUT)}s — "
+                    "provision manually if needed",
+                )
+            return
+        if self.event_log is None:
+            return
+        if proc.returncode == 0:
+            self.event_log(task_id, f"node_modules installed via {' '.join(cmd)}")
+        else:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            detail = detail[-self._INSTALL_STDERR_TAIL :]
+            self.event_log(
+                task_id,
+                f"Warning: node_modules install failed ({cmd[0]} exited "
+                f"with code {proc.returncode}): {detail}",
+            )
 
     def _collect_untracked(self) -> list[str]:
         """Untracked (plain + gitignored) files of the main tree, relative

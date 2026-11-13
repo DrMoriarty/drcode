@@ -53,7 +53,9 @@ def _mcp_submodules():
     `mcp[cli]` extra, not a drcode dependency — drcode only uses the
     mcp.server/mcp.client halves), so plain collection dies with
     SystemExit(1). Listing *.py paths needs no imports at all; mcp.cli
-    and its submodules are dropped from the bundle entirely.
+    and its submodules are dropped from the bundle entirely. The skip
+    must match the package EXACTLY — a bare prefix like startswith(
+    "mcp.cli") also swallows every mcp.client.* module.
     """
     import mcp
 
@@ -64,7 +66,7 @@ def _mcp_submodules():
         if "__init__" in parts:
             parts.remove("__init__")
         name = ".".join(parts)
-        if not name.startswith("mcp.cli"):
+        if name != "mcp.cli" and not name.startswith("mcp.cli."):
             names.append(name)
     return names
 

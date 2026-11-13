@@ -12,11 +12,14 @@ dialog:
   per-role ``max_tokens`` overrides are persisted only on Apply (ESC
   dismisses with None and discards everything);
 - one section per agent role (coding / research / tester / compaction /
-  resolver) with a model Select (catalog models, the role's saved custom
+  resolver / subagents) with a model Select (catalog models, the role's saved custom
   model as "Custom: <model-id>", "Custom…" to enter a free-form model
   via the existing ModelSetupDialog, and "User default" to drop the
   project slot — the reset is available for EVERY role, including those
-  the old palette offered no reset for). The user-level default model of
+  the old palette offered no reset for; for the SUBAGENTS section the
+  reset reads "Inherit parent role" — an empty slot means the
+  `delegate_research` subagents run on the parent task's role model).
+  The user-level default model of
   a role is marked by a single ``▸`` glyph and a bold name in the row's
   marker gutter; the currently selected model carries no marker at all
   (the Select's own field shows it) — the old " (default)"/" (current)"
@@ -96,6 +99,7 @@ _ROLE_TITLES: dict[AgentRole, str] = {
     AgentRole.TESTER: "Tester",
     AgentRole.COMPACTION: "Compaction",
     AgentRole.RESOLVER: "Resolver",
+    AgentRole.SUBAGENT: "Subagents (delegate_research)",
 }
 
 THINKING_HINT = (
@@ -325,7 +329,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         The effective slot is deliberately NOT marked: the Select's own
         field already shows the selected value (the old " (current)" suffix
         was pure noise). Then the saved/draft custom model, "Custom…" and
-        "User default" (always — the reset exists for every role)."""
+        the reset ("User default" — for the SUBAGENT pseudo-role
+        "Inherit parent role"; always present)."""
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
@@ -373,7 +378,18 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             # missing/invalid: same missing-value hazard as above.
             options.append(("Custom: <no saved model>", "custom"))
         options.append(("Custom…", _CUSTOM_NEW))
-        options.append(("User default", _USER_DEFAULT))
+        # The reset's label: for the SUBAGENT pseudo-role an empty slot
+        # means "run on the parent task's role model", not "use the
+        # user-level default" (the subagent slot has no user-level
+        # default chain — see providers.resolve_subagent).
+        options.append(
+            (
+                "Inherit parent role"
+                if role is AgentRole.SUBAGENT
+                else "User default",
+                _USER_DEFAULT,
+            )
+        )
         return options
 
     def _slot_value(self, role: AgentRole) -> object:

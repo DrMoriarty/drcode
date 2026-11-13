@@ -241,6 +241,15 @@ class AgentRole(str, enum.Enum):
     RESOLVER serves the automatic merge-conflict resolver rounds (a
     conflicted merge parked in the task's worktree by the merge engine):
     same fallback to the coding model when nothing is selected for it.
+
+    SUBAGENT is a pseudo-role: it is never the serving role of a task run,
+    it only keys the project slot (`models["subagent"]` /
+    `custom_models["subagent"]`) that the read-only `delegate_research`
+    subagents run on when one is set — with no slot they inherit the
+    PARENT run's role model (see `resolve_subagent`). No user-level
+    default chain exists for it on purpose: the inheritance IS the
+    fallback, and it is dynamic (a research parent's subagents inherit
+    the research model, a coding parent's — the coding model).
     """
 
     CODING = "coding"
@@ -248,6 +257,7 @@ class AgentRole(str, enum.Enum):
     TESTER = "tester"
     COMPACTION = "compaction"
     RESOLVER = "resolver"
+    SUBAGENT = "subagent"
 
 
 class ModelRef(BaseModel):
@@ -943,11 +953,15 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
 
     # 3. The user-level ordered chain: primary first, then the availability
     #    fallbacks; the first reference resolving to a catalog provider
-    #    wins (dangling ones fall through to the next candidate).
-    for ref in catalog.role_refs(role):
-        provider = _match_ref(catalog, ref)
-        if provider is not None:
-            return _apply_provider(config, ref, provider)
+    #    wins (dangling ones fall through to the next candidate). Skipped
+    #    for the SUBAGENT pseudo-role: its fallback is the PARENT run's
+    #    model, decided by the caller (`resolve_subagent`) — a user-level
+    #    default chain for it is deliberately not consulted.
+    if role is not AgentRole.SUBAGENT:
+        for ref in catalog.role_refs(role):
+            provider = _match_ref(catalog, ref)
+            if provider is not None:
+                return _apply_provider(config, ref, provider)
 
     # 4. Nothing selected for this role: "model not set".
     return config.model_copy(update={"model": ""})
@@ -963,7 +977,10 @@ def resolve_model_key(config: Config, role: AgentRole) -> str:
     Mirrors `resolve`/`resolve_effective` precedence — env override, the
     project slot (exact → cross-provider id match, same as
     `_resolve_connection`), the user-level ordered chain — including the
-    research/resolver fallback to the coding model. The provider name in
+    research/resolver fallback to the coding model. The SUBAGENT
+    pseudo-role is the exception: no user-level chain and no env key —
+    only a project slot yields an own key, otherwise "" (the inheritance
+    is the caller's business, see `subagent_usage_key`). The provider name in
     the key is the one the reference ACTUALLY resolved to (after a
     cross-provider id match), not the one written in the slot. Feeds the
     TUI's usage-accounting key ("<role>/<model-id>", see
@@ -976,6 +993,26 @@ def resolve_model_key(config: Config, role: AgentRole) -> str:
     resolved = resolve(config, role)
     if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
         return resolve_model_key(config, AgentRole.CODING)
+    if role is AgentRole.SUBAGENT:
+        # The subagent pseudo-role has no user-level chain: only a project
+        # slot (catalog reference or custom model) yields an OWN key —
+        # with no slot (or a dangling one) the subagent inherits the
+        # parent run's model and the accounting stays there (see
+        # `subagent_usage_key`). The env override makes every role — the
+        # parent's included — the env model, which counts as inheritance.
+        if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
+            return ""
+        catalog = UserModelsStore().load()
+        slot = load_project_model_slots(config._project_root).get(role)
+        if isinstance(slot, ModelRef):
+            provider = _match_ref(catalog, slot)
+            if provider is not None:
+                return f"{provider.name}/{slot.model}"
+        elif slot == "custom":
+            custom = load_project_custom_models(config._project_root).get(role)
+            if custom is not None:
+                return custom.model
+        return ""
     if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
         # The env layer wins for all roles and carries no provider name.
         return resolved.model
@@ -1014,6 +1051,51 @@ def resolve_effective(config: Config, role: AgentRole) -> Config:
     if role in (AgentRole.RESEARCH, AgentRole.RESOLVER) and not resolved.is_ready:
         return resolve(config, AgentRole.CODING)
     return resolved
+
+
+def resolve_subagent(config: Config) -> Config:
+    """The model connection the read-only `delegate_research` subagents
+    (see `drcode.subagents`) run on: the project's `models["subagent"]`
+    slot when one resolves — a catalog reference or the "subagent" custom
+    model (`custom_models["subagent"]`, `models["subagent"] = "custom"`).
+
+    With NO slot (or a dangling reference / an invalid custom entry) the
+    PARENT role's model is inherited: the input `config` is returned
+    unchanged — the historical behavior, so existing configs keep working
+    (empty/absent = inherit). The user-level default chain is deliberately
+    not consulted for this pseudo-role: the inheritance IS the fallback,
+    and it is dynamic — a research parent's subagents inherit the research
+    model, a coding parent's the coding model.
+
+    The env override (`DRCODE_MODEL` / `DRCODE_BASE_URL`) wins globally as
+    everywhere: with it set every role — the parent's included — IS the
+    env model, which here means plain inheritance (the input returned).
+
+    The catalog entry's token caps (max_context_tokens / max_tokens /
+    compaction_threshold) ride with the resolved connection like for any
+    other role, so a subagent run is measured against ITS model's window.
+    """
+    if os.environ.get("DRCODE_MODEL") or os.environ.get("DRCODE_BASE_URL"):
+        return config
+    resolved = resolve(config, AgentRole.SUBAGENT)
+    return resolved if resolved.is_ready else config
+
+
+def subagent_usage_key(
+    config: Config, parent_role: AgentRole, parent_key: str
+) -> tuple[AgentRole, str]:
+    """The usage-accounting (role, model key) a nested `delegate_research`
+    run's tokens are recorded under: the subagent's OWN slot
+    ("subagent/<model-id>", bare id for a custom model) when the project
+    pinned one, else the PARENT run's role/key — the historical accounting
+    for the inherited model. `parent_key` is the caller's pinned/effective
+    key (`resolved_model_key(parent_role)`), passed in rather than
+    re-resolved so a run-start availability fallback is honored. Mirrors
+    `resolve_subagent` by construction (same slot walk, same env rule)."""
+    own = resolve_model_key(config, AgentRole.SUBAGENT)
+    if own:
+        return AgentRole.SUBAGENT, own
+    return parent_role, parent_key
 
 
 # -- availability-aware resolution (run start) ---------------------------------
@@ -1224,7 +1306,14 @@ def migrate_user_config() -> bool:
         if flat is not None:
             catalog = UserModelsConfig(providers=[flat])
             ref = ModelRef(provider=flat.name, model=flat.models[0].id)
-            catalog.defaults = {role: [ref] for role in AgentRole}
+            # The SUBAGENT pseudo-role stays unpinned: its empty slot means
+            # "inherit the parent role's model", and right after this
+            # migration the parent runs on the migrated model anyway.
+            catalog.defaults = {
+                role: [ref]
+                for role in AgentRole
+                if role is not AgentRole.SUBAGENT
+            }
             try:
                 store.save(catalog)
             except OSError:
@@ -1276,6 +1365,12 @@ def migrate_project_config(project_root: Path) -> bool:
             customs = dict(customs_raw) if isinstance(customs_raw, dict) else {}
             models_raw = data.get("models")
             for role in AgentRole:
+                if role is AgentRole.SUBAGENT:
+                    # No subagent copy: an empty slot = inherit the parent
+                    # role's model (the slot's documented fallback), and
+                    # pinning one here would freeze it against later
+                    # changes of the coding model.
+                    continue
                 customs[role.value] = json.loads(entry.model_dump_json())
                 # A catalog reference already in the slot stays active;
                 # only an unpinned slot activates the migrated custom

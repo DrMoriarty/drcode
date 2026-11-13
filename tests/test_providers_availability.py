@@ -175,6 +175,8 @@ def test_migrate_user_config_writes_ordered_lists(
     assert migrate_user_config() is True
     catalog = UserModelsStore().load()
     for role in AgentRole:
+        if role is AgentRole.SUBAGENT:
+            continue  # no user-level chain for the subagent pseudo-role
         assert catalog.role_refs(role) == [ModelRef(provider="x", model="m")]
 
 

@@ -982,6 +982,12 @@ def test_migrate_user_config_creates_catalog_with_role_defaults(
         ModelEntry(id="qwen3-coder-30b", max_context_tokens=131072, max_tokens=4096)
     ]
     for role in AgentRole:
+        if role is AgentRole.SUBAGENT:
+            # The subagent pseudo-role stays unpinned: an empty slot means
+            # "inherit the parent role's model" (its fallback is dynamic —
+            # the parent run's role model — see providers.resolve_subagent).
+            assert AgentRole.SUBAGENT not in catalog.defaults
+            continue
         assert catalog.defaults[role] == [
             ModelRef(provider="localhost", model="qwen3-coder-30b")
         ]
@@ -1058,6 +1064,12 @@ def test_migrate_project_config_moves_flat_keys_to_custom_models(
     data = json.loads(cfg_file.read_text())
     # Three independent per-role copies...
     for role in AgentRole:
+        if role is AgentRole.SUBAGENT:
+            # No subagent copy: the slot stays empty (= inherit the parent
+            # role's model) — see providers.resolve_subagent.
+            assert "subagent" not in data["custom_models"]
+            assert "subagent" not in data["models"]
+            continue
         assert data["custom_models"][role.value]["model"] == "flat-m"
         assert data["custom_models"][role.value]["base_url"] == "http://flat/v1"
     assert data["models"]["coding"] == "custom"
@@ -1138,6 +1150,8 @@ def test_migrations_run_before_resolution(
     config = make_config(project_root)
     # The project's custom models beat the fresh catalog defaults.
     for role in AgentRole:
+        if role is AgentRole.SUBAGENT:
+            continue  # unpinned on purpose — inherits the parent role
         resolved = resolve(config, role)
         assert resolved.model == "flat-m"
         assert resolved.base_url == "http://flat/v1"
@@ -1145,6 +1159,8 @@ def test_migrations_run_before_resolution(
     cfg_file.unlink()
     config = make_config(project_root)
     for role in AgentRole:
+        if role is AgentRole.SUBAGENT:
+            continue
         assert resolve(config, role).model == "user-m"
 
 

@@ -66,6 +66,14 @@ _SCROLLBAR_ALLOWANCE = 2
 _FALLBACK_RIGHT_WIDTH = 50
 _FALLBACK_GROUP_WIDTH = 42
 
+# The roles the user-level fallback chains are edited for: every agent
+# role EXCEPT the SUBAGENT pseudo-role — its model slot is project-level
+# and its fallback is the parent run's model, so no user-level chain
+# exists for it (see providers.resolve_subagent).
+CHAIN_ROLES: tuple[AgentRole, ...] = tuple(
+    role for role in AgentRole if role is not AgentRole.SUBAGENT
+)
+
 
 class _FittingOptionList(OptionList):
     """OptionList that reports its own width changes to the screen:
@@ -208,8 +216,13 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
             self.catalog = self.store.load()
         # Working copy of the chains (role → ordered refs), seeded from the
         # catalog; mutated live, flushed into `catalog.defaults` on Save.
+        # The SUBAGENT pseudo-role is excluded: its model slot is
+        # PROJECT-level (`models["subagent"]`, edited in the project model
+        # settings dialog), and its fallback is the parent run's model —
+        # no user-level default chain exists for it (see
+        # providers.resolve_subagent).
         self.chains: dict[AgentRole, list[ModelRef]] = {
-            role: self.catalog.role_refs(role) for role in AgentRole
+            role: self.catalog.role_refs(role) for role in CHAIN_ROLES
         }
         self._filter_text: str = ""
         self._selected_ref: ModelRef | None = None
@@ -227,7 +240,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
             )
             with Horizontal(id="ac-main"):
                 with Vertical(id="ac-left"):
-                    for role in AgentRole:
+                    for role in CHAIN_ROLES:
                         with Horizontal(classes="ac-group-head"):
                             yield Static(
                                 f"{role.value} · 0/{MAX_ROLE_DEFAULTS}",
@@ -330,7 +343,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         )
 
     def _refresh_all_groups(self) -> None:
-        for role in AgentRole:
+        for role in CHAIN_ROLES:
             self._refresh_group(role)
 
     def _role_from_button(self, button_id: str | None, prefix: str) -> AgentRole | None:
@@ -426,7 +439,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
     def _flush_chains(self) -> None:
         """Write the working chains into the catalog object: empty chains
         are absence (the slot is dropped, matching the on-load normalizer)."""
-        for role in AgentRole:
+        for role in CHAIN_ROLES:
             refs = self.chains.get(role, [])
             if refs:
                 self.catalog.defaults[role] = list(refs)

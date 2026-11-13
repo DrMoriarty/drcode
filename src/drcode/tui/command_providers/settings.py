@@ -407,7 +407,8 @@ class AgentChainsCommandProvider(CommandListProvider):
                 "Ordered model chains per agent role (coding / research / "
                 "tester / compaction / resolver) — first entry is the "
                 "role's primary model, the rest are availability fallbacks; "
-                "stored in ~/.config/drcode/models.json",
+                "stored in ~/.config/drcode/models.json (subagents have no "
+                "chain here — their model is a project-level slot)",
             ),
         ]
 
@@ -426,7 +427,7 @@ class ModelSettingsCommandProvider(CommandListProvider):
                 "Model settings…",
                 app.action_open_model_settings,
                 "Provider catalog and per-agent model selection "
-                "(coding / research / tester / compaction)",
+                "(coding / research / tester / compaction / subagents)",
             ),
         ]
 

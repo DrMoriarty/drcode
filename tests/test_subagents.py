@@ -242,6 +242,11 @@ def test_subagent_answer_reaches_parent(
     texts = [e.text for e in task.events]
     assert any("subagent spawned (1/2)" in t for t in texts)
     assert any("subagent finished" in t and "requests" in t for t in texts)
+    # Observability in the project stats: one successful spawn counted.
+    assert manager.stats.subagent_usage() == (1, 1)
+    day = manager.stats.snapshot(1)[0][1]
+    assert day.subagent_spawns == 1
+    assert day.subagent_failures == 0
 
 
 def test_gate_exhaustion_returns_plain_message(
@@ -375,6 +380,11 @@ def test_subagent_failure_is_plain_result(
     assert deps.subagent_gate.active == 0  # released in the failure path too
     texts = [e.text for e in task.events]
     assert any("subagent failed" in t and "kaboom" in t for t in texts)
+    # A failed delegation counts only the failure, never a spawn.
+    assert manager.stats.subagent_usage() == (0, 0)
+    day = manager.stats.snapshot(1)[0][1]
+    assert day.subagent_spawns == 0
+    assert day.subagent_failures == 1
 
 
 def test_no_gate_returns_configuration_hint(

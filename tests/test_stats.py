@@ -118,6 +118,49 @@ def test_store_add_time_validates(project_root: Path) -> None:
     assert not (project_root / ".drcode" / "stats.json").exists()
 
 
+def test_subagent_spawn_counters_and_usage_window(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful spawn counts subagent_spawns, a failed one only
+    subagent_failures; `subagent_usage` splits the successful totals into
+    (ever, last-N-days) for the "enabled but never used" hint."""
+    today = "2026-11-04"
+    old = "2026-10-10"
+    monkeypatch.setattr("drcode.stats._utc_today", lambda: today)
+    store = StatsStore(project_root)
+
+    store.record_subagent_spawn()
+    store.record_subagent_spawn()
+    store.record_subagent_spawn(failed=True)
+    # A failure is a failure, never a spawn.
+    day = store.snapshot(1)[0][1]
+    assert day.subagent_spawns == 2
+    assert day.subagent_failures == 1
+    assert store.subagent_usage() == (2, 2)
+    assert store.subagent_usage(recent_days=14) == (2, 2)
+
+    # An older successful spawn lands outside the recent window but stays
+    # in the "ever" total; the persisted file survives a reload.
+    monkeypatch.setattr("drcode.stats._utc_today", lambda: old)
+    StatsStore(project_root).record_subagent_spawn()
+    monkeypatch.setattr("drcode.stats._utc_today", lambda: today)
+
+    reloaded = StatsStore(project_root)
+    assert reloaded.subagent_usage() == (3, 2)
+    assert reloaded.subagent_usage(recent_days=1) == (3, 2)
+
+
+def test_record_subagent_spawn_unwritable_path_never_raises(
+    project_root: Path,
+) -> None:
+    (project_root / ".drcode" / "stats.json").mkdir(parents=True)
+    store = StatsStore(project_root)
+    store.record_subagent_spawn()  # must not raise
+    store.record_subagent_spawn(failed=True)  # must not raise
+    assert store.snapshot(1)[0][1].subagent_spawns == 1
+    assert store.snapshot(1)[0][1].subagent_failures == 1
+
+
 def test_snapshot_zero_fills_and_orders(project_root: Path, fixed_day: str) -> None:
     store = StatsStore(project_root)
     store.record_created()

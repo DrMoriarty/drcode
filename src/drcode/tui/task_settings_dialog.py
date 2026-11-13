@@ -68,6 +68,7 @@ from ..settings import (
     GitPolicy,
     ProjectSettings,
     StallNudge,
+    SubagentUsageSummary,
     TaskIsolation,
     Verification,
     WebFetchMode,
@@ -289,12 +290,16 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         settings: ProjectSettings,
         *,
         git_available: bool | None = None,
+        subagent_usage: SubagentUsageSummary | None = None,
     ) -> None:
         super().__init__()
         self._original = settings.model_copy(deep=True)
         self._draft = settings.model_copy(deep=True)
         # None = derive from the app's TaskEnvironment at mount time.
         self._git_available = git_available
+        # delegate_research usage counts (from the per-day project stats)
+        # for the "enabled but never used" hint; None = no stats handy.
+        self._subagent_usage = subagent_usage
         self._branches: list[str] = []
         # fix-button id -> the hint's fix callable (rebuilt per render).
         self._fixes: dict[str, Callable[[ProjectSettings], None]] = {}
@@ -720,7 +725,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
 
     def _sync_hints(self) -> None:
         hints = task_settings_hints(
-            self._draft, git_available=bool(self._git_available)
+            self._draft,
+            git_available=bool(self._git_available),
+            subagent_usage=self._subagent_usage,
         )
         panel = self.query_one("#ts-hints", Vertical)
         self._fixes = {}

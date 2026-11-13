@@ -543,3 +543,54 @@ def test_hints_worktree_without_git_is_conflict() -> None:
     assert [h.severity for h in hints] == ["conflict"]
     # With git available the same draft is clean.
     assert task_settings_hints(draft, git_available=True) == []
+
+
+# -- task_settings_hints: subagent usage ----------------------------------------
+
+
+def test_hints_subagents_enabled_never_used() -> None:
+    """subagents_* > 0 with a ZERO delegation count is the drcode-bench
+    observability hole: the hint must say it outright."""
+    from drcode.settings import SubagentUsageSummary, task_settings_hints
+
+    draft = ProjectSettings(subagents_coder=1, subagents_researcher=1)
+    usage = SubagentUsageSummary(total_spawns=0, recent_spawns=0)
+    hints = task_settings_hints(draft, git_available=True, subagent_usage=usage)
+    assert len(hints) == 1
+    assert hints[0].severity == "info"
+    assert "NEVER" in hints[0].text
+    assert hints[0].fix is None  # the user decides — no auto-fix
+
+
+def test_hints_subagents_enabled_stale_usage() -> None:
+    """Used once upon a time, but not in the recent window: a softer hint
+    naming the window and the ever-total."""
+    from drcode.settings import SubagentUsageSummary, task_settings_hints
+
+    draft = ProjectSettings(subagents_coder=2)
+    usage = SubagentUsageSummary(total_spawns=5, recent_spawns=0, recent_days=14)
+    hints = task_settings_hints(draft, git_available=True, subagent_usage=usage)
+    assert len(hints) == 1
+    assert hints[0].severity == "info"
+    assert "last 14 days" in hints[0].text
+    assert "5" in hints[0].text
+
+
+def test_hints_subagents_recently_used_is_silent() -> None:
+    from drcode.settings import SubagentUsageSummary, task_settings_hints
+
+    draft = ProjectSettings(subagents_coder=1, subagents_researcher=0)
+    usage = SubagentUsageSummary(total_spawns=3, recent_spawns=2)
+    assert task_settings_hints(draft, git_available=True, subagent_usage=usage) == []
+
+
+def test_hints_subagents_without_usage_data_is_silent() -> None:
+    """No stats handy (None) or subagents off: no hint either way — the
+    default draft must stay hint-free."""
+    from drcode.settings import SubagentUsageSummary, task_settings_hints
+
+    assert task_settings_hints(ProjectSettings(), git_available=True) == []
+    on = ProjectSettings(subagents_coder=1)
+    assert task_settings_hints(on, git_available=True) == []
+    usage = SubagentUsageSummary(total_spawns=0, recent_spawns=0)
+    assert task_settings_hints(on, git_available=True, subagent_usage=usage)

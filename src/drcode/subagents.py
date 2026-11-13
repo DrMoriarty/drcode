@@ -454,8 +454,11 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
 
     Enforces the per-run gate, runs the nested read-only subagent (the
     event loop stays free — the nested run is plain async), logs the
-    spawn/finish into the task's service-event log and returns the
-    subagent's final answer plus a one-line usage summary. Every failure
+    spawn/finish into the task's service-event log, counts the outcome
+    into the per-day project stats (`manager.stats`: one successful spawn
+    or one failure — the "enabled but never used" observability signal)
+    and returns the subagent's final answer plus a one-line usage
+    summary. Every failure
     mode — gate exhausted, model/network error, usage cap — comes back
     as a PLAIN tool result with an actionable explanation: the parent
     run must never crash because a subagent did.
@@ -567,6 +570,14 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
                 f"subagent finished ({requests} requests, "
                 f"{tokens} total tokens): {label}",
             )
+            # Observability: one successful spawn into the per-day project
+            # stats (.drcode/stats.json) — the "subagents enabled but never
+            # used" task-settings hint reads these totals. Best effort: a
+            # stats problem must not fail the delegation.
+            try:
+                deps.manager.stats.record_subagent_spawn()
+            except Exception:  # noqa: BLE001, S110 - statistics never fatal
+                pass
             summary = (
                 f"[subagent usage: {requests} requests, {tokens} tokens]"
                 if tokens or requests
@@ -587,6 +598,10 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
                 "subagent",
                 f"subagent failed: {type(e).__name__}: {e}",
             )
+            try:
+                deps.manager.stats.record_subagent_spawn(failed=True)
+            except Exception:  # noqa: BLE001, S110 - statistics never fatal
+                pass
             return (
                 f"The subagent failed ({type(e).__name__}: {e}). You can "
                 "retry the delegation (perhaps with a narrower brief) or "

@@ -159,10 +159,21 @@ class SettingsLayer(DrCodeState):
         the time this executes, so pushing the dialog is safe."""
         if isinstance(self.screen, CommandPalette):
             return
+        from ..settings import SubagentUsageSummary
         from .task_settings_dialog import TaskSettingsDialog
 
+        # delegate_research usage counts for the "enabled but never used"
+        # hint — read once at open time (they cannot change mid-dialog).
+        try:
+            total, recent = self.manager.stats.subagent_usage()
+            usage: SubagentUsageSummary | None = SubagentUsageSummary(
+                total_spawns=total, recent_spawns=recent
+            )
+        except Exception:  # noqa: BLE001 - a stats problem must not block settings
+            usage = None
+
         self.push_screen(
-            TaskSettingsDialog(self.settings),
+            TaskSettingsDialog(self.settings, subagent_usage=usage),
             self._task_settings_done,
         )
 

@@ -859,16 +859,36 @@ class SettingsHint:
     fix_label: str = ""
 
 
+@dataclass(frozen=True)
+class SubagentUsageSummary:
+    """delegate_research usage counts fed into :func:`task_settings_hints`
+    (None = the caller has no stats handy — no hint is produced). Built
+    from the per-day project stats (`StatsStore.subagent_usage`), NEVER
+    from settings.json — this is usage telemetry, not a preference.
+
+    `total_spawns` counts every successful spawn ever recorded;
+    `recent_spawns` the last `recent_days` UTC days (today included).
+    """
+
+    total_spawns: int = 0
+    recent_spawns: int = 0
+    recent_days: int = 14
+
+
 def task_settings_hints(
-    draft: ProjectSettings, *, git_available: bool
+    draft: ProjectSettings,
+    *,
+    git_available: bool,
+    subagent_usage: SubagentUsageSummary | None = None,
 ) -> list[SettingsHint]:
     """The single source of the coupling rules between the task-management
     settings — every combination the UI/startup warnings must tell the
     user about, in one function, so the dialog and future warning wiring
     can never diverge.
 
-    Pure: reads `draft` (and the git availability of the project), never
-    mutates it; fixes are separate callables the user opts into.
+    Pure: reads `draft` (and the git availability of the project plus the
+    optional subagent-usage counts), never mutates it; fixes are separate
+    callables the user opts into.
     """
     hints: list[SettingsHint] = []
     isolated = draft.task_isolation is TaskIsolation.WORKTREE
@@ -964,6 +984,41 @@ def task_settings_hints(
                 ),
             )
         )
+
+    # -- subagents enabled but never used --------------------------------------
+    # Pure observability: subagents_coder/subagents_researcher > 0 with a
+    # zero delegation count means the parent agents do all the reading
+    # themselves (the drcode-bench 119-task run had the slots on and ZERO
+    # calls, noticed only by grepping the transcript archive). No fix —
+    # the user decides whether to turn the slots off or prompt harder.
+    if draft.subagents_coder > 0 or draft.subagents_researcher > 0:
+        usage = subagent_usage
+        if usage is not None and usage.total_spawns == 0:
+            hints.append(
+                SettingsHint(
+                    severity="info",
+                    text=(
+                        "Subagents: enabled (coder: "
+                        f"{draft.subagents_coder}, researcher: "
+                        f"{draft.subagents_researcher}), but delegate_research "
+                        "has NEVER fired — the agents read everything in "
+                        "their own context."
+                    ),
+                )
+            )
+        elif usage is not None and usage.recent_spawns == 0:
+            hints.append(
+                SettingsHint(
+                    severity="info",
+                    text=(
+                        "Subagents: enabled (coder: "
+                        f"{draft.subagents_coder}, researcher: "
+                        f"{draft.subagents_researcher}), but delegate_research "
+                        f"has not been used in the last {usage.recent_days} "
+                        f"days (total spawns ever: {usage.total_spawns})."
+                    ),
+                )
+            )
 
     # -- parked fields under isolation off ------------------------------------
     if not isolated and draft.isolation_start_branch:

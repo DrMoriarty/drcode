@@ -28,6 +28,14 @@ What is counted and when:
   expressible as a task status (the resolver runs while the task is
   parked), so it is measured directly around the resolver round in
   ``core/pipeline_resolver.py`` and accumulated on ``task.resolver_seconds``.
+- ``subagent_spawns`` / ``subagent_failures`` — observability of the
+  read-only subagents (``delegate_research``): a SUCCESSFUL nested spawn
+  counts one ``subagent_spawns`` (recorded next to the "subagent finished"
+  service event in ``subagents.py``), a failed one counts only
+  ``subagent_failures`` (next to "subagent failed"). Separated from the
+  user preferences (``settings.json``) on purpose — this is usage telemetry,
+  not a preference. The task-settings hints read the totals to report
+  "subagents enabled but never used".
 
 The aggregates are folded into the day buckets AT THE MOMENT of the event
 (a transition, a completion, a round end), never recomputed from the task
@@ -85,6 +93,8 @@ class DayStats(BaseModel):
     testing_rounds: int = 0
     resolver_seconds: float = 0.0
     resolver_rounds: int = 0
+    subagent_spawns: int = 0
+    subagent_failures: int = 0
 
 
 class StatsStore:
@@ -207,7 +217,42 @@ class StatsStore:
                 setattr(day, f"{kind}_rounds", getattr(day, f"{kind}_rounds") + rounds)
             self._save_locked()
 
+    def record_subagent_spawn(self, *, failed: bool = False) -> None:
+        """A delegate_research delegation finished: a SUCCESSFUL spawn
+        counts one ``subagent_spawns``, a failed one counts only
+        ``subagent_failures`` (a cancelled run — the parent aborted —
+        counts neither). Attributed to TODAY (UTC)."""
+        with self._lock:
+            day = self._bucket()
+            if failed:
+                day.subagent_failures += 1
+            else:
+                day.subagent_spawns += 1
+            self._save_locked()
+
     # -- reads ---------------------------------------------------------------------
+
+    def subagent_usage(self, recent_days: int = 14) -> tuple[int, int]:
+        """Successful delegate_research spawns as ``(total, recent)`` —
+        the whole store and the last `recent_days` UTC days (today
+        included). The "enabled but never used" hint in the task-settings
+        dialog reads exactly this pair; failures are deliberately NOT
+        folded in (a failed delegation still proves the parent tried)."""
+        recent_days = max(recent_days, 1)
+        today = date.fromisoformat(_utc_today())
+        oldest = today - timedelta(days=recent_days - 1)
+        with self._lock:
+            total = 0
+            recent = 0
+            for key, day in self._days.items():
+                total += day.subagent_spawns
+                try:
+                    day_date = date.fromisoformat(key)
+                except ValueError:
+                    continue
+                if day_date >= oldest:
+                    recent += day.subagent_spawns
+            return total, recent
 
     def snapshot(self, days: int = 14) -> list[tuple[str, DayStats]]:
         """The last `days` UTC days, oldest first, zero-filled — the

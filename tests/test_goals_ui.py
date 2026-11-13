@@ -473,6 +473,10 @@ async def test_goal_capture_not_in_palette_and_header_links(app: DrCodeApp) -> N
         assert extra.index("✏") < extra.index("goal:")
         assert extra.index("✕") < extra.index("goal:")
         assert "[blue]change" not in extra
+        # The ✕ of the goal group sits at the head of the row and must not
+        # be confused with the per-dependency ✕ links — no dependencies
+        # here, so exactly one cross.
+        assert extra.count("✕") == 1
         # "unlink" survives only inside the click-action tag
         # (app.unlink_viewed_goal), never as the rendered label.
         assert "[red]unlink" not in extra

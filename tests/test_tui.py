@@ -3032,11 +3032,21 @@ async def test_project_model_dialog_form_and_apply(
             assert "Custom…" in prompts
             assert any(p.startswith("User default") for p in prompts)
             assert input_widget.placeholder == str(app.resolved_config(role).max_tokens)
-        # The tester's active slot is marked "(current)".
-        assert any(
-            "local-swap/small (current)" in str(prompt)
-            for prompt, _ in _pms_select(dialog, AgentRole.TESTER)._options
+        # The selected model carries NO marker — the Select's own field
+        # shows it — and the appended " (default)"/" (current)" words are
+        # gone for good: the user default is a single "▸" glyph plus a
+        # bold name instead (the tester's own user default is unset here,
+        # the coding one is the big model).
+        prompts_by_role = {
+            role: [str(prompt) for prompt, _ in _pms_select(dialog, role)._options]
+            for role in AgentRole
+        }
+        assert all(
+            "(current)" not in prompt and "(default)" not in prompt
+            for prompts in prompts_by_role.values()
+            for prompt in prompts
         )
+        assert "▸   local-swap/qwen3-coder-30b" in prompts_by_role[AgentRole.CODING]
 
         # Edit the tester: switch to the big catalog model and set an
         # override. Nothing is persisted while editing.
@@ -3055,6 +3065,123 @@ async def test_project_model_dialog_form_and_apply(
         data = json.loads((project_root / ".drcode" / "drcode.json").read_text())
         assert data["models"]["tester"] == "local-swap/qwen3-coder-30b"
         assert settings_store.load().role_max_tokens == {"tester": 24576}
+
+
+async def test_project_model_dialog_marks_default_and_changed_fields(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The user-level default model is marked by a single "▸" glyph and a
+    bold name inside the row's marker gutter (no " (default)" suffix that
+    wrapped the narrow rows), a favorite default carries both marks
+    ("▸ ★ name"), and every field whose draft value differs from the
+    persisted one gets the orange "changed" tint — the same signal as the
+    Task-settings dialog — including the max_tokens Inputs, which are
+    re-evaluated on each keystroke."""
+    from textual.widgets._select import SelectCurrent
+
+    from drcode.providers import (
+        ModelEntry,
+        ModelRef,
+        Provider,
+        UserModelsConfig,
+        UserModelsStore,
+    )
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import (
+        DEFAULT_MARKER,
+        ProjectModelSettingsDialog,
+    )
+
+    catalog = UserModelsConfig(
+        providers=[
+            Provider(
+                name="local-swap",
+                base_url="http://localhost:8080/v1",
+                models=[
+                    ModelEntry(id="plain-def"),
+                    ModelEntry(id="fav-def", favorite=2),
+                    ModelEntry(id="plain"),
+                ],
+            )
+        ]
+    )
+    catalog.defaults[AgentRole.TESTER] = [
+        ModelRef(provider="local-swap", model="plain-def")
+    ]
+    UserModelsStore().save(catalog)
+    store = ProjectSettingsStore(project_root)
+    store.save(store.load().model_copy(update={"role_max_tokens": {"coding": 4096}}))
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+
+        prompts = {
+            str(prompt): prompt
+            for prompt, _ in _pms_select(dialog, AgentRole.TESTER)._options
+        }
+        # A plain default: the marker in the gutter, then the glyph column
+        # (blank), then the bold name.
+        default_prompt = prompts[f"{DEFAULT_MARKER}   local-swap/plain-def"]
+        assert default_prompt.plain == "▸   local-swap/plain-def"
+        assert [(sp.start, sp.end, str(sp.style)) for sp in default_prompt.spans] == [
+            (4, len(default_prompt.plain), "bold")
+        ]
+        # A non-default favorite keeps the plain two-space gutter.
+        assert "  ★ local-swap/fav-def" in prompts
+        assert "    local-swap/plain" in prompts
+        # The names line up: every row starts with the same 4-character
+        # gutter (the default marker column + the favorite glyph column),
+        # so marking a default costs no extra width before the name.
+        catalog_rows = [p.plain for p in prompts.values() if isinstance(p, Text)]
+        assert sorted(catalog_rows) == [
+            "    local-swap/plain",
+            "  ★ local-swap/fav-def",
+            "▸   local-swap/plain-def",
+        ]
+        assert all(row[2:].startswith(("  ", "★ ", "• ", "✚ ")) for row in catalog_rows)
+        # ...and the name itself always starts at the same offset.
+        assert all(row[4:].startswith("local-swap/") for row in catalog_rows)
+
+        # Nothing is changed yet on mount.
+        for role in AgentRole:
+            assert not _pms_select(dialog, role).has_class("changed")
+        assert not _pms_input(dialog, AgentRole.TESTER).has_class("changed")
+
+        # Changing a model tints the SELECT's inner SelectCurrent (a tint
+        # on the Select itself is hidden behind it — the historical bug
+        # this test pins).
+        _pms_select(dialog, AgentRole.TESTER).value = "local-swap/plain"
+        await pilot.pause()
+        select = _pms_select(dialog, AgentRole.TESTER)
+        assert select.has_class("changed")
+        current = select.query_one(SelectCurrent)
+        assert (
+            current.background_colors[1]
+            != (
+                _pms_select(dialog, AgentRole.CODING)
+                .query_one(SelectCurrent)
+                .background_colors[1]
+            )
+        )
+
+        # Typing an override tints the Input live (it had no marker at all
+        # before), and clearing it back to the saved value un-tints it.
+        tokens = _pms_input(dialog, AgentRole.CODING)
+        assert not tokens.has_class("changed")
+        tokens.value = "8192"
+        await pilot.pause()
+        assert tokens.has_class("changed")
+        tokens.value = "4096"
+        await pilot.pause()
+        assert not tokens.has_class("changed")
+        tokens.value = ""
+        await pilot.pause()
+        assert tokens.has_class("changed")
 
 
 async def test_project_model_dialog_slot_missing_from_user_catalog(
@@ -3150,8 +3277,8 @@ async def test_project_model_dialog_favorites_sorted_first(
             "  ✚ local-swap/fav3",
         ]
         assert plain[4:6] == [
-            "  local-swap/plain-a",
-            "  local-swap/plain-b",
+            "    local-swap/plain-a",
+            "    local-swap/plain-b",
         ]
         glyphs = [
             (p.spans[0].style, p.plain[2:4])
@@ -3164,10 +3291,11 @@ async def test_project_model_dialog_favorites_sorted_first(
             ("bold yellow", "★ "),
             ("bold cyan", "✚ "),
         ]
-        # The tail options stay plain strings, unindented (the slot here
-        # is unset, so "User default" is marked "(current)").
+        # The tail options stay plain strings, unindented; the unset slot
+        # is NOT marked " (current)" — "User default" carries no marker
+        # (the Select's field is the "current" indicator).
         assert plain[-2] == "Custom…"
-        assert plain[-1].startswith("User default")
+        assert plain[-1] == "User default"
 
 
 async def test_project_model_dialog_custom_slot_without_saved_entry(
@@ -3326,7 +3454,7 @@ async def test_project_model_dialog_custom_model_flow(
         assert isinstance(app.screen, ProjectModelSettingsDialog)
         assert load_project_custom_models(project_root) == {}
         assert _pms_select(dialog, AgentRole.RESOLVER).value == "custom"
-        assert "Custom: free-m (current)" in [
+        assert "Custom: free-m" in [
             str(prompt)
             for prompt, _ in _pms_select(dialog, AgentRole.RESOLVER)._options
         ]

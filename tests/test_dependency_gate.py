@@ -18,10 +18,11 @@ from typing import cast
 import pytest
 from pydantic_ai import capture_run_messages
 from pydantic_ai.models.test import TestModel
-from textual.widgets import Static, TextArea
+from textual.widgets import Button, Input, ListView, Static, TextArea
 
 from drcode.models import Task, TaskStatus
 from drcode.tui.app import DrCodeApp
+from drcode.tui.confirm_dialog import ConfirmDialog
 from drcode.tui.inputs import DepsInput
 from drcode.tui.sidebar import TaskItem
 
@@ -431,3 +432,222 @@ def test_set_task_dependencies_replaces_and_restricts(
 
     with pytest.raises(ValueError, match="unknown task id"):
         _set_task_dependencies(deps, "ffffffff", [])
+
+
+# -- TUI: Settings palette composition ----------------------------------------------
+
+
+async def test_palette_has_no_dependency_provider(app: DrCodeApp) -> None:
+    """Dependency management lives entirely on the task header: attaching
+    via the "+" picker / the form (`ctrl+g`), removal via the red ✕ with
+    its confirmation (the force-start). The Settings palette carries no
+    dependency provider at all."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        viewed = app.manager.create("viewed", "x")
+        dep = app.manager.create("candidate", "x")
+        app.manager.set_dependencies(viewed.id, [dep.id])
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        providers = {getattr(p, "__name__", "") for p in app.COMMANDS}
+        assert "DependencyCommandsProvider" not in providers
+
+        # Both header-driven actions are kept (the header "+" and ✕ reuse
+        # them) — only the palette entries are gone.
+        assert callable(app.action_add_dependency)
+        assert callable(app.action_remove_dependency)
+
+
+async def test_header_dependency_link_opens_picker_and_links(
+    app: DrCodeApp,
+) -> None:
+    """The second header row carries a cyan "+" for queued/held tasks: it
+    opens the picker over the non-COMPLETED tasks (minus the viewed one
+    and the existing deps), and picking a row adds the depends_on edge
+    through manager.set_dependencies + logs the service event."""
+    from drcode.models import TaskKind
+    from drcode.tui.deps_picker import DependencyPicker
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        viewed = app.manager.create("viewed", "x")
+        # A COMPLETED task must never be a candidate: it can't block
+        # anything, so offering it would be a dead entry.
+        done = app.manager.create("done", "x", kind=TaskKind.RESEARCH)
+        app.manager.mark_done(done.id)
+        assert done.status is TaskStatus.COMPLETED
+        live = app.manager.create("live", "x")
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "app.pick_dependency" in extra
+        assert "+" in extra
+
+        app.action_pick_dependency()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DependencyPicker)
+        listing = screen.query_one("#deps-picker-list", ListView)
+        rows = [w for w in listing.children if isinstance(w, TaskItem)]
+        ids = {w.task_id for w in rows}
+        assert ids == {live.id}, "only the unfinished non-dep task is offered"
+        assert done.id not in ids and viewed.id not in ids
+
+        # Enter in the filter takes the first row (the type-then-enter path).
+        screen.query_one("#deps-picker-input", Input).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, DependencyPicker)
+        assert app.manager.get(viewed.id).depends_on == [live.id]
+        assert any(
+            f"#{live.id}" in e.text and "Dependency" in e.text
+            for e in app.manager.get(viewed.id).events
+        ), [e.text for e in app.manager.get(viewed.id).events]
+        # The row now lists the dependency AND keeps the "+" (add another).
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "depends on:" in extra and f"#{live.id}" in extra
+        assert "app.pick_dependency" in extra
+
+
+async def test_header_dependency_link_only_for_editable_statuses(
+    app: DrCodeApp,
+) -> None:
+    """The "+" obeys the _can_edit_dependencies gate: QUEUED and HOLD
+    show it, every other status (here TESTING, i.e. "already under way")
+    renders no dependency fragment at all."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        task = app.manager.create("viewed", "x")
+        app.manager.create("other", "x")
+        app.view_task(task.id)
+        await pilot.pause()
+        assert "app.pick_dependency" in str(
+            app.query_one("#task-status-extra", Static).content
+        )
+
+        app.manager.set_hold(task.id, on=True)
+        app.refresh_task_status()
+        await pilot.pause()
+        assert "app.pick_dependency" in str(
+            app.query_one("#task-status-extra", Static).content
+        )
+        assert task.status is TaskStatus.HOLD
+
+        app.manager.set_hold(task.id, on=False)
+        app.manager.mark_done(task.id)  # → TESTING (a feature task)
+        assert task.status is TaskStatus.TESTING
+        app.refresh_task_status()
+        await pilot.pause()
+        assert "app.pick_dependency" not in str(
+            app.query_one("#task-status-extra", Static).content
+        )
+
+
+# -- TUI: the per-dependency ✕ of the task header ------------------------------------
+
+
+async def test_header_dependency_remove_link_confirmed_force_start(
+    app: DrCodeApp,
+) -> None:
+    """Every listed dependency of a queued task carries its own red ✕
+    (the `app.remove_viewed_dependency('<id>')` link), next to that
+    dependency's `#id`. The click never acts directly: it opens a yes/no
+    confirmation, a decline changes nothing, and only an explicit "yes"
+    drops exactly that id from `depends_on` and logs the manual override
+    (the force-start)."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        a = app.manager.create("first", "do a")
+        b = app.manager.create("second", "do b")
+        viewed = app.manager.create("viewed", "x")
+        app.manager.set_dependencies(viewed.id, [a.id, b.id])
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        # One ✕ per dependency, each carrying the id it belongs to...
+        for dep in (a.id, b.id):
+            assert f"app.remove_viewed_dependency('{dep}')" in extra, extra
+        assert extra.count("✕") == 2
+        # ...and each drawn right after its own #id, before the next one
+        # (so the ✕ the user aims at belongs to that dependency).
+        open_a = extra.index(f"app.open_task('{a.id}')")
+        remove_a = extra.index(f"app.remove_viewed_dependency('{a.id}')")
+        open_b = extra.index(f"app.open_task('{b.id}')")
+        remove_b = extra.index(f"app.remove_viewed_dependency('{b.id}')")
+        assert open_a < remove_a < open_b < remove_b
+
+        # The click opens the confirmation — nothing is changed yet.
+        app.action_remove_viewed_dependency(a.id)
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ConfirmDialog)
+        assert app.manager.get(viewed.id).depends_on == [a.id, b.id]
+
+        # Decline: the task keeps both dependencies and no event is logged.
+        dialog.query_one("#cf-no", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, ConfirmDialog)
+        assert app.manager.get(viewed.id).depends_on == [a.id, b.id]
+        assert not any("Manual override" in e.text for e in viewed.events)
+
+        # Accept: exactly the clicked id is dropped, the override is
+        # logged and the pipeline re-advances (the task is eligible).
+        app.action_remove_viewed_dependency(a.id)
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmDialog)
+        app.screen.query_one("#cf-yes", Button).press()
+        await pilot.pause()
+        assert app.manager.get(viewed.id).depends_on == [b.id]
+        assert any(
+            f"Manual override: dependency #{a.id} removed" in e.text
+            for e in app.manager.get(viewed.id).events
+        ), [e.text for e in app.manager.get(viewed.id).events]
+        # The header no longer offers the removed dependency's ✕.
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert f"app.remove_viewed_dependency('{a.id}')" not in extra
+        assert f"app.remove_viewed_dependency('{b.id}')" in extra
+
+
+async def test_header_dependency_remove_link_only_for_editable_statuses(
+    app: DrCodeApp,
+) -> None:
+    """The ✕ obeys the _can_edit_dependencies gate: a queued and a held
+    task show it, an ACTIVE/TESTING/COMPLETED task renders the dependency
+    list read-only (the ids stay clickable, no removal link)."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        dep = app.manager.create("dep", "x")
+        task = app.manager.create("viewed", "x")
+        app.manager.set_dependencies(task.id, [dep.id])
+        app.view_task(task.id)
+        await pilot.pause()
+        link = f"app.remove_viewed_dependency('{dep.id}')"
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert link in extra
+
+        app.manager.set_hold(task.id, on=True)
+        app.refresh_task_status()
+        await pilot.pause()
+        assert task.status is TaskStatus.HOLD
+        assert link in str(app.query_one("#task-status-extra", Static).content)
+
+        app.manager.set_hold(task.id, on=False)
+        task.status = TaskStatus.ACTIVE
+        app.manager.storage.save(task)
+        app.refresh_task_status()
+        await pilot.pause()
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert f"#{dep.id}" in extra, "the list stays visible, read-only"
+        assert link not in extra
+        assert "✕" not in extra
+
+        # The action itself is gated too: even fired by hand on a started
+        # task it neither mutates nor opens the confirmation.
+        app.action_remove_viewed_dependency(dep.id)
+        await pilot.pause()
+        assert not isinstance(app.screen, ConfirmDialog)
+        assert app.manager.get(task.id).depends_on == [dep.id]

@@ -16,13 +16,20 @@ dialog:
   model as "Custom: <model-id>", "Custom…" to enter a free-form model
   via the existing ModelSetupDialog, and "User default" to drop the
   project slot — the reset is available for EVERY role, including those
-  the old palette offered no reset for);
+  the old palette offered no reset for). The user-level default model of
+  a role is marked by a single ``▸`` glyph and a bold name in the row's
+  marker gutter; the currently selected model carries no marker at all
+  (the Select's own field shows it) — the old " (default)"/" (current)"
+  suffixes made the narrow rows wrap;
 - an "max_tokens" Input per role: empty = inherit (the catalog entry's
   cap or the flat-config default — the override key is removed), a
   value = a positive-integer override that beats the more general
   layers (``providers.resolve`` applies it last). A live hint warns
   when the value exceeds the role model's context window, and a static
   note explains why thinking models commonly need a raised budget;
+- both widgets are tinted orange ("changed") as soon as their draft
+  value differs from the persisted one — the same marker the
+  Task-settings dialog uses;
 - COMPACTION-only extras: a "request timeout" Input (seconds; empty =
   the OpenAI SDK default 600 s — a summarizer call prefills a
   multi-hundred-k-token transcript and may need a longer read window)
@@ -76,6 +83,12 @@ if TYPE_CHECKING:
 # are real option values (mirroring the project slot forms).
 _CUSTOM_NEW = "__custom__"
 _USER_DEFAULT = "__user_default__"
+
+# One-character marker of the user-level default model — it replaced the
+# " (default)" suffix (long catalog names wrapped in the narrow Select
+# rows). It sits in the two-column gutter every catalog row starts with,
+# so no row grows wider than before.
+DEFAULT_MARKER = "▸"
 
 _ROLE_TITLES: dict[AgentRole, str] = {
     AgentRole.CODING: "Coding",
@@ -200,9 +213,18 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     Select {
         width: 1fr;
     }
-    Select.changed {
-        /* Compact form styles removed the border this marker used to
-           color — tint the background instead (see DrCodeApp.CSS). */
+    # "Changed" marker (a field differing from the saved value), same
+    # orange tint as the Task-settings dialog: a border-tint is useless
+    # under the compact form styles (the border the signal used to color
+    # is gone), and a tint set on the Select itself is hidden behind the
+    # opaque SelectCurrent — it goes on that child, plus $warning text for
+    # terminals without truecolor. Inputs get the same treatment (they had
+    # no marker at all here, unlike the Task-settings dialog's Switch).
+    Select.changed > SelectCurrent {
+        background-tint: $warning 25%;
+        color: $warning;
+    }
+    Input.changed {
         background-tint: $warning 25%;
     }
     .pms-hint {
@@ -284,43 +306,55 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     # -- draft ---------------------------------------------------------------------
 
     def _model_options(self, role: AgentRole) -> list[tuple[Text | str, object]]:
-        """The model Select options of one role: catalog models
-        (as "provider/model" prompts — Select values must be hashable and
-        are the plain "provider/model" strings; the user-level default and
-        the effective slot are marked; sorted favorites-first — level 1,
-        then 2, then 3, then the non-favorites, the original order kept
-        within each group; a favorite carries its tier glyph, same shapes
-        and colors as the catalog table's Favorites column, followed by a
-        two-space indent on the non-favorites so the names align), the
-        saved/draft custom model, "Custom…" and "User default" (always —
-        the reset exists for every role)."""
+        """The model Select options of one role.
+
+        Catalog models (as "provider/model" prompts — Select values must be
+        hashable and are the plain "provider/model" strings) are sorted
+        favorites-first — level 1, then 2, then 3, then the non-favorites,
+        the original order kept within each group. A row is built as a
+        compact marker gutter followed by the name:
+
+        - a favorite carries its tier glyph, same shapes and colors as the
+          catalog table's Favorites column (``★ ``), non-favorites keep the
+          same two-space indent so the names align;
+        - the user-level default model of the role is marked with a single
+          ``▸`` in the gutter and a BOLD name (the old " (default)" suffix
+          made the narrow rows wrap); a favorite default gets both marks
+          (``▸ ★ name``). No word is ever appended to a name.
+
+        The effective slot is deliberately NOT marked: the Select's own
+        field already shows the selected value (the old " (current)" suffix
+        was pure noise). Then the saved/draft custom model, "Custom…" and
+        "User default" (always — the reset exists for every role)."""
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
         options: list[tuple[Text | str, object]] = []
-        catalog_options: list[tuple[int, str, object]] = []
+        # (tier rank, "provider/model", is user default) — 4 = not a
+        # favorite, sorts after the 1..3 tiers.
+        catalog_options: list[tuple[int, str, bool]] = []
         for provider in catalog.providers:
             for entry in provider.models:
                 ref = f"{provider.name}/{entry.id}"
-                label = ref
-                if user_default is not None and ref == str(user_default):
-                    label += " (default)"
-                if slot is not None and ref == str(slot):
-                    label += " (current)"
-                # 0 = not a favorite — sorts after the 1..3 tiers.
-                catalog_options.append((entry.favorite or 4, label, ref))
+                is_default = user_default is not None and ref == str(user_default)
+                catalog_options.append((entry.favorite or 4, ref, is_default))
         catalog_options.sort(key=lambda item: item[0])
-        for favorite, label, ref in catalog_options:
-            # ONLY the glyph carries the tier color (a span, not the base
-            # style — same rule as the catalog table and the chains
-            # dialog); the model name stays uncolored.
+        for favorite, ref, is_default in catalog_options:
+            # Fixed two-column gutter before the name: the default marker
+            # column ("▸ " or blank) and the favorite tier column ("★ " or
+            # blank), so every name starts at the same offset — marking a
+            # default widens nothing but the marker itself.
+            prompt = Text(f"{DEFAULT_MARKER} " if is_default else "  ")
             glyph = _FAVORITE_GLYPHS.get(favorite)
             if glyph is None:
-                prompt: Text | str = Text(f"  {label}")
+                prompt.append("  ")
             else:
-                prompt = Text("  ")
+                # ONLY the glyph carries the tier color (a span, not the
+                # base style — same rule as the catalog table and the
+                # chains dialog).
                 prompt.append(f"{glyph.plain} ", style=glyph.style)
-                prompt.append(label)
+            # The default's name is bold on top of the arrow marker.
+            prompt.append(ref, style="bold" if is_default else None)
             options.append((prompt, ref))
         if isinstance(slot, ModelRef) and str(slot) not in {
             value for _, value in options
@@ -333,19 +367,13 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             options.append((f"{slot} (not in user catalog)", str(slot)))
         custom = self._customs.get(role)
         if custom is not None:
-            label = f"Custom: {custom.model}"
-            if slot == "custom":
-                label += " (current)"
-            options.append((label, "custom"))
+            options.append((f"Custom: {custom.model}", "custom"))
         elif slot == "custom":
             # A "custom" slot whose saved custom_models[role] entry is
             # missing/invalid: same missing-value hazard as above.
             options.append(("Custom: <no saved model>", "custom"))
         options.append(("Custom…", _CUSTOM_NEW))
-        reset = "User default"
-        if slot is None:
-            reset += " (current)"
-        options.append((reset, _USER_DEFAULT))
+        options.append(("User default", _USER_DEFAULT))
         return options
 
     def _slot_value(self, role: AgentRole) -> object:
@@ -479,8 +507,17 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             select.value = self._slot_value(role)
         original_slot = load_project_model_slots(self._project_root).get(role)
         select.set_class(self._slots[role] != original_slot, "changed")
-        inp = self._tokens_input(role)
-        inp.set_class(
+        self._mark_tokens_changed(role)
+        self._render_hint(role)
+
+    def _mark_tokens_changed(self, role: AgentRole) -> None:
+        """The max_tokens Input's "changed" class: an override differing
+        from the saved one (set or cleared) is tinted, same marker as the
+        model Select — it must be re-evaluated on every keystroke, not only
+        with the model options. For the compaction role the request-timeout
+        input and the split switch are marked the same way (and the
+        timeout hint re-renders)."""
+        self._tokens_input(role).set_class(
             self._max_tokens[role] != self._saved_overrides.get(role.value),
             "changed",
         )
@@ -493,7 +530,6 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 self._split_giant != self._saved_split_giant, "changed"
             )
             self._render_timeout_hint()
-        self._render_hint(role)
 
     def _render_hint(self, role: AgentRole) -> None:
         text = self._tokens_input(role).value.strip()
@@ -585,6 +621,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 self._max_tokens[role] = int(text)
             else:
                 self._max_tokens[role] = None  # invalid: the hint says so
+            self._mark_tokens_changed(role)
             self._render_hint(role)
             return
         role = self._role_of_widget_id(event.input.id, "pms-timeout-")

@@ -206,9 +206,18 @@ class TaskStatusLayer(DrCodeState):
         - `#id ?` — an id that is not in the manager and has no branch
           (a stale entry; the gate treats it as satisfied).
 
-        Each id is a link that opens the dependency task. Empty string
-        when the task has no dependencies; `label` prefixes the list
-        ("deps: " on the first header row, "depends on: " on the second).
+        Each id is a link that opens the dependency task. For the
+        statuses where the gate is still editable (QUEUED / HOLD — the
+        ``_can_edit_dependencies`` gate) every single dependency is
+        followed by its own small red ✕: the click removes THAT
+        dependency (the ``action_remove_viewed_dependency`` link asks for
+        a confirmation first — the removal is a force-start). The ✕ hugs
+        its own `#id`, so the pair reads as one unit and the right one is
+        dropped; for every other status the list stays read-only.
+
+        Empty string when the task has no dependencies; `label` prefixes
+        the list ("deps: " on the first header row, "depends on: " on the
+        second).
 
         The whole fragment is tinted cyan (the dependency-list color of
         the second header row, distinct from the magenta goal and the
@@ -217,6 +226,9 @@ class TaskStatusLayer(DrCodeState):
         if not task.depends_on:
             return ""
         gate = self._dep_gate.get(task.id, {})
+        # Same gate as the "+" link of the group: only a task that has not
+        # started yet can have its dependencies edited.
+        editable = self._can_edit_dependencies(task)
         bits: list[str] = []
         for dep in task.depends_on:
             # Each #id marker is itself a link to the dependency task (ids
@@ -224,18 +236,30 @@ class TaskStatusLayer(DrCodeState):
             link = f"[@click=app.open_task('{dep.lower()}')]#{dep.lower()}[/]"
             dep_task = self.manager.tasks.get(dep)
             if gate.get(dep) == "unmerged":
-                bits.append(f"[red]{link}⇴[/]")
+                bit = f"[red]{link}⇴[/]"
             elif dep_task is not None and dep_task.status is TaskStatus.COMPLETED:
-                bits.append(f"[green]{link}✓[/]")
+                bit = f"[green]{link}✓[/]"
             elif dep_task is not None:
-                bits.append(f"[yellow]{link}…[/]")
+                bit = f"[yellow]{link}…[/]"
             else:
-                bits.append(f"[dim]{link}?[/]")
+                bit = f"[dim]{link}?[/]"
+            if editable:
+                # The per-dependency ✕, modeled on the ✏/✕ icon pair of the
+                # goal group: it carries the id in the click action, so a
+                # click always targets THIS dependency, and it is drawn in
+                # the deps group's cyan context but red on its own.
+                bit += (
+                    f" [@click=app.remove_viewed_dependency('{dep.lower()}')]"
+                    "[red]✕[/][/]"
+                )
+            bits.append(bit)
         return f"[cyan]{label}{' '.join(bits)}[/]"
 
     def _task_status_extra(self, task: Task) -> str:
         """The second header row (under the kind/id/date/status line):
-        the full dependency list with its gate colors, the goal link
+        the full dependency list with its gate colors — each of them
+        followed by its own ✕ removal link for a queued/held task — plus
+        the cyan "+" picker link (same statuses), the goal link
         with its ✏/✕ icon fragments (or the "+ assign" picker
         link when unattached), the GitHub issue number, the
         worktree branch (clickable — copies the branch name), the
@@ -247,6 +271,18 @@ class TaskStatusLayer(DrCodeState):
         deps = self._dependency_status_part(task, label="depends on: ")
         if deps:
             bits.append(deps)
+        # The "+" of the dependency group: only for the statuses where the
+        # gate can still change (queued/held — the _can_edit_dependencies
+        # gate), and rendered both with and without existing dependencies
+        # (an unconditional "add another one" right after the list). Cyan,
+        # the color of the group it belongs to.
+        if self._can_edit_dependencies(task):
+            if not deps:
+                # A bare "+" would read as noise at the head of the row:
+                # label the empty state the way the list is labelled.
+                bits.append("[@click=app.pick_dependency][cyan]depends on: +[/][/]")
+            else:
+                bits.append("[@click=app.pick_dependency][cyan]+[/][/]")
         # Goal link — a task attached to a product goal opens the
         # GoalScreen focused on it, with the ✏ (re-assign to another
         # goal via the picker) and ✕ (detach) icon buttons before the

@@ -322,6 +322,18 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
     return prompts
 
 
+def _parse_stamp(raw: Any) -> datetime | None:
+    """Parse a serialized timestamp (ISO string or datetime); None on junk."""
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    if isinstance(raw, datetime):
+        return raw
+    return None
+
+
 def _message_time(msg: dict[str, Any]) -> datetime | None:
     """Timestamp of a serialized ModelMessage (None when not recorded).
 
@@ -336,38 +348,29 @@ def _message_time(msg: dict[str, Any]) -> datetime | None:
     with a fresh top-level timestamp (the moment the retried/resumed
     attempt actually runs) while leaving UserPromptPart.timestamp at the
     moment the prompt was typed. Trusting the top-level stamp would drop
-    the user's message below service events that happened in between."""
-    raw = msg.get("timestamp")
-    top: datetime | None = None
-    if isinstance(raw, str):
-        try:
-            top = datetime.fromisoformat(raw)
-        except ValueError:
-            top = None
-    elif isinstance(raw, datetime):
-        top = raw
+    the user's message below service events that happened in between.
+
+    When a request carries SEVERAL user-prompt parts (after a compaction
+    pydantic-ai folds the summary part into the original-prompt request on
+    resume), the EARLIEST prompt stamp wins: the message's chronological
+    identity is the moment of the original prompt — the summary is a later
+    appendage, and its stamp must not re-date the description below the
+    service events that happened in between (task cca920d5)."""
+    top = _parse_stamp(msg.get("timestamp"))
     is_request = msg.get("kind") == "request" or msg.get("role") == "request"
     stamps: list[datetime] = []
-    prompt_stamp: datetime | None = None
+    prompt_stamps: list[datetime] = []
     for part in msg.get("parts", []):
         if not isinstance(part, dict):
             continue
-        part_raw = part.get("timestamp")
-        stamp: datetime | None = None
-        if isinstance(part_raw, str):
-            try:
-                stamp = datetime.fromisoformat(part_raw)
-            except ValueError:
-                stamp = None
-        elif isinstance(part_raw, datetime):
-            stamp = part_raw
+        stamp = _parse_stamp(part.get("timestamp"))
         if stamp is None:
             continue
         stamps.append(stamp)
         if is_request and part.get("part_kind") == "user-prompt":
-            prompt_stamp = stamp
-    if is_request and prompt_stamp is not None:
-        return prompt_stamp
+            prompt_stamps.append(stamp)
+    if is_request and prompt_stamps:
+        return min(prompt_stamps)
     if top is not None:
         return top
     return max(stamps) if stamps else None
@@ -399,18 +402,26 @@ def extract_display(
                 if part.get("part_kind") == "user-prompt":
                     content = part.get("content")
                     if isinstance(content, str) and content:
+                        # Each user-prompt part is stamped at its OWN moment,
+                        # not the message time: a merged request (original
+                        # prompt + compaction summary folded in by pydantic-ai
+                        # on resume) must render the description at the task's
+                        # creation time and the summary at the compaction time
+                        # (task cca920d5). Legacy transcripts without part
+                        # stamps fall back to the message time.
+                        part_at = _parse_stamp(part.get("timestamp")) or at
                         if content.startswith(COMPACTION_SUMMARY_PREFIX):
                             # Synthetic compaction summary, not a user message:
                             # rendered as its own "context compacted" block.
                             out.append(
                                 (
-                                    at,
+                                    part_at,
                                     "summary",
                                     content[len(COMPACTION_SUMMARY_PREFIX) :].strip(),
                                 )
                             )
                         else:
-                            out.append((at, "user", content))
+                            out.append((part_at, "user", content))
             continue
         for part in msg.get("parts", []):
             kind = part.get("part_kind")

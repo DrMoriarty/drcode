@@ -9,7 +9,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic_ai.exceptions import ModelRetry
@@ -50,7 +50,7 @@ from drcode.agent import (
     unwrap_summary_envelope,
 )
 from drcode.config import Config
-from drcode.models import TaskKind, TaskStatus, VerificationStatus
+from drcode.models import Task, TaskEvent, TaskKind, TaskStatus, VerificationStatus
 from drcode.settings import GitPolicy
 from drcode.task_manager import TaskManager
 from drcode.tools import PathViolation
@@ -291,6 +291,33 @@ def test_extract_display_resumed_request_uses_prompt_stamp() -> None:
     assert [(at, role) for at, role, _ in out] == [(typed, "user")]
 
 
+def test_message_time_merged_prompt_takes_earliest_stamp() -> None:
+    """After a compaction pydantic-ai folds the summary UserPromptPart into
+    the original-prompt request on resume; the message's chronological
+    identity stays the ORIGINAL prompt's stamp — the summary's stamp (the
+    compaction moment) must not re-date the description below the service
+    events that happened in between (task cca920d5)."""
+    typed = datetime(2026, 1, 1, 12, 14, 47, tzinfo=UTC)
+    compacted = datetime(2026, 1, 1, 17, 32, 50, tzinfo=UTC)
+    merged = {
+        "kind": "request",
+        "timestamp": compacted.isoformat(),
+        "parts": [
+            {
+                "part_kind": "user-prompt",
+                "content": "fix the bug",
+                "timestamp": typed.isoformat(),
+            },
+            {
+                "part_kind": "user-prompt",
+                "content": f"{COMPACTION_SUMMARY_PREFIX}\n\nsummary body",
+                "timestamp": compacted.isoformat(),
+            },
+        ],
+    }
+    assert _message_time(merged) == typed
+
+
 def test_message_time_fallbacks() -> None:
     # No top-level timestamp (legacy transcripts): the latest part stamp wins.
     legacy = {
@@ -351,6 +378,70 @@ def test_extract_display_summary_message() -> None:
     )
     out = extract_display(data)
     assert [(role, text) for _, role, text in out] == [("summary", "the summary body")]
+
+
+def test_extract_display_merged_summary_keeps_own_stamp() -> None:
+    """In a merged request (original prompt + compaction summary folded in
+    by pydantic-ai on resume) each display entry is stamped at its own
+    part's moment: the description at the task's creation time, the summary
+    at the compaction time — so a timeline sort puts the description first
+    with the service events between (task cca920d5)."""
+    typed = datetime(2026, 1, 1, 12, 14, 47, tzinfo=UTC)
+    compacted = datetime(2026, 1, 1, 17, 32, 50, tzinfo=UTC)
+    merged = ModelRequest(
+        parts=[
+            UserPromptPart(content="fix the bug", timestamp=typed),
+            UserPromptPart(
+                content=f"{COMPACTION_SUMMARY_PREFIX}\n\nsummary body",
+                timestamp=compacted,
+            ),
+        ],
+        timestamp=compacted,
+    )
+    out = extract_display(serialize_messages([merged]))
+    assert out == [
+        (typed, "user", "fix the bug"),
+        (compacted, "summary", "summary body"),
+    ]
+
+
+def test_timeline_merged_summary_orders_description_first() -> None:
+    """End-to-end ordering regression (task cca920d5): prompt typed at T0,
+    service events between T0 and the compaction at T1 — the timeline must
+    show the description first, the events in between, the summary at T1."""
+    from drcode.tui.chat_timeline import ChatTimelineLayer
+
+    t0 = datetime(2026, 1, 1, 12, 14, 47, tzinfo=UTC)
+    t_event = datetime(2026, 1, 1, 12, 15, 26, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 17, 32, 50, tzinfo=UTC)
+    task = Task(title="t")
+    task.messages = serialize_messages(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="fix the bug", timestamp=t0),
+                    UserPromptPart(
+                        content=f"{COMPACTION_SUMMARY_PREFIX}\n\nsummary body",
+                        timestamp=t1,
+                    ),
+                ],
+                timestamp=t1,
+            )
+        ]
+    )
+    task.events = [
+        TaskEvent(at=t_event, kind="system", text="event one"),
+        TaskEvent(at=t1.replace(second=51), kind="system", text="event two"),
+    ]
+
+    class _Stub:
+        _consumed_prompts: ClassVar[dict[str, Any]] = {}
+        _format_event = staticmethod(ChatTimelineLayer._format_event)
+
+    timeline = ChatTimelineLayer._build_task_timeline(cast(Any, _Stub()), task, task.id)
+    roles = [role for _, _, role, _ in timeline]
+    assert roles == ["user", "event", "summary", "event"]
+    assert [at for at, _, _, _ in timeline] == [t0, t_event, t1, t1.replace(second=51)]
 
 
 def test_extract_display_reasoning_flushed_before_tool_call() -> None:

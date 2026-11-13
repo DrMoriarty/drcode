@@ -10,12 +10,10 @@ Modules:
 - ``settings`` — the Settings palette, its sub-menus, main-menu entry
   providers and per-preference option providers;
 - ``models`` — per-role model pickers;
-- ``themes`` — the theme picker;
-- ``merge`` — the merge-conflict screen entry.
+- ``themes`` — the theme picker.
 """
 
 from .base import CommandEntry, CommandListProvider, SpacedCommandList
-from .merge import MergeCommandsProvider
 from .models import ProjectModelSettingsCommandProvider, role_model_options_provider
 from .settings import (
     WORKFLOW_PRESETS,
@@ -61,7 +59,6 @@ __all__ = [
     "GitResearchOptionsProvider",
     "GitTesterOptionsProvider",
     "IsolationOptionsProvider",
-    "MergeCommandsProvider",
     "ModelCatalogCommandProvider",
     "ModelSettingsCommandProvider",
     "ModelSettingsPalette",

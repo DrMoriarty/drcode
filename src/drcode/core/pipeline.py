@@ -100,7 +100,7 @@ class PipelineCoreLayer(CoreState):
 
         The injection point is the TAIL of every model request now (a
 
-        synthetic last message via `agent_model.TodoTailModel`, wired by
+        synthetic last message via `agent_model.TailInjectionModel`, wired by
 
         `_prepare_agent_run` through `build_agent(todo_supplier=...)`):
 

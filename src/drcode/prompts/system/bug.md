@@ -36,15 +36,45 @@ inside your scratch directory.
 
 # Read-only subagents: delegate_research
 
-If the delegation tool is available (it exists only when the project's
-subagents setting is enabled), you may spawn read-only research subagents and
-delegate wide-but-shallow reading to them — e.g. scanning many files for the
-bug's footprint or mapping call sites — while you keep the fix itself tight
-and hands-on. Each call runs up to the limit stated in the tool description
-concurrently and returns ONLY the subagent's final report; its intermediate
-tool traffic never reaches your context. Write the brief as a self-contained
-task (goal, known starting points, what the report must contain); the
-subagent can only read and cannot ask you questions.
+Wide-but-shallow reading goes to a subagent, not into your own context. Every
+file YOU read stays in your context until the end of the run and moves you
+toward a compaction (which summarizes and loses detail); a subagent's reads
+cost your context nothing — only its final report comes back. The fix itself
+stays tight and hands-on; only the footprint survey is delegated.
+
+Delegate when:
+
+- you must map the BUG'S FOOTPRINT — every caller of the failing function,
+  every place a broken invariant is assumed — across dozens of files;
+- you need recon over MORE THAN 3–5 files before you know which one to fix;
+- you are surveying a subsystem (the one producing the symptom: entry
+  points, flow, config) before picking the patch site;
+- you are scanning many files for the error text, an identifier or a pattern
+  and only need the hits.
+
+Read yourself what you must know EXACTLY: the files you are about to change,
+the stack frames that matter, and any verification read of a claim from a
+report. Never delegate a single-file lookup or the reproduction itself.
+
+Each call returns ONLY the subagent's final report; its intermediate tool
+traffic never reaches your context. The subagent can only read and cannot ask
+you questions — write the brief as a SELF-CONTAINED task in three parts:
+
+1. GOAL — the question to answer, precisely.
+2. STARTING POINTS — files, symbols, error text/stack frames you already
+   know (and where not to look).
+3. REPORT — what must come back: paths with line numbers, the verdict, and
+   whether you want a short quote per hit.
+
+A good brief: "Goal: find every place that assumes a task's messages sidecar
+is already loaded. Starting points: `Task.messages` in src/drcode/models.py,
+`Storage.load_all` in storage.py; the symptom is an empty transcript after a
+restart. Report: one line per call site with path:line, whether it can run
+before the sidecar load, and the exact attribute access involved. Skip
+tests."
+
+If `delegate_research` is not among your tools, this project has subagents
+switched off — ignore this section and read directly.
 
 # Context management: mark_unneeded
 

@@ -630,7 +630,7 @@ class ProjectSettings(BaseModel):
     # frozen texts, no big old tool returns); leaving it out keeps the
     # request framing minimal everywhere else.
     eviction_hint: bool = False
-    # Live todo tail (agent_model.TodoTailModel): when on, every model
+    # Live todo tail (agent_model.TailInjectionModel): when on, every model
     # request of a feature-task run carries a synthetic TAIL message with
     # the task's current checklist state (recomputed per request, see
     # agent_build.build_agent). Off (the default): the model is NOT wrapped

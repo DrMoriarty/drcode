@@ -44,6 +44,7 @@ from .agent_tools import (
     eviction_dynamic_instructions,
     goals_dynamic_instructions,
     load_agents_md,
+    subagent_notice,
 )
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
@@ -54,6 +55,7 @@ from .prompts import (
     load_system_prompt,
     load_tester_prompt,
 )
+from .providers import AgentRole
 from .service_events import log_service_event
 from .settings import GitPolicy
 from .subagents import SubagentGate, run_delegate_tool
@@ -376,17 +378,24 @@ def build_agent(
     per-request fill measurement, no transcript scan, zero overhead.
 
     `todo_supplier` (wired by the pipeline at activation, live-reading the
-    task) wraps the model in `agent_model.TodoTailModel`: the feature task's
-    checklist state rides on EVERY model request as a synthetic TAIL
-    message, recomputed from `task.todos` at request time — so a list
-    created or updated mid-activation is seen by the next request of the
-    same run. Deliberately NOT dynamic instructions: those render into the
-    leading system messages, and a mid-activation checklist mutation there
-    would invalidate the server-side prefix cache almost entirely (the
-    #a0a55d3d incident). The tail instead only ever invalidates the small
-    trailing zone. For non-feature tasks, empty lists and taskless builds
-    (schema estimation) the supplier yields None and the wrapper passes the
-    request through untouched.
+    task) adds the feature task's checklist state to the trailing injection
+    wrapper (`agent_model.TailInjectionModel`): it rides on EVERY model
+    request as a synthetic TAIL message, recomputed from `task.todos` at
+    request time — so a list created or updated mid-activation is seen by
+    the next request of the same run. Deliberately NOT dynamic instructions:
+    those render into the leading system messages, and a mid-activation
+    checklist mutation there would invalidate the server-side prefix cache
+    almost entirely (the #a0a55d3d incident). The tail instead only ever
+    invalidates the small trailing zone. For non-feature tasks, empty lists
+    and taskless builds (schema estimation) the supplier yields None and the
+    wrapper passes the request through untouched.
+
+    `subagent_limit` above 0 additionally puts ONE line into that same
+    trailing zone ("You have N read-only subagents available via
+    delegate_research", see `agent_tools.subagent_notice`): the tool exists
+    in the schema either way, but a mere existence never got it called —
+    the standing reminder of the real budget does. Same tail zone, so no
+    leading prefix is touched; the block is constant within a run.
 
     `research_web_fetch` (the project's web fetch policy, read at
     activation) registers the `web_fetch` tool — RESEARCH tasks ONLY, and
@@ -404,8 +413,23 @@ def build_agent(
     """
     scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config, announce_wait)
+    tail_blocks: list[Callable[[], str | None]] = []
     if todo_supplier is not None:
-        model = agent_model.TodoTailModel(model, todo_supplier)
+        tail_blocks.append(todo_supplier)
+    # The run's delegation note (one line, when the project enabled
+    # subagents for this role): a tool nobody is reminded of never gets
+    # called — see `agent_tools.subagent_notice`. It rides the same trailing
+    # synthetic message as the checklist (one extra user message per request,
+    # never one per block) and its text is constant within a run, so the
+    # cached prefix is untouched.
+    delegation_note = subagent_notice(
+        subagent_limit,
+        role=AgentRole.RESEARCH if kind is TaskKind.RESEARCH else AgentRole.CODING,
+    )
+    if delegation_note is not None:
+        tail_blocks.append(lambda: delegation_note)
+    if tail_blocks:
+        model = agent_model.TailInjectionModel(model, tail_blocks)
     instructions = load_system_prompt(
         kind, project_root=root, research_git=research_git
     )
@@ -626,7 +650,7 @@ def build_agent(
     # one-item-list-on-a-small-bugfix anti-pattern. The list lives on the
     # task (`task.todos`, persisted by storage) and is injected into the
     # model context on every request as a synthetic TAIL message (the
-    # `todo_supplier` wired at activation — see `agent_model.TodoTailModel`),
+    # `todo_supplier` wired at activation — see `agent_model.TailInjectionModel`),
     # so an abandoned stale list cannot go unnoticed either. Both tools run through
     # _run_tool so the fixable ValueErrors below become ModelRetry
     # prompts for the model.
@@ -1189,14 +1213,30 @@ def build_agent(
             traffic stays invisible to your context) plus a one-line usage
             summary. The subagent can only read: read_file, grep_search,
             glob_files, search_task_archive — no writing, no shell.
-            `task` is a SELF-CONTAINED brief for the subagent: state the
-            question or investigation goal precisely, name the starting
-            points you already know (files, symbols, error text), and spell
-            out what the report must contain (file paths, line numbers).
-            The subagent cannot ask you questions — the brief must be enough
-            on its own. Use delegation for wide but shallow reading (mapping
-            call sites, surveying a subsystem, scanning many files for a
-            pattern); do the targeted verification reads yourself."""
+
+            WHY IT IS CHEAP: every file YOU read stays in your context until
+            the end of the run and pushes you toward a compaction, which
+            summarizes and loses detail. A subagent's reads cost your context
+            NOTHING — only its report comes back, a few hundred tokens
+            instead of tens of thousands. Delegating the wide reading is
+            therefore cheaper (and faster) than doing it yourself, not a
+            detour.
+
+            WHEN TO DELEGATE: mapping the call sites of a symbol/class/module
+            across the repository; recon over more than 3–5 files before you
+            know where to edit; surveying a subsystem (entry points, data
+            flow, config) before touching it; scanning many files for a
+            pattern when you only need the hits. Do the TARGETED verification
+            reads yourself: the file you are about to edit, its immediate
+            neighbours, and any spot-check of a claim from a report. Never
+            delegate a single-file lookup.
+
+            HOW TO WRITE THE BRIEF: `task` is a SELF-CONTAINED brief — (1) the
+            GOAL, the question to answer precisely; (2) the STARTING POINTS
+            you already know (files, symbols, error text) and where not to
+            look; (3) the REPORT, what must come back (paths with line
+            numbers, the verdict, quotes or not). The subagent cannot ask you
+            questions — the brief must be enough on its own."""
         agent.tool(delegate_research)
 
     return agent

@@ -29,6 +29,7 @@ from .agent_build import (
 from .agent_model import (
     AsyncOpenAI,
     ModelFetchError,
+    TailInjectionModel,
     fetch_models,
     probe_model,
 )
@@ -52,6 +53,7 @@ from .agent_tools import (
     goals_dynamic_instructions,
     goals_instructions,
     load_agents_md,
+    subagent_notice,
     task_goal_block,
     todo_instructions,
 )
@@ -177,6 +179,7 @@ __all__ = [
     "ResolverDeps",
     "SubagentDeps",
     "SubagentGate",
+    "TailInjectionModel",
     "TaskManager",
     "TesterDeps",
     "WebFetchError",
@@ -257,6 +260,7 @@ __all__ = [
     "split_original_prompts",
     "strip_thinking_parts",
     "subagent_limit_for",
+    "subagent_notice",
     "task_goal_block",
     "task_search",
     "tester_verdict_issued",

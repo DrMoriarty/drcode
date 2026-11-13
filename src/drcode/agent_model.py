@@ -12,7 +12,7 @@ import asyncio
 import json
 import ssl
 import weakref
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -73,12 +73,12 @@ def base_model_settings(config: Config) -> ModelSettings:
     return settings
 
 
-class TodoTailModel(WrapperModel):
-    """Trailing-injection wrapper: appends the task's CURRENT checklist block
-    as a synthetic last message of EVERY outgoing request.
+class TailInjectionModel(WrapperModel):
+    """Trailing-injection wrapper: appends the per-request blocks supplied by
+    its suppliers as a synthetic last message of EVERY outgoing request.
 
     Why a tail and not dynamic instructions: pydantic-ai renders dynamic
-    instructions into the LEADING system messages, so any mutation of the
+    instructions into the LEADING system messages, so any mutation of a
     block (todo_create / todo_update mid-activation) moves the request
     divergence point to the top of the dialogue and invalidates the
     server-side prefix cache almost entirely (production incident #a0a55d3d:
@@ -86,10 +86,15 @@ class TodoTailModel(WrapperModel):
     ~65% of the run's bill). A trailing block sits AFTER the whole history:
     mutating it only re-reads a few tokens of the tail.
 
-    The block is injected at REQUEST time — `request` and `request_stream`
-    both copy the outgoing message list and append one synthetic
-    `ModelRequest` (a user message) carrying the fresh block. Reading the
-    supplier per request is what keeps the list live mid-activation: a
+    Every block rides the SAME synthetic message: several suppliers (the
+    task's live checklist and the run's delegation note, say) are read at
+    request time and their non-None texts joined into ONE `ModelRequest` —
+    one extra user message per request at most, never one per block.
+
+    The blocks are injected at REQUEST time — `request` and
+    `request_stream` both copy the outgoing message list and append that
+    synthetic `ModelRequest` (a user message) carrying the fresh text.
+    Reading the suppliers per request is what keeps them live mid-run: a
     todo_update executed in the current run is visible to the very next
     model request of that run.
 
@@ -104,19 +109,27 @@ class TodoTailModel(WrapperModel):
     formats; no leading system zone is touched.
     """
 
-    def __init__(self, wrapped: Model, todo_block: Callable[[], str | None]) -> None:
+    def __init__(
+        self,
+        wrapped: Model,
+        blocks: Sequence[Callable[[], str | None]],
+    ) -> None:
         super().__init__(wrapped)
-        self._todo_block = todo_block
+        self._blocks = list(blocks)
 
     def _messages_with_tail(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        """A copy of the outgoing messages with the fresh checklist block
-        appended as the LAST message (None supplier result → unchanged)."""
-        block = self._todo_block()
-        if block is None:
+        """A copy of the outgoing messages with the fresh blocks appended as
+        the LAST message (no non-None block → the list unchanged)."""
+        parts = [
+            block
+            for block in (supplier() for supplier in self._blocks)
+            if block is not None and block.strip()
+        ]
+        if not parts:
             return messages
         return [
             *messages,
-            ModelRequest(parts=[UserPromptPart(content=block)]),
+            ModelRequest(parts=[UserPromptPart(content="\n\n".join(parts))]),
         ]
 
     async def request(self, messages, model_settings, model_request_parameters):  # type: ignore[no-untyped-def]
@@ -624,14 +637,14 @@ def build_throttled_model(
 
 def unwrap_model(model: Model) -> Model:
     """Strip drcode's request-shaping wrappers (`ThrottledModel`,
-    `TodoTailModel`) off `model` and return the underlying one.
+    `TailInjectionModel`) off `model` and return the underlying one.
 
     Only the truly INNER model — the `OpenAIChatModel` with its
     `AsyncOpenAI` client — carries the connection settings, so introspection
     (tests reading `model.client`, a future diagnostics screen) must peel
     the wrappers first. Unknown wrapper types are left alone: the outer
     loop stops at the first model it does not recognise."""
-    while isinstance(model, (ThrottledModel, TodoTailModel)):
+    while isinstance(model, (ThrottledModel, TailInjectionModel)):
         model = model.wrapped
     return model
 

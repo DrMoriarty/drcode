@@ -188,7 +188,7 @@ async def test_dynamic_instructions_yield_single_leading_system_message(
     therefore always build with that profile.
 
     The todo checklist is deliberately NOT among them anymore (#a0a55d3d):
-    it rides the request TAIL (TodoTailModel), so a mid-run checklist
+    it rides the request TAIL (TailInjectionModel), so a mid-run checklist
     mutation never invalidates the cached leading prefix. Asserted on the
     real request body captured through a mock transport: a feature agent
     whose checklist is non-empty sends exactly one leading system message
@@ -247,6 +247,57 @@ async def test_dynamic_instructions_yield_single_leading_system_message(
     assert "step one" not in leading[0]["content"]
     # The checklist rides the LAST message of the request instead.
     assert "step one" in str(messages[-1])
+
+
+async def test_delegation_note_rides_the_trailing_message_only(
+    manager, project_root, monkeypatch
+) -> None:
+    """The "You have N read-only subagents" reminder must sit in the
+    trailing synthetic message ONLY — never in the leading (cached) system
+    zone of the wire request. That placement is what lets it be repeated on
+    every request without invalidating the server-side prefix cache; the
+    reminder itself exists because a merely-offered tool was never called
+    across a whole benchmark run."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=completion_payload("ok"))
+
+    real_cls = agent_model.AsyncOpenAI
+
+    def factory(**kwargs: object) -> AsyncOpenAI:
+        kwargs["http_client"] = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        kwargs["max_retries"] = 0
+        return real_cls(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(agent_model, "AsyncOpenAI", factory)
+
+    task = manager.create("t", "feature brief", kind=TaskKind.FEATURE)
+    ag = build_agent(make_config(), kind=TaskKind.FEATURE, subagent_limit=2)
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=agent_mod.tools.scratch_dir(task.id),
+    )
+    await ag.run("hi", deps=deps)
+
+    messages = seen["body"]["messages"]
+    note = "You have 2 read-only subagents available via delegate_research"
+    leading, rest = [], []
+    for msg in messages:
+        (leading if not rest and msg["role"] == "system" else rest).append(msg)
+    assert len(leading) == 1  # the static prompt, still a single leading system
+    assert note not in leading[0]["content"]
+    assert note in str(messages[-1])  # the trailing synthetic message
+    # The tool itself is offered (the note would be a lie otherwise).
+    assert any(
+        tool["function"]["name"] == "delegate_research"
+        for tool in seen["body"]["tools"]
+    )
 
 
 async def test_streamed_roundtrip_and_per_request_user_agent_override() -> None:

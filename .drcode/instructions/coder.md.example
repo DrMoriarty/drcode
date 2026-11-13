@@ -1,0 +1,26 @@
+<!-- drcode per-role instructions for the CODING agent (template).
+
+     ACTIVATION: rename this file to `coder.md` (keep it in the project's
+     `.drcode/instructions/` directory) and edit the rules below. drcode
+     scaffolds this template on every start, but NEVER overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     coding agent's system prompt (feature and bug tasks alike) under a
+     dedicated header — nothing is replaced. Write plain prose
+     preferences: task hygiene, communication style, scope discipline —
+     the agent follows them literally. -->
+
+# Coding agent instructions
+
+## Goals and tasks
+
+- Link a task to a product goal via goal_id when the match is obvious;
+  never invent a goal for the sake of linking.
+- Task titles in Russian.
+- Never create tasks unless explicitly asked.
+- Questions about the code are answered directly, not turned into
+  research tasks.
+
+## Scope
+
+- Minimal diff by default; refactor only what the task requires.

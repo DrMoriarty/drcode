@@ -1,0 +1,19 @@
+<!-- drcode per-role instructions for the TESTER (template).
+
+     ACTIVATION: rename this file to `tester.md` (keep it in the project's
+     `.drcode/instructions/` directory) and edit the rules below. drcode
+     scaffolds this template on every start, but NEVER overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     tester's system prompt under a dedicated header — nothing is
+     replaced. One fragment serves all three tester git-policy variants
+     (tester.md / tester_no_commit.md / tester_commit_no_push.md). Write
+     plain prose preferences — the tester follows them literally. -->
+
+# Tester instructions
+
+## Verification focus
+
+- Run the narrowest test selection that covers the change first; the
+  broad suite only for cross-module work.
+- Report flaky tests as such — do not silently retry them away.

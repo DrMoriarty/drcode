@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import pytest
+from textual.css.query import NoMatches
 from textual.widgets import Static
 
 from drcode import merge_engine as me
@@ -423,11 +424,22 @@ async def test_auto_resolve_starts_round_and_closes_list(
 
 
 def _footer_text(screen: UnmergedListScreen) -> str:
-    return str(screen.query_one("#unmerged-footer", Static).content)
+    # A freshly pushed screen may not have its DOM composed yet (the
+    # screen is already active but query_one would raise NoMatches);
+    # return "" so wait_until predicates treat that as "not ready yet"
+    # and keep polling instead of erroring out (load-dependent flake
+    # under xdist).
+    try:
+        return str(screen.query_one("#unmerged-footer", Static).content)
+    except NoMatches:
+        return ""
 
 
 def _title_text(screen: UnmergedListScreen) -> str:
-    return str(screen.query_one("#unmerged-title", Static).content)
+    try:
+        return str(screen.query_one("#unmerged-title", Static).content)
+    except NoMatches:
+        return ""
 
 
 async def test_busy_spinner_replaces_and_restores_footer(

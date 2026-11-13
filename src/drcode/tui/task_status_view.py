@@ -235,7 +235,8 @@ class TaskStatusLayer(DrCodeState):
 
     def _task_status_extra(self, task: Task) -> str:
         """The second header row (under the kind/id/date/status line):
-        the full dependency list with its gate colors, the goal link
+        the full dependency list with its gate colors plus the cyan "+"
+        picker link (queued/held tasks only), the goal link
         with its ✏/✕ icon fragments (or the "+ assign" picker
         link when unattached), the GitHub issue number, the
         worktree branch (clickable — copies the branch name), the
@@ -247,6 +248,18 @@ class TaskStatusLayer(DrCodeState):
         deps = self._dependency_status_part(task, label="depends on: ")
         if deps:
             bits.append(deps)
+        # The "+" of the dependency group: only for the statuses where the
+        # gate can still change (queued/held — the _can_edit_dependencies
+        # gate), and rendered both with and without existing dependencies
+        # (an unconditional "add another one" right after the list). Cyan,
+        # the color of the group it belongs to.
+        if self._can_edit_dependencies(task):
+            if not deps:
+                # A bare "+" would read as noise at the head of the row:
+                # label the empty state the way the list is labelled.
+                bits.append("[@click=app.pick_dependency][cyan]depends on: +[/][/]")
+            else:
+                bits.append("[@click=app.pick_dependency][cyan]+[/][/]")
         # Goal link — a task attached to a product goal opens the
         # GoalScreen focused on it, with the ✏ (re-assign to another
         # goal via the picker) and ✕ (detach) icon buttons before the

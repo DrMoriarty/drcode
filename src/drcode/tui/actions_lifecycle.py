@@ -29,6 +29,7 @@ from ..models import (
 from ..settings import (
     EscAbort,
 )
+from .deps_picker import DependencyPicker
 from .sidebar import TaskItem
 from .state import DrCodeState
 
@@ -398,6 +399,45 @@ class TaskLifecycleLayer(DrCodeState):
             TaskStatus.QUEUED,
             TaskStatus.HOLD,
         )
+
+    def action_pick_dependency(self) -> None:
+        """Click on the cyan "+" fragment of the task statusbar's second
+        row (a queued/held viewed task): open the dependency picker over
+        the tasks that could still block it and attach the picked one. A
+        drag-selection ending on the link is copying text, not
+        navigating (same guard as the other header links)."""
+        if self.screen.selections:
+            return
+        task = self.viewed
+        if not self._can_edit_dependencies(task) or task is None:
+            return
+        # Candidates: everything still unfinished (a COMPLETED task can
+        # never block anything), minus the task itself and the deps it
+        # already has (those are visible in the header itself).
+        candidates = [
+            other
+            for other in self.manager.all_tasks()
+            if other.id != task.id
+            and other.id not in task.depends_on
+            and other.status is not TaskStatus.COMPLETED
+        ]
+        if not candidates:
+            self.notify(
+                "No task to depend on — every other unfinished task is "
+                "already a dependency.",
+                title="Dependencies",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        self.push_screen(DependencyPicker(task, candidates), self._dependency_picked)
+
+    def _dependency_picked(self, dep_id: str | None) -> None:
+        # None = ESC / no pick: nothing to do. The picker is manager-free;
+        # the mutation goes through the same path as the palette entry.
+        if dep_id is None:
+            return
+        self.action_add_dependency(dep_id)
 
     def action_add_dependency(self, dep_id: str) -> None:
         """Command-palette entry: make the viewed task wait for `dep_id`

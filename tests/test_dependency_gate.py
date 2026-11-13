@@ -18,7 +18,7 @@ from typing import cast
 import pytest
 from pydantic_ai import capture_run_messages
 from pydantic_ai.models.test import TestModel
-from textual.widgets import Static, TextArea
+from textual.widgets import Input, ListView, Static, TextArea
 
 from drcode.models import Task, TaskStatus
 from drcode.tui.app import DrCodeApp
@@ -431,3 +431,93 @@ def test_set_task_dependencies_replaces_and_restricts(
 
     with pytest.raises(ValueError, match="unknown task id"):
         _set_task_dependencies(deps, "ffffffff", [])
+
+
+# -- TUI: the cyan "+" picker link of the task header --------------------------------
+
+
+async def test_header_dependency_link_opens_picker_and_links(
+    app: DrCodeApp,
+) -> None:
+    """The second header row carries a cyan "+" for queued/held tasks: it
+    opens the picker over the non-COMPLETED tasks (minus the viewed one
+    and the existing deps), and picking a row adds the depends_on edge
+    through manager.set_dependencies + logs the service event."""
+    from drcode.models import TaskKind
+    from drcode.tui.deps_picker import DependencyPicker
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        viewed = app.manager.create("viewed", "x")
+        # A COMPLETED task must never be a candidate: it can't block
+        # anything, so offering it would be a dead entry.
+        done = app.manager.create("done", "x", kind=TaskKind.RESEARCH)
+        app.manager.mark_done(done.id)
+        assert done.status is TaskStatus.COMPLETED
+        live = app.manager.create("live", "x")
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "app.pick_dependency" in extra
+        assert "+" in extra
+
+        app.action_pick_dependency()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DependencyPicker)
+        listing = screen.query_one("#deps-picker-list", ListView)
+        rows = [w for w in listing.children if isinstance(w, TaskItem)]
+        ids = {w.task_id for w in rows}
+        assert ids == {live.id}, "only the unfinished non-dep task is offered"
+        assert done.id not in ids and viewed.id not in ids
+
+        # Enter in the filter takes the first row (the type-then-enter path).
+        screen.query_one("#deps-picker-input", Input).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, DependencyPicker)
+        assert app.manager.get(viewed.id).depends_on == [live.id]
+        assert any(
+            f"#{live.id}" in e.text and "Dependency" in e.text
+            for e in app.manager.get(viewed.id).events
+        ), [e.text for e in app.manager.get(viewed.id).events]
+        # The row now lists the dependency AND keeps the "+" (add another).
+        extra = str(app.query_one("#task-status-extra", Static).content)
+        assert "depends on:" in extra and f"#{live.id}" in extra
+        assert "app.pick_dependency" in extra
+
+
+async def test_header_dependency_link_only_for_editable_statuses(
+    app: DrCodeApp,
+) -> None:
+    """The "+" obeys the _can_edit_dependencies gate: QUEUED and HOLD
+    show it, every other status (here TESTING, i.e. "already under way")
+    renders no dependency fragment at all."""
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        task = app.manager.create("viewed", "x")
+        app.manager.create("other", "x")
+        app.view_task(task.id)
+        await pilot.pause()
+        assert "app.pick_dependency" in str(
+            app.query_one("#task-status-extra", Static).content
+        )
+
+        app.manager.set_hold(task.id, on=True)
+        app.refresh_task_status()
+        await pilot.pause()
+        assert "app.pick_dependency" in str(
+            app.query_one("#task-status-extra", Static).content
+        )
+        assert task.status is TaskStatus.HOLD
+
+        app.manager.set_hold(task.id, on=False)
+        app.manager.mark_done(task.id)  # → TESTING (a feature task)
+        assert task.status is TaskStatus.TESTING
+        app.refresh_task_status()
+        await pilot.pause()
+        assert "app.pick_dependency" not in str(
+            app.query_one("#task-status-extra", Static).content
+        )

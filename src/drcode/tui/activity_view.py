@@ -343,6 +343,43 @@ class ActivityLayer(DrCodeState):
             # this the sweep would re-nudge every tick until it fires.
             self._last_activity[task_id] = now
 
+    def _abort_task_runs(self, task_id: str) -> None:
+        """Stop every in-flight run of ONE task — agent and, when it is
+        this task's, the tester — leaving all other tasks' runs untouched
+        (parallel slots). The per-task worker half of the Ctrl+X cancel:
+        `action_cancel_task` and the MCP `cancel` mutation both need
+        exactly this (the mutation reaches it from a foreign thread
+        through `call_from_thread`). Order matters and mirrors the cancel
+        action: the worker groups are cancelled first (the in-flight run
+        must not persist over the transition that follows), the run
+        bookkeeping is dropped, and the consumed-but-not-yet-transcribed
+        prompt is flushed so the user's brief cannot vanish from the chat
+        history. No status is touched here — the caller decides what the
+        task becomes."""
+        if task_id in self._agent_runs:
+            self.workers.cancel_group(self, f"agent-{task_id}")
+            self._agent_runs.pop(task_id, None)
+            self._current_tool[task_id] = None
+        if self.tester_running and self._tester_task_id == task_id:
+            self.workers.cancel_group(self, "tester")
+            self.tester_running = False
+            self._current_tool[task_id] = None
+        # A cancelled task's tester pipeline state must not linger: with a
+        # live tester run the cancelled worker's `finally` clears it, but
+        # without one (retry backoff, failed round) nobody else would —
+        # the stale entries would block restarts until the app restarts.
+        self._tester_fail_count.pop(task_id, None)
+        self._tester_retry_at.pop(task_id, None)
+        self._tester_net_count.pop(task_id, None)
+        self._tester_resume_round.discard(task_id)
+        self._tester_compaction_resumed.discard(task_id)
+        self._tester_compaction_verdict.discard(task_id)
+        if self._tester_task_id == task_id and not self.tester_running:
+            self._tester_task_id = None
+        task = self.manager.tasks.get(task_id)
+        if task is not None:
+            self._flush_in_flight_prompt(task)
+
     def _nudge_run(self, task: Task, *, source: str = "watchdog") -> bool:
         """Abort the hung/stalled run for `task` (if one is in flight) and
         schedule its restart: the agent resumes via a continuation turn (no

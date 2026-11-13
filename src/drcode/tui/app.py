@@ -1341,16 +1341,21 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self.refresh_status()
 
     def _build_mcp_server(self):
-        """The `McpService` server factory: a fresh read surface per start.
+        """The `McpService` server factory: a fresh surface per start.
 
         An SDK server is per-instance state (tool manager, session
         manager), so every start builds a new one over the live manager.
-        The surface is kept on `self._mcp_surface` for the bridge
-        attach/detach in `_sync_mcp_server` / teardown.
+        The mutation hooks (§6) bind the surface to THIS app: every
+        successful mutation schedules `_advance()` (and the cancel
+        power-action's worker aborts) through `call_from_thread` — the
+        §6 guarantee that the post-steps land on the one application
+        event loop. The surface is kept on `self._mcp_surface` for the
+        bridge attach/detach in `_sync_mcp_server` / teardown.
         """
-        from drcode.mcp.wiring import ReadSurface
+        from drcode.mcp.mutations import app_hooks
+        from drcode.mcp.wiring import McpSurface
 
-        surface = ReadSurface(self.manager)
+        surface = McpSurface(self.manager, hooks=app_hooks(self))
         self._mcp_surface = surface
         return surface.server
 

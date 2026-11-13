@@ -1483,3 +1483,542 @@ def test_the_router_never_raises_on_a_closed_loop(manager) -> None:
     bridge._on_status(manager.create("Zombie", "zombie"), None, None, "user")
     bridge._on_removal("ghost")
     router.close()
+
+
+# -- the mutation surface (§4/§6): gating matrix + re-advance -------------------
+#
+# Same in-process discipline as the read half: the FULL guarded ASGI stack
+# is driven by the SDK's own Streamable HTTP client, the TaskManager is the
+# live conftest `manager`, and the §6 re-advance is observed through a
+# recorder injected as the surface's MutationHooks (in production the TUI
+# passes wrappers that hop into the app thread — the tests record instead,
+# which is the mock-_advance observation the design prescribes).
+
+from drcode.mcp.mutations import (
+    MUTATION_TOOLS,
+    MutationHooks,
+)
+from drcode.models import (
+    Clarification,
+    ClarificationItem,
+    Task,
+    TaskStatus,
+)
+
+
+class AdvanceRecorder:
+    """The mutation hooks as test observers: every §6 post-step is counted."""
+
+    def __init__(self) -> None:
+        self.advances: list[str] = []
+        self.aborted: list[str] = []
+        self.restarted: list[str] = []
+        self.hooks = MutationHooks(
+            advance=lambda: self.advances.append("advance"),
+            abort_runs=self.abort_runs,
+            restart_run=self.restart_run,
+        )
+
+    def abort_runs(self, task_id: str) -> None:
+        self.aborted.append(task_id)
+
+    def restart_run(self, task_id: str) -> None:
+        self.restarted.append(task_id)
+
+
+@pytest.fixture
+def mut(manager, tmp_path: Path):
+    """A surface WITH the mutation tools, plus the recorder of its hooks."""
+    from drcode.mcp.wiring import McpSurface
+    from drcode.usage_store import UsageStore
+
+    recorder = AdvanceRecorder()
+    surface = McpSurface(
+        manager,
+        usage_store=UsageStore(path=tmp_path / "usage.json"),
+        hooks=recorder.hooks,
+    )
+    return surface, recorder
+
+
+# The §4 matrix, literally: row = tool, column = status, value = outcome.
+# ALLOWED — the mutation applies and (for the §6 set) re-advance is planned;
+# BUSY — denied with the matrix's verbatim ACTIVE/TESTING advice
+# («отмените (cancel) или дождитесь»); DENIED — any other refusal, still a
+# normal isError carrying the current status.
+ALLOWED, DENIED, BUSY = "allowed", "denied", "busy"
+
+_STATUSES = (
+    "queued",
+    "draft",
+    "hold",
+    "clarification",
+    "active",
+    "testing",
+    "completed",
+)
+
+_MUTATION_MATRIX: dict[str, dict[str, str]] = {
+    "send_input": dict.fromkeys(_STATUSES, ALLOWED),
+    "answer_clarification": dict.fromkeys(_STATUSES, DENIED)
+    | {"clarification": ALLOWED},
+    "edit_task": dict.fromkeys(_STATUSES, DENIED)
+    | {"queued": ALLOWED, "draft": ALLOWED, "hold": ALLOWED},
+    "set_dependencies": dict.fromkeys(_STATUSES, DENIED)
+    | {
+        "queued": ALLOWED,
+        "draft": ALLOWED,
+        "hold": ALLOWED,
+        "active": BUSY,
+        "testing": BUSY,
+    },
+    "set_kind": dict.fromkeys(_STATUSES, DENIED)
+    | {
+        "queued": ALLOWED,
+        "draft": ALLOWED,
+        "hold": ALLOWED,
+        "active": BUSY,
+        "testing": BUSY,
+    },
+    # The matrix row is set_hold(ON); the resume half has its own tests below.
+    "set_hold": dict.fromkeys(_STATUSES, DENIED)
+    | {
+        "queued": ALLOWED,
+        "draft": ALLOWED,
+        "hold": ALLOWED,
+        "active": BUSY,
+        "testing": BUSY,
+    },
+    "move_in_queue": dict.fromkeys(_STATUSES, DENIED) | {"queued": ALLOWED},
+    "cancel": dict.fromkeys(_STATUSES, ALLOWED) | {"completed": DENIED},
+    "delete": dict.fromkeys(_STATUSES, DENIED)
+    | {
+        "hold": ALLOWED,
+        "draft": ALLOWED,
+        "active": BUSY,
+        "testing": BUSY,
+    },
+}
+
+#: The §6 re-advance set. `edit_task`/`set_kind`/`set_hold(on)` are absent
+#: on purpose: the TUI does not press Enter after them (a held/draft task
+#: is never promotable; a re-type only changes the queue position).
+#: `set_dependencies` IS one: dropping a blocker is the TUI's
+#: force-start (action_remove_dependency advances).
+_ADVANCE_AFTER = {
+    "send_input",
+    "answer_clarification",
+    "set_dependencies",
+    "move_in_queue",
+    "cancel",
+    "delete",
+}
+
+
+def _task_in_status(manager, status: str, *, title: str | None = None) -> Task:
+    """A real task parked in the given status (direct transitions — the
+    gating only reads the status, so no pipeline round-trip is needed)."""
+    name = title or f"Task {status}"
+    if status == "draft":
+        return manager.create(name, f"condition of {status}", draft=True)
+    if status == "hold":
+        return manager.create(name, f"condition of {status}", hold=True)
+    task = manager.create(name, f"condition of {status}")
+    if status == "clarification":
+        task.status = TaskStatus.AWAITING_CLARIFICATION
+        task.clarification = Clarification.single("Which variant?", options=["A", "B"])
+    elif status != "queued":
+        task.status = TaskStatus(status)
+    if status != "queued":
+        manager.storage.save(task)
+    return task
+
+
+def _mutation_args(tool: str, task: Task, manager) -> dict:
+    """Minimal valid arguments for one mutation against `task`."""
+    if tool == "send_input":
+        return {"task_id": task.id, "text": "a fresh external comment"}
+    if tool == "answer_clarification":
+        return {"task_id": task.id, "answers": ["A"]}
+    if tool == "edit_task":
+        return {"task_id": task.id, "text": "rewritten condition"}
+    if tool == "set_dependencies":
+        dep = manager.create("Dep target", "the dependency condition")
+        return {"task_id": task.id, "deps": [dep.id]}
+    if tool == "set_kind":
+        return {"task_id": task.id, "kind": "bug"}
+    if tool == "set_hold":
+        return {"task_id": task.id, "on": True}
+    if tool == "move_in_queue":
+        return {"task_id": task.id, "up": True}
+    return {"task_id": task.id}
+
+
+async def _mutation_call(mut, tool: str, arguments: dict) -> tuple[bool, str]:
+    """One tool call over the in-process client: (is_error, text)."""
+    surface, _recorder = mut
+    async with mcp_client(surface) as client:
+        result = await client.call_tool(tool, arguments)
+    return result.is_error, result.content[0].text  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("status", _STATUSES)
+@pytest.mark.parametrize("tool", list(_MUTATION_MATRIX))
+async def test_gating_matrix_cell(mut, manager, tool: str, status: str) -> None:
+    """Every row × column of the §4 matrix, driven through the ASGI client."""
+    _surface, recorder = mut
+    expected = _MUTATION_MATRIX[tool][status]
+    task = _task_in_status(manager, status)
+    if tool == "move_in_queue" and status == "queued":
+        # queued() runs next-to-run FIRST, and up=True swaps with the entry
+        # BEHIND — the target needs a later queued task to swap with.
+        manager.create("Later queued", "queued later")
+    arguments = _mutation_args(tool, task, manager)
+    recorder.advances.clear()
+
+    is_error, text = await _mutation_call(mut, tool, arguments)
+
+    if expected is ALLOWED:
+        assert is_error is False, text
+        # The mutation is reflected in the TaskManager — the one source of truth.
+        if tool == "send_input":
+            fresh = manager.get(task.id)
+            assert any(
+                e.text == "a fresh external comment" for e in fresh.pending_input
+            )
+        elif tool == "answer_clarification":
+            fresh = manager.get(task.id)
+            assert fresh.clarification is None
+            assert fresh.status is TaskStatus.QUEUED
+        elif tool == "edit_task":
+            fresh = manager.get(task.id)
+            assert [e.text for e in fresh.pending_input] == ["rewritten condition"]
+        elif tool == "set_dependencies":
+            assert manager.get(task.id).depends_on == [arguments["deps"][0]]
+        elif tool == "set_kind":
+            assert manager.get(task.id).kind.value == "bug"
+        elif tool == "set_hold":
+            fresh = manager.get(task.id)
+            assert fresh.status is TaskStatus.HOLD or status == "draft"
+        elif tool == "move_in_queue":
+            assert manager.queued()[-1].id == task.id  # moved up = away from execution
+        elif tool == "cancel":
+            fresh = manager.get(task.id)
+            assert fresh.status is TaskStatus.COMPLETED and fresh.cancelled
+        elif tool == "delete":
+            assert task.id not in manager.tasks
+        # §6: the re-advance is planned exactly for the TUI's Enter set.
+        if tool in _ADVANCE_AFTER:
+            assert recorder.advances == ["advance"], tool
+        else:
+            assert recorder.advances == [], tool
+    else:
+        # A forbidden mutation is a NORMAL isError with the current status
+        # and advice — not a crash, not a silent no-op.
+        assert is_error is True, text
+        assert status in text
+        assert task.status.value == status  # nothing moved
+        if expected is BUSY:
+            # The matrix's verbatim advice: cancel it, or wait for it.
+            assert "cancel" in text
+        if tool in (
+            "set_kind",
+            "set_dependencies",
+            "set_hold",
+            "delete",
+            "move_in_queue",
+        ):
+            # The denial really denied: the field is untouched.
+            fresh = manager.get(task.id)
+            assert fresh.status is TaskStatus(task.status.value)
+
+
+async def test_the_surface_with_hooks_lists_reads_then_mutations(mut) -> None:
+    from drcode.mcp.tools import READ_TOOLS
+
+    surface, _recorder = mut
+    async with mcp_client(surface) as client:
+        tools = await client.list_tools()
+    assert [tool.name for tool in tools.tools] == [*READ_TOOLS, *MUTATION_TOOLS]
+
+
+async def test_the_forbidden_tools_are_never_published(mut) -> None:
+    """§4 «Не публикуются» — the tester/hook/config/transcript internals
+    stay unreachable: the tester alone owns the COMPLETED verdict."""
+    surface, _recorder = mut
+    forbidden = (
+        "set_verification",
+        "finalize_verified",
+        "requeue_failed_fix",
+        "requeue_review_rejection",
+        "complete_without_verification",
+        "purge_expired_completed",
+        "link_goal",
+        "unlink_goal",
+        "write_transcript",
+        "set_model",
+        "configure_models",
+    )
+    async with mcp_client(surface) as client:
+        tools = await client.list_tools()
+    names = {tool.name for tool in tools.tools}
+    assert names & set(forbidden) == set()
+
+
+async def test_cancel_description_declares_the_power_action(mut) -> None:
+    """§4: the cancel tool's description MUST say in plain words that it
+    aborts the run and completes past the tester."""
+    surface, _recorder = mut
+    async with mcp_client(surface) as client:
+        tools = await client.list_tools()
+    description = next(t.description for t in tools.tools if t.name == "cancel")
+    # The SDK types Tool.description as `str | None` — narrow first.
+    assert description is not None
+    assert "POWER-ACTION" in description
+    assert "ABORTS" in description
+    assert "COMPLETED" in description
+    assert "NEVER runs" in description
+
+
+# -- re-advance details (§6) ----------------------------------------------------
+
+
+async def test_send_input_to_active_restarts_the_run(mut, manager) -> None:
+    """§4 ACTIVE cell: a comment interrupts the run — the TUI's run_agent
+    supersede is planned (restart hook) alongside the re-advance."""
+    surface, recorder = mut
+    task = _task_in_status(manager, "active")
+    async with mcp_client(surface) as client:
+        text = await call_text(
+            client, "send_input", {"task_id": task.id, "text": "mid-flight comment"}
+        )
+    assert "restarts" in text
+    assert recorder.restarted == [task.id]
+    assert recorder.advances == ["advance"]
+    fresh = manager.get(task.id)
+    assert fresh.status is TaskStatus.ACTIVE
+    assert fresh.pending_input[-1].text == "mid-flight comment"
+
+
+async def test_send_input_to_completed_requeues_and_clears_stale_marks(
+    mut, manager
+) -> None:
+    """§4 completed cell: «перезакидывает в очередь», dropping the stale
+    verification label / cancel marker — manager.send's own transition."""
+    surface, recorder = mut
+    task = _task_in_status(manager, "completed")
+    task.cancelled = True
+    manager.storage.save(task)
+    async with mcp_client(surface) as client:
+        await call_text(
+            client, "send_input", {"task_id": task.id, "text": "one more round"}
+        )
+    fresh = manager.get(task.id)
+    assert fresh.status is TaskStatus.QUEUED
+    assert fresh.cancelled is False
+    assert fresh.verification is None
+    assert recorder.advances == ["advance"]
+
+
+async def test_set_hold_resume_advances_and_refuses_the_rest(mut, manager) -> None:
+    """set_hold(off) is a §6 trigger; a non-held task refuses honestly."""
+    surface, recorder = mut
+    task = _task_in_status(manager, "hold")
+    async with mcp_client(surface) as client:
+        text = await call_text(client, "set_hold", {"task_id": task.id, "on": False})
+        assert "resumed" in text
+        message = await call_text_error(
+            client, "set_hold", {"task_id": task.id, "on": False}
+        )
+    assert recorder.advances == ["advance"]
+    assert manager.get(task.id).status is TaskStatus.QUEUED
+    # A second resume is refused: the task is not on hold anymore.
+    assert "not on hold" in message
+
+
+async def test_move_in_queue_refusals_carry_the_tui_reasons(mut, manager) -> None:
+    """An impossible move is an isError with the TUI toast's reason — a
+    silent no-op would look like the tool ignored the call. queued() runs
+    next-to-run first: the bug sits at the head, the dependency-blocked
+    task sinks to the tail."""
+    surface, recorder = mut
+    bug = manager.create("The bug", "fix it", kind="bug")
+    free = manager.create("The feature", "build it")
+    blocked = manager.create("The blocked", "waits", depends_on=[bug.id])
+    async with mcp_client(surface) as client:
+        edge = await call_text_error(
+            client, "move_in_queue", {"task_id": blocked.id, "up": True}
+        )
+        cross = await call_text_error(
+            client, "move_in_queue", {"task_id": bug.id, "up": True}
+        )
+        tier = await call_text_error(
+            client, "move_in_queue", {"task_id": free.id, "up": True}
+        )
+    assert "already farthest" in edge
+    assert "bug block" in cross
+    assert "waits for its dependencies" in tier
+    assert recorder.advances == []  # refusals do not advance
+    assert [t.id for t in manager.queued()] == [bug.id, free.id, blocked.id]
+
+
+async def test_trigger_advance_schedules_the_gate(mut) -> None:
+    surface, recorder = mut
+    async with mcp_client(surface) as client:
+        text = await call_text(client, "trigger_advance")
+    assert "scheduled" in text
+    assert recorder.advances == ["advance"]
+
+
+async def test_mutation_with_unknown_task_id_is_an_error(mut, manager) -> None:
+    surface, _recorder = mut
+    async with mcp_client(surface) as client:
+        message = await call_text_error(
+            client, "send_input", {"task_id": "nope", "text": "hi"}
+        )
+    assert "unknown task id" in message and "nope" in message
+
+
+# -- create_task ----------------------------------------------------------------
+
+
+async def test_create_task_contract(mut, manager) -> None:
+    surface, recorder = mut
+    async with mcp_client(surface) as client:
+        text = await call_text(
+            client,
+            "create_task",
+            {"text": "implement src/thing.py", "kind": "bug", "title": "Thing"},
+        )
+    created = manager.all_tasks()[-1]
+    assert f"#{created.id}" in text and "[bug]" in text and "status queued" in text
+    assert created.title == "Thing"  # an explicit title is kept verbatim
+    assert created.kind.value == "bug"
+    assert created.pending_input[-1].text == "implement src/thing.py"
+    assert recorder.advances == ["advance"]  # §6: creation re-advances
+
+
+async def test_create_task_held_and_dependencies(mut, manager) -> None:
+    surface, _recorder = mut
+    dep = manager.create("The dep", "the blocker")
+    async with mcp_client(surface) as client:
+        text = await call_text(
+            client,
+            "create_task",
+            {
+                "text": "the parked work",
+                "kind": "feature",
+                "hold": True,
+                "depends_on": [dep.id],
+            },
+        )
+    created = manager.all_tasks()[-1]
+    assert created.status is TaskStatus.HOLD
+    assert created.depends_on == [dep.id]
+    assert "hold" in text
+
+
+async def test_create_task_validates_kind_goal_and_text(mut, manager) -> None:
+    surface, _recorder = mut
+    async with mcp_client(surface) as client:
+        bad_kind = await call_text_error(
+            client, "create_task", {"text": "x", "kind": "banana"}
+        )
+        bad_goal = await call_text_error(
+            client, "create_task", {"text": "x", "kind": "bug", "goal_id": "ghost"}
+        )
+        bad_dep = await call_text_error(
+            client, "create_task", {"text": "x", "kind": "bug", "depends_on": ["ghost"]}
+        )
+        empty = await call_text_error(
+            client, "create_task", {"text": "  ", "kind": "bug"}
+        )
+    assert "unknown kind" in bad_kind
+    assert "unknown goal id" in bad_goal
+    assert "unknown task id" in bad_dep
+    assert "must not be empty" in empty
+
+
+async def test_create_task_reports_file_overlaps(mut, manager) -> None:
+    """The pre-flight warning: an unfinished task already mentions the same
+    files — a WARNING in the answer (and a service event), never a block."""
+    surface, _recorder = mut
+    manager.create("Alpha work", "implement src/alpha.py properly")
+    async with mcp_client(surface) as client:
+        text = await call_text(
+            client, "create_task", {"text": "refactor src/alpha.py", "kind": "feature"}
+        )
+    assert "src/alpha.py" in text
+    assert "also appear in unfinished task" in text
+    created = manager.all_tasks()[-1]
+    assert any("overlap" in e.text.lower() for e in created.events)
+
+
+# -- answer_clarification --------------------------------------------------------
+
+
+async def test_answer_clarification_joins_one_line_per_question(mut, manager) -> None:
+    """Count validation + the exact TUI Enter semantics: one line per
+    question, submitted as ONE pending input; the task re-queues at the head."""
+    surface, recorder = mut
+    task = _task_in_status(manager, "clarification")
+    task.clarification = Clarification(
+        questions=[
+            ClarificationItem(question="Which variant?", options=["A", "B"]),
+            ClarificationItem(question="Which color?", options=["red", "green"]),
+        ]
+    )
+    manager.storage.save(task)
+    async with mcp_client(surface) as client:
+        # The wrong count is refused BEFORE anything is sent…
+        mismatch = await call_text_error(
+            client, "answer_clarification", {"task_id": task.id, "answers": ["A"]}
+        )
+        assert "expected 2 answer(s), got 1" in mismatch
+        assert "Which color?" in mismatch  # the questions are listed
+        fresh = manager.get(task.id)
+        assert fresh.clarification is not None  # …the package is intact
+        # …and the right count submits one line per question.
+        text = await call_text(
+            client,
+            "answer_clarification",
+            {"task_id": task.id, "answers": ["Variant B", "green"]},
+        )
+    fresh = manager.get(task.id)
+    assert fresh.clarification is None
+    assert fresh.status is TaskStatus.QUEUED
+    assert fresh.queue_head is True
+    assert [e.text for e in fresh.pending_input] == [
+        "condition of clarification",
+        "Variant B\ngreen",
+    ]
+    assert recorder.advances == ["advance"]
+    assert "queued" in text
+
+
+async def test_answer_clarification_without_a_package_is_refused(mut, manager) -> None:
+    surface, _recorder = mut
+    task = manager.create("Plain", "plain")
+    async with mcp_client(surface) as client:
+        message = await call_text_error(
+            client, "answer_clarification", {"task_id": task.id, "answers": ["x"]}
+        )
+    assert "no pending clarification" in message
+
+
+# -- edit_task --------------------------------------------------------------------
+
+
+async def test_edit_task_refuses_when_nothing_is_editable(mut, manager) -> None:
+    """§4 «по editable_condition (причина в ошибке)»: consumed text is
+    history, not a form field — the error says so."""
+    surface, _recorder = mut
+    task = manager.create("Started", "original condition", hold=True)
+    task.pending_input.clear()  # everything consumed before the hold
+    manager.storage.save(task)
+    async with mcp_client(surface) as client:
+        message = await call_text_error(
+            client, "edit_task", {"task_id": task.id, "text": "rewritten"}
+        )
+    assert "nothing editable" in message
+    assert manager.get(task.id).pending_input == []

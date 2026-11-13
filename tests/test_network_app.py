@@ -3094,6 +3094,25 @@ def test_context_overflow_classifier() -> None:
     assert _is_context_overflow_error(
         http_error(400, "prompt is too long: 210000 tokens > 200000 maximum")
     )
+    # zveno.ai phrasing (#c1edeefe): neither the message nor the type
+    # field matches any of the earlier markers, but both name the same
+    # deterministic overflow — the request cannot shrink on retry.
+    assert _is_context_overflow_error(
+        http_error(
+            400,
+            "request (131186 tokens) exceeds the available context size "
+            "(131072 tokens), try increasing it",
+        )
+    )
+    assert _is_context_overflow_error(
+        http_error(
+            400,
+            "{'code': 400, 'message': 'request (131186 tokens) exceeds the "
+            "available context size (131072 tokens), try increasing it', "
+            "'type': 'exceed_context_size_error', 'n_prompt_tokens': "
+            "131186, 'n_ctx': 131072}",
+        )
+    )
     # Other 400s are ordinary failures, even non-400 overflow mentions.
     assert not _is_context_overflow_error(http_error(400, "invalid tool schema"))
     assert not _is_context_overflow_error(

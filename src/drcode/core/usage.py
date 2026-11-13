@@ -56,7 +56,9 @@ def _is_retryable_network_error(e: BaseException) -> bool:
 # response body) — the list covers the phrasings of the common gateways
 # (OpenAI "maximum context length" / "context_length_exceeded",
 # Anthropic "prompt is too long", generic "context too long" / "too many
-# tokens" / "reduce the length of the input").
+# tokens" / "reduce the length of the input", zveno "request ... exceeds
+# the available context size ... try increasing it" with the
+# "exceed_context_size_error" type field).
 _CONTEXT_OVERFLOW_MARKERS = (
     "context length",
     "context_length",
@@ -68,6 +70,8 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "too many tokens",
     "reduce the length of the input",
     "longer than the model's context",
+    "exceeds the available context size",
+    "exceed_context_size_error",
 )
 
 

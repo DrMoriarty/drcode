@@ -24,10 +24,15 @@ Module map:
 - `service` — the lifecycle controller: the ephemeral socket, the
   `uvicorn.Server` in a daemon thread, start/stop and the conflicts of
   two TUIs over one project.
-
-No MCP tools are registered yet — this is the transport, auth and
-lifecycle foundation; the tool surface (§4/§7 of the design) is the next
-layer and plugs into `app.build_server()`.
+- `reads` / `tools` — the read-only half (§7): the shaping layer and the
+  nine read tools over one `ProjectView`.
+- `mutations` — the mutating half (§4/§6): the gating matrix, the
+  mutation bodies, the `MutationHooks` re-advance seam and their
+  registration.
+- `resources` / `bridge` — the resources and the manager-event →
+  `resources/updated` bridge with its coalescing (§5).
+- `wiring` — `McpSurface`: the one object that assembles tools +
+  resources + bus and the TUI keeps a reference to.
 
 The token is never displayed in the UI: the user is told the path of
 `.drcode/mcp.json` (mode 0600), which is also how a client obtains it.

@@ -84,40 +84,12 @@ class TaskLifecycleLayer(DrCodeState):
         if task is None or task.status is TaskStatus.COMPLETED:
             return
         # Stop only the target task's runs (parallel slots: other tasks'
-        # agent runs are independent and keep running).
-        if task.id in self._agent_runs:
-            self.workers.cancel_group(self, f"agent-{task.id}")
-            self._agent_runs.pop(task.id, None)
-            self._current_tool[task.id] = None
-        if self.tester_running and self._tester_task_id == task.id:
-            self.workers.cancel_group(self, "tester")
-            self.tester_running = False
-            self._current_tool[task.id] = None
-        # A queued comment (if any) leaves pending_input with the cancel:
-        # its rendered "user-pending" block must come off the screen, which
-        # only a full re-render does. Captured before cancel() clears it.
+        # agent runs are independent and keep running) and flush the
+        # in-flight prompt — the shared per-task half, also used by the
+        # MCP `cancel` mutation.
         had_pending = bool(task.pending_input)
-        # A running agent may have already consumed the queued prompts
-        # (popped from pending_input, not yet persisted into the transcript):
-        # cancel() is about to clear pending_input and complete the task,
-        # and the cancelled run's own persist skips a no-longer-ACTIVE task —
-        # flush the in-flight copy into the transcript, or the user's brief
-        # would disappear from the chat history.
-        self._flush_in_flight_prompt(task)
+        self._abort_task_runs(task.id)
         self.manager.cancel(task.id)
-        self._tester_resume_round.discard(task.id)
-        self._tester_compaction_resumed.discard(task.id)
-        self._tester_compaction_verdict.discard(task.id)
-        # The task was possibly in TESTING: drop its tester pipeline state.
-        # With a live tester run this is done by the cancelled worker's
-        # `finally` (idempotent); without one (retry backoff, failed round)
-        # nobody else would clear it — and the stale backoff/retry entries
-        # and the stale `_tester_task_id` would linger until restart.
-        self._tester_fail_count.pop(task.id, None)
-        self._tester_retry_at.pop(task.id, None)
-        self._tester_net_count.pop(task.id, None)
-        if self._tester_task_id == task.id and not self.tester_running:
-            self._tester_task_id = None
         # Сервисное событие: "Задача отменена пользователем — снята с конвейера без тестирования".
         self._show_event(
             task,

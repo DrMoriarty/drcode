@@ -1,17 +1,26 @@
-"""The read surface assembled: tools + resources + the event bridge (§5/§7).
+"""The tool surface assembled: reads + mutations + resources + the event
+bridge (§4/§5/§7).
 
-The transport (§1/§2) and the read half (§7) meet here. `ReadSurface` is
+The transport (§1/§2) and the tool halves (§7) meet here. `McpSurface` is
 the ONE object the TUI keeps a reference to: it builds the SDK server,
-registers the nine read tools and the four resources over a single
+registers the nine read tools, the four resources and — when mutation
+hooks are provided — the eleven mutation tools over a single
 `ProjectView`, and owns the subscription bus the event bridge publishes
 through. Owning the bus explicitly (instead of letting the SDK build its
 own) is what makes `start_notifications` possible: the bridge's
 `NotificationRouter` publishes onto exactly the bus whose listen streams
 the clients hang off.
 
+The mutation hooks (§6) are the seam that keeps this class testable: the
+TUI passes `mutations.app_hooks(self)` (every post-step hops into the app
+thread via `call_from_thread`), the tests pass recorders. A surface built
+without hooks serves the read-only half only — no mutation tool exists
+that could not re-advance the pipeline, which would make the server a
+headless task manager the design explicitly rejected (§0).
+
 Lifecycle contract with `McpService`:
 
-- the factory (the TUI's closure) builds a fresh `ReadSurface` per START —
+- the factory (the TUI's closure) builds a fresh `McpSurface` per START —
   an SDK server is per-instance state (tool managers, the streamable
   HTTP session manager) and must not be reused across a stop/start cycle;
 - `start_notifications(loop)` runs AFTER the service is healthy (the loop
@@ -28,21 +37,31 @@ import asyncio
 
 from .app import build_app, build_server
 from .bridge import EventBridge, NotificationRouter, bridge_for
+from .mutations import MutationHooks, register_mutation_tools
 from .reads import ProjectView
 from .resources import register_resources
 from .tools import register_tools
 
 
-class ReadSurface:
-    """The read half of the embedded server, assembled and lifecycle-aware."""
+class McpSurface:
+    """The embedded server's tool surface, assembled and lifecycle-aware."""
 
-    def __init__(self, manager, *, usage_store=None) -> None:
+    def __init__(
+        self,
+        manager,
+        *,
+        usage_store=None,
+        hooks: MutationHooks | None = None,
+    ) -> None:
         from mcp.server.subscriptions import InMemorySubscriptionBus
 
         self.view = ProjectView(manager, usage_store=usage_store)
+        self.hooks = hooks
         self.bus = InMemorySubscriptionBus()
         self.server = build_server(bus=self.bus)
         register_tools(self.server, self.view)
+        if hooks is not None:
+            register_mutation_tools(self.server, self.view, hooks)
         register_resources(self.server, self.view)
         self.router: NotificationRouter | None = None
         self.bridge: EventBridge | None = None
@@ -91,4 +110,10 @@ class ReadSurface:
             router.close()
 
 
-__all__ = ["ReadSurface"]
+#: Historical name of the pre-mutation surface — the read-only half. Kept
+#: as an alias so older imports (and the tests' read fixtures) keep
+#: working; the TUI now builds the full surface.
+ReadSurface = McpSurface
+
+
+__all__ = ["McpSurface", "ReadSurface"]

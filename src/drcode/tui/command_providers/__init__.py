@@ -11,12 +11,10 @@ Modules:
   providers and per-preference option providers;
 - ``models`` — per-role model pickers;
 - ``themes`` — the theme picker;
-- ``deps`` — dependency-gate commands;
 - ``merge`` — the merge-conflict screen entry.
 """
 
 from .base import CommandEntry, CommandListProvider, SpacedCommandList
-from .deps import DependencyCommandsProvider
 from .merge import MergeCommandsProvider
 from .models import ProjectModelSettingsCommandProvider, role_model_options_provider
 from .settings import (
@@ -58,7 +56,6 @@ __all__ = [
     "AgentChainsCommandProvider",
     "CommandEntry",
     "CommandListProvider",
-    "DependencyCommandsProvider",
     "DevRoundsOptionsProvider",
     "EscAbortOptionsProvider",
     "GitResearchOptionsProvider",

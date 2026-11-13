@@ -51,7 +51,7 @@ from ..core.usage import (
     _network_retry_delay,
 )
 from ..models import PendingInput, Task, TaskKind, TaskStatus
-from ..providers import AgentRole, resolve_available
+from ..providers import AgentRole, resolve_available, subagent_usage_key
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
@@ -307,13 +307,22 @@ class PipelineAgentRunLayer(CoreState):
                             # create DRAFT tasks when the setting is on
                             # (the user finishes them in the editor).
                             agent_creates_drafts=(self.settings.agent_creates_drafts),
-                            # delegate_research subagents run on THIS
-                            # role's model: their usage folds into the
-                            # per-day store under the parent's key (see
+                            # delegate_research subagents run on the
+                            # project's `models["subagent"]` slot when one
+                            # is set, else on THIS role's model: their
+                            # usage folds into the per-day store under the
+                            # subagent's OWN key in the first case, the
+                            # parent's key in the second (see
+                            # providers.subagent_usage_key and
                             # _record_session_usage).
                             record_usage=(
                                 lambda u, _role=role: self._record_session_usage(
-                                    u, _role, self.resolved_model_key(_role)
+                                    u,
+                                    *subagent_usage_key(
+                                        self.config,
+                                        _role,
+                                        self.resolved_model_key(_role),
+                                    ),
                                 )
                             ),
                             # The research agent's web_fetch budget/policy

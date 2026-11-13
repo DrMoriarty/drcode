@@ -12,6 +12,7 @@ FunctionModel stubs — no network.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 
@@ -31,7 +32,11 @@ from drcode.config import Config
 from drcode.models import TaskKind
 from drcode.providers import AgentRole
 from drcode.settings import ProjectSettings
-from drcode.subagents import build_subagent_agent, git_read
+from drcode.subagents import (
+    _subagent_model_config,
+    build_subagent_agent,
+    git_read,
+)
 from drcode.task_manager import TaskManager
 from drcode.tool_runtime import _run_tool
 from tests.network_mocks import text_response
@@ -638,3 +643,233 @@ def test_git_read_empty_output_is_marker(git_repo: Path) -> None:
     not an empty string the model cannot tell from silence."""
     out = git_read(git_repo, ["diff", "HEAD", "HEAD"])
     assert out == "(empty output)"
+
+
+# -- the subagent model slot (models["subagent"]) ---------------------------------
+#
+# The subagents' own project-level model slot: a catalog reference or the
+# "subagent" custom model; empty/absent = inherit the parent role's model
+# (the historical behavior). See providers.resolve_subagent.
+
+
+def _seed_cheap_catalog() -> None:
+    from drcode.providers import (
+        ModelEntry,
+        Provider,
+        UserModelsConfig,
+        UserModelsStore,
+    )
+
+    UserModelsStore().save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="cheap",
+                    base_url="http://cheap/v1",
+                    api_key="k-cheap",
+                    models=[
+                        ModelEntry(
+                            id="mini",
+                            max_context_tokens=32_000,
+                            max_tokens=2048,
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+
+
+def _slot_config(project_root: Path, raw: dict[str, object]) -> Config:
+    (project_root / ".drcode").mkdir(parents=True, exist_ok=True)
+    (project_root / ".drcode" / "drcode.json").write_text(json.dumps(raw))
+    return Config(
+        project_root=project_root,
+        model="big-model",
+        base_url="http://big/v1",
+        api_key="k-big",
+    )
+
+
+def test_subagent_slot_resolves_own_model(project_root: Path) -> None:
+    """A catalog reference in models["subagent"] resolves to the slot's
+    connection WITH the entry's token caps — the subagent run is measured
+    against ITS model's window, not the parent's."""
+    _seed_cheap_catalog()
+    config = _slot_config(
+        project_root, {"models": {"subagent": "cheap/mini"}}
+    )
+    own = _subagent_model_config(config)
+    assert own.model == "mini"
+    assert own.base_url == "http://cheap/v1"
+    assert own.api_key == "k-cheap"
+    assert own.max_context_tokens == 32_000
+    assert own.max_tokens == 2048
+    # The parent's config is untouched (resolve never mutates the input).
+    assert config.model == "big-model"
+    # The built agent actually carries the cheap model's connection.
+    ag = build_subagent_agent(own, root=project_root)
+    from pydantic_ai.models import Model
+
+    from drcode.agent_model import openai_client_of, unwrap_model
+
+    # Agent.model is `Model | str | None` (a model name or "not built"
+    # are legal states) — the builder hands back a real Model here.
+    model = ag.model
+    assert isinstance(model, Model)
+    assert unwrap_model(model).model_name == "mini"
+    assert (
+        str(openai_client_of(model).base_url).rstrip("/") == "http://cheap/v1"
+    )
+
+
+def test_subagent_custom_slot_resolves_own_connection(project_root: Path) -> None:
+    """models["subagent"] = "custom" activates custom_models["subagent"] —
+    a full independent connection with its own concurrency cap."""
+    config = _slot_config(
+        project_root,
+        {
+            "models": {"subagent": "custom"},
+            "custom_models": {
+                "subagent": {
+                    "model": "free-m",
+                    "base_url": "http://free/v1",
+                    "api_key": "k-free",
+                    "max_context_tokens": 16_000,
+                    "max_parallel_requests": 2,
+                }
+            },
+        },
+    )
+    own = _subagent_model_config(config)
+    assert own.model == "free-m"
+    assert own.base_url == "http://free/v1"
+    assert own.api_key == "k-free"
+    assert own.max_context_tokens == 16_000
+    assert own.provider_max_parallel_requests == 2
+
+
+def test_subagent_without_slot_inherits_parent_config(project_root: Path) -> None:
+    """No slot (the default), a DANGLING reference and an unparsable custom
+    entry all read as "inherit": the parent's config comes back unchanged
+    — the exact pre-slot behavior."""
+    config = Config(
+        project_root=project_root,
+        model="big-model",
+        base_url="http://big/v1",
+    )
+    # Nothing in the project json at all.
+    assert _subagent_model_config(config) is config
+    # A dangling reference (no matching provider in the user catalog).
+    _seed_cheap_catalog()
+    dangling = _slot_config(
+        project_root, {"models": {"subagent": "nowhere/gone"}}
+    )
+    own = _subagent_model_config(dangling)
+    assert own.model == "big-model"
+    assert own.base_url == "http://big/v1"
+    # A "custom" slot with no saved custom_models entry.
+    broken = _slot_config(project_root, {"models": {"subagent": "custom"}})
+    assert _subagent_model_config(broken).model == "big-model"
+
+
+def test_subagent_env_override_beats_the_slot(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DRCODE_MODEL wins globally for every role — the subagent slot
+    included, which here means plain inheritance of the parent's (env)
+    model."""
+    _seed_cheap_catalog()
+    config = _slot_config(
+        project_root, {"models": {"subagent": "cheap/mini"}}
+    )
+    monkeypatch.setenv("DRCODE_MODEL", "env-model")
+    monkeypatch.setenv("DRCODE_BASE_URL", "http://env/v1")
+    own = _subagent_model_config(config)
+    assert own is config  # inherit: the parent config already IS the env model
+
+
+def test_subagent_usage_key_own_and_inherited(project_root: Path) -> None:
+    """The usage-accounting target: the subagent's OWN
+    ("subagent/<model-id>") key when the slot resolves, the parent's
+    role/key otherwise (incl. the env override and a dangling slot)."""
+    from drcode.providers import resolve_model_key, subagent_usage_key
+
+    # Nothing slotted: the parent's key.
+    plain = Config(project_root=project_root, model="big-model")
+    assert resolve_model_key(plain, AgentRole.SUBAGENT) == ""
+    assert subagent_usage_key(
+        plain, AgentRole.CODING, "coding/big-model"
+    ) == (AgentRole.CODING, "coding/big-model")
+
+    # A catalog reference: the subagent's own key.
+    _seed_cheap_catalog()
+    slotted = _slot_config(
+        project_root, {"models": {"subagent": "cheap/mini"}}
+    )
+    assert resolve_model_key(slotted, AgentRole.SUBAGENT) == "cheap/mini"
+    assert subagent_usage_key(
+        slotted, AgentRole.CODING, "coding/big-model"
+    ) == (AgentRole.SUBAGENT, "cheap/mini")
+
+    # A custom model: bare id (no provider name in the key).
+    custom = _slot_config(
+        project_root,
+        {
+            "models": {"subagent": "custom"},
+            "custom_models": {
+                "subagent": {"model": "free-m", "base_url": "http://free/v1"}
+            },
+        },
+    )
+    assert resolve_model_key(custom, AgentRole.SUBAGENT) == "free-m"
+
+    # Dangling reference: back to the parent's key.
+    dangling = _slot_config(
+        project_root, {"models": {"subagent": "nowhere/gone"}}
+    )
+    assert resolve_model_key(dangling, AgentRole.SUBAGENT) == ""
+
+
+def test_delegation_records_usage_under_subagent_key(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """With a slotted subagent model the whole nested run's usage is
+    recorded under the SUBAGENT role and the slot's model key — not the
+    parent's (the pipeline wires deps.record_usage through
+    providers.subagent_usage_key; this replays exactly that wiring)."""
+    from drcode.providers import subagent_usage_key
+
+    _seed_cheap_catalog()
+    config = _slot_config(
+        project_root, {"models": {"subagent": "cheap/mini"}}
+    )
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(
+            lambda messages, info: text_response("cheap findings")
+        ),
+    )
+    task = manager.create("T", "delegate me")
+    recorded: list[tuple[AgentRole, str]] = []
+
+    def capture(usage: object) -> None:
+        # The pipeline's closure shape (pipeline_agent_run.py), replayed:
+        role, key = subagent_usage_key(
+            config, AgentRole.CODING, "coding/big-model"
+        )
+        recorded.append((role, key))
+
+    deps = AgentDeps(
+        root=project_root,
+        manager=manager,
+        task_id=task.id,
+        scratch=project_root / "scratch",
+        subagent_gate=SubagentGate(1),
+        record_usage=capture,
+    )
+    out = asyncio.run(run_delegate_tool(deps, config, "Investigate foo"))
+    assert "cheap findings" in out
+    assert recorded == [(AgentRole.SUBAGENT, "cheap/mini")]

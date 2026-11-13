@@ -157,9 +157,11 @@ class AgentDeps:
 
     `record_usage`, when set, is called by the nested `delegate_research`
     subagent run with its total RunUsage — the pipeline wires it to
-    `_record_session_usage` with the PARENT's role and model key, so the
-    subagent's tokens are accounted on the model that actually served
-    them (the subagent runs on the parent's config).
+    `_record_session_usage` with the role/model key the subagent
+    actually ran on (`providers.subagent_usage_key`): the project's
+    `models["subagent"]` slot ("subagent/<model-id>") when one is pinned,
+    else the PARENT's role and model key (the subagent inherits the
+    parent's config).
 
     `web_fetch_gate` carries the research run's `web_fetch` budget and its
     policy (None = web fetch off: the tool is not even registered). It is

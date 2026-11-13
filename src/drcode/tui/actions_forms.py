@@ -60,10 +60,16 @@ class TaskFormLayer(DrCodeState):
         entry = custom_entry_from_setup(setup)
         try:
             for role in AgentRole:
-                if role in (AgentRole.RESEARCH, AgentRole.RESOLVER):
+                if role in (
+                    AgentRole.RESEARCH,
+                    AgentRole.RESOLVER,
+                    AgentRole.SUBAGENT,
+                ):
                     # Unpinned on purpose: research and the merge-conflict
                     # resolver fall back to the coding model (see
-                    # providers.resolve_effective).
+                    # providers.resolve_effective); the subagent slot
+                    # inherits the PARENT run's role model (see
+                    # providers.resolve_subagent).
                     continue
                 set_project_custom_model(self.project_root, role, entry)
         except OSError as e:

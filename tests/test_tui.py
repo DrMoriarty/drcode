@@ -3022,8 +3022,9 @@ async def test_project_model_dialog_form_and_apply(
         dialog = app.screen
         assert isinstance(dialog, ProjectModelSettingsDialog)
 
-        # Five role sections, each with a model Select and a max_tokens
-        # Input whose placeholder is the role's effective cap.
+        # Six role sections (incl. the subagents pseudo-role), each with a
+        # model Select and a max_tokens Input whose placeholder is the
+        # role's effective cap.
         for role in AgentRole:
             select = _pms_select(dialog, role)
             input_widget = _pms_input(dialog, role)
@@ -3032,7 +3033,12 @@ async def test_project_model_dialog_form_and_apply(
             assert "__custom__" in values
             assert "__user_default__" in values
             assert "Custom…" in prompts
-            assert any(p.startswith("User default") for p in prompts)
+            reset_label = (
+                "Inherit parent role"
+                if role is AgentRole.SUBAGENT
+                else "User default"
+            )
+            assert any(p.startswith(reset_label) for p in prompts)
             assert input_widget.placeholder == str(app.resolved_config(role).max_tokens)
         # The selected model carries NO marker — the Select's own field
         # shows it — and the appended " (default)"/" (current)" words are

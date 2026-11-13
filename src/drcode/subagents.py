@@ -243,13 +243,27 @@ def subagent_limit_for(settings: ProjectSettings, role: AgentRole) -> int:
     return settings.subagents_coder
 
 
+def _subagent_model_config(config: Config) -> Config:
+    """The config the subagent runs on: the project's `models["subagent"]`
+    slot when one resolves (`providers.resolve_subagent` — a catalog
+    reference or the "subagent" custom model, with the entry's token
+    caps), else the parent role's config UNCHANGED — the historical
+    inheritance (a coding parent's subagents run on the coding model, a
+    research parent's on the research model). Split into a helper so the
+    resolution point is explicit and testable."""
+    from .providers import resolve_subagent
+
+    return resolve_subagent(config)
+
+
 def _build_subagent_model(
     config: Config, announce_wait: agent_model.WaitAnnouncer | None = None
 ):
-    """The subagent's model: the resolved config of the role serving the
-    parent (CODING → the coding model, RESEARCH → the research model —
-    `build_agent` receives exactly that config). Split into a helper so
-    the test-suite can stub it without touching the parent's wiring.
+    """The subagent's model, built from `config` — ALREADY subagent-
+    resolved by `build_subagent_agent` (`_subagent_model_config`: the
+    project's subagent slot, else the parent role's config). Kept a thin
+    build helper so the test-suite can stub it without touching the
+    parent's wiring.
 
     `announce_wait` rides along like everywhere else: a subagent request
     queued behind the provider's `max_parallel_requests` cap reports the
@@ -285,18 +299,28 @@ def build_subagent_agent(
     the tool is not registered and the system prompt does not mention it.
 
     `announce_wait` (the parent run's slot-wait announcer) is forwarded to
-    the model builder — see `_build_subagent_model`."""
+    the model builder — see `_build_subagent_model`.
+
+    The model comes from the project's `models["subagent"]` slot when one
+    resolves (`_subagent_model_config` — a catalog reference or the
+    "subagent" custom model, with the entry's token caps), else from the
+    parent role's config unchanged (the inheritance). Everything that
+    shapes the run — model settings (max_tokens), the batch guard, the
+    model itself — is measured against the RESOLVED config, so a cheap
+    subagent model with a small window behaves like any other role's
+    model."""
+    model_config = _subagent_model_config(config)
     agent = Agent(
-        _build_subagent_model(config, announce_wait),
+        _build_subagent_model(model_config, announce_wait),
         instructions=_subagent_instructions(root, web_fetch_policy),
         deps_type=SubagentDeps,
-        model_settings=agent_model.base_model_settings(config),
+        model_settings=agent_model.base_model_settings(model_config),
         # Short runs: fewer retries than the parent agents keep.
         retries=3,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
     # a subagent with five read tools can degenerate just like a parent.
-    attach_batch_guard(agent, config.tool_batch_limit)
+    attach_batch_guard(agent, model_config.tool_batch_limit)
 
     @agent.tool
     async def read_file(
@@ -482,8 +506,13 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             parent_web_fetch_gate.policy, limit=SUBAGENT_FETCHES_PER_RUN
         )
     try:
+        # The subagent's own model when the project pinned one
+        # (`models["subagent"]`), else the parent role's config (the
+        # inheritance) — resolved ONCE here and reused for the agent
+        # build (which re-resolves idempotently) and the usage limits.
+        model_config = _subagent_model_config(config)
         agent = build_subagent_agent(
-            config,
+            model_config,
             root=deps.root,
             announce_wait=deps.wait_announcer,
             web_fetch_policy=(
@@ -503,7 +532,7 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             async with agent.iter(
                 brief,
                 deps=subagent_deps,
-                usage_limits=UsageLimits(request_limit=config.request_limit),
+                usage_limits=UsageLimits(request_limit=model_config.request_limit),
             ) as run:
                 async for _node in run:
                     # Keep the parent's stall-watchdog fed while the
@@ -518,9 +547,13 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             usage = result.usage
             # The subagent's tokens are billed the same as the parent's:
             # fold the whole nested run's usage into the per-day usage
-            # store under the parent's role/model key (the recorder is
-            # wired by the pipeline — see AgentDeps.record_usage). Best
-            # effort: an accounting failure must not fail the delegation.
+            # store. The (role, model key) the recording lands under is
+            # decided by the PIPELINE's recorder wiring
+            # (`providers.subagent_usage_key`): the subagent's OWN
+            # "subagent/<model-id>" key when the project pinned a subagent
+            # model, else the parent's role/key (the inherited model). See
+            # AgentDeps.record_usage. Best effort: an accounting failure
+            # must not fail the delegation.
             if deps.record_usage is not None and usage.total_tokens:
                 try:
                     deps.record_usage(usage)

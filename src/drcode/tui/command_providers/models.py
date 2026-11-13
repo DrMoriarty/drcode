@@ -34,9 +34,9 @@ class ProjectModelSettingsCommandProvider(CommandListProvider):
                 "Project model settings…",
                 app.action_open_project_model_settings,
                 "Model and max_tokens override per agent role (coding / "
-                "research / tester / compaction / resolver) — the model "
-                "slots go to the project's drcode.json, the max_tokens "
-                "overrides to the project's settings.json",
+                "research / tester / compaction / resolver / subagents) — "
+                "the model slots go to the project's drcode.json, the "
+                "max_tokens overrides to the project's settings.json",
             ),
         ]
 

@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from rich.text import Text
 from textual.app import App
+from textual.css.query import NoMatches
 from textual.widgets import Button, Input, OptionList, Static
 
 from drcode.providers import (
@@ -413,8 +415,9 @@ async def test_opened_from_catalog_screen_shares_catalog(tmp_path: Path) -> None
 
 
 async def test_add_button_ids_cover_all_roles(tmp_path: Path) -> None:
-    """Every role group carries its Add/Del buttons (the ids the handlers
-    dispatch on)."""
+    """Every chain role group carries its Add/Del buttons (the ids the
+    handlers dispatch on). The SUBAGENT pseudo-role has no group: its
+    model slot is project-level, no user-level chain exists for it."""
     path = tmp_path / "models.json"
     store = _seed_store(path)
     async with _Host(store).run_test(size=(120, 56)) as pilot:
@@ -422,6 +425,10 @@ async def test_add_button_ids_cover_all_roles(tmp_path: Path) -> None:
         screen = pilot.app.screen
         assert isinstance(screen, AgentChainsScreen)
         for role in AgentRole:
+            if role is AgentRole.SUBAGENT:
+                with pytest.raises(NoMatches):
+                    screen.query_one(f"#ac-add-{role.value}", Button)
+                continue
             assert screen.query_one(f"#ac-add-{role.value}", Button)
             assert screen.query_one(f"#ac-del-{role.value}", Button)
             assert screen.query_one(f"#ac-list-{role.value}", OptionList)

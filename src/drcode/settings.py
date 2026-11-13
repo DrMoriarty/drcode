@@ -684,6 +684,18 @@ class ProjectSettings(BaseModel):
     # it last): a thinking model burns the default 8192 budget on
     # reasoning alone, so the tester/resolver roles commonly need 16–32k.
     role_max_tokens: dict[str, int] = Field(default_factory=dict)
+    # -- per-role request timeouts -------------------------------------------
+    # Per-role REQUEST TIMEOUT overrides, in seconds: keys are AgentRole
+    # values, values are positive ints. Absent / 0 = the OpenAI SDK default
+    # (600 s read/write). The value is carried into the role's resolved
+    # `Config.request_timeout` by `providers.resolve` and lands in
+    # `AsyncOpenAI(timeout=...)` only for the role it is set on — every
+    # other role keeps the SDK default. Exposed by the project model
+    # settings dialog for the COMPACTION role only: a summarizer call
+    # prefills a multi-hundred-k-token transcript and legitimately needs a
+    # longer read window than a coding turn (a real case died at exactly
+    # 600 s mid-generation).
+    role_request_timeout: dict[str, int] = Field(default_factory=dict)
 
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
@@ -745,6 +757,19 @@ class ProjectSettings(BaseModel):
     # transcripts the ordinary threshold gate never touches, trading
     # cache warmth for summarizer calls for nothing.
     compaction_resume_min_tokens: int = 0
+    # Giant-prompt splitting of the compaction summarizer: when ON and the
+    # SINGLE-SHOT summarizer prompt exceeds `compaction.GIANT_PROMPT_TOKENS`
+    # (256k tokens by the chars/4 estimate), the history is chunked into a
+    # map-reduce of ~EQUAL slices instead — n = ceil(total / 256k) parts of
+    # total/n each (300k → two 150k slices, deliberately NOT 256k + 44k),
+    # cut at conversation boundaries by the same chunker the ordinary
+    # over-window map-reduce uses. Off (the default) keeps the historical
+    # behavior: one summarizer call as long as the prompt fits the model's
+    # window, whatever its size. On is for gateways/models that stall or
+    # die on a multi-hundred-k prefill (the 600 s read timeout, a runaway
+    # output budget) — a uniform split makes every map call predictable.
+    # Read per summarizer call, so a toggle applies to the next compaction.
+    compaction_split_giant_prompt: bool = False
 
     @field_validator("role_max_tokens", mode="before")
     @classmethod
@@ -753,16 +778,14 @@ class ProjectSettings(BaseModel):
         int (a stray key or a typo in settings.json must not invalidate
         the WHOLE file — the wholesale default fallback of load() is
         reserved for structural corruption)."""
-        if not isinstance(value, dict):
-            return value
-        return {
-            key: int(v)
-            for key, v in value.items()
-            if key in _ROLE_MAX_TOKENS_KEYS
-            and isinstance(v, int | float)
-            and not isinstance(v, bool)
-            and int(v) > 0
-        }
+        return _clean_role_int_map(value)
+
+    @field_validator("role_request_timeout", mode="before")
+    @classmethod
+    def _clean_role_request_timeout(cls, value: object) -> object:
+        """Same filtering as `role_max_tokens` (see `_clean_role_int_map`):
+        the per-role request timeouts are as typo-prone as the token caps."""
+        return _clean_role_int_map(value)
 
     @field_validator("web_fetch_allow_hosts", "web_fetch_block_hosts", mode="before")
     @classmethod
@@ -785,12 +808,29 @@ class ProjectSettings(BaseModel):
         return max(int(value), 0)
 
 
-# Valid keys of ProjectSettings.role_max_tokens: the AgentRole values
-# (duplicated here as literals — settings.py must not import providers.py,
-# which reads this module).
+# Valid keys of the per-role int maps (ProjectSettings.role_max_tokens and
+# role_request_timeout): the AgentRole values (duplicated here as literals —
+# settings.py must not import providers.py, which reads this module).
 _ROLE_MAX_TOKENS_KEYS: frozenset[str] = frozenset(
     {"coding", "research", "tester", "compaction", "resolver"}
 )
+
+
+def _clean_role_int_map(value: object) -> object:
+    """Validator body of the per-role int maps: keep only valid role keys
+    with a positive int value. A stray key or a typo must not invalidate
+    the WHOLE settings file (the wholesale default fallback of `load()` is
+    reserved for structural corruption)."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: int(v)
+        for key, v in value.items()
+        if key in _ROLE_MAX_TOKENS_KEYS
+        and isinstance(v, int | float)
+        and not isinstance(v, bool)
+        and int(v) > 0
+    }
 
 
 @dataclass

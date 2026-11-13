@@ -453,6 +453,51 @@ def test_resolve_role_max_tokens_does_not_mutate_original(
     assert config.max_tokens == 1234
 
 
+# -- per-role request timeout override -----------------------------------------------
+
+
+def _set_role_request_timeout(project_root: Path, role: AgentRole, value: int) -> None:
+    from drcode.settings import ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    settings = store.load()
+    settings.role_request_timeout[role.value] = value
+    store.save(settings)
+
+
+def test_resolve_role_request_timeout_lands_on_the_role(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The project's per-role request timeout rides the resolved config of
+    EXACTLY that role: only the compaction summarizer gets a non-default
+    `Config.request_timeout` (0 = the OpenAI SDK default), every other
+    role keeps 0 — `agent_model.build_model` needs no role knowledge."""
+    set_project_model(
+        project_root,
+        AgentRole.COMPACTION,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m")
+    assert resolve(config, AgentRole.COMPACTION).request_timeout == 0
+    _set_role_request_timeout(project_root, AgentRole.COMPACTION, 900)
+    resolved = resolve(config, AgentRole.COMPACTION)
+    assert resolved.request_timeout == 900.0
+    assert resolved.model == "qwen3-coder-30b"
+    # The other roles keep the SDK default.
+    for role in AgentRole:
+        if role is not AgentRole.COMPACTION:
+            assert resolve(config, role).request_timeout == 0
+
+
+def test_resolve_role_request_timeout_does_not_mutate_original(
+    project_root: Path,
+) -> None:
+    _set_role_request_timeout(project_root, AgentRole.COMPACTION, 900)
+    config = make_config(project_root, model="flat-m")
+    resolve(config, AgentRole.COMPACTION)
+    assert config.request_timeout == 0
+
+
 def test_resolve_does_not_mutate_original(
     project_root: Path, catalog: UserModelsConfig
 ) -> None:

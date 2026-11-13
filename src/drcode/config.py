@@ -97,14 +97,20 @@ _LEGACY_PROJECT_CONFIG_FILENAME = "drcode.json"
 # (~/.config/drcode/models.json) or in the project's per-role selections.
 _EXAMPLE_PLACEHOLDERS: dict[str, str] = {}
 
-# The per-model connection fields of `Config`. They stay on the model (the
-# env/dotenv layers still populate them — DRCODE_MODEL etc. — and
-# `drcode.providers.resolve` writes its result into a copy of Config), but
-# they are deliberately NOT read from any json layer: the model selection
-# lives in the user-level catalog and the project's `models` /
-# `custom_models` keys. Legacy flat keys inside a drcode.json are consumed
-# by the startup migrations (`drcode.providers.migrate_user_config` /
-# `migrate_project_config`) instead.
+# Fields that are written ONLY by the resolver (`drcode.providers.resolve`
+# over a Config copy) and are deliberately NOT read from any json layer.
+#
+# The first block is the per-model CONNECTION: the model selection lives in
+# the user-level catalog and the project's `models` / `custom_models` keys,
+# so a drcode.json cannot set them. Legacy flat keys inside a drcode.json
+# are consumed by the startup migrations
+# (`drcode.providers.migrate_user_config` / `migrate_project_config`).
+#
+# `request_timeout` is NOT a connection field — it is a per-role request
+# budget — but it shares the layering rule for the same reason: its value is
+# per ROLE (project settings `role_request_timeout`, see
+# `drcode.settings.ProjectSettings`), which a flat json key cannot express;
+# the resolver writes the role's value over the Config copy.
 _PROVIDER_FIELDS: frozenset[str] = frozenset(
     {
         "model",
@@ -114,6 +120,7 @@ _PROVIDER_FIELDS: frozenset[str] = frozenset(
         "max_context_tokens",
         "max_tokens",
         "provider_extra_body",
+        "request_timeout",
     }
 )
 
@@ -152,6 +159,15 @@ class Config(BaseSettings):
     # the provider's `extra_body` in the user-level catalog (models.json).
     # Empty dict = nothing is added to the request bodies.
     provider_extra_body: dict[str, Any] = {}
+    # Per-request read/write timeout (SECONDS) of the OpenAI client serving
+    # this role's model; 0 (the default) = the OpenAI SDK default
+    # (600 s read/write). Set only through the project's per-role override
+    # (`ProjectSettings.role_request_timeout`, project model settings
+    # dialog); `providers.resolve` writes the role's value over a Config
+    # copy, so `agent_model.build_model` needs no role knowledge. Currently
+    # only the COMPACTION role gets a non-default value — the ui exposes
+    # exactly that field — but the plumbing is role-generic.
+    request_timeout: float = 0
     # Context fill (percent of max_context_tokens) at which the agent's
     # history is compacted before the next turn: a tool-less summarizer
     # agent rewrites the transcript into a structured summary while the

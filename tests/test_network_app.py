@@ -961,6 +961,124 @@ async def test_summarizer_streamed_output_is_unwrapped(
     assert '{"summary"' not in summary
 
 
+def _seed_giant_transcript(app: DrCodeApp) -> Any:
+    """A transcript of three ~95k-token turns (~285k tokens in total):
+    past GIANT_PROMPT_TOKENS (256k) but — with the wide compaction window —
+    still inside the single-shot window, so only the giant-split setting
+    decides between one call and the even map-reduce."""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.usage import RequestUsage
+
+    task = app.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    messages = []
+    for i in range(3):
+        messages.append(
+            ModelRequest(parts=[UserPromptPart(f"turn {i}: " + "x" * 380_000)])
+        )
+        messages.append(
+            ModelResponse(
+                parts=[TextPart("work")],
+                usage=RequestUsage(input_tokens=900, output_tokens=8),
+            )
+        )
+    task.messages = serialize_messages(messages)
+    app.manager.storage.save(task)
+    return task
+
+
+def _giant_compaction_window(
+    monkeypatch: pytest.MonkeyPatch, tokens: int = 500_000
+) -> None:
+    """wide_compaction with a 500k compaction window: the ~285k-token
+    single-shot prompt fits, the serving window stays small (1000 tokens —
+    the compaction gate of the small-ctx app still fires)."""
+    real = DrCodeApp.resolved_config
+
+    def resolved(self: DrCodeApp, role: AgentRole):  # type: ignore[no-untyped-def]
+        cfg = real(self, role)
+        if role is AgentRole.COMPACTION:
+            return cfg.model_copy(update={"max_context_tokens": tokens})
+        return cfg
+
+    monkeypatch.setattr(DrCodeApp, "resolved_config", resolved)
+
+
+async def test_giant_prompt_split_even_map_reduce(
+    net_app_small_ctx: DrCodeApp,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compaction_split_giant_prompt setting ON: a single-shot
+    summarizer prompt past 256k tokens is cut into ~EQUAL slices (n =
+    ceil(total / 256k), each ~total/n) even though it still fits the
+    window — the slice budget comes from the even-split rule, not from the
+    model's window. Three ~95k-token turns → 285k total → n = 2, budget
+    142.5k → one slice per turn (3 map calls) + the reduce call."""
+    _giant_compaction_window(monkeypatch)
+    net_app_small_ctx.settings.compaction_split_giant_prompt = True
+    bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+    )
+    task = _seed_giant_transcript(net_app_small_ctx)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert any("splitting it into" in t and "equal slice(s)" in t for t in texts)
+    assert not any("compaction failed" in t for t in texts)
+    # 3 map calls + the reduce call; no single request carries the whole
+    # giant history (the even split, not 256k + the remainder).
+    assert len(bodies) == 4
+    map_bodies = bodies[:-1]
+    assert all(
+        len(json.dumps(body["messages"], ensure_ascii=False)) < 1_000_000
+        for body in map_bodies
+    )
+    assert any("Context compacted" in t for t in texts)
+    assert "THE SUMMARY BODY" in json.dumps(task.messages)
+
+
+async def test_giant_prompt_split_off_keeps_single_shot(
+    net_app_small_ctx: DrCodeApp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The setting OFF (the default) keeps the historical behavior: one
+    summarizer call with the whole giant prompt as long as it fits the
+    compaction model's window."""
+    _giant_compaction_window(monkeypatch)
+    bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+    )
+    task = _seed_giant_transcript(net_app_small_ctx)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    texts = event_texts(task)
+    assert not any("splitting it into" in t for t in texts)
+    assert any("Context compacted" in t for t in texts)
+    # Exactly ONE summarizer call, carrying the entire giant history.
+    assert len(bodies) == 1
+    assert len(json.dumps(bodies[0]["messages"], ensure_ascii=False)) > 1_000_000
+    assert "THE SUMMARY BODY" in json.dumps(task.messages)
+
+
 async def test_compaction_preflight_skips_llm_and_trims_mechanically(
     net_app_small_ctx: DrCodeApp, scripted: ScriptedState
 ) -> None:

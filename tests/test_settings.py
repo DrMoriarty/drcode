@@ -336,6 +336,55 @@ def test_store_role_max_tokens_stale_entries_dropped(
     assert loaded.role_max_tokens == {"tester": 16384}
 
 
+# -- role_request_timeout / compaction_split_giant_prompt ----------------------------
+
+
+def test_role_request_timeout_default_empty() -> None:
+    """No timeout overrides by default: every role keeps the OpenAI SDK
+    default (600 s read/write)."""
+    assert ProjectSettings().role_request_timeout == {}
+    assert ProjectSettings().compaction_split_giant_prompt is False
+
+
+def test_store_role_request_timeout_roundtrip(project_root: Path) -> None:
+    store = ProjectSettingsStore(project_root)
+    settings = ProjectSettings(
+        role_request_timeout={"compaction": 900},
+        compaction_split_giant_prompt=True,
+    )
+    store.save(settings)
+    assert store.load() == settings
+    data = json.loads(store.path.read_text())
+    assert data["role_request_timeout"] == {"compaction": 900}
+    assert data["compaction_split_giant_prompt"] is True
+
+
+def test_role_request_timeout_invalid_entries_dropped() -> None:
+    """Same filtering as role_max_tokens: unknown role keys and
+    non-positive values are dropped at load, a typo must not invalidate
+    the whole settings file."""
+    settings = ProjectSettings(
+        role_request_timeout={
+            "compaction": 900,
+            "bogus": 60,  # not an AgentRole value
+            "tester": 0,  # not positive
+            "coding": -5,  # not positive
+        }
+    )
+    assert settings.role_request_timeout == {"compaction": 900}
+
+
+def test_store_role_request_timeout_stale_entries_dropped(
+    project_root: Path,
+) -> None:
+    store = _write_raw_settings(
+        project_root,
+        {"role_request_timeout": {"compaction": 900, "bogus": 7, "tester": 0}},
+    )
+    loaded = store.load()
+    assert loaded.role_request_timeout == {"compaction": 900}
+
+
 # -- Legacy task_finalization migration ------------------------------------------
 
 

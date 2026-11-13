@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -60,6 +60,30 @@ def test_build_model_client_disables_silent_sdk_retries() -> None:
     client = model.client
     assert isinstance(client, AsyncOpenAI)
     assert client.max_retries == 0
+
+
+def test_build_model_client_default_timeout_is_sdk_default() -> None:
+    """request_timeout 0 (the default) keeps the OpenAI SDK timeout
+    untouched (600 s read/write): only a configured per-role override may
+    change the budget."""
+    model = agent_model.build_model(make_config())
+    timeout = cast(httpx.Timeout, model.client.timeout)
+    default = cast(httpx.Timeout, agent_model.DEFAULT_TIMEOUT)
+    assert timeout.read == default.read
+    assert timeout.write == default.write
+
+
+def test_build_model_client_applies_request_timeout() -> None:
+    """A configured request_timeout raises ONLY read/write (connect/pool
+    keep the SDK values): a slow-but-alive summarizer generation must not
+    be cut off, and no request stalls forever either."""
+    model = agent_model.build_model(make_config(request_timeout=900))
+    timeout = cast(httpx.Timeout, model.client.timeout)
+    default = cast(httpx.Timeout, agent_model.DEFAULT_TIMEOUT)
+    assert timeout.read == 900.0
+    assert timeout.write == 900.0
+    assert timeout.connect == default.connect
+    assert timeout.pool == default.pool
 
 
 # -- HTTP status errors ------------------------------------------------------------

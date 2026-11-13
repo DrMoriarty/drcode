@@ -15,7 +15,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from openai import AsyncOpenAI
+from openai import DEFAULT_TIMEOUT, AsyncOpenAI
+from openai import Timeout as timeout_cls
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -293,6 +294,25 @@ async def probe_model(
     return True, "", f"{base_url.rstrip('/')}/chat/completions"
 
 
+def _client_timeout(config: Config) -> Any:
+    """The `timeout` argument for `AsyncOpenAI`.
+
+    A configured `request_timeout` (> 0) becomes a per-phase timeout with
+    the SDK's own connect/pool values kept — raising only read/write so a
+    slow-but-alive generation is not cut off, and no request stalls forever
+    either. 0/absent keeps the SDK default (`DEFAULT_TIMEOUT`, 600 s
+    read/write), i.e. `None` is passed through unchanged.
+    """
+    if config.request_timeout <= 0:
+        return DEFAULT_TIMEOUT
+    return timeout_cls(
+        connect=DEFAULT_TIMEOUT.connect,
+        read=config.request_timeout,
+        write=config.request_timeout,
+        pool=DEFAULT_TIMEOUT.pool,
+    )
+
+
 def build_model(config: Config):
     client = AsyncOpenAI(
         base_url=config.base_url,
@@ -300,6 +320,12 @@ def build_model(config: Config):
         # valid Authorization header: "Bearer " is rejected by httpx.
         api_key=config.api_key or "no-key",
         default_headers=EXTRA_HEADERS,
+        # Per-role request budget (Config.request_timeout, written by
+        # providers.resolve from ProjectSettings.role_request_timeout):
+        # 0 = the SDK default. Only the compaction role sets it today —
+        # a huge summarizer prefill needs a longer read window than a
+        # coding turn.
+        timeout=_client_timeout(config),
         # No SILENT SDK-internal retries (the openai default is
         # max_retries=2): a stalled request (e.g. a gateway holding the
         # call in its processing queue while the model slot is busy) is

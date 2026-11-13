@@ -3384,6 +3384,115 @@ async def test_project_model_dialog_invalid_max_tokens_blocks_apply(
         assert store.load().role_max_tokens == {"tester": 16384}
 
 
+async def test_project_model_dialog_compaction_extras(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The compaction extras of the project model settings dialog: the
+    request-timeout input (seconds; empty = the SDK default) and the
+    giant-prompt-split switch persist to the project settings on Apply —
+    the timeout merged per-role (a hand-set timeout of another role, which
+    has no UI field here, survives), the toggle as a plain boolean. ESC
+    discards, an invalid value blocks Apply."""
+    from textual.widgets import Button, Input, Switch
+
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(role_request_timeout={"coding": 60}))
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+
+        timeout_input = dialog.query_one("#pms-timeout-compaction", Input)
+        split_switch = dialog.query_one("#pms-split-giant", Switch)
+        assert timeout_input.value == ""  # empty = the SDK default
+        assert split_switch.value is False
+
+        # An invalid value blocks Apply, nothing is persisted.
+        timeout_input.value = "abc"
+        await pilot.pause()
+        hint = dialog.query_one("#pms-timeout-hint")
+        assert hint.has_class("error")
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        assert isinstance(app.screen, ProjectModelSettingsDialog)
+        assert store.load().role_request_timeout == {"coding": 60}
+
+        # Valid values: drafted, not persisted until Apply.
+        timeout_input.value = "900"
+        await pilot.pause()
+        split_switch.value = True
+        await pilot.pause()
+        assert store.load().role_request_timeout == {"coding": 60}
+        assert store.load().compaction_split_giant_prompt is False
+
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        settings = store.load()
+        assert settings.role_request_timeout == {"coding": 60, "compaction": 900}
+        assert settings.compaction_split_giant_prompt is True
+        # The overrides ride the resolved configs: compaction 900 s,
+        # coding keeps its hand-set 60 s (no UI field, untouched).
+        assert app.resolved_config(AgentRole.COMPACTION).request_timeout == 900.0
+        assert app.resolved_config(AgentRole.CODING).request_timeout == 60.0
+
+        # Reopen: both prefilled from the store; emptying the input and
+        # switching off drops the override on Apply.
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        assert dialog.query_one("#pms-timeout-compaction", Input).value == "900"
+        assert dialog.query_one("#pms-split-giant", Switch).value is True
+        dialog.query_one("#pms-timeout-compaction", Input).value = ""
+        await pilot.pause()
+        dialog.query_one("#pms-split-giant", Switch).value = False
+        await pilot.pause()
+        dialog.query_one("#pms-apply", Button).press()
+        await pilot.pause()
+        settings = store.load()
+        assert settings.role_request_timeout == {"coding": 60}
+        assert settings.compaction_split_giant_prompt is False
+        assert app.resolved_config(AgentRole.COMPACTION).request_timeout == 0
+
+
+async def test_project_model_dialog_esc_discards_compaction_extras(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """ESC persists nothing of the compaction extras either."""
+    from textual.widgets import Input, Switch
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
+
+    _write_user_catalog()
+    store = ProjectSettingsStore(project_root)
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        dialog.query_one("#pms-timeout-compaction", Input).value = "900"
+        await pilot.pause()
+        dialog.query_one("#pms-split-giant", Switch).value = True
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        settings = store.load()
+        assert settings.role_request_timeout == {}
+        assert settings.compaction_split_giant_prompt is False
+
+
 async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
     """The main Settings menu collapses all model-related entries into one
     "Model settings…" item, which opens the sub-menu with the provider

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..agent import (
+    GIANT_PROMPT_TOKENS,
     MECHANICAL_HEADROOM_TOKENS,
     build_compaction_agent,
     build_compaction_prompt,
@@ -21,6 +22,7 @@ from ..agent import (
     build_resolver_agent,
     chunk_history_for_summary,
     compacted_messages,
+    even_slice_budget,
     extract_previous_summary,
     is_summary_message,
     last_context_tokens,
@@ -754,6 +756,14 @@ class PipelineCompactionLayer(CoreState):
         `_ChunkingImpossible` — the deterministic signal for the caller to
         apply the mechanical floor instead of calling the model.
 
+        The project setting `compaction_split_giant_prompt` forces the
+        map-reduce route for a prompt that would still fit the window but
+        exceeds `GIANT_PROMPT_TOKENS` (256k, chars/4), with the slice
+        budget taken from the EVEN-split rule (`even_slice_budget`: n =
+        ceil(total / 256k) parts of ~total/n tokens) instead of the window
+        budget, capped by the window budget when the window is the tighter
+        of the two.
+
         Every model call's usage is recorded via _record_session_usage, so
         total extra calls stay visible exactly like the single-shot path.
         Returns the summary text; a summarizer failure propagates to the
@@ -762,17 +772,31 @@ class PipelineCompactionLayer(CoreState):
         kill the run)."""
         system_prompt, template = load_compaction_prompts(tester)
         anchor = extract_previous_summary(messages)
+        history = render_history_for_summary(messages)
+        history_tokens = estimate_tokens(history)
         prompt = build_compaction_prompt(
             anchor,
-            render_history_for_summary(messages),
+            history,
             template,
             checklist=checklist,
             facts=facts,
         )
         compaction_cfg = self.resolved_config(AgentRole.COMPACTION)
-        if prompt_fits_context(prompt, system_prompt, compaction_cfg):
+        # Giant-prompt split (project setting, off by default): a
+        # single-shot prompt past GIANT_PROMPT_TOKENS is chunked even when
+        # it would still fit the window — a multi-hundred-k prefill is a
+        # prefill-and-pray call, and an EVEN split (n = ceil(total / 256k)
+        # slices of ~total/n tokens, never 256k + the remainder) makes
+        # every map call equally sized.
+        giant_split = (
+            self.settings.compaction_split_giant_prompt
+            and history_tokens > GIANT_PROMPT_TOKENS
+        )
+        if not giant_split and prompt_fits_context(
+            prompt, system_prompt, compaction_cfg
+        ):
             return await self._run_summarizer(prompt)
-        budget = slice_budget_tokens(
+        window_budget = slice_budget_tokens(
             compaction_cfg,
             anchor,
             checklist,
@@ -780,6 +804,12 @@ class PipelineCompactionLayer(CoreState):
             template=template,
             facts=facts,
         )
+        budget = window_budget
+        if giant_split:
+            # Equal slices from the even-split rule, but never wider than
+            # what the serving window can actually take: the window budget
+            # is a physical limit, so it wins when it is the smaller one.
+            budget = min(even_slice_budget(history_tokens), window_budget)
         if budget > compaction_cfg.max_context_tokens:
             raise _ChunkingImpossible(
                 f"the {compaction_cfg.max_context_tokens}-token window is "
@@ -788,11 +818,19 @@ class PipelineCompactionLayer(CoreState):
         slices = chunk_history_for_summary(messages, budget)
         if not slices:
             raise _ChunkingImpossible("no summarizable slices")
-        self._show_event(
-            task,
-            f"History too large for one summarizer call — map-reduce "
-            f"over {len(slices)} slice(s)…",
-        )
+        if giant_split:
+            self._show_event(
+                task,
+                f"Summarizer prompt is huge (≈{history_tokens} tokens) — "
+                f"splitting it into {len(slices)} equal slice(s) of "
+                f"≈{budget} tokens each…",
+            )
+        else:
+            self._show_event(
+                task,
+                f"History too large for one summarizer call — map-reduce "
+                f"over {len(slices)} slice(s)…",
+            )
         partials: list[str] = []
         for chunk in slices:
             running = "\n\n".join(partials) if partials else anchor

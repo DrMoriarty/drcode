@@ -59,12 +59,17 @@ endpoint at run start and taking the first AVAILABLE candidate by
 priority — is the separate async `resolve_available` (see below); the
 pipeline applies it once per run start, never mid-run.
 
-Independently of the model connection, a per-role OUTPUT cap is overlaid
-on the result of every path (including the env shortcut): the project
-setting `role_max_tokens[role]` (`.drcode/settings.json`, see
-`drcode.settings.ProjectSettings`) — the most specific layer, beating the
-catalog entry's `max_tokens` and the flat config default 8192 /
-DRCODE_MAX_TOKENS.
+Independently of the model connection, two per-role REQUEST overrides are
+overlaid on the result of every path (including the env shortcut), from
+`<project>/.drcode/settings.json` (see `drcode.settings.ProjectSettings`) —
+the most specific layer, beating the catalog entry and the flat config:
+
+- `role_max_tokens[role]` — the per-response output cap (beats the catalog
+  entry's `max_tokens` and the flat config default 8192 / DRCODE_MAX_TOKENS);
+- `role_request_timeout[role]` — the role's OpenAI client timeout in
+  seconds (`Config.request_timeout`, consumed by
+  `agent_model.build_model`); absent = the SDK default 600 s. The UI
+  exposes it for the COMPACTION role only.
 
 The resolver returns a `config.model_copy(update={...})` so
 `agent_model.build_model(config)` keeps working unchanged — and so the
@@ -776,16 +781,31 @@ def load_seeded_catalog(
 # -- resolution ---------------------------------------------------------------
 
 
-def _apply_role_max_tokens(config: Config, role: AgentRole) -> Config:
-    """Overlay the project's per-role max_tokens override (the LAST
-    resolution layer: the role — the most specific scope — beats the
-    catalog entry's `max_tokens` and the flat config's default /
-    DRCODE_MAX_TOKENS). See `ProjectSettings.role_max_tokens`."""
+def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
+    """Overlay the project's per-role overrides over the resolved role
+    config — the LAST resolution layer (the role — the most specific scope
+    — beats the catalog entry and the flat config / env):
+
+    - `role_max_tokens[role]` beats the catalog entry's `max_tokens` and
+      the flat config's default / DRCODE_MAX_TOKENS;
+    - `role_request_timeout[role]` sets the role's `request_timeout`
+      (seconds; the OpenAI client timeout of `agent_model.build_model`).
+      Only roles present in the map get a value — every other role keeps
+      0 = the SDK default (600 s).
+
+    See `ProjectSettings.role_max_tokens` / `role_request_timeout`. One
+    settings read for both maps (they are edited in the same dialog)."""
     settings = ProjectSettingsStore(config._project_root).load()
-    override = settings.role_max_tokens.get(role.value)
-    if override is None or override == config.max_tokens:
+    update: dict[str, object] = {}
+    tokens = settings.role_max_tokens.get(role.value)
+    if tokens is not None and tokens != config.max_tokens:
+        update["max_tokens"] = tokens
+    timeout = settings.role_request_timeout.get(role.value)
+    if timeout is not None and timeout != config.request_timeout:
+        update["request_timeout"] = float(timeout)
+    if not update:
         return config
-    return config.model_copy(update={"max_tokens": override})
+    return config.model_copy(update=update)
 
 
 def resolve(config: Config, role: AgentRole) -> Config:
@@ -796,10 +816,11 @@ def resolve(config: Config, role: AgentRole) -> Config:
     feed it straight into `agent_model.build_model`. A role with no
     selection anywhere resolves to "model not set": an empty `model` in
     the returned config (`is_ready` is False). The project's per-role
-    max_tokens override (`ProjectSettings.role_max_tokens`) is applied to
-    every outcome — it is the most specific layer.
+    overrides (`ProjectSettings.role_max_tokens` /
+    `role_request_timeout`) are applied to every outcome — they are the
+    most specific layer.
     """
-    return _apply_role_max_tokens(_resolve_connection(config, role), role)
+    return _apply_role_overrides(_resolve_connection(config, role), role)
 
 
 def _match_ref(catalog: UserModelsConfig, ref: ModelRef) -> Provider | None:
@@ -1045,7 +1066,7 @@ class AvailableResolution(NamedTuple):
     """The outcome of an availability-aware run-start resolution."""
 
     # The connection to serve the run with (already overlaid with the
-    # role's max_tokens override, same as `resolve`).
+    # role's max_tokens / request-timeout overrides, same as `resolve`).
     config: Config
     # Usage-accounting key of the FACTUALLY chosen model
     # ("<provider>/<model-id>", bare id for custom/env).
@@ -1094,7 +1115,7 @@ async def _resolve_available_chain(
         # caller decides whether to start anyway).
         return AvailableResolution(theoretical_config, theoretical_key, False, down)
     ref, provider = chosen
-    cfg = _apply_role_max_tokens(_apply_provider(config, ref, provider), role)
+    cfg = _apply_role_overrides(_apply_provider(config, ref, provider), role)
     return AvailableResolution(cfg, f"{provider.name}/{ref.model}", True, down)
 
 

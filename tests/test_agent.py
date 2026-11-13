@@ -838,6 +838,33 @@ def test_slice_budget_tokens_leaves_headroom() -> None:
     assert tiny >= 2_000
 
 
+def test_even_slice_budget_below_threshold_is_single_slice() -> None:
+    """At or below GIANT_PROMPT_TOKENS the whole history is one slice —
+    the single-shot behavior is untouched."""
+    from drcode.agent import GIANT_PROMPT_TOKENS, even_slice_budget
+
+    assert even_slice_budget(0) == 1
+    assert even_slice_budget(10_000) == 10_000
+    assert even_slice_budget(GIANT_PROMPT_TOKENS) == GIANT_PROMPT_TOKENS
+
+
+def test_even_slice_budget_splits_evenly() -> None:
+    """Above the threshold the split is UNIFORM: n = ceil(total / 256k)
+    parts of ~total/n each — 300k becomes two 150k slices, NOT 256k plus
+    the 44k remainder."""
+    from drcode.agent import even_slice_budget
+
+    assert even_slice_budget(300_000) == 150_000
+    # 257_001 tokens: two parts of ~128_501.
+    assert even_slice_budget(257_001) == 128_501
+    # 600_000 tokens: three parts of 200_000.
+    assert even_slice_budget(600_000) == 200_000
+    # Remainders round up, the budget never drops below 1.
+    assert even_slice_budget(300_001) == 150_001
+    assert even_slice_budget(257_000) == 128_500
+    assert even_slice_budget(1) == 1
+
+
 def test_compacted_messages_preserves_originals() -> None:
     data = serialize_messages(
         [

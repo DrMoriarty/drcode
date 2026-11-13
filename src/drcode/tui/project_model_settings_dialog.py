@@ -22,7 +22,17 @@ dialog:
   value = a positive-integer override that beats the more general
   layers (``providers.resolve`` applies it last). A live hint warns
   when the value exceeds the role model's context window, and a static
-  note explains why thinking models commonly need a raised budget.
+  note explains why thinking models commonly need a raised budget;
+- COMPACTION-only extras: a "request timeout" Input (seconds; empty =
+  the OpenAI SDK default 600 s — a summarizer call prefills a
+  multi-hundred-k-token transcript and may need a longer read window)
+  and a Switch "split a giant summarizer prompt" (the
+  ``compaction_split_giant_prompt`` project setting: when ON, a
+  single-shot summarizer prompt past ~256k tokens is cut into ~equal
+  map-reduce slices instead of one giant call). The underlying
+  ``role_request_timeout`` plumbing is role-generic, the dialog edits
+  the compaction slot only — a summarizer is the role whose requests
+  legitimately outlast a coding turn.
 
 On Apply the draft is handed back to the app layer
 (``ModelSelectionLayer._project_model_settings_done``), which persists
@@ -43,7 +53,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, Static
+from textual.widgets import Button, Input, Label, Select, Static, Switch
 
 from ..providers import (
     AgentRole,
@@ -91,6 +101,11 @@ class ProjectModelSettingsResult:
 
     slots: dict[AgentRole, ModelRef | str | None] = field(default_factory=dict)
     role_max_tokens: dict[AgentRole, int] = field(default_factory=dict)
+    # The compaction role's request-timeout override (seconds; only this
+    # role is editable in the dialog, so only its key is ever present) and
+    # the giant-prompt split toggle — both applied by the caller.
+    role_request_timeout: dict[AgentRole, int] = field(default_factory=dict)
+    split_giant_prompt: bool = False
     customs: dict[AgentRole, CustomModelEntry] = field(default_factory=dict)
 
 
@@ -138,7 +153,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     }
     #pms-body {
         height: auto;
-        max-height: 26;
+        max-height: 30;
         overflow-y: auto;
     }
     .pms-section {
@@ -158,6 +173,23 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         width: 1fr;
         height: auto;
         margin-left: 1;
+    }
+    .pms-timeout-col {
+        width: 1fr;
+        height: auto;
+        margin-left: 1;
+    }
+    .pms-hint-col {
+        width: 1fr;
+        height: auto;
+        margin-left: 1;
+    }
+    #pms-split-giant {
+        height: auto;
+    }
+    #pms-split-giant-label {
+        color: $text-muted;
+        margin-top: 1;
     }
     .pms-label {
         width: auto;
@@ -231,11 +263,23 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         )
         # The saved overrides prefill the inputs: an untouched field keeps
         # its override on Apply, an emptied one drops it (= inherit).
-        saved_overrides = ProjectSettingsStore(project_root).load().role_max_tokens
+        saved_settings = ProjectSettingsStore(project_root).load()
+        saved_overrides = saved_settings.role_max_tokens
         self._saved_overrides = dict(saved_overrides)
         self._max_tokens: dict[AgentRole, int | None] = {
             role: saved_overrides.get(role.value) for role in AgentRole
         }
+        # The compaction extras (see the docstring): the per-role request
+        # timeout (only the compaction slot is editable) and the
+        # giant-prompt split toggle. Same untouched/emptied rule as the
+        # token caps.
+        saved_timeouts = saved_settings.role_request_timeout
+        self._saved_timeouts = dict(saved_timeouts)
+        self._timeouts: dict[AgentRole, int | None] = {
+            role: saved_timeouts.get(role.value) for role in AgentRole
+        }
+        self._split_giant = saved_settings.compaction_split_giant_prompt
+        self._saved_split_giant = self._split_giant
 
     # -- draft ---------------------------------------------------------------------
 
@@ -357,6 +401,41 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                                 value=self._input_value(role),
                                 id=f"pms-tokens-{role.value}",
                             )
+                    if role is AgentRole.COMPACTION:
+                        # Compaction-only extras (see the module
+                        # docstring): the request-timeout override and the
+                        # giant-prompt split toggle — both live in
+                        # ProjectSettings, not in the model catalog.
+                        with Horizontal(classes="pms-row"):
+                            with Vertical(classes="pms-timeout-col"):
+                                yield Label(
+                                    "request timeout, s (empty = SDK default 600)",
+                                    classes="pms-label",
+                                )
+                                yield Input(
+                                    placeholder="600",
+                                    value=self._timeout_value(role),
+                                    id="pms-timeout-compaction",
+                                )
+                            with Vertical(classes="pms-hint-col"):
+                                yield Label("", classes="pms-label")
+                                yield Static(
+                                    "",
+                                    classes="pms-hint",
+                                    id="pms-timeout-hint",
+                                )
+                        yield Label(
+                            "Split a giant summarizer prompt — a single-shot "
+                            "compaction call past ~256k tokens is cut into "
+                            "~equal map-reduce slices instead of one huge "
+                            "prefill (off: one call while it fits the "
+                            "window)",
+                            id="pms-split-giant-label",
+                        )
+                        yield Switch(
+                            value=self._split_giant,
+                            id="pms-split-giant",
+                        )
                     yield Static("", classes="pms-hint", id=f"pms-hint-{role.value}")
             yield Static(THINKING_HINT, id="pms-thinking-hint")
             with Horizontal(id="pms-buttons"):
@@ -371,6 +450,16 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     def _input_value(self, role: AgentRole) -> str:
         value = self._max_tokens[role]
         return "" if value is None else str(value)
+
+    def _timeout_input(self, role: AgentRole) -> Input:
+        return self.query_one("#pms-timeout-compaction", Input)
+
+    def _timeout_value(self, role: AgentRole) -> str:
+        value = self._timeouts[role]
+        return "" if value is None else str(value)
+
+    def _split_switch(self) -> Switch:
+        return self.query_one("#pms-split-giant", Switch)
 
     def on_mount(self) -> None:
         for role in AgentRole:
@@ -395,6 +484,15 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             self._max_tokens[role] != self._saved_overrides.get(role.value),
             "changed",
         )
+        if role is AgentRole.COMPACTION:
+            self._timeout_input(role).set_class(
+                self._timeouts[role] != self._saved_timeouts.get(role.value),
+                "changed",
+            )
+            self._split_switch().set_class(
+                self._split_giant != self._saved_split_giant, "changed"
+            )
+            self._render_timeout_hint()
         self._render_hint(role)
 
     def _render_hint(self, role: AgentRole) -> None:
@@ -479,26 +577,70 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     @on(Input.Changed)
     def _tokens_changed(self, event: Input.Changed) -> None:
         role = self._role_of_widget_id(event.input.id, "pms-tokens-")
-        if role is None:
+        if role is not None:
+            text = event.value.strip()
+            if not text:
+                self._max_tokens[role] = None  # empty = inherit
+            elif text.isdigit() and int(text) > 0:
+                self._max_tokens[role] = int(text)
+            else:
+                self._max_tokens[role] = None  # invalid: the hint says so
+            self._render_hint(role)
             return
-        text = event.value.strip()
+        role = self._role_of_widget_id(event.input.id, "pms-timeout-")
+        if role is not None:
+            text = event.value.strip()
+            if not text:
+                self._timeouts[role] = None  # empty = the SDK default
+            elif text.isdigit() and int(text) > 0:
+                self._timeouts[role] = int(text)
+            else:
+                self._timeouts[role] = None  # invalid: the hint says so
+            self._render_timeout_hint()
+
+    def _render_timeout_hint(self) -> None:
+        """The live hint of the compaction request-timeout input (the
+        same error/warning shape as the max_tokens hints)."""
+        text = self._timeout_input(AgentRole.COMPACTION).value.strip()
+        value = self._timeouts[AgentRole.COMPACTION]
+        hint = self.query_one("#pms-timeout-hint", Static)
         if not text:
-            self._max_tokens[role] = None  # empty = inherit
-        elif text.isdigit() and int(text) > 0:
-            self._max_tokens[role] = int(text)
+            hint.remove_class("warning", "error")
+            hint.update(
+                "empty = the OpenAI SDK default (600 s read/write) — "
+                "set it higher when a big summarizer prefill dies at 600 s"
+            )
+        elif value is None:
+            hint.add_class("error")
+            hint.remove_class("warning")
+            hint.update("request timeout must be a positive integer (seconds)")
         else:
-            self._max_tokens[role] = None  # invalid: the hint says so
-        self._render_hint(role)
+            hint.remove_class("warning", "error")
+            hint.update(
+                f"override: {value} s (the compaction client's read/write "
+                "timeout; other roles keep the SDK default)"
+            )
+
+    @on(Switch.Changed, "#pms-split-giant")
+    def _split_giant_changed(self, event: Switch.Changed) -> None:
+        self._split_giant = event.value
+        self._split_switch().set_class(
+            self._split_giant != self._saved_split_giant, "changed"
+        )
 
     # -- apply / cancel --------------------------------------------------------------------
 
-    def _first_invalid(self) -> AgentRole | None:
-        """The first role whose max_tokens input is a non-empty
-        non-positive-integer (its override stays unset), or None."""
+    def _first_invalid(self) -> str | None:
+        """A description of the first invalid field (its override stays
+        unset), or None. Checks every max_tokens input and the compaction
+        request-timeout input."""
         for role in AgentRole:
             text = self._tokens_input(role).value.strip()
             if text and self._max_tokens[role] is None:
-                return role
+                return f"max_tokens for {role.value}"
+        timeout_text = self._timeout_input(AgentRole.COMPACTION).value.strip()
+        if timeout_text and self._timeouts[AgentRole.COMPACTION] is None:
+            return "request timeout for compaction"
         return None
 
     @on(Button.Pressed, "#pms-apply")
@@ -506,14 +648,17 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         invalid = self._first_invalid()
         if invalid is not None:
             self.notify(
-                f"max_tokens for {invalid.value} must be a positive "
-                "integer (empty = inherit)",
+                f"{invalid} must be a positive integer "
+                "(max_tokens / seconds; empty = inherit)",
                 title="Project model settings",
                 severity="error",
                 timeout=6,
             )
             return
         original_customs = load_project_custom_models(self._project_root)
+        timeouts = {
+            role: value for role, value in self._timeouts.items() if value is not None
+        }
         self.dismiss(
             ProjectModelSettingsResult(
                 slots=dict(self._slots),
@@ -522,6 +667,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                     for role, value in self._max_tokens.items()
                     if value is not None
                 },
+                role_request_timeout=timeouts,
+                split_giant_prompt=self._split_giant,
                 customs={
                     role: entry
                     for role, entry in self._customs.items()

@@ -142,15 +142,31 @@ class ModelSelectionLayer(DrCodeState):
             return
         # The per-role max_tokens overrides live in the project settings
         # (merged against the STORED file, not just the live object — the
-        # live one may predate an external edit).
-        stored = dict(self.settings_store.load().role_max_tokens)
-        merged = dict(stored)
+        # live one may predate an external edit). The dialog edits EVERY
+        # role's max_tokens, so all keys are re-derived from the result;
+        # the request timeout is edited for the COMPACTION role only — its
+        # key alone is re-derived, hand-set timeouts of other roles (no UI
+        # for them here) must survive an Apply untouched.
+        stored = self.settings_store.load()
+        stored_tokens = dict(stored.role_max_tokens)
+        merged_tokens = dict(stored_tokens)
         for role in AgentRole:
-            merged.pop(role.value, None)
+            merged_tokens.pop(role.value, None)
         for role, value in result.role_max_tokens.items():
-            merged[role.value] = value
-        self.settings.role_max_tokens = merged
-        if merged != stored:
+            merged_tokens[role.value] = value
+        stored_timeouts = dict(stored.role_request_timeout)
+        merged_timeouts = dict(stored_timeouts)
+        merged_timeouts.pop(AgentRole.COMPACTION.value, None)
+        for role, value in result.role_request_timeout.items():
+            merged_timeouts[role.value] = value
+        self.settings.role_max_tokens = merged_tokens
+        self.settings.role_request_timeout = merged_timeouts
+        self.settings.compaction_split_giant_prompt = result.split_giant_prompt
+        if (
+            merged_tokens != stored_tokens
+            or merged_timeouts != stored_timeouts
+            or result.split_giant_prompt != stored.compaction_split_giant_prompt
+        ):
             self.settings_store.save(self.settings)
         self.invalidate_resolved_configs()
         self._emit_manual_model_change_events(model_keys_before)
@@ -166,6 +182,10 @@ class ModelSelectionLayer(DrCodeState):
             )
             or "no max_tokens overrides"
         )
+        if AgentRole.COMPACTION in result.role_request_timeout:
+            overrides += f", compaction timeout={result.role_request_timeout[AgentRole.COMPACTION]}s"
+        if result.split_giant_prompt:
+            overrides += ", giant-prompt split on"
         self.notify(
             f"Project model settings applied ({overrides})",
             title="Project model settings",

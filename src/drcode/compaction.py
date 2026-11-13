@@ -637,6 +637,31 @@ def chunk_history_for_summary(
     return slices
 
 
+# Threshold (tokens, chars/4) of the "giant single-shot prompt" split: when
+# the project setting `compaction_split_giant_prompt` is on and the rendered
+# summarizer prompt exceeds this, the prompt is chunked into map-reduce
+# slices even though it might still fit the model's window. The number is
+# the map-reduce convention of the summarizer: a single prompt this large is
+# a prefill-and-pray call (minutes of prefill, one giant output budget).
+GIANT_PROMPT_TOKENS = 256_000
+
+
+def even_slice_budget(history_tokens: int) -> int:
+    """Slice budget of the even split: `ceil(total / GIANT_PROMPT_TOKENS)`
+    parts of ~equal size, i.e. `ceil(total / n)` tokens each.
+
+    The point is NOT to cut the oversized tail off at the cap (that would
+    leave one 256k slice plus one tiny remainder): 300k tokens become TWO
+    slices of ~150k, so every map call is equally sized and the sequence of
+    partial summaries is balanced. At or below the threshold a single slice
+    covering the whole history is returned (the single-shot behavior).
+    """
+    if history_tokens <= GIANT_PROMPT_TOKENS:
+        return max(history_tokens, 1)
+    parts = -(-history_tokens // GIANT_PROMPT_TOKENS)  # ceil division
+    return max(-(-history_tokens // parts), 1)
+
+
 def compacted_messages(
     messages: list[dict[str, Any]], summary: str
 ) -> list[dict[str, Any]]:

@@ -106,8 +106,13 @@ def test_system_components_split_base_agents_and_git_workflow(
     (drcode_dir / "git-workflow.md").write_text("- never commit to main\n")
     parts = system_components_coding(TaskKind.FEATURE, project_root)
     labels = [label for label, _ in parts]
-    assert labels == ["base template", "AGENTS.md", "git workflow"]
-    base, agents_md, git_workflow = (text for _, text in parts)
+    assert labels == [
+        "base template",
+        "AGENTS.md",
+        "git workflow",
+        "role instructions",
+    ]
+    base, agents_md, git_workflow, role_instructions = (text for _, text in parts)
     assert base is not None and "{project_path}" not in base
     assert "{project_path}" not in base
     assert agents_md is not None and "be terse." in agents_md
@@ -115,6 +120,8 @@ def test_system_components_split_base_agents_and_git_workflow(
     # The bundled "Never commit to git" sentence is dropped when the
     # workflow exists (same rule as the real prompt assembly).
     assert "Never commit to" not in base
+    # No instruction fragments shipped: the line is present but empty.
+    assert role_instructions is None
 
     # Without the files the components are absent (None) — the dialog
     # renders them as "absent".
@@ -122,6 +129,7 @@ def test_system_components_split_base_agents_and_git_workflow(
     assert empty[0][1] is not None
     assert empty[1][1] is None
     assert empty[2][1] is None
+    assert empty[3][1] is None
 
 
 def test_system_components_tester_split_base_agents_and_git_workflow(
@@ -133,17 +141,24 @@ def test_system_components_tester_split_base_agents_and_git_workflow(
     (drcode_dir / "git-workflow.md").write_text("- never commit to main\n")
     parts = system_components_tester(True, project_root)
     labels = [label for label, _ in parts]
-    assert labels == ["base template", "AGENTS.md", "git workflow"]
-    base, agents_md, git_workflow = (text for _, text in parts)
+    assert labels == [
+        "base template",
+        "AGENTS.md",
+        "git workflow",
+        "role instructions",
+    ]
+    base, agents_md, git_workflow, role_instructions = (text for _, text in parts)
     assert base is not None and "{project_path}" not in base
     assert agents_md is not None and "be terse." in agents_md
     assert git_workflow is not None and "never commit to main" in git_workflow
+    assert role_instructions is None
 
     # Without the files the components are absent (None).
     empty = system_components_tester(True, project_root.parent)
     assert empty[0][1] is not None
     assert empty[1][1] is None
     assert empty[2][1] is None
+    assert empty[3][1] is None
 
 
 def test_tool_schemas_follow_role_and_kind(project_root: Path) -> None:
@@ -288,7 +303,12 @@ def test_build_report_sections_and_totals(project_root: Path) -> None:
     assert report.headroom_tokens == (report.threshold_tokens or 0) - 1100
     # Every system-prompt component and tool is listed as its own line.
     system_labels = [l.label for l in report.sections[0].lines]
-    assert system_labels == ["base template", "AGENTS.md", "git workflow"]
+    assert system_labels == [
+        "base template",
+        "AGENTS.md",
+        "git workflow",
+        "role instructions",
+    ]
     assert any("todo_create" in l.label for l in report.sections[1].lines)
     # Retry prompts surface as their own transcript line.
     transcript_labels = [l.label for l in report.sections[2].lines]
@@ -309,6 +329,35 @@ def test_system_components_resolver_split_base_agents(project_root: Path) -> Non
     empty = system_components_resolver(project_root.parent)
     assert empty[0][1] is not None
     assert empty[1][1] is None
+
+
+def test_system_components_role_instructions(project_root: Path) -> None:
+    # Without the files the fragment line is present but empty (None).
+    bare = system_components_coding(TaskKind.FEATURE, project_root)
+    assert ("role instructions", None) in bare
+    bare_tester = system_components_tester(True, project_root)
+    assert ("role instructions", None) in bare_tester
+
+    instructions = project_root / ".drcode" / "instructions"
+    instructions.mkdir(parents=True)
+    (instructions / "coder.md").write_text("Titles in Russian.\n")
+    (instructions / "tester.md").write_text("Never approve flaky tests.\n")
+    (instructions / "researcher.md").write_text("Answer in the code's language.\n")
+
+    coder = dict(system_components_coding(TaskKind.FEATURE, project_root))
+    assert coder["role instructions"] == "Titles in Russian."
+    bug = dict(system_components_coding(TaskKind.BUG, project_root))
+    assert bug["role instructions"] == "Titles in Russian."
+    research = dict(system_components_coding(TaskKind.RESEARCH, project_root))
+    assert research["role instructions"] == "Answer in the code's language."
+    tester = dict(system_components_tester(True, project_root))
+    assert tester["role instructions"] == "Never approve flaky tests."
+
+    # The resolver never gets a role-instructions fragment — the scope is
+    # strictly coder/researcher/tester (its component list has no such
+    # line at all, file present or not).
+    resolver = dict(system_components_resolver(project_root))
+    assert "role instructions" not in resolver
 
 
 def test_resolver_tool_schemas(project_root: Path) -> None:

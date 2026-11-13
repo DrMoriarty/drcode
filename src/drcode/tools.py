@@ -15,7 +15,15 @@ Permission model:
   DRCODE_USER_CONFIG_DIR: diagnostic python snippets that construct
   default-constructed stores (`UserModelsStore()`, `Config()`) then read
   and write the sandbox copy, never the real `~/.config/drcode` (incident
-  ebe6ba15: such a snippet wiped the user's model catalog).
+  ebe6ba15: such a snippet wiped the user's model catalog);
+- run_bash is also LOCAL-ONLY on the network: a shell command may talk to
+  the loopback interface (localhost, 127.0.0.0/8, ::1 — a dev server or a
+  test fixture started inside the project), while an outbound request of a
+  network client (curl, wget, http/https, ftp, and any redirect-following
+  flag) is refused. External network access belongs to the managed
+  `web_fetch` tool — see the "bash network guard" section below for the
+  exact scope (interpreters, package managers and git remotes are not
+  analysed: this is a policy guard, not an OS-level network sandbox).
 
 Every refusal raises PathViolation with a model-friendly message; the agent
 layer logs it into the task's service-event history before returning it to
@@ -25,15 +33,18 @@ the model as a retry prompt.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import config as _config
 from .config import PROJECT_STATE_DIRNAME
@@ -539,7 +550,577 @@ def _is_forbidden_git_stash(words: list[str], i: int) -> bool:
     return len(sub) < 2 or sub[1] not in _ALLOWED_STASH_SUBCOMMANDS
 
 
-def check_command(root: Path, command: str, extra_writable: Path | None = None) -> None:
+# -- bash network guard -------------------------------------------------------
+#
+# External network access of an agent goes through the managed `web_fetch`
+# tool (drcode.web_fetch: GET-only, SSRF-guarded, size-capped, every result
+# framed as untrusted content). run_bash stays for LOCAL work — an agent may
+# start a dev server or a test fixture inside the project and poke its
+# endpoints with `curl localhost:8000/health` — but an arbitrary outbound
+# request from a shell command is refused: an unmanaged shell client bypasses
+# every check `web_fetch` exists for.
+#
+# Permitted: the LOOPBACK interface only — `localhost` (and *.localhost,
+# RFC 6761), 127.0.0.0/8 and ::1. Everything else is refused, INCLUDING names
+# that resolve to public or to private-but-not-loopback addresses: the host is
+# resolved through getaddrinfo and EVERY address is judged with `ipaddress`,
+# which also closes the cloud metadata service (169.254.169.254). An address
+# LITERAL is judged without the resolver (a lying resolver must not launder
+# `http://127.0.0.1/`), and the numeric forms (`127.1`, `2130706433`,
+# `::ffff:127.0.0.1`) parse as loopback — so they are allowed exactly as what
+# they are, loopback, and nothing else.
+#
+# Redirect-following flags (`curl -L`/`--location`, `--max-redirs`, wget's
+# `--max-redirect`) are REFUSED rather than under-checked: only the URL on the
+# command line is validated, so a followed redirect could leave the loopback
+# interface without any check. The refusal tells the model to drop the flag.
+#
+# Deliberately the SAME strictness as the rm/mv/cp and git-stash checks above:
+# only the LEADING command of each shell segment is inspected (after env
+# assignments and COMMAND_WRAPPERS), so a nested command substitution
+# (`echo $(curl …)`) is not analysed. NOT analysed either — out of scope for
+# what is a policy guard against casual shell fetching, not an OS-level
+# network sandbox: interpreters and package managers (python, node, pip, uv,
+# npm install), git remotes (push/fetch/clone), a URL list read from a file
+# (`curl -i urls.txt`, `curl -K cfg`) and a proxy/tunnel the agent sets up
+# itself.
+
+# Command-line network clients: a leading command from this set may only talk
+# to the loopback interface.
+NETWORK_CLIENTS = frozenset({"curl", "wget", "http", "https", "ftp"})
+# HTTPie (`http`/`https`) takes `[METHOD] URL [REQUEST_ITEM…]`: only the first
+# non-method positional is a target — request items (`key=value`,
+# `Header:value`) must never be read as hosts.
+_HTTPIE_CLIENTS = frozenset({"http", "https"})
+_HTTPIE_METHODS = frozenset(
+    {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
+)
+
+# Long flags taking a VALUE — data, headers, output files, credentials — per
+# client, so `curl -d @payload.json …` never has the payload read as a host
+# and `http --json :8000/api` (where `--json` is a BOOLEAN) never has its URL
+# swallowed as a flag value. The lists are deliberately explicit: a flag
+# wrongly listed here would SKIP its target, i.e. open the hole this guard
+# closes, while a missing one only makes a value look like a target (a false
+# refusal, never a bypass).
+_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "curl": frozenset(
+        {
+            "--output",
+            "--data",
+            "--data-ascii",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "--json",
+            "--header",
+            "--request",
+            "--request-target",
+            "--user",
+            "--user-agent",
+            "--referer",
+            "--cookie",
+            "--cookie-jar",
+            "--form",
+            "--form-string",
+            "--upload-file",
+            "--proxy",
+            "--proxy-user",
+            "--proxy-header",
+            "--connect-timeout",
+            "--max-time",
+            "--max-redirs",
+            "--max-filesize",
+            "--range",
+            "--write-out",
+            "--config",
+            "--cert",
+            "--cacert",
+            "--key",
+            "--pass",
+            "--ciphers",
+            "--retry",
+            "--retry-delay",
+            "--retry-max-time",
+            "--dump-header",
+            "--stderr",
+            "--trace",
+            "--trace-ascii",
+            "--limit-rate",
+            "--speed-limit",
+            "--speed-time",
+            "--time-cond",
+            "--continue-at",
+            "--resolve",
+            "--connect-to",
+            "--interface",
+            "--unix-socket",
+            "--netrc-file",
+            "--oauth2-bearer",
+            "--local-port",
+            "--dns-servers",
+            "--keepalive-time",
+            "--expect100-timeout",
+            "--telnet-option",
+            "--pinnedpubkey",
+        }
+    ),
+    "wget": frozenset(
+        {
+            "--output-document",
+            "--output-file",
+            "--append-output",
+            "--directory-prefix",
+            "--post-data",
+            "--post-file",
+            "--body-data",
+            "--body-file",
+            "--method",
+            "--timeout",
+            "--tries",
+            "--wait",
+            "--waitretry",
+            "--quota",
+            "--input-file",
+            "--base",
+            "--level",
+            "--accept",
+            "--reject",
+            "--domains",
+            "--exclude-domains",
+            "--include-directories",
+            "--exclude-directories",
+            "--load-cookies",
+            "--save-cookies",
+            "--ca-certificate",
+            "--certificate",
+            "--private-key",
+            "--dns-timeout",
+            "--read-timeout",
+            "--connect-timeout",
+            "--http-user",
+            "--http-password",
+            "--user",
+            "--password",
+            "--header",
+            "--referer",
+            "--user-agent",
+            "--progress",
+            "--bind-address",
+            "--restrict-file-names",
+            "--secure-protocol",
+            "--max-redirect",
+            "--limit-rate",
+        }
+    ),
+    "ftp": frozenset(),
+    "http": frozenset(
+        {
+            "--auth",
+            "--auth-type",
+            "--session",
+            "--session-read-only",
+            "--style",
+            "--print",
+            "--pretty",
+            "--verify",
+            "--cert",
+            "--cert-key",
+            "--timeout",
+            "--proxy",
+            "--default-scheme",
+            "--output",
+            "--format-options",
+            "--response-charset",
+            "--response-mime",
+            "--max-redirects",
+        }
+    ),
+    "https": frozenset(
+        {
+            "--auth",
+            "--auth-type",
+            "--session",
+            "--session-read-only",
+            "--style",
+            "--print",
+            "--pretty",
+            "--verify",
+            "--cert",
+            "--cert-key",
+            "--timeout",
+            "--proxy",
+            "--default-scheme",
+            "--output",
+            "--format-options",
+            "--response-charset",
+            "--response-mime",
+            "--max-redirects",
+        }
+    ),
+}
+
+# Short flags whose value may be glued to the flag or follow it as the next
+# token (`-oFILE`, `-sSo FILE`). Per client: the same letter differs (curl's
+# `-O` is a boolean "keep the remote name", wget's `-O` takes the output file,
+# wget's `-L` is `--relative` while curl's `-L` follows redirects).
+_SHORT_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "curl": frozenset("odHXAuAebcFTxmrEwKDzCUyY"),
+    "wget": frozenset("OPoaeUTtwlARDIXBiQ"),
+    "ftp": frozenset(),
+    "http": frozenset("opsaA"),
+    "https": frozenset("opsaA"),
+}
+
+# Flags whose VALUE is itself a fetch target (curl's `--url http://…`).
+_TARGET_VALUE_FLAGS = frozenset({"--url"})
+
+# Flags following HTTP redirects, and the max-redirs knobs of both clients.
+_REDIRECT_FLAGS = frozenset(
+    {
+        "--location",
+        "--location-trusted",
+        "--max-redirs",
+        "--max-redirect",
+        "--max-redirects",
+    }
+)
+
+# Conservative fallback for unparsable segments (bad quoting): a leading
+# network client in there is refused instead of executed blind. The
+# `(?![:/])` keeps URLs (`http://…`, `ftp://…`) out of the match — they are
+# data, not an invocation.
+_NETWORK_WORD = re.compile(
+    r"(?:^|[\s;&|(])(?:sudo\s+)?(?:curl|wget|https?|ftp)\b(?![:/])"
+)
+
+# A shell redirection token as shlex leaves it in a segment: `>`, `>>`, `2>`,
+# `<`, `<<EOF`, `>file`, `>&2`, `2>&1`.
+_REDIRECTION = re.compile(r"^(?P<fd>[0-9]*)(?P<op>>>|>>|<<|<|>)(?P<rest>.*)$")
+
+
+def _redirection_end(token: str, next_index: int) -> int | None:
+    """Index after a shell redirection token, or None when it is not one.
+
+    run_bash's segment split does not treat `<`/`>` as separators, so they
+    stay in the segment; the operator and its FILE operand are never fetch
+    targets and must not be read as hosts. An inline operand (`>out.json`,
+    `2>err.log`, `>&2`) is inside the token itself — nothing to skip; a bare
+    operator (`>`, `2>`) takes the NEXT token as its operand.
+    """
+    match = _REDIRECTION.match(token)
+    if match is None:
+        return None
+    rest = match.group("rest")
+    if rest:
+        return next_index  # `>&2` / `>out.json`: the operand is inline
+    return next_index + 1  # `>` / `2>`: the operand is the next token
+
+
+def _redirect_flag(cmd: str, args: list[str]) -> str | None:
+    """The first redirect-following flag in `args`, if any (see the section
+    comment: following a redirect would escape the loopback check)."""
+    for token in args:
+        if token.startswith("--"):
+            name = token.partition("=")[0]
+            if name in _REDIRECT_FLAGS:
+                return name
+            continue
+        if cmd == "curl" and token.startswith("-") and "L" in token[1:]:
+            # Also inside a cluster (`-sSL`), where it is easy to miss.
+            return "-L"
+    return None
+
+
+def _redirect_violation(command: str, cmd: str, flag: str) -> PathViolation:
+    return PathViolation(
+        f"Command refused: '{command}': {cmd} {flag} follows redirects, and a "
+        f"redirect target is never checked — run_bash may only reach the local "
+        f"machine (loopback), so following a redirect could leave it. Drop the "
+        f"flag and fetch the local endpoint directly; public pages are read "
+        f"with the web_fetch tool, never with a shell client."
+    )
+
+
+def _network_violation(
+    command: str,
+    cmd: str,
+    target: str,
+    reason: str,
+    *,
+    web_fetch_available: bool,
+) -> PathViolation:
+    """The refusal of an outbound request from a shell command.
+
+    `web_fetch_available` picks the actionable half of the message: when the
+    running role has the `web_fetch` tool the model is pointed at it,
+    otherwise it must know that no external access exists in this run at all
+    (the coding, tester and resolver agents never get the tool).
+    """
+    if web_fetch_available:
+        instead = (
+            "outbound network requests from run_bash are disabled — read the "
+            "page with the web_fetch tool instead."
+        )
+    else:
+        instead = (
+            "external network access is closed for this agent: there is no "
+            "way to reach a public page from this run at all."
+        )
+    return PathViolation(
+        f"Command refused: '{command}': {cmd} would talk to '{target}' "
+        f"({reason}), but {instead} A shell command may only reach the LOCAL "
+        f"machine — loopback addresses (localhost, 127.0.0.0/8, ::1), e.g. a "
+        f"dev server or a test fixture started inside this project. Public "
+        f"and LAN hosts are not available to run_bash."
+    )
+
+
+def _strip_url_head(raw: str) -> str:
+    """The authority of a bare target — `host[:port]` out of
+    `[user[:pass]@]host[:port]/path?query#fragment`."""
+    head = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in head:  # credentials before the host
+        head = head.rsplit("@", 1)[1]
+    return head
+
+
+def _host_of_target(text: str) -> str | None:
+    """The host a fetch target talks to, or None when the argument is not a
+    network target at all (a local file, a bare path, stdin).
+
+    Handles what the clients really accept: a full URL
+    (`http://host:port/x`), a scheme-relative one (`//host/x`), a bare host
+    (`example.com`, `localhost:8000/x`), an IPv6 literal (`[::1]:8000`) and
+    HTTPie's `:3000/path` shorthand for localhost.
+    """
+    raw = (text or "").strip()
+    if not raw or raw == "-" or raw.startswith("@"):
+        # `-` is stdin, `@file` is a data/upload reference — never a host.
+        return None
+    if "://" in raw:
+        try:
+            return urlsplit(raw).hostname or None
+        except ValueError:
+            return _strip_url_head(raw) or None
+    if raw.startswith("//"):
+        try:
+            return urlsplit(f"http:{raw}").hostname or None
+        except ValueError:
+            return None
+    if raw.startswith("/"):
+        # A bare path: there is no host to talk to (the client itself will
+        # complain), so nothing to check.
+        return None
+    head = _strip_url_head(raw)
+    if head.startswith(":"):
+        return "localhost"  # HTTPie's `:3000/path`
+    if head.startswith("["):  # [::1] or [::1]:8000
+        end = head.find("]")
+        return head[1:end] if end > 0 else head[1:]
+    if head.count(":") >= 2:
+        return head  # a bare IPv6 literal, no port to strip
+    host, _, port = head.rpartition(":")
+    if host and port.isdigit():
+        return host
+    return head or None
+
+
+def _port_of_target(text: str) -> int | None:
+    """The port a bare/URL target names (None when it names none)."""
+    raw = (text or "").strip()
+    try:
+        return urlsplit(raw if "://" in raw else f"//{raw}").port
+    except ValueError:
+        return None
+
+
+def _legacy_ipv4(text: str) -> str | None:
+    """The canonical dotted form of a LEGACY numeric IPv4 spelling, or None.
+
+    `inet_aton` is what the C library — and therefore every client — accepts:
+    `127.1`, `0x7f.1`, `017700000001` and the integer form `2130706433` all
+    mean 127.0.0.1. Judging them here keeps the decision independent of DNS
+    for anything numeric, which is exactly what the `http://2130706433/`
+    trick relies on (a resolver may or may not resolve it, the client always
+    connects to 127.0.0.1).
+    """
+    try:
+        packed = socket.inet_aton(text)
+    except (OSError, ValueError):
+        return None
+    return str(ipaddress.IPv4Address(packed))
+
+
+def _is_loopback_address(address: str) -> bool:
+    """Whether this IP literal is loopback, parsed with `ipaddress` — the only
+    reliable way to judge the numeric forms (`127.1`, `2130706433`,
+    `::ffff:127.0.0.1`) a command can smuggle in."""
+    text = address.split("%", 1)[0]  # drop an IPv6 scope id
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        legacy = _legacy_ipv4(text)
+        return legacy is not None and ipaddress.ip_address(legacy).is_loopback
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None and mapped != ip:
+        return _is_loopback_address(str(mapped))
+    return ip.is_loopback
+
+
+def _resolve_addresses(host: str, port: int | None) -> list[str]:
+    """Every address `host` resolves to (the guard's single DNS seam).
+
+    Kept as a module function so tests can inject a fake resolver instead of
+    depending on real DNS: the guard's decision must be provable offline
+    (and a CI box's resolver is not part of the contract). Any resolution
+    failure is an empty list — the caller treats "could not resolve" as
+    "cannot be proven local".
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+    addresses: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and str(sockaddr[0]) not in addresses:
+            addresses.append(str(sockaddr[0]))
+    return addresses
+
+
+def _non_loopback_reason(host: str, port: int | None = None) -> str | None:
+    """Why `host` may NOT be used, or None when it reaches only loopback.
+
+    An address LITERAL is judged on the spot, without the resolver (the check
+    must not depend on getaddrinfo for `127.0.0.1` to be recognized as local).
+    Otherwise the name is resolved and EVERY returned address must be
+    loopback: a name resolving anywhere else — a public host, a LAN box, the
+    cloud metadata service — is refused. A name that does not resolve is
+    refused too: it cannot be PROVEN local.
+    """
+    text = host.split("%", 1)[0].strip().strip("[]").strip(".")
+    if not text:
+        return "the target has an empty host"
+    lower = text.lower()
+    if lower == "localhost" or lower.endswith(".localhost"):
+        return None  # RFC 6761: *.localhost is loopback by definition
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        # Not a canonical literal — but it may still be a LEGACY numeric IPv4
+        # (`127.1`, `0x7f.1`, `2130706433`): the client's C library accepts
+        # those and never asks DNS, so neither do we.
+        legacy = _legacy_ipv4(text)
+        if legacy is not None:
+            if ipaddress.ip_address(legacy).is_loopback:
+                return None
+            return f"{legacy} is not a loopback address"
+    else:
+        if _is_loopback_address(text):
+            return None
+        return f"{text} is not a loopback address"
+    addresses = _resolve_addresses(text, port)
+    if not addresses:
+        return f"{text} does not resolve, so it cannot be shown to be local"
+    foreign = sorted(a for a in addresses if not _is_loopback_address(a))
+    if foreign:
+        return f"{text} resolves to {', '.join(foreign)} — not loopback"
+    return None
+
+
+def _network_targets(cmd: str, args: list[str]) -> list[str]:
+    """The fetch targets (URLs / hosts / IP literals) among a client's args.
+
+    Flags, shell redirections and the values of value-taking flags are not
+    targets: headers, payloads and output file names never reach the check.
+    For HTTPie only the first non-method positional counts.
+    """
+    value_flags = _VALUE_FLAGS.get(cmd, frozenset())
+    short_value = _SHORT_VALUE_FLAGS.get(cmd, frozenset())
+    httpie = cmd in _HTTPIE_CLIENTS
+    targets: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        token = args[i]
+        i += 1
+        if not token or token == "--":
+            continue
+        redirect_end = _redirection_end(token, i)
+        if redirect_end is not None:
+            i = redirect_end
+            continue
+        if token.startswith("--"):
+            name, glued, value = token.partition("=")
+            if name in _TARGET_VALUE_FLAGS:
+                if glued:
+                    if value:
+                        targets.append(value)
+                elif i < n:
+                    targets.append(args[i])
+                    i += 1
+                continue
+            if name in value_flags and not glued and i < n:
+                i += 1  # the flag's value: a header, a payload, a file, …
+            continue
+        if token.startswith("-") and len(token) > 1:
+            # A short-flag cluster: walk it, because a value-taking flag
+            # hides its value inside or after the cluster (`-oFILE`,
+            # `-sSo FILE`) and the rest of the cluster is not a target.
+            for index, ch in enumerate(token[1:], start=1):
+                if ch in short_value:
+                    if index == len(token) - 1 and i < n:
+                        i += 1  # the value follows as the next token
+                    break
+            continue
+        targets.append(token)
+        if httpie:
+            break  # HTTPie's URL comes first; the rest are request items
+    return targets
+
+
+def _check_network_command(
+    command: str,
+    cmd: str,
+    args: list[str],
+    *,
+    web_fetch_available: bool = False,
+) -> None:
+    """Refuse an outbound request of a network client unless it is loopback.
+
+    Raises PathViolation — a plain refusal (the agent layer logs it and hands
+    the text back as a retry prompt), never a crash.
+    """
+    flag = _redirect_flag(cmd, args)
+    if flag is not None:
+        raise _redirect_violation(command, cmd, flag)
+    if cmd in _HTTPIE_CLIENTS:
+        args = [a for a in args if a not in _HTTPIE_METHODS]
+    for target in _network_targets(cmd, args):
+        host = _host_of_target(target)
+        if host is None:
+            continue  # not a network target (a local file, an empty host)
+        reason = _non_loopback_reason(host, _port_of_target(target))
+        if reason is not None:
+            raise _network_violation(
+                command,
+                cmd,
+                target,
+                reason,
+                web_fetch_available=web_fetch_available,
+            )
+
+
+def check_command(
+    root: Path,
+    command: str,
+    extra_writable: Path | None = None,
+    *,
+    web_fetch_available: bool = False,
+) -> None:
     """Refuse rm/mv/cp whose path arguments escape the writable area.
 
     The command line is split into shell segments (`;`, `&&`, `||`, `|`,
@@ -558,6 +1139,17 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
     `refs/stash` is shared between all worktrees of the repository, so
     parallel task agents would otherwise push and pop each other's stashed
     changes. `git stash list` (read-only) stays allowed.
+
+    Finally, an outbound request of a network client (`curl`, `wget`, `http`,
+    `https`, `ftp`) is refused unless it targets the loopback interface:
+    external network access belongs to the managed `web_fetch` tool, while
+    run_bash stays for local work (a dev server or a test fixture started
+    inside the project is reachable at localhost/127.0.0.1/::1). See the
+    "bash network guard" section above for what is and is not analysed.
+
+    `web_fetch_available` only shapes the refusal text: when the running role
+    carries the `web_fetch` tool the model is pointed at it, otherwise it is
+    told that external access is closed in this run.
     """
     state_dir = (root / PROJECT_STATE_DIRNAME).resolve()
     for segment in _split_segments(command):
@@ -575,6 +1167,15 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
                 ) from None
             if _GIT_STASH_WORD.search(segment):
                 raise _stash_violation(command) from None
+            if _NETWORK_WORD.search(segment):
+                raise _network_violation(
+                    command,
+                    "a network client",
+                    "an unparsable command line",
+                    "the command line could not be parsed, so its target "
+                    "could not be checked",
+                    web_fetch_available=web_fetch_available,
+                ) from None
             continue
         i = 0
         # Strip leading env assignments and wrappers in any order
@@ -594,6 +1195,14 @@ def check_command(root: Path, command: str, extra_writable: Path | None = None) 
         base = Path(words[i]).name  # tolerate /bin/rm, /usr/bin/mv, …
         if base == "git" and _is_forbidden_git_stash(words, i):
             raise _stash_violation(command)
+        if base in NETWORK_CLIENTS:
+            _check_network_command(
+                command,
+                base,
+                words[i + 1 :],
+                web_fetch_available=web_fetch_available,
+            )
+            continue
         if base not in DESTRUCTIVE_COMMANDS:
             continue
         paths: list[str] = []
@@ -772,6 +1381,49 @@ def _user_config_sandbox_env(
     env["DRCODE_USER_CONFIG_DIR"] = str(sandbox)
 
 
+# How long the guard's DNS lookups may take before the command is refused.
+# `getaddrinfo` has no timeout of its own and a wedged resolver can sit on it
+# for minutes; the decision is fail-closed anyway (an unresolvable target
+# cannot be PROVEN loopback), so the bound only shortens a refusal that was
+# already coming.
+_NETWORK_CHECK_TIMEOUT = 30.0
+
+
+async def _check_command_async(
+    root: Path,
+    command: str,
+    extra_writable: Path | None,
+    *,
+    web_fetch_available: bool,
+) -> None:
+    """`check_command` off the event loop.
+
+    The path half of the checks is pure and instant, but the bash network
+    guard resolves host names (`socket.getaddrinfo` — see `_resolve_addresses`)
+    and a slow resolver would otherwise stall the loop that drives the Textual
+    UI: the same reason every tool body runs through `tool_runtime._run_tool`.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                check_command,
+                root,
+                command,
+                extra_writable,
+                web_fetch_available=web_fetch_available,
+            ),
+            timeout=_NETWORK_CHECK_TIMEOUT,
+        )
+    except TimeoutError:
+        raise PathViolation(
+            f"Command refused: '{command}': checking the target's address took "
+            f"longer than {_NETWORK_CHECK_TIMEOUT:.0f}s (a stalled name "
+            f"resolver), so the command cannot be shown to reach only the LOCAL "
+            f"machine. run_bash may only talk to loopback (localhost, "
+            f"127.0.0.0/8, ::1); retry with a loopback address or an IP literal."
+        ) from None
+
+
 async def run_bash(
     root: Path,
     command: str,
@@ -779,8 +1431,14 @@ async def run_bash(
     *,
     extra_writable: Path | None = None,
     task_id: str | None = None,
+    web_fetch_available: bool = False,
 ) -> str:
-    check_command(root, command, extra_writable)
+    await _check_command_async(
+        root,
+        command,
+        extra_writable,
+        web_fetch_available=web_fetch_available,
+    )
     effective = clamp_bash_timeout(timeout)
     env = sanitized_env()
     if extra_writable is not None:

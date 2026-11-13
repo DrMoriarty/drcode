@@ -88,16 +88,21 @@ def system_components_coding(
     research_git: GitPolicy = GitPolicy.PUSH,
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of a coding agent run: the base template
-    (project override honored), the project's AGENTS.md and the git-workflow
-    rules — exactly what `build_agent` assembles into the instructions.
-    For research tasks `research_git` selects the git fragment (or none
-    under the OFF policy), matching `build_agent(research_git=...)`."""
-    base, git_workflow = load_system_prompt_components(kind, project_root, research_git)
+    (project override honored), the project's AGENTS.md, the git-workflow
+    rules and the per-role instructions fragment (None when the project
+    ships none) — exactly what `build_agent` assembles into the
+    instructions. For research tasks `research_git` selects the git
+    fragment (or none under the OFF policy), matching
+    `build_agent(research_git=...)`."""
+    base, git_workflow, role_instructions = load_system_prompt_components(
+        kind, project_root, research_git
+    )
     agents_md = load_agents_md(project_root) if project_root is not None else ""
     return [
         ("base template", base),
         ("AGENTS.md", agents_md.strip() or None),
         ("git workflow", git_workflow),
+        ("role instructions", role_instructions),
     ]
 
 
@@ -105,10 +110,11 @@ def system_components_tester(
     allow_commit: bool, project_root: Path | None, allow_push: bool = True
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of the tester run: the base template
-    (project override honored), the project's AGENTS.md and the git-workflow
-    rules — exactly what `build_tester_agent` assembles into the
+    (project override honored), the project's AGENTS.md, the git-workflow
+    rules and the per-role instructions fragment (None when the project
+    ships none) — exactly what `build_tester_agent` assembles into the
     instructions."""
-    base, git_workflow = load_tester_prompt_components(
+    base, git_workflow, role_instructions = load_tester_prompt_components(
         allow_commit, project_root, allow_push
     )
     agents_md = load_agents_md(project_root) if project_root is not None else ""
@@ -116,6 +122,7 @@ def system_components_tester(
         ("base template", base),
         ("AGENTS.md", agents_md.strip() or None),
         ("git workflow", git_workflow),
+        ("role instructions", role_instructions),
     ]
 
 

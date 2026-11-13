@@ -58,6 +58,19 @@ async def _run_tool_logged(
         raise ModelRetry(str(e)) from e
 
 
+def web_fetch_available(deps: AgentDeps | TesterDeps | ResolverDeps) -> bool:
+    """Whether the run that owns `deps` has the managed `web_fetch` tool.
+
+    Only the RESEARCH agent ever gets it, and only when the project's
+    web-fetch mode is not off — which the pipeline expresses as a present
+    `web_fetch_gate` (see `agent_build.AgentDeps`). The coding, tester and
+    resolver deps have no such field at all, so the flag is False there and
+    the bash network guard's refusal says external access is closed instead
+    of pointing at a tool the model does not have.
+    """
+    return getattr(deps, "web_fetch_gate", None) is not None
+
+
 async def _run_bash_logged(
     deps: AgentDeps | TesterDeps | ResolverDeps,
     root: Path,
@@ -66,7 +79,15 @@ async def _run_bash_logged(
 ) -> str:
     try:
         return await tools.run_bash(
-            root, command, timeout, extra_writable=deps.scratch, task_id=deps.task_id
+            root,
+            command,
+            timeout,
+            extra_writable=deps.scratch,
+            task_id=deps.task_id,
+            # Only shapes the network refusal's wording (see `check_command`):
+            # an agent WITH web_fetch is pointed at it, one without is told
+            # that external access is closed in this run.
+            web_fetch_available=web_fetch_available(deps),
         )
     except PathViolation as e:
         log_violation(deps, "run_bash", str(e))

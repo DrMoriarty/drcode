@@ -450,6 +450,12 @@ class PipelineAgentRunLayer(CoreState):
                 # entry — parallel slots make the other tasks' runs
                 # untouchable by definition.)
                 self._agent_runs.pop(task_id, None)
+                # The run's factual model choice no longer serves
+                # anything: drop the role's pin unless another live run
+                # of the role still keeps it (parallel slots) — between
+                # runs the resolution must reflect the current config
+                # (see `invalidate_resolved_configs`).
+                self._drop_run_pin_if_idle(role)
                 self.refresh_status()
                 # The run is over: the consumed prompt is either persisted in
                 # the transcript or back in pending_input — the in-flight

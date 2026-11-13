@@ -594,14 +594,17 @@ class PipelineTesterLayer(CoreState):
                                 # persistently broken summarizer would loop
                                 # pause→resume forever — except at the
                                 # HARD-LIMIT level, which fires regardless
-                                # of `_compaction_failed` (a broken
+                                # of `_tester_compaction_failed` (a broken
                                 # summarizer there escalates to the
                                 # mechanical trim; unless the escalation
                                 # proved unable to shrink the round —
-                                # `_hard_limit_exhausted`, or the livelock
-                                # guard stopped the gate after consecutive
-                                # compactions that never landed under the
-                                # hard limit — both flags set together).
+                                # `_tester_hard_limit_exhausted`, or the
+                                # livelock guard stopped the gate after
+                                # consecutive compactions that never landed
+                                # under the hard limit — both flags set
+                                # together). The ROUND's own sets: an
+                                # agent-transcript compaction failure or
+                                # livelock must never silence this gate.
                                 tokens = self._fill_over_threshold(
                                     live_tokens,
                                     task.tester_messages[-1],
@@ -632,10 +635,11 @@ class PipelineTesterLayer(CoreState):
                                     is not None
                                 )
                                 if tokens is not None and (
-                                    task.id not in self._compaction_failed
+                                    task.id not in self._tester_compaction_failed
                                     or (
                                         hard_due
-                                        and task.id not in self._hard_limit_exhausted
+                                        and task.id
+                                        not in self._tester_hard_limit_exhausted
                                     )
                                 ):
                                     pct = round(

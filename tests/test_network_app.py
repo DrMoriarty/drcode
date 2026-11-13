@@ -1398,8 +1398,11 @@ async def test_tester_round_livelock_terminates_after_bounded_compactions(
     assert any(is_summary_message(m) for m in task.tester_messages[-1])
     # The gate is disabled for the task on both levels: the mid-round pause
     # condition in run_tester can no longer fire (no pause→resume churn).
-    assert task.id in net_app_small_ctx._hard_limit_exhausted
-    assert task.id in net_app_small_ctx._compaction_failed
+    # The ROUND's own sets — the agent transcript's gate stays untouched.
+    assert task.id in net_app_small_ctx._tester_hard_limit_exhausted
+    assert task.id in net_app_small_ctx._tester_compaction_failed
+    assert task.id not in net_app_small_ctx._hard_limit_exhausted
+    assert task.id not in net_app_small_ctx._compaction_failed
     texts = event_texts(task)
     diagnostics = [
         t for t in texts if "cannot bring the testing round below the hard limit" in t
@@ -1527,8 +1530,11 @@ async def test_tester_round_threshold_livelock_terminates_after_bounded_compacti
     assert any(is_summary_message(m) for m in task.tester_messages[-1])
     # The gate is disabled for the task on both levels: the mid-round pause
     # condition in run_tester can no longer fire (no pause→resume churn).
-    assert task.id in net_app_small_ctx._hard_limit_exhausted
-    assert task.id in net_app_small_ctx._compaction_failed
+    # The ROUND's own sets — the agent transcript's gate stays untouched.
+    assert task.id in net_app_small_ctx._tester_hard_limit_exhausted
+    assert task.id in net_app_small_ctx._tester_compaction_failed
+    assert task.id not in net_app_small_ctx._hard_limit_exhausted
+    assert task.id not in net_app_small_ctx._compaction_failed
     texts = event_texts(task)
     diagnostics = [
         t for t in texts if "cannot bring the testing round below the threshold" in t
@@ -1737,8 +1743,8 @@ async def test_threshold_livelock_counter_resets_on_under_threshold_observation(
 
     # Every cycle compacted (5 calls) and the gate never disabled itself.
     assert len(scripted.calls) == 5
-    assert task.id not in net_app_small_ctx._hard_limit_exhausted
-    assert task.id not in net_app_small_ctx._compaction_failed
+    assert task.id not in net_app_small_ctx._tester_hard_limit_exhausted
+    assert task.id not in net_app_small_ctx._tester_compaction_failed
     assert not any("consecutive compactions" in t for t in event_texts(task))
 
 
@@ -1817,8 +1823,11 @@ async def test_threshold_livelock_ignores_lagging_under_reading_of_resumed_round
     # then the gate stopped — the remaining summarizer steps were never
     # consumed.
     assert len(scripted.calls) == 3
-    assert task.id in net_app_small_ctx._hard_limit_exhausted
-    assert task.id in net_app_small_ctx._compaction_failed
+    # The ROUND's own sets — the agent transcript's gate stays untouched.
+    assert task.id in net_app_small_ctx._tester_hard_limit_exhausted
+    assert task.id in net_app_small_ctx._tester_compaction_failed
+    assert task.id not in net_app_small_ctx._hard_limit_exhausted
+    assert task.id not in net_app_small_ctx._compaction_failed
     texts = event_texts(task)
     diagnostics = [
         t for t in texts if "cannot bring the testing round below the threshold" in t
@@ -3660,9 +3669,72 @@ async def test_tester_round_failed_compaction_resumes_without_note(
         )
 
     assert task.verification is VerificationStatus.PASSED
-    assert task.id in net_app_small_ctx._compaction_failed
+    assert task.id in net_app_small_ctx._tester_compaction_failed
     assert len(task.tester_messages) == 1
     assert not any(
         t.startswith(COMPACTION_RESUME_PREFIX)
         for t in _prompt_texts(task.tester_messages[0])
     )
+
+
+async def test_agent_compaction_failure_does_not_disable_tester_round_gate(
+    net_app_small_ctx: DrCodeApp,
+    wide_compaction: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #c1edeefe poisoning: a compaction failure (or a livelock stop) of
+    the AGENT transcript used to land in the sets the tester's mid-round
+    gate also consulted — the round then crossed the model's whole window
+    with the gate silently refusing to fire and died on a deterministic
+    context overflow with no compaction attempt at all. The tester keeps
+    its own bookkeeping now: an agent-transcript failure must leave the
+    round's gate fully armed (including the hard-limit level, whose
+    mechanical escalation does not depend on the summarizer)."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.usage import RequestUsage
+
+    _fake_tester_live_tokens(monkeypatch, 950)
+    task = net_app_small_ctx.manager.create("feature", "implement x")
+    # Poison the AGENT transcript's gate bookkeeping (a broken summarizer /
+    # livelock stop of a development round).
+    net_app_small_ctx._compaction_failed.add(task.id)
+    net_app_small_ctx._hard_limit_exhausted.add(task.id)
+    scripted.steps = [
+        text_response("work done"),  # development run
+        ModelResponse(  # tester: a check to run, fill above the threshold
+            parts=[
+                ToolCallPart(
+                    tool_name="run_bash", args={"command": "echo hi"}, tool_call_id="c1"
+                )
+            ],
+            usage=RequestUsage(input_tokens=950, output_tokens=8),
+        ),
+        text_response("THE SUMMARY BODY"),  # the summarizer
+        tool_response("set_verification", {"success": True}),  # resumed round
+        text_response("all checks passed"),
+    ]
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED,
+            pilot,
+            what="testing round compacted despite the agent's poisoned gate",
+        )
+        await wait_until(
+            lambda: not net_app_small_ctx.tester_running,
+            pilot,
+            what="tester worker fully finished",
+        )
+
+    assert task.verification is VerificationStatus.PASSED
+    texts = event_texts(task)
+    # The mid-round gate fired despite the agent-level latches.
+    assert any("compacting the testing round" in t for t in texts)
+    assert any(is_summary_message(m) for m in task.tester_messages[0])
+    # The round's success touched only the tester's own sets.
+    assert task.id not in net_app_small_ctx._tester_compaction_failed
+    assert task.id not in net_app_small_ctx._tester_hard_limit_exhausted
+    assert task.id in net_app_small_ctx._compaction_failed
+    assert task.id in net_app_small_ctx._hard_limit_exhausted

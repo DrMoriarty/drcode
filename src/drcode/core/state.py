@@ -808,13 +808,23 @@ class CoreState:
     # finally-block.
     _live_ctx_tester: dict[str, int]
     _live_ctx_resolver: dict[str, int]
+    # Compaction-failure bookkeeping of the DEV/RESEARCH transcript gate —
+    # separate from the tester/resolver round sets so a broken summarizer
+    # (or a livelock) seen by one role's transcript never disables another
+    # role's gate.
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
+    # Same bookkeeping for the tester ROUND gate (see
+    # _maybe_compact_tester_round): an agent-transcript compaction failure
+    # or livelock must never disable the testing round's mid-round gate.
+    _tester_compaction_failed: set[str]
+    _tester_hard_limit_exhausted: set[str]
     # Livelock guard: consecutive hard-limit compactions per task that never
-    # landed a turn under the hard limit (see _livelock_stop). Shared by
-    # the main-agent and tester gates (like the sets above); the resolver
-    # keeps its own counter.
+    # landed a turn under the hard limit (see _livelock_stop). One counter
+    # per layer (dev transcript, tester round; the resolver keeps its own)
+    # — a stale count of one layer must never stop another layer's gate.
     _hard_limit_compactions: dict[str, int]
+    _tester_hard_limit_compactions: dict[str, int]
     # The same guard at the threshold level — one counter per layer (the
     # main agent's, the tester rounds' own): a stale count of one layer
     # must never disable another layer's compaction gate. Reset is

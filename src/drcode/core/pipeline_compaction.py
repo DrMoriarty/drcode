@@ -318,11 +318,12 @@ class PipelineCompactionLayer(CoreState):
                 "growth)"
             )
             tail = (
-                "Compaction stopped for this task: it runs without "
-                "mid-round compaction and a request past the hard limit "
-                "will fail with a context overflow. Raise the model's "
-                "max_context_tokens or lower the compaction threshold in "
-                "the provider catalog (Settings → Provider catalog)."
+                f"Compaction stopped for this task's {what}: it runs "
+                "without mid-round compaction and a request past the hard "
+                "limit will fail with a context overflow. Raise the "
+                "model's max_context_tokens or lower the compaction "
+                "threshold in the provider catalog (Settings → Provider "
+                "catalog)."
             )
         self._show_event(
             task,
@@ -1326,23 +1327,28 @@ class PipelineCompactionLayer(CoreState):
         not possible — the threshold is not reached, there is nothing to
         summarize (a no-op), or the summarizer failed with a non-overflow
         error below the hard limit — in which case the round is resumed
-        uncompressed and the caller adds the task to `_compaction_failed`,
-        so the mid-round gate stays off at the threshold level (a
-        persistently broken summarizer must not loop pause→resume forever);
-        turn-boundary compaction of the main agent still retries on later
-        turns. At the hard-limit level a failed summarizer escalates to the
-        mechanical trim instead of giving up (growth past the hard limit is
-        never allowed) — unless even the mechanical floor cannot shrink the
-        round (nothing to summarize), in which case the task lands in
-        `_hard_limit_exhausted` and the hard-level gate bypass stops
-        firing. The `_livelock_stop` guard bounds the cycle itself on both
-        levels: past the level's limit of consecutive compactions without a
-        durable landing under it (hard limit: the cap is below the round's
-        irreducible context floor; threshold: every turn's growth re-crosses
-        the threshold — the counter is reset only by demonstrated progress,
-        see _threshold_observation) the gate stops compacting, disables
+        uncompressed and the caller adds the task to
+        `_tester_compaction_failed`, so the mid-round gate stays off at the
+        threshold level (a persistently broken summarizer must not loop
+        pause→resume forever); turn-boundary compaction of the main agent
+        still retries on later turns. At the hard-limit level a failed
+        summarizer escalates to the mechanical trim instead of giving up
+        (growth past the hard limit is never allowed) — unless even the
+        mechanical floor cannot shrink the round (nothing to summarize), in
+        which case the task lands in `_tester_hard_limit_exhausted` and the
+        hard-level gate bypass stops firing. The `_livelock_stop` guard
+        bounds the cycle itself on both levels: past the level's limit of
+        consecutive compactions without a durable landing under it (hard
+        limit: the cap is below the round's irreducible context floor;
+        threshold: every turn's growth re-crosses the threshold — the
+        counter is reset only by demonstrated progress, see
+        _threshold_observation) the gate stops compacting, disables
         itself for the task (both sets) and emits a diagnostic event
-        instead of burning the API budget forever.
+        instead of burning the API budget forever. The bookkeeping uses the
+        tester's own sets (`_tester_compaction_failed` /
+        `_tester_hard_limit_exhausted`) and its own hard-livelock counter —
+        a compaction failure or livelock of the agent's transcript must
+        never disable the testing round's gate (and vice versa).
         """
         round_messages = task.tester_messages[-1] if task.tester_messages else []
         # Was the round's set_verification verdict already issued — by this
@@ -1376,7 +1382,7 @@ class PipelineCompactionLayer(CoreState):
             # A reading under the hard limit: the previous compaction (if
             # any) landed — the consecutive hard-compaction counter of the
             # livelock guard starts over.
-            self._hard_limit_compactions.pop(task.id, None)
+            self._tester_hard_limit_compactions.pop(task.id, None)
         if tokens is None:
             # Forced pass: the threshold gate did not fire (the live
             # reading is stale or absent — the request died before it) —
@@ -1390,20 +1396,20 @@ class PipelineCompactionLayer(CoreState):
             # Nothing to summarize (only the original prompt(s), possibly
             # plus a previous summary): compacting again would be a no-op —
             # resuming the round as-is would hit the gate again.
-            self._compaction_failed.add(task.id)
+            self._tester_compaction_failed.add(task.id)
             if hard:
                 # The mechanical floor keeps the original prompts verbatim
                 # too: nothing can shrink this round — stop the hard-level
                 # gate bypass or pause→resume would loop forever.
-                self._hard_limit_exhausted.add(task.id)
+                self._tester_hard_limit_exhausted.add(task.id)
             return False
         if not force and self._livelock_stop(
             task,
-            self._hard_limit_compactions
+            self._tester_hard_limit_compactions
             if hard
             else self._tester_threshold_compactions,
-            self._hard_limit_exhausted,
-            self._compaction_failed,
+            self._tester_hard_limit_exhausted,
+            self._tester_compaction_failed,
             AgentRole.TESTER,
             pct,
             "testing round",
@@ -1426,7 +1432,7 @@ class PipelineCompactionLayer(CoreState):
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the round
-            self._compaction_failed.add(task.id)
+            self._tester_compaction_failed.add(task.id)
             if not hard:
                 self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
                 return False
@@ -1444,17 +1450,17 @@ class PipelineCompactionLayer(CoreState):
         else:
             new_messages, event, llm_failed, _mechanical = compacted
         if llm_failed:
-            self._compaction_failed.add(task.id)
-            self._hard_limit_exhausted.discard(task.id)
+            self._tester_compaction_failed.add(task.id)
+            self._tester_hard_limit_exhausted.discard(task.id)
         else:
-            self._compaction_failed.discard(task.id)
-            self._hard_limit_exhausted.discard(task.id)
+            self._tester_compaction_failed.discard(task.id)
+            self._tester_hard_limit_exhausted.discard(task.id)
         if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
             round_messages
         ):
             # The hard-level compaction could not shrink the round:
             # disable the hard-level gate bypass for this task.
-            self._hard_limit_exhausted.add(task.id)
+            self._tester_hard_limit_exhausted.add(task.id)
         task.tester_messages[-1] = new_messages
         task.touch()
         self.manager.storage.save(task)

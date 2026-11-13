@@ -867,7 +867,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # break→continuation→break forever); turn-boundary compaction still
         # retries each turn, and the HARD-LIMIT level ignores this flag
         # entirely (growth past the hard limit is never allowed — it
-        # escalates to the mechanical trim instead).
+        # escalates to the mechanical trim instead). DEV/RESEARCH
+        # transcript only: the tester and resolver rounds keep their own
+        # sets so a failure seen by one role's transcript never disables
+        # another role's gate.
         self._compaction_failed: set[str] = set()
         # Tasks whose HARD-LIMIT escalation could not shrink the transcript
         # either (nothing beyond the verbatim original prompts to trim): the
@@ -875,11 +878,23 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # resume cycle would repeat at every tool boundary with no effect.
         # Cleared as soon as any compaction actually shrinks the transcript.
         self._hard_limit_exhausted: set[str] = set()
+        # The same bookkeeping for the tester ROUND gate (see
+        # _maybe_compact_tester_round): an agent-transcript compaction
+        # failure or livelock must never disable the testing round's
+        # mid-round gate (the #c1edeefe poisoning — a dev-transcript
+        # livelock stop silenced the tester's gate entirely and the round
+        # died on a deterministic context overflow with no compaction
+        # attempt at all).
+        self._tester_compaction_failed: set[str] = set()
+        self._tester_hard_limit_exhausted: set[str] = set()
         # Livelock guard: consecutive hard-limit compactions per task that
         # never landed a turn under the hard limit — past
         # _HARD_LIMIT_COMPACTION_LIMIT the gate stops compacting (the cap is
-        # below the transcript's irreducible floor; see _livelock_stop).
+        # below the transcript's irreducible floor; see _livelock_stop). One
+        # counter per layer (dev transcript, tester round; the resolver
+        # keeps its own).
         self._hard_limit_compactions: dict[str, int] = {}
+        self._tester_hard_limit_compactions: dict[str, int] = {}
         # The same guard at the threshold level: consecutive threshold
         # compactions per task with no demonstrated progress under the
         # threshold in between (every turn's growth re-crosses it — the

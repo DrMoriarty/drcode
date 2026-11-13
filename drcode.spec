@@ -45,6 +45,30 @@ elif sys.platform.startswith("linux"):
         file=sys.stderr,
     )
 
+def _mcp_submodules():
+    """mcp submodules, enumerated from the filesystem WITHOUT importing.
+
+    PyInstaller's collect_submodules imports every subpackage to walk it,
+    and mcp's `mcp.cli` demands typer at import time (the optional
+    `mcp[cli]` extra, not a drcode dependency — drcode only uses the
+    mcp.server/mcp.client halves), so plain collection dies with
+    SystemExit(1). Listing *.py paths needs no imports at all; mcp.cli
+    and its submodules are dropped from the bundle entirely.
+    """
+    import mcp
+
+    root = Path(mcp.__file__).parent
+    names = ["mcp"]
+    for path in sorted(root.rglob("*.py")):
+        parts = list(path.relative_to(root.parent).with_suffix("").parts)
+        if "__init__" in parts:
+            parts.remove("__init__")
+        name = ".".join(parts)
+        if not name.startswith("mcp.cli"):
+            names.append(name)
+    return names
+
+
 a = Analysis(
     [str(ROOT / "drcode_entry.py")],
     pathex=[str(ROOT / "src")],
@@ -88,7 +112,7 @@ a = Analysis(
         # dependency and a half-collected bundle fails at the first
         # request instead of at import time.
         "mcp",
-        *collect_submodules("mcp"),
+        *_mcp_submodules(),
         "uvicorn",
         *collect_submodules("uvicorn"),
         "starlette",
@@ -99,7 +123,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["mcp.cli"],
     noarchive=False,
 )
 

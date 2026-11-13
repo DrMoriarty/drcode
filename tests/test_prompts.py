@@ -361,6 +361,12 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
         TESTER_SYSTEM_PROMPT_NO_COMMIT,
     )
 
+    # Every template names the task's ISOLATED worktree as its working
+    # directory (otherwise the project root): under worktree isolation the
+    # agent works — and the tester verifies — in `.drcode/worktrees/<id>`,
+    # never in the user's main checkout (the #92194141 class: the tester
+    # read the main checkout, found none of the task's uncommitted work and
+    # returned a finished task to development).
     for template in (
         FEATURE_SYSTEM_PROMPT,
         BUG_SYSTEM_PROMPT,
@@ -370,9 +376,65 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
         TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
     ):
         assert template.startswith(
-            "Working directory (project root): {project_path}\n"
+            "Working directory (under worktree isolation: the task's own "
+            "isolated worktree\n"
+            "`.drcode/worktrees/<task-id>`; otherwise the project root): "
+            "{project_path}\n"
             "Relative tool paths resolve against it; run_bash starts there.\n"
         )
+    # The read-only subagent reads the parent's tree — same header, no shell.
+    from drcode.prompts import SUBAGENT_SYSTEM_PROMPT
+
+    assert SUBAGENT_SYSTEM_PROMPT.startswith(
+        "Working directory (under worktree isolation: the task's own isolated "
+        "worktree\n"
+        "`.drcode/worktrees/<task-id>`; otherwise the project root): "
+        "{project_path}\n"
+        "Relative tool paths resolve against it.\n"
+    )
+
+
+def test_tester_prompts_pin_the_verified_tree() -> None:
+    """Every tester variant must (a) say the working directory is the task's
+    ISOLATED worktree, (b) forbid absolute paths / `cd` into the main
+    checkout and (c) teach the grep-vs-read_file diagnostic — the #92194141
+    incident: the tester read the main checkout by absolute paths, saw no
+    diff there and failed a task whose work sat uncommitted in its worktree
+    while grep_search (run in the worktree, where the old code was gone)
+    returned nothing."""
+    from drcode.prompts import (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+    )
+
+    for template in (
+        TESTER_SYSTEM_PROMPT,
+        TESTER_SYSTEM_PROMPT_NO_COMMIT,
+        TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH,
+    ):
+        normalized = " ".join(template.split())
+        # (a) the isolated worktree is named, not just "project root".
+        assert "the task's own isolated worktree" in normalized
+        assert ".drcode/worktrees/<task-id>" in template
+        assert "NOT the main project checkout" in normalized
+        # (b) the hard prohibition on leaving the verified tree.
+        assert "no absolute paths pointing into it" in normalized
+        assert "no `cd` out of this working directory" in normalized
+        assert "runs HERE, in this directory" in normalized
+        # The wrong-tree conclusion is explicitly disarmed.
+        assert "git diff main...drcode/<task-id>" in template
+        assert "must never be reported as one" in template
+        # (c) the contradiction diagnostic sits BEFORE step 1.
+        assert "Steps:\n0. Pre-flight: confirm the tree" in template
+        assert (
+            "a read_file by an absolute path shows the old code while "
+            "grep_search in the working directory cannot find the new one"
+        ) in normalized
+        assert "TWO different trees" in normalized
+        assert "Never blame the tool" in normalized
+        # The uncommitted-work fact is stated (each variant in its own words).
+        assert "edits sit there UNCOMMITTED" in normalized
 
 
 def test_templates_exist_in_package() -> None:

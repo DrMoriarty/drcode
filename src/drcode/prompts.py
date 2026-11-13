@@ -265,8 +265,11 @@ def load_tester_prompt(
     push. A project may override the template
     with `<root>/.drcode/prompts/tester.md` (or `tester_no_commit.md` /
     `tester_commit_no_push.md`). The ``{project_path}`` placeholder in the
-    template header is replaced with the actual project directory; without a
-    root a neutral ``(unknown)`` marker is substituted.
+    template header is replaced with the actual working directory — under
+    worktree isolation the task's own worktree (``project_root`` is then
+    the root `build_tester_agent` received from `task_env.ensure_root`),
+    never the main checkout — and without a root a neutral ``(unknown)``
+    marker is substituted.
 
     When the project defines `.drcode/git-workflow.md`, its rules are
     appended: the tester must finalize the task according to the same team

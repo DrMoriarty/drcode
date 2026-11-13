@@ -38,6 +38,9 @@ voice = []
 
 [project.scripts]
 drcode = "drcode:main"
+# stdio→Streamable-HTTP MCP shim for clients that can only spawn a
+# subprocess (docs/mcp-server-design.md §1). Logic in drcode.mcp.proxy.
+drcode-mcp = "drcode.mcp_proxy:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

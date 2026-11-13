@@ -20,7 +20,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 
 from drcode import agent as agent_mod
 from drcode.agent import AgentDeps
-from drcode.agent_model import TodoTailModel
+from drcode.agent_model import TailInjectionModel
 from drcode.config import Config
 from drcode.models import Task, TaskKind, TaskStatus, TodoItem
 from drcode.storage import Storage
@@ -216,7 +216,7 @@ class _CreateThenFinishModel(TestModel):
 
 class _CapturingModel(WrapperModel):
     """Records the message list every wrapped request actually receives —
-    the wire boundary the TodoTailModel injection must show up at."""
+    the wire boundary the TailInjectionModel injection must show up at."""
 
     def __init__(self, wrapped):  # type: ignore[no-untyped-def]
         super().__init__(wrapped)
@@ -271,7 +271,7 @@ async def _run_once(
     path the pipeline uses, i.e. model.request_stream."""
     from pydantic_ai import Agent
 
-    model = TodoTailModel(inner, supplier)
+    model = TailInjectionModel(inner, [supplier])
     async with ag.iter(prompt, model=model, deps=deps) as run:
         async for node in run:
             if stream_nodes and Agent.is_model_request_node(node):
@@ -400,13 +400,13 @@ async def test_todo_tail_model_semantics() -> None:
             return ModelResponse(parts=[TextPart(content="ok")])
 
     echo = _EchoModel()
-    model = TodoTailModel(echo, lambda: None)
+    model = TailInjectionModel(echo, [lambda: None])
     msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hi")])]
     await model.request(msgs, None, None)  # type: ignore[arg-type]
     assert echo.seen == msgs
 
     echo2 = _EchoModel()
-    model2 = TodoTailModel(echo2, lambda: "BLOCK")
+    model2 = TailInjectionModel(echo2, [lambda: "BLOCK"])
     await model2.request(msgs, None, None)  # type: ignore[arg-type]
     assert echo2.seen is not None
     assert len(echo2.seen) == 2
@@ -416,15 +416,72 @@ async def test_todo_tail_model_semantics() -> None:
     assert len(msgs) == 1
 
 
+async def test_tail_injection_merges_suppliers_into_one_message() -> None:
+    """Several suppliers share ONE synthetic trailing message: the checklist
+    block and the delegation note never cost two extra user messages, and
+    None/blank suppliers are skipped entirely."""
+    from pydantic_ai.messages import (
+        ModelMessage,
+        ModelResponse,
+        TextPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.models import Model
+
+    class _EchoModel(Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[ModelMessage] | None = None
+
+        @property
+        def model_name(self) -> str:
+            return "echo"
+
+        @property
+        def system(self) -> str:
+            return "test"
+
+        async def request(  # type: ignore[no-untyped-def]
+            self, messages, model_settings, model_request_parameters
+        ):
+            self.seen = list(messages)
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+    msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hi")])]
+
+    echo = _EchoModel()
+    model = TailInjectionModel(echo, [lambda: "CHECKLIST", lambda: None, lambda: " "])
+    await model.request(msgs, None, None)  # type: ignore[arg-type]
+    assert echo.seen is not None
+    assert len(echo.seen) == 2  # exactly one extra message
+    tail = _tail_text(echo.seen)
+    assert "CHECKLIST" in tail
+    # Blank suppliers contribute nothing (no stray separators).
+    assert tail.strip() == "CHECKLIST"
+
+    echo2 = _EchoModel()
+    both = TailInjectionModel(echo2, [lambda: "CHECKLIST", lambda: "NOTE"])
+    await both.request(msgs, None, None)  # type: ignore[arg-type]
+    assert echo2.seen is not None
+    assert len(echo2.seen) == 2  # still one extra message for both blocks
+    tail2 = _tail_text(echo2.seen)
+    assert "CHECKLIST" in tail2 and "NOTE" in tail2
+    # All-None suppliers leave the request untouched.
+    echo3 = _EchoModel()
+    empty = TailInjectionModel(echo3, [lambda: None])
+    await empty.request(msgs, None, None)  # type: ignore[arg-type]
+    assert echo3.seen == msgs
+
+
 def test_build_agent_wraps_model_only_with_supplier(fake_config: Config) -> None:
     """The tail wrapper is installed exactly when a supplier is wired, and
     stays a pass-through design elsewhere (tester/resolver/estimation)."""
     from drcode.agent import build_agent
 
     assert isinstance(
-        build_agent(fake_config, todo_supplier=lambda: None).model, TodoTailModel
+        build_agent(fake_config, todo_supplier=lambda: None).model, TailInjectionModel
     )
-    assert not isinstance(build_agent(fake_config).model, TodoTailModel)
+    assert not isinstance(build_agent(fake_config).model, TailInjectionModel)
 
 
 def test_todo_tail_defaults_off_in_settings(project_root: Path) -> None:

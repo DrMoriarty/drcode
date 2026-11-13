@@ -24,6 +24,24 @@ pipeline creates one per activation and hands it to the agent deps;
 exceeding the limit returns a plain explanatory tool result — never a
 crash of the parent run. A failing subagent (network, model refusal,
 usage cap) is likewise converted into a plain tool result.
+
+PROMPTING is what makes the tool get called — the wiring alone does not.
+A whole 119-task drcode-bench run with the slots enabled fired ZERO
+delegations while the tool was merely present in the schema. Three
+places carry the prompting, all of them deliberate:
+
+- the "Read-only subagents: delegate_research" section of the coding
+  system prompts (`prompts/system/{feature,bug,research}.md`) — imperative,
+  with hard triggers (mapping call sites, recon over >3-5 files, surveying
+  a subsystem before editing) and a worked three-part brief example;
+- the tool description built in `agent_build` — the same triggers plus the
+  economics (the parent's own reads are permanent context and move it
+  toward a compaction; a subagent's reads are free);
+- `agent_tools.subagent_notice` — one line put into the request TAIL on
+  every request while the limit is above 0, right next to the live
+  checklist (`agent_model.TailInjectionModel`). The tail, never leading
+  dynamic instructions: the leading system zone is the server-side prefix
+  cache.
 """
 
 from __future__ import annotations

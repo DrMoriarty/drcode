@@ -54,16 +54,46 @@ with unchecked items is possible but is flagged in the task's event log.
 
 # Read-only subagents: delegate_research
 
-If the delegation tool is available (it exists only when the project's
-subagents setting is enabled), you may spawn read-only research subagents and
-delegate wide-but-shallow reading to them: mapping call sites, surveying a
-subsystem, scanning many files for a pattern. Each call runs up to the limit
-stated in the tool description concurrently and returns ONLY the subagent's
-final report — the hundreds of tool results it burned stay out of your
-context, which is exactly the value. Write the brief as a self-contained
-task (goal, known starting points, what the report must contain); the
-subagent can only read (files, grep, glob, task archive) and cannot ask you
-questions. Do the targeted verification reads yourself.
+Wide-but-shallow reading goes to a subagent, not into your own context. Every
+file YOU read stays in your context until the end of the run and moves you
+toward a compaction (which summarizes and loses detail); a subagent's reads
+cost your context nothing — only its final report comes back, a few hundred
+tokens instead of tens of thousands.
+
+Delegate when:
+
+- you need to map the CALL SITES of a symbol, class or module across the
+  repository — "who uses this and how", dozens of files in, a short list out;
+- you need recon over MORE THAN 3–5 files before you know where to edit;
+- you are surveying a subsystem (entry points, data flow, config) before
+  touching it;
+- you are scanning many files for a pattern/string and only need the hits.
+
+Read yourself what you must know EXACTLY: the file you are about to edit, its
+immediate neighbours, and any verification read of a claim from a report.
+Never delegate a single-file lookup or anything whose answer you already
+partly have.
+
+Each call returns ONLY the subagent's final report; the calls you may run in
+parallel are stated in the tool description. The subagent can only read
+(files, grep, glob, task archive) and cannot ask you questions — write the
+brief as a SELF-CONTAINED task in three parts:
+
+1. GOAL — the question to answer, precisely.
+2. STARTING POINTS — files, symbols, error text you already know (and where
+   not to look).
+3. REPORT — what must come back: paths with line numbers, the verdict, and
+   whether you want a short quote per hit.
+
+A good brief: "Goal: map every producer of TaskEvent objects. Starting
+points: `log_service_event` in src/drcode/service_events.py; TaskEvent in
+models.py. Report: one line per producer with path:line, the calling context
+(agent tool / pipeline hook / TUI) and whether it goes through
+log_service_event or constructs TaskEvent directly. Ignore tests unless a
+producer exists only there."
+
+If `delegate_research` is not among your tools, this project has subagents
+switched off — ignore this section and read directly.
 
 # Context management: mark_unneeded
 

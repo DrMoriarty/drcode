@@ -49,6 +49,27 @@ def _description(ag, name: str) -> str:
     raise AssertionError(f"tool {name} is not registered")
 
 
+def _instructions_text(ag) -> str:
+    """The LEADING (static) instruction text of a built agent — dynamic
+    hooks are functions and carry no literal here, like in the agent tests."""
+    return "\n".join(
+        si.instruction for si in ag._instructions if isinstance(si.instruction, str)
+    )
+
+
+def _tail_text(messages: list) -> str:
+    """The text of the trailing synthetic message the wrapper appends."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    last = messages[-1]
+    assert isinstance(last, ModelRequest)
+    return "\n".join(
+        part.content
+        for part in last.parts
+        if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+    )
+
+
 # -- registration follows the project setting ----------------------------------
 
 
@@ -69,6 +90,95 @@ def test_delegate_tool_registered_with_baked_limit(fake_config: Config) -> None:
     # Singular spelling at 1 — the number must never lie.
     ag1 = build_agent(fake_config, kind=TaskKind.RESEARCH, subagent_limit=1)
     assert "up to 1 subagent" in _description(ag1, "delegate_research")
+
+
+def test_delegate_description_carries_triggers_and_economics(
+    fake_config: Config,
+) -> None:
+    """The description must not merely explain how to write a brief: it
+    carries the WHEN (hard triggers) and the WHY (the context economics —
+    the parent's own reads are permanent context and move it toward a
+    compaction, a subagent's reads are free). A 119-task benchmark in which
+    the tool was offered but never once called is the regression this guards.
+    """
+    for kind in (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH):
+        text = _description(
+            build_agent(fake_config, kind=kind, subagent_limit=2), "delegate_research"
+        )
+        # WHEN: the concrete triggers, not a vague "you may delegate".
+        assert "WHEN TO DELEGATE" in text
+        assert "call sites" in text
+        assert "3–5 files" in text
+        assert "surveying a subsystem" in text
+        # WHY: the economic argument.
+        assert "WHY IT IS CHEAP" in text
+        assert "compaction" in text
+        assert "stays in your context" in text
+        # HOW: still the three-part brief (goal / starting points / report).
+        assert "HOW TO WRITE THE BRIEF" in text
+        assert "STARTING POINTS" in text
+        assert "REPORT" in text
+        # The description is parsed from the SOURCE (the docstring is
+        # assigned, never an f-string in the def) — a blank one would be a
+        # silent regression of the whole feature.
+        assert len(text) > 500
+
+
+def test_delegation_note_injected_at_request_tail(fake_config: Config) -> None:
+    """With slots enabled the run gets ONE line in the trailing injection
+    zone ("You have N ..."), never in the leading system instructions: the
+    leading zone is the cached prefix, and a per-request reminder there
+    would invalidate it on every request."""
+    from drcode.agent import subagent_notice
+    from drcode.agent_model import TailInjectionModel
+
+    for kind, role in (
+        (TaskKind.FEATURE, AgentRole.CODING),
+        (TaskKind.BUG, AgentRole.CODING),
+        (TaskKind.RESEARCH, AgentRole.RESEARCH),
+    ):
+        ag = build_agent(fake_config, kind=kind, subagent_limit=2)
+        assert isinstance(ag.model, TailInjectionModel)
+        block = subagent_notice(2, role=role)
+        assert block is not None
+        assert "You have 2 read-only subagents available via delegate_research" in block
+        assert "delegate_research" in block
+        # Not in the static instructions.
+        assert "You have 2 read-only subagents" not in _instructions_text(ag)
+
+    # Singular spelling, and 0 = no note at all (no wrapper, no block).
+    assert "You have 1 read-only subagent available" in (
+        subagent_notice(1, role=AgentRole.CODING) or ""
+    )
+    assert subagent_notice(0, role=AgentRole.CODING) is None
+    assert not isinstance(
+        build_agent(fake_config, kind=TaskKind.FEATURE).model, TailInjectionModel
+    )
+    # Short on purpose: it repeats on every request of every run with slots
+    # enabled, so it must stay a POINTER to the triggers — the description
+    # and the system prompt already carry the full argument.
+    assert len(subagent_notice(2, role=AgentRole.CODING) or "") < 320
+
+
+def test_delegation_note_rides_the_same_tail_as_the_checklist(
+    fake_config: Config,
+) -> None:
+    """Both tail blocks share ONE synthetic message (the wrapper merges its
+    suppliers), so enabling subagents never costs a second extra message."""
+    from drcode.agent_model import TailInjectionModel
+
+    ag = build_agent(
+        fake_config,
+        kind=TaskKind.FEATURE,
+        subagent_limit=1,
+        todo_supplier=lambda: "CHECKLIST-BLOCK",
+    )
+    assert isinstance(ag.model, TailInjectionModel)
+    written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
+    assert len(written) == 1
+    tail = _tail_text(written)
+    assert "CHECKLIST-BLOCK" in tail
+    assert "You have 1 read-only subagent available" in tail
 
 
 def test_subagent_limit_follows_role() -> None:

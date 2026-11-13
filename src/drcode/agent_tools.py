@@ -48,6 +48,7 @@ from .models import (
     VerificationStatus,
     render_todos,
 )
+from .providers import AgentRole
 from .service_events import log_service_event
 from .task_env import WORKTREES_SUBDIR, branch_for
 from .task_overlap import (
@@ -83,6 +84,7 @@ __all__ = [
     "goals_dynamic_instructions",
     "goals_instructions",
     "load_agents_md",
+    "subagent_notice",
     "todo_instructions",
 ]
 
@@ -752,6 +754,40 @@ def _update_goal(
     )
 
 
+def subagent_notice(limit: int, *, role: AgentRole) -> str | None:
+    """The run's delegation note as a prompt block (None when the run has no
+    subagent slots — the default).
+
+    One line, injected at the TAIL of every model request of the run
+    (`agent_model.TailInjectionModel`, wired by `build_agent`) whenever the
+    project's `subagents_coder`/`subagents_researcher` setting is above 0.
+    Without it the feature is effectively invisible: a tool that merely
+    EXISTS in the schema went uncalled across a whole 119-task benchmark run
+    (drcode-bench, slots enabled), while a standing reminder of the real
+    budget in the live context does get acted on.
+
+    Deliberately the TAIL, not leading dynamic instructions: the leading
+    system zone is the cached prefix, and a per-request reminder there would
+    invalidate it on every request. The text is constant for a run (the
+    limit is fixed at activation), so even the tail zone stays stable.
+
+    The block stays SHORT on purpose — it is repeated on every request of
+    every run with slots enabled, so it buys its keep as a pointer to the
+    triggers, not as a second copy of the tool description (which the model
+    sees in the schema and the system prompt already). `role` picks the
+    WRITE/GREP counterpart: the research role documents rather than edits."""
+    if limit <= 0:
+        return None
+    plural = "subagent" if limit == 1 else "subagents"
+    verb = "document" if role is AgentRole.RESEARCH else "edit"
+    return (
+        f"You have {limit} read-only {plural} available via delegate_research "
+        "— free context for wide-but-shallow reading (mapping call sites, "
+        "recon over >3-5 files, surveying a subsystem before you touch it). "
+        f"Read only the files you will {verb} yourself."
+    )
+
+
 def todo_instructions(task: Task) -> str | None:
     """The task's current checklist state as a prompt block (feature tasks
     with a non-empty list only — nothing else has todo tools or a
@@ -759,11 +795,11 @@ def todo_instructions(task: Task) -> str | None:
 
     This is the key anti-"forgot the list" measure. The block is injected
     at the TAIL of every model request of the coding agent (a synthetic
-    last message, see `agent_model.TodoTailModel` — the pipeline supplies
-    the live supplier at activation), recomputed from the task's CURRENT
-    state: the model sees the live list on the very first request after a
-    `todo_create`/`todo_update` call within the same uninterrupted run,
-    not only after a restart or a compaction.
+    last message, see `agent_model.TailInjectionModel` — the pipeline
+    supplies the live supplier at activation), recomputed from the task's
+    CURRENT state: the model sees the live list on the very first request
+    after a `todo_create`/`todo_update` call within the same uninterrupted
+    run, not only after a restart or a compaction.
 
     Deliberately the TAIL, not dynamic instructions: those render into the
     leading system messages, and a mid-activation checklist mutation there

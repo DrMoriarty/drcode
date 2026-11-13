@@ -310,6 +310,47 @@ def test_bug_and_feature_prompts_mirror_options_discipline() -> None:
         assert "~5–10-word imperative label" in normalized
 
 
+def test_system_prompts_delegate_imperatively_with_triggers() -> None:
+    """All three coding/research system prompts must carry an IMPERATIVE
+    delegation section with hard triggers and the context economics.
+
+    Regression: the section used to open with "If the delegation tool is
+    available (it exists only when the project's subagents setting is
+    enabled)" — a conditional framing models barely act on. A whole 119-task
+    drcode-bench run with `subagents_coder`/`subagents_researcher` = 1 fired
+    ZERO `delegate_research` calls while the tool was merely present."""
+    from drcode.prompts import (
+        BUG_SYSTEM_PROMPT,
+        FEATURE_SYSTEM_PROMPT,
+        RESEARCH_SYSTEM_PROMPT,
+    )
+
+    for template in (FEATURE_SYSTEM_PROMPT, BUG_SYSTEM_PROMPT, RESEARCH_SYSTEM_PROMPT):
+        normalized = " ".join(template.split())
+        assert "# Read-only subagents: delegate_research" in normalized
+        # The conditional opening is gone (allow only the fallback guard at
+        # the end, which is an "if ... not among your tools" clause).
+        assert "If the delegation tool is available" not in normalized
+        # Imperative + the concrete triggers.
+        assert "Wide-but-shallow reading goes to a subagent" in normalized
+        assert "Delegate when:" in normalized
+        assert "MORE THAN 3–5 files" in normalized
+        assert "surveying a subsystem" in normalized
+        assert "Never delegate a single-file lookup" in normalized
+        # The economics: the parent's reads are permanent context, a
+        # subagent's are free.
+        assert "moves you toward a compaction" in normalized
+        assert "cost your context nothing" in normalized
+        # The three-part brief example.
+        assert "SELF-CONTAINED task in three parts" in normalized
+        assert "GOAL" in normalized
+        assert "STARTING POINTS" in normalized
+        assert "REPORT" in normalized
+        assert 'A good brief: "' in normalized
+        # Graceful degradation when the project has subagents switched off.
+        assert "If `delegate_research` is not among your tools" in normalized
+
+
 def test_system_prompt_templates_carry_placeholder_header() -> None:
     from drcode.prompts import (
         BUG_SYSTEM_PROMPT,

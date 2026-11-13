@@ -14,8 +14,10 @@ Split out of :mod:`drcode.tui.actions` — see the composition in
 from __future__ import annotations
 
 import time
+from functools import partial
 from typing import ClassVar
 
+from rich.markup import escape
 from textual.widgets import ListView
 
 from ..agent import (
@@ -29,6 +31,7 @@ from ..models import (
 from ..settings import (
     EscAbort,
 )
+from .confirm_dialog import ConfirmDialog
 from .deps_picker import DependencyPicker
 from .sidebar import TaskItem
 from .state import DrCodeState
@@ -462,10 +465,73 @@ class TaskLifecycleLayer(DrCodeState):
         Doubles as the force-start: removing the blocking dependency makes
         the task eligible immediately (the gate is dynamic — nothing else
         to reset). The manual override is logged into the task's service
-        events."""
+        events. The palette entry is an explicit user command and acts
+        directly; the header's ✕ link goes through the confirmation
+        (`action_remove_viewed_dependency`) and then the same tail."""
         task = self.viewed
         if not self._can_edit_dependencies(task) or task is None:
             return
+        self._drop_dependency(task.id, dep_id)
+
+    def action_remove_viewed_dependency(self, dep_id: str) -> None:
+        """Click on a dependency's ✕ in the task header's second row.
+
+        The ✕ carries the id it belongs to, so a click always targets
+        exactly that dependency. Nothing is changed on the click itself:
+        the removal is a force-start (the task stops waiting and becomes
+        eligible for development immediately), so it goes through a
+        modal yes/no confirmation first — only an explicit "yes" reaches
+        the mutation (`_dependency_removal_confirmed`). A drag-selection
+        ending on the link is copying text, not clicking (the same guard
+        as the other header links)."""
+        if self.screen.selections:
+            return
+        task = self.viewed
+        if not self._can_edit_dependencies(task) or task is None:
+            return
+        dep = dep_id.lower()
+        if dep not in task.depends_on:
+            return
+        dep_task = self.manager.tasks.get(dep)
+        what = f"#{dep} {dep_task.title_display}" if dep_task else f"#{dep}"
+        self.push_screen(
+            ConfirmDialog(
+                f"[bold]Remove dependency {escape(what)} from #{task.id}?[/]",
+                "Dropping the dependency unblocks the task: it becomes "
+                "eligible for development right away (a manual force-start) "
+                "and the override is logged into the task's service events.",
+                confirm_label="Remove",
+                cancel_label="Keep",
+            ),
+            partial(self._dependency_removal_confirmed, task.id, dep),
+        )
+
+    def _dependency_removal_confirmed(
+        self, task_id: str, dep_id: str, confirmed: bool | None
+    ) -> None:
+        """Callback of the header ✕'s confirmation: an explicit "yes" is
+        the only answer that removes the dependency (ESC / "keep" — and
+        Textual's None for a screen dismissed without a result — leave the
+        task untouched)."""
+        if not confirmed:
+            return
+        self._drop_dependency(task_id, dep_id)
+
+    def _drop_dependency(self, task_id: str, dep_id: str) -> None:
+        """The shared tail of both removal paths (the palette command and
+        the confirmed header ✕): replace `depends_on` without `dep_id`,
+        forget the cached gate state of that task (the block toast and
+        the promote worker's last verdict are stale now) and force the
+        pipeline to re-evaluate the queue — the task is eligible at once.
+
+        Re-validated here rather than trusting the caller: between the
+        click and the confirmation the task may have been promoted (or
+        the dependency already dropped), and dependencies of a started
+        task are no longer editable."""
+        task = self.manager.tasks.get(task_id)
+        if task is None or not self._can_edit_dependencies(task):
+            return
+        dep_id = dep_id.lower()
         if dep_id not in task.depends_on:
             return
         self.manager.set_dependencies(

@@ -611,16 +611,33 @@ class PipelineCompactionLayer(CoreState):
         models that ignore the markdown template and answer with a JSON
         envelope or a ```json fence are unwrapped here (see
         `unwrap_summary_envelope`) — an envelope that slipped through would
-        ride the <previous-summary> anchor chain forever."""
+        ride the <previous-summary> anchor chain forever.
+
+        The call is STREAMED (`run_stream` + `get_output`): the transport's
+        read-timeout then applies between chunks instead of to the whole
+        response, so a long prefill plus a long summary no longer expires a
+        call that is actively generating (see the inline note)."""
         agent = build_compaction_agent(self.resolved_config(AgentRole.COMPACTION))
-        result = await agent.run(prompt)
+        # Streaming on purpose: the OpenAI SDK read-timeout (default 600s)
+        # measures time-to-full-response on a non-streaming call — prefill
+        # of a multi-hundred-k-token transcript plus generation can exceed
+        # it (a real case: 714k tokens of prefill, the summary died at
+        # token ~2900 after exactly 600s, and drcode's retry layer then
+        # repeated the whole prefill five more times). With a streaming
+        # call the read-timeout applies BETWEEN chunks, so it only bounds
+        # the time to the first token; the generation itself can run as
+        # long as it keeps producing. `get_output()` drains the stream and
+        # the usage is final once the context exits (the run completed).
+        async with agent.run_stream(prompt) as streamed:
+            output = await streamed.get_output()
+            usage = streamed.usage
         # The summarizer's model calls count toward the session usage too.
         self._record_session_usage(
-            result.usage,
+            usage,
             AgentRole.COMPACTION,
             self.resolved_model_key(AgentRole.COMPACTION),
         )
-        return unwrap_summary_envelope(result.output)
+        return unwrap_summary_envelope(output)
 
     async def _reduce_partials(
         self,

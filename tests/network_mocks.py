@@ -85,6 +85,53 @@ def last_user_text(messages: list[ModelMessage]) -> str:
     return "\n".join(parts)
 
 
+def response_deltas(
+    response: ModelResponse,
+) -> list[str | dict[int, DeltaToolCall]]:
+    """Replay a `ModelResponse` as streamed deltas: text parts as text,
+    tool calls as DeltaToolCall batches (the shape FunctionModel streams)."""
+    deltas: list[str | dict[int, DeltaToolCall]] = []
+    for part in response.parts:
+        if isinstance(part, TextPart):
+            deltas.append(part.content)
+        elif isinstance(part, ToolCallPart):
+            args = (
+                part.args if isinstance(part.args, str) else json.dumps(part.args or {})
+            )
+            deltas.append(
+                {
+                    0: DeltaToolCall(
+                        name=part.tool_name,
+                        json_args=args,
+                        tool_call_id=part.tool_call_id,
+                    )
+                }
+            )
+    return deltas
+
+
+def function_model(
+    function: Callable[[list[ModelMessage], AgentInfo], ModelResponse],
+) -> FunctionModel:
+    """A FunctionModel serving BOTH request kinds from one scripted function.
+
+    `FunctionModel(function)` alone refuses streamed requests ("must receive a
+    stream_function"), and the compaction summarizer
+    (`core/pipeline_compaction._run_summarizer`) always streams, so the plain
+    constructor cannot stub it. Here the scripted `ModelResponse` is replayed
+    as deltas for the streamed request kind; exceptions raised by the function
+    propagate into both kinds alike.
+    """
+
+    async def stream_fn(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
+        for delta in response_deltas(function(messages, info)):
+            yield delta
+
+    return FunctionModel(function, stream_function=stream_fn)
+
+
 class ScriptedState:
     """A queue of model responses / exceptions consumed in request order.
 
@@ -112,22 +159,8 @@ class ScriptedState:
         """Streamed variant: replays the scripted response as deltas (the
         TUI consumes model responses through the streaming API)."""
         response = self.fn(messages, info)
-        for part in response.parts:
-            if isinstance(part, TextPart):
-                yield part.content
-            elif isinstance(part, ToolCallPart):
-                args = (
-                    part.args
-                    if isinstance(part.args, str)
-                    else json.dumps(part.args or {})
-                )
-                yield {
-                    0: DeltaToolCall(
-                        name=part.tool_name,
-                        json_args=args,
-                        tool_call_id=part.tool_call_id,
-                    )
-                }
+        for delta in response_deltas(response):
+            yield delta
 
     def model(self) -> FunctionModel:
         """A FunctionModel consuming this script, usable for both plain and

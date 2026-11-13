@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai.models.function import FunctionModel
 
 from drcode import agent_model
 from drcode.agent import is_summary_message, serialize_messages
@@ -26,6 +25,7 @@ from tests.network_mocks import (
     ScriptedState,
     api_error,
     event_texts,
+    function_model,
     text_response,
     wait_until,
 )
@@ -248,7 +248,7 @@ async def test_summarizer_failure_degrades_to_uncompressed_run(
     def failing(messages: list, info: Any) -> Any:
         raise api_error("Connection error.")
 
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: FunctionModel(failing))
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: function_model(failing))
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 30_000)
     _idle(app, task, 200)

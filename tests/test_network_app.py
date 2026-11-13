@@ -44,7 +44,9 @@ from tests.network_mocks import (
     ScriptedState,
     api_error,
     event_texts,
+    function_model,
     http_error,
+    mock_openai_model,
     status_handler,
     text_response,
     tool_response,
@@ -822,12 +824,10 @@ def _seed_transcript(app: DrCodeApp, prompt: str) -> Any:
 async def test_compaction_failure_is_not_fatal(
     net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pydantic_ai.models.function import FunctionModel
-
     def failing(messages: list, info: Any) -> Any:
         raise api_error("Connection error.")
 
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: FunctionModel(failing))
+    monkeypatch.setattr(agent_model, "build_model", lambda cfg: function_model(failing))
     task = _seed_transcript(net_app_small_ctx, "long task " * 200)
 
     async with net_app_small_ctx.run_test() as pilot:
@@ -846,11 +846,11 @@ async def test_compaction_failure_is_not_fatal(
 async def test_compaction_success_replaces_history(
     net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pydantic_ai.models.function import FunctionModel
-
     state = ScriptedState()
     state.steps = [text_response("THE SUMMARY BODY")]
-    monkeypatch.setattr(agent_model, "build_model", lambda cfg: FunctionModel(state.fn))
+    monkeypatch.setattr(
+        agent_model, "build_model", lambda cfg: function_model(state.fn)
+    )
     prompt = "long task " * 200
     task = _seed_transcript(net_app_small_ctx, prompt)
 
@@ -866,6 +866,99 @@ async def test_compaction_success_replaces_history(
     assert is_summary_message(task.messages[1])
     assert "THE SUMMARY BODY" in task.messages[1]["parts"][0]["content"]
     assert not state.steps  # exactly one summarizer request happened
+
+
+def _sse_summarizer(
+    bodies: list[dict[str, Any]], text: str, usage: tuple[int, int] = (700, 40)
+) -> Any:
+    """An httpx handler serving the compaction summarizer: records every
+    request body and answers with an SSE (streamed) chat completion."""
+    from tests.network_mocks import sse_text_stream
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=sse_text_stream(text, usage=usage),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    return handler
+
+
+async def test_summarizer_always_streams(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The summarizer call is STREAMED, not single-shot.
+
+    A non-streaming request is measured by the OpenAI SDK's read-timeout
+    (default 600s) as time-to-full-response, so a big prefill plus a long
+    generation expires the call even while the model is actively producing
+    tokens — and drcode's retry layer then redoes the full prefill. Streamed
+    requests measure the timeout between chunks instead, so only the
+    time-to-first-token is bounded. Asserted at the transport level (the real
+    OpenAIChatModel over a mocked httpx transport): every compaction request
+    must carry `stream: true`, and the streamed usage must still be recorded
+    like the single-shot path's."""
+    bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: mock_openai_model(_sse_summarizer(bodies, "THE SUMMARY BODY")),
+    )
+    recorded: list[tuple[Any, AgentRole]] = []
+    orig_record = DrCodeApp._record_session_usage
+    monkeypatch.setattr(
+        DrCodeApp,
+        "_record_session_usage",
+        lambda self, usage, role, model_id: (
+            recorded.append((usage, role)),
+            orig_record(self, usage, role, model_id),
+        ),
+    )
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert bodies, "the summarizer was never called"
+    assert all(body.get("stream") is True for body in bodies)
+    assert any("Context compacted" in t for t in event_texts(task))
+    assert "THE SUMMARY BODY" in json.dumps(task.messages)
+    # Usage of the streamed call is accounted exactly once, under COMPACTION.
+    assert len(recorded) == len(bodies)
+    assert all(role is AgentRole.COMPACTION for _, role in recorded)
+    assert recorded[0][0].input_tokens == 700
+    assert recorded[0][0].output_tokens == 40
+
+
+async def test_summarizer_streamed_output_is_unwrapped(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The envelope normalization survives the streaming switch: a model
+    that ignores the markdown template and streams a JSON envelope still
+    lands a clean summary in the transcript (an envelope would otherwise
+    ride the <previous-summary> anchor chain forever)."""
+    bodies: list[dict[str, Any]] = []
+    envelope = json.dumps({"summary": "## Goal\n- streamed and unwrapped"})
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg: mock_openai_model(_sse_summarizer(bodies, envelope)),
+    )
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with net_app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await net_app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    summary = task.messages[-1]["parts"][0]["content"]
+    assert "## Goal\n- streamed and unwrapped" in summary
+    assert '{"summary"' not in summary
 
 
 async def test_compaction_preflight_skips_llm_and_trims_mechanically(
@@ -1930,14 +2023,13 @@ async def test_map_reduce_compaction_over_window(
     a final reduce call merges the partials — with every extra model call
     recorded via _record_session_usage like the single-shot path."""
     monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
-    from pydantic_ai.models.function import FunctionModel
 
     map_prompts: list[str] = []
     calls: dict[str, Any] = {"map": 0, "reduce": 0}
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: FunctionModel(_routing_summarizer(map_prompts, calls)),
+        lambda cfg: function_model(_routing_summarizer(map_prompts, calls)),
     )
 
     recorded: list[Any] = []
@@ -1990,13 +2082,12 @@ async def test_reduce_partials_hierarchical_on_overflow(
     batched and reduced hierarchically, then merged: bounded extra calls,
     still a structured summary."""
     monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
-    from pydantic_ai.models.function import FunctionModel
 
     calls: dict[str, Any] = {"map": 0, "reduce": 0}
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: FunctionModel(_routing_summarizer([], calls)),
+        lambda cfg: function_model(_routing_summarizer([], calls)),
     )
     app = DrCodeApp(project_root)
     partials = ["p" * 60_000 for _ in range(3)]
@@ -2015,13 +2106,12 @@ async def test_reduce_partials_mechanical_trim_at_depth_cap(
     trimmed per partial so the merge call always happens (the guaranteed
     floor)."""
     monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "2000")
-    from pydantic_ai.models.function import FunctionModel
 
     calls: dict[str, Any] = {"map": 0, "reduce": 0}
     monkeypatch.setattr(
         agent_model,
         "build_model",
-        lambda cfg: FunctionModel(_routing_summarizer([], calls)),
+        lambda cfg: function_model(_routing_summarizer([], calls)),
     )
     app = DrCodeApp(project_root)
     async with app.run_test() as pilot:

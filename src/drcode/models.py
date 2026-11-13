@@ -364,6 +364,18 @@ class Task(BaseModel):
     # (a newer run of the same task took over) never stamp — the newer
     # run re-stamps at its own end.
     last_run_end: datetime | None = None
+    # The model key ("<provider>/<model-id>"; bare id for custom models and
+    # the env override) that factually STARTED this task's last agent run —
+    # stamped on every run start (see
+    # core/pipeline_compaction._prepare_model_switch_transcript). Persisted
+    # with the task, so a model change ACROSS a drcode restart is detected:
+    # the next run compares the stored key against the freshly resolved one
+    # and, on a mismatch, cleans the transcript for the new model (strips
+    # the previous model's thinking parts — a cross-provider resume maps
+    # foreign reasoning into the assistant content otherwise — and
+    # compacts a large history). None for tasks never run and for old task
+    # files (no migration; the first run after the upgrade just stamps).
+    last_model_key: str | None = None
     # Service events (tester/agent failures, skips) with timestamps. Human
     # only: never serialized into the model context on resume.
     events: list[TaskEvent] = Field(default_factory=list)

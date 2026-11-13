@@ -223,6 +223,16 @@ class PipelineAgentRunLayer(CoreState):
             # run start, including the automatic resume of a demoted or
             # unfinished attempt.
             self._emit_run_model_event(task, role)
+            # Model-switch housekeeping (persisted `task.last_model_key` vs
+            # the freshly resolved key): when the model changed BETWEEN
+            # runs — a settings edit, or a restart after one — the
+            # transcript is cleaned for the new model before the first
+            # turn: the previous model's thinking parts are stripped
+            # mechanically (a cross-provider resume would otherwise map
+            # the foreign reasoning into the assistant content), a large
+            # history is force-compacted and a takeover note is added.
+            # Never fatal; a no-op when the key is unchanged.
+            await self._prepare_model_switch_transcript(task, role)
             # Agent-generated task title (project setting
             # generate_task_titles): on the FIRST activation only, before
             # the run loop consumes the pending input — so the user sees

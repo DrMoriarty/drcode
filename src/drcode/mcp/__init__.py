@@ -33,6 +33,11 @@ Module map:
   `resources/updated` bridge with its coalescing (§5).
 - `wiring` — `McpSurface`: the one object that assembles tools +
   resources + bus and the TUI keeps a reference to.
+- `proxy` — the stdio shim (`drcode-mcp` / `python -m drcode.mcp_proxy`,
+  executable module `drcode.mcp_proxy`): bridges `mcp.server.stdio` to
+  `mcp.client.streamable_http` for clients that can only spawn a
+  subprocess. Discovers the endpoint in `<cwd>/.drcode/mcp.json`,
+  never auto-starts a TUI (§1).
 
 The token is never displayed in the UI: the user is told the path of
 `.drcode/mcp.json` (mode 0600), which is also how a client obtains it.

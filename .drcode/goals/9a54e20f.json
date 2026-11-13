@@ -1,0 +1,10 @@
+{
+  "id": "9a54e20f",
+  "title": "Внутренний MCP-сервер",
+  "description": "Встроенный MCP-сервер в живом TUI (Streamable HTTP, localhost) + stdio-шим: внешним ИИ-агентам — управление задачами drcode. Дизайн: docs/mcp-server-design.md (утверждён).",
+  "notes": "## Источник правды\n\nПолное утверждённое описание реализации: **`docs/mcp-server-design.md`** — читать его как спецификацию, здесь только ключевое.\n\n## Суть\n\nДать внешним ИИ-агентам управлять drcode через MCP: ставить задачи, следить за статусом, отвечать на clarifications, двигать очередь. Мутации жизненного цикла идут строго через живой pipeline (единый гейт `_advance()`, `core/pipeline.py:210`) — сервер встраивается в TUI-процесс, headless-вариант отклонён.\n\n## Ключевые решения (утверждены)\n\n- Модули в `src/drcode/mcp/` (НЕ в `core/` — purity-тест); SDK — официальный `mcp` (python-sdk), standalone fastmcp и ручная JSON-RPC отклонены.\n- Транспорт: Streamable HTTP на 127.0.0.1, эфемерный порт, публикация в `.drcode/mcp.json` (port/token/pid, 0600); Bearer-токен + Origin/Host-валидация; `/healthz` без токена.\n- Один сервер = один проект; второй инстанс TUI не поднимает свой сервер (healthz + pid-проба).\n- Гейтинг мутаций повторяет TUI (`actions_lifecycle.py`), запрет → isError с советом, не исключение.\n- События — штатные MCP resources + `resources/updated` (коалесцирование ~250 мс).\n- stdio-шим `drcode-mcp` (`python -m drcode.mcp_proxy`) для клиентов только со stdio.\n- Вне v1: link/unlink_goal, стриминг прогресса, ask-drcode (§9 дизайн-документа).\n\n## Цепочка задач (физическая последовательность — один пакет `src/drcode/mcp/`)\n\n1. Фундамент: настройка, mcp.json, auth, жизненный цикл сервера в TUI.\n2. Read-only инструменты + ресурсы + мост событий.\n3. Мутации + матрица гейтинга + re-advance.\n4. stdio-шим `drcode-mcp`.",
+  "type": "goal",
+  "parent_id": null,
+  "order": 0,
+  "created_at": "2026-11-12T12:13:59.756770Z"
+}

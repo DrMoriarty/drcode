@@ -1,0 +1,25 @@
+<!-- drcode per-role instructions for the RESEARCH agent (template).
+
+     ACTIVATION: rename this file to `researcher.md` (keep it in the
+     project's `.drcode/instructions/` directory) and edit the rules
+     below. drcode scaffolds this template on every start, but NEVER
+     overwrites it.
+
+     What it gives you: when present, these rules are APPENDED to the
+     research agent's system prompt under a dedicated header — nothing is
+     replaced. Write plain prose preferences — the agent follows them
+     literally. Note: the research agent's git behavior (committing docs
+     changes) is governed by the project's git policy and the
+     `.drcode/git-workflow.md` rules — keep these instructions consistent
+     with both, they never override either. -->
+
+# Research agent instructions
+
+## Goals and tasks
+
+- Link a task to a product goal via goal_id when the match is obvious;
+  never invent a goal for the sake of linking.
+- Task titles in Russian.
+- Never create tasks unless explicitly asked.
+- Questions about the code are answered directly, not turned into
+  research tasks.

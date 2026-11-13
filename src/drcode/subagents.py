@@ -4,13 +4,17 @@ The parent agent's `delegate_research` tool (registered by
 `build_agent` only when the project's `subagents_coder` /
 `subagents_researcher` setting is above 0) runs a SHORT-LIVED nested
 pydantic-ai run whose toolset is deliberately READ-ONLY — read_file,
-grep_search, glob_files and search_task_archive. No run_bash, no
-writing tools: subagents must never touch the (possibly shared)
+grep_search, glob_files, search_task_archive and a whitelist-gated
+read-only git tool (`git_history`: log/blame/show/diff). No run_bash,
+no writing tools: subagents must never touch the (possibly shared)
 worktree, the git refs or the stash stack while the parent (or a
 sibling slot) is working — that is the structural guarantee against
-the #5c4c9912 write-race class. The path jail is the parent's own
-(`tools.read_file` reads anywhere anyway; the brief decides what is
-looked at).
+the #5c4c9912 write-race class. The git tool stays inside that
+guarantee structurally: a fixed subcommand whitelist (history readers
+only) plus GIT_OPTIONAL_LOCKS=0, so even the harmless-looking index
+stat-refresh a plain `git diff` performs can never take index.lock.
+The path jail is the parent's own (`tools.read_file` reads anywhere
+anyway; the brief decides what is looked at).
 
 The subagent's transcript is session-only (in memory, never persisted
 into task.json): the parent receives ONLY the subagent's final answer
@@ -47,6 +51,8 @@ places carry the prompting, all of them deliberate:
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -68,9 +74,101 @@ __all__ = [
     "SubagentDeps",
     "SubagentGate",
     "build_subagent_agent",
+    "git_read",
     "run_delegate_tool",
     "subagent_limit_for",
 ]
+
+# -- read-only git history tool --------------------------------------------------
+#
+# The subagent is blind to the code's history without git: "why is this code
+# like this", "when did this change", "what did the function look like
+# before" are unanswerable with read/grep/glob alone. A git tool would be the
+# natural fix, but a shell opens the write-race door (#5c4c9912) — so this is
+# NOT run_bash: a FIXED subcommand whitelist of pure history readers, run
+# without a shell (argv list — `>`/`>>` redirection is impossible by
+# construction), with GIT_OPTIONAL_LOCKS=0 so even the stat-cache refresh a
+# plain `git diff` may attempt never takes index.lock on a shared checkout.
+
+# Pure readers: they never write the worktree, the index, the refs or the
+# stash. Anything else (`commit`, `checkout`, `stash`, `apply`, `reset`, …)
+# is refused by the whitelist before git even runs.
+GIT_READ_SUBCOMMANDS = ("log", "blame", "show", "diff")
+
+# Argument-level refusals: options of the whitelisted subcommands that would
+# still leave the read-only lane. `--output`/`-o` (git diff) writes a file;
+# the global options that retarget the repository (`--git-dir`,
+# `--work-tree`, `-C`) would read a foreign tree the brief did not sanction —
+# refused along with the config-injecting global forms.
+GIT_FORBIDDEN_ARG_PREFIXES = ("--output", "--git-dir=", "--work-tree=")
+GIT_FORBIDDEN_ARGS = {"-o", "-C", "--git-dir", "--work-tree", "--namespace", "-c"}
+
+GIT_OUTPUT_CAP = 24_000
+GIT_TIMEOUT_SECONDS = 30
+
+
+def git_read(root: Path, args: list[str]) -> str:
+    """Run a whitelisted READ-ONLY git command in `root` and return its output.
+
+    `args` is `[subcommand, *arguments]` with `subcommand` one of
+    GIT_READ_SUBCOMMANDS (log/blame/show/diff). Anything else — and any
+    argument that would leave the read-only lane (file-writing `--output`,
+    repository-retargeting global options) — raises `ValueError`, which
+    `_run_tool` converts into a ModelRetry. Git failures (bad ref, unknown
+    revision) are plain ValueErrors too: never a crash of the nested run.
+
+    Executed without a shell, with `--no-pager` and GIT_OPTIONAL_LOCKS=0;
+    output is capped at GIT_OUTPUT_CAP chars."""
+    if not args:
+        raise ValueError(
+            "git command required: ["
+            + "|".join(GIT_READ_SUBCOMMANDS)
+            + "] plus arguments"
+        )
+    subcommand, rest = args[0], args[1:]
+    if subcommand not in GIT_READ_SUBCOMMANDS:
+        raise ValueError(
+            f"git subcommand {subcommand!r} is not allowed; the read-only "
+            "tool accepts only: " + ", ".join(GIT_READ_SUBCOMMANDS)
+        )
+    for arg in rest:
+        if arg in GIT_FORBIDDEN_ARGS or any(
+            arg.startswith(prefix) for prefix in GIT_FORBIDDEN_ARG_PREFIXES
+        ):
+            raise ValueError(
+                f"git argument {arg!r} is not allowed in the read-only tool "
+                "(it writes a file or retargets the repository)"
+            )
+    command = ["git", "--no-pager", subcommand, *rest]
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env=env,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise ValueError("git is not available on this machine") from e
+    except subprocess.TimeoutExpired as e:
+        raise ValueError(
+            f"git {subcommand} timed out after {GIT_TIMEOUT_SECONDS}s"
+        ) from e
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        raise ValueError(
+            f"git {subcommand} failed (exit {proc.returncode}): "
+            f"{stderr or 'no error output'}"
+        )
+    out = proc.stdout or ""
+    if len(out) > GIT_OUTPUT_CAP:
+        out = out[:GIT_OUTPUT_CAP] + f"\n... [truncated at {GIT_OUTPUT_CAP} chars]"
+    elif stderr:
+        out = f"{out}\n[git stderr]\n{stderr}" if out else stderr
+    return out or "(empty output)"
 
 
 @dataclass
@@ -129,9 +227,11 @@ def build_subagent_agent(
     announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[SubagentDeps, str]:
     """Build the read-only research subagent: the bundled `subagent.md`
-    system prompt (project-overridable) and exactly four tools, all
+    system prompt (project-overridable) and exactly five tools, all
     reading — no run_bash, no write tools, no ask_clarifying_question
-    (there is no user to answer a subagent).
+    (there is no user to answer a subagent). The git tool
+    (`git_history`) is read-only by whitelist (log/blame/show/diff),
+    not by convention — see `git_read`.
 
     `announce_wait` (the parent run's slot-wait announcer) is forwarded to
     the model builder — see `_build_subagent_model`."""
@@ -144,7 +244,7 @@ def build_subagent_agent(
         retries=3,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
-    # a subagent with four read tools can degenerate just like a parent.
+    # a subagent with five read tools can degenerate just like a parent.
     attach_batch_guard(agent, config.tool_batch_limit)
 
     @agent.tool
@@ -184,6 +284,20 @@ def build_subagent_agent(
             keywords,
             exclude_task_id=ctx.deps.parent_task_id,
         )
+
+    @agent.tool
+    async def git_history(ctx: RunContext[SubagentDeps], args: list[str]) -> str:
+        """Read-only git history: answer "why is the code like this", "when did
+        this change", "what did it look like before". `args` starts with a
+        whitelisted subcommand — log, blame, show or diff — followed by its
+        arguments, e.g.:
+        - ["log", "--oneline", "-15", "--", "src/foo.py"] — recent commits of a file;
+        - ["blame", "src/foo.py"] — last change per line;
+        - ["show", "abc1234"] — a commit (use --stat or a path to narrow it);
+        - ["diff", "HEAD~1", "--", "src/foo.py"] — what changed between revisions.
+        Only reads: no shell, no writing options (--output etc. refused), other
+        subcommands refused. Run from the project root."""
+        return await _run_tool(git_read, ctx.deps.root, args)
 
     return agent
 

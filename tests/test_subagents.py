@@ -12,9 +12,11 @@ FunctionModel stubs — no network.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -29,7 +31,9 @@ from drcode.config import Config
 from drcode.models import TaskKind
 from drcode.providers import AgentRole
 from drcode.settings import ProjectSettings
+from drcode.subagents import build_subagent_agent, git_read
 from drcode.task_manager import TaskManager
+from drcode.tool_runtime import _run_tool
 from tests.network_mocks import text_response
 
 
@@ -382,3 +386,126 @@ def test_no_gate_returns_configuration_hint(
     )
     out = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
     assert "not configured" in out
+
+
+# -- the read-only git history tool ----------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A tiny real git repo with two commits over one file."""
+    import subprocess as sp
+
+    def git(*args: str) -> None:
+        sp.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    git("init", "-q", "--initial-branch=main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "T")
+    (tmp_path / "foo.py").write_text("one\n", encoding="utf-8")
+    git("add", "foo.py")
+    git("commit", "-q", "-m", "first commit")
+    (tmp_path / "foo.py").write_text("one\ntwo\n", encoding="utf-8")
+    git("commit", "-q", "-am", "second commit")
+    return tmp_path
+
+
+def test_subagent_gets_git_history_tool(fake_config: Config) -> None:
+    """The subagent's toolset carries the whitelisted git tool with a
+    description naming the subcommands and the read-only guarantee."""
+    ag = build_subagent_agent(fake_config, root=Path.cwd())
+    names = {t.name for t in ag._function_toolset.tools.values()}
+    assert "git_history" in names
+    desc = _description(ag, "git_history")
+    assert "log" in desc and "blame" in desc and "show" in desc and "diff" in desc
+    assert "read-only" in desc.lower()
+    # Still no shell and no fetch: the git tool is the ONLY addition.
+    assert "run_bash" not in names
+    assert "web_fetch" not in names
+
+
+def test_git_read_reads_history(git_repo: Path) -> None:
+    """log/blame/show/diff work against a real repo and return the output."""
+    log = git_read(git_repo, ["log", "--oneline"])
+    assert "second commit" in log and "first commit" in log
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert "second commit" in git_read(git_repo, ["show", sha, "--stat"])
+    assert "second commit" in git_read(git_repo, ["show", "--oneline", "-s", sha])
+
+    diff = git_read(git_repo, ["diff", "HEAD~1", "HEAD"])
+    assert "+two" in diff
+
+    blame = git_read(git_repo, ["blame", "foo.py"])
+    assert "two" in blame
+
+
+def test_git_read_refuses_non_whitelisted_subcommands(git_repo: Path) -> None:
+    """Anything outside log/blame/show/diff is refused BEFORE git runs —
+    including read-shaped commands (status) and obvious writers (commit,
+    checkout, stash, apply, reset). The message lists the whitelist."""
+    for sub in ("status", "commit", "checkout", "stash", "apply", "reset", "push"):
+        with pytest.raises(ValueError, match=r"not allowed.*log, blame, show, diff"):
+            git_read(git_repo, [sub])
+
+
+def test_git_read_refuses_writing_and_retargeting_arguments(git_repo: Path) -> None:
+    """Options that would leave the read-only lane (git diff --output/-o
+    writes a file; --git-dir/--work-tree/-C retarget the repository) are
+    refused before git runs."""
+    for args in (
+        ["diff", "--output=leak.txt", "HEAD~1", "HEAD"],
+        ["diff", "-o", "leak.txt", "HEAD~1", "HEAD"],
+        ["log", "--git-dir=/etc", "--oneline"],
+        ["log", "--work-tree=/tmp", "--oneline"],
+        ["log", "-C", "/elsewhere", "--oneline"],
+        ["show", "-c", "core.pager=cat", "HEAD"],
+    ):
+        with pytest.raises(ValueError, match="not allowed"):
+            git_read(git_repo, args)
+    assert not (git_repo / "leak.txt").exists()
+
+
+def test_git_read_failure_is_value_error_not_crash(git_repo: Path) -> None:
+    """A git error (unknown revision) surfaces as a plain ValueError —
+    _run_tool turns it into a ModelRetry, never a crash of the nested run."""
+    with pytest.raises(ValueError, match="failed"):
+        git_read(git_repo, ["show", "deadbeefdeadbeef"])
+
+
+def test_git_read_refusal_becomes_model_retry(git_repo: Path) -> None:
+    """Through _run_tool both refusals and git errors degrade to ModelRetry."""
+
+    async def call(args: list[str]) -> str:
+        return await _run_tool(git_read, git_repo, args)
+
+    with pytest.raises(ModelRetry):
+        asyncio.run(call(["checkout", "main"]))
+    with pytest.raises(ModelRetry):
+        asyncio.run(call(["show", "deadbeefdeadbeef"]))
+
+
+def test_git_read_truncates_huge_output(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output is capped so a huge dump cannot blow the subagent's context."""
+    import drcode.subagents as subagents_mod
+
+    monkeypatch.setattr(subagents_mod, "GIT_OUTPUT_CAP", 100)
+    out = git_read(git_repo, ["log", "-p"])
+    assert out.startswith("commit") or out  # something real came first
+    assert "truncated at 100 chars" in out
+    assert len(out) < 200
+
+
+def test_git_read_empty_output_is_marker(git_repo: Path) -> None:
+    """An empty result (e.g. diff with no changes) comes back as a marker,
+    not an empty string the model cannot tell from silence."""
+    out = git_read(git_repo, ["diff", "HEAD", "HEAD"])
+    assert out == "(empty output)"

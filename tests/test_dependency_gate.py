@@ -433,7 +433,41 @@ def test_set_task_dependencies_replaces_and_restricts(
         _set_task_dependencies(deps, "ffffffff", [])
 
 
-# -- TUI: the cyan "+" picker link of the task header --------------------------------
+# -- TUI: Settings palette composition ----------------------------------------------
+
+
+async def test_palette_offers_only_removal_entries(app: DrCodeApp) -> None:
+    """Attaching a dependency lives on the header ("+") and in the form
+    (`ctrl+g`) — the Settings palette carries NO "Add dependency" entries
+    (one per task, a wall of noise). It keeps exactly the force-start
+    removal entries for the dependencies the viewed task already has."""
+    from drcode.tui.command_providers import DependencyCommandsProvider
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        viewed = app.manager.create("viewed", "x")
+        dep = app.manager.create("candidate", "x")
+        # A second, unattached task: it must not produce an entry either.
+        app.manager.create("innocent", "x")
+        app.manager.set_dependencies(viewed.id, [dep.id])
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        names = [
+            c.name
+            for c in DependencyCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        ]
+        assert not [n for n in names if n.startswith("Add dependency")], names
+        assert names == [f"Remove dependency: #{dep.id} candidate"]
+
+        # The provider is still registered in the app's palette set: the
+        # removal entries are what it contributes now.
+        providers = {getattr(p, "__name__", "") for p in app.COMMANDS}
+        assert "DependencyCommandsProvider" in providers
+
+        # Attaching still works through the header "+" / form path — the
+        # action itself is kept (the palette merely stopped offering it).
+        assert callable(app.action_add_dependency)
 
 
 async def test_header_dependency_link_opens_picker_and_links(

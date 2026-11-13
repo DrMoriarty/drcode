@@ -16,8 +16,10 @@ class DependencyCommandsProvider(CommandListProvider):
 
     One "Remove dependency: #<id>" entry per current dependency (the
     force-start: dropping a blocking dependency makes the task eligible
-    immediately and logs the manual override) and one "Add dependency:
-    #<id> <title>" entry per other task. Only offered while a queued or
+    immediately and logs the manual override). Attaching a dependency is
+    deliberately NOT a palette entry — that lives on the task header (the
+    cyan "+" link opening the filtered picker) and in the new-task/edit
+    form (`ctrl+g`, comma-separated ids). Only offered while a queued or
     held task is open — dependencies of a running/completed task make no
     sense (the gate is evaluated at promotion time only)."""
 
@@ -42,19 +44,6 @@ class DependencyCommandsProvider(CommandListProvider):
                     "Force start: drop this dependency — the task stops "
                     "waiting for it (logged as a manual override into "
                     "the task's service events)",
-                )
-            )
-        for other in app.manager.all_tasks():
-            if other.id == task.id or other.id in task.depends_on:
-                continue
-            commands.append(
-                CommandEntry(
-                    f"Add dependency: #{other.id} {other.title_display}",
-                    partial(app.action_add_dependency, other.id),
-                    "Make this task wait for it: the dependency must be "
-                    "COMPLETED and (under worktree isolation) merged "
-                    "into the base branch before this task is taken "
-                    "into development",
                 )
             )
         return commands

@@ -886,6 +886,15 @@ def _event_summary(page: FetchedPage) -> str:
     )
 
 
+def _fetch_failure_text(reason: str) -> str:
+    """The plain tool result for a refused or failed fetch."""
+    return (
+        f"Web fetch refused/failed: {reason}\n"
+        "Pick another source (or ask the user), and continue without it "
+        "if nothing else is reachable."
+    )
+
+
 async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
     """The body of the research agent's `web_fetch` tool (and of the
     subagent's inherited copy — both dep shapes carry `web_fetch_gate`
@@ -896,6 +905,14 @@ async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
     never model context) and returns the framed page. Every refusal and
     network failure comes back as a PLAIN tool result: a fetch never crashes
     the run, the model can fix the URL or continue without it.
+
+    Budget discipline: only a fetch that actually reached (or started
+    reading) a page consumes a slot. A failed fetch — HTTP ≥ 400, a network
+    error/timeout, a content-type refusal, too many redirects, an
+    unresolvable host, a binary body — returns its slot, so a run of dead
+    URLs cannot exhaust the allowance (#91217764). Pre-flight rejections
+    (a structurally broken URL, a host the project policy refuses) are
+    answered BEFORE the slot is claimed.
     """
     gate = deps.web_fetch_gate
     if gate is None or not gate.policy.enabled:
@@ -904,6 +921,18 @@ async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
             "off). Continue without it — do not try curl/wget as a "
             "workaround."
         )
+    # Pre-flight: everything decidable from the URL alone, no slot spent.
+    try:
+        parsed = _parse_url(url)
+    except WebFetchError as e:
+        log_service_event(deps, "web-fetch", f"web_fetch {url} failed: {e}")
+        return _fetch_failure_text(str(e))
+    policy_refusal = gate.policy.host_refusal(_host_of(parsed))
+    if policy_refusal is not None:
+        log_service_event(
+            deps, "web-fetch", f"web_fetch {url} failed: {policy_refusal}"
+        )
+        return _fetch_failure_text(policy_refusal)
     refusal = gate.take()
     if refusal is not None:
         return refusal
@@ -913,15 +942,14 @@ async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
         # `_run_tool` converts the fixable errors (ValueError, and
         # WebFetchError is one) into ModelRetry — unwrap both shapes so the
         # model gets the explanation as a plain tool result rather than a
-        # retry prompt that hides the reason.
+        # retry prompt that hides the reason. A failed fetch returns its
+        # budget slot.
+        gate.used -= 1
         reason = str(e)
         log_service_event(deps, "web-fetch", f"web_fetch {url} failed: {reason}")
-        return (
-            f"Web fetch refused/failed: {reason}\n"
-            "Pick another source (or ask the user), and continue without it "
-            "if nothing else is reachable."
-        )
+        return _fetch_failure_text(reason)
     except Exception as e:  # noqa: BLE001 - a fetch failure never kills the run
+        gate.used -= 1
         log_service_event(
             deps, "web-fetch", f"web_fetch {url} failed: {type(e).__name__}: {e}"
         )

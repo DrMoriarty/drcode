@@ -676,6 +676,127 @@ def test_run_web_fetch_exhausted_gate_never_calls_the_network(
     assert "budget exhausted" in out
 
 
+def test_run_web_fetch_http_404_returns_its_budget_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """A dead URL must not burn budget: the slot is refunded (#91217764)."""
+
+    def not_found(url: str, policy: WebFetchPolicy) -> object:
+        raise WebFetchError(
+            f"the server answered HTTP 404 Not Found for {url}. "
+            "The page may be gone, moved or behind a login."
+        )
+
+    monkeypatch.setattr("drcode.web_fetch.fetch", not_found)
+    task = manager.create("R", "research")
+    gate = WebFetchGate(ALLOW_ALL, limit=2)
+    deps = _deps(project_root, manager, task.id, gate)
+
+    out = asyncio.run(run_web_fetch(deps, "https://example.com/docs/gone"))
+
+    assert "HTTP 404" in out
+    assert "another source" in out
+    assert gate.used == 0
+
+
+def test_run_web_fetch_network_error_returns_its_budget_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    def connect_error(url: str, policy: WebFetchPolicy) -> object:
+        raise WebFetchError(f"network error while fetching {url}: ConnectError: boom")
+
+    monkeypatch.setattr("drcode.web_fetch.fetch", connect_error)
+    task = manager.create("R", "research")
+    gate = WebFetchGate(ALLOW_ALL, limit=2)
+    deps = _deps(project_root, manager, task.id, gate)
+
+    out = asyncio.run(run_web_fetch(deps, "https://example.com/docs/tui"))
+
+    assert "network error" in out
+    assert gate.used == 0
+
+
+def test_run_web_fetch_policy_refusal_spends_no_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """A block-listed host is refused BEFORE the slot is claimed."""
+
+    def must_not_run(url: str, policy: WebFetchPolicy) -> object:
+        raise AssertionError("a policy-refused host must not reach the network")
+
+    monkeypatch.setattr("drcode.web_fetch.fetch", must_not_run)
+    task = manager.create("R", "research")
+    policy = _policy(WebFetchMode.ALL, block=("tracker.example.com",))
+    gate = WebFetchGate(policy, limit=2)
+    deps = _deps(project_root, manager, task.id, gate)
+
+    out = asyncio.run(run_web_fetch(deps, "https://tracker.example.com/"))
+
+    assert "BLOCK list" in out
+    assert gate.used == 0
+
+
+def test_run_web_fetch_success_spends_exactly_one_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    from drcode.web_fetch import FetchedPage
+
+    monkeypatch.setattr(
+        "drcode.web_fetch.fetch",
+        lambda url, policy: FetchedPage(
+            url=url,
+            status=200,
+            content_type="text/html",
+            bytes_read=10,
+            truncated=False,
+            text="body",
+        ),
+    )
+    task = manager.create("R", "research")
+    gate = WebFetchGate(ALLOW_ALL, limit=2)
+    deps = _deps(project_root, manager, task.id, gate)
+
+    asyncio.run(run_web_fetch(deps, "https://example.com/one"))
+    asyncio.run(run_web_fetch(deps, "https://example.com/two"))
+
+    assert gate.used == 2
+
+
+def test_run_web_fetch_budget_still_exhausts_after_refunds(
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """Refunds never create budget: limit is still the hard cap."""
+
+    def not_found(url: str, policy: WebFetchPolicy) -> object:
+        raise WebFetchError("the server answered HTTP 404 Not Found.")
+
+    monkeypatch.setattr("drcode.web_fetch.fetch", not_found)
+    task = manager.create("R", "research")
+    gate = WebFetchGate(ALLOW_ALL, limit=1)
+    deps = _deps(project_root, manager, task.id, gate)
+
+    first = asyncio.run(run_web_fetch(deps, "https://example.com/a"))
+    assert "HTTP 404" in first
+    assert gate.used == 0
+
+    # Now burn the slot directly (as a successful fetch would) — the next
+    # call must be refused even though the failing one was refunded.
+    assert gate.take() is None
+    out = asyncio.run(run_web_fetch(deps, "https://example.com/b"))
+    assert "budget exhausted" in out
+    assert gate.used == 1
+
+
 # -- registration ----------------------------------------------------------------
 
 

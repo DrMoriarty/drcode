@@ -572,11 +572,11 @@ class TaskSettingsEntriesProvider(CommandListProvider):
             CommandEntry(
                 f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
                 app.action_change_subagents_coder,
-                "How many read-only research subagents the CODING agent "
-                "may run in parallel via its delegate_research tool — "
-                "each returns only its final report, saving the agent's "
-                "context; off removes the tool entirely (project "
-                "setting)",
+                "How many delegate_research calls the CODING agent has "
+                "per run (total budget — subagents may run in parallel "
+                "within it, the slots are never renewed): each returns "
+                "only its final report, saving the agent's context; off "
+                "removes the tool entirely (project setting)",
             ),
             CommandEntry(
                 f"Subagents (researcher): "

@@ -925,7 +925,13 @@ class PipelineCompactionLayer(CoreState):
         every other gate uses) reached a third of the serving role's
         context window (see drcode.eviction). False when nothing is marked
         or the window is unknown — the marks then just ride along until a
-        compaction takes them."""
+        compaction takes them.
+
+        The gated quantity is a SUBSET of the transcript (the marked tool
+        results), and the API's usage counters are aggregate per-request
+        figures — no exact per-part token count exists, so unlike the fill
+        gates this one cannot prefer a usage reading: the chars/4
+        estimate is the deliberate choice here, not a stopgap."""
         if not task.marked_unneeded:
             return False
         window = self.resolved_config(self._task_role(task)).max_context_tokens
@@ -1007,6 +1013,29 @@ class PipelineCompactionLayer(CoreState):
         if not credit or not tokens:
             return tokens
         return max(tokens - credit, 0) or None
+
+    def _pre_run_fill_tokens(self, task: Task) -> int | None:
+        """Exact context fill (tokens) of the dev transcript BEFORE a
+        run's first turn — the measurement input of the two pre-run gates
+        (`_maybe_compact_after_idle`, and the model-switch housekeeping
+        via `_force_pre_run_compaction`).
+
+        Prefers the live usage reading of the task's LAST run
+        (`_live_ctx_tokens`, the status-bar counter that survives the run
+        end): on an interrupted attempt the trailing response it measured
+        can be sanitized away from the persisted transcript, whose own
+        last-response usage then lags behind that reading. Falls back to
+        the persisted transcript's last-response usage
+        (`last_context_tokens`) — after a drcode restart no live reading
+        exists. BOTH are exact API figures (input + output of the last
+        model request); the chars/4 estimate is not involved here.
+        Corrected by the batch-eviction credit like every other
+        dev-transcript reading."""
+        live = self._live_ctx_tokens.get(task.id)
+        return self._apply_eviction_credit(
+            task.id,
+            live if live else last_context_tokens(task.messages),
+        )
 
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
@@ -1191,7 +1220,10 @@ class PipelineCompactionLayer(CoreState):
         is force-compacted BEFORE the first turn: the cold re-read then
         happens over a compact history instead of the full one. Applied
         to both roles alike — the fill is measured against the role
-        actually serving the transcript (`_task_role`).
+        actually serving the transcript (`_task_role`) from EXACT usage
+        figures (`_pre_run_fill_tokens`: the last run's live reading,
+        else the persisted last-response usage — never the chars/4
+        estimate).
 
         One-shot, deliberately NOT the mid-run gate machinery: the
         livelock counters (`_threshold_compactions` /
@@ -1225,9 +1257,7 @@ class PipelineCompactionLayer(CoreState):
             # (and delaying) attempt on every activation.
             return
         role = self._task_role(task)
-        tokens = self._apply_eviction_credit(
-            task.id, last_context_tokens(task.messages)
-        )
+        tokens = self._pre_run_fill_tokens(task)
         if not tokens or tokens <= threshold:
             return
         _, rest = split_original_prompts(task.messages)
@@ -1270,9 +1300,7 @@ class PipelineCompactionLayer(CoreState):
             # left — compacting again would be a no-op.
             return False
         self._maybe_evict_marked(task, force=True)
-        tokens = self._apply_eviction_credit(
-            task.id, last_context_tokens(task.messages)
-        )
+        tokens = self._pre_run_fill_tokens(task)
         if not tokens or tokens <= threshold:
             return False
         self._show_event(
@@ -1317,13 +1345,15 @@ class PipelineCompactionLayer(CoreState):
         task.messages = new_messages
         task.touch()
         self.manager.storage.save(task)
-        # The fill figures are persisted-transcript estimates (no live
-        # reading exists at run start): `tokens` is the exact API usage of
-        # the old transcript's last response, `after` deliberately a
-        # chars/4 estimate of the compacted one — the summarizer's output
-        # carries no usage at all (a transcript of verbatim prompts + one
-        # synthetic summary request), and the mechanical floor keeps the
-        # STALE responses, whose usage describes the pre-compaction size.
+        # The BEFORE figure is exact API usage (`_pre_run_fill_tokens`:
+        # the last run's live reading, else the persisted last response's
+        # usage); `after` is deliberately a chars/4 estimate of the
+        # compacted transcript — the summarizer's output carries no usage
+        # at all (a transcript of verbatim prompts + one synthetic summary
+        # request), and the mechanical floor keeps the STALE responses,
+        # whose usage describes the pre-compaction size. The two scales
+        # are never mixed into one comparison: the event text marks the
+        # estimate with "≈".
         # The credit belongs to the old transcript — the summary was built
         # from the lightened history, so drop it with the stale live
         # reading.

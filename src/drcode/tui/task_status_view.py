@@ -505,6 +505,15 @@ class TaskStatusLayer(DrCodeState):
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit_for(self.settings, role),
             research_web_fetch=web_fetch_policy_for(self.settings, role),
+            # The goals data for the dev report's dynamic-instructions line:
+            # the roadmap block needs the active list, the per-task block
+            # the goal behind task.goal_id (None when absent/deleted).
+            active_goals=self.manager.goals.active(),
+            linked_goal=(
+                self.manager.goals.goals.get(task.goal_id)
+                if task.goal_id is not None
+                else None
+            ),
         )
         agent, _ = self._agent_ctx(task)
         self.push_screen(

@@ -1,10 +1,14 @@
 """Context-layout estimation for a task's model context (≈, no tokenizer).
 
 Answers "what is actually inside the context slot of this task's model
-requests": the system prompt (base template + AGENTS.md + git workflow), the
-tool descriptions (docstrings + JSON schemas), and the serialized transcript
-by part kind (user prompts, retry prompts, compaction summary, model
-generation, tool returns).
+requests": the system prompt (base template + AGENTS.md + git workflow, plus
+the DYNAMIC goals instructions — the roadmap block for research tasks, the
+per-task "Task goal" block for tasks with a linked goal — reconstructed by
+`goals_system_component` and estimated as their own "system prompt" line,
+since pydantic-ai renders dynamic instructions into a separate leading
+system message of every request), the tool descriptions (docstrings + JSON
+schemas), and the serialized transcript by part kind (user prompts, retry
+prompts, compaction summary, model generation, tool returns).
 
 There is deliberately NO tokenizer here — the model behind drcode is any
 OpenAI-compatible endpoint, so every figure is the conventional
@@ -37,10 +41,12 @@ from .agent import (
     build_agent,
     build_resolver_agent,
     build_tester_agent,
+    goals_instructions,
     load_agents_md,
+    task_goal_block,
 )
 from .config import Config
-from .models import Task, TaskKind
+from .models import Goal, Task, TaskKind
 from .prompts import (
     load_resolver_prompt,
     load_system_prompt_components,
@@ -104,6 +110,37 @@ def system_components_coding(
         ("git workflow", git_workflow),
         ("role instructions", role_instructions),
     ]
+
+
+def goals_system_component(
+    kind: TaskKind,
+    goal_id: str | None,
+    active_goals: list[Goal],
+    linked_goal: Goal | None,
+) -> tuple[str, str] | None:
+    """Reconstruct the DYNAMIC goals block the coding agent injects into the
+    leading system messages of every request (`goals_dynamic_instructions`,
+    registered in `agent_build` on the coding agent for all kinds): the
+    exact text pydantic-ai renders as a separate leading system message,
+    which the static system-components reconstruction above never sees.
+
+    Mirrors the hook's branching exactly — RESEARCH tasks get the roadmap
+    block over `active_goals` (the task's own goal is visible there
+    already), any other kind with a linked goal gets the compact per-task
+    block; empty registry / no link / deleted goal → None (the hook yields
+    None and the block is excluded from the request entirely — there is no
+    "absent" placeholder to estimate)."""
+    if kind is TaskKind.RESEARCH:
+        block = goals_instructions(active_goals)
+        label = "product goals"
+    elif goal_id is not None and linked_goal is not None:
+        block = task_goal_block(linked_goal)
+        label = "task goal (linked)"
+    else:
+        return None
+    if block is None:
+        return None
+    return (label, block)
 
 
 def system_components_tester(
@@ -540,10 +577,19 @@ def build_report(
     *,
     system_components: list[tuple[str, str | None]],
     tools: list[tuple[str, str]],
+    goals_component: tuple[str, str] | None = None,
     exact_tokens: int | None = None,
 ) -> CtxReport:
     """Assemble the report of one transcript: exact + estimated figures,
-    the three sections and the heaviest tool results."""
+    the three sections and the heaviest tool results.
+
+    `goals_component` is the (label, text) reconstruction of the coding
+    agent's DYNAMIC goals instructions (see `goals_system_component`) —
+    pydantic-ai renders them into a separate leading system message of
+    every request, invisible to the static `system_components`, so it is
+    estimated as its own line of the "system prompt" section (None when
+    the agent carries no goals block; only the development report ever
+    passes it — the tester and resolver agents register no goals hook)."""
     stats = analyze_transcript(messages)
     if exact_tokens is None:
         exact_tokens = last_context_tokens(messages)
@@ -552,6 +598,15 @@ def build_report(
         CtxLine(label, estimate_tokens(text) if text else 0, "" if text else "absent")
         for label, text in system_components
     ]
+    if goals_component is not None:
+        goals_label, goals_text = goals_component
+        system_lines.append(
+            CtxLine(
+                goals_label,
+                estimate_tokens(goals_text),
+                "dynamic instructions — in every request",
+            )
+        )
     tool_lines = [
         CtxLine(name, estimate_tokens(text), "docstring + schema")
         for name, text in tools
@@ -637,6 +692,8 @@ def task_reports(
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
+    active_goals: list[Goal] | None = None,
+    linked_goal: Goal | None = None,
 ) -> tuple[CtxReport | None, CtxReport | None, CtxReport | None, RunUsage, int]:
     """The per-agent transcript reports of one task plus its whole-task
     cumulative exact usage.
@@ -651,7 +708,14 @@ def task_reports(
     are separate contexts — neither the tester nor the resolver ever sees
     the development transcript). `research_web_fetch` is the RESEARCH web
     fetch policy (None when the role has no web_fetch tool), so the tool
-    schema is counted exactly when the run really carries it. `*_live_tokens`
+    schema is counted exactly when the run really carries it. `active_goals`
+    (the GoalStore's active list) and `linked_goal` (the goal behind
+    `task.goal_id`, None when absent or deleted) feed the reconstruction of
+    the coding agent's DYNAMIC goals instructions — they ride every dev
+    request as leading system messages and are estimated as their own line
+    of the development report's "system prompt" section (absent there when
+    the hook yields None); the tester and resolver never carry goals, so
+    their reports are unaffected. `*_live_tokens`
     carry the live in-run
     readings of the respective agents where one is running (they win over
     the persisted transcript, like the dev counter does).
@@ -672,6 +736,9 @@ def task_reports(
                 research_git=research_git,
                 subagent_limit=subagent_limit,
                 research_web_fetch=research_web_fetch,
+            ),
+            goals_component=goals_system_component(
+                task.kind, task.goal_id, active_goals or [], linked_goal
             ),
             exact_tokens=live_tokens,
         )

@@ -33,6 +33,7 @@ from drcode.context_layout import (
     coding_tool_schemas,
     cumulative_usage,
     estimate_tokens,
+    goals_system_component,
     last_agent,
     system_components_coding,
     system_components_resolver,
@@ -503,6 +504,106 @@ def test_task_reports_resolver_report_and_cumulative(project_root: Path) -> None
 
 
 # -- dialog wiring ---------------------------------------------------------------
+
+
+def test_task_reports_goals_lines(project_root: Path) -> None:
+    """The dynamic goals instructions are reconstructed into their own
+    "system prompt" line of the DEVELOPMENT report only — the tester and
+    resolver never carry the goals hook."""
+    from drcode.models import Goal, Task, TaskKind
+
+    goal = Goal(title="Ship the importer", description="CSV import for v2")
+    other = Goal(title="Second roadmap item", description="later")
+
+    # RESEARCH + active goals → the roadmap block line.
+    research = Task(title="a research task", kind=TaskKind.RESEARCH)
+    research.messages = _transcript()
+    research.tester_messages = [_transcript()]
+    dev, tester, resolver, _usage, _requests = task_reports(
+        research,
+        Config(),
+        Config(),
+        Config(),
+        "RESEARCH",
+        project_root,
+        active_goals=[goal, other],
+        linked_goal=goal,
+    )
+    assert dev is not None
+    system = next(s for s in dev.sections if s.title == "system prompt")
+    line = next(l for l in system.lines if l.label == "product goals")
+    assert line.note == "dynamic instructions — in every request"
+    component = goals_system_component(TaskKind.RESEARCH, None, [goal, other], None)
+    assert component is not None
+    assert line.tokens == estimate_tokens(component[1])
+    assert system.total == sum(l.tokens for l in system.lines)
+    # The goals block text is the real goals_instructions output.
+    from drcode.agent import goals_instructions
+
+    block = goals_instructions([goal, other])
+    assert block is not None
+    assert line.tokens == estimate_tokens(block)
+    # Tester/resolver reports are never affected.
+    assert tester is not None
+    assert not any(
+        l.label == "product goals"
+        for s in tester.sections
+        if s.title == "system prompt"
+        for l in s.lines
+    )
+    assert resolver is None
+
+    # BUG with a linked goal → the compact per-task block.
+    bug = Task(title="a bug", kind=TaskKind.BUG, goal_id=goal.id)
+    bug.messages = _transcript()
+    dev, _tester, _resolver, _usage, _requests = task_reports(
+        bug,
+        Config(),
+        Config(),
+        Config(),
+        "CODING",
+        project_root,
+        active_goals=[goal, other],
+        linked_goal=goal,
+    )
+    assert dev is not None
+    system = next(s for s in dev.sections if s.title == "system prompt")
+    line = next(l for l in system.lines if l.label == "task goal (linked)")
+    assert line.note == "dynamic instructions — in every request"
+
+    # No linked goal (and a non-research kind) → no line at all: the hook
+    # yields None and the block is excluded from the request entirely.
+    plain = Task(title="a plain bug", kind=TaskKind.BUG)
+    plain.messages = _transcript()
+    dev, _tester, _resolver, _usage, _requests = task_reports(
+        plain,
+        Config(),
+        Config(),
+        Config(),
+        "CODING",
+        project_root,
+        active_goals=[goal, other],
+        linked_goal=None,
+    )
+    assert dev is not None
+    system = next(s for s in dev.sections if s.title == "system prompt")
+    assert not any("goal" in l.label for l in system.lines)
+
+    # RESEARCH with an empty registry → no roadmap line either.
+    research.messages = _transcript()
+    dev, _tester, _resolver, _usage, _requests = task_reports(
+        research,
+        Config(),
+        Config(),
+        Config(),
+        "RESEARCH",
+        project_root,
+        active_goals=[],
+        linked_goal=goal,
+    )
+    assert dev is not None
+    system = next(s for s in dev.sections if s.title == "system prompt")
+    assert not any("goal" in l.label for l in system.lines)
 
 
 async def test_ctx_counter_opens_dialog_on_action(app: DrCodeApp) -> None:

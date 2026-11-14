@@ -397,8 +397,8 @@ def build_agent(
     wrapper passes the request through untouched.
 
     `subagent_limit` above 0 additionally puts ONE line into that same
-    trailing zone ("You have N read-only subagents available via
-    delegate_research", see `agent_tools.subagent_notice`): the tool exists
+    trailing zone ("You have N delegate_research calls left this run", see
+    `agent_tools.subagent_notice`): the tool exists
     in the schema either way, but a mere existence never got it called —
     the standing reminder of the real budget does. Same tail zone, so no
     leading prefix is touched. With `subagent_gate` (the pipeline's

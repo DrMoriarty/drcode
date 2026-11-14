@@ -156,13 +156,15 @@ def test_delegation_note_injected_at_request_tail(fake_config: Config) -> None:
         assert isinstance(ag.model, TailInjectionModel)
         block = subagent_notice(2, role=role)
         assert block is not None
-        assert "You have 2 read-only subagents available via delegate_research" in block
+        assert "You have 2 delegate_research calls left this run" in block
         assert "delegate_research" in block
+        # Budget, not a renewable resource.
+        assert "not renewed" in block
         # Not in the static instructions.
-        assert "You have 2 read-only subagents" not in _instructions_text(ag)
+        assert "You have 2 delegate_research" not in _instructions_text(ag)
 
     # Singular spelling, and 0 = no note at all (no wrapper, no block).
-    assert "You have 1 read-only subagent available" in (
+    assert "You have 1 delegate_research call left this run" in (
         subagent_notice(1, role=AgentRole.CODING) or ""
     )
     assert subagent_notice(0, role=AgentRole.CODING) is None
@@ -193,7 +195,7 @@ def test_delegation_note_rides_the_same_tail_as_the_checklist(
     assert len(written) == 1
     tail = _tail_text(written)
     assert "CHECKLIST-BLOCK" in tail
-    assert "You have 1 read-only subagent available" in tail
+    assert "You have 1 delegate_research call left this run" in tail
 
 
 def test_notice_is_state_aware() -> None:
@@ -206,10 +208,11 @@ def test_notice_is_state_aware() -> None:
 
     fresh = subagent_notice(2, 0, role=AgentRole.CODING)
     assert fresh is not None
-    assert "You have 2 read-only subagents available via delegate_research" in fresh
+    assert "You have 2 delegate_research calls left this run" in fresh
+    assert "not renewed" in fresh
     after_one = subagent_notice(2, 1, role=AgentRole.CODING)
     assert after_one is not None
-    assert "You have 1 read-only subagent available via delegate_research" in after_one
+    assert "You have 1 delegate_research call left this run" in after_one
     exhausted = subagent_notice(2, 2, role=AgentRole.CODING)
     assert exhausted is not None
     assert "delegate_research slots of this run are used" in exhausted
@@ -245,11 +248,11 @@ def test_gate_notice_supplier_reflects_the_gate(fake_config: Config) -> None:
         written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
         return _tail_text(written)
 
-    assert "You have 2 read-only subagents available via delegate_research" in (
+    assert "You have 2 delegate_research calls left this run" in (
         tail_text()
     )
     gate.used = 1
-    assert "You have 1 read-only subagent available via delegate_research" in (
+    assert "You have 1 delegate_research call left this run" in (
         tail_text()
     )
     gate.used = 2

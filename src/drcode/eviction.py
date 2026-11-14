@@ -17,6 +17,14 @@ the LLM-free mechanics of the DEFERRED batch eviction:
 Eviction never happens at mark time: the pipeline fires it in one batch
 (one prompt-cache invalidation per batch, not per mark) from the gates in
 `core/pipeline_compaction.py` — between turns, never mid-stream.
+
+On top of the agent's own marks runs the AUTOMATIC layer (tool result
+clearing, the Claude Code recipe — "the safest, lightest touch form of
+compaction"): tool results older than `AUTO_EVICTION_MIN_AGE_TURNS` model
+exchanges — except the freshest `AUTO_EVICTION_KEEP_RECENT` ones — are
+collapsed into the same stubs by the same batch pass, no mark required.
+`auto_evictable_ids` is the pure criterion; the pipeline union-folds it
+into the same eviction batch the marks go through.
 """
 
 from __future__ import annotations
@@ -36,6 +44,32 @@ EVICTION_WINDOW_FRACTION = 3
 # The args summary in the stub is capped: the stub must stay a short,
 # self-describing line whatever the original call looked like.
 ARGS_SUMMARY_CAP = 120
+
+# Automatic tool result clearing (the age criterion, no marks involved):
+# a tool result is auto-evictable once this many model exchanges
+# (assistant responses — the "turns" of an agentic run) have happened
+# AFTER the exchange that produced it. Anthropic's measurements of the
+# recipe (+29% agentic-search quality, −84% tokens over a 100-turn eval)
+# come from exactly this regime: fresh results the agent still works from
+# stay verbatim, stale ones degrade to re-runnable stubs. Not a project
+# setting (yet): a module knob, like EVICTION_WINDOW_FRACTION.
+AUTO_EVICTION_MIN_AGE_TURNS = 10
+
+# The freshness anchor of the automatic clearing: the last K tool results
+# of the transcript are NEVER auto-evicted, however old — the newest
+# conclusions (test output, the last file read) are what the agent is
+# still actively reasoning over, and the age estimate cannot see that.
+AUTO_EVICTION_KEEP_RECENT = 5
+
+# Mid-run pause gate of the automatic clearing: between turns the pass
+# fires on any auto-evictable result at all (see _maybe_evict_marked),
+# but pausing a LIVE run costs a stop/resume cycle — mid-run it fires
+# only when the auto-evictable results' ≈size (chars/4) reached this
+# fraction of the serving role's context window. Deliberately tighter
+# than the marks gate's EVICTION_WINDOW_FRACTION (3): auto-evictable
+# volume renews itself every turn once past the age horizon, and a
+# pause per turn would be churn.
+AUTO_EVICTION_PAUSE_FRACTION = 6
 
 
 def evicted_stub(tool_name: str, args: Any) -> str:
@@ -102,6 +136,76 @@ def marked_tokens(messages: list[dict[str, Any]], marked: Iterable[str]) -> int:
             ):
                 total += estimate_tokens(_return_text(part.get("content")))
     return total
+
+
+def auto_evictable_ids(
+    messages: list[dict[str, Any]],
+    *,
+    min_age_turns: int = AUTO_EVICTION_MIN_AGE_TURNS,
+    keep_recent: int = AUTO_EVICTION_KEEP_RECENT,
+) -> set[str]:
+    """The tool-call ids the AUTOMATIC age criterion would clear now.
+
+    A turn is one model exchange (a serialized `kind: "response"`
+    message — the unit Anthropic's 100-turn agentic evals count). A
+    tool return's age is the number of exchanges that happened AFTER
+    the exchange carrying its `tool-call` sibling (the return landing
+    directly behind its call is age 0 — brand new). Eligible: live
+    (not yet a stub) returns with age ≥ `min_age_turns`, minus the
+    freshness anchor — the last `keep_recent` live returns of the
+    transcript in chronological order, however old.
+
+    Never eligible, on top of that: `mark_unneeded`'s own returns
+    (one-liners, and the marks machinery assumes them present — the
+    same exclusion `_eviction_candidates` makes), and returns with no
+    `tool-call` sibling in the transcript at all (a broken pair is
+    sanitized away elsewhere; conservatively kept here). The
+    tool-call parts are never touched by the collapse — the criterion
+    selects whole call/return pairs, matching evict_marked's
+    pair-intact invariant by construction.
+
+    One scan, no mutation — the pipeline calls it at every gate
+    observation to union the ids into the batch the marks go through.
+    """
+    exchanges = 0
+    call_exchange: dict[str, int] = {}
+    live: list[str] = []  # evictable-candidate call ids, chronological
+    seen: set[str] = set()
+    for msg in messages:
+        kind = msg.get("kind") or msg.get("role")
+        if kind == "response":
+            exchanges += 1
+            for part in msg.get("parts", []):
+                if (
+                    isinstance(part, dict)
+                    and part.get("part_kind") == "tool-call"
+                    and part.get("tool_call_id")
+                ):
+                    call_exchange[part["tool_call_id"]] = exchanges
+            continue
+        for part in msg.get("parts", []):
+            if not (isinstance(part, dict) and part.get("part_kind") == "tool-return"):
+                continue
+            call_id = part.get("tool_call_id")
+            if (
+                not call_id
+                or call_id in seen
+                or part.get("tool_name") == "mark_unneeded"
+                or is_evicted_stub(part.get("content"))
+            ):
+                continue
+            if call_id not in call_exchange:
+                continue  # no sibling call: conservatively kept
+            seen.add(call_id)
+            live.append(call_id)
+    if not live:
+        return set()
+    # The age is measured against the FINAL exchange count: a return seen
+    # right behind its call sits at age 0 NOW, but the exchanges still to
+    # come age it — the criterion judges the transcript as it stands.
+    ages = {call_id: exchanges - call_exchange[call_id] for call_id in live}
+    anchor = set(live[-keep_recent:]) if keep_recent > 0 else set()
+    return {call_id for call_id, age in ages.items() if age >= min_age_turns} - anchor
 
 
 def evict_marked(

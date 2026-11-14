@@ -1,13 +1,16 @@
 """Selective context eviction driven by the agent's mark_unneeded marks.
 
-Covers the three layers of the mechanism:
+Covers the four layers of the mechanism:
 - the pure eviction mechanics (drcode.eviction): stub replacement, the
   intact tool-call/tool-return pairs, ≈token accounting;
 - the mark_unneeded tool body (selectors, ModelRetry on a bad target,
   persistence through the task metadata);
 - the pipeline gates: the batch eviction at 1/3 of the window, the
   pre-compaction eviction (spares the summarizer or lightens its input),
-  and the live-run pause→evict→resume cycle.
+  and the live-run pause→evict→resume cycle;
+- the AUTOMATIC tool result clearing (the age criterion, no marks):
+  `auto_evictable_ids` selection, the freshness anchor, and its wiring
+  into the same batch the marks go through.
 """
 
 from __future__ import annotations
@@ -699,6 +702,180 @@ async def test_live_run_pauses_evicts_and_resumes(
     assert "read_file" in stub_part["content"]
     assert task.marked_unneeded == []
     load_messages(task.messages)  # API-valid
+
+
+# -- automatic tool result clearing (the age criterion) -----------------------------
+
+
+def auto_transcript_raw(content: str, n: int, last_usage: int = 0) -> list[Any]:
+    """The unserialized form of auto_transcript (for tests that mutate
+    single messages before serializing)."""
+    messages: list[Any] = [user_msg("read things")]
+    for i in range(n):
+        messages.append(tool_call_msg(f"c{i}", "read_file", {"path": f"src/f{i}.py"}))
+        messages.append(tool_return_msg(f"c{i}", "read_file", content))
+    if last_usage:
+        messages.append(
+            ModelResponse(
+                parts=[TextPart("final")],
+                usage=RequestUsage(input_tokens=last_usage, output_tokens=8),
+            )
+        )
+    return messages
+
+
+def auto_transcript(content: str, n: int, last_usage: int = 0) -> list[Any]:
+    """prompt → n rounds of (call-response ci → return-request ci), plus a
+    final text response carrying `last_usage` when set.
+
+    Exchange count is n without the final response, n + 1 with it.
+    Return ci's age — exchanges AFTER the response carrying its tool
+    call — is (n - 1 - i) without / (n - i) with the final response:
+    with n=16 the eligible-by-default band (age ≥ 10) is c0..c5, and the
+    freshness anchor covers c11..c15."""
+    return serialize_messages(auto_transcript_raw(content, n, last_usage))
+
+
+def test_auto_evictable_ids_age_and_anchor() -> None:
+    """Age ≥ min_age_turns makes a result eligible; the last keep_recent
+    live returns are anchored out of it however old."""
+    messages = auto_transcript("y" * 100, n=5)  # ages c0..c4 = 4,3,2,1,0
+    assert eviction.auto_evictable_ids(messages, min_age_turns=1, keep_recent=0) == {
+        "c0",
+        "c1",
+        "c2",
+        "c3",
+    }
+    assert eviction.auto_evictable_ids(messages, min_age_turns=1, keep_recent=3) == {
+        "c0",
+        "c1",
+    }
+    # Default knobs: nothing is 10 exchanges old here.
+    assert eviction.auto_evictable_ids(messages) == set()
+
+
+def test_auto_evictable_ids_exclusions() -> None:
+    """mark_unneeded's own returns, already-collapsed stubs and returns
+    without their sibling call are never selected."""
+    messages = auto_transcript("y" * 100, n=12)  # ages: c0=11 … c11=0
+    assert eviction.auto_evictable_ids(messages) == {"c0", "c1"}
+
+    marked_own = auto_transcript_raw("y" * 100, n=12)
+    marked_own[2] = tool_return_msg("c0", "mark_unneeded", "ok")
+    assert eviction.auto_evictable_ids(serialize_messages(marked_own)) == {"c1"}
+
+    stubbed = auto_transcript_raw("y" * 100, n=12)
+    stubbed[2].parts[0].content = eviction.evicted_stub(
+        "read_file", {"path": "src/f0.py"}
+    )
+    assert eviction.auto_evictable_ids(serialize_messages(stubbed)) == {"c1"}
+
+    orphan = auto_transcript_raw("y" * 100, n=12)
+    orphan[1] = ModelResponse(parts=[TextPart("no calls here")])  # c0's call gone
+    assert eviction.auto_evictable_ids(serialize_messages(orphan)) == {"c1"}
+
+
+async def test_auto_clearing_fires_between_turns_without_marks(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """No marks anywhere: the batch eviction still collapses the six
+    age-eligible results (≈1200 tokens) in ONE pass, keeps the anchor
+    verbatim, deposits the credit and stays API-valid."""
+    content = "y" * 800  # ≈200 tokens per result
+    task = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = auto_transcript(content, n=16)
+    app_small_ctx.manager.storage.save(task)
+    ids = app_small_ctx._auto_eviction_ids(task)
+    assert ids == {f"c{i}" for i in range(6)}
+    assert not task.marked_unneeded
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        evicted = app_small_ctx._maybe_evict_marked(task)
+        await pilot.pause()
+
+    assert evicted == estimate_tokens(content) * 6
+    assert {p["tool_call_id"] for p in stubs_in(task.messages)} == ids
+    # The anchor (c11..c15) and the not-yet-old middle stay verbatim.
+    assert returns_in(task.messages)["c15"]["content"] == content
+    assert returns_in(task.messages)["c10"]["content"] == content
+    assert task.marked_unneeded == []
+    assert app_small_ctx._evicted_ctx_tokens[task.id] == evicted
+    assert any("auto-cleared 6 old tool result(s)" in t for t in event_texts(task))
+    load_messages(task.messages)  # API-valid
+
+
+async def test_pre_compaction_auto_clearing_spares_the_summarizer(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """Fill over the threshold (908 ≥ 80% of 1000) with NO marks: the
+    automatic clearing at the gate entry deposits its credit, the
+    re-measured fill falls under the threshold and the summarizer never
+    runs — the unloading alone did the compaction."""
+    content = "y" * 800
+    task = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = auto_transcript(content, n=15, last_usage=900)
+    app_small_ctx.manager.storage.save(task)
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert scripted.calls == []  # the summarizer was never invoked
+    assert not any("Context compacted" in t for t in event_texts(task))
+    assert any("Context unloading" in t for t in event_texts(task))
+    assert len(stubs_in(task.messages)) == 6
+
+
+async def test_marks_and_auto_clearing_share_one_batch(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """A mark on a NOT-yet-old result rides the same batch as the
+    automatic clearing — one pass, one prompt-cache invalidation, one
+    event naming both origins."""
+    content = "y" * 800
+    task = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = auto_transcript(content, n=16)
+    task.marked_unneeded = ["c7"]  # age 8: below the age horizon
+    app_small_ctx.manager.storage.save(task)
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        evicted = app_small_ctx._maybe_evict_marked(task)
+        await pilot.pause()
+
+    assert evicted == estimate_tokens(content) * 7
+    assert {p["tool_call_id"] for p in stubs_in(task.messages)} == (
+        {f"c{i}" for i in range(6)} | {"c7"}
+    )
+    assert task.marked_unneeded == []
+    assert any(
+        "collapsed 1 marked and 6 old tool result(s)" in t for t in event_texts(task)
+    )
+
+
+async def test_mid_run_pause_gate_auto_volume(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The live-run pause fires on the automatic clearing only when the
+    auto-evictable ≈volume reached 1/6 of the window; between turns the
+    pass fires on any eligible result regardless of volume."""
+    big = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    big.messages = auto_transcript("y" * 800, n=16)  # 6 × ≈200 ≥ 1000/6
+    assert app_small_ctx._auto_eviction_due(big)
+    assert not app_small_ctx._eviction_due(big)
+
+    small = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    small.messages = auto_transcript("y" * 100, n=16)  # 6 × ≈25 < 1000/6
+    assert app_small_ctx._auto_eviction_ids(small) == {f"c{i}" for i in range(6)}
+    assert not app_small_ctx._auto_eviction_due(small)
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        assert app_small_ctx._maybe_evict_marked(small) > 0
+        await pilot.pause()
+    assert len(stubs_in(small.messages)) == 6
 
 
 # -- eviction nudge: dynamic-instructions hook --------------------------------------

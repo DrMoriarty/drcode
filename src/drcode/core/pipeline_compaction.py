@@ -55,7 +55,13 @@ from ..context_layout import (
     tool_schemas,
 )
 from ..core.usage import _is_context_overflow_error
-from ..eviction import EVICTION_WINDOW_FRACTION, evict_marked, marked_tokens
+from ..eviction import (
+    AUTO_EVICTION_PAUSE_FRACTION,
+    EVICTION_WINDOW_FRACTION,
+    auto_evictable_ids,
+    evict_marked,
+    marked_tokens,
+)
 from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts
 from ..providers import AgentRole
@@ -919,6 +925,33 @@ class PipelineCompactionLayer(CoreState):
             role=self._task_role(task),
         )
 
+    def _auto_eviction_ids(self, task: Task) -> set[str]:
+        """The tool-call ids the AUTOMATIC clearing (tool result clearing,
+        drcode.eviction's age criterion) would collapse right now: results
+        older than AUTO_EVICTION_MIN_AGE_TURNS model exchanges, minus the
+        last AUTO_EVICTION_KEEP_RECENT live results. Pure and cheap — one
+        scan of the serialized transcript, no mutation."""
+        return auto_evictable_ids(task.messages)
+
+    def _auto_eviction_due(self, task: Task) -> bool:
+        """Whether the auto-evictable old tool results are worth pausing a
+        LIVE run for: their ≈size (chars/4) reached
+        AUTO_EVICTION_PAUSE_FRACTION-th of the serving role's window.
+
+        Between turns the pass fires on any auto-evictable result at all
+        (see _maybe_evict_marked); mid-run it must earn the pause — the
+        auto-evictable volume renews itself every turn once past the age
+        horizon, and a pause/resume per turn would be churn."""
+        ids = self._auto_eviction_ids(task)
+        if not ids:
+            return False
+        window = self.resolved_config(self._task_role(task)).max_context_tokens
+        if window <= 0:
+            return False
+        return (
+            marked_tokens(task.messages, ids) * AUTO_EVICTION_PAUSE_FRACTION >= window
+        )
+
     def _eviction_due(self, task: Task) -> bool:
         """Whether the agent-marked tool results have piled up enough to be
         worth one batch eviction: their ≈size (chars/4, the same estimate
@@ -942,22 +975,31 @@ class PipelineCompactionLayer(CoreState):
 
     def _maybe_evict_marked(self, task: Task, force: bool = False) -> int:
         """Batch eviction of the agent-marked tool results (the deferred
-        half of the mark_unneeded tool): collapse ALL marked tool-return
-        contents into short stubs in ONE pass (one prompt-cache
-        invalidation per batch, never per mark). The tool-call/tool-return
-        pairs survive; the stub names the tool and its arguments so the
-        model can re-run it. Marked ids are pruned (stubbed ones and stale
-        ones left over from a full compaction that rewrote the history
-        around them).
+        half of the mark_unneeded tool) PLUS the automatic tool result
+        clearing (the age criterion, `auto_evictable_ids`): collapse ALL
+        selected tool-return contents into short stubs in ONE pass (one
+        prompt-cache invalidation per batch, never per mark). The
+        tool-call/tool-return pairs survive; the stub names the tool and
+        its arguments so the model can re-run it. Marked ids are pruned
+        (stubbed ones and stale ones left over from a full compaction that
+        rewrote the history around them); the automatic ids need no
+        bookkeeping — the criterion recomputes from the transcript, whose
+        collapsed contents are stubs it never selects again.
 
-        Without ``force`` the pass fires only when the pending marks'
+        Without ``force`` the pass fires when (a) the pending marks'
         ≈size (chars/4) reached a third of the serving role's window (the
-        batch gate: below it the marks ride along cheaply). ``force=True``
-        is the PRE-COMPACTION eviction from _maybe_compact: before the
-        summarizer runs, every mark is honored — the unloading alone may
-        pull the fill back under the threshold and spare the summarizer
-        entirely, and a still-needed summarizer works on the lightened
-        history either way.
+        marks batch gate: below it the marks ride along cheaply), or (b)
+        ANY auto-evictable old result exists — between turns the automatic
+        clearing is unconditional (the lightest-touch compaction: stubs
+        cost nothing, fresh results stay verbatim behind the
+        AUTO_EVICTION_KEEP_RECENT anchor; the per-batch cache
+        invalidation is the accepted tradeoff, exactly as in Claude
+        Code). ``force=True`` is the PRE-COMPACTION eviction from
+        _maybe_compact: before the summarizer runs, every mark is honored
+        and every old result collapsed — the unloading alone may pull the
+        fill back under the threshold and spare the summarizer entirely,
+        and a still-needed summarizer works on the lightened history
+        either way.
 
         The collapsed ≈size is deposited as an eviction credit
         (`_evicted_ctx_tokens`): every fill reading the dev-transcript
@@ -968,12 +1010,17 @@ class PipelineCompactionLayer(CoreState):
         pause path), so the history is never mutated mid-stream. Returns
         the ≈number of tokens the eviction collapsed (0 = nothing
         evicted)."""
-        if not task.marked_unneeded or not (force or self._eviction_due(task)):
+        marked_ids = set(task.marked_unneeded)
+        auto_ids = self._auto_eviction_ids(task)
+        ids = marked_ids | auto_ids
+        if not ids or not (
+            force or (bool(marked_ids) and self._eviction_due(task)) or auto_ids
+        ):
             return 0
         role = self._task_role(task)
         window = self.resolved_config(role).max_context_tokens
-        pending = marked_tokens(task.messages, task.marked_unneeded)
-        result = evict_marked(task.messages, task.marked_unneeded)
+        pending = marked_tokens(task.messages, ids)
+        result = evict_marked(task.messages, ids)
         task.messages = result.new_messages
         evicted_set = set(result.evicted)
         task.marked_unneeded = [
@@ -991,10 +1038,21 @@ class PipelineCompactionLayer(CoreState):
         self._evicted_ctx_tokens[task.id] = (
             self._evicted_ctx_tokens.get(task.id, 0) + pending
         )
+        marked_evicted = len(evicted_set & marked_ids)
+        auto_evicted = len(evicted_set) - marked_evicted
+        if marked_evicted and auto_evicted:
+            head = (
+                f"collapsed {marked_evicted} marked and {auto_evicted} old "
+                "tool result(s)"
+            )
+        elif auto_evicted:
+            head = f"auto-cleared {auto_evicted} old tool result(s)"
+        else:
+            head = f"collapsed {marked_evicted} marked tool result(s)"
         self._show_event(
             task,
-            f"Context unloading: collapsed {len(result.evicted)} marked tool "
-            f"result(s) (≈{pending} tokens of a {window}-token window) — "
+            f"Context unloading: {head} "
+            f"(≈{pending} tokens of a {window}-token window) — "
             "re-run a tool if you need its result again.",
         )
         if self.viewed_id == task.id:
@@ -1075,19 +1133,24 @@ class PipelineCompactionLayer(CoreState):
 
         The gate also owns the selective-eviction gates (drcode.eviction):
         at entry the batch gate collapses the agent-marked tool results
-        when they reached a third of the window; when the threshold
-        measurement then comes out OVER the threshold, a forced eviction
-        of the remaining marks runs BEFORE the summarizer is considered —
-        the fill is re-measured with the eviction credit applied, so one
-        unloading can pull it back under the threshold and spare the
-        summarizer entirely; a still-needed summarizer works on the
-        already lightened history.
+        when they reached a third of the window, and the AUTOMATIC tool
+        result clearing whenever any old-enough result exists (the age
+        criterion, fresh results anchored); when the threshold measurement
+        then comes out OVER the threshold, a forced eviction of everything
+        still selectable (remaining marks AND remaining old results) runs
+        BEFORE the summarizer is considered — the fill is re-measured with
+        the eviction credit applied, so one unloading can pull it back
+        under the threshold and spare the summarizer entirely; a
+        still-needed summarizer works on the already lightened history.
         """
         self._maybe_evict_marked(task)
         tokens = self._compaction_due(task)
-        if tokens is not None and task.marked_unneeded:
-            # Pre-compaction eviction: honor every remaining mark before
-            # the summarizer is even considered, then re-measure.
+        if tokens is not None and (
+            task.marked_unneeded or self._auto_eviction_ids(task)
+        ):
+            # Pre-compaction eviction: honor every remaining mark and
+            # collapse every remaining old result before the summarizer
+            # is even considered, then re-measure.
             self._maybe_evict_marked(task, force=True)
             tokens = self._compaction_due(task)
         hard = self._hard_limit_due(task)

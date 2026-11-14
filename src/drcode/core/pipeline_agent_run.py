@@ -912,24 +912,32 @@ class PipelineAgentRunLayer(CoreState):
             task.unfinished = True
             self.manager.storage.save(task)
             return True
-        # Selective-eviction gate (mark_unneeded marks): the threshold is
-        # NOT reached, but the agent-marked results have piled up to a
-        # third of the window — pause the run so the batch eviction can
-        # collapse them between turns (the actual eviction happens in
-        # _maybe_compact at the next turn boundary, exactly like a
-        # mid-run compaction pause).
+        # Selective-eviction gate (mark_unneeded marks + the automatic
+        # tool result clearing): the threshold is NOT reached, but the
+        # agent-marked results have piled up to a third of the window, or
+        # the auto-evictable old results to AUTO_EVICTION_PAUSE_FRACTION-th
+        # of it — pause the run so the batch eviction can collapse them
+        # between turns (the actual eviction happens in _maybe_compact at
+        # the next turn boundary, exactly like a mid-run compaction
+        # pause).
         if self._eviction_due(task):
-            self._show_event(
-                task,
+            pause_event = (
                 "Marked tool results reached ≈1/3 of the context window — "
-                "pausing the run to unload them…",
+                "pausing the run to unload them…"
             )
-            self._persist_task_messages(task, run)
-            task.messages = sanitized_messages(task.messages)
-            task.unfinished = True
-            self.manager.storage.save(task)
-            return True
-        return False
+        elif self._auto_eviction_due(task):
+            pause_event = (
+                "Old tool results (automatic clearing) reached ≈1/6 of the "
+                "context window — pausing the run to unload them…"
+            )
+        else:
+            return False
+        self._show_event(task, pause_event)
+        self._persist_task_messages(task, run)
+        task.messages = sanitized_messages(task.messages)
+        task.unfinished = True
+        self.manager.storage.save(task)
+        return True
 
     def _agent_turn_succeeded(self, task: Task, task_id: str) -> None:
         """The turn went through: the network-retry budget for this task

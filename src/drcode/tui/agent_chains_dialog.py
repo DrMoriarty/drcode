@@ -12,12 +12,13 @@ the "Model settings…" palette ("Agent model chains…").
 Layout: RIGHT — every model of the whole catalog (all providers),
 favorites highlighted with the same tier glyphs/colors as the catalog
 table's Favorites column (the color on the GLYPH only — the model name
-stays uncolored), labels middle-truncated to the list width so long ids
+stays uncolored except the provider part, which is gray), labels
+middle-truncated to the list width so long ids
 never wrap, with a case-insensitive substring filter above
 (model and/or provider name). LEFT — one group per agent role, each
 holding the role's selected references in chain order (long names
-middle-truncated the same way; the primary is simply the first entry —
-no extra marker). Order is the
+middle-truncated the same way, no positional prefix — the primary is
+simply the first entry). Order is the
 insertion order on purpose: no internal re-sorting, reordering is done
 by removing and re-adding (at most three entries).
 
@@ -98,20 +99,34 @@ def _label_width(option_list: OptionList, fallback: int) -> int:
     return max(8, width - _SCROLLBAR_ALLOWANCE)
 
 
+# The provider part of a right-hand list label (everything up to the
+# first slash) is rendered gray; the model id keeps the default (white)
+# color. The favorite tier glyph keeps its own tier color.
+_PROVIDER_STYLE = "grey50"
+
+
 def _model_label(entry: ModelEntry, provider_name: str, name_width: int) -> Text:
     """One right-hand list line: the favorite tier glyph (same shapes and
     colors as the catalog table's Favorites column — единообразие with the
     catalog screen) followed by "provider/model". ONLY the glyph carries
     the tier color (a span, not the base style — otherwise Rich would
-    paint the whole line); the name stays uncolored and is
-    middle-truncated to `name_width` so long ids never wrap."""
+    paint the whole line); the provider part of the name is gray, the
+    model id stays default (white); the full name is middle-truncated to
+    `name_width` so long ids never wrap."""
     name = _truncate_middle(f"{provider_name}/{entry.id}", name_width)
     glyph = _FAVORITE_GLYPHS.get(entry.favorite)
-    if glyph is None:
-        return Text(f"  {name}")
     line = Text("  ")
-    line.append(f"{glyph.plain} ", style=glyph.style)
-    line.append(name)
+    if glyph is not None:
+        line.append(f"{glyph.plain} ", style=glyph.style)
+    # Style the truncated name in place: the provider (up to the first
+    # slash) gray, the model id default. A name truncated so hard that
+    # no slash survives keeps the plain default color.
+    provider, sep, model = name.partition("/")
+    if sep:
+        line.append(f"{provider}/", style=_PROVIDER_STYLE)
+        line.append(model)
+    else:
+        line.append(name)
     return line
 
 
@@ -328,14 +343,12 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         option_list = self.query_one(f"#ac-list-{role.value}", OptionList)
         prev_highlight = option_list.highlighted
         option_list.clear_options()
-        # "N. " occupies 3 cells before the "provider/model" name; the
-        # name is middle-truncated so long ids never wrap.
-        name_width = _label_width(option_list, _FALLBACK_GROUP_WIDTH) - 3
+        # No positional prefix (a leading number makes long ids wrap onto
+        # a second line); the name is middle-truncated so it never wraps.
+        name_width = _label_width(option_list, _FALLBACK_GROUP_WIDTH)
         for index, ref in enumerate(refs):
             name = _truncate_middle(str(ref), name_width)
-            option_list.add_option(
-                Option(f"{index + 1}. {name}", id=f"{role.value}:{index}")
-            )
+            option_list.add_option(Option(name, id=f"{role.value}:{index}"))
         if prev_highlight is not None and prev_highlight < len(refs):
             option_list.highlighted = prev_highlight
         self.query_one(f"#ac-role-{role.value}", Static).update(

@@ -104,7 +104,7 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
         assert isinstance(screen, AgentChainsScreen)
         coding = _group_list(screen, AgentRole.CODING)
         texts = [str(option.prompt) for option in coding.options]
-        assert texts == ["1. alpha/m1", "2. beta/m3"]
+        assert texts == ["alpha/m1", "beta/m3"]
         header = screen.query_one("#ac-role-coding", Static)
         assert "2/3" in str(header.render())
         # Other roles start empty.
@@ -117,15 +117,20 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
         first_prompt = right.options[0].prompt
         assert isinstance(first_prompt, Text)
         assert "•" in first_prompt.plain and "alpha/m2" in first_prompt.plain
-        # Only the glyph carries the favorite color: a single styled span
-        # over the "• " prefix — the name itself stays uncolored.
+        # The glyph carries the favorite color ("• " prefix) and the
+        # provider part ("alpha/", up to the first slash) is gray; the
+        # model id stays default (white).
         assert [(s.start, s.end, s.style) for s in first_prompt.spans] == [
-            (2, 4, "bold red")
+            (2, 4, "bold red"),
+            (4, 10, "grey50"),
         ]
         assert "•" not in str(right.options[1].prompt)
         non_favorite = right.options[1].prompt
         assert isinstance(non_favorite, Text)
-        assert not non_favorite.spans
+        # No favorite glyph here — only the gray provider span.
+        assert [(s.start, s.end, s.style) for s in non_favorite.spans] == [
+            (2, 8, "grey50")
+        ]
 
 
 async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
@@ -161,12 +166,13 @@ async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
         assert "…" in label
         assert label.startswith("  alpha/a-very-long")
         assert label.endswith("column")
-        # Same treatment in the per-agent chain list ("N. " prefix).
+        # Same treatment in the per-agent chain list (no positional
+        # prefix — a number would make long ids wrap).
         group_label = str(_group_list(screen, AgentRole.CODING).options[0].prompt)
         group = _group_list(screen, AgentRole.CODING)
         assert len(group_label) <= group.size.width - 2
         assert "…" in group_label
-        assert group_label.startswith("1. alpha/a-very-")
+        assert group_label.startswith("alpha/a-very-")
         assert group_label.endswith("-a-narrow-column")
 
 
@@ -214,7 +220,7 @@ async def test_add_to_chain_and_save(tmp_path: Path) -> None:
         screen.query_one("#ac-add-coding", Button).press()
         await pilot.pause()
         texts = [str(o.prompt) for o in _group_list(screen, AgentRole.CODING).options]
-        assert texts == ["1. alpha/m1", "2. alpha/m2"]
+        assert texts == ["alpha/m1", "alpha/m2"]
         assert "added to coding" in _status(screen)
         await pilot.click("#ac-save")
         await pilot.pause()
@@ -306,7 +312,7 @@ async def test_limit_three_per_role(tmp_path: Path) -> None:
 
 async def test_remove_from_chain(tmp_path: Path) -> None:
     """Del removes the highlighted entry; the rest keep their insertion
-    order and are renumbered."""
+    order."""
     path = tmp_path / "models.json"
     store = _seed_store(path)
     async with _Host(store).run_test(size=(120, 56)) as pilot:
@@ -337,7 +343,7 @@ async def test_remove_from_chain(tmp_path: Path) -> None:
         await pilot.pause()
         assert "removed" in _status(screen)
         texts = [str(o.prompt) for o in coding.options]
-        assert texts == ["1. alpha/m2"]
+        assert texts == ["alpha/m2"]
 
 
 async def test_save_drops_emptied_chain(tmp_path: Path) -> None:

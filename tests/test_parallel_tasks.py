@@ -570,6 +570,76 @@ async def test_watchdog_nudges_only_the_stalled_run(
         await wait_until(lambda: not app._agent_runs, pilot, what="runs finished")
 
 
+async def test_watchdog_tolerates_stale_stamp_on_fresh_registration(
+    parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clarification-resume race (incident #cbe953be): the previous
+    run ended with ask_clarifying_question and left a ~42-minute-old
+    activity stamp behind; when the user answers, the promoted run is
+    registered in _agent_runs BEFORE its worker's first _touch_activity.
+    The watchdog must not abort the fresh run over its predecessor's
+    stamp: the registration itself resets the stall clock."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task = app.manager.create("stale", "work s")
+        _to_active(app, task)
+        app._last_activity[task.id] = time.monotonic() - 42 * 60
+        stale = app._last_activity[task.id]
+
+        # Hold the worker off: the stamp reset must come from the
+        # registration itself, not from the worker's first touch.
+        async def hanging_worker(task_id: str) -> None:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(app, "_run_agent_worker", hanging_worker)
+        app.run_agent(task.id)
+        assert task.id in app._agent_runs
+        assert app._last_activity[task.id] > stale + 30 * 60, (
+            "a fresh run registration must reset the stale stall clock"
+        )
+        # The watchdog tick that aborted the fresh run before the fix.
+        app._poll_stall()
+        events = [e.text for e in app.manager.get(task.id).events]
+        assert not any("stalled" in e or "restarting" in e for e in events), (
+            "the watchdog must not abort a freshly registered run"
+        )
+
+
+async def test_watchdog_nudge_pushes_stall_clock_forward(
+    parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After aborting a stalled run the live watchdog branch pushes the
+    stall clock forward — mirror of the zombie sweep below: the restart
+    is scheduled (it re-registers the run within seconds), and a
+    slow-starting worker must not earn a re-nudge on every tick in the
+    meantime."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task = app.manager.create("stalled", "work s")
+        _to_active(app, task)
+        app._agent_runs[task.id] = 1
+        app._last_activity[task.id] = time.monotonic() - 3600
+        scheduled: list[Any] = []
+        monkeypatch.setattr(
+            app, "_schedule_pipeline_timer", lambda d, cb: scheduled.append(cb)
+        )
+        app._poll_stall()
+        events = [e.text for e in app.manager.get(task.id).events]
+        assert any("stalled" in e for e in events)
+        assert scheduled, "the nudge schedules a restart"
+        assert app._last_activity[task.id] > time.monotonic() - 60, (
+            "the nudge must push the stall clock forward"
+        )
+        # The next tick (restart timer hasn't fired yet) must stay quiet.
+        app._poll_stall()
+        events = [e.text for e in app.manager.get(task.id).events]
+        assert sum("stalled" in e for e in events) == 1, (
+            "no re-nudge storm while the restart is pending"
+        )
+
+
 async def test_ctrl_r_restart_leaves_event_and_toast(
     parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:

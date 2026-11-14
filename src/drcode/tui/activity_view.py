@@ -307,6 +307,13 @@ class ActivityLayer(DrCodeState):
                 f"{self.settings.stall_nudge.label})",
             )
             self._nudge_run(task)
+            # Push the stall clock forward (mirror of the zombie sweep
+            # below): the restart is scheduled (the nudge timer
+            # re-registers the run within seconds) — without this a
+            # slow-starting worker (model probe, agent build before its
+            # first _touch_activity) leaves the stale stamp in place and
+            # the next tick re-aborts the freshly registered run.
+            self._last_activity[task_id] = now
         # Zombie sweep: an ACTIVE task nobody runs and nothing legitimately
         # pauses (see _zombie_active_ids) — the silent-worker-exit state
         # (incident #a2dc8424): the worker vanished without a trace, the

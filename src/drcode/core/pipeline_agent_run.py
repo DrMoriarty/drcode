@@ -85,6 +85,15 @@ class PipelineAgentRunLayer(CoreState):
         generation = self._agent_generations.get(task_id, 0) + 1
         self._agent_generations[task_id] = generation
         self._agent_runs[task_id] = generation
+        # A fresh registration starts with clean stall clocks: the stamp
+        # left by the PREVIOUS run (e.g. the ask_clarifying_question one,
+        # which may have ended tens of minutes ago) would otherwise make
+        # the watchdog abort this run on its very next tick — the worker
+        # only touches the clock itself inside _prepare_agent_run, well
+        # after the dispatch. The zombie sweep already treats a missing
+        # stamp as "clock starts on first sight", so a reset here keeps
+        # both branches consistent.
+        self._touch_activity(task_id)
         self.host.host_spawn_worker(
             partial(self._run_agent_worker, task_id),
             name=f"agent run {task_id}",

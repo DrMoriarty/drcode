@@ -990,10 +990,16 @@ class PipelineCompactionLayer(CoreState):
         LIVE run for: their ≈size (chars/4) reached
         AUTO_EVICTION_PAUSE_FRACTION-th of the serving role's window.
 
+        Gated by the `auto_context_unloading` project setting (default
+        off): with the auto layer disabled this is always False and the
+        mid-run pause fires only on the agent's marks (_eviction_due).
+
         Between turns the pass fires on any auto-evictable result at all
         (see _maybe_evict_marked); mid-run it must earn the pause — the
         auto-evictable volume renews itself every turn once past the age
         horizon, and a pause/resume per turn would be churn."""
+        if not self.settings.auto_context_unloading:
+            return False
         ids = self._auto_eviction_ids(task)
         if not ids:
             return False
@@ -1041,12 +1047,14 @@ class PipelineCompactionLayer(CoreState):
         Without ``force`` the pass fires when (a) the pending marks'
         ≈size (chars/4) reached a third of the serving role's window (the
         marks batch gate: below it the marks ride along cheaply), or (b)
-        ANY auto-evictable old result exists — between turns the automatic
-        clearing is unconditional (the lightest-touch compaction: stubs
+        ANY auto-evictable old result exists and the `auto_context_unloading`
+        project setting is on — between turns the automatic clearing is
+        unconditional once opted in (the lightest-touch compaction: stubs
         cost nothing, fresh results stay verbatim behind the
         AUTO_EVICTION_KEEP_RECENT anchor; the per-batch cache
         invalidation is the accepted tradeoff, exactly as in Claude
-        Code). ``force=True`` is the PRE-COMPACTION eviction from
+        Code). With the setting off (the default) only the marks gates
+        fire. ``force=True`` is the PRE-COMPACTION eviction from
         _maybe_compact: before the summarizer runs, every mark is honored
         and every old result collapsed — the unloading alone may pull the
         fill back under the threshold and spare the summarizer entirely,
@@ -1066,7 +1074,14 @@ class PipelineCompactionLayer(CoreState):
         auto_ids = self._auto_eviction_ids(task)
         ids = marked_ids | auto_ids
         if not ids or not (
-            force or (bool(marked_ids) and self._eviction_due(task)) or auto_ids
+            force
+            or (bool(marked_ids) and self._eviction_due(task))
+            # The automatic clearing branch (the unconditional between-turns
+            # pass) — gated by the `auto_context_unloading` project setting
+            # (default off). The `force` branch above is NOT gated: the
+            # pre-compaction eviction still collapses everything selectable,
+            # whatever the flag says.
+            or (self.settings.auto_context_unloading and auto_ids)
         ):
             return 0
         role = self._task_role(task)

@@ -544,6 +544,24 @@ def app_small_ctx(
     project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> DrCodeApp:
     monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "1000")
+    # The auto-clearing tests exercise the AUTOMATIC layer, which the
+    # auto_context_unloading setting gates (default OFF) — opt in here;
+    # the flag-off behavior gets its own tests below.
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+
+    ProjectSettingsStore(project_root).save(
+        ProjectSettings(auto_context_unloading=True)
+    )
+    return DrCodeApp(project_root)
+
+
+@pytest.fixture
+def app_small_ctx_auto_off(
+    project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> DrCodeApp:
+    """Same small window, but the auto_context_unloading setting is left
+    at its default (OFF): the auto clearing never fires."""
+    monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "1000")
     return DrCodeApp(project_root)
 
 
@@ -878,6 +896,64 @@ async def test_mid_run_pause_gate_auto_volume(
     assert len(stubs_in(small.messages)) == 6
 
 
+# -- auto_context_unloading project setting ------------------------------------------
+
+
+async def test_auto_unloading_off_disables_auto_layer(
+    app_small_ctx_auto_off: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """With auto_context_unloading off (the default) the AUTOMATIC
+    clearing never fires: nothing is evicted between turns and no mid-run
+    pause is due, however much auto-evictable volume has piled up. The
+    pure criterion (_auto_eviction_ids) is untouched — it still reports
+    what WOULD be evicted, the gates just refuse to act."""
+    big = app_small_ctx_auto_off.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    big.messages = auto_transcript("y" * 800, n=16)  # 6 × ≈200 ≥ 1000/6
+    assert app_small_ctx_auto_off._auto_eviction_ids(big)
+    assert not app_small_ctx_auto_off._auto_eviction_due(big)
+
+    small = app_small_ctx_auto_off.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    small.messages = auto_transcript("y" * 100, n=16)
+    app_small_ctx_auto_off.manager.storage.save(small)
+    async with app_small_ctx_auto_off.run_test() as pilot:
+        await pilot.pause()
+        assert app_small_ctx_auto_off._maybe_evict_marked(small) == 0
+        await pilot.pause()
+    assert len(stubs_in(small.messages)) == 0
+
+
+async def test_auto_unloading_off_keeps_marks_working(
+    app_small_ctx_auto_off: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The marks layer is NOT affected by the flag: with auto unloading
+    off, agent-marked results still pile up to the batch gate and are
+    still collapsed by the pass."""
+    task = _seed_marked_task(app_small_ctx_auto_off, "y" * 6000)  # ≥ 1000/3
+    assert app_small_ctx_auto_off._eviction_due(task)
+    async with app_small_ctx_auto_off.run_test() as pilot:
+        await pilot.pause()
+        evicted = app_small_ctx_auto_off._maybe_evict_marked(task)
+        await pilot.pause()
+    assert evicted > 0
+    assert len(stubs_in(task.messages)) == 1
+
+
+async def test_auto_unloading_off_force_path_unaffected(
+    app_small_ctx_auto_off: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The forced pre-compaction eviction is NOT gated by the flag: with
+    auto unloading off it still collapses everything selectable."""
+    task = app_small_ctx_auto_off.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = auto_transcript("y" * 100, n=16)
+    app_small_ctx_auto_off.manager.storage.save(task)
+    async with app_small_ctx_auto_off.run_test() as pilot:
+        await pilot.pause()
+        evicted = app_small_ctx_auto_off._maybe_evict_marked(task, force=True)
+        await pilot.pause()
+    assert evicted > 0
+    assert len(stubs_in(task.messages)) == 6
+
+
 # -- eviction nudge: dynamic-instructions hook --------------------------------------
 
 
@@ -1106,3 +1182,24 @@ def test_eviction_hint_setting_persisted(project_root: Any) -> None:
     assert ProjectSettingsStore(project_root).load().eviction_hint is True
     store.save(ProjectSettings(eviction_hint=False))
     assert ProjectSettingsStore(project_root).load().eviction_hint is False
+
+
+def test_auto_unloading_defaults_off_in_settings(project_root: Any) -> None:
+    """ProjectSettings.auto_context_unloading defaults to False: the
+    automatic tool-result clearing is opt-in per project (the marks layer
+    and the forced pre-compaction eviction are not affected)."""
+    from drcode.settings import ProjectSettings
+
+    assert ProjectSettings().auto_context_unloading is False
+
+
+def test_auto_unloading_setting_persisted(project_root: Any) -> None:
+    """The flag round-trips through the project settings store, so a
+    toggle applies to the next activation of each task."""
+    from drcode.settings import ProjectSettings, ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(auto_context_unloading=True))
+    assert ProjectSettingsStore(project_root).load().auto_context_unloading is True
+    store.save(ProjectSettings(auto_context_unloading=False))
+    assert ProjectSettingsStore(project_root).load().auto_context_unloading is False

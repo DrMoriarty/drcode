@@ -112,6 +112,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.agent_creates_drafts = src.agent_creates_drafts
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
+    dst.auto_context_unloading = src.auto_context_unloading
     dst.todo_tail = src.todo_tail
     dst.compaction_resume_min_tokens = src.compaction_resume_min_tokens
     dst.background_compaction = src.background_compaction
@@ -461,6 +462,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                 )
                 yield Switch(value=d.eviction_hint, id="ts-eviction-hint")
                 yield Label(
+                    "Automatic context unloading — auto-clear old tool "
+                    "results (collapse to re-runnable stubs) once they age "
+                    "past ~10 model exchanges; off: results are cleared "
+                    "only when the agent marks them mark_unneeded",
+                    classes="ts-label",
+                )
+                yield Switch(value=d.auto_context_unloading, id="ts-auto-unload")
+                yield Label(
                     "Live todo tail — attach the task's live checklist to "
                     "every model request as a trailing message (off: the "
                     "requests are never modified; the checklist stays in "
@@ -667,6 +676,10 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if eviction_switch.value != d.eviction_hint:
             with self.prevent(Switch.Changed):  # same staleness rule
                 eviction_switch.value = d.eviction_hint
+        auto_unload_switch = self.query_one("#ts-auto-unload", Switch)
+        if auto_unload_switch.value != d.auto_context_unloading:
+            with self.prevent(Switch.Changed):  # same staleness rule
+                auto_unload_switch.value = d.auto_context_unloading
         tail_switch = self.query_one("#ts-todo-tail", Switch)
         if tail_switch.value != d.todo_tail:
             with self.prevent(Switch.Changed):  # same staleness rule
@@ -699,6 +712,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
+            "#ts-auto-unload": (d.auto_context_unloading != o.auto_context_unloading),
             "#ts-todo-tail": d.todo_tail != o.todo_tail,
             "#ts-compaction-resume": (
                 d.compaction_resume_min_tokens != o.compaction_resume_min_tokens
@@ -959,6 +973,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _eviction_hint_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.eviction_hint:
             self._draft.eviction_hint = event.value
+            self._refresh()
+
+    @on(Switch.Changed, "#ts-auto-unload")
+    def _auto_unload_changed(self, event: Switch.Changed) -> None:
+        if event.value != self._draft.auto_context_unloading:
+            self._draft.auto_context_unloading = event.value
             self._refresh()
 
     @on(Switch.Changed, "#ts-todo-tail")

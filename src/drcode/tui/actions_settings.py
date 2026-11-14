@@ -740,8 +740,9 @@ class SettingsLayer(DrCodeState):
         )
 
     def action_set_subagents_coder(self, count: int) -> None:
-        """Settings command: how many read-only research subagents the
-        CODING agent may run in parallel (its delegate_research tool).
+        """Settings command: how many delegate_research calls the
+        CODING agent has per run (total budget; a few may run in
+        parallel within it, the slots are never renewed).
         0 = off: the tool is not registered at all. Persisted per project
         (.drcode/settings.json); applies from the next task activation on
         (agents are built per run, so a raised limit reaches the next
@@ -770,8 +771,9 @@ class SettingsLayer(DrCodeState):
         )
 
     def action_set_subagents_researcher(self, count: int) -> None:
-        """Settings command: how many read-only research subagents the
-        RESEARCH agent may run in parallel (its delegate_research tool).
+        """Settings command: how many delegate_research calls the
+        RESEARCH agent has per run (total budget; a few may run in
+        parallel within it, the slots are never renewed).
         0 = off: the tool is not registered at all. Persisted per project
         (.drcode/settings.json); applies from the next task activation on."""
         self.settings.subagents_researcher = max(0, count)

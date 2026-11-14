@@ -43,15 +43,19 @@ body {
 
 /* ---- tab bar ---- */
 
+/* The tab bar is a real tab STRIP: no bottom border of its own — the
+ * active tab's background (#16181d, same as the terminal/welcome pane)
+ * must flow into the workspace below, so the tab reads as attached to
+ * it rather than as a floating button. Tabs are bottom-aligned; the
+ * active one is a couple of pixels taller (classic raised-tab look). */
 #tabbar {
   flex: none;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 6px;
-  height: 38px;
-  padding: 0 8px;
+  height: 40px;
+  padding: 7px 8px 0;
   background: #1b1e24;
-  border-bottom: 1px solid var(--border);
   position: relative;
   z-index: 10;
 }
@@ -59,7 +63,7 @@ body {
 .tabs {
   flex: 1;
   display: flex;
-  align-items: center;
+  align-items: flex-end; /* every tab's bottom edge flush with the pane */
   gap: 5px;
   margin: 0;
   padding: 0;
@@ -74,9 +78,10 @@ body {
   align-items: center;
   gap: 6px;
   max-width: 220px;
-  padding: 4px 7px 4px 12px;
+  padding: 5px 7px 5px 12px;
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
   background: #20242c;
   color: var(--muted);
   font-size: 12.5px;
@@ -86,9 +91,10 @@ body {
   user-select: none;
 }
 .tab.active {
-  background: #2b303a;
+  background: var(--bg);
   border-color: #3d434f;
   color: var(--fg);
+  padding-top: 7px;
 }
 .tab-label { overflow: hidden; text-overflow: ellipsis; }
 .tab-close {
@@ -97,11 +103,15 @@ body {
   color: var(--muted);
 }
 .tab-close:hover { background: #3d434f; color: var(--fg); }
+/* Close button only on the ACTIVE tab: clicking an inactive tab must
+ * switch to it, never risk hitting its close button instead. */
+.tab:not(.active) .tab-close { display: none; }
 
 .new-tab-btn {
   flex: none;
   width: 26px;
   height: 26px;
+  margin-bottom: 4px; /* bottom-aligned strip: keep the "+" off the pane edge */
   padding: 0;
   border: 1px solid var(--border);
   border-radius: 7px;

@@ -355,6 +355,9 @@ class SidebarLayer(DrCodeState):
         # WITHOUT VS16: terminals render it narrow (1 cell), consistent
         # with the rest of the row; the emoji presentation (⚙️) would
         # be double-width and shift the rest of the line.
+        # Dependency gate suffix (computed first — a blocked task shows
+        # the lock INSTEAD of its status symbol, see below).
+        deps_suffix = self._dependency_marker(t)
         if self._resolver_running and self._resolver_task_id == t.id:
             marker = "⚙"
         elif t.status.value == "completed":
@@ -370,6 +373,12 @@ class SidebarLayer(DrCodeState):
                 "merged": "green",
             }.get(self._merge_state.get(t.id, "none"))
             marker = f"[{color}]✓[/]" if color else "✓"
+        elif deps_suffix:
+            # Blocked by dependencies: the lock replaces the status
+            # symbol — the tail "🔒 ⇢ ids" after the 40-char title was
+            # clipped off narrow panels entirely, so the lock had to
+            # move to the front where it is always visible.
+            marker = "[red]🔒[/]"
         else:
             marker = {
                 "queued": "◷",
@@ -390,9 +399,6 @@ class SidebarLayer(DrCodeState):
             suffix = " ❌"
         else:
             suffix = ""
-        # Dependency gate: a task whose depends_on is not satisfied yet
-        # gets the lock marker and the ids it waits for.
-        deps_suffix = self._dependency_marker(t)
         # The goal link (◆<goal-id>) next to the task, same pattern.
         goal_suffix = self._goal_marker(t)
         # The failed-conflict-fallback marker: the agent resolver gave up
@@ -714,8 +720,11 @@ class SidebarLayer(DrCodeState):
         return f"{indent}{marker} {escape(goal.title_display)}  [dim]{counter}[/]"
 
     def _dependency_marker(self, task: Task) -> str:
-        """Sidebar suffix of the dependency gate: " 🔒 ⇢ <id1>,<id2>" for a
-        task whose dependencies are not satisfied yet, "" otherwise.
+        """Sidebar suffix of the dependency gate: " ⇢ <id1>,<id2>" for a
+        task whose dependencies are not satisfied yet, "" otherwise. The
+        lock itself is NOT part of the suffix — it renders as the row's
+        LEADING marker (replacing the status symbol), so a narrow panel
+        cannot clip it away; this tail only names whom we wait for.
 
         Status half from the manager (a dep exists and is not COMPLETED);
         the mergedness half from the promote worker's last computed gate
@@ -730,7 +739,7 @@ class SidebarLayer(DrCodeState):
             waiting = list(task.depends_on)
         else:
             return ""
-        return f" [red]🔒[/] ⇢ {','.join(waiting)}"
+        return f" ⇢ {','.join(waiting)}"
 
     def toggle_sidebar_section(self, section: str) -> None:
         """Collapse/expand one sidebar category (its header row).

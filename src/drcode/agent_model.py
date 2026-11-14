@@ -30,6 +30,7 @@ from pydantic_ai.settings import ModelSettings
 
 from .config import Config
 from .providers import ModelEntry
+from .providers import coerce_price as _coerce_price
 from .version import APP_VERSION
 
 # Гейтвей блокирует запросы с UA известных CLI/SDK
@@ -703,11 +704,45 @@ def _entry_context(item: dict[str, Any]) -> int:
     return 200_000
 
 
+def _entry_prices(item: dict[str, Any]) -> dict[str, float | None]:
+    """Per-token USD prices carried by a /models entry, or all-None when
+    the gateway prices nothing.
+
+    Preferred source: the `pricing` block (zveno.ai-style:
+    `{"prompt": "0.000007346057", "completion": …, "input_cache_read": …}`
+    — already per ONE token, values may be strings). Fallback for
+    prompt/completion: the `price_in_per_1k` / `price_out_per_1k` keys
+    (per 1k tokens → divided by 1000); there is no per-1k cache-read
+    counterpart, so `price_cache_read` only ever comes from the pricing
+    block. Every value passes through the catalog's tolerant coercion:
+    junk becomes None, never a discovery failure.
+    """
+    prompt = completion = cache_read = None
+    pricing = item.get("pricing")
+    if isinstance(pricing, dict):
+        prompt = _coerce_price(pricing.get("prompt"))
+        completion = _coerce_price(pricing.get("completion"))
+        cache_read = _coerce_price(pricing.get("input_cache_read"))
+    if prompt is None:
+        in_1k = _coerce_price(item.get("price_in_per_1k"))
+        prompt = None if in_1k is None else in_1k / 1000.0
+    if completion is None:
+        out_1k = _coerce_price(item.get("price_out_per_1k"))
+        completion = None if out_1k is None else out_1k / 1000.0
+    return {
+        "price_prompt": prompt,
+        "price_completion": completion,
+        "price_cache_read": cache_read,
+    }
+
+
 def _parse_models_payload(payload: Any) -> list[ModelEntry]:
     """Extract model entries from a /models response body.
 
     Canonical shape: {"data": [{"id": ...}, ...]}; some gateways return a
     bare list of entries — accept both. Entries without an id are skipped.
+    Per-token prices (`_entry_prices`) ride along when the gateway
+    reports them; absent pricing leaves the fields None.
     """
     items: Any = None
     if isinstance(payload, dict):
@@ -724,10 +759,14 @@ def _parse_models_payload(payload: Any) -> list[ModelEntry]:
         if not isinstance(model_id, str) or not model_id:
             continue
         context = _entry_context(item)
+        prices = _entry_prices(item)
         entries.append(
             ModelEntry(
                 id=model_id,
                 max_context_tokens=context,
+                price_prompt=prices["price_prompt"],
+                price_completion=prices["price_completion"],
+                price_cache_read=prices["price_cache_read"],
             )
         )
     return entries
@@ -747,6 +786,10 @@ async def fetch_models(
     taken from optional gateway-specific keys when present
     (`_CONTEXT_KEYS` / llama.cpp `meta.n_ctx`); otherwise the entry gets
     the 200_000 default (adjust by hand in the catalog UI if needed).
+    Per-token prices ride along from the entry's `pricing` block (or the
+    `price_in_per_1k` / `price_out_per_1k` keys) when the gateway reports
+    them — `_entry_prices`; absent pricing leaves the price fields None
+    and never fails the discovery.
 
     Raises `ModelFetchError` when no endpoint answers with a model list.
     The `_transport` parameter exists for tests (httpx.MockTransport).

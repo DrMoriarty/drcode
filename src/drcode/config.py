@@ -363,6 +363,12 @@ def ensure_user_config_dir() -> None:
                                         "max_context_tokens": 200000,
                                         "max_tokens": None,
                                         "compaction_threshold": None,
+                                        # Per-token USD prices, edited only
+                                        # by hand here (no UI); None/absent
+                                        # = the cost is not computed.
+                                        "price_prompt": None,
+                                        "price_completion": None,
+                                        "price_cache_read": None,
                                     }
                                 ],
                             }

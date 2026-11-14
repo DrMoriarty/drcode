@@ -13,7 +13,7 @@ from pydantic_ai.usage import RunUsage
 from textual.widgets import DataTable, Tabs
 
 import drcode.config as config_module
-from drcode.providers import AgentRole
+from drcode.providers import AgentRole, UserModelsStore
 from drcode.usage_store import FIELDS, VERSION, UsageStore
 
 
@@ -299,3 +299,122 @@ async def test_app_usage_dialog_renders_the_store(
         assert table.row_count == 2
         status = str(dialog.query_one("#usage-status").render())
         assert "1 дн." in status
+
+
+async def test_app_usage_dialog_cost_column(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The cost column prices each (day, model) row from the model's
+    catalog prices: input minus cache reads at the prompt price, cache
+    reads at the cache price, output at the completion price. Rows of
+    unpriced models show an EMPTY cell (never 0); the period total sums
+    the computable rows."""
+    from drcode.providers import ModelEntry, Provider, UserModelsConfig
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.stats_dialog import StatsDialog
+
+    config_module._USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UserModelsStore().save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="zveno",
+                    base_url="https://zveno.ai/v1",
+                    models=[
+                        ModelEntry(
+                            id="m1",
+                            price_prompt=0.000002,
+                            price_completion=0.000008,
+                            price_cache_read=0.0000005,
+                        ),
+                        ModelEntry(id="unpriced"),
+                    ],
+                )
+            ]
+        )
+    )
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        # cost = (1000-500)*0.000002 + 500*0.0000005 + 100*0.000008
+        #      = 0.001 + 0.00025 + 0.0008 = 0.00205
+        app._record_session_usage(
+            _usage(input=1000, output=100, cache_read=500, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+        )
+        app._record_session_usage(
+            _usage(input=100, output=10, requests=1),
+            AgentRole.CODING,
+            "zveno/unpriced",
+        )
+        dialog = StatsDialog(project_root, usage_store=app._usage_store)
+        await app.push_screen(dialog)
+        await pilot.pause()
+        dialog.query_one("#stats-tabs", Tabs).active = "usage"
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = dialog.query_one("#usage-table", DataTable)
+        # Two data rows + the period total.
+        assert table.row_count == 3
+        # Rows are sorted by (day desc, key): "coding/zveno/m1" first,
+        # then "coding/zveno/unpriced", then the Σ row.
+        first, second, total = (table.get_row_at(i) for i in range(3))
+        assert first[-1] == "$0.00205"
+        assert second[-1] == ""  # unknown price — empty, not zero
+        assert total[-1] == "$0.00205"
+
+
+async def test_app_usage_dialog_cost_without_cache_read_price(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """A model with prompt/completion prices but no cache-read price is
+    still costed while it has zero cache reads; once a row HAS cache
+    reads, its cell goes empty (the cache term is unknowable)."""
+    from drcode.providers import ModelEntry, Provider, UserModelsConfig
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.stats_dialog import StatsDialog
+
+    config_module._USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UserModelsStore().save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="zveno",
+                    base_url="https://zveno.ai/v1",
+                    models=[
+                        ModelEntry(
+                            id="m1", price_prompt=0.000002, price_completion=0.000008
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        app._record_session_usage(
+            _usage(input=1000, output=100, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+        )
+        app._record_session_usage(
+            _usage(input=1000, output=100, cache_read=500, requests=1),
+            AgentRole.RESEARCH,
+            "zveno/m1",
+        )
+        dialog = StatsDialog(project_root, usage_store=app._usage_store)
+        await app.push_screen(dialog)
+        await pilot.pause()
+        dialog.query_one("#stats-tabs", Tabs).active = "usage"
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = dialog.query_one("#usage-table", DataTable)
+        rows = [table.get_row_at(i) for i in range(table.row_count)]
+        by_key = {row[1]: row[-1] for row in rows if row[0] != "Σ период"}
+        coding = by_key["coding/zveno/m1"]
+        research = by_key["research/zveno/m1"]
+        # cost = 1000*0.000002 + 100*0.000008 = 0.0028
+        assert coding == "$0.0028"
+        assert research == ""  # cache reads present, cache price unknown

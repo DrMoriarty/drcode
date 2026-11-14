@@ -1615,3 +1615,131 @@ async def test_fetch_models_no_models() -> None:
 
     with pytest.raises(ModelFetchError):
         await fetch_models("http://x/v1", "", _transport=_transport(handler))
+
+
+async def test_fetch_models_parses_pricing_block() -> None:
+    """A zveno.ai-style `pricing` block (per-token USD, values as strings)
+    fills the entry's price fields; entries without pricing keep them
+    None — discovery never fails on prices."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "priced",
+                        "pricing": {
+                            "prompt": "0.000007346057",
+                            "completion": "0.00002",
+                            "input_cache_read": "0.000001",
+                            "web_search": "0.01",
+                        },
+                    },
+                    {
+                        "id": "per-1k",
+                        "price_in_per_1k": 10,
+                        "price_out_per_1k": "30.5",
+                    },
+                    {"id": "junk", "pricing": {"prompt": "free", "completion": None}},
+                    {"id": "bare"},
+                ]
+            },
+        )
+
+    entries = await fetch_models("http://x/v1", "k", _transport=_transport(handler))
+    by_id = {e.id: e for e in entries}
+    priced = by_id["priced"]
+    assert priced.price_prompt == pytest.approx(0.000007346057)
+    assert priced.price_completion == pytest.approx(0.00002)
+    assert priced.price_cache_read == pytest.approx(0.000001)
+    # Per-1k keys are the fallback, divided by 1000; no cache-read price.
+    per_1k = by_id["per-1k"]
+    assert per_1k.price_prompt == pytest.approx(0.01)
+    assert per_1k.price_completion == pytest.approx(0.0305)
+    assert per_1k.price_cache_read is None
+    # Junk values drop to None, never break the discovery.
+    for entry in (by_id["junk"], by_id["bare"]):
+        assert entry.price_prompt is None
+        assert entry.price_completion is None
+        assert entry.price_cache_read is None
+
+
+# -- model entry prices --------------------------------------------------------
+
+
+def test_model_entry_prices_roundtrip(user_config_dir: Path) -> None:
+    """Prices survive a catalog save/load and are visible in the json for
+    hand editing; an unpriced entry serializes explicit nulls."""
+    cfg = UserModelsConfig(
+        providers=[
+            Provider(
+                name="zveno",
+                base_url="https://zveno.ai/v1",
+                models=[
+                    ModelEntry(
+                        id="m1",
+                        price_prompt=0.000002,
+                        price_completion=0.000008,
+                        price_cache_read=0.0000005,
+                    ),
+                    ModelEntry(id="m2"),
+                ],
+            )
+        ]
+    )
+    UserModelsStore().save(cfg)
+
+    raw = json.loads((user_config_dir / "models.json").read_text())
+    m1 = raw["providers"][0]["models"][0]
+    assert m1["price_prompt"] == 0.000002
+    assert m1["price_completion"] == 0.000008
+    assert m1["price_cache_read"] == 0.0000005
+    assert raw["providers"][0]["models"][1]["price_prompt"] is None
+
+    loaded = UserModelsStore().load()
+    assert loaded == cfg
+
+
+def test_model_entry_price_junk_does_not_invalidate_catalog(
+    user_config_dir: Path,
+) -> None:
+    """A garbage price in a hand-edited models.json is dropped to None
+    (never a ValidationError — that would send the whole catalog to the
+    .bak fallback); valid sibling prices load unchanged."""
+    user_config_dir.mkdir(parents=True, exist_ok=True)
+    (user_config_dir / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "zveno",
+                        "base_url": "https://zveno.ai/v1",
+                        "models": [
+                            {
+                                "id": "bad",
+                                "price_prompt": "abc",
+                                "price_completion": -1,
+                                "price_cache_read": [1],
+                            },
+                            {
+                                "id": "good",
+                                "price_prompt": "0.000002",
+                                "price_completion": 8e-6,
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    store = UserModelsStore()
+    loaded = store.load()
+    assert store.last_warning is None
+    bad, good = loaded.providers[0].models
+    assert bad.price_prompt is None
+    assert bad.price_completion is None
+    assert bad.price_cache_read is None
+    assert good.price_prompt == pytest.approx(0.000002)
+    assert good.price_completion == pytest.approx(8e-6)
+    assert good.price_cache_read is None

@@ -12,7 +12,11 @@ A single modal with two tabs over the main screen:
   pydantic-ai reports plus the request count, and a period-total row at
   the bottom. The keys are "<role>/<model>" — model id in the catalog's
   "<provider>/<model-id>" format where the provider is known — so the
-  same model serving different roles shows as separate rows.
+  same model serving different roles shows as separate rows. When the
+  model's catalog entry carries per-token prices (auto-discovered from
+  the gateway's pricing block or entered by hand in models.json), a
+  final "Стоимость" column shows the row's USD cost; rows of unpriced
+  models show an empty cell.
 
 No data ever touches the event loop's hot path: both reads (the
 :class:`drcode.stats.StatsStore` window snapshot and the usage file
@@ -40,6 +44,7 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Sparkline, Static, Tab, Tabs
 
+from ..providers import UserModelsStore, user_models_file
 from ..stats import DayStats, StatsStore, format_seconds
 from ..usage_store import FIELDS, UsageStore, usage_file
 
@@ -59,6 +64,85 @@ _HINTS: dict[str, str] = {
 def _fmt(n: int) -> str:
     """Thousands-separated counter for the usage table cells."""
     return f"{n:,}"
+
+
+# Per-model prices of one usage key: (prompt, completion, cache_read) per
+# token in USD; cache_read may be None (unknown) while the other two are
+# always present — the index only holds entries whose cost CAN be computed
+# (with the caveat that a nonzero cache_read still needs price_cache_read).
+_PriceTriple = tuple[float, float, float | None]
+
+
+def _price_index() -> dict[str, _PriceTriple]:
+    """Model reference → per-token prices, from the user-level catalog.
+
+    The usage keys are "<role>/<model>" where <model> is the catalog's
+    "<provider>/<model-id>" reference (or the bare model id for custom /
+    env models), so the lookup mirrors `providers._match_ref`: the full
+    "<provider>/<model-id>" form first, then the bare model id across the
+    catalog. Only entries with BOTH the prompt and the completion price
+    are indexed — without either the cost is never computable; the
+    cache-read price stays optional (a row with zero cache reads doesn't
+    need it). The blocking catalog read happens in the usage-load worker
+    thread, never on the event loop.
+    """
+    catalog = UserModelsStore(path=user_models_file()).load()
+    index: dict[str, _PriceTriple] = {}
+    for provider in catalog.providers:
+        for entry in provider.models:
+            if entry.price_prompt is None or entry.price_completion is None:
+                continue
+            prices: _PriceTriple = (
+                entry.price_prompt,
+                entry.price_completion,
+                entry.price_cache_read,
+            )
+            index.setdefault(f"{provider.name}/{entry.id}", prices)
+    for provider in catalog.providers:
+        for entry in provider.models:
+            if entry.price_prompt is None or entry.price_completion is None:
+                continue
+            index.setdefault(
+                entry.id,
+                (entry.price_prompt, entry.price_completion, entry.price_cache_read),
+            )
+    return index
+
+
+def _row_cost(counters: dict[str, int], prices: _PriceTriple) -> float | None:
+    """The USD cost of one (day, model) counter row.
+
+    `input` already INCLUDES cache reads/writes (pydantic-ai normalizes
+    usage that way — see `transcript._usage_context_tokens`), so the
+    cache-read tokens are priced separately and subtracted from the
+    prompt-priced remainder; cache writes stay inside the prompt term
+    (no separate per-token price exists for them). None = not computable:
+    a needed price is missing (the cache-read price only once the row
+    actually has cache reads)."""
+    price_prompt, price_completion, price_cache_read = prices
+    cache_read = counters.get("cache_read", 0)
+    if cache_read and price_cache_read is None:
+        return None
+    plain_input = max(0, counters.get("input", 0) - cache_read)
+    return (
+        plain_input * price_prompt
+        + cache_read * (price_cache_read or 0.0)
+        + counters.get("output", 0) * price_completion
+    )
+
+
+def _fmt_cost(cost: float) -> str:
+    """Human-readable USD amount: costs are usually cents or less, so
+    the precision scales down with the value; trailing zeros are trimmed
+    ("$0.023", "$0.000735")."""
+    if cost >= 1:
+        text = f"{cost:,.2f}"
+    elif cost >= 0.01:
+        text = f"{cost:.4f}"
+    else:
+        text = f"{cost:.6f}"
+    text = text.rstrip("0").rstrip(".")
+    return f"${text or '0'}"
 
 
 class StatsDialog(ModalScreen[None]):
@@ -168,6 +252,7 @@ class StatsDialog(ModalScreen[None]):
             "Output",
             "Cache read",
             "Cache write",
+            "Стоимость",
         )
         self._load_days()
 
@@ -265,17 +350,18 @@ class StatsDialog(ModalScreen[None]):
 
     @work(exclusive=True, group="usage-load")
     async def _load_usage(self) -> None:
-        """Read the usage file in a worker thread (the store may hold a
-        long history; the parse itself is part of the read)."""
+        """Read the usage file (and the price index) in a worker thread
+        (the store may hold a long history; the parse itself is part of
+        the read, and the catalog read belongs off the event loop too)."""
 
-        def read() -> dict:
-            return self._usage_store.load()
+        def read() -> tuple[dict, dict[str, _PriceTriple]]:
+            return self._usage_store.load(), _price_index()
 
         try:
-            days = await asyncio.to_thread(read)
+            days, prices = await asyncio.to_thread(read)
             status = self.query_one("#usage-status", Static)
             table = self.query_one("#usage-table", DataTable)
-            self._fill_usage_table(table, days)
+            self._fill_usage_table(table, days, prices)
             status.update(self._usage_summary(days))
         except Exception:  # noqa: BLE001, S110 - the dialog may be mid-teardown
             # DOM pruning of a popped screen is gradual; dropping the
@@ -283,11 +369,19 @@ class StatsDialog(ModalScreen[None]):
             pass
 
     @staticmethod
-    def _fill_usage_table(table: DataTable, days: dict) -> None:
+    def _fill_usage_table(
+        table: DataTable, days: dict, prices: dict[str, _PriceTriple] | None = None
+    ) -> None:
         """One row per (day, model), newest day first, then a period
-        total. Clearing first makes a future reload idempotent."""
+        total. Clearing first makes a future reload idempotent.
+
+        The cost column shows the USD amount of the row per the model's
+        catalog prices; a model whose prices are unknown (or missing the
+        cache-read price while the row has cache reads) shows an empty
+        cell — never 0. The period total sums the computable rows only."""
         table.clear()
         totals = dict.fromkeys(FIELDS, 0)
+        total_cost = 0.0
         rows = 0
         for day in sorted(days, reverse=True):
             for key in sorted(days[day]):
@@ -295,10 +389,19 @@ class StatsDialog(ModalScreen[None]):
                 for field in FIELDS:
                     totals[field] += counters.get(field, 0)
                 rows += 1
+                # The usage key is "<role>/<model>"; the price index is
+                # keyed by the model part ("<provider>/<model-id>" or the
+                # bare id) — strip the role prefix (first slash only: the
+                # model id itself may contain slashes).
+                row_prices = (prices or {}).get(key.partition("/")[2])
+                cost = _row_cost(counters, row_prices) if row_prices else None
+                if cost is not None:
+                    total_cost += cost
                 table.add_row(
                     day,
                     key,
                     *(_fmt(counters.get(field, 0)) for field in FIELDS),
+                    _fmt_cost(cost) if cost is not None else "",
                 )
         if rows == 0:
             return
@@ -306,6 +409,7 @@ class StatsDialog(ModalScreen[None]):
             "Σ период",
             "",
             *(_fmt(totals[field]) for field in FIELDS),
+            _fmt_cost(total_cost) if total_cost else "",
         )
 
     @staticmethod

@@ -88,6 +88,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import math
 import os
 import shutil
 import ssl
@@ -135,6 +136,26 @@ def user_models_file() -> Path:
     return _config._USER_CONFIG_DIR / USER_MODELS_FILENAME
 
 
+def coerce_price(value: object) -> float | None:
+    """Tolerant per-token price coercion shared by the catalog validator
+    and the `fetch_models` pricing parser: numbers pass through, numeric
+    strings (what gateways actually send) are parsed, everything else —
+    None, bools, junk strings, negatives, non-finite values — is dropped
+    to None (= "the price is unknown"), never a validation error."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        price = float(value)
+    elif isinstance(value, str):
+        try:
+            price = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
+
+
 def _reject_slash(value: str) -> str:
     """Shared validator body: `/` is the separator of the
     "<provider>/<model-id>" reference format and is forbidden in provider
@@ -174,6 +195,19 @@ class ModelEntry(BaseModel):
     # catalog UI (a separate task) will sort favorites to the top. Stored
     # on the model entry in the user-level models.json.
     favorite: int = 0
+    # Per-token prices in USD (per ONE token, not per 1k): prompt (plain
+    # input AND cache writes — the gateways rarely price cache writes
+    # separately, and the usage store's `input` counter already includes
+    # them), completion (output) and cache reads. None/absent = the price
+    # is unknown: the entry then shows no cost in the statistics dialog.
+    # Filled automatically from the gateway's pricing block when
+    # `agent_model.fetch_models` discovers the models; edited only BY HAND
+    # in models.json (no UI fields — the catalog screen's model editing
+    # touches other fields in place and never rebuilds the entry, so the
+    # prices survive every catalog edit).
+    price_prompt: float | None = None
+    price_completion: float | None = None
+    price_cache_read: float | None = None
 
     @field_validator("favorite")
     @classmethod
@@ -181,6 +215,19 @@ class ModelEntry(BaseModel):
         if not 0 <= value <= 3:
             raise ValueError("favorite must be 0..3 (0 = not a favorite)")
         return value
+
+    @field_validator(
+        "price_prompt", "price_completion", "price_cache_read", mode="before"
+    )
+    @classmethod
+    def _coerce_price(cls, value: object) -> float | None:
+        """Tolerant price coercion — a garbage price in models.json must
+        never invalidate the whole catalog (the `.bak` fallback is far too
+        coarse a hammer for one bad field): numbers pass through, numeric
+        strings (what gateways actually send, e.g. "0.000007346057") are
+        parsed, everything else — junk, negatives, non-finite — is dropped
+        to None (= the price is simply unknown)."""
+        return coerce_price(value)
 
 
 class Provider(BaseModel):

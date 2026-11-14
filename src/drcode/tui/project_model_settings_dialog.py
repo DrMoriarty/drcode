@@ -384,9 +384,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         # default chain — see providers.resolve_subagent).
         options.append(
             (
-                "Inherit parent role"
-                if role is AgentRole.SUBAGENT
-                else "User default",
+                "Inherit parent role" if role is AgentRole.SUBAGENT else "User default",
                 _USER_DEFAULT,
             )
         )

@@ -1310,9 +1310,7 @@ def migrate_user_config() -> bool:
             # "inherit the parent role's model", and right after this
             # migration the parent runs on the migrated model anyway.
             catalog.defaults = {
-                role: [ref]
-                for role in AgentRole
-                if role is not AgentRole.SUBAGENT
+                role: [ref] for role in AgentRole if role is not AgentRole.SUBAGENT
             }
             try:
                 store.save(catalog)

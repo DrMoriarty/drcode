@@ -551,8 +551,9 @@ class ProjectSettings(BaseModel):
     # single: testing never occupies a development slot and never runs
     # concurrently with another tester round.
     parallel_tasks: int = 1
-    # How many read-only research subagents the CODING agent may run in
-    # parallel at once (spawned via its delegate_research tool; each
+    # How many delegate_research calls the CODING agent has per run
+    # (total budget: a few may run in parallel within it, the slots are
+    # never renewed — spawned via its delegate_research tool; each
     # returns only its final answer, so the parent's context stays small).
     # 0 (the default) = delegation is off: the tool is not registered and
     # the agent neither knows about nor can use subagents.

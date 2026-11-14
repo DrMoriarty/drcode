@@ -286,7 +286,7 @@ async def test_delegation_note_rides_the_trailing_message_only(
     await ag.run("hi", deps=deps)
 
     messages = seen["body"]["messages"]
-    note = "You have 2 read-only subagents available via delegate_research"
+    note = "You have 2 delegate_research calls left this run"
     leading, rest = [], []
     for msg in messages:
         (leading if not rest and msg["role"] == "system" else rest).append(msg)

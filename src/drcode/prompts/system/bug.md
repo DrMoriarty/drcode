@@ -58,7 +58,11 @@ the stack frames that matter, and any verification read of a claim from a
 report. Never delegate a single-file lookup or the reproduction itself.
 
 Each call returns ONLY the subagent's final report; its intermediate tool
-traffic never reaches your context. The subagent can only read and cannot ask
+traffic never reaches your context. The run has a TOTAL budget of
+delegate_research calls (the exact count is stated in the tool description
+and the tail reminder): parallel calls are fine, but every call spends one
+of the run's slots for good — spent slots are not renewed. The subagent can
+only read and cannot ask
 you questions — write the brief as a SELF-CONTAINED task in three parts:
 
 1. GOAL — the question to answer, precisely.

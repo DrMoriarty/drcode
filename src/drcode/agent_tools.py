@@ -764,8 +764,12 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
 
     - limit <= 0 → None: the feature is off, no block at all (the
       TailInjectionModel passes the request through untouched).
-    - used < limit → the standing "you have N available" reminder (N =
-      remaining). Without it the feature is effectively invisible: a tool
+    - used < limit → the standing "N calls left this run" reminder (N =
+      remaining; the wording names the PER-RUN BUDGET explicitly — an
+      earlier "you have N available" phrasing read as a renewable
+      resource and the agent of the a7be0f94 transcript burned real
+      reasoning reconciling it with the budget semantics). Without it
+      the feature is effectively invisible: a tool
       that merely EXISTS in the schema went uncalled across a whole
       119-task benchmark run (drcode-bench, slots enabled), while a
       standing reminder of the real budget in the live context does get
@@ -806,13 +810,14 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
             "— further delegation is unavailable. Continue with direct reads."
         )
     remaining = limit - used
-    plural = "subagent" if remaining == 1 else "subagents"
+    call_word = "call" if remaining == 1 else "calls"
     verb = "document" if role is AgentRole.RESEARCH else "edit"
     return (
-        f"You have {remaining} read-only {plural} available via delegate_research "
-        "— free context for wide-but-shallow reading (mapping call sites, "
-        "recon over >3-5 files, surveying a subsystem before you touch it). "
-        f"Read only the files you will {verb} yourself."
+        f"You have {remaining} delegate_research {call_word} left this run "
+        f"(of {limit} total) — a TOTAL budget per run, not renewed once "
+        "spent. Free context for wide-but-shallow reading (mapping call "
+        "sites, recon over >3-5 files, surveying a subsystem before you "
+        f"touch it). Read only the files you will {verb} yourself."
     )
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ from ..agent import (
     prompt_fits_context,
     prompt_fits_window,
     render_history_for_summary,
+    sanitized_messages,
     serialize_messages,
     slice_budget_tokens,
     split_original_prompts,
@@ -45,7 +47,14 @@ from ..agent import (
     tester_verdict_issued,
     unwrap_summary_envelope,
 )
-from ..compaction import _MAX_REDUCE_DEPTH, CHARS_PER_TOKEN
+from ..compaction import (
+    _MAX_REDUCE_DEPTH,
+    CHARS_PER_TOKEN,
+    background_compaction_mark,
+    drop_background_marks,
+    find_background_mark,
+    split_at_background_mark,
+)
 from ..config import Config
 from ..context_layout import (
     coding_tool_schemas,
@@ -138,6 +147,34 @@ RESUME_COMPACTION_MIN_IDLE_SECONDS = 180.0
 # summary there would only lose detail (and burn a call).
 MODEL_SWITCH_COMPACTION_MIN_TOKENS = RESUME_COMPACTION_MIN_TOKENS
 
+# Background compaction (`background_compaction` setting, the OpenCode v2
+# `experimental.background_compaction` pattern): the trigger point sits
+# this many percentage points of the window BELOW the compaction
+# threshold — the summary is prepared while the agent keeps working, so it
+# has the whole band to ripen before the blocking threshold gate would
+# fire. A margin too small risks the summary arriving after the threshold
+# is crossed (the gate is suppressed while it matures — the fill would
+# keep growing toward the hard limit); 10 points of a typical window is
+# several turns of headroom.
+_BACKGROUND_TRIGGER_MARGIN_PCT = 10
+
+
+@dataclass
+class BackgroundCompaction:
+    """Held state of one background compaction (per task, session-only —
+    a restart discards it by design, see the survey §2.1 "held summaries
+    are lost on restart").
+
+    `handle` is the asyncio task running the summarizer (cancelled on
+    invalidation); `ready` the finished summary while it waits for the
+    next turn boundary — the run is live, and rewriting the dev
+    transcript mid-turn would race the run's own persist syncs, so the
+    stitch happens only at turn boundaries (or in the run epilogue, when
+    no turn boundary comes anymore)."""
+
+    handle: asyncio.Task[None] | None = None
+    ready: str | None = None
+
 
 # The synthetic user message appended to a transcript when the next run
 # starts on a DIFFERENT model (see _prepare_model_switch_transcript): the
@@ -185,17 +222,35 @@ class PipelineCompactionLayer(CoreState):
         config of `role` — the model actually serving the transcript — so
         a per-model compaction limit from the catalog (models.json) is
         honored instead of the flat config's value."""
+        tokens = self._fill_tokens(live_tokens, messages, role)
+        if not tokens:
+            return None
         config = self.resolved_config(role)
         max_tokens = config.max_context_tokens
-        if max_tokens <= 0:
-            return None
         threshold = min(max(config.compaction_threshold, 1), 100)
+        if tokens * 100 < threshold * max_tokens:
+            return None
+        return tokens
+
+    def _fill_tokens(
+        self,
+        live_tokens: int | None,
+        messages: list[dict[str, Any]],
+        role: AgentRole = AgentRole.CODING,
+    ) -> int | None:
+        """Current context fill (tokens) of a transcript measured against
+        `role`'s resolved config — the threshold-independent reading the
+        background-compaction trigger measures its band against. None
+        when the window is unknown or nothing was measured. Prefers the
+        live reading of the running turn over the persisted transcript,
+        whose usage lags behind by the not-yet-persisted requests."""
+        config = self.resolved_config(role)
+        if config.max_context_tokens <= 0:
+            return None
         tokens = live_tokens
         if tokens is None:
             tokens = last_context_tokens(messages)
-        if not tokens or tokens * 100 < threshold * max_tokens:
-            return None
-        return tokens
+        return tokens or None
 
     def _compaction_due(self, task: Task) -> int | None:
         """Compaction threshold check for the main agent transcript,
@@ -227,14 +282,11 @@ class PipelineCompactionLayer(CoreState):
         request is rejected deterministically, so a broken summarizer must
         never disable this check — it can only downgrade the compaction
         itself to the mechanical floor (see `_compact_transcript`)."""
-        config = self.resolved_config(role)
-        max_tokens = config.max_context_tokens
-        if max_tokens <= 0:
+        tokens = self._fill_tokens(live_tokens, messages, role)
+        if not tokens:
             return None
-        tokens = live_tokens
-        if tokens is None:
-            tokens = last_context_tokens(messages)
-        if not tokens or tokens * 100 < _HARD_LIMIT_PCT * max_tokens:
+        max_tokens = self.resolved_config(role).max_context_tokens
+        if tokens * 100 < _HARD_LIMIT_PCT * max_tokens:
             return None
         return tokens
 
@@ -1144,6 +1196,12 @@ class PipelineCompactionLayer(CoreState):
         still-needed summarizer works on the already lightened history.
         """
         self._maybe_evict_marked(task)
+        # Background compaction (project setting `background_compaction`):
+        # land a ready summary, clean a stale mark, maybe start a new
+        # preparatory summarization — all at this turn boundary, BEFORE
+        # the threshold gate measures the fill (a landing drops the fill
+        # massively; the gate then sees the post-stitch transcript).
+        self._background_compaction_tick(task)
         tokens = self._compaction_due(task)
         if tokens is not None and (
             task.marked_unneeded or self._auto_eviction_ids(task)
@@ -1159,6 +1217,18 @@ class PipelineCompactionLayer(CoreState):
         # over-threshold one breaks the streak (a single under-threshold
         # observation proves nothing — see _threshold_observation).
         self._threshold_observation(task, tokens, self._threshold_compactions)
+        if tokens is not None and (
+            task.id in self._background_compactions and not hard
+        ):
+            # A background summary is maturing (or is ready to land at the
+            # next stitch point): the ordinary THRESHOLD compaction is
+            # suppressed — it would burn the very summarizer call the
+            # background one is already paying for. The HARD-LIMIT level
+            # deliberately stays active: it is the crash-guard (the fill
+            # is at the deterministic overflow line), not an ordinary
+            # compaction — a background summary may not ripen before the
+            # window is gone.
+            return
         if tokens is None:
             return
         if not hard:
@@ -1199,6 +1269,16 @@ class PipelineCompactionLayer(CoreState):
         self._show_event(
             task,
             f"Context fill {pct}% — pausing the agent and compacting history…",
+        )
+        # The threshold/hard-limit compaction rewrites the whole history:
+        # whatever a background summarizer was building off the old anchor
+        # is stale the moment it lands — discard it (cancel the worker,
+        # drop the held mark) before the replacement is written.
+        self._invalidate_background_compaction(
+            task,
+            "an ordinary compaction took over"
+            if not hard
+            else "the fill reached the hard limit",
         )
         old_messages = task.messages
         try:
@@ -1267,6 +1347,286 @@ class PipelineCompactionLayer(CoreState):
         self._live_ctx_tokens.pop(task.id, None)
         self._evicted_ctx_tokens.pop(task.id, None)
         self._show_event(task, event)
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+
+    # -- background compaction (the OpenCode v2 pattern) ----------------------
+
+    def _background_compaction_tick(self, task: Task) -> None:
+        """The background-compaction bookkeeping of one turn boundary:
+        land a ready summary, clean a stale held mark, maybe start a new
+        preparatory summarization. Called from `_maybe_compact` BEFORE the
+        threshold gate measures the fill — a landing rewrites the
+        transcript, and the gate must see the post-stitch state."""
+        self._stitch_ready_background(task)
+        self._cleanup_stale_mark(task)
+        self._maybe_start_background_compaction(task)
+
+    def _maybe_start_background_compaction(self, task: Task) -> None:
+        """Start a background summarization of the dev transcript when
+        EVERY condition holds: the setting is on, the resolved COMPACTION
+        model differs from the model serving this task (same model = the
+        summarizer call would contend with the run itself for nothing —
+        the feature stays off, announced once per task), no attempt is in
+        flight or latched failed, the fill is inside the trigger band
+        (above the trigger point, below the threshold — the threshold is
+        the regular gate's territory) and there is something to summarize.
+
+        The launch parks a held-summary mark in the transcript (fixing the
+        point up to which the history is handed to the summarizer) and
+        spawns the summarizer as a plain asyncio task — it occupies NO
+        development slot, touches neither `_agent_runs` nor the run
+        generations, and its model request goes through the provider's
+        throttling pool like every other call."""
+        if not self.settings.background_compaction:
+            return
+        if task.id in self._background_compactions:
+            return
+        role = self._task_role(task)
+        serve_key = self.resolved_model_key(role)
+        comp_key = self.resolved_model_key(AgentRole.COMPACTION)
+        if not serve_key or not comp_key:
+            return
+        if comp_key == serve_key:
+            self._show_event_once(
+                task,
+                "Background compaction is on but inactive: the compaction "
+                "model equals this task's model — the ordinary threshold "
+                "compaction stays in charge.",
+            )
+            return
+        if task.id in self._background_compaction_failed:
+            return
+        config = self.resolved_config(role)
+        window = config.max_context_tokens
+        if window <= 0:
+            return
+        threshold_pct = min(max(config.compaction_threshold, 1), 100)
+        tokens = self._apply_eviction_credit(
+            task.id,
+            self._fill_tokens(self._live_ctx_tokens.get(task.id), task.messages, role),
+        )
+        if not tokens:
+            return
+        threshold_tokens = window * threshold_pct // 100
+        trigger_tokens = (
+            window * max(threshold_pct - _BACKGROUND_TRIGGER_MARGIN_PCT, 1) // 100
+        )
+        if tokens >= threshold_tokens:
+            # The threshold gate's territory this turn.
+            return
+        if tokens < trigger_tokens:
+            # Below the trigger band: a past failure latch re-arms here —
+            # the fill demonstrably dropped (a compaction or a landing
+            # happened), so a later band entry may try again.
+            self._background_compaction_failed.discard(task.id)
+            return
+        _, rest = split_original_prompts(task.messages)
+        if not any(not is_summary_message(m) for m in rest):
+            return
+        if find_background_mark(task.messages) is not None:
+            return
+        mark_text = background_compaction_mark()
+        task.messages = task.messages + serialize_messages(
+            [ModelRequest(parts=[UserPromptPart(content=mark_text)])]
+        )
+        # The summarizer works on everything up to the mark (the mark part
+        # itself is machinery and never rendered into the summary prompt).
+        # The list holds the live message dicts; a mid-flight eviction
+        # collapsing their contents only lightens what the summarizer
+        # renders — never corrupts it.
+        prefix = task.messages[:-1]
+        state = BackgroundCompaction()
+        self._background_compactions[task.id] = state
+        job = asyncio.create_task(
+            self._run_background_compaction(task.id, role, prefix, state),
+            name=f"background-compaction-{task.id}",
+        )
+        state.handle = job
+        # Strong reference: a bare create_task result can be
+        # garbage-collected mid-flight.
+        self._background_compaction_jobs.add(job)
+        job.add_done_callback(self._background_compaction_jobs.discard)
+        task.touch()
+        self.manager.storage.save(task)
+        pct = round(tokens * 100 / window)
+        self._show_event(
+            task,
+            f"Context fill {pct}% — preparing a background summary; the run continues.",
+        )
+
+    async def _run_background_compaction(
+        self,
+        task_id: str,
+        role: AgentRole,
+        prefix: list[dict[str, Any]],
+        state: BackgroundCompaction,
+    ) -> None:
+        """The background summarizer worker: one `_summarize_history` call
+        (single-shot or map-reduce — the same funnel the blocking gate
+        uses, usage recorded under the COMPACTION role, throttled by the
+        provider pool) over the history up to the held mark.
+
+        Failure is never fatal: the held mark is dropped, the attempt is
+        latched until the fill drops back under the trigger point, and the
+        ordinary threshold compaction stays in charge. Success with a LIVE
+        run only records readiness — the stitch waits for the next turn
+        boundary; without a live run the stitch lands immediately."""
+        try:
+            task = self.manager.get(task_id)
+        except KeyError:
+            self._background_compactions.pop(task_id, None)
+            return
+        try:
+            summary = await self._summarize_history(
+                task,
+                prefix,
+                checklist=(
+                    render_todos(task.todos)
+                    if task.kind is TaskKind.FEATURE and task.todos
+                    else None
+                ),
+            )
+        except asyncio.CancelledError:
+            # Invalidated (model switch / a real compaction took over) or
+            # app shutdown: the invalidation path popped the state and
+            # dropped the mark already — never re-add anything here.
+            if self._background_compactions.get(task_id) is state:
+                self._background_compactions.pop(task_id, None)
+            raise
+        except Exception as e:  # noqa: BLE001 - a background failure degrades
+            if self._background_compactions.get(task_id) is state:
+                self._background_compactions.pop(task_id, None)
+                self._background_compaction_failed.add(task_id)
+                try:
+                    failed = self.manager.get(task_id)
+                except KeyError:
+                    failed = None
+                if failed is not None:
+                    self._discard_held_mark(
+                        failed,
+                        f"Background summarization failed "
+                        f"({type(e).__name__}: {e}) — the held mark was "
+                        "dropped; the ordinary compaction stays in charge.",
+                    )
+            return
+        if self._background_compactions.get(task_id) is not state:
+            # Invalidated while the call was in flight: the summary is
+            # stale (its anchor moved) — discard silently, the
+            # invalidation already announced itself.
+            return
+        if task_id in self._agent_runs:
+            state.ready = summary
+            self._show_event(
+                task,
+                "Background summary ready — it replaces the older history "
+                "at the next turn boundary.",
+            )
+            return
+        self._background_compactions.pop(task_id, None)
+        self._apply_background_summary(task, summary)
+
+    def _stitch_ready_background(self, task: Task) -> None:
+        """Land a READY background summary — called at the turn boundary,
+        the only point where rewriting the dev transcript cannot interleave
+        with a live run's own persist syncs."""
+        state = self._background_compactions.get(task.id)
+        if state is None or state.ready is None:
+            return
+        self._background_compactions.pop(task.id, None)
+        self._apply_background_summary(task, state.ready)
+
+    def _finish_background_compaction(self, task: Task) -> None:
+        """Land a READY background summary when a run ends without another
+        turn boundary (the run loop breaks before the gate ticks again).
+        An IN-FLIGHT one is left alone: the worker stitches on completion —
+        the transcript is stable once the run is over."""
+        state = self._background_compactions.get(task.id)
+        if state is None or state.ready is None or task.id in self._agent_runs:
+            return
+        self._background_compactions.pop(task.id, None)
+        self._apply_background_summary(task, state.ready)
+
+    def _apply_background_summary(self, task: Task, summary: str) -> bool:
+        """The stitch: [original prompts verbatim + summary] + EVERYTHING
+        after the held mark becomes the new transcript — the same shape a
+        blocking compaction produces (anchored previous-summary chain,
+        original prompts preserved inside the summary), with the newer
+        messages kept verbatim behind it. The call/return pairs are never
+        separated (the cut is a turn boundary by construction) and
+        `sanitized_messages` keeps the concatenation API-valid. Returns
+        False when the mark is no longer in the transcript (defensive —
+        invalidation pops the held state first)."""
+        split = split_at_background_mark(task.messages)
+        if split is None:
+            return False
+        before, after = split
+        old_messages = task.messages
+        new_messages = sanitized_messages(compacted_messages(before, summary) + after)
+        self._archive_transcript_replacement(
+            task,
+            old_messages,
+            new_messages,
+            hard=False,
+            mechanical=False,
+            level="background",
+        )
+        task.messages = new_messages
+        task.touch()
+        self.manager.storage.save(task)
+        # The live token reading belongs to the pre-stitch transcript; drop
+        # it (and the eviction credit with it) exactly like a full
+        # compaction does, until the next model request reports real usage.
+        self._live_ctx_tokens.pop(task.id, None)
+        self._evicted_ctx_tokens.pop(task.id, None)
+        self._show_event(
+            task,
+            "Background summary landed: the history up to the held mark "
+            f"was replaced (≈{self._messages_estimate(old_messages)} → "
+            f"≈{self._messages_estimate(new_messages)} tokens); the newer "
+            "messages are kept verbatim.",
+        )
+        if self.viewed_id == task.id:
+            self.view_task(task.id)
+        return True
+
+    def _invalidate_background_compaction(self, task: Task, reason: str) -> None:
+        """Discard the held background summary: the anchor it was built on
+        moved (an ordinary compaction, the hard-limit guard, a model
+        switch, a pre-run compaction) — a maturing summary is stale the
+        moment that happens, and so is a ready-but-unlanded one. Cancels
+        the worker, drops the held mark, announces once."""
+        state = self._background_compactions.pop(task.id, None)
+        if state is None:
+            return
+        if state.handle is not None and not state.handle.done():
+            state.handle.cancel()
+        self._discard_held_mark(task, f"Background summary discarded: {reason}.")
+
+    def _cleanup_stale_mark(self, task: Task) -> None:
+        """A held-summary mark with no background job behind it (drcode was
+        restarted, or the worker died without a failure path): held state
+        is session-only by design — drop the mark and say so once."""
+        if self._background_compactions.get(task.id) is not None:
+            return
+        if find_background_mark(task.messages) is None:
+            return
+        self._discard_held_mark(
+            task,
+            "A held background summary was lost (restart or cancelled "
+            "worker) — its mark was dropped; the ordinary compaction "
+            "stays in charge.",
+        )
+
+    def _discard_held_mark(self, task: Task, reason: str) -> None:
+        """Mechanically remove the held-summary mark from the transcript
+        and announce `reason` (the state pop is the caller's job)."""
+        if find_background_mark(task.messages) is None:
+            return
+        task.messages = drop_background_marks(task.messages)
+        task.touch()
+        self.manager.storage.save(task)
+        self._show_event(task, reason)
         if self.viewed_id == task.id:
             self.view_task(task.id)
 
@@ -1362,6 +1722,12 @@ class PipelineCompactionLayer(CoreState):
             # Only the original prompt(s) plus a previous summary are
             # left — compacting again would be a no-op.
             return False
+        # The pre-run compaction rewrites the history: whatever a
+        # background summarizer was building off the old anchor goes stale
+        # with it — discard before the replacement is written.
+        self._invalidate_background_compaction(
+            task, "the transcript is compacted before the run"
+        )
         self._maybe_evict_marked(task, force=True)
         tokens = self._pre_run_fill_tokens(task)
         if not tokens or tokens <= threshold:
@@ -1469,6 +1835,13 @@ class PipelineCompactionLayer(CoreState):
             task.last_model_key = new_key
             self.manager.storage.save(task)
             return
+        # A held background summary is built on the OLD model's anchor
+        # chain: the switch (and the takeover housekeeping below) invalidates
+        # it — a maturing or ready-but-unlanded summary is discarded with
+        # its mark.
+        self._invalidate_background_compaction(
+            task, f"the model switched ({old_key} → {new_key})"
+        )
         cleaned, removed = strip_thinking_parts(task.messages)
         if removed:
             task.messages = cleaned
@@ -1530,6 +1903,7 @@ class PipelineCompactionLayer(CoreState):
         *,
         hard: bool,
         mechanical: bool,
+        level: str | None = None,
     ) -> None:
         """Forensic archive of ONE main-transcript compaction: the full
         pre-compaction transcript is appended as a JSON line to the task's
@@ -1551,7 +1925,7 @@ class PipelineCompactionLayer(CoreState):
             return
         record = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "level": "hard" if hard else "threshold",
+            "level": level or ("hard" if hard else "threshold"),
             "compaction": "mechanical" if mechanical else "llm",
             "role": self._task_role(task).value,
             "messages": old_messages,

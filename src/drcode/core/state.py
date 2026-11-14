@@ -31,7 +31,7 @@ import asyncio
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.usage import RunUsage
@@ -63,6 +63,9 @@ from ..workflow import WorkflowHooks
 from .host import PipelineHost
 from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
+
+if TYPE_CHECKING:
+    from .pipeline_compaction import BackgroundCompaction
 
 
 class CoreState:
@@ -476,6 +479,10 @@ class CoreState:
         self, task: Task, role: AgentRole
     ) -> None: ...
 
+    def _cleanup_stale_mark(self, task: Task) -> None: ...
+
+    def _finish_background_compaction(self, task: Task) -> None: ...
+
     async def _maybe_compact_tester_round(
         self, task: Task, live_tokens: int | None, *, force: bool = False
     ) -> bool: ...
@@ -851,6 +858,18 @@ class CoreState:
     # counters (consecutive under-threshold gate observations; see
     # _threshold_observation).
     _threshold_under_obs: dict[str, int]
+    # Background compaction (the OpenCode v2 pattern, project setting
+    # `background_compaction`): per-task held state of the summary that is
+    # being prepared IN PARALLEL with a live run. Session-only by design —
+    # a restart discards a matured-but-unlanded summary (the mark left in
+    # the transcript is cleaned up at the next gate tick with a service
+    # event). `_background_compaction_failed` latches a failed attempt per
+    # task until the fill drops back under the trigger point, so a broken
+    # summarizer cannot loop background attempts at every turn boundary;
+    # the ordinary threshold compaction stays in charge meanwhile.
+    _background_compactions: dict[str, BackgroundCompaction]
+    _background_compaction_jobs: set[asyncio.Task[None]]
+    _background_compaction_failed: set[str]
     _chat_epoch: int
 
     # -- chat batch drain ---------------------------------------------------

@@ -32,6 +32,7 @@ from textual.widgets import (
 )
 
 from ..config import Config
+from ..core.pipeline_compaction import BackgroundCompaction
 from ..core.usage import SessionTokenUsage
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
@@ -909,6 +910,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # _threshold_observation). One dict for all three layers: a task
         # runs at most one of them at a time.
         self._threshold_under_obs: dict[str, int] = {}
+        # Background compaction (project setting `background_compaction`,
+        # the OpenCode v2 pattern): held state per task — session-only by
+        # design (a restart discards a matured-but-unlanded summary), a
+        # strong-ref set for the in-flight summarizer tasks (a bare
+        # create_task result can be garbage-collected mid-flight) and the
+        # failure latch (a failed attempt is not retried until the fill
+        # drops back under the trigger point).
+        self._background_compactions: dict[str, BackgroundCompaction] = {}
+        self._background_compaction_jobs: set[asyncio.Task[None]] = set()
+        self._background_compaction_failed: set[str] = set()
         # Bumped by every view_task(): the streaming loop compares it with
         # each block's stream_epoch to detect that a mid-node re-render
         # orphaned the live blocks and they must be re-mounted.

@@ -22,6 +22,7 @@ from . import agent_model
 from .config import Config
 from .prompts import load_compaction_prompts
 from .transcript import (
+    BACKGROUND_COMPACTION_MARK_PREFIX,
     COMPACTION_RESUME_PREFIX,
     COMPACTION_SUMMARY_PREFIX,
     MODEL_SWITCH_NOTE_PREFIX,
@@ -125,15 +126,22 @@ def _is_summary_part(part: dict[str, Any]) -> bool:
 def _is_resume_part(part: dict[str, Any]) -> bool:
     """Compaction-continuation note (a round resumed after a successful
     compaction was nudged with this instruction, see
-    drcode.core.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT) or a
+    drcode.core.pipeline_tester.TESTER_COMPACTION_RESUME_PROMPT), a
     model-switch note (the takeover briefing appended when the next run
     starts on a different model, see
-    drcode.core.pipeline_compaction._prepare_model_switch_transcript).
-    Both are pipeline machinery: never preserved verbatim across
+    drcode.core.pipeline_compaction._prepare_model_switch_transcript) or
+    a background-compaction mark (the held-summary boundary a live
+    background summarizer parked in the transcript, see
+    drcode.core.pipeline_compaction._maybe_start_background_compaction).
+    All are pipeline machinery: never preserved verbatim across
     compactions, never counted as user prompts."""
     content = part.get("content")
     return isinstance(content, str) and content.startswith(
-        (COMPACTION_RESUME_PREFIX, MODEL_SWITCH_NOTE_PREFIX)
+        (
+            COMPACTION_RESUME_PREFIX,
+            MODEL_SWITCH_NOTE_PREFIX,
+            BACKGROUND_COMPACTION_MARK_PREFIX,
+        )
     )
 
 
@@ -225,6 +233,116 @@ def extract_previous_summary(messages: list[dict[str, Any]]) -> str | None:
     return found
 
 
+def background_compaction_mark() -> str:
+    """Text of the held-summary boundary mark a live background compaction
+    parks in the transcript (see
+    drcode.core.pipeline_compaction._maybe_start_background_compaction).
+
+    Pure bookkeeping for the machinery — but it rides in a user-prompt
+    part, so the serving agent sees it too until the stitch lands: the
+    body says explicitly that it is not an instruction, so a model that
+    reads it keeps working instead of reacting to it."""
+    return (
+        f"{BACKGROUND_COMPACTION_MARK_PREFIX} The context summary of the "
+        "history above is being prepared in the background and will "
+        "replace the older history when it arrives; this line is "
+        "bookkeeping, not an instruction — keep working as usual."
+    )
+
+
+def _is_mark_part(part: dict[str, Any]) -> bool:
+    content = part.get("content")
+    return isinstance(content, str) and content.startswith(
+        BACKGROUND_COMPACTION_MARK_PREFIX
+    )
+
+
+def find_background_mark(messages: list[dict[str, Any]]) -> int | None:
+    """Index of the serialized message carrying the background-compaction
+    mark part (None when no held-summary mark is parked). pydantic-ai
+    merges adjacent requests on resume, so the mark may share a message
+    with later prompt parts — any mark part makes the message the mark
+    carrier."""
+    for i, msg in enumerate(messages):
+        if not _is_request(msg):
+            continue
+        if any(_is_mark_part(p) for p in _user_prompt_parts(msg)):
+            return i
+    return None
+
+
+def _without_mark_parts(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy of a serialized request with its background-compaction mark
+    parts dropped; None when nothing but the mark remains."""
+    parts = [
+        p
+        for p in msg.get("parts", [])
+        if not (
+            isinstance(p, dict)
+            and p.get("part_kind") == "user-prompt"
+            and _is_mark_part(p)
+        )
+    ]
+    if len(parts) == len(msg.get("parts", [])):
+        return msg
+    return {**msg, "parts": parts} if parts else None
+
+
+def split_at_background_mark(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Split the transcript at the held-summary mark into
+    (summarized prefix, re-glued suffix); None when no mark is parked.
+
+    The summary was built from everything up to the mark, so the stitched
+    transcript is (compacted prefix) + (everything after it) — the mark
+    itself never survives. pydantic-ai merges adjacent requests on resume,
+    so the mark can share a message with the next turn's prompt: the
+    stripped copy then closes the prefix AND opens the suffix (the prompt
+    text stays verbatim in the suffix, and is also inside the summarized
+    prefix — exactly how regular compaction treats the original prompts).
+    The cut is a turn boundary by construction (the mark is appended only
+    between turns), so the suffix always starts with a request and
+    `sanitized_messages` on the concatenation keeps it API-valid."""
+    idx = find_background_mark(messages)
+    if idx is None:
+        return None
+    stripped = _without_mark_parts(messages[idx])
+    before = list(messages[:idx])
+    after = list(messages[idx + 1 :])
+    if stripped is not None:
+        before.append(stripped)
+        after.insert(0, stripped)
+    return before, after
+
+
+def drop_background_marks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove every background-compaction mark from a transcript (a new
+    list; requests left without parts are dropped — an empty ModelRequest
+    is not API-valid). Used when held state is discarded: a stale mark
+    must never outlive the background job it belonged to."""
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        parts = msg.get("parts") if isinstance(msg, dict) else None
+        if not isinstance(parts, list):
+            cleaned.append(msg)
+            continue
+        kept = [
+            p
+            for p in parts
+            if not (
+                isinstance(p, dict)
+                and p.get("part_kind") == "user-prompt"
+                and _is_mark_part(p)
+            )
+        ]
+        if len(kept) == len(parts):
+            cleaned.append(msg)
+        elif kept:
+            cleaned.append({**msg, "parts": kept})
+    return cleaned
+
+
 def tester_verdict_issued(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Facts about a set_verification verdict already issued inside a tester
     round transcript (None while the round has not called the tool yet).
@@ -292,6 +410,7 @@ def render_history_blocks(messages: list[dict[str, Any]]) -> list[tuple[str, str
                     isinstance(content, str)
                     and content
                     and not content.startswith(COMPACTION_SUMMARY_PREFIX)
+                    and not content.startswith(BACKGROUND_COMPACTION_MARK_PREFIX)
                 ):
                     blocks.append(("user", f"[user]\n{content}"))
             elif kind == "tool-return":

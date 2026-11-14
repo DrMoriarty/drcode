@@ -114,6 +114,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.eviction_hint = src.eviction_hint
     dst.todo_tail = src.todo_tail
     dst.compaction_resume_min_tokens = src.compaction_resume_min_tokens
+    dst.background_compaction = src.background_compaction
     dst.worktree_removal = src.worktree_removal
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
@@ -478,6 +479,18 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     value=str(d.compaction_resume_min_tokens),
                     id="ts-compaction-resume",
                     placeholder="0 = off (minimum 20000)",
+                )
+                yield Label(
+                    "Background compaction — prepare the context summary "
+                    "before the compaction threshold is crossed, without "
+                    "pausing the run (needs a compaction model different "
+                    "from the agent's model; held summaries are lost on "
+                    "restart)",
+                    classes="ts-label",
+                )
+                yield Switch(
+                    value=d.background_compaction,
+                    id="ts-background-compaction",
                 )
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
@@ -952,6 +965,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     def _todo_tail_changed(self, event: Switch.Changed) -> None:
         if event.value != self._draft.todo_tail:
             self._draft.todo_tail = event.value
+            self._refresh()
+
+    @on(Switch.Changed, "#ts-background-compaction")
+    def _background_compaction_changed(self, event: Switch.Changed) -> None:
+        if event.value != self._draft.background_compaction:
+            self._draft.background_compaction = event.value
             self._refresh()
 
     @on(Input.Changed, "#ts-compaction-resume")

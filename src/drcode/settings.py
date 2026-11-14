@@ -770,6 +770,22 @@ class ProjectSettings(BaseModel):
     # output budget) — a uniform split makes every map call predictable.
     # Read per summarizer call, so a toggle applies to the next compaction.
     compaction_split_giant_prompt: bool = False
+    # Background compaction (the OpenCode v2 `experimental.background_compaction`
+    # pattern, docs/context-compaction-survey.md §2.1): when ON, a context
+    # summary is prepared IN ADVANCE — while the agent keeps working — once
+    # the dev transcript's fill reaches a trigger point below the compaction
+    # threshold, and lands at the next turn boundary instead of pausing the
+    # run. Two hard conditions: it applies to the DEV transcript only, and it
+    # activates only when the resolved COMPACTION model DIFFERS from the
+    # serving agent's model (same model = the summarizer call would contend
+    # with the run for the same context budget and provider slots for
+    # nothing) — when they coincide the feature stays off and the ordinary
+    # threshold compaction is used (a service event says so once per task).
+    # Held state is session-only: a restart discards a matured-but-unlanded
+    # summary, a model switch or an ordinary compaction while one is maturing
+    # invalidates it (the anchor moved). The HARD-LIMIT gate stays active
+    # regardless — it is the crash-guard, not an ordinary compaction.
+    background_compaction: bool = False
 
     @field_validator("role_max_tokens", mode="before")
     @classmethod
@@ -919,6 +935,27 @@ def task_settings_hints(
                     "no git repository, so tasks keep running in the shared "
                     "project directory. Init git (git init) or set isolation "
                     "to off."
+                ),
+            )
+        )
+
+    # -- background compaction needs a DIFFERENT compaction model -------------
+    # The model-equality condition itself is checked live by the pipeline
+    # gate (per task role, against the resolved configs — a static hint
+    # cannot see them); here only the requirement itself is spelled out,
+    # so a user who turns the flag on without a dedicated summarizer
+    # model knows why nothing changes.
+    if draft.background_compaction:
+        hints.append(
+            SettingsHint(
+                severity="info",
+                text=(
+                    "Background compaction activates only when the "
+                    "compaction (summarizer) model differs from the "
+                    "serving agent's model — pick a different model for "
+                    "the compaction role in Settings → Provider catalog; "
+                    "with the same model the ordinary threshold "
+                    "compaction is used."
                 ),
             )
         )

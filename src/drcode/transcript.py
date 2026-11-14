@@ -51,6 +51,15 @@ COMPACTION_RESUME_PREFIX = "[compaction note]"
 # extraction.
 MODEL_SWITCH_NOTE_PREFIX = "[model switch note]"
 
+# Marker prefix of the synthetic user message a LIVE background compaction
+# parks in the transcript (see core/pipeline_compaction): it fixes the point
+# up to which the history has been handed to the background summarizer —
+# everything AFTER the mark stays out of the summary and is re-glued behind
+# it when the summary arrives. Like COMPACTION_RESUME_PREFIX it is
+# compaction machinery: never preserved verbatim across compactions, never
+# a user prompt for any user-side extraction, never rendered as one.
+BACKGROUND_COMPACTION_MARK_PREFIX = "[background compaction mark]"
+
 # Conventional token-size assumption of the chars/4 estimate: ~4 characters
 # per token. Used by `estimate_tokens` here and re-exported by
 # `context_layout` (which labels every figure built from it with "≈").
@@ -411,6 +420,7 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
                             COMPACTION_SUMMARY_PREFIX,
                             COMPACTION_RESUME_PREFIX,
                             MODEL_SWITCH_NOTE_PREFIX,
+                            BACKGROUND_COMPACTION_MARK_PREFIX,
                         )
                     ):
                         continue
@@ -523,6 +533,12 @@ def extract_display(
                             # body itself is long model-facing prose — the
                             # chat shows only the fact, with no text.
                             out.append((part_at, "note", ""))
+                        elif content.startswith(BACKGROUND_COMPACTION_MARK_PREFIX):
+                            # Held-summary bookkeeping line of a live
+                            # background compaction (compaction machinery):
+                            # pure bookkeeping, never a user message — the
+                            # chat shows only the fact.
+                            out.append((part_at, "note", ""))
                         else:
                             out.append((part_at, "user", content))
             continue
@@ -605,7 +621,9 @@ def user_prompt_texts(messages: list[dict[str, Any]]) -> list[str]:
                 continue
             content = part.get("content")
             if isinstance(content, str):
-                if content.startswith(MODEL_SWITCH_NOTE_PREFIX):
+                if content.startswith(
+                    (MODEL_SWITCH_NOTE_PREFIX, BACKGROUND_COMPACTION_MARK_PREFIX)
+                ):
                     continue
                 texts.append(content)
             elif isinstance(content, list):

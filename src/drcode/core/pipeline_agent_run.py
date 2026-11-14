@@ -269,6 +269,12 @@ class PipelineAgentRunLayer(CoreState):
             # and the ordinary threshold gate below keeps working as
             # before. Never fatal: the helper swallows its own failures.
             await self._maybe_compact_after_idle(task)
+            # A held-summary mark with no background job behind it (the
+            # held state is session-only — a restart discards it): clean
+            # it BEFORE the turn loop, or the stale mark would end the
+            # transcript as an open request and a resumed attempt would
+            # burn a spurious continuation turn on it.
+            self._cleanup_stale_mark(task)
             # Chronological message flow: the transcript is the single
             # chronological record — the original prompt lives in it exactly
             # once and is NEVER re-queued/re-sent. Each activation first
@@ -898,8 +904,13 @@ class PipelineAgentRunLayer(CoreState):
         # _threshold_observation). Over it: the streak breaks.
         self._threshold_observation(task, tokens, self._threshold_compactions)
         hard_due = tokens is not None and self._hard_limit_due(task)
+        # A background summary maturing (or ready to land at the next turn
+        # boundary) suppresses the THRESHOLD-level pause exactly like it
+        # suppresses the turn-boundary gate; the HARD-LIMIT level stays
+        # active — it is the crash-guard, not an ordinary compaction.
+        bg_held = task.id in self._background_compactions
         if tokens is not None and (
-            task.id not in self._compaction_failed
+            (not bg_held and task.id not in self._compaction_failed)
             or (hard_due and task.id not in self._hard_limit_exhausted)
         ):
             pct = round(tokens * 100 / self.resolved_config(role).max_context_tokens)
@@ -1179,6 +1190,11 @@ class PipelineAgentRunLayer(CoreState):
         re-queued, a finished task is auto-completed (research tasks with
         their own finalization), a queue-demoted task keeps the pipeline
         going with the next one."""
+        # A background summary that ripened while the last turn ran: this
+        # is the last stitch point the run offers (the loop breaks before
+        # the gate ticks again). An in-flight one is left alone — the
+        # worker stitches on completion, the transcript is stable now.
+        self._finish_background_compaction(task)
         if task.status is TaskStatus.AWAITING_CLARIFICATION:
             # The user may have answered while the run was still finishing
             # (the answer sits in pending_input and send()'s clarification

@@ -92,13 +92,19 @@ def test_delegate_tool_absent_at_zero(fake_config: Config) -> None:
 
 def test_delegate_tool_registered_with_baked_limit(fake_config: Config) -> None:
     """Above 0 the tool exists and its description carries the ACTUAL
-    limit (rebuilt per run, so the model always sees the real budget)."""
+    limit (rebuilt per run, so the model always sees the real budget).
+    The limit is the run's TOTAL call budget (each call spends one slot
+    for good), not a pure concurrency cap."""
     ag = build_agent(fake_config, kind=TaskKind.FEATURE, subagent_limit=3)
     assert "delegate_research" in _tool_names(ag)
-    assert "up to 3 subagents" in _description(ag, "delegate_research")
+    assert "3 delegate_research calls for this run" in _description(
+        ag, "delegate_research"
+    )
     # Singular spelling at 1 — the number must never lie.
     ag1 = build_agent(fake_config, kind=TaskKind.RESEARCH, subagent_limit=1)
-    assert "up to 1 subagent" in _description(ag1, "delegate_research")
+    assert "1 delegate_research call for this run" in _description(
+        ag1, "delegate_research"
+    )
 
 
 def test_delegate_description_carries_triggers_and_economics(
@@ -188,6 +194,109 @@ def test_delegation_note_rides_the_same_tail_as_the_checklist(
     tail = _tail_text(written)
     assert "CHECKLIST-BLOCK" in tail
     assert "You have 1 read-only subagent available" in tail
+
+
+def test_notice_is_state_aware() -> None:
+    """The notice counts the REMAINING slots down with the spent ones and
+    switches to the short "used up" text once the budget is gone — the
+    constant reminder kept being re-discussed on every remaining request
+    of a 78-message run (a7be0f94: both calls spent by message 4, the
+    reminder re-acknowledged 50+ times, partly in visible output)."""
+    from drcode.agent import subagent_notice
+
+    fresh = subagent_notice(2, 0, role=AgentRole.CODING)
+    assert fresh is not None
+    assert "You have 2 read-only subagents available via delegate_research" in fresh
+    after_one = subagent_notice(2, 1, role=AgentRole.CODING)
+    assert after_one is not None
+    assert "You have 1 read-only subagent available via delegate_research" in after_one
+    exhausted = subagent_notice(2, 2, role=AgentRole.CODING)
+    assert exhausted is not None
+    assert "delegate_research slots of this run are used" in exhausted
+    assert "further delegation is unavailable" in exhausted
+    assert "You have" not in exhausted
+    # Singular budget wording.
+    solo = subagent_notice(1, 1, role=AgentRole.CODING)
+    assert solo is not None
+    assert "The delegate_research slot of this run is used" in solo
+    assert "further delegation is unavailable" in solo
+    # The feature being OFF stays None — no "used up" note for a run that
+    # never had slots.
+    assert subagent_notice(0, 0, role=AgentRole.CODING) is None
+    assert subagent_notice(0, 5, role=AgentRole.CODING) is None
+    # The exhausted note stays short for the same reason as the fresh one.
+    assert len(exhausted) < 320
+
+
+def test_gate_notice_supplier_reflects_the_gate(fake_config: Config) -> None:
+    """With the pipeline's gate wired, the tail block is recomputed per
+    request: it names the remaining slots and, once the gate is spent,
+    switches to the "used up" text. At most ONE text change per run —
+    only that one small tail invalidation is ever paid."""
+    from drcode.agent_model import TailInjectionModel
+
+    gate = SubagentGate(2)
+    ag = build_agent(
+        fake_config, kind=TaskKind.FEATURE, subagent_limit=2, subagent_gate=gate
+    )
+    assert isinstance(ag.model, TailInjectionModel)
+
+    def tail_text() -> str:
+        written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
+        return _tail_text(written)
+
+    assert "You have 2 read-only subagents available via delegate_research" in (
+        tail_text()
+    )
+    gate.used = 1
+    assert "You have 1 read-only subagent available via delegate_research" in (
+        tail_text()
+    )
+    gate.used = 2
+    tail = tail_text()
+    assert "further delegation is unavailable" in tail
+    assert "You have" not in tail
+
+
+def test_delegate_tool_refuses_when_budget_spent(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """The limit is the run's TOTAL budget: after every slot is spent the
+    tool refuses with the plain "Subagent limit reached" result — and no
+    further subagent model call happens."""
+    ran = {"count": 0}
+
+    def sub_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        ran["count"] += 1
+        return text_response("report")
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(sub_fn),
+    )
+    task = manager.create("T", "delegate me")
+    gate = SubagentGate(1)
+
+    def deps() -> AgentDeps:
+        return AgentDeps(
+            root=project_root,
+            manager=manager,
+            task_id=task.id,
+            scratch=project_root / "scratch",
+            subagent_gate=gate,
+        )
+
+    first = asyncio.run(run_delegate_tool(deps(), fake_config, "Investigate foo"))
+    assert "report" in first
+    second = asyncio.run(run_delegate_tool(deps(), fake_config, "Investigate bar"))
+    assert second.startswith("Subagent limit reached")
+    assert "1 of 1" in second
+    assert "Further delegation is unavailable" in second
+    assert ran["count"] == 1  # no subagent ran for the refused call
+    assert gate.used == 1 and gate.remaining == 0 and gate.active == 0
 
 
 def test_subagent_limit_follows_role() -> None:
@@ -706,9 +815,7 @@ def test_subagent_slot_resolves_own_model(project_root: Path) -> None:
     connection WITH the entry's token caps — the subagent run is measured
     against ITS model's window, not the parent's."""
     _seed_cheap_catalog()
-    config = _slot_config(
-        project_root, {"models": {"subagent": "cheap/mini"}}
-    )
+    config = _slot_config(project_root, {"models": {"subagent": "cheap/mini"}})
     own = _subagent_model_config(config)
     assert own.model == "mini"
     assert own.base_url == "http://cheap/v1"
@@ -728,9 +835,7 @@ def test_subagent_slot_resolves_own_model(project_root: Path) -> None:
     model = ag.model
     assert isinstance(model, Model)
     assert unwrap_model(model).model_name == "mini"
-    assert (
-        str(openai_client_of(model).base_url).rstrip("/") == "http://cheap/v1"
-    )
+    assert str(openai_client_of(model).base_url).rstrip("/") == "http://cheap/v1"
 
 
 def test_subagent_custom_slot_resolves_own_connection(project_root: Path) -> None:
@@ -772,9 +877,7 @@ def test_subagent_without_slot_inherits_parent_config(project_root: Path) -> Non
     assert _subagent_model_config(config) is config
     # A dangling reference (no matching provider in the user catalog).
     _seed_cheap_catalog()
-    dangling = _slot_config(
-        project_root, {"models": {"subagent": "nowhere/gone"}}
-    )
+    dangling = _slot_config(project_root, {"models": {"subagent": "nowhere/gone"}})
     own = _subagent_model_config(dangling)
     assert own.model == "big-model"
     assert own.base_url == "http://big/v1"
@@ -790,9 +893,7 @@ def test_subagent_env_override_beats_the_slot(
     included, which here means plain inheritance of the parent's (env)
     model."""
     _seed_cheap_catalog()
-    config = _slot_config(
-        project_root, {"models": {"subagent": "cheap/mini"}}
-    )
+    config = _slot_config(project_root, {"models": {"subagent": "cheap/mini"}})
     monkeypatch.setenv("DRCODE_MODEL", "env-model")
     monkeypatch.setenv("DRCODE_BASE_URL", "http://env/v1")
     own = _subagent_model_config(config)
@@ -808,19 +909,19 @@ def test_subagent_usage_key_own_and_inherited(project_root: Path) -> None:
     # Nothing slotted: the parent's key.
     plain = Config(project_root=project_root, model="big-model")
     assert resolve_model_key(plain, AgentRole.SUBAGENT) == ""
-    assert subagent_usage_key(
-        plain, AgentRole.CODING, "coding/big-model"
-    ) == (AgentRole.CODING, "coding/big-model")
+    assert subagent_usage_key(plain, AgentRole.CODING, "coding/big-model") == (
+        AgentRole.CODING,
+        "coding/big-model",
+    )
 
     # A catalog reference: the subagent's own key.
     _seed_cheap_catalog()
-    slotted = _slot_config(
-        project_root, {"models": {"subagent": "cheap/mini"}}
-    )
+    slotted = _slot_config(project_root, {"models": {"subagent": "cheap/mini"}})
     assert resolve_model_key(slotted, AgentRole.SUBAGENT) == "cheap/mini"
-    assert subagent_usage_key(
-        slotted, AgentRole.CODING, "coding/big-model"
-    ) == (AgentRole.SUBAGENT, "cheap/mini")
+    assert subagent_usage_key(slotted, AgentRole.CODING, "coding/big-model") == (
+        AgentRole.SUBAGENT,
+        "cheap/mini",
+    )
 
     # A custom model: bare id (no provider name in the key).
     custom = _slot_config(
@@ -835,9 +936,7 @@ def test_subagent_usage_key_own_and_inherited(project_root: Path) -> None:
     assert resolve_model_key(custom, AgentRole.SUBAGENT) == "free-m"
 
     # Dangling reference: back to the parent's key.
-    dangling = _slot_config(
-        project_root, {"models": {"subagent": "nowhere/gone"}}
-    )
+    dangling = _slot_config(project_root, {"models": {"subagent": "nowhere/gone"}})
     assert resolve_model_key(dangling, AgentRole.SUBAGENT) == ""
 
 
@@ -853,9 +952,7 @@ def test_delegation_records_usage_under_subagent_key(
     from drcode.providers import subagent_usage_key
 
     _seed_cheap_catalog()
-    config = _slot_config(
-        project_root, {"models": {"subagent": "cheap/mini"}}
-    )
+    config = _slot_config(project_root, {"models": {"subagent": "cheap/mini"}})
     monkeypatch.setattr(
         "drcode.subagents._build_subagent_model",
         lambda cfg, announce_wait=None: FunctionModel(
@@ -867,9 +964,7 @@ def test_delegation_records_usage_under_subagent_key(
 
     def capture(usage: object) -> None:
         # The pipeline's closure shape (pipeline_agent_run.py), replayed:
-        role, key = subagent_usage_key(
-            config, AgentRole.CODING, "coding/big-model"
-        )
+        role, key = subagent_usage_key(config, AgentRole.CODING, "coding/big-model")
         recorded.append((role, key))
 
     deps = AgentDeps(

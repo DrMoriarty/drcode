@@ -590,6 +590,13 @@ class PipelineAgentRunLayer(CoreState):
         # subagents_coder for coding); 0 = the tool is not registered at
         # all and the gate stays None.
         subagent_limit = subagent_limit_for(self.settings, role)
+        # The run's delegation budget, created BEFORE the agent build so
+        # the SAME object does both jobs: it enforces the total slot count
+        # in run_delegate_tool (deps carry it) and it makes the
+        # delegation tail notice state-aware (build_agent closes a
+        # supplier over it — the reminder names the remaining slots and
+        # switches to the "slots used" text once the budget is spent).
+        subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         # Managed web reading (project setting web_fetch_mode): RESEARCH
         # only — web_fetch_policy_for returns None for every other role, so
         # the tool is not registered there at all. Read at activation, so a
@@ -601,6 +608,10 @@ class PipelineAgentRunLayer(CoreState):
             root=root,
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit,
+            # The run's delegation gate (created above, BEFORE the build):
+            # makes the delegation tail notice state-aware and enforces
+            # the budget inside run_delegate_tool.
+            subagent_gate=subagent_gate,
             # The research agent's web_fetch tool (SSRF-guarded, capped,
             # framed as untrusted content): None when the mode is off.
             research_web_fetch=web_fetch_policy,
@@ -635,7 +646,6 @@ class PipelineAgentRunLayer(CoreState):
             # in the task's chat instead of looking like a hung run.
             announce_wait=self._wait_announcer(task_id, role),
         )
-        subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
         # One gate per activation: it carries the run's policy AND the
         # fetch budget, so a superseded run's gate dies with it (the same
         # reasoning as the subagent gate).

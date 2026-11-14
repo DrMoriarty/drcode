@@ -36,10 +36,14 @@ compactions). Spawns/finishes land in the task's service-event log
 for observability in the chat.
 
 The gate counter (`SubagentGate`) is per parent run (generation): the
-pipeline creates one per activation and hands it to the agent deps;
-exceeding the limit returns a plain explanatory tool result — never a
-crash of the parent run. A failing subagent (network, model refusal,
-usage cap) is likewise converted into a plain tool result.
+pipeline creates one per activation and hands it to the agent deps AND
+to the state-aware tail notice (`agent_tools.subagent_notice`, via
+`build_agent`). It carries the run's TOTAL slot budget: every spawn
+spends one slot for good (`used`/`remaining`), a spent budget refuses
+further delegations with a plain explanatory tool result — never a
+crash of the parent run — and the tail notice switches to the "slots
+used" text at the same moment. A failing subagent (network, model
+refusal, usage cap) is likewise converted into a plain tool result.
 
 PROMPTING is what makes the tool get called — the wiring alone does not.
 A whole 119-task drcode-bench run with the slots enabled fired ZERO
@@ -193,14 +197,29 @@ def git_read(root: Path, args: list[str]) -> str:
 
 @dataclass
 class SubagentGate:
-    """Per-parent-run counter of concurrently running subagents.
+    """Per-parent-run budget of delegate_research calls.
 
-    Plain int arithmetic on the event loop (tool bodies of one run all
-    execute on it) is race-free; the pipeline creates one gate per run
-    so a superseded run's gate dies with it."""
+    `limit` is the run's TOTAL slot count (the project's
+    subagents_coder/subagents_researcher setting): every spawn spends one
+    slot for good — `used` never decreases, `remaining` is what is left.
+    `active` tracks the currently running spawns (always a subset of the
+    spent slots, so the total budget subsumes the old concurrency-only
+    cap). Plain int arithmetic on the event loop (tool bodies of one run
+    all execute on it) is race-free; the pipeline creates one gate per
+    run so a superseded run's gate dies with it — and hands the SAME
+    object to the state-aware tail notice, so the reminder always names
+    the remaining slots and switches to the "slots used" text at the
+    moment the budget is spent."""
 
     limit: int
     active: int = 0
+    used: int = 0
+
+    @property
+    def remaining(self) -> int:
+        """Slots still available: full `limit` on a fresh run, 0 once
+        every slot has been spent."""
+        return max(0, self.limit - self.used)
 
 
 @dataclass
@@ -481,18 +500,33 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             "Delegation is not configured for this run (no subagent slots). "
             "Continue without it."
         )
+    if gate.remaining <= 0:
+        # The run's budget is spent: refuse in plain text (never crash)
+        # with the SAME "no further delegation" fact the state-aware tail
+        # notice now carries (`agent_tools.subagent_notice`) — the model
+        # must not hear two different stories about its budget.
+        slots = "slot" if gate.limit == 1 else "slots"
+        return (
+            f"Subagent limit reached ({gate.used} of {gate.limit} {slots} "
+            "used this run). Further delegation is unavailable — continue "
+            "with direct reads."
+        )
     if gate.active >= gate.limit:
+        # Defensive only: under the total budget this is unreachable
+        # (every running spawn has already spent its slot), kept for a
+        # mismatched manual wiring of the gate.
         return (
             f"Subagent limit reached ({gate.active} running of {gate.limit} "
             "allowed). Wait for a running subagent to finish or continue "
             "without delegation."
         )
     gate.active += 1
+    gate.used += 1
     label = _brief_label(brief)
     log_service_event(
         deps,
         "subagent",
-        f"subagent spawned ({gate.active}/{gate.limit}): {label}",
+        f"subagent spawned ({gate.used}/{gate.limit}): {label}",
     )
     # Inherited web-fetch permission: the subagent gets the managed
     # `web_fetch` tool ONLY when the parent run itself had it (the pipeline

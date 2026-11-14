@@ -3035,9 +3035,7 @@ async def test_project_model_dialog_form_and_apply(
             assert "__user_default__" in values
             assert "Custom…" in prompts
             reset_label = (
-                "Inherit parent role"
-                if role is AgentRole.SUBAGENT
-                else "User default"
+                "Inherit parent role" if role is AgentRole.SUBAGENT else "User default"
             )
             assert any(p.startswith(reset_label) for p in prompts)
             assert input_widget.placeholder == str(app.resolved_config(role).max_tokens)
@@ -3941,6 +3939,46 @@ async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None
         dialog = app.screen
         assert isinstance(dialog, TaskSettingsDialog)
         assert dialog.query_one("#ts-eviction-hint", Switch).value is True
+
+
+async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> None:
+    """The automatic-unloading switch edits a draft copy and persists on
+    Apply; the dialog's field copy includes it too."""
+    from textual.widgets import Button, Switch
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+
+        # Default off; toggling updates only the draft.
+        switch = dialog.query_one("#ts-auto-unload", Switch)
+        assert switch.value is False
+        assert app.settings.auto_context_unloading is False
+        switch.value = True
+        await pilot.pause()
+        assert app.settings.auto_context_unloading is False
+
+        # Apply persists the flag; reopening shows it on.
+        dialog.query_one("#ts-apply", Button).press()
+        await pilot.pause()
+        assert app.settings.auto_context_unloading is True
+        assert ProjectSettingsStore(app.project_root).load() is not None
+        assert (
+            ProjectSettingsStore(app.project_root).load().auto_context_unloading is True
+        )
+
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+        assert dialog.query_one("#ts-auto-unload", Switch).value is True
 
 
 async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:

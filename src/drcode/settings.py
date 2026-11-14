@@ -630,6 +630,22 @@ class ProjectSettings(BaseModel):
     # frozen texts, no big old tool returns); leaving it out keeps the
     # request framing minimal everywhere else.
     eviction_hint: bool = False
+    # Automatic context unloading (the auto half of drcode.eviction — the
+    # Claude Code recipe): when on, old tool results (past
+    # AUTO_EVICTION_MIN_AGE_TURNS model exchanges, minus the freshest
+    # AUTO_EVICTION_KEEP_RECENT) are collapsed to re-runnable stubs —
+    # unconditionally between turns, mid-run only when their ≈volume
+    # reached AUTO_EVICTION_PAUSE_FRACTION-th of the window. Off (the
+    # default): the auto layer never fires — no old result is cleared
+    # without the agent's explicit mark_unneeded mark, and the forced
+    # pre-compaction eviction collapses only what it would have selected
+    # anyway. The mark_unneeded marks layer and the forced pre-compaction
+    # eviction are NOT affected by this flag: they always work. Off by
+    # default (a deliberate change from the always-on behavior): stubbing
+    # costs a prompt-cache invalidation per batch and degrades results the
+    # agent may still want verbatim, so it stays opt-in per project. Read
+    # at the eviction gates, so a toggle applies to the next activation.
+    auto_context_unloading: bool = False
     # Live todo tail (agent_model.TailInjectionModel): when on, every model
     # request of a feature-task run carries a synthetic TAIL message with
     # the task's current checklist state (recomputed per request, see

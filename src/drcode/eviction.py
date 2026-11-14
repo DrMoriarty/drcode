@@ -51,8 +51,11 @@ ARGS_SUMMARY_CAP = 120
 # AFTER the exchange that produced it. Anthropic's measurements of the
 # recipe (+29% agentic-search quality, −84% tokens over a 100-turn eval)
 # come from exactly this regime: fresh results the agent still works from
-# stay verbatim, stale ones degrade to re-runnable stubs. Not a project
-# setting (yet): a module knob, like EVICTION_WINDOW_FRACTION.
+# stay verbatim, stale ones degrade to re-runnable stubs. The auto layer
+# itself is a project setting (auto_context_unloading, default OFF — the
+# gates in core/pipeline_compaction check it before anything auto-evicts);
+# this module knob, like EVICTION_WINDOW_FRACTION, only shapes HOW MUCH
+# age/freshness the opted-in layer grants.
 AUTO_EVICTION_MIN_AGE_TURNS = 10
 
 # The freshness anchor of the automatic clearing: the last K tool results

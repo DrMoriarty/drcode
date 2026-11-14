@@ -754,22 +754,39 @@ def _update_goal(
     )
 
 
-def subagent_notice(limit: int, *, role: AgentRole) -> str | None:
-    """The run's delegation note as a prompt block (None when the run has no
-    subagent slots — the default).
+def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None:
+    """The run's delegation note as a prompt block, STATE-AWARE.
 
-    One line, injected at the TAIL of every model request of the run
-    (`agent_model.TailInjectionModel`, wired by `build_agent`) whenever the
-    project's `subagents_coder`/`subagents_researcher` setting is above 0.
-    Without it the feature is effectively invisible: a tool that merely
-    EXISTS in the schema went uncalled across a whole 119-task benchmark run
-    (drcode-bench, slots enabled), while a standing reminder of the real
-    budget in the live context does get acted on.
+    `limit` is the run's TOTAL delegate_research budget (the project's
+    `subagents_coder`/`subagents_researcher` setting) and `used` how many
+    of its slots the run has already spent (`SubagentGate.used`, read per
+    request by the supplier `build_agent` wires). Three states:
 
-    Deliberately the TAIL, not leading dynamic instructions: the leading
-    system zone is the cached prefix, and a per-request reminder there would
-    invalidate it on every request. The text is constant for a run (the
-    limit is fixed at activation), so even the tail zone stays stable.
+    - limit <= 0 → None: the feature is off, no block at all (the
+      TailInjectionModel passes the request through untouched).
+    - used < limit → the standing "you have N available" reminder (N =
+      remaining). Without it the feature is effectively invisible: a tool
+      that merely EXISTS in the schema went uncalled across a whole
+      119-task benchmark run (drcode-bench, slots enabled), while a
+      standing reminder of the real budget in the live context does get
+      acted on.
+    - used >= limit → a short "slots used" note. Once the budget is
+      spent, the standing reminder is pure noise: the model kept
+      re-discussing it on every remaining request of a 78-message run
+      (the a7be0f94 transcript — both calls spent by message 4, the
+      reminder re-acknowledged in thinking for 50+ more requests, part
+      of it leaking into visible output). The explicit "further
+      delegation is unavailable" line is preferred over dropping the
+      block entirely: it visibly extinguishes retry attempts and matches
+      the plain-text refusal `run_delegate_tool` now returns.
+
+    Both texts go to the TAIL of every model request
+    (`agent_model.TailInjectionModel`, wired by `build_agent`), never
+    into the leading system zone — that zone is the cached prefix, and a
+    per-request reminder there would invalidate it on every request. The
+    text changes AT MOST ONCE per run (available → exhausted), so the
+    tail zone stays stable except for that one small invalidation — the
+    same cache argument that justifies the tail injection itself.
 
     The block stays SHORT on purpose — it is repeated on every request of
     every run with slots enabled, so it buys its keep as a pointer to the
@@ -778,10 +795,21 @@ def subagent_notice(limit: int, *, role: AgentRole) -> str | None:
     WRITE/GREP counterpart: the research role documents rather than edits."""
     if limit <= 0:
         return None
-    plural = "subagent" if limit == 1 else "subagents"
+    if used >= limit:
+        if limit == 1:
+            return (
+                "The delegate_research slot of this run is used "
+                "— further delegation is unavailable. Continue with direct reads."
+            )
+        return (
+            f"All {limit} delegate_research slots of this run are used "
+            "— further delegation is unavailable. Continue with direct reads."
+        )
+    remaining = limit - used
+    plural = "subagent" if remaining == 1 else "subagents"
     verb = "document" if role is AgentRole.RESEARCH else "edit"
     return (
-        f"You have {limit} read-only {plural} available via delegate_research "
+        f"You have {remaining} read-only {plural} available via delegate_research "
         "— free context for wide-but-shallow reading (mapping call sites, "
         "recon over >3-5 files, surveying a subsystem before you touch it). "
         f"Read only the files you will {verb} yourself."

@@ -200,6 +200,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         root: Any = None,
         research_git: Any = None,
         subagent_limit: int = 0,
+        subagent_gate: Any = None,
         task_id: Any = None,
         eviction_hint: bool = False,
         todo_supplier: Any = None,
@@ -210,6 +211,8 @@ async def test_research_task_builds_agent_with_research_role_config(
         kwargs = {"kind": kind, "root": root}
         if research_git is not None:
             kwargs["research_git"] = research_git
+        if subagent_gate is not None:
+            kwargs["subagent_gate"] = subagent_gate
         if task_id is not None:
             kwargs["task_id"] = task_id
         if eviction_hint:

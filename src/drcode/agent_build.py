@@ -343,6 +343,7 @@ def build_agent(
     root: Path | None = None,
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
+    subagent_gate: SubagentGate | None = None,
     task_id: str | None = None,
     eviction_hint: bool = False,
     todo_supplier: Callable[[], str | None] | None = None,
@@ -369,6 +370,9 @@ def build_agent(
     delegate_research tool when above 0; at 0 (the default) the tool is
     not registered at all — the agent never sees it. The limit is baked
     into the tool description so the model knows its actual budget.
+    `subagent_gate` (the pipeline's per-run `SubagentGate`, when given)
+    supplies the EFFECTIVE limit and the live state: see the tail-wiring
+    note below.
 
     `task_id` (the task being served, known at activation) bakes the real
     scratch-directory path into the write tools' descriptions; without it
@@ -397,7 +401,17 @@ def build_agent(
     delegate_research", see `agent_tools.subagent_notice`): the tool exists
     in the schema either way, but a mere existence never got it called —
     the standing reminder of the real budget does. Same tail zone, so no
-    leading prefix is touched; the block is constant within a run.
+    leading prefix is touched. With `subagent_gate` (the pipeline's
+    per-run `SubagentGate`, created at activation BEFORE this build) the
+    line is STATE-AWARE: the supplier re-reads the gate per request, so
+    the reminder always names the REMAINING slots and, once the budget
+    is spent, switches to the short "slots used — further delegation is
+    unavailable" text that visibly extinguishes retry attempts (the
+    a7be0f94 transcript: the constant reminder kept being re-discussed
+    for 50+ requests after both calls were spent). The text changes at
+    most once per run, so only that one small tail invalidation is paid.
+    Without a gate (schema estimation, tests) the line is built once
+    from `subagent_limit` and stays constant.
 
     `research_web_fetch` (the project's web fetch policy, read at
     activation) registers the `web_fetch` tool — RESEARCH tasks ONLY, and
@@ -420,18 +434,35 @@ def build_agent(
     tail_blocks: list[Callable[[], str | None]] = []
     if todo_supplier is not None:
         tail_blocks.append(todo_supplier)
+    # The effective delegate_research budget: the pipeline's per-run gate
+    # when one is wired (its limit is authoritative), else the bare
+    # subagent_limit (schema estimation / tests — no state to read).
+    delegation_role = (
+        AgentRole.RESEARCH if kind is TaskKind.RESEARCH else AgentRole.CODING
+    )
+    if subagent_gate is not None:
+        effective_limit = subagent_gate.limit
+    else:
+        effective_limit = subagent_limit
     # The run's delegation note (one line, when the project enabled
     # subagents for this role): a tool nobody is reminded of never gets
     # called — see `agent_tools.subagent_notice`. It rides the same trailing
     # synthetic message as the checklist (one extra user message per request,
-    # never one per block) and its text is constant within a run, so the
-    # cached prefix is untouched.
-    delegation_note = subagent_notice(
-        subagent_limit,
-        role=AgentRole.RESEARCH if kind is TaskKind.RESEARCH else AgentRole.CODING,
-    )
-    if delegation_note is not None:
-        tail_blocks.append(lambda: delegation_note)
+    # never one per block), so the cached prefix is untouched. With a gate
+    # the supplier is STATE-AWARE: recomputed per request, it counts the
+    # remaining slots down and switches to the "slots used" text once the
+    # budget is spent — at most ONE text change per run, so only that one
+    # small tail invalidation is ever paid.
+    if subagent_gate is not None:
+        tail_blocks.append(
+            lambda: subagent_notice(
+                subagent_gate.limit, subagent_gate.used, role=delegation_role
+            )
+        )
+    elif effective_limit > 0:
+        delegation_note = subagent_notice(effective_limit, role=delegation_role)
+        if delegation_note is not None:
+            tail_blocks.append(lambda: delegation_note)
     if tail_blocks:
         model = agent_model.TailInjectionModel(model, tail_blocks)
     instructions = load_system_prompt(
@@ -1198,12 +1229,14 @@ def build_agent(
         )
 
     # Read-only subagent delegation (project settings subagents_coder /
-    # subagents_researcher): registered ONLY when the limit is above 0 —
-    # at the default 0 the tool does not exist for the model at all. The
-    # actual limit is baked into the description (the tool is rebuilt per
-    # run, so a settings change reaches the very next activation). Not
-    # sequential: several subagents may run in parallel within the limit.
-    if subagent_limit > 0:
+    # subagents_researcher): registered ONLY when the effective limit is
+    # above 0 — at the default 0 the tool does not exist for the model at
+    # all. The actual limit is baked into the description (the tool is
+    # rebuilt per run, so a settings change reaches the very next
+    # activation). The limit is the run's TOTAL budget (each call spends
+    # one slot for good — SubagentGate.used), not a pure concurrency cap:
+    # several subagents may still run in parallel within it.
+    if effective_limit > 0:
 
         async def delegate_research(ctx: RunContext[AgentDeps], task: str) -> str:
             return await run_delegate_tool(ctx.deps, config, task)
@@ -1212,7 +1245,9 @@ def build_agent(
         # def): pydantic-ai parses the tool description out of the SOURCE
         # and an f-string docstring yields an empty description.
         delegate_research.__doc__ = f"""Spawn a READ-ONLY research subagent and delegate a piece of THIS
-            task to it. You may run up to {subagent_limit} subagent{"" if subagent_limit == 1 else "s"} in parallel; the
+            task to it. You have {effective_limit} delegate_research call{"" if effective_limit == 1 else "s"} for this run (each
+            call spends one of the run's slots for good; you may run
+            several subagents in parallel within the budget); the
             call returns the subagent's final report (its intermediate tool
             traffic stays invisible to your context) plus a one-line usage
             summary. The subagent can only read: read_file, grep_search,

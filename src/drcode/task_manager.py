@@ -9,6 +9,8 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from pathlib import Path
 
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+
 from .goals import GoalStore
 from .models import (
     Goal,
@@ -25,7 +27,12 @@ from .models import (
 from .stats import StatsStore
 from .storage import Storage
 from .tools import remove_scratch
-from .transcript import is_pending_retry
+from .transcript import (
+    all_user_prompts,
+    backdate_user_prompt,
+    is_pending_retry,
+    serialize_messages,
+)
 from .workflow import ensure_workflow_examples
 
 # Status-change observer: (task, old status, new status, origin). Origin is
@@ -1178,6 +1185,22 @@ class TaskManager:
         removal listeners run after the transition."""
         task = self.get(task_id)
         old = task.status
+        # A never-run task's pending_input is the ONLY record of its brief
+        # (the prompt lands in the transcript only when a run consumes it).
+        # Clearing it here would erase the brief from the chat history and
+        # the search skeleton. Persist every queued text into the transcript
+        # first — the same shape the run-start consumption produces
+        # (ModelRequest + UserPromptPart), backdated to the moment the user
+        # typed the text so the chat thread stays chronological.
+        existing = all_user_prompts(task.messages)
+        for entry in task.pending_input:
+            if entry.text in existing:
+                # A re-queued task may already carry this exact prompt in
+                # its transcript — don't duplicate it.
+                continue
+            request = ModelRequest(parts=[UserPromptPart(content=entry.text)])
+            backdate_user_prompt([request], entry.text, entry.at)
+            task.messages.extend(serialize_messages([request]))
         task.pending_input.clear()
         task.unfinished = False
         # The cancel marker: the status lands on COMPLETED like an honest

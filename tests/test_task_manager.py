@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic_ai import ModelRequest, ModelResponse
 from pydantic_ai.messages import TextPart, UserPromptPart
 
-from drcode.agent import serialize_messages
+from drcode.agent import all_user_prompts, serialize_messages
 from drcode.models import (
     PendingInput,
     Task,
@@ -655,6 +656,65 @@ def test_cancel_completes_and_drops_input(manager: TaskManager) -> None:
     assert task.unfinished is False
     assert task.clarification is None
     assert task.queue_head is False
+
+
+def test_cancel_persists_never_run_brief_into_transcript(
+    manager: TaskManager, project_root: Path
+) -> None:
+    """A never-run task's pending_input is the ONLY record of its brief —
+    cancel() must move it into the transcript (as backdated user prompts),
+    not destroy it."""
+    from datetime import UTC, datetime
+
+    from drcode.storage import build_skeleton
+    from drcode.task_search import search
+
+    typed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    task = manager.create("t", "the never-run brief", hold=True)
+    task.pending_input[0].at = typed_at
+    task.pending_input.append(PendingInput(text="extra comment", at=typed_at))
+
+    manager.cancel(task.id)
+    assert task.status is TaskStatus.COMPLETED
+    assert task.pending_input == []
+    # The brief survives as user prompts in the transcript...
+    assert all_user_prompts(task.messages) == ["the never-run brief", "extra comment"]
+    # ...backdated to the moment the texts were typed (the serialized
+    # stamp is an ISO string)...
+    from drcode.transcript import _message_time
+
+    for msg in task.messages:
+        assert _message_time(msg) == typed_at
+    # ...the search skeleton (rebuilt from the transcript on save) knows it...
+    assert "the never-run brief" in build_skeleton(task.messages)["prompts"]
+    # ...the archive search finds the task by its brief text...
+    result = search(project_root, ["never-run brief"])
+    assert task.id in result
+    # ...and the chat timeline renders it as a user block.
+    from drcode.tui.chat_timeline import ChatTimelineLayer
+
+    class _Stub:
+        _consumed_prompts: ClassVar[dict[str, Any]] = {}
+        _format_event = staticmethod(ChatTimelineLayer._format_event)
+
+    timeline = ChatTimelineLayer._build_task_timeline(cast(Any, _Stub()), task, task.id)
+    assert ("user", "the never-run brief") in [
+        (role, text) for _, _, role, text in timeline
+    ]
+
+
+def test_cancel_does_not_duplicate_already_transcribed_prompt(
+    manager: TaskManager,
+) -> None:
+    """A re-queued task whose prompt already sits in the transcript (the
+    run recorded it, the run failed, the task was re-queued) must not get
+    a second copy on cancel."""
+    task = manager.create("t", "the brief")
+    task.messages = serialize_messages(
+        [ModelRequest(parts=[UserPromptPart(content="the brief")])]
+    )
+    manager.cancel(task.id)
+    assert all_user_prompts(task.messages) == ["the brief"]
 
 
 # -- requeue_answered_clarification ----------------------------------------------

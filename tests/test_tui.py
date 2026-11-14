@@ -1448,8 +1448,9 @@ async def test_cancel_without_pending_skips_full_rebuild(app: DrCodeApp) -> None
 
 
 async def test_cancel_with_pending_input_rebuilds(app: DrCodeApp) -> None:
-    """A queued comment leaves pending_input with the cancel: its rendered
-    "user-pending" block must come off the screen (full re-render)."""
+    """A queued comment leaves pending_input with the cancel — but it is
+    preserved in the transcript first (never-run briefs must not vanish):
+    the re-render shows it once, as a transcript user block now."""
     task = app.manager.create("cancelled", "prompt")
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -1459,12 +1460,12 @@ async def test_cancel_with_pending_input_rebuilds(app: DrCodeApp) -> None:
         await pilot.pause()
         log = app.query_one("#chat-log")
         assert "a queued comment" in "\n".join(str(w.render()) for w in log.children)
-        before_count = len(log.children)
         app.action_cancel_task()
         await pilot.pause()
         rendered = "\n".join(str(w.render()) for w in log.children)
-        assert "a queued comment" not in rendered
-        assert len(log.children) < before_count + 2
+        # The brief survives the cancel — rendered exactly once (the
+        # pending copy is gone, the transcript copy took its place).
+        assert rendered.count("a queued comment") == 1
 
 
 # -- task actions ------------------------------------------------------------------

@@ -189,6 +189,14 @@ class ModelCatalogScreen(ModalScreen[None]):
         padding: 1 2;
         background: $panel;
         border: thick $accent;
+        /* The dialog itself NEVER scrolls: the tall middle block
+           (#mc-scroll) does, while the connection actions, the status
+           line, the hint and the Save button stay pinned in the fixed
+           bottom zone — always visible, whatever the content height. */
+        overflow: hidden;
+    }
+    #mc-scroll {
+        height: 1fr;
         overflow-y: auto;
     }
     .mc-title {
@@ -208,22 +216,29 @@ class ModelCatalogScreen(ModalScreen[None]):
     /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
        border-inclusive height:3 would pad every field with 2 blank rows. */
     #mc-name, #mc-url, #mc-key, #mc-parallel { height: 1; }
-    /* Push the provider fields down so the Check connection / Fetch models
-       row sits on ONE height with the Add / Delete row of the providers
-       pane: that row's top = title (1) + list margin (1) + list (6) +
-       button-row margin (1) = 3 blank rows above it, mirrored here. */
-    /* Blank lines between the provider fields so they don't run together
-       (the key row needs no bottom margin — the button row below already
-       carries margin-top). NOTE: margins must be declared in ONE rule per
-       widget — a later longhand rule resets the earlier one's sides. */
-    #mc-name { margin-top: 3; margin-bottom: 1; }
+    /* Blank lines between the provider fields so they don't run together;
+       the key field also carries a bottom margin so a blank separator row
+       sits between the token field and max parallel requests. NOTE:
+       margins must be declared in ONE rule per widget — a later longhand
+       rule resets the earlier one's sides. */
+    #mc-name { margin-top: 2; margin-bottom: 1; }
     #mc-url { margin-bottom: 1; }
+    #mc-key { margin-bottom: 1; }
     .mc-btnrow {
         height: auto;
         margin-top: 1;
     }
     .mc-btnrow Button { margin-right: 1; }
+    /* The fixed bottom zone of the modal: the connection actions row, the
+       status line below it, then the hint and the Save footer (all live
+       OUTSIDE #mc-scroll, so they never scroll away). */
+    #mc-actions {
+        height: auto;
+        margin-top: 1;
+    }
+    #mc-actions Button { margin-right: 1; }
     #mc-status {
+        width: 100%;
         height: auto;
         min-height: 1;
         margin-top: 1;
@@ -296,56 +311,64 @@ class ModelCatalogScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mc-dialog"):
-            yield Static(
-                "Model catalog — OpenAI-compatible providers and their models. "
-                f"Stored in [b]{self.store.path.name}[/b] (user level).",
-                classes="mc-title",
-            )
-            with Horizontal(id="mc-main"):
-                with Vertical(id="mc-left"):
-                    yield Static("Providers", classes="mc-title")
-                    yield OptionList(id="mc-providers")
-                    with Horizontal(classes="mc-btnrow"):
-                        yield Button("+ Add", id="mc-add")
-                        yield Button("Delete", id="mc-del-provider")
-                with Vertical(id="mc-right"):
-                    yield Input(
-                        id="mc-name", placeholder="provider name, e.g. local-swap"
-                    )
-                    yield Input(
-                        id="mc-url",
-                        placeholder="base URL, e.g. http://localhost:8080/v1",
-                    )
-                    yield Input(
-                        id="mc-key",
-                        password=True,
-                        placeholder="API key (optional — leave empty if not needed)",
-                    )
-                    yield Input(
-                        id="mc-parallel",
-                        placeholder=("max parallel requests (empty / 0 = unlimited)"),
-                    )
-                    with Horizontal(classes="mc-btnrow"):
-                        yield Button("Check connection", id="mc-check")
-                        yield Button("Fetch models", id="mc-fetch")
-                    yield Static("", id="mc-status")
-            # The model filter and the model table live OUTSIDE the
-            # two-column block: the table spans the full width of the modal.
-            yield Input(
-                id="mc-model-filter",
-                placeholder="filter models by name (substring, case-insensitive)",
-            )
-            yield _ModelTable(id="mc-models", cursor_type="row")
-            with Horizontal(id="mc-model-row"):
-                yield Input(id="mc-model-id", placeholder="model id")
-                yield Input(id="mc-ctx", placeholder="context tokens")
-                yield Input(id="mc-pct", placeholder="compact % (empty = inherit)")
-            with Horizontal(classes="mc-btnrow"):
-                yield Button("Update", id="mc-model-update")
-                yield Button("Remove", id="mc-model-del")
-                yield Button("Add model", id="mc-model-add")
-            # Just below the model buttons, its own row.
-            yield Button("Assign agents…", id="mc-assign-agents")
+            # The SCROLLABLE middle: title, the two-column provider block,
+            # the model table and its editor — everything tall lives here.
+            with Vertical(id="mc-scroll"):
+                yield Static(
+                    "Model catalog — OpenAI-compatible providers and their models. "
+                    f"Stored in [b]{self.store.path.name}[/b] (user level).",
+                    classes="mc-title",
+                )
+                with Horizontal(id="mc-main"):
+                    with Vertical(id="mc-left"):
+                        yield Static("Providers", classes="mc-title")
+                        yield OptionList(id="mc-providers")
+                        with Horizontal(classes="mc-btnrow"):
+                            yield Button("+ Add", id="mc-add")
+                            yield Button("Delete", id="mc-del-provider")
+                    with Vertical(id="mc-right"):
+                        yield Input(
+                            id="mc-name", placeholder="provider name, e.g. local-swap"
+                        )
+                        yield Input(
+                            id="mc-url",
+                            placeholder="base URL, e.g. http://localhost:8080/v1",
+                        )
+                        yield Input(
+                            id="mc-key",
+                            password=True,
+                            placeholder="API key (optional — leave empty if not needed)",
+                        )
+                        yield Input(
+                            id="mc-parallel",
+                            placeholder=(
+                                "max parallel requests (empty / 0 = unlimited)"
+                            ),
+                        )
+                # The model filter and the model table live OUTSIDE the
+                # two-column block: the table spans the full width of the modal.
+                yield Input(
+                    id="mc-model-filter",
+                    placeholder="filter models by name (substring, case-insensitive)",
+                )
+                yield _ModelTable(id="mc-models", cursor_type="row")
+                with Horizontal(id="mc-model-row"):
+                    yield Input(id="mc-model-id", placeholder="model id")
+                    yield Input(id="mc-ctx", placeholder="context tokens")
+                    yield Input(id="mc-pct", placeholder="compact % (empty = inherit)")
+                with Horizontal(classes="mc-btnrow"):
+                    yield Button("Update", id="mc-model-update")
+                    yield Button("Remove", id="mc-model-del")
+                    yield Button("Add model", id="mc-model-add")
+                # Just below the model buttons, its own row.
+                yield Button("Assign agents…", id="mc-assign-agents")
+            # The FIXED bottom zone — never scrolls with the content: the
+            # connection actions row, the status line under it, the hint
+            # and the Save button (pinned to the modal's bottom-right).
+            with Horizontal(classes="mc-btnrow", id="mc-actions"):
+                yield Button("Check connection", id="mc-check")
+                yield Button("Fetch models", id="mc-fetch")
+            yield Static("", id="mc-status")
             yield Static(
                 "esc — close without saving · Update / Add model / Remove "
                 "edit the table below (the Favorites cell cycles • → ★ → ✚); "
@@ -353,8 +376,6 @@ class ModelCatalogScreen(ModalScreen[None]):
                 "(empty / 0 = unlimited)",
                 id="mc-hint",
             )
-            # The very last row: Save pinned to the modal's bottom-right
-            # corner (kept out of the wrapping hint block for that).
             with Horizontal(id="mc-footer"):
                 yield Button("Save", variant="primary", id="mc-save")
 

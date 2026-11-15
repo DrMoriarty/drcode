@@ -32,7 +32,21 @@ from drcode.tui.model_setup_app import ModelCatalogScreen
 
 
 class _Host(App):
-    """Minimal host pushing the chains screen (the palette entry point)."""
+    """Minimal host pushing the chains screen (the palette entry point).
+
+    Mirrors the app-level OptionList override from `tui/app.py` (`padding:
+    0` on the list, `0 2` on the option component): that override is what
+    decides the real render width of an option line, so the truncation
+    regression test below is meaningless without it — a bare App silently
+    gives OptionList its default geometry and the labels fit where the
+    real app's don't."""
+
+    CSS = """
+    OptionList {
+        padding: 0;
+        & > .option-list--option { padding: 0 2 0 2; }
+    }
+    """
 
     def __init__(self, store: UserModelsStore) -> None:
         super().__init__()

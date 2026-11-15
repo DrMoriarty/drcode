@@ -11,13 +11,16 @@ dialog:
 - works on a DRAFT: model slots, per-role custom models and the
   per-role ``max_tokens`` overrides are persisted only on Apply (ESC
   dismisses with None and discards everything);
-- one section per agent role (coding / research / tester / compaction /
-  resolver / subagents) with a model Select (catalog models, the role's saved custom
-  model as "Custom: <model-id>", "Custom…" to enter a free-form model
-  via the existing ModelSetupDialog, and "User default" to drop the
-  project slot — the reset is available for EVERY role, including those
-  the old palette offered no reset for; for the SUBAGENTS section the
-  reset reads "Inherit parent role" — an empty slot means the
+- one section per agent role, in the dialog's own display order
+  (research / coding / tester / resolver / subagents / compaction —
+  deliberately not the load-bearing ``AgentRole`` enum order) with a
+  model Select (catalog models, the role's saved custom model as
+  "Custom: <model-id>", and "Custom…" to enter a free-form model via the
+  existing ModelSetupDialog) plus a small reset button that drops the
+  project slot — available for EVERY role, including those the old
+  palette offered no reset for; an empty slot renders as the Select's
+  blank value (the prompt reads "(user default)", for the SUBAGENTS
+  section "(inherit parent role)" — an empty slot means the
   `delegate_research` subagents run on the parent task's role model).
   The user-level default model of
   a role is marked by a single ``▸`` glyph and a bold name in the row's
@@ -80,12 +83,13 @@ from .setup_dialog import ModelSetup, ModelSetupDialog
 if TYPE_CHECKING:
     from ..config import Config
 
-# Sentinel values of the model Select. "Custom…" is transient: picking it
-# only opens the setup dialog, the select bounces back to the draft slot
-# until a setup is returned. ModelRef instances and the "custom" string
-# are real option values (mirroring the project slot forms).
+# Sentinel value of the model Select's "Custom…" entry. It is transient:
+# picking it only opens the setup dialog, the select bounces back to the
+# draft slot until a setup is returned. ModelRef instances and the
+# "custom" string are real option values (mirroring the project slot
+# forms); an EMPTY slot is the Select's blank value (allow_blank=True,
+# prompt — see _slot_value), never a selectable option.
 _CUSTOM_NEW = "__custom__"
-_USER_DEFAULT = "__user_default__"
 
 # One-character marker of the user-level default model — it replaced the
 # " (default)" suffix (long catalog names wrapped in the narrow Select
@@ -102,6 +106,36 @@ _ROLE_TITLES: dict[AgentRole, str] = {
     AgentRole.SUBAGENT: "Subagents (delegate_research)",
 }
 
+# The dialog's section display order — deliberately NOT the AgentRole
+# enum order: the enum's own order is load-bearing across the
+# persistence/resolution/migration loops (`for role in AgentRole`), the
+# UI just presents the roles in this sequence (compaction last — its
+# extras close the form).
+_ROLE_SECTION_ORDER: list[AgentRole] = [
+    AgentRole.RESEARCH,
+    AgentRole.CODING,
+    AgentRole.TESTER,
+    AgentRole.RESOLVER,
+    AgentRole.SUBAGENT,
+    AgentRole.COMPACTION,
+]
+
+# The model Select's blank-state prompt (allow_blank=True) and the reset
+# button's tooltip — the empty slot means "drop the project override",
+# which for the SUBAGENT pseudo-role reads as "run on the parent task's
+# role model" (the subagent slot has no user-level default chain — see
+# providers.resolve_subagent).
+_ROLE_BLANK_PROMPT: dict[AgentRole, str] = {
+    role: "(inherit parent role)" if role is AgentRole.SUBAGENT else "(user default)"
+    for role in AgentRole
+}
+_ROLE_RESET_TOOLTIP: dict[AgentRole, str] = {
+    role: "Inherit parent role"
+    if role is AgentRole.SUBAGENT
+    else "Reset to User default"
+    for role in AgentRole
+}
+
 THINKING_HINT = (
     "Thinking models spend their reasoning tokens from the same output "
     "budget — for the tester/resolver roles set it noticeably higher "
@@ -112,7 +146,7 @@ THINKING_HINT = (
 @dataclass
 class ProjectModelSettingsResult:
     """The dialog's accepted draft: the per-role model slots (a ModelRef,
-    "custom", or None = "User default"), the per-role max_tokens
+    "custom", or None = drop the project override / inherit), the per-role max_tokens
     overrides (only the roles with a value) and the NEW/changed custom
     model entries to persist."""
 
@@ -185,6 +219,15 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     .pms-model-col {
         width: 2fr;
         height: auto;
+    }
+    .pms-model-row {
+        height: auto;
+    }
+    .pms-reset {
+        width: auto;
+        min-width: 3;
+        height: auto;
+        margin-right: 1;
     }
     .pms-tokens-col {
         width: 1fr;
@@ -328,9 +371,11 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
 
         The effective slot is deliberately NOT marked: the Select's own
         field already shows the selected value (the old " (current)" suffix
-        was pure noise). Then the saved/draft custom model, "Custom…" and
-        the reset ("User default" — for the SUBAGENT pseudo-role
-        "Inherit parent role"; always present)."""
+        was pure noise). Then the saved/draft custom model and "Custom…".
+        There is NO selectable reset option here: an empty slot is the
+        Select's blank value (prompt "(user default)" / "(inherit parent
+        role)" for SUBAGENT), and the reset is the dedicated ✕ button next
+        to the Select."""
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
@@ -378,25 +423,18 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             # missing/invalid: same missing-value hazard as above.
             options.append(("Custom: <no saved model>", "custom"))
         options.append(("Custom…", _CUSTOM_NEW))
-        # The reset's label: for the SUBAGENT pseudo-role an empty slot
-        # means "run on the parent task's role model", not "use the
-        # user-level default" (the subagent slot has no user-level
-        # default chain — see providers.resolve_subagent).
-        options.append(
-            (
-                "Inherit parent role" if role is AgentRole.SUBAGENT else "User default",
-                _USER_DEFAULT,
-            )
-        )
         return options
 
     def _slot_value(self, role: AgentRole) -> object:
-        """The Select value for the draft slot (None = the "User
-        default" sentinel; a ModelRef becomes its "provider/model"
-        string; "custom" stays itself)."""
+        """The Select value for the draft slot. An empty slot is the
+        Select's blank value (``Select.NULL`` — the prompt "(user
+        default)" / "(inherit parent role)" shows it, both as the
+        closed-field placeholder and as the dim first dropdown row); a
+        ModelRef becomes its "provider/model" string; "custom" stays
+        itself."""
         slot = self._slots[role]
         if slot is None:
-            return _USER_DEFAULT
+            return Select.NULL
         return slot if isinstance(slot, str) else str(slot)
 
     def _select(self, role: AgentRole) -> Select:
@@ -422,17 +460,25 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         with Vertical(id="pms-dialog"):
             yield Static("Project model settings", id="pms-title")
             with VerticalScroll(id="pms-body"):
-                for role in AgentRole:
+                for role in _ROLE_SECTION_ORDER:
                     yield Label(_ROLE_TITLES[role], classes="pms-section")
                     with Horizontal(classes="pms-row"):
                         with Vertical(classes="pms-model-col"):
                             yield Label("Model", classes="pms-label")
-                            yield Select(
-                                self._model_options(role),
-                                value=self._slot_value(role),
-                                allow_blank=False,
-                                id=f"pms-model-{role.value}",
-                            )
+                            with Horizontal(classes="pms-model-row"):
+                                yield Button(
+                                    "✕",
+                                    classes="pms-reset",
+                                    tooltip=_ROLE_RESET_TOOLTIP[role],
+                                    id=f"pms-reset-{role.value}",
+                                )
+                                yield Select(
+                                    self._model_options(role),
+                                    value=self._slot_value(role),
+                                    prompt=_ROLE_BLANK_PROMPT[role],
+                                    allow_blank=True,
+                                    id=f"pms-model-{role.value}",
+                                )
                         with Vertical(classes="pms-tokens-col"):
                             yield Label(
                                 "max_tokens (empty = inherit)",
@@ -588,7 +634,12 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             self._open_custom_setup(role)
             return
         value = event.value
-        if value == _USER_DEFAULT:
+        if value == Select.NULL:
+            # The blank value (allow_blank=True): an empty slot = the
+            # user-level default /, for SUBAGENT, the parent-role
+            # inheritance. Reachable via the reset button's refresh, the
+            # dim prompt row or a manual clear — all mean "drop the
+            # project override".
             self._slots[role] = None
         elif value == "custom" or value == _CUSTOM_NEW:
             self._slots[role] = cast("ModelRef | str", value)
@@ -600,6 +651,20 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             self._slots[role] = ModelRef(provider=provider, model=model)
         else:
             return
+        self._refresh_role(role)
+
+    @on(Button.Pressed, ".pms-reset")
+    def _reset_pressed(self, event: Button.Pressed) -> None:
+        """The role's reset button: drop the project slot (None = the
+        user-level default; SUBAGENT = inherit the parent role model)
+        and re-sync the section — the Select goes blank (its prompt
+        shows the empty state) and the existing "changed" tint marks the
+        deviation from the persisted slot; None is persisted as the
+        override removal on Apply."""
+        role = self._role_of_widget_id(event.button.id, "pms-reset-")
+        if role is None:
+            return
+        self._slots[role] = None
         self._refresh_role(role)
 
     def _open_custom_setup(self, role: AgentRole) -> None:

@@ -3023,21 +3023,33 @@ async def test_project_model_dialog_form_and_apply(
         dialog = app.screen
         assert isinstance(dialog, ProjectModelSettingsDialog)
 
-        # Six role sections (incl. the subagents pseudo-role), each with a
-        # model Select and a max_tokens Input whose placeholder is the
-        # role's effective cap.
+        # Six role sections (incl. the subagents pseudo-role) in the
+        # dialog's own display order (NOT the AgentRole enum order),
+        # each with a model Select and a max_tokens Input whose
+        # placeholder is the role's effective cap.
+        sections = [str(label.render()) for label in dialog.query(".pms-section")]
+        assert sections == [
+            "Research",
+            "Coding",
+            "Tester",
+            "Resolver",
+            "Subagents (delegate_research)",
+            "Compaction",
+        ]
         for role in AgentRole:
             select = _pms_select(dialog, role)
             input_widget = _pms_input(dialog, role)
             values = [str(v) for _, v in select._options]
             prompts = [str(p) for p, _ in select._options]
             assert "__custom__" in values
-            assert "__user_default__" in values
+            # No selectable reset option: an empty slot is the Select's
+            # blank value, the reset is the dedicated ✕ button.
+            assert "__user_default__" not in values
+            assert "User default" not in prompts
+            assert "Inherit parent role" not in prompts
             assert "Custom…" in prompts
-            reset_label = (
-                "Inherit parent role" if role is AgentRole.SUBAGENT else "User default"
-            )
-            assert any(p.startswith(reset_label) for p in prompts)
+            # The reset button exists per role, left of the Select.
+            dialog.query_one(f"#pms-reset-{role.value}", Button)
             assert input_widget.placeholder == str(app.resolved_config(role).max_tokens)
         # The selected model carries NO marker — the Select's own field
         # shows it — and the appended " (default)"/" (current)" words are
@@ -3226,8 +3238,10 @@ async def test_project_model_dialog_favorites_sorted_first(
 ) -> None:
     """Catalog models with favorite levels 1..3 sit above the
     non-favorites (tier order, original order within each tier); the
-    non-catalog tail options (custom / Custom… / User default) stay at
-    the bottom."""
+    non-catalog tail options (custom / Custom…) stay at the bottom —
+    there is no selectable "User default" reset option anymore."""
+    from textual.widgets import Select
+
     from drcode.providers import (
         ModelEntry,
         Provider,
@@ -3260,7 +3274,11 @@ async def test_project_model_dialog_favorites_sorted_first(
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, ProjectModelSettingsDialog)
-        values = [str(v) for _, v in _pms_select(dialog, AgentRole.CODING)._options]
+        # With allow_blank the Select prepends its internal blank option
+        # ("", Select.NULL) — the dim prompt row; the real options follow.
+        select = _pms_select(dialog, AgentRole.CODING)
+        assert select._options[0] == ("", Select.NULL)
+        values = [str(v) for _, v in select._options[1:]]
         assert values == [
             "local-swap/fav1-a",
             "local-swap/fav1-b",
@@ -3269,13 +3287,12 @@ async def test_project_model_dialog_favorites_sorted_first(
             "local-swap/plain-a",
             "local-swap/plain-b",
             "__custom__",
-            "__user_default__",
         ]
         # Favorites carry their tier glyph (same shapes/colors as the
         # catalog table's Favorites column) before the model name; every
         # catalog row starts with a two-space indent (same layout as the
         # agent-chains dialog's right list).
-        prompts = [p for p, _ in _pms_select(dialog, AgentRole.CODING)._options]
+        prompts = [p for p, _ in select._options[1:]]
         plain = [str(p) for p in prompts]
         assert plain[:4] == [
             "  • local-swap/fav1-a",
@@ -3298,11 +3315,11 @@ async def test_project_model_dialog_favorites_sorted_first(
             ("bold yellow", "★ "),
             ("bold cyan", "✚ "),
         ]
-        # The tail options stay plain strings, unindented; the unset slot
-        # is NOT marked " (current)" — "User default" carries no marker
-        # (the Select's field is the "current" indicator).
-        assert plain[-2] == "Custom…"
-        assert plain[-1] == "User default"
+        # The tail option stays a plain string, unindented; the unset
+        # slot is NOT marked " (current)" and there is no selectable
+        # reset option — the Select's field (blank prompt) is the
+        # "current"/empty indicator.
+        assert plain[-1] == "Custom…"
 
 
 async def test_project_model_dialog_custom_slot_without_saved_entry(
@@ -3329,18 +3346,17 @@ async def test_project_model_dialog_custom_slot_without_saved_entry(
 async def test_project_model_dialog_reset_to_user_default(
     app: DrCodeApp, project_root: Path
 ) -> None:
-    """ "User default" is available for EVERY role: picking it and
-    applying drops the project slot (null = inherit the user catalog
-    default) and, for an overridden role, the max_tokens key too when
+    """The ✕ reset button is available for EVERY role: pressing it drops
+    the draft slot (the Select goes blank — its prompt shows the empty
+    state — and gets the orange "changed" tint) and applying persists
+    the null (the project override removal = inherit the user catalog
+    default); for an overridden role the max_tokens key drops too when
     the field is emptied."""
-    from textual.widgets import Button
+    from textual.widgets import Button, Select
 
     from drcode.providers import ModelRef, set_project_model
     from drcode.settings import ProjectSettingsStore
-    from drcode.tui.project_model_settings_dialog import (
-        _USER_DEFAULT,
-        ProjectModelSettingsDialog,
-    )
+    from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
 
     _write_user_catalog()
     set_project_model(
@@ -3361,8 +3377,13 @@ async def test_project_model_dialog_reset_to_user_default(
 
         # Reset the model slot to the user default AND empty the
         # override (= inherit).
-        _pms_select(dialog, AgentRole.CODING).value = _USER_DEFAULT
+        dialog.query_one("#pms-reset-coding", Button).press()
         await pilot.pause()
+        # The Select went blank (Select.NULL, the dim prompt row) ...
+        assert _pms_select(dialog, AgentRole.CODING).value == Select.NULL
+        # ...and carries the orange "changed" tint (slot None differs
+        # from the persisted override).
+        assert _pms_select(dialog, AgentRole.CODING).has_class("changed")
         _pms_input(dialog, AgentRole.CODING).value = ""
         await pilot.pause()
         dialog.query_one("#pms-apply", Button).press()

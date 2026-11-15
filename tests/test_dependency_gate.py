@@ -254,9 +254,9 @@ async def test_sidebar_shows_lock_marker_on_blocked_task(app: DrCodeApp) -> None
             [w for w in app.sidebar.children if isinstance(w, TaskItem)],
         )
         b_items = [i for i in items if i.task_id == b.id]
-        assert b_items and "🔒" in b_items[0].text and a.id in b_items[0].text
+        assert b_items and "⊘" in b_items[0].text and a.id in b_items[0].text
         a_items = [i for i in items if i.task_id == a.id]
-        assert a_items and "🔒" not in a_items[0].text
+        assert a_items and "⊘" not in a_items[0].text
 
 
 # -- integration: mergedness under worktree isolation -------------------------------

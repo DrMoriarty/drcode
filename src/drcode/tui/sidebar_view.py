@@ -374,11 +374,14 @@ class SidebarLayer(DrCodeState):
             }.get(self._merge_state.get(t.id, "none"))
             marker = f"[{color}]✓[/]" if color else "✓"
         elif deps_suffix:
-            # Blocked by dependencies: the lock replaces the status
-            # symbol — the tail "🔒 ⇢ ids" after the 40-char title was
-            # clipped off narrow panels entirely, so the lock had to
-            # move to the front where it is always visible.
-            marker = "[red]🔒[/]"
+            # Blocked by dependencies: the "no entry" symbol replaces
+            # the status symbol — the tail "⊘ ⇢ ids" after the 40-char
+            # title was clipped off narrow panels entirely, so the
+            # symbol had to move to the front where it is always
+            # visible. Plain U+2298 (⊘), NOT the 🔒 emoji: the emoji
+            # presentation renders double-width and shifts the rest of
+            # the line.
+            marker = "[red]⊘[/]"
         else:
             marker = {
                 "queued": "◷",

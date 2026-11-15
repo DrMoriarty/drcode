@@ -834,23 +834,21 @@ class SettingsLayer(DrCodeState):
         layers are active and where their files live. Shown in the
         Task-settings dialog's bottom info block. The workflow is enabled
         by file presence alone; there is nothing to toggle."""
-        parts = [
-            (
-                "Git rules: .drcode/git-workflow.md — "
-                f"{'present' if load_git_workflow(self.project_root) else 'not present'}"
-            )
-        ]
-        # Per-role instruction fragments: three lines, present/not present.
+        parts: list[str] = []
+        # Custom layers are shown only when their files actually exist —
+        # absent files would just be noise ("not present" lines for
+        # nothing the team set up).
+        if load_git_workflow(self.project_root) is not None:
+            parts.append("Git rules: .drcode/git-workflow.md — present")
         for role_file in (
             CODER_INSTRUCTIONS_FILE,
             RESEARCHER_INSTRUCTIONS_FILE,
             TESTER_INSTRUCTIONS_FILE,
         ):
-            present = load_role_instructions(self.project_root, role_file) is not None
-            parts.append(
-                f"Instructions: .drcode/instructions/{role_file} — "
-                f"{'present' if present else 'not present'}"
-            )
+            if load_role_instructions(self.project_root, role_file) is not None:
+                parts.append(
+                    f"Instructions: .drcode/instructions/{role_file} — present"
+                )
         hooks = self.workflow
         if hooks is None:
             parts.append("Hooks: .drcode/workflow.py — not present")

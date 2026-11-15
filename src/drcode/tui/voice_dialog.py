@@ -48,6 +48,7 @@ from ..voice import (
     play_wav,
     terminal_voice_language,
 )
+from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 from .toggle_row import ToggleRow
 
 _VOICE_URLS = {
@@ -91,7 +92,7 @@ class VoiceSetup:
     language: str
 
 
-class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
+class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None]):
     """Modal form: audio API connection, ASR/TTS models, announcement
     checkboxes, connection check, Save / ESC-to-cancel."""
 
@@ -99,7 +100,9 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         Binding("escape", "cancel", "Close", priority=True),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = (
+        CHANGED_CSS
+        + """
     VoiceSettingsDialog {
         align: center middle;
     }
@@ -161,6 +164,7 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         text-align: right;
     }
     """
+    )
 
     def __init__(
         self,
@@ -285,6 +289,69 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    # -- changed markers ----------------------------------------------------------
+
+    @on(Input.Changed)
+    def _input_changed(self, event: Input.Changed) -> None:
+        if event.input.id and event.input.id.startswith("voice-"):
+            self._sync_changed()
+
+    @on(Select.Changed, "#voice-lang")
+    def _language_changed(self, event: Select.Changed) -> None:
+        self._sync_changed()
+
+    @on(RadioButton.Changed)
+    def _toggle_changed(self, event: RadioButton.Changed) -> None:
+        # Only the four ToggleRow toggles emit this here.
+        self._sync_changed()
+
+    def _sync_changed(self) -> None:
+        """Mark every field whose live value differs from the saved one
+        (the shared "changed" highlight)."""
+        self._apply_changed(
+            {
+                self.query_one("#voice-url", Input): (
+                    self.query_one("#voice-url", Input).value.strip()
+                    != self._initial["api_url"]
+                ),
+                self.query_one("#voice-key", Input): (
+                    self.query_one("#voice-key", Input).value.strip()
+                    != self._initial["api_key"]
+                ),
+                self.query_one("#voice-asr", Input): (
+                    self.query_one("#voice-asr", Input).value.strip()
+                    != self._initial["asr_model"]
+                ),
+                self.query_one("#voice-tts-model", Input): (
+                    self.query_one("#voice-tts-model", Input).value.strip()
+                    != self._initial["tts_model"]
+                ),
+                self.query_one("#voice-tts-voice", Input): (
+                    self.query_one("#voice-tts-voice", Input).value.strip()
+                    != self._initial["tts_voice"]
+                ),
+                self.query_one("#voice-lang", Select): (
+                    str(self.query_one("#voice-lang", Select).value) != self._language
+                ),
+                self.query_one("#voice-tts-completed", RadioButton): (
+                    self.query_one("#voice-tts-completed", RadioButton).value
+                    != self._initial_tts["completed"]
+                ),
+                self.query_one("#voice-tts-tester-failed", RadioButton): (
+                    self.query_one("#voice-tts-tester-failed", RadioButton).value
+                    != self._initial_tts["tester_failed"]
+                ),
+                self.query_one("#voice-tts-queue-empty", RadioButton): (
+                    self.query_one("#voice-tts-queue-empty", RadioButton).value
+                    != self._initial_tts["queue_empty"]
+                ),
+                self.query_one("#voice-tts-clarification", RadioButton): (
+                    self.query_one("#voice-tts-clarification", RadioButton).value
+                    != self._initial_tts["clarification"]
+                ),
+            }
+        )
 
     # -- values -----------------------------------------------------------------
 

@@ -457,6 +457,63 @@ async def test_dialog_escape_saves_nothing(project_root: Path) -> None:
     assert settings.github_token == ""
 
 
+async def test_dialog_changed_markers_track_edits(project_root: Path) -> None:
+    """The orange "changed" marker appears when a field is edited away from
+    its saved value and clears again on revert (token Input, Enabled
+    ToggleRow label, interval RadioSet label)."""
+    from textual.widgets import Input, RadioButton, Static
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.github_dialog import GitHubSettingsDialog
+    from drcode.tui.toggle_row import ToggleRow
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_change_github()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, GitHubSettingsDialog)
+
+        token = dialog.query_one("#gh-token", Input)
+        row = dialog.query_one("#gh-enabled-row", ToggleRow)
+        interval_label = dialog.query_one("#gh-interval-label", Static)
+        assert not token.has_class("changed")
+        assert not row.label.has_class("changed")
+        assert not interval_label.has_class("changed")
+
+        # Edit the token away from the saved value — the Input tints;
+        # reverting to the saved value clears the tint.
+        token.value = "ghp_token"
+        await pilot.pause()
+        assert token.has_class("changed")
+        token.value = ""
+        await pilot.pause()
+        assert not token.has_class("changed")
+
+        # The Enabled toggle marks the row's explanatory Label.
+        enabled = dialog.query_one("#gh-enabled", RadioButton)
+        enabled.value = True
+        await pilot.pause()
+        assert row.label.has_class("changed")
+        enabled.value = False
+        await pilot.pause()
+        assert not row.label.has_class("changed")
+
+        # The interval is a RadioSet: its label above the group carries
+        # the marker. The saved interval is the FIRST option.
+        interval_buttons = [
+            button for button in dialog.query(RadioButton) if button.id is None
+        ]
+        interval_buttons[-1].value = True
+        await pilot.pause()
+        assert interval_label.has_class("changed")
+        interval_buttons[0].value = True
+        await pilot.pause()
+        assert not interval_label.has_class("changed")
+
+
 async def test_dialog_status_line_updates_live(
     project_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

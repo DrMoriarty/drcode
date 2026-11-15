@@ -52,6 +52,7 @@ from ..providers import (
     UserModelsConfig,
     UserModelsStore,
 )
+from .changed_highlight import ChangedHighlightMixin
 from .model_setup_app import (
     _FAVORITE_GLYPHS,
     _model_sort_key,
@@ -143,7 +144,7 @@ def _model_label(entry: ModelEntry, provider_name: str, name_width: int) -> Text
     return line
 
 
-class AgentChainsScreen(ModalScreen["bool | None"]):
+class AgentChainsScreen(ChangedHighlightMixin, ModalScreen["bool | None"]):
     """Per-role ordered model chains editor (modal screen)."""
 
     BINDINGS: ClassVar = [
@@ -188,6 +189,12 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         width: 1fr;
         color: $accent;
         text-style: bold;
+    }
+    /* The "changed" marker (the shared $warning signal): the chain is a
+       list, not a Select/Input/ToggleRow — the tint rides the role's
+       header label, the same scheme as the ToggleRow rows. */
+    .ac-role.changed {
+        color: $warning;
     }
     .ac-group-head Button {
         height: 1;
@@ -251,6 +258,11 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         # providers.resolve_subagent).
         self.chains: dict[AgentRole, list[ModelRef]] = {
             role: self.catalog.role_refs(role) for role in CHAIN_ROLES
+        }
+        # The saved chains at open time (a copy — `chains` mutates live):
+        # the "changed" highlight compares against this snapshot.
+        self._original_chains: dict[AgentRole, list[ModelRef]] = {
+            role: list(refs) for role, refs in self.chains.items()
         }
         self._filter_text: str = ""
         self._selected_ref: ModelRef | None = None
@@ -378,6 +390,21 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         role_value = button_id[len(prefix) + 1 :]
         return next((r for r in AgentRole if r.value == role_value), None)
 
+    # -- changed markers ------------------------------------------------------
+
+    def _sync_changed(self) -> None:
+        """Mark the roles whose chain differs from the saved one (the
+        shared "changed" highlight — the tint rides the role's header
+        label, the ToggleRow scheme)."""
+        self._apply_changed(
+            {
+                self.query_one(f"#ac-role-{role.value}", Static): (
+                    self.chains.get(role, []) != self._original_chains.get(role, [])
+                )
+                for role in CHAIN_ROLES
+            }
+        )
+
     # -- lifecycle ------------------------------------------------------------
 
     def on_mount(self) -> None:
@@ -444,6 +471,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
             return
         refs.append(ref)
         self._refresh_group(role)
+        self._sync_changed()
         position = len(refs)
         note = "primary" if position == 1 else f"fallback #{position}"
         self._status(f"✓ {ref} added to {role.value} as {note}")
@@ -463,6 +491,7 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
             return
         removed = refs.pop(index)
         self._refresh_group(role)
+        self._sync_changed()
         self._status(f"✓ {removed} removed from {role.value}")
 
     # -- save -----------------------------------------------------------------

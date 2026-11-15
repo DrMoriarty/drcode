@@ -35,6 +35,7 @@ from textual.widgets import Button, Input, RadioButton, RadioSet, Static
 
 from ..github import GitHubClient, normalize_repo
 from ..settings import GITHUB_SYNC_INTERVAL_OPTIONS, GitHubSyncInterval
+from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 from .toggle_row import ToggleRow
 
 # How long after the last keystroke/click the live probe fires (the API
@@ -53,7 +54,7 @@ class GitHubSetup:
     interval: GitHubSyncInterval
 
 
-class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
+class GitHubSettingsDialog(ChangedHighlightMixin, ModalScreen[GitHubSetup | None]):
     """Modal form: enable switch, token, repository, sync interval, and a
     live connection-status line. ESC — close without saving."""
 
@@ -61,7 +62,9 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         Binding("escape", "cancel", "Close", priority=True),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = (
+        CHANGED_CSS
+        + """
     GitHubSettingsDialog {
         align: center middle;
     }
@@ -84,6 +87,12 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         margin-top: 0; /* compact widgets need no border-spacing */
         color: $text-muted;
         text-style: bold;
+    }
+    /* The interval group is a RadioSet (its RadioButton glyphs render the
+       pressed state, a tint there carries nothing): the changed marker
+       rides the label above the group — the ToggleRow scheme. */
+    .gh-label.changed {
+        color: $warning;
     }
     .gh-opt { color: $text-disabled; text-style: italic; }
     #gh-token { margin-bottom: 0; }
@@ -122,6 +131,7 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         text-align: right;
     }
     """
+    )
 
     # Bumped on every form edit; the debounced probe only runs when the
     # counter still matches — stale timers from older edits are no-ops.
@@ -169,7 +179,7 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
                 value=self._initial_repo,
                 id="gh-repo",
             )
-            yield Static("Sync interval", classes="gh-label")
+            yield Static("Sync interval", classes="gh-label", id="gh-interval-label")
             with RadioSet(id="gh-interval"):
                 for option in GITHUB_SYNC_INTERVAL_OPTIONS:
                     button = RadioButton(option.label)
@@ -194,14 +204,48 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         # Immediate visual feedback; the probe itself does not depend on
         # the switch, but the status line re-renders its prefix.
         self._form_version += 1
+        self._sync_changed()
+
+    @on(RadioSet.Changed, "#gh-interval")
+    def _interval_changed(self, event: RadioSet.Changed) -> None:
+        # The RadioSet consumes the inner RadioButton.Changed events
+        # (event.stop()) — the group's own Changed is the one that bubbles.
+        self._sync_changed()
 
     @on(Input.Changed, "#gh-token")
     def _token_changed(self, event: Input.Changed) -> None:
         self._form_version += 1
+        self._sync_changed()
 
     @on(Input.Changed, "#gh-repo")
     def _repo_changed(self, event: Input.Changed) -> None:
         self._form_version += 1
+        self._sync_changed()
+
+    # -- changed markers -----------------------------------------------------
+
+    def _sync_changed(self) -> None:
+        """Mark every field whose live value differs from the saved one
+        (the shared "changed" highlight)."""
+        self._apply_changed(
+            {
+                self.query_one("#gh-enabled", RadioButton): (
+                    self.query_one("#gh-enabled", RadioButton).value
+                    != self._initial_enabled
+                ),
+                self.query_one("#gh-token", Input): (
+                    self.query_one("#gh-token", Input).value.strip()
+                    != self._initial_token
+                ),
+                self.query_one("#gh-repo", Input): (
+                    self.query_one("#gh-repo", Input).value.strip()
+                    != self._initial_repo
+                ),
+                self.query_one("#gh-interval-label", Static): (
+                    self._selected_interval() != self._initial_interval
+                ),
+            }
+        )
 
     def watch__form_version(self) -> None:
         self._schedule_probe()

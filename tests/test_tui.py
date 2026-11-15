@@ -4063,6 +4063,7 @@ async def test_task_settings_dialog_label_click_toggles(app: DrCodeApp) -> None:
         assert isinstance(dialog, TaskSettingsDialog)
 
         row = dialog.query_one("#ts-agent-drafts", RadioButton).parent
+        assert row is not None
         label = row.query_one(Label)
         assert dialog.query_one("#ts-agent-drafts", RadioButton).value is False
 

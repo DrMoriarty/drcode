@@ -1,0 +1,102 @@
+"""Shared flat on/off toggle row for the settings dialogs.
+
+The boolean toggles of the Task-settings dialog (``.ts-toggle-row`` —
+a RadioButton beside a wrapping label, styled flat: transparent
+background, no border, no padding) are the reference look of the
+settings forms. This module extracts that pattern into a reusable
+widget so the other settings dialogs (project model settings, voice,
+notifications, GitHub) present their booleans the same way — they used
+the stock ``Switch``, which renders differently.
+
+The widget owns the CSS (including the "changed" marker rule: the
+``changed`` class set on the RadioButton tints the toggle glyph orange —
+the same field-differs-from-saved signal the Task-settings dialog uses,
+visible even under the compact borderless styling). The row never sets
+the marker itself; a dialog that tracks a draft marks its rows exactly
+like its other fields (``set_class(changed)`` on the RadioButton).
+
+``set_toggle`` is the programmatic-sync helper (an analogue of the Task
+settings dialog's ``_set_toggle``): assigning ``value`` posts a
+``RadioButton.Changed`` message that Textual delivers asynchronously, so
+such an event can be STALE by the time its handler runs — the guard
+suppresses it.
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.containers import Horizontal
+from textual.widgets import Label, RadioButton
+
+
+class ToggleRow(Horizontal):
+    """A flat boolean toggle: ``RadioButton`` + wrapping ``Label``.
+
+    ``toggle_id`` is the RadioButton's id (dialogs and tests query the
+    toggle by it, keeping the ids the Switches used before); ``id`` — the
+    row container's own id (only when a selector must reach the row).
+    """
+
+    DEFAULT_CSS: ClassVar = """
+    ToggleRow {
+        height: auto;
+        margin-top: 1;
+    }
+    ToggleRow > RadioButton {
+        width: auto;
+        background: transparent;
+        border: none;
+        padding: 0;
+        margin-right: 1;
+    }
+    ToggleRow > Label {
+        width: 1fr; /* fill the row so long text WRAPS, never clips */
+        height: auto; /* grow with the wrapped line count */
+        color: $text-muted;
+        margin-top: 0; /* compact widgets need no border-spacing */
+    }
+    /* The "changed" marker (a field differing from the saved value): the
+       tint goes on the toggle glyph — its background-tint alone would be
+       invisible on the transparent background; plus $warning text for
+       terminals without truecolor. */
+    ToggleRow > RadioButton.changed > .toggle--button {
+        background-tint: $warning 25%;
+        color: $warning;
+    }
+    """
+
+    def __init__(
+        self,
+        label: str | Text,
+        *,
+        value: bool = False,
+        toggle_id: str | None = None,
+        name: str | None = None,
+        id: str | None = None,
+        classes: str | None = None,
+    ) -> None:
+        super().__init__(name=name, id=id, classes=classes)
+        self._row_label = label
+        self._initial_value = value
+        self._toggle_id = toggle_id
+
+    def compose(self) -> ComposeResult:
+        yield RadioButton(value=self._initial_value, id=self._toggle_id)
+        yield Label(self._row_label)
+
+    @property
+    def toggle(self) -> RadioButton:
+        """The row's RadioButton (queried by type — the only one here)."""
+        return self.query_one(RadioButton)
+
+    def set_toggle(self, value: bool) -> None:
+        """Programmatic sync of the toggle (the Task-settings
+        ``_set_toggle`` rule: a stale Changed event must never echo back
+        into the draft)."""
+        toggle = self.toggle
+        if toggle.value != value:
+            with self.prevent(RadioButton.Changed):
+                toggle.value = value

@@ -366,7 +366,7 @@ async def test_dialog_save_persists_settings(
 ) -> None:
     import time as time_module
 
-    from textual.widgets import Button, Input, RadioButton, Switch
+    from textual.widgets import Button, Input, RadioButton
 
     from drcode.tui.app import DrCodeApp
     from drcode.tui.github_dialog import GitHubSettingsDialog
@@ -387,7 +387,7 @@ async def test_dialog_save_persists_settings(
 
         dialog.query_one("#gh-token", Input).value = "ghp_live_token"
         dialog.query_one("#gh-repo", Input).value = "https://github.com/owner/repo"
-        dialog.query_one("#gh-enabled", Switch).value = True
+        dialog.query_one("#gh-enabled", RadioButton).value = True
         # Pick the last interval option (4 hours).
         buttons = list(dialog.query(RadioButton))
         buttons[-1].value = True

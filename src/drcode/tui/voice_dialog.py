@@ -11,7 +11,8 @@ Opened from the Settings palette ("Voice…"). The form collects:
 - the TTS model id + speaker voice,
 - the announcement language (Russian/English; the dialog preselects the
   stored value, or the terminal locale's language when nothing is stored),
-- four checkboxes: which events to voice-announce (task completed,
+- four boolean toggles (the shared flat ``ToggleRow`` — the Task-settings
+  look): which events to voice-announce (task completed,
   tester failure, needs clarification, empty queue).
 
 "Check" probes ``GET /models`` in a worker thread; when it succeeds and a
@@ -35,7 +36,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Select, Static, Switch
+from textual.widgets import Button, Input, RadioButton, Select, Static
 
 from ..voice import (
     DEFAULT_TTS_VOICE,
@@ -47,6 +48,7 @@ from ..voice import (
     play_wav,
     terminal_voice_language,
 )
+from .toggle_row import ToggleRow
 
 _VOICE_URLS = {
     "transcriptions": "/audio/transcriptions",
@@ -127,8 +129,6 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
         height: auto;
         width: 30;
     }
-    .voice-row { height: auto; }
-    .voice-row Switch { margin-right: 1; }
     /* TTS voice + announcement language share one row to save vertical
        space; each half is a label-above-widget column. */
     .voice-pair { height: auto; }
@@ -253,31 +253,26 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
                         id="voice-lang",
                     )
             yield Static("Announce (TTS)", classes="voice-label")
-            with Horizontal(classes="voice-row"):
-                yield Switch(
-                    value=self._initial_tts["completed"], id="voice-tts-completed"
-                )
-                yield Static("task completed", classes="voice-label")
-            with Horizontal(classes="voice-row"):
-                yield Switch(
-                    value=self._initial_tts["tester_failed"],
-                    id="voice-tts-tester-failed",
-                )
-                yield Static(
-                    "tester failure (bug / back to queue)", classes="voice-label"
-                )
-            with Horizontal(classes="voice-row"):
-                yield Switch(
-                    value=self._initial_tts["queue_empty"],
-                    id="voice-tts-queue-empty",
-                )
-                yield Static("queue empty", classes="voice-label")
-            with Horizontal(classes="voice-row"):
-                yield Switch(
-                    value=self._initial_tts["clarification"],
-                    id="voice-tts-clarification",
-                )
-                yield Static("needs clarification", classes="voice-label")
+            yield ToggleRow(
+                "task completed",
+                value=self._initial_tts["completed"],
+                toggle_id="voice-tts-completed",
+            )
+            yield ToggleRow(
+                "tester failure (bug / back to queue)",
+                value=self._initial_tts["tester_failed"],
+                toggle_id="voice-tts-tester-failed",
+            )
+            yield ToggleRow(
+                "queue empty",
+                value=self._initial_tts["queue_empty"],
+                toggle_id="voice-tts-queue-empty",
+            )
+            yield ToggleRow(
+                "needs clarification",
+                value=self._initial_tts["clarification"],
+                toggle_id="voice-tts-clarification",
+            )
             with Vertical(id="voice-footer"):
                 with Horizontal(id="voice-buttons"):
                     yield Button("Check", variant="default", id="voice-check")
@@ -312,10 +307,14 @@ class VoiceSettingsDialog(ModalScreen[VoiceSetup | None]):
             asr_model=self.query_one("#voice-asr", Input).value.strip(),
             tts_model=self.query_one("#voice-tts-model", Input).value.strip(),
             tts_voice=self.query_one("#voice-tts-voice", Input).value.strip(),
-            tts_completed=self.query_one("#voice-tts-completed", Switch).value,
-            tts_tester_failed=self.query_one("#voice-tts-tester-failed", Switch).value,
-            tts_queue_empty=self.query_one("#voice-tts-queue-empty", Switch).value,
-            tts_clarification=self.query_one("#voice-tts-clarification", Switch).value,
+            tts_completed=self.query_one("#voice-tts-completed", RadioButton).value,
+            tts_tester_failed=self.query_one(
+                "#voice-tts-tester-failed", RadioButton
+            ).value,
+            tts_queue_empty=self.query_one("#voice-tts-queue-empty", RadioButton).value,
+            tts_clarification=self.query_one(
+                "#voice-tts-clarification", RadioButton
+            ).value,
             language=str(self.query_one("#voice-lang", Select).value),
         )
 

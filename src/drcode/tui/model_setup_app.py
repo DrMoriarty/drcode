@@ -68,6 +68,11 @@ _MAX_ID_COL_WIDTH = 80
 # columns never overflow into a horizontal scrollbar.
 _SCROLLBAR_ALLOWANCE = 2
 
+# The model table has exactly these columns (see _refresh_models): the
+# per-column cell padding (2 * cell_padding each) must be counted when the
+# id column is fitted to the table width.
+_MODEL_TABLE_COLUMNS = 4
+
 # The Favorites column sits FIRST in the model table (index 0) — the
 # click target must be visible without scrolling a wide id column.
 _FAVORITE_COLUMN_INDEX = 0
@@ -210,8 +215,11 @@ class ModelCatalogScreen(ModalScreen[None]):
            placed below it (the filter field / model table). */
         height: auto;
     }
-    #mc-left { width: 34; margin-right: 2; height: auto; }
-    #mc-providers { height: 6; margin-top: 1; }
+    /* The left column is wide enough for its 4-button row (Add / Delete /
+       Check connection / Fetch models — compact, min-width: 0) to fit on
+       ONE line; the right column takes the rest. */
+    #mc-left { width: 50; margin-right: 2; height: auto; }
+    #mc-providers { height: 7; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }
     /* Compact form widgets are 1 line tall (see DrCodeApp.CSS) — the old
        border-inclusive height:3 would pad every field with 2 blank rows. */
@@ -229,14 +237,11 @@ class ModelCatalogScreen(ModalScreen[None]):
         margin-top: 1;
     }
     .mc-btnrow Button { margin-right: 1; }
-    /* The fixed bottom zone of the modal: the connection actions row, the
-       status line below it, then the hint and the Save footer (all live
-       OUTSIDE #mc-scroll, so they never scroll away). */
-    #mc-actions {
-        height: auto;
-        margin-top: 1;
-    }
-    #mc-actions Button { margin-right: 1; }
+    /* The provider row packs FOUR buttons (Add / Delete / Check connection
+       / Fetch models) into the 50-cell left column — only possible with
+       auto-sized (content-width) buttons, so the default min-width: 16 is
+       dropped here. */
+    #mc-provider-btns Button { min-width: 0; }
     #mc-status {
         width: 100%;
         height: auto;
@@ -259,12 +264,12 @@ class ModelCatalogScreen(ModalScreen[None]):
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
-    #mc-assign-agents { margin-top: 1; }
     #mc-footer {
         height: auto;
         margin-top: 1;
         align-horizontal: right;
     }
+    #mc-footer Button { margin-left: 1; }
     #mc-hint {
         width: 100%;
         /* No top padding: the footer's own margin-top already separates
@@ -323,9 +328,14 @@ class ModelCatalogScreen(ModalScreen[None]):
                     with Vertical(id="mc-left"):
                         yield Static("Providers", classes="mc-title")
                         yield OptionList(id="mc-providers")
-                        with Horizontal(classes="mc-btnrow"):
+                        # One row under the provider list: the list editors
+                        # AND the connection actions, all acting on the
+                        # selected provider.
+                        with Horizontal(classes="mc-btnrow", id="mc-provider-btns"):
                             yield Button("+ Add", id="mc-add")
                             yield Button("Delete", id="mc-del-provider")
+                            yield Button("Check connection", id="mc-check")
+                            yield Button("Fetch models", id="mc-fetch")
                     with Vertical(id="mc-right"):
                         yield Input(
                             id="mc-name", placeholder="provider name, e.g. local-swap"
@@ -360,14 +370,9 @@ class ModelCatalogScreen(ModalScreen[None]):
                     yield Button("Update", id="mc-model-update")
                     yield Button("Remove", id="mc-model-del")
                     yield Button("Add model", id="mc-model-add")
-                # Just below the model buttons, its own row.
-                yield Button("Assign agents…", id="mc-assign-agents")
             # The FIXED bottom zone — never scrolls with the content: the
-            # connection actions row, the status line under it, the hint
-            # and the Save button (pinned to the modal's bottom-right).
-            with Horizontal(classes="mc-btnrow", id="mc-actions"):
-                yield Button("Check connection", id="mc-check")
-                yield Button("Fetch models", id="mc-fetch")
+            # status line, the hint and the footer (Assign agents + Save,
+            # pinned to the modal's bottom-right).
             yield Static("", id="mc-status")
             yield Static(
                 "esc — close without saving · Update / Add model / Remove "
@@ -377,6 +382,7 @@ class ModelCatalogScreen(ModalScreen[None]):
                 id="mc-hint",
             )
             with Horizontal(id="mc-footer"):
+                yield Button("Assign agents…", id="mc-assign-agents")
                 yield Button("Save", variant="primary", id="mc-save")
 
     # -- helpers ------------------------------------------------------------
@@ -510,14 +516,25 @@ class ModelCatalogScreen(ModalScreen[None]):
         """Width of the "model id" column: whatever the modal width leaves
         free after the fixed columns, so the model list fills the FULL
         width of the modal. Falls back to the fixed default before the
-        first layout pass (when the table has no size yet)."""
+        first layout pass (when the table has no size yet).
+
+        DataTable pads EVERY cell with `cell_padding` spaces on EACH side
+        (default 1 → +2 cells per column), so the four columns need
+        2 * cell_padding * 4 extra cells on top of their content widths —
+        not subtracting them produced a horizontal scrollbar."""
         available = table.size.width
         if not available:
             return _MODEL_ID_COL_WIDTH
+        cell_pad = 2 * table.cell_padding * _MODEL_TABLE_COLUMNS
         return max(
             _MIN_ID_COL_WIDTH,
             min(
-                available - _SCROLLBAR_ALLOWANCE - _FAVORITE_COL_WIDTH - ctx_w - pct_w,
+                available
+                - _SCROLLBAR_ALLOWANCE
+                - cell_pad
+                - _FAVORITE_COL_WIDTH
+                - ctx_w
+                - pct_w,
                 _MAX_ID_COL_WIDTH,
             ),
         )

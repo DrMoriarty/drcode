@@ -290,7 +290,8 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
                 yield Static(
                     "esc — close without saving · pick a model on the right, "
                     "then its group's Add appends it to that agent's chain; "
-                    "Del removes the highlighted entry of the group. No "
+                    "Del removes the highlighted entry of the group (with a "
+                    "single entry, no highlighting needed). No "
                     "reordering: remove and re-add to change the order.",
                     id="ac-hint",
                 )
@@ -454,8 +455,15 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
         index = option_list.highlighted
         refs = self.chains.get(role, [])
         if index is None or not 0 <= index < len(refs):
-            self._status(f"Select an entry in the {role.value} list first.")
-            return
+            if len(refs) == 1:
+                # A single-entry chain needs no highlight: the only option
+                # is unambiguously the one the user wants gone (an
+                # OptionList keeps `highlighted=None` until the user moves
+                # onto the entry — Del must not demand a selection then).
+                index = 0
+            else:
+                self._status(f"Select an entry in the {role.value} list first.")
+                return
         removed = refs.pop(index)
         self._refresh_group(role)
         self._status(f"✓ {removed} removed from {role.value}")

@@ -92,18 +92,23 @@ class _FittingOptionList(OptionList):
 def _label_width(option_list: OptionList, fallback: int) -> int:
     """Usable character width for one option line of `option_list`.
 
-    Measured from the widget's REAL render geometry: OptionList wraps
-    option lines at `scrollable_content_region.width`, which already
-    excludes border, padding and a SHOWN vertical scrollbar. When the
-    scrollbar is not shown yet its cells are still reserved — it appears
-    only once the options are added, and no Resize event fires then, so
-    an un-reserved label would wrap. `fallback` before the first layout
+    Measured from the widget's REAL render geometry: OptionList renders an
+    option's text at `scrollable_content_region.width` MINUS the option
+    COMPONENT's padding (`option-list--option` — the app-level CSS in
+    `app.py` sets it to `0 2`, carving 4 cells out of the strip width;
+    `OptionList._get_option_render` wraps the visual in that Padding
+    inside the strip width). The list's own border/padding are already
+    excluded by `scrollable_content_region`. When the vertical scrollbar
+    is not shown yet its cells are still reserved — it appears only once
+    the options are added, and no Resize event fires then, so an
+    un-reserved label would wrap. `fallback` before the first layout
     (the render region is still empty)."""
     width = option_list.scrollable_content_region.width
     if not width:
         return fallback
     if not option_list.show_vertical_scrollbar:
         width -= option_list.styles.scrollbar_size_vertical
+    width -= option_list.get_component_styles("option-list--option").padding.width
     return max(8, width)
 
 

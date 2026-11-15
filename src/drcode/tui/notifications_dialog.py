@@ -3,7 +3,8 @@
 Opened from the Settings palette ("Notifications: on/off"). The form
 collects:
 
-- Enabled (a Switch: toggled by mouse click, Enter or Space),
+- Enabled (a flat toggle row — the shared ``ToggleRow``, the
+  Task-settings look: toggled by mouse click, Enter or Space),
 - the ntfy.sh topic name to publish to (a plain input).
 
 Save persists the values into the project settings
@@ -25,7 +26,9 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static, Switch
+from textual.widgets import Button, Input, RadioButton, Static
+
+from .toggle_row import ToggleRow
 
 
 @dataclass
@@ -64,8 +67,6 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
         color: $text-muted;
         text-style: bold;
     }
-    #ntf-enabled-row { height: auto; }
-    #ntf-enabled-row Switch { margin-right: 1; }
     #ntf-status {
         height: auto;
         min-height: 1;
@@ -105,12 +106,12 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
                 "topic can read its messages — pick an unguessable one.",
                 id="ntf-note",
             )
-            with Horizontal(id="ntf-enabled-row"):
-                yield Switch(
-                    value=self._initial_enabled,
-                    id="ntf-enabled",
-                )
-                yield Static("Enabled", classes="ntf-label")
+            yield ToggleRow(
+                "Enabled",
+                value=self._initial_enabled,
+                toggle_id="ntf-enabled",
+                id="ntf-enabled-row",
+            )
             yield Static("ntfy.sh topic", classes="ntf-label")
             yield Input(
                 placeholder="my-secret-drcode-topic",
@@ -131,8 +132,8 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
 
     # -- live delivery hint ----------------------------------------------------
 
-    @on(Switch.Changed, "#ntf-enabled")
-    def _enabled_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ntf-enabled")
+    def _enabled_changed(self, event: RadioButton.Changed) -> None:
         self._refresh_status()
 
     @on(Input.Changed, "#ntf-topic")
@@ -140,7 +141,7 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
-        enabled = self.query_one("#ntf-enabled", Switch).value
+        enabled = self.query_one("#ntf-enabled", RadioButton).value
         topic = self.query_one("#ntf-topic", Input).value.strip()
         status = self.query_one("#ntf-status", Static)
         if not enabled:
@@ -162,7 +163,7 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
     def _save_clicked(self) -> None:
         self.dismiss(
             NotificationsSetup(
-                enabled=self.query_one("#ntf-enabled", Switch).value,
+                enabled=self.query_one("#ntf-enabled", RadioButton).value,
                 topic=self.query_one("#ntf-topic", Input).value.strip(),
             )
         )

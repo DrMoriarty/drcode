@@ -39,7 +39,8 @@ dialog:
 - COMPACTION-only extras: a "request timeout" Input (seconds; empty =
   the OpenAI SDK default 600 s — a summarizer call prefills a
   multi-hundred-k-token transcript and may need a longer read window)
-  and a Switch "split a giant summarizer prompt" (the
+  and a flat toggle row "split a giant summarizer prompt" (the
+  shared ``ToggleRow`` widget — the Task-settings look; the
   ``compaction_split_giant_prompt`` project setting: when ON, a
   single-shot summarizer prompt past ~256k tokens is cut into ~equal
   map-reduce slices instead of one giant call). The underlying
@@ -66,7 +67,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, Static, Switch
+from textual.widgets import Button, Input, Label, RadioButton, Select, Static
 
 from ..providers import (
     AgentRole,
@@ -79,6 +80,7 @@ from ..providers import (
 from ..settings import ProjectSettingsStore
 from .model_setup_app import _FAVORITE_GLYPHS
 from .setup_dialog import ModelSetup, ModelSetupDialog
+from .toggle_row import ToggleRow
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -243,13 +245,6 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         width: 1fr;
         height: auto;
         margin-left: 1;
-    }
-    #pms-split-giant {
-        height: auto;
-    }
-    #pms-split-giant-label {
-        color: $text-muted;
-        margin-top: 1;
     }
     .pms-label {
         width: auto;
@@ -512,17 +507,15 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                                     classes="pms-hint",
                                     id="pms-timeout-hint",
                                 )
-                        yield Label(
+                        yield ToggleRow(
                             "Split a giant summarizer prompt — a single-shot "
                             "compaction call past ~256k tokens is cut into "
                             "~equal map-reduce slices instead of one huge "
                             "prefill (off: one call while it fits the "
                             "window)",
-                            id="pms-split-giant-label",
-                        )
-                        yield Switch(
                             value=self._split_giant,
-                            id="pms-split-giant",
+                            toggle_id="pms-split-giant",
+                            id="pms-split-row",
                         )
                     yield Static("", classes="pms-hint", id=f"pms-hint-{role.value}")
             yield Static(THINKING_HINT, id="pms-thinking-hint")
@@ -546,8 +539,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         value = self._timeouts[role]
         return "" if value is None else str(value)
 
-    def _split_switch(self) -> Switch:
-        return self.query_one("#pms-split-giant", Switch)
+    def _split_toggle(self) -> RadioButton:
+        return self.query_one("#pms-split-giant", RadioButton)
 
     def on_mount(self) -> None:
         for role in AgentRole:
@@ -586,7 +579,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 self._timeouts[role] != self._saved_timeouts.get(role.value),
                 "changed",
             )
-            self._split_switch().set_class(
+            self._split_toggle().set_class(
                 self._split_giant != self._saved_split_giant, "changed"
             )
             self._render_timeout_hint()
@@ -737,10 +730,10 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 "timeout; other roles keep the SDK default)"
             )
 
-    @on(Switch.Changed, "#pms-split-giant")
-    def _split_giant_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#pms-split-giant")
+    def _split_giant_changed(self, event: RadioButton.Changed) -> None:
         self._split_giant = event.value
-        self._split_switch().set_class(
+        self._split_toggle().set_class(
             self._split_giant != self._saved_split_giant, "changed"
         )
 

@@ -3,7 +3,8 @@
 Opened from the Settings palette ("GitHub integration: on/off"). The
 form collects:
 
-- Enabled (a Switch: toggled by mouse click, Enter or Space),
+- Enabled (a flat toggle row — the shared ``ToggleRow``, the
+  Task-settings look: toggled by mouse click, Enter or Space),
 - the personal access token (a masked input),
 - the repository name "owner/repo" (a plain input; a pasted URL is
   normalized on save),
@@ -30,10 +31,11 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, RadioButton, RadioSet, Static, Switch
+from textual.widgets import Button, Input, RadioButton, RadioSet, Static
 
 from ..github import GitHubClient, normalize_repo
 from ..settings import GITHUB_SYNC_INTERVAL_OPTIONS, GitHubSyncInterval
+from .toggle_row import ToggleRow
 
 # How long after the last keystroke/click the live probe fires (the API
 # must not be hit per character).
@@ -84,8 +86,6 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
         text-style: bold;
     }
     .gh-opt { color: $text-disabled; text-style: italic; }
-    #gh-enabled-row { height: auto; }
-    #gh-enabled-row Switch { margin-right: 1; }
     #gh-token { margin-bottom: 0; }
     /* One row instead of three stacked options — saves vertical space
        for the live connection-status line below. */
@@ -150,12 +150,12 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
                 "[b]invalid[/b]/[b]wontfix[/b] are skipped.",
                 id="gh-note",
             )
-            with Horizontal(id="gh-enabled-row"):
-                yield Switch(
-                    value=self._initial_enabled,
-                    id="gh-enabled",
-                )
-                yield Static("Enabled", classes="gh-label")
+            yield ToggleRow(
+                "Enabled",
+                value=self._initial_enabled,
+                toggle_id="gh-enabled",
+                id="gh-enabled-row",
+            )
             yield Static("Token", classes="gh-label")
             yield Input(
                 placeholder="personal access token (needs read access to the repo)",
@@ -189,8 +189,8 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
 
     # -- live connection status ---------------------------------------------
 
-    @on(Switch.Changed, "#gh-enabled")
-    def _enabled_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#gh-enabled")
+    def _enabled_changed(self, event: RadioButton.Changed) -> None:
         # Immediate visual feedback; the probe itself does not depend on
         # the switch, but the status line re-renders its prefix.
         self._form_version += 1
@@ -264,7 +264,7 @@ class GitHubSettingsDialog(ModalScreen[GitHubSetup | None]):
     def _save_clicked(self) -> None:
         self.dismiss(
             GitHubSetup(
-                enabled=self.query_one("#gh-enabled", Switch).value,
+                enabled=self.query_one("#gh-enabled", RadioButton).value,
                 token=self.query_one("#gh-token", Input).value.strip(),
                 repo=normalize_repo(self.query_one("#gh-repo", Input).value),
                 interval=self._selected_interval(),

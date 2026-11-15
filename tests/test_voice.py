@@ -1206,7 +1206,7 @@ async def test_sticky_error_cleared_by_any_user_action(project_root: Any) -> Non
 
 
 async def test_voice_settings_dialog_saves(project_root: Any) -> None:
-    from textual.widgets import Button, Input, Switch
+    from textual.widgets import Button, Input, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.app import DrCodeApp
@@ -1222,8 +1222,8 @@ async def test_voice_settings_dialog_saves(project_root: Any) -> None:
         assert dialog.query_one("#voice-url", Input).value == DEFAULT_VOICE_API_URL
         dialog.query_one("#voice-asr", Input).value = "x5-asr/x5-asr-large"
         dialog.query_one("#voice-tts-model", Input).value = "x5-tts/tts-1"
-        dialog.query_one("#voice-tts-completed", Switch).value = True
-        dialog.query_one("#voice-tts-clarification", Switch).value = True
+        dialog.query_one("#voice-tts-completed", RadioButton).value = True
+        dialog.query_one("#voice-tts-clarification", RadioButton).value = True
         dialog.query_one("#voice-save", Button).press()
         await pilot.pause()
         assert app.settings.voice_asr_model == "x5-asr/x5-asr-large"

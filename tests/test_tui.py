@@ -2113,7 +2113,7 @@ async def test_sidebar_task_row_click_still_opens_task(app: DrCodeApp) -> None:
 async def test_notifications_dialog_saves_project_settings(
     app: DrCodeApp, project_root: Path
 ) -> None:
-    from textual.widgets import Input, Switch
+    from textual.widgets import Input, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.notifications_dialog import NotificationsDialog
@@ -2124,7 +2124,7 @@ async def test_notifications_dialog_saves_project_settings(
         app.action_change_notifications()
         await pilot.pause()
         assert isinstance(app.screen, NotificationsDialog)
-        app.screen.query_one("#ntf-enabled", Switch).value = True
+        app.screen.query_one("#ntf-enabled", RadioButton).value = True
         app.screen.query_one("#ntf-topic", Input).value = "my-secret-topic"
         await pilot.pause()
         await pilot.click("#ntf-save")
@@ -2137,7 +2137,7 @@ async def test_notifications_dialog_saves_project_settings(
 async def test_notifications_dialog_escape_keeps_settings(
     app: DrCodeApp, project_root: Path
 ) -> None:
-    from textual.widgets import Input, Switch
+    from textual.widgets import Input, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.notifications_dialog import NotificationsDialog
@@ -2152,7 +2152,7 @@ async def test_notifications_dialog_escape_keeps_settings(
         app.action_change_notifications()
         await pilot.pause()
         assert isinstance(app.screen, NotificationsDialog)
-        app.screen.query_one("#ntf-enabled", Switch).value = False
+        app.screen.query_one("#ntf-enabled", RadioButton).value = False
         app.screen.query_one("#ntf-topic", Input).value = "changed"
         await pilot.press("escape")
         await pilot.pause()
@@ -3549,7 +3549,7 @@ async def test_project_model_dialog_compaction_extras(
     the timeout merged per-role (a hand-set timeout of another role, which
     has no UI field here, survives), the toggle as a plain boolean. ESC
     discards, an invalid value blocks Apply."""
-    from textual.widgets import Button, Input, Switch
+    from textual.widgets import Button, Input, RadioButton
 
     from drcode.settings import ProjectSettings, ProjectSettingsStore
     from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
@@ -3567,7 +3567,7 @@ async def test_project_model_dialog_compaction_extras(
         assert isinstance(dialog, ProjectModelSettingsDialog)
 
         timeout_input = dialog.query_one("#pms-timeout-compaction", Input)
-        split_switch = dialog.query_one("#pms-split-giant", Switch)
+        split_switch = dialog.query_one("#pms-split-giant", RadioButton)
         assert timeout_input.value == ""  # empty = the SDK default
         assert split_switch.value is False
 
@@ -3606,10 +3606,10 @@ async def test_project_model_dialog_compaction_extras(
         dialog = app.screen
         assert isinstance(dialog, ProjectModelSettingsDialog)
         assert dialog.query_one("#pms-timeout-compaction", Input).value == "900"
-        assert dialog.query_one("#pms-split-giant", Switch).value is True
+        assert dialog.query_one("#pms-split-giant", RadioButton).value is True
         dialog.query_one("#pms-timeout-compaction", Input).value = ""
         await pilot.pause()
-        dialog.query_one("#pms-split-giant", Switch).value = False
+        dialog.query_one("#pms-split-giant", RadioButton).value = False
         await pilot.pause()
         dialog.query_one("#pms-apply", Button).press()
         await pilot.pause()
@@ -3623,7 +3623,7 @@ async def test_project_model_dialog_esc_discards_compaction_extras(
     app: DrCodeApp, project_root: Path
 ) -> None:
     """ESC persists nothing of the compaction extras either."""
-    from textual.widgets import Input, Switch
+    from textual.widgets import Input, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.project_model_settings_dialog import ProjectModelSettingsDialog
@@ -3640,7 +3640,7 @@ async def test_project_model_dialog_esc_discards_compaction_extras(
         assert isinstance(dialog, ProjectModelSettingsDialog)
         dialog.query_one("#pms-timeout-compaction", Input).value = "900"
         await pilot.pause()
-        dialog.query_one("#pms-split-giant", Switch).value = True
+        dialog.query_one("#pms-split-giant", RadioButton).value = True
         await pilot.pause()
         await pilot.press("escape")
         await pilot.pause()

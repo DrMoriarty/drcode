@@ -35,7 +35,8 @@ dialog:
   note explains why thinking models commonly need a raised budget;
 - both widgets are tinted orange ("changed") as soon as their draft
   value differs from the persisted one — the same marker the
-  Task-settings dialog uses;
+  Task-settings dialog uses (for the toggle the tint rides the row's
+  Label via ``ToggleRow.set_changed``, never the glyph);
 - COMPACTION-only extras: a "request timeout" Input (seconds; empty =
   the OpenAI SDK default 600 s — a summarizer call prefills a
   multi-hundred-k-token transcript and may need a longer read window)
@@ -539,8 +540,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         value = self._timeouts[role]
         return "" if value is None else str(value)
 
-    def _split_toggle(self) -> RadioButton:
-        return self.query_one("#pms-split-giant", RadioButton)
+    def _split_toggle(self) -> ToggleRow:
+        return self.query_one("#pms-split-row", ToggleRow)
 
     def on_mount(self) -> None:
         for role in AgentRole:
@@ -579,8 +580,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 self._timeouts[role] != self._saved_timeouts.get(role.value),
                 "changed",
             )
-            self._split_toggle().set_class(
-                self._split_giant != self._saved_split_giant, "changed"
+            self._split_toggle().set_changed(
+                self._split_giant != self._saved_split_giant
             )
             self._render_timeout_hint()
 
@@ -733,8 +734,8 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     @on(RadioButton.Changed, "#pms-split-giant")
     def _split_giant_changed(self, event: RadioButton.Changed) -> None:
         self._split_giant = event.value
-        self._split_toggle().set_class(
-            self._split_giant != self._saved_split_giant, "changed"
+        self._split_toggle().set_changed(
+            self._split_giant != self._saved_split_giant
         )
 
     # -- apply / cancel --------------------------------------------------------------------

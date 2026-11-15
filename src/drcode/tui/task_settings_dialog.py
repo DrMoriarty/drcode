@@ -217,10 +217,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     }
     # "Changed" marker: a border-tint is useless under the compact form
     # styles (the border the signal used to color is gone). Boolean
-    # toggles are compact RadioButtons — the tint goes on the toggle
-    # glyph (its background-tint alone would be invisible on a
-    # transparent background; plus $warning text for terminals without
-    # truecolor); for Select the tint goes on the child SelectCurrent
+    # toggles are ToggleRows — their tint goes on the row's Label (the
+    # ToggleRow's own CSS; the glyph renders identically on and off);
+    # for Select the tint goes on the child SelectCurrent
     # — its opaque background hides the parent's tint.
     Select.changed > SelectCurrent {
         background-tint: $warning 25%;
@@ -714,7 +713,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
-            widget.set_class(is_changed, "changed")
+            if isinstance(widget, RadioButton) and isinstance(
+                widget.parent, ToggleRow
+            ):
+                # A toggle's changed marker rides the row's Label, not the
+                # glyph (the glyph renders identically on and off).
+                widget.parent.set_changed(is_changed)
+            else:
+                widget.set_class(is_changed, "changed")
         dormant: set[str] = set()
         if d.task_isolation is not TaskIsolation.WORKTREE:
             dormant |= {

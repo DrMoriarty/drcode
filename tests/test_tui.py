@@ -3721,7 +3721,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     """The main Settings menu collapses the task-management entries
     into one "Task settings…" item, which opens the modal
     TaskSettingsDialog with all the preference fields."""
-    from textual.widgets import Label, Select, Switch
+    from textual.widgets import Label, RadioButton, Select
 
     from drcode.tui.command_providers import (
         ProjectSettingsCommandsProvider,
@@ -3784,7 +3784,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         assert dialog.query_one("#ts-verification", Select).value is (
             app.settings.verification
         )
-        assert dialog.query_one("#ts-keep-awake", Switch).value is (
+        assert dialog.query_one("#ts-keep-awake", RadioButton).value is (
             app.settings.keep_awake
         )
         sections = [
@@ -3831,7 +3831,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
     """The dialog works on a deep copy: nothing is persisted until Apply,
     ESC discards everything, and Apply persists ONCE and replays the same
     side effects as the per-field actions (_advance, _update_keepawake)."""
-    from textual.widgets import Button, Select, Switch
+    from textual.widgets import Button, RadioButton, Select
 
     from drcode.settings import ProjectSettingsStore, Verification
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
@@ -3871,7 +3871,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
         # Edit two fields through the widgets.
         dialog.query_one("#ts-verification", Select).value = Verification.NONE
         await pilot.pause()
-        dialog.query_one("#ts-keep-awake", Switch).value = False
+        dialog.query_one("#ts-keep-awake", RadioButton).value = False
         await pilot.pause()
         # Nothing persisted while editing; the live settings are untouched.
         assert saves == []
@@ -3907,7 +3907,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
 async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None:
     """The eviction-hint switch edits a draft copy and persists on Apply;
     the dialog's field copy includes it too."""
-    from textual.widgets import Button, Switch
+    from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
@@ -3921,10 +3921,10 @@ async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None
         assert isinstance(dialog, TaskSettingsDialog)
 
         # Default off; toggling updates only the draft.
-        switch = dialog.query_one("#ts-eviction-hint", Switch)
-        assert switch.value is False
+        toggle = dialog.query_one("#ts-eviction-hint", RadioButton)
+        assert toggle.value is False
         assert app.settings.eviction_hint is False
-        switch.value = True
+        toggle.value = True
         await pilot.pause()
         assert app.settings.eviction_hint is False
 
@@ -3938,13 +3938,13 @@ async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, TaskSettingsDialog)
-        assert dialog.query_one("#ts-eviction-hint", Switch).value is True
+        assert dialog.query_one("#ts-eviction-hint", RadioButton).value is True
 
 
 async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> None:
     """The automatic-unloading switch edits a draft copy and persists on
     Apply; the dialog's field copy includes it too."""
-    from textual.widgets import Button, Switch
+    from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
@@ -3958,10 +3958,10 @@ async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> Non
         assert isinstance(dialog, TaskSettingsDialog)
 
         # Default off; toggling updates only the draft.
-        switch = dialog.query_one("#ts-auto-unload", Switch)
-        assert switch.value is False
+        toggle = dialog.query_one("#ts-auto-unload", RadioButton)
+        assert toggle.value is False
         assert app.settings.auto_context_unloading is False
-        switch.value = True
+        toggle.value = True
         await pilot.pause()
         assert app.settings.auto_context_unloading is False
 
@@ -3978,13 +3978,13 @@ async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> Non
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, TaskSettingsDialog)
-        assert dialog.query_one("#ts-auto-unload", Switch).value is True
+        assert dialog.query_one("#ts-auto-unload", RadioButton).value is True
 
 
 async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
     """The todo-tail switch edits a draft copy and persists on Apply; the
     dialog's field copy includes it too."""
-    from textual.widgets import Button, Switch
+    from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
@@ -3998,10 +3998,10 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
         assert isinstance(dialog, TaskSettingsDialog)
 
         # Default off; toggling updates only the draft.
-        switch = dialog.query_one("#ts-todo-tail", Switch)
-        assert switch.value is False
+        toggle = dialog.query_one("#ts-todo-tail", RadioButton)
+        assert toggle.value is False
         assert app.settings.todo_tail is False
-        switch.value = True
+        toggle.value = True
         await pilot.pause()
         assert app.settings.todo_tail is False
 
@@ -4015,7 +4015,7 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, TaskSettingsDialog)
-        assert dialog.query_one("#ts-todo-tail", Switch).value is True
+        assert dialog.query_one("#ts-todo-tail", RadioButton).value is True
 
 
 async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:

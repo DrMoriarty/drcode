@@ -243,6 +243,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     .ts-dormant {
         opacity: 0.55;
     }
+    .ts-hidden {
+        display: none;
+    }
     #ts-hints {
         height: auto;
         max-height: 8;
@@ -443,6 +446,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     "wins over the allow list and over the all-hosts mode; "
                     "private and link-local addresses are refused in every "
                     "mode",
+                    id="ts-web-fetch-block-label",
                     classes="ts-label",
                 )
                 yield Input(
@@ -747,24 +751,24 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             }
         if d.verification is Verification.NONE:
             dormant.add("#ts-git-tester")
-        # Web fetch off: the host lists park (their values are kept, never
-        # rewritten — the user's entries come back when the mode turns on).
-        if d.web_fetch_mode is WebFetchMode.OFF:
-            dormant |= {"#ts-web-fetch-allow", "#ts-web-fetch-block"}
-        elif d.web_fetch_mode is WebFetchMode.ALL:
-            # Block list still applies in the all-hosts mode; only the
-            # allow list is dormant there.
-            dormant.add("#ts-web-fetch-allow")
         for selector in (
             "#ts-start-branch",
             "#ts-parallel",
             "#ts-removal",
             "#ts-snapshot",
             "#ts-git-tester",
-            "#ts-web-fetch-allow",
-            "#ts-web-fetch-block",
         ):
             self.query_one(selector).set_class(selector in dormant, "ts-dormant")
+        # Web fetch host lists are HIDDEN entirely (their values are kept,
+        # never rewritten — the user's entries come back when the mode
+        # turns on): the allow list shows ONLY in allowlist mode, the
+        # block list is hidden in every mode.
+        allow_visible = d.web_fetch_mode is WebFetchMode.ALLOWLIST
+        allow_col = self.query_one("#ts-web-fetch-allow").parent
+        assert allow_col is not None  # the input always sits in a ts-col
+        allow_col.set_class(not allow_visible, "ts-hidden")
+        self.query_one("#ts-web-fetch-block-label").set_class(True, "ts-hidden")
+        self.query_one("#ts-web-fetch-block").set_class(True, "ts-hidden")
 
     def _sync_hints(self) -> None:
         hints = task_settings_hints(

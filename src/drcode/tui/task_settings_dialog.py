@@ -713,9 +713,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
-            if isinstance(widget, RadioButton) and isinstance(
-                widget.parent, ToggleRow
-            ):
+            if isinstance(widget, RadioButton) and isinstance(widget.parent, ToggleRow):
                 # A toggle's changed marker rides the row's Label, not the
                 # glyph (the glyph renders identically on and off).
                 widget.parent.set_changed(is_changed)

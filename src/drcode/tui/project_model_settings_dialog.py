@@ -734,9 +734,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
     @on(RadioButton.Changed, "#pms-split-giant")
     def _split_giant_changed(self, event: RadioButton.Changed) -> None:
         self._split_giant = event.value
-        self._split_toggle().set_changed(
-            self._split_giant != self._saved_split_giant
-        )
+        self._split_toggle().set_changed(self._split_giant != self._saved_split_giant)
 
     # -- apply / cancel --------------------------------------------------------------------
 

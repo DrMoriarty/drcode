@@ -3,7 +3,8 @@ RadioButton — the glyph is no longer the only click target (parity with
 the GitHub dialog's interval radio group, where the text is the
 RadioButton's own content). A label click is a USER action, so it posts
 ``RadioButton.Changed``; the programmatic ``set_toggle`` stays
-event-silent (the stale-event guard)."""
+event-silent (the stale-event guard). The "changed" marker
+(``set_changed``) rides the Label, never the glyph."""
 
 from __future__ import annotations
 
@@ -76,3 +77,23 @@ async def test_set_toggle_stays_event_silent() -> None:
         row.set_toggle(True)
         await pilot.pause()
         assert app.changed == []
+
+
+async def test_set_changed_marks_the_label_not_the_glyph() -> None:
+    """The changed marker rides the row's Label — the RadioButton glyph
+    renders identically on and off, so the orange tint is on the
+    explanatory text (label/set_changed, dialogs never query the Label)."""
+    app = _ToggleApp()
+    async with app.run_test() as pilot:
+        row = app.query_one(ToggleRow)
+        label = row.label
+
+        row.set_changed(True)
+        await pilot.pause()
+        assert label.has_class("changed")
+        assert not row.toggle.has_class("changed")
+
+        row.set_changed(False)
+        await pilot.pause()
+        assert not label.has_class("changed")
+        assert not row.toggle.has_class("changed")

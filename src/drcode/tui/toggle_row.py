@@ -9,11 +9,13 @@ notifications, GitHub) present their booleans the same way — they used
 the stock ``Switch``, which renders differently.
 
 The widget owns the CSS (including the "changed" marker rule: the
-``changed`` class set on the RadioButton tints the toggle glyph orange —
+``changed`` class set on the row tints the explanatory Label orange —
 the same field-differs-from-saved signal the Task-settings dialog uses,
-visible even under the compact borderless styling). The row never sets
-the marker itself; a dialog that tracks a draft marks its rows exactly
-like its other fields (``set_class(changed)`` on the RadioButton).
+visible even under the compact borderless styling; the glyph itself
+renders identically on and off, so a tint there is pointless). The row
+never sets the marker itself; a dialog that tracks a draft marks its
+rows exactly like its other fields (``row.set_changed(bool)`` —
+a thin ``set_class(changed)`` on the row's Label).
 
 ``set_toggle`` is the programmatic-sync helper (an analogue of the Task
 settings dialog's ``_set_toggle``): assigning ``value`` posts a
@@ -83,10 +85,10 @@ class ToggleRow(Horizontal):
         margin-top: 0; /* compact widgets need no border-spacing */
     }
     /* The "changed" marker (a field differing from the saved value): the
-       tint goes on the toggle glyph — its background-tint alone would be
-       invisible on the transparent background; plus $warning text for
-       terminals without truecolor. */
-    ToggleRow > RadioButton.changed > .toggle--button {
+       tint goes on the explanatory Label — the RadioButton glyph renders
+       identically on and off, so a tint there carries nothing; plus
+       $warning text for terminals without truecolor. */
+    ToggleRow > Label.changed {
         background-tint: $warning 25%;
         color: $warning;
     }
@@ -115,6 +117,19 @@ class ToggleRow(Horizontal):
     def toggle(self) -> RadioButton:
         """The row's RadioButton (queried by type — the only one here)."""
         return self.query_one(RadioButton)
+
+    @property
+    def label(self) -> Label:
+        """The row's explanatory Label."""
+        return self.query_one(Label)
+
+    def set_changed(self, is_changed: bool) -> None:
+        """Mark the row as differing from its saved value: the "changed"
+        class rides the explanatory Label (a legible tint on text — the
+        glyph renders identically on and off), never the RadioButton.
+        Draft-tracking dialogs call this instead of setting classes on
+        the toggle."""
+        self.label.set_class(is_changed, "changed")
 
     def set_toggle(self, value: bool) -> None:
         """Programmatic sync of the toggle (the Task-settings

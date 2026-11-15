@@ -248,13 +248,9 @@ def test_gate_notice_supplier_reflects_the_gate(fake_config: Config) -> None:
         written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
         return _tail_text(written)
 
-    assert "You have 2 delegate_research calls left this run" in (
-        tail_text()
-    )
+    assert "You have 2 delegate_research calls left this run" in (tail_text())
     gate.used = 1
-    assert "You have 1 delegate_research call left this run" in (
-        tail_text()
-    )
+    assert "You have 1 delegate_research call left this run" in (tail_text())
     gate.used = 2
     tail = tail_text()
     assert "further delegation is unavailable" in tail

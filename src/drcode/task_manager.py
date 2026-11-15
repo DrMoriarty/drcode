@@ -610,8 +610,12 @@ class TaskManager:
             # goal's counters derive it dynamically, nothing to append.
             goal = self.goals.get(goal_id)
             # A freshly created task is by definition not COMPLETED yet:
-            # assigning it to a done goal re-opens the goal.
-            self._goal_reactivate_if_done(goal, task)
+            # assigning it to a done goal re-opens the goal — but a DRAFT
+            # does not: it is parked, not picked up by the pipeline, so
+            # the done goal keeps its status until the draft is actually
+            # finished (finish_draft re-runs the reactivation then).
+            if not draft:
+                self._goal_reactivate_if_done(goal, task)
         if first_message.strip():
             task.pending_input.append(PendingInput(text=first_message.strip()))
         if draft:
@@ -701,6 +705,13 @@ class TaskManager:
         task.status = TaskStatus.HOLD if hold else TaskStatus.QUEUED
         task.touch()
         self._save_changed(task, old, "user")
+        # The draft enters the pipeline now: a DONE goal it is linked to
+        # is not done anymore (create deliberately skipped the
+        # reactivation for drafts — see the goal branch there).
+        if task.goal_id is not None:
+            goal = self.goals.goals.get(task.goal_id)
+            if goal is not None:
+                self._goal_reactivate_if_done(goal, task)
         return task
 
     def send(self, task_id: str, text: str) -> Task:

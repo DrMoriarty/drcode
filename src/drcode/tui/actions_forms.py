@@ -238,9 +238,9 @@ class TaskFormLayer(DrCodeState):
                 "you are composing a task to be executed later."
             )
             hint.update(
-                "tab — switch type   ctrl+g — depends on   ctrl+enter — create   "
-                "ctrl+h — create on hold   ctrl+d — create as draft   esc — cancel"
-                + voice
+                "tab — switch type   ctrl+g — depends on   ctrl+l — goal   "
+                "ctrl+enter — create   ctrl+h — create on hold   "
+                "ctrl+d — create as draft   esc — cancel" + voice
             )
 
     def action_edit_task(self) -> None:

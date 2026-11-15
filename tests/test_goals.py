@@ -485,6 +485,23 @@ def test_goal_reactivates_when_new_task_created(manager) -> None:
     assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
 
 
+def test_goal_reactivates_on_create_but_not_draft(manager) -> None:
+    goal = manager.goals.create("Async core")
+    first = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)
+    manager.mark_done(first.id)
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+    # A DRAFT keeps the done goal done: it is parked, never picked up by
+    # the pipeline, so there is no fresh work to re-open the goal for.
+    draft = manager.create("t2", "brief", goal_id=goal.id, draft=True)
+    assert draft.status is TaskStatus.DRAFT
+    assert manager.goals.get(goal.id).status is GoalStatus.DONE
+
+    # Finishing the draft (into the queue or on hold) re-opens the goal.
+    manager.finish_draft(draft.id, hold=True)
+    assert manager.goals.get(goal.id).status is GoalStatus.ACTIVE
+
+
 def test_goal_reactivates_on_link(manager) -> None:
     goal = manager.goals.create("Async core")
     done = manager.create("t1", "brief", kind=TaskKind.RESEARCH, goal_id=goal.id)

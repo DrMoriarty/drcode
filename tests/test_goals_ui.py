@@ -20,7 +20,12 @@ from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
 from drcode.models import GoalStatus, GoalType, TaskKind, TaskStatus
 from drcode.tui.app import DrCodeApp
-from drcode.tui.goal_screen import GoalCaptureResult, GoalEditScreen, GoalScreen
+from drcode.tui.goal_screen import (
+    GoalAssignPicker,
+    GoalCaptureResult,
+    GoalEditScreen,
+    GoalScreen,
+)
 from drcode.tui.inputs import ChatInput, NewTaskInput
 from drcode.tui.sidebar import TaskItem
 
@@ -417,6 +422,75 @@ async def test_goal_screen_task_from_goal(app: DrCodeApp) -> None:
         # The link is consumed with the form.
         assert app._new_task_goal_id is None
         assert app.query_one("#nt-goal", Static).content == ""
+
+
+async def test_new_task_form_goal_picker(app: DrCodeApp) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        active = app.manager.goals.create("Active goal")
+        done = app.manager.goals.create("Done goal")
+        app.manager.goals.update_status(done.id, GoalStatus.DONE)
+        archived = app.manager.goals.create("Archived goal")
+        app.manager.goals.update(archived.id, status=GoalStatus.ARCHIVED)
+
+        # Ctrl+L in the fresh new-task form opens the same picker the
+        # task header's "+ assign" link uses.
+        app.action_new_task()
+        await pilot.pause()
+        app.action_assign_new_task_goal()
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, GoalAssignPicker)
+        listing = picker.query_one("#goal-assign-list", ListView)
+        ids = [i.goal_id for i in listing.children if isinstance(i, TaskItem)]
+        # The archive is never a candidate; a DONE goal is.
+        assert ids == [active.id, done.id]
+
+        # Enter on the done goal presets the link into the form.
+        listing.index = 1
+        listing.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._new_task_goal_id == done.id
+        assert "Done goal" in str(app.query_one("#nt-goal", Static).content)
+
+        # Submitting the form links the task; the done goal re-opens.
+        app.new_task_input.load_text("migrate the storage layer")
+        app._submit_new_form(hold=False)
+        await pilot.pause()
+        created = [t for t in app.manager.tasks.values() if t.goal_id == done.id]
+        assert len(created) == 1
+        assert app.manager.goals.get(done.id).status is GoalStatus.ACTIVE
+        assert app._new_task_goal_id is None
+
+
+async def test_new_task_goal_picker_not_offered_while_editing(
+    app: DrCodeApp,
+) -> None:
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        goal = app.manager.goals.create("Active goal")
+        task = app.manager.create("held", "x")
+        app.manager.set_hold(task.id, on=True)
+
+        # Fresh creation offers the picker (the check_action gate).
+        app.action_new_task()
+        await pilot.pause()
+        assert app.check_action("assign_new_task_goal", ()) is True
+
+        # The edit/draft modes never re-link: the key is gated off and
+        # the action is a no-op.
+        app.view_task(task.id)
+        app.action_edit_task()
+        await pilot.pause()
+        assert app.check_action("assign_new_task_goal", ()) is False
+        app.action_assign_new_task_goal()
+        await pilot.pause()
+        assert not isinstance(app.screen, GoalAssignPicker)
+        assert app._new_task_goal_id is None
+        assert task.goal_id is None
+        assert goal.id  # the goal is untouched
 
 
 async def test_goal_capture_with_parent_and_link(app: DrCodeApp) -> None:

@@ -165,6 +165,45 @@ class GoalsActionsLayer(DrCodeState):
             return
         self.link_viewed_goal(goal_id)
 
+    # -- picking a goal for the task being composed (Ctrl+L in the form) ------
+
+    def action_assign_new_task_goal(self) -> None:
+        """Ctrl+L in the fresh new-task form: pick a goal for the task
+        being composed — the same GoalAssignPicker the task header's
+        "+ assign" link opens. DONE goals are candidates too: creating
+        a queued/held task under a done goal re-opens it
+        (TaskManager.create); a DRAFT keeps the goal's status until the
+        draft is finished (finish_draft runs the reactivation then).
+        Only fresh creation offers the picker — the edit/draft modes
+        never re-link (the existing goal is shown as read-only)."""
+        if not self._new_task_mode or self._editing_task_id is not None:
+            return
+        candidates = [
+            goal
+            for goal in self.manager.goals.goals.values()
+            if goal.status is not GoalStatus.ARCHIVED
+            and goal.id != self._new_task_goal_id
+        ]
+        if not candidates:
+            self.notify(
+                "No goals to assign — capture one with Ctrl+Y first.",
+                title="Goals",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        self.push_screen(GoalAssignPicker(candidates), self._new_task_goal_picked)
+
+    def _new_task_goal_picked(self, goal_id: str | None) -> None:
+        # None = ESC / no pick: keep the form as it is.
+        if goal_id is None:
+            return
+        goal = self.manager.goals.get(goal_id)
+        self._new_task_goal_id = goal.id
+        self.query_one("#nt-goal", Static).update(
+            f"goal: [magenta]◆[/] {escape(goal.title_display)}"
+        )
+
     def action_unlink_viewed_goal(self) -> None:
         """The "unlink" header fragment over the viewed task (also a
         click target — a drag-selection ending on it is copying text,

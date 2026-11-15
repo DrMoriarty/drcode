@@ -378,6 +378,43 @@ async def test_remove_from_chain(tmp_path: Path) -> None:
         assert texts == ["alpha/m2"]
 
 
+async def test_remove_single_entry_without_highlight(tmp_path: Path) -> None:
+    """A single-entry chain needs no highlighting: Del removes the only
+    entry even when the group list was never focused (an OptionList keeps
+    `highlighted=None` until the user moves onto an option). With two or
+    more entries and no highlight Del still refuses."""
+    path = tmp_path / "models.json"
+    store = _seed_store(path)
+    catalog = store.load()
+    catalog.defaults[AgentRole.CODING] = [ModelRef(provider="alpha", model="m1")]
+    catalog.defaults[AgentRole.RESEARCH] = [
+        ModelRef(provider="alpha", model="m1"),
+        ModelRef(provider="beta", model="m3"),
+    ]
+    store.save(catalog)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, AgentChainsScreen)
+        # Single-entry chain: no highlight → Del still removes it.
+        assert _group_list(screen, AgentRole.CODING).highlighted is None
+        await pilot.click("#ac-del-coding")
+        await pilot.pause()
+        assert "removed" in _status(screen)
+        assert _group_list(screen, AgentRole.CODING).option_count == 0
+        # Multi-entry chain, nothing highlighted → the hint, no removal.
+        assert _group_list(screen, AgentRole.RESEARCH).highlighted is None
+        await pilot.click("#ac-del-research")
+        await pilot.pause()
+        assert "Select an entry" in _status(screen)
+        assert _group_list(screen, AgentRole.RESEARCH).option_count == 2
+        # Saving now persists only the untouched research chain.
+        await pilot.click("#ac-save")
+        await pilot.pause()
+        data = json.loads(path.read_text())
+        assert data["defaults"] == {"research": ["alpha/m1", "beta/m3"]}
+
+
 async def test_save_drops_emptied_chain(tmp_path: Path) -> None:
     """Removing every entry of a prefilled chain and saving drops the
     role's slot entirely (empty chain = absence)."""

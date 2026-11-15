@@ -47,7 +47,6 @@ from textual.widgets import (
     RadioSet,
     Select,
     Static,
-    Switch,
 )
 
 from ..settings import (
@@ -219,16 +218,34 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         width: 1fr;
     }
     # "Changed" marker: a border-tint is useless under the compact form
-    # styles (the border the signal used to color is gone). Switch is
-    # tinted directly; for Select the tint goes on the child SelectCurrent
-    # — its opaque background hides the parent's tint (plus $warning text
-    # for terminals without truecolor).
+    # styles (the border the signal used to color is gone). Boolean
+    # toggles are compact RadioButtons — the tint goes on the toggle
+    # glyph (its background-tint alone would be invisible on a
+    # transparent background; plus $warning text for terminals without
+    # truecolor); for Select the tint goes on the child SelectCurrent
+    # — its opaque background hides the parent's tint.
     Select.changed > SelectCurrent {
         background-tint: $warning 25%;
         color: $warning;
     }
-    Switch.changed {
+    .ts-toggle-row > RadioButton.changed > .toggle--button {
         background-tint: $warning 25%;
+        color: $warning;
+    }
+    .ts-toggle-row {
+        height: auto;
+        margin-top: 1;
+    }
+    .ts-toggle-row > RadioButton {
+        width: auto;
+        background: transparent;
+        border: none;
+        padding: 0;
+        margin-right: 1;
+    }
+    .ts-toggle-row > .ts-label {
+        width: 1fr;
+        height: auto;
     }
     .ts-dormant {
         opacity: 0.55;
@@ -439,44 +456,55 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-web-fetch-block",
                     placeholder="(empty — nothing blocked)",
                 )
-                yield Label(
-                    "Agent creates drafts — the agents' task-creation tools "
-                    "(research: bug/feature, tester: bug) create DRAFT tasks; "
-                    "a draft does not enter the queue until you open and "
-                    "finish it",
-                    classes="ts-label",
-                )
-                yield Switch(value=d.agent_creates_drafts, id="ts-agent-drafts")
-                yield Label(
-                    "Generate task titles — the agent names a task from its "
-                    "description on the task's first activation (once per "
-                    "task; a failure keeps the first-line title)",
-                    classes="ts-label",
-                )
-                yield Switch(value=d.generate_task_titles, id="ts-generate-titles")
-                yield Label(
-                    "Context-eviction hint — remind the model about "
-                    "mark_unneeded when the context fill passes ~half its "
-                    "window (useful only on some setups)",
-                    classes="ts-label",
-                )
-                yield Switch(value=d.eviction_hint, id="ts-eviction-hint")
-                yield Label(
-                    "Automatic context unloading — auto-clear old tool "
-                    "results (collapse to re-runnable stubs) once they age "
-                    "past ~10 model exchanges; off: results are cleared "
-                    "only when the agent marks them mark_unneeded",
-                    classes="ts-label",
-                )
-                yield Switch(value=d.auto_context_unloading, id="ts-auto-unload")
-                yield Label(
-                    "Live todo tail — attach the task's live checklist to "
-                    "every model request as a trailing message (off: the "
-                    "requests are never modified; the checklist stays in "
-                    "the TUI)",
-                    classes="ts-label",
-                )
-                yield Switch(value=d.todo_tail, id="ts-todo-tail")
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(
+                        value=d.agent_creates_drafts, id="ts-agent-drafts"
+                    )
+                    yield Label(
+                        "Agent creates drafts — the agents' task-creation tools "
+                        "(research: bug/feature, tester: bug) create DRAFT tasks; "
+                        "a draft does not enter the queue until you open and "
+                        "finish it",
+                        classes="ts-label",
+                    )
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(
+                        value=d.generate_task_titles, id="ts-generate-titles"
+                    )
+                    yield Label(
+                        "Generate task titles — the agent names a task from its "
+                        "description on the task's first activation (once per "
+                        "task; a failure keeps the first-line title)",
+                        classes="ts-label",
+                    )
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(value=d.eviction_hint, id="ts-eviction-hint")
+                    yield Label(
+                        "Context-eviction hint — remind the model about "
+                        "mark_unneeded when the context fill passes ~half its "
+                        "window (useful only on some setups)",
+                        classes="ts-label",
+                    )
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(
+                        value=d.auto_context_unloading, id="ts-auto-unload"
+                    )
+                    yield Label(
+                        "Automatic context unloading — auto-clear old tool "
+                        "results (collapse to re-runnable stubs) once they age "
+                        "past ~10 model exchanges; off: results are cleared "
+                        "only when the agent marks them mark_unneeded",
+                        classes="ts-label",
+                    )
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(value=d.todo_tail, id="ts-todo-tail")
+                    yield Label(
+                        "Live todo tail — attach the task's live checklist to "
+                        "every model request as a trailing message (off: the "
+                        "requests are never modified; the checklist stays in "
+                        "the TUI)",
+                        classes="ts-label",
+                    )
                 yield Label(
                     "Pre-run compaction threshold (tokens) — when a task "
                     "resumes after ≥3 min idle (cache burnt out) and its "
@@ -489,18 +517,19 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-compaction-resume",
                     placeholder="0 = off (minimum 20000)",
                 )
-                yield Label(
-                    "Background compaction — prepare the context summary "
-                    "before the compaction threshold is crossed, without "
-                    "pausing the run (needs a compaction model different "
-                    "from the agent's model; held summaries are lost on "
-                    "restart)",
-                    classes="ts-label",
-                )
-                yield Switch(
-                    value=d.background_compaction,
-                    id="ts-background-compaction",
-                )
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(
+                        value=d.background_compaction,
+                        id="ts-background-compaction",
+                    )
+                    yield Label(
+                        "Background compaction — prepare the context summary "
+                        "before the compaction threshold is crossed, without "
+                        "pausing the run (needs a compaction model different "
+                        "from the agent's model; held summaries are lost on "
+                        "restart)",
+                        classes="ts-label",
+                    )
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -554,8 +583,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-git-research",
                         )
-                yield Label("Keep computer awake", classes="ts-label")
-                yield Switch(value=d.keep_awake, id="ts-keep-awake")
+                with Horizontal(classes="ts-toggle-row"):
+                    yield RadioButton(value=d.keep_awake, id="ts-keep-awake")
+                    yield Label("Keep computer awake", classes="ts-label")
             yield Vertical(id="ts-hints")
             yield Static("", id="ts-workflow-info")
             with Horizontal(id="ts-buttons"):
@@ -627,6 +657,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             with self.prevent(Select.Changed):
                 select.value = value  # type: ignore[assignment]
 
+    def _set_toggle(self, selector: str, value: bool) -> None:
+        toggle = self.query_one(selector, RadioButton)
+        if toggle.value != value:
+            with self.prevent(RadioButton.Changed):  # same staleness rule
+                toggle.value = value
+
     def _sync_preset(self) -> None:
         """Press the radio of the preset the draft currently matches, or
         "Custom" when it matches none (the display-state rule)."""
@@ -660,30 +696,13 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-git-research", d.git_policy.research)
         self._set_select("#ts-retention", d.completed_retention)
         self._set_select("#ts-esc-abort", d.esc_abort)
-        switch = self.query_one("#ts-keep-awake", Switch)
-        if switch.value != d.keep_awake:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                switch.value = d.keep_awake
-        drafts_switch = self.query_one("#ts-agent-drafts", Switch)
-        if drafts_switch.value != d.agent_creates_drafts:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                drafts_switch.value = d.agent_creates_drafts
-        titles_switch = self.query_one("#ts-generate-titles", Switch)
-        if titles_switch.value != d.generate_task_titles:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                titles_switch.value = d.generate_task_titles
-        eviction_switch = self.query_one("#ts-eviction-hint", Switch)
-        if eviction_switch.value != d.eviction_hint:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                eviction_switch.value = d.eviction_hint
-        auto_unload_switch = self.query_one("#ts-auto-unload", Switch)
-        if auto_unload_switch.value != d.auto_context_unloading:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                auto_unload_switch.value = d.auto_context_unloading
-        tail_switch = self.query_one("#ts-todo-tail", Switch)
-        if tail_switch.value != d.todo_tail:
-            with self.prevent(Switch.Changed):  # same staleness rule
-                tail_switch.value = d.todo_tail
+        self._set_toggle("#ts-keep-awake", d.keep_awake)
+        self._set_toggle("#ts-agent-drafts", d.agent_creates_drafts)
+        self._set_toggle("#ts-generate-titles", d.generate_task_titles)
+        self._set_toggle("#ts-eviction-hint", d.eviction_hint)
+        self._set_toggle("#ts-auto-unload", d.auto_context_unloading)
+        self._set_toggle("#ts-todo-tail", d.todo_tail)
+        self._set_toggle("#ts-background-compaction", d.background_compaction)
         resume_input = self.query_one("#ts-compaction-resume", Input)
         if resume_input.value != str(d.compaction_resume_min_tokens):
             with self.prevent(Input.Changed):  # same staleness rule
@@ -714,6 +733,9 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
             "#ts-auto-unload": (d.auto_context_unloading != o.auto_context_unloading),
             "#ts-todo-tail": d.todo_tail != o.todo_tail,
+            "#ts-background-compaction": (
+                d.background_compaction != o.background_compaction
+            ),
             "#ts-compaction-resume": (
                 d.compaction_resume_min_tokens != o.compaction_resume_min_tokens
             ),
@@ -951,44 +973,44 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             self._draft.esc_abort = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-keep-awake")
-    def _keep_awake_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-keep-awake")
+    def _keep_awake_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.keep_awake:
             self._draft.keep_awake = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-agent-drafts")
-    def _agent_drafts_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-agent-drafts")
+    def _agent_drafts_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.agent_creates_drafts:
             self._draft.agent_creates_drafts = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-generate-titles")
-    def _generate_titles_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-generate-titles")
+    def _generate_titles_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.generate_task_titles:
             self._draft.generate_task_titles = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-eviction-hint")
-    def _eviction_hint_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-eviction-hint")
+    def _eviction_hint_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.eviction_hint:
             self._draft.eviction_hint = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-auto-unload")
-    def _auto_unload_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-auto-unload")
+    def _auto_unload_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.auto_context_unloading:
             self._draft.auto_context_unloading = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-todo-tail")
-    def _todo_tail_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-todo-tail")
+    def _todo_tail_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.todo_tail:
             self._draft.todo_tail = event.value
             self._refresh()
 
-    @on(Switch.Changed, "#ts-background-compaction")
-    def _background_compaction_changed(self, event: Switch.Changed) -> None:
+    @on(RadioButton.Changed, "#ts-background-compaction")
+    def _background_compaction_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.background_compaction:
             self._draft.background_compaction = event.value
             self._refresh()

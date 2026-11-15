@@ -28,6 +28,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, RadioButton, Static
 
+from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 from .toggle_row import ToggleRow
 
 
@@ -39,14 +40,18 @@ class NotificationsSetup:
     topic: str
 
 
-class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
+class NotificationsDialog(
+    ChangedHighlightMixin, ModalScreen[NotificationsSetup | None]
+):
     """Modal form: enable switch, ntfy.sh topic, Save / ESC-to-cancel."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Close", priority=True),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = (
+        CHANGED_CSS
+        + """
     NotificationsDialog {
         align: center middle;
     }
@@ -89,6 +94,7 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
         text-align: right;
     }
     """
+    )
 
     def __init__(self, enabled: bool = False, topic: str = "") -> None:
         super().__init__()
@@ -141,6 +147,9 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
+        # Both change handlers funnel through here (and on_mount too), so
+        # the changed markers re-sync on every edit.
+        self._sync_changed()
         enabled = self.query_one("#ntf-enabled", RadioButton).value
         topic = self.query_one("#ntf-topic", Input).value.strip()
         status = self.query_one("#ntf-status", Static)
@@ -156,6 +165,22 @@ class NotificationsDialog(ModalScreen[NotificationsSetup | None]):
         status.remove_class("error")
         status.add_class("ok")
         status.update(f"✓ Events will be published to ntfy.sh/{topic}.")
+
+    def _sync_changed(self) -> None:
+        """Mark every field whose live value differs from the saved one
+        (the shared "changed" highlight)."""
+        self._apply_changed(
+            {
+                self.query_one("#ntf-enabled", RadioButton): (
+                    self.query_one("#ntf-enabled", RadioButton).value
+                    != self._initial_enabled
+                ),
+                self.query_one("#ntf-topic", Input): (
+                    self.query_one("#ntf-topic", Input).value.strip()
+                    != self._initial_topic
+                ),
+            }
+        )
 
     # -- save ------------------------------------------------------------------
 

@@ -1250,6 +1250,49 @@ async def test_voice_dialog_cancel_keeps_settings(project_root: Any) -> None:
         assert app.settings.voice_api_url == ""
 
 
+async def test_voice_dialog_changed_markers_track_edits(project_root: Any) -> None:
+    """The orange "changed" marker appears when a field is edited away from
+    its saved value and clears again on revert (ASR model Input, completed
+    announcements ToggleRow label)."""
+    from textual.widgets import Input, RadioButton
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.toggle_row import ToggleRow
+    from drcode.tui.voice_dialog import VoiceSettingsDialog
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        app.action_change_voice()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, VoiceSettingsDialog)
+
+        asr = dialog.query_one("#voice-asr", Input)
+        toggle = dialog.query_one("#voice-tts-completed", RadioButton)
+        row = toggle.parent
+        assert isinstance(row, ToggleRow)
+        assert not asr.has_class("changed")
+        assert not row.label.has_class("changed")
+
+        # Edit the ASR model away from the saved value (empty) — the Input
+        # tints; reverting to the saved value clears the tint.
+        asr.value = "x5-asr/x5-asr-large"
+        await pilot.pause()
+        assert asr.has_class("changed")
+        asr.value = ""
+        await pilot.pause()
+        assert not asr.has_class("changed")
+
+        # The completed-announcements toggle marks the row's Label.
+        toggle.value = True
+        await pilot.pause()
+        assert row.label.has_class("changed")
+        toggle.value = False
+        await pilot.pause()
+        assert not row.label.has_class("changed")
+
+
 async def test_voice_dialog_language_select_defaults_to_terminal(
     project_root: Any, monkeypatch: Any
 ) -> None:

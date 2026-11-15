@@ -26,6 +26,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
 
 from ..agent import probe_model
+from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 
 # Probe timeout for an explicit user-initiated check: the header's
 # background probe uses 5s, here a slow gateway deserves more patience
@@ -45,7 +46,7 @@ class ModelSetup:
     health_check_url: str = ""  # verified availability endpoint, cached for later runs
 
 
-class ModelSetupDialog(ModalScreen[ModelSetup | None]):
+class ModelSetupDialog(ChangedHighlightMixin, ModalScreen[ModelSetup | None]):
     """Modal form: model (required), URL (required), API key and max
     context tokens (optional). ESC — skip, Save — validate & apply."""
 
@@ -53,7 +54,9 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         Binding("escape", "cancel", "Skip", priority=True),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = (
+        CHANGED_CSS
+        + """
     ModelSetupDialog {
         align: center middle;
     }
@@ -94,6 +97,7 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
         text-align: right;
     }
     """
+    )
 
     def __init__(
         self,
@@ -240,6 +244,37 @@ class ModelSetupDialog(ModalScreen[ModelSetup | None]):
                 max_tokens=max_tokens,
                 health_check_url=checked_url,
             )
+        )
+
+    @on(Input.Changed)
+    def _input_changed(self, event: Input.Changed) -> None:
+        self._sync_changed()
+
+    def _sync_changed(self) -> None:
+        """Mark every field whose live value differs from the initial one
+        (the shared "changed" highlight). The token fields compare the raw
+        input text against the pre-filled display value (an emptied field
+        IS a change — Save would then store "keep the default")."""
+        self._apply_changed(
+            {
+                self.query_one("#sd-model", Input): (
+                    self.query_one("#sd-model", Input).value != self._initial_model
+                ),
+                self.query_one("#sd-url", Input): (
+                    self.query_one("#sd-url", Input).value != self._initial_base_url
+                ),
+                self.query_one("#sd-key", Input): (
+                    self.query_one("#sd-key", Input).value != self._initial_api_key
+                ),
+                self.query_one("#sd-ctx", Input): (
+                    self.query_one("#sd-ctx", Input).value
+                    != str(self._initial_max_context_tokens)
+                ),
+                self.query_one("#sd-tokens", Input): (
+                    self.query_one("#sd-tokens", Input).value
+                    != str(self._initial_max_tokens)
+                ),
+            }
         )
 
     @on(Button.Pressed, "#sd-save")

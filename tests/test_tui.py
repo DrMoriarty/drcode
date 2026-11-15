@@ -2161,6 +2161,49 @@ async def test_notifications_dialog_escape_keeps_settings(
         assert settings.ntfy_topic == "topic-a"
 
 
+async def test_notifications_dialog_changed_markers(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """The orange "changed" marker appears when a field is edited away from
+    its saved value and clears again on revert (topic Input, Enabled
+    ToggleRow label)."""
+    from textual.widgets import Input, RadioButton
+
+    from drcode.tui.notifications_dialog import NotificationsDialog
+    from drcode.tui.toggle_row import ToggleRow
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the setup dialog
+        await pilot.pause()
+        app.action_change_notifications()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, NotificationsDialog)
+
+        topic = dialog.query_one("#ntf-topic", Input)
+        row = dialog.query_one("#ntf-enabled-row", ToggleRow)
+        assert not topic.has_class("changed")
+        assert not row.label.has_class("changed")
+
+        # Edit the topic away from the saved value (empty) — the Input
+        # tints; reverting to the saved value clears the tint.
+        topic.value = "my-secret-topic"
+        await pilot.pause()
+        assert topic.has_class("changed")
+        topic.value = ""
+        await pilot.pause()
+        assert not topic.has_class("changed")
+
+        # The Enabled toggle marks the row's explanatory Label.
+        enabled = dialog.query_one("#ntf-enabled", RadioButton)
+        enabled.value = True
+        await pilot.pause()
+        assert row.label.has_class("changed")
+        enabled.value = False
+        await pilot.pause()
+        assert not row.label.has_class("changed")
+
+
 # -- task search dialog (Ctrl+F) ---------------------------------------------------
 
 

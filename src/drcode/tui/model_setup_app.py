@@ -53,6 +53,7 @@ from ..providers import (
     UserModelsStore,
     load_seeded_catalog,
 )
+from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 
 _PROBE_TIMEOUT = 15.0
 
@@ -175,7 +176,7 @@ class _ModelTable(DataTable):
         await super()._on_click(event)
 
 
-class ModelCatalogScreen(ModalScreen[None]):
+class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
     """Provider/model catalog editor (modal inside the main TUI, or the
     whole UI of the standalone debug app)."""
 
@@ -183,7 +184,9 @@ class ModelCatalogScreen(ModalScreen[None]):
         Binding("escape", "close", "Close", priority=True),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = (
+        CHANGED_CSS
+        + """
     ModelCatalogScreen {
         align: center middle;
     }
@@ -280,6 +283,7 @@ class ModelCatalogScreen(ModalScreen[None]):
         color: $text-disabled;
     }
     """
+    )
 
     def __init__(
         self,
@@ -574,6 +578,63 @@ class ModelCatalogScreen(ModalScreen[None]):
         self._clear_model_inputs()
         self._refresh_models()
         self._status("")
+
+    # -- changed markers --------------------------------------------------------
+
+    @on(Input.Changed)
+    def _form_input_changed(self, event: Input.Changed) -> None:
+        # The model-name filter is a view control, not a stored value.
+        # The programmatic loads (_load_form / _select_model /
+        # _clear_model_inputs) also arrive here — they restore exactly
+        # the snapshot values, so the sync clears the markers.
+        if event.input.id != "mc-model-filter":
+            self._sync_changed()
+
+    def _sync_changed(self) -> None:
+        """Mark every form field whose live value differs from the loaded
+        catalog state (the shared "changed" highlight). The provider form
+        compares against the selected provider, the model editor against
+        the selected model entry (no selection = the empty editor)."""
+        provider = self._provider()
+        entry = self._current_model_entry()
+        expected_parallel = (
+            str(provider.max_parallel_requests)
+            if provider is not None and provider.max_parallel_requests > 0
+            else ""
+        )
+        pct = entry.compaction_threshold if entry is not None else None
+        self._apply_changed(
+            {
+                self.query_one("#mc-name", Input): (
+                    self.query_one("#mc-name", Input).value.strip()
+                    != (provider.name if provider else "")
+                ),
+                self.query_one("#mc-url", Input): (
+                    self.query_one("#mc-url", Input).value.strip()
+                    != (provider.base_url if provider else "")
+                ),
+                self.query_one("#mc-key", Input): (
+                    self.query_one("#mc-key", Input).value.strip()
+                    != (provider.api_key if provider else "")
+                ),
+                self.query_one("#mc-parallel", Input): (
+                    self.query_one("#mc-parallel", Input).value.strip()
+                    != expected_parallel
+                ),
+                self.query_one("#mc-model-id", Input): (
+                    self.query_one("#mc-model-id", Input).value.strip()
+                    != (entry.id if entry else "")
+                ),
+                self.query_one("#mc-ctx", Input): (
+                    self.query_one("#mc-ctx", Input).value.strip()
+                    != (str(entry.max_context_tokens) if entry else "")
+                ),
+                self.query_one("#mc-pct", Input): (
+                    self.query_one("#mc-pct", Input).value.strip()
+                    != ("" if pct is None else str(pct))
+                ),
+            }
+        )
 
     # -- lifecycle ------------------------------------------------------------
 

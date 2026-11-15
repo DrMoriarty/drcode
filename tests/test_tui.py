@@ -3781,7 +3781,7 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, TaskSettingsDialog)
-        # The 11 field widgets are all there, grouped under their three
+        # The 11 field widgets are all there, grouped under their
         # section headers (plus the workflow-preset header on top).
         for selector in (
             "#ts-isolation",
@@ -3812,7 +3812,13 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             str(cast(Label, label).render())
             for label in dialog.query(".ts-section").results(Label)
         ]
-        assert sections == ["Workflow preset", "Workflow", "Testing", "Git"]
+        assert sections == [
+            "Workflow preset",
+            "Workflow",
+            "Context management",
+            "Testing",
+            "Git",
+        ]
         # The main-menu provider no longer carries the task entries: it
         # keeps only the workflow/github/notifications/voice preferences.
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]

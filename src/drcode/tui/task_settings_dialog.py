@@ -11,8 +11,8 @@ the old TaskSettingsPalette sub-menu; the per-field palettes and their
   one applies it to the draft and every field widget updates in place;
   "Custom" is only the display state of a draft matching no preset
   (mirrors ``action_workflow_preset_custom``);
-- groups the field widgets into the three sections of the old sub-menu
-  (Workflow / Testing / Git) — the closely-related fields sit side by side
+- groups the field widgets into sections (Workflow / Context management /
+  Testing / Git) — the closely-related fields sit side by side
   in two-column rows — marking fields that differ from the saved
   values and dimming the currently dormant ones (their value parks and
   activates when the governing field turns on — the user's choice is
@@ -151,7 +151,7 @@ class DialogScroll(VerticalScroll):
 
 
 class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
-    """Modal form: preset radio row, three sections of field widgets,
+    """Modal form: preset radio row, sections of field widgets,
     live hints, Apply / ESC-to-cancel. Returns the accepted draft (the
     same object it mutated) or None on cancel."""
 
@@ -475,6 +475,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                         "task; a failure keeps the first-line title)",
                         classes="ts-label",
                     )
+                yield Label("Context management", classes="ts-section")
                 with Horizontal(classes="ts-toggle-row"):
                     yield RadioButton(value=d.eviction_hint, id="ts-eviction-hint")
                     yield Label(

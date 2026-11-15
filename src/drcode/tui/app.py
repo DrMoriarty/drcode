@@ -1048,7 +1048,8 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     yield Static("", id="nt-goal")
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
-                        "tab — switch type   ctrl+enter — create   "
+                        "tab — switch type   ctrl+g — depends on   "
+                        "ctrl+l — goal   ctrl+enter — create   "
                         "ctrl+h — create on hold   esc — cancel",
                         id="nt-hint",
                     )
@@ -2068,6 +2069,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 or any(report_path(self.project_root, t.id).exists() for t in tasks)
             )
         if action == "submit_new_task_hold":
+            return self._new_task_mode and self._editing_task_id is None
+        if action == "assign_new_task_goal":
+            # Ctrl+L in the fresh new-task form only: the edit/draft
+            # modes never re-link (the goal line is read-only there).
             return self._new_task_mode and self._editing_task_id is None
         if action == "submit_new_task_draft":
             # Fresh creation only — a held task cannot become a draft (a

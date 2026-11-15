@@ -135,6 +135,13 @@ class NewTaskInput(WordNavTextArea):
         Binding("ctrl+b", "push_to_talk", "Voice", priority=True, show=False),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
+        # Ctrl+L — assign a goal to the task being composed (the same
+        # GoalAssignPicker the task header's "+ assign" link opens).
+        # Fresh creation only: the app's check_action hides the key
+        # while editing (the edit/draft modes never re-link).
+        Binding(
+            "ctrl+l", "app.assign_new_task_goal", "Assign goal", priority=True
+        ),
         # Ctrl+D — create as draft / save as draft while editing one
         # (gated by the app's check_action like the ctrl+h pair above).
         # The widget binding out-prioritizes the app's global ctrl+d
@@ -187,6 +194,9 @@ class DepsInput(Input):
         Binding("ctrl+g,tab", "focus_editor", "Back to editor", priority=True),
         Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
         Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
+        Binding(
+            "ctrl+l", "app.assign_new_task_goal", "Assign goal", priority=True
+        ),
         Binding(
             "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
         ),

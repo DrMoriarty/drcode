@@ -58,12 +58,11 @@ from .model_setup_app import (
     _truncate_middle,
 )
 
-# Cells reserved for the vertical scrollbar of an OptionList, so a label
-# never wraps onto a second line (it is middle-truncated instead — same
-# approach as the catalog table's model id column).
-_SCROLLBAR_ALLOWANCE = 2
-# Fallback label widths, used before the first layout pass (widget size
-# is still 0): roughly the CSS width of the lists minus the prefix.
+# Fallback label widths, used before the first layout pass (the widget's
+# render region is still empty): roughly the CSS width of the lists minus
+# the prefix. Labels are middle-truncated to the list's real render width
+# (see `_label_width`) so they never wrap onto a second line — same
+# approach as the catalog table's model id column.
 _FALLBACK_RIGHT_WIDTH = 50
 _FALLBACK_GROUP_WIDTH = 42
 
@@ -91,12 +90,21 @@ class _FittingOptionList(OptionList):
 
 
 def _label_width(option_list: OptionList, fallback: int) -> int:
-    """Usable character width for one option line of `option_list`
-    (minus the scrollbar allowance; `fallback` before the first layout)."""
-    width = option_list.size.width
+    """Usable character width for one option line of `option_list`.
+
+    Measured from the widget's REAL render geometry: OptionList wraps
+    option lines at `scrollable_content_region.width`, which already
+    excludes border, padding and a SHOWN vertical scrollbar. When the
+    scrollbar is not shown yet its cells are still reserved — it appears
+    only once the options are added, and no Resize event fires then, so
+    an un-reserved label would wrap. `fallback` before the first layout
+    (the render region is still empty)."""
+    width = option_list.scrollable_content_region.width
     if not width:
         return fallback
-    return max(8, width - _SCROLLBAR_ALLOWANCE)
+    if not option_list.show_vertical_scrollbar:
+        width -= option_list.styles.scrollbar_size_vertical
+    return max(8, width)
 
 
 # The provider part of a right-hand list label (everything up to the
@@ -372,6 +380,11 @@ class AgentChainsScreen(ModalScreen["bool | None"]):
             self._status(f"⚠ {self.store.last_warning}")
         self._refresh_right()
         self._refresh_all_groups()
+        # The refreshes above run before the first layout pass (the lists
+        # still have no render region), so the labels are built at the
+        # fallback widths; re-fit them once the layout is final even if no
+        # Resize event arrives.
+        self.call_after_refresh(self._lists_resized)
         self.query_one("#ac-filter", Input).focus()
 
     def action_close(self) -> None:

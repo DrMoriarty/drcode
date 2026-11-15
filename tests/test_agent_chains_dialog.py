@@ -136,8 +136,12 @@ async def test_prefill_and_favorites_order(tmp_path: Path) -> None:
 async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
     """Long provider/model names are middle-truncated — in the right
     catalog list and in the per-agent group lists alike — so an option
-    never wraps onto a second line."""
+    never wraps onto a second line. The fitting width is the list's REAL
+    render width (`scrollable_content_region`), not the widget size:
+    OptionList's border+padding eat 2 cells per side and the vertical
+    scrollbar appears only once the options are added."""
     long_id = "a-very-long-model-identifier-that-would-wrap-in-a-narrow-column"
+    exact_fallback = "api-copilot.x5.ru/x5-airun-medium-thinking"  # 42 chars
     path = tmp_path / "models.json"
     store = UserModelsStore(path)
     store.save(
@@ -146,34 +150,48 @@ async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
                 Provider(
                     name="alpha",
                     base_url="http://a/v1",
-                    models=[ModelEntry(id=long_id)],
+                    models=[
+                        ModelEntry(id=long_id),
+                        ModelEntry(id=exact_fallback),
+                    ],
                 )
             ]
         )
     )
     catalog = store.load()
-    catalog.defaults[AgentRole.CODING] = [ModelRef(provider="alpha", model=long_id)]
+    catalog.defaults[AgentRole.CODING] = [
+        ModelRef(provider="alpha", model=long_id),
+        ModelRef(provider="alpha", model=exact_fallback),
+    ]
     store.save(catalog)
     async with _Host(store).run_test(size=(110, 40)) as pilot:
         await pilot.pause()
         screen = pilot.app.screen
         assert isinstance(screen, AgentChainsScreen)
         right = _right_list(screen)
+        group = _group_list(screen, AgentRole.CODING)
+        # Ground truth for "no wrap": every option occupies exactly one
+        # rendered line of its list.
+        for option_list in (right, group):
+            assert option_list.virtual_size.height == option_list.option_count
         label = str(right.options[0].prompt)
-        # Fits the list width (scrollbar allowance included) and keeps
-        # BOTH ends visible around the ellipsis.
-        assert len(label) <= right.size.width - 2
+        # Fits the list's real render width and keeps BOTH ends visible
+        # around the ellipsis.
+        assert len(label) <= right.scrollable_content_region.width
         assert "…" in label
         assert label.startswith("  alpha/a-very-long")
         assert label.endswith("column")
         # Same treatment in the per-agent chain list (no positional
-        # prefix — a number would make long ids wrap).
-        group_label = str(_group_list(screen, AgentRole.CODING).options[0].prompt)
-        group = _group_list(screen, AgentRole.CODING)
-        assert len(group_label) <= group.size.width - 2
+        # prefix — a number would make long ids wrap). The 42-char name
+        # sits exactly at the pre-layout fallback width: it must still be
+        # re-fitted to the (narrower) real render width after layout.
+        group_label = str(group.options[0].prompt)
+        assert len(group_label) <= group.scrollable_content_region.width
         assert "…" in group_label
         assert group_label.startswith("alpha/a-very-")
         assert group_label.endswith("-a-narrow-column")
+        second_group_label = str(group.options[1].prompt)
+        assert len(second_group_label) <= group.scrollable_content_region.width
 
 
 async def test_filter_narrows_model_list(tmp_path: Path) -> None:

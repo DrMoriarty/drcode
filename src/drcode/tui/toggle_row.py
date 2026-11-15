@@ -20,6 +20,15 @@ settings dialog's ``_set_toggle``): assigning ``value`` posts a
 ``RadioButton.Changed`` message that Textual delivers asynchronously, so
 such an event can be STALE by the time its handler runs — the guard
 suppresses it.
+
+The whole row is the click target: the Label carries its own click
+handler that flips the RadioButton — a click on the explanatory text
+activates the toggle exactly like a click on the glyph (the reference
+behavior of the GitHub dialog's interval radio group, where the text is
+the RadioButton's own content). A label click is a genuine USER action,
+so it POSTS ``RadioButton.Changed`` normally — the draft-tracking
+handlers must see it; only ``set_toggle`` (programmatic sync) goes
+through the ``prevent`` path.
 """
 
 from __future__ import annotations
@@ -30,6 +39,21 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Label, RadioButton
+
+
+class _RowLabel(Label):
+    """The row's explanatory label — clickable.
+
+    A click flips the row's RadioButton (the sibling glyph toggles
+    itself, this covers the text). The handler lives HERE, not on the
+    row: a Click event bubbles, so a row-level handler would also fire
+    for clicks on the RadioButton and toggle it twice.
+    """
+
+    def on_click(self) -> None:
+        row = self.parent
+        assert isinstance(row, ToggleRow)  # composed as ToggleRow's child
+        row.toggle.toggle()
 
 
 class ToggleRow(Horizontal):
@@ -85,7 +109,7 @@ class ToggleRow(Horizontal):
 
     def compose(self) -> ComposeResult:
         yield RadioButton(value=self._initial_value, id=self._toggle_id)
-        yield Label(self._row_label)
+        yield _RowLabel(self._row_label)
 
     @property
     def toggle(self) -> RadioButton:

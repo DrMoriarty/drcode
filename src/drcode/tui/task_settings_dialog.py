@@ -80,6 +80,7 @@ from ..settings import (
     task_settings_hints,
 )
 from .command_providers import WORKFLOW_PRESETS, workflow_preset_for
+from .toggle_row import ToggleRow
 
 if TYPE_CHECKING:
     from .app import DrCodeApp
@@ -224,21 +225,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     Select.changed > SelectCurrent {
         background-tint: $warning 25%;
         color: $warning;
-    }
-    .ts-toggle-row > RadioButton.changed > .toggle--button {
-        background-tint: $warning 25%;
-        color: $warning;
-    }
-    .ts-toggle-row {
-        height: auto;
-        margin-top: 1;
-    }
-    .ts-toggle-row > RadioButton {
-        width: auto;
-        background: transparent;
-        border: none;
-        padding: 0;
-        margin-right: 1;
     }
     .ts-dormant {
         opacity: 0.55;
@@ -454,56 +440,45 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-web-fetch-block",
                     placeholder="(empty — nothing blocked)",
                 )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(
-                        value=d.agent_creates_drafts, id="ts-agent-drafts"
-                    )
-                    yield Label(
-                        "Agent creates drafts — the agents' task-creation tools "
-                        "(research: bug/feature, tester: bug) create DRAFT tasks; "
-                        "a draft does not enter the queue until you open and "
-                        "finish it",
-                        classes="ts-label",
-                    )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(
-                        value=d.generate_task_titles, id="ts-generate-titles"
-                    )
-                    yield Label(
-                        "Generate task titles — the agent names a task from its "
-                        "description on the task's first activation (once per "
-                        "task; a failure keeps the first-line title)",
-                        classes="ts-label",
-                    )
+                yield ToggleRow(
+                    "Agent creates drafts — the agents' task-creation tools "
+                    "(research: bug/feature, tester: bug) create DRAFT tasks; "
+                    "a draft does not enter the queue until you open and "
+                    "finish it",
+                    value=d.agent_creates_drafts,
+                    toggle_id="ts-agent-drafts",
+                )
+                yield ToggleRow(
+                    "Generate task titles — the agent names a task from its "
+                    "description on the task's first activation (once per "
+                    "task; a failure keeps the first-line title)",
+                    value=d.generate_task_titles,
+                    toggle_id="ts-generate-titles",
+                )
                 yield Label("Context management", classes="ts-section")
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(value=d.eviction_hint, id="ts-eviction-hint")
-                    yield Label(
-                        "Context-eviction hint — remind the model about "
-                        "mark_unneeded when the context fill passes ~half its "
-                        "window (useful only on some setups)",
-                        classes="ts-label",
-                    )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(
-                        value=d.auto_context_unloading, id="ts-auto-unload"
-                    )
-                    yield Label(
-                        "Automatic context unloading — auto-clear old tool "
-                        "results (collapse to re-runnable stubs) once they age "
-                        "past ~10 model exchanges; off: results are cleared "
-                        "only when the agent marks them mark_unneeded",
-                        classes="ts-label",
-                    )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(value=d.todo_tail, id="ts-todo-tail")
-                    yield Label(
-                        "Live todo tail — attach the task's live checklist to "
-                        "every model request as a trailing message (off: the "
-                        "requests are never modified; the checklist stays in "
-                        "the TUI)",
-                        classes="ts-label",
-                    )
+                yield ToggleRow(
+                    "Context-eviction hint — remind the model about "
+                    "mark_unneeded when the context fill passes ~half its "
+                    "window (useful only on some setups)",
+                    value=d.eviction_hint,
+                    toggle_id="ts-eviction-hint",
+                )
+                yield ToggleRow(
+                    "Automatic context unloading — auto-clear old tool "
+                    "results (collapse to re-runnable stubs) once they age "
+                    "past ~10 model exchanges; off: results are cleared "
+                    "only when the agent marks them mark_unneeded",
+                    value=d.auto_context_unloading,
+                    toggle_id="ts-auto-unload",
+                )
+                yield ToggleRow(
+                    "Live todo tail — attach the task's live checklist to "
+                    "every model request as a trailing message (off: the "
+                    "requests are never modified; the checklist stays in "
+                    "the TUI)",
+                    value=d.todo_tail,
+                    toggle_id="ts-todo-tail",
+                )
                 yield Label(
                     "Pre-run compaction threshold (tokens) — when a task "
                     "resumes after ≥3 min idle (cache burnt out) and its "
@@ -516,19 +491,15 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-compaction-resume",
                     placeholder="0 = off (minimum 20000)",
                 )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(
-                        value=d.background_compaction,
-                        id="ts-background-compaction",
-                    )
-                    yield Label(
-                        "Background compaction — prepare the context summary "
-                        "before the compaction threshold is crossed, without "
-                        "pausing the run (needs a compaction model different "
-                        "from the agent's model; held summaries are lost on "
-                        "restart)",
-                        classes="ts-label",
-                    )
+                yield ToggleRow(
+                    "Background compaction — prepare the context summary "
+                    "before the compaction threshold is crossed, without "
+                    "pausing the run (needs a compaction model different "
+                    "from the agent's model; held summaries are lost on "
+                    "restart)",
+                    value=d.background_compaction,
+                    toggle_id="ts-background-compaction",
+                )
                 yield Label("Testing", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
@@ -582,9 +553,11 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-git-research",
                         )
-                with Horizontal(classes="ts-toggle-row"):
-                    yield RadioButton(value=d.keep_awake, id="ts-keep-awake")
-                    yield Label("Keep computer awake", classes="ts-label")
+                yield ToggleRow(
+                    "Keep computer awake",
+                    value=d.keep_awake,
+                    toggle_id="ts-keep-awake",
+                )
             yield Vertical(id="ts-hints")
             yield Static("", id="ts-workflow-info")
             with Horizontal(id="ts-buttons"):

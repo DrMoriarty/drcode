@@ -408,6 +408,37 @@ async def test_dialog_save_persists_settings(
     assert getattr(app, "_github_synced", False)
 
 
+async def test_dialog_label_click_toggles_enabled(project_root: Path) -> None:
+    """Clicking the Enabled row's explanatory Label flips the toggle — the
+    text is a click target, not only the glyph (the shared ToggleRow)."""
+    from textual.widgets import Button, Label, RadioButton
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.github_dialog import GitHubSettingsDialog
+    from drcode.tui.toggle_row import ToggleRow
+
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        app.action_change_github()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, GitHubSettingsDialog)
+
+        row = dialog.query_one("#gh-enabled-row", ToggleRow)
+        assert dialog.query_one("#gh-enabled", RadioButton).value is False
+
+        await pilot.click(row.query_one(Label))
+        await pilot.pause()
+        assert dialog.query_one("#gh-enabled", RadioButton).value is True
+
+        dialog.query_one("#gh-save", Button).press()
+        await pilot.pause()
+
+    assert ProjectSettingsStore(project_root).load().github_enabled is True
+
+
 async def test_dialog_escape_saves_nothing(project_root: Path) -> None:
     from drcode.tui.app import DrCodeApp
 

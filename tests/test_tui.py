@@ -4045,6 +4045,47 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
         assert dialog.query_one("#ts-todo-tail", RadioButton).value is True
 
 
+async def test_task_settings_dialog_label_click_toggles(app: DrCodeApp) -> None:
+    """Clicking a toggle row's explanatory Label flips the RadioButton and
+    runs the same draft handler as a click on the glyph (the rows are the
+    shared ToggleRow; the label click POSTS RadioButton.Changed)."""
+    from textual.widgets import Button, Label, RadioButton
+
+    from drcode.settings import ProjectSettingsStore
+    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_task_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, TaskSettingsDialog)
+
+        row = dialog.query_one("#ts-agent-drafts", RadioButton).parent
+        label = row.query_one(Label)
+        assert dialog.query_one("#ts-agent-drafts", RadioButton).value is False
+
+        # The row sits far down the scrollable form — scroll it fully into
+        # the viewport (a partial row keeps the click coordinates clipped).
+        dialog.query_one("#ts-body").scroll_to(y=6, animate=False)
+        await pilot.pause()
+        await pilot.click(label)
+        await pilot.pause()
+        assert dialog.query_one("#ts-agent-drafts", RadioButton).value is True
+        # The draft-tracking handler ran (the label click posts Changed).
+        assert dialog._draft.agent_creates_drafts is True
+        assert app.settings.agent_creates_drafts is False  # still draft-only
+
+        # Apply persists what the label click set.
+        dialog.query_one("#ts-apply", Button).press()
+        await pilot.pause()
+        assert app.settings.agent_creates_drafts is True
+        assert (
+            ProjectSettingsStore(app.project_root).load().agent_creates_drafts is True
+        )
+
+
 async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:
     """Picking a preset rewrites the field widgets; the first manual
     change flips the radio row to "Custom"."""

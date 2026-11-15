@@ -191,7 +191,8 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         background: $panel;
     }
     .ts-label {
-        width: auto;
+        width: 1fr; /* fill the row/column so long text WRAPS, never clips */
+        height: auto; /* grow with the wrapped line count */
         color: $text-muted;
         margin-top: 0; /* compact widgets need no border-spacing */
     }
@@ -206,10 +207,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
     .ts-col {
         width: 1fr;
         height: auto;
-    }
-    .ts-col > .ts-label {
-        height: 1;
-        overflow: hidden;
     }
     .ts-row .ts-col:first-child {
         margin-right: 1;
@@ -242,10 +239,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         border: none;
         padding: 0;
         margin-right: 1;
-    }
-    .ts-toggle-row > .ts-label {
-        width: 1fr;
-        height: auto;
     }
     .ts-dormant {
         opacity: 0.55;
@@ -282,6 +275,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         height: auto;
     }
     #ts-workflow-info {
+        width: 1fr; /* wrap long info lines instead of overflowing the dialog */
         color: $text-muted;
         margin-top: 1;
     }

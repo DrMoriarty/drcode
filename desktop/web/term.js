@@ -18,6 +18,13 @@
  * byte stream BEFORE xterm.js sees it and routed to the system clipboard:
  * first navigator.clipboard, then the pywebview bridge as fallback
  * (WKWebView often rejects clipboard writes without a user gesture).
+ *
+ * The same filter also intercepts OSC 0 / OSC 2 (window/tab title) — the
+ * TUI announces "DrCode — <project>" (plus an agent badge [F]/[B]/[R]/[T]
+ * while an agent runs) — and reflects it onto the owning tab, mirroring
+ * what iTerm2 does with the last title escape received. Still pure
+ * presentation: escape-sequence parsing in the terminal client, no drcode
+ * logic.
  */
 (function () {
   "use strict";
@@ -88,7 +95,16 @@
   /* ---- tab model ---- */
   /* tabs[] holds one object per tab, in tab-bar order:
    *   { id, kind: "welcome"|"terminal", project, started, closing,
-   *     ws, term, fit, webgl, filter, pane, elTerm, tabEl, labelEl }
+   *     ws, term, fit, webgl, filter, pane, elTerm, tabEl, labelEl,
+   *     badgeEl, desiredTitle, desiredBadge }
+   * desiredTitle/desiredBadge mirror the last OSC 0/2 title the tab's
+   * drcode process announced ("DrCode — <project>", optionally
+   * "DrCode [F] — <project>"): desiredTitle is the badge-stripped title
+   * shown on the tab instead of the plain project name, desiredBadge is
+   * the agent letter ([F]/[B]/[R]/[T]) shown as a separate element.
+   * Both are cleared when the session (re)starts or ends — and an EMPTY
+   * title escape (the TUI clears its title on unmount) means "back to
+   * the project name".
    * The welcome node (#welcome) is a SINGLE shared element moved into
    * whichever welcome-tab is active — only one tab is visible at a
    * time, so reparenting is enough. */
@@ -132,24 +148,37 @@
    */
   var OSC52_MAX = 16 * 1024 * 1024; // sanity cap on the base64 payload
 
-  function makeOsc52Filter(forward, copy) {
+  function makeOscFilter(forward, copy, setTitle) {
     var state = 0; // 0 normal, 1 saw ESC, 2 in OSC, 3 in OSC, saw ESC
     var osc = [];
     var ESC = 0x1b, BEL = 0x07, BRACKET = 0x5d, BACKSLASH = 0x5c;
 
     function finishOsc() {
-      var body = String.fromCharCode.apply(null, osc);
+      var bytes = osc;
       osc = [];
-      var parts = body.split(";");
+      var head = String.fromCharCode.apply(null, bytes);
+      var parts = head.split(";");
+      if ((parts[0] === "0" || parts[0] === "2") && setTitle) {
+        // Title body = everything after "0;"/"2;" — decode from the RAW
+        // bytes: String.fromCharCode would mangle the multibyte UTF-8 the
+        // TUI sends ("DrCode — <кириллица>"). ';' inside a title is legal,
+        // hence the +1 skips exactly one separator.
+        try {
+          setTitle(new TextDecoder("utf-8").decode(
+            new Uint8Array(bytes.slice(parts[0].length + 1))
+          ));
+        } catch (err) { /* malformed title — drop silently */ }
+        return;
+      }
       if (parts[0] !== "52" || parts.length < 2) return;
       var b64 = parts.length >= 3 ? parts.slice(2).join(";") : parts[1];
       if (!b64) return; // empty payload = OSC 52 "clear/query" — ignore
       if (b64.length > OSC52_MAX) return;
       try {
         var bin = atob(b64);
-        var bytes = new Uint8Array(bin.length);
-        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        var text = new TextDecoder("utf-8").decode(bytes);
+        var raw = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+        var text = new TextDecoder("utf-8").decode(raw);
         if (text) copy(text);
       } catch (err) {
         /* malformed OSC 52 — drop silently */
@@ -209,6 +238,36 @@
     return parts.pop() || path || "DrCode";
   }
 
+  /* Split an announced terminal title into the badge-stripped label and
+   * the agent letter. drcode announces "DrCode — <project>" when idle and
+   * "DrCode [F|B|R|T] — <project>" while an agent runs (src/drcode/tui/
+   * app.py); the badge moves to its own tab element, the rest stays the
+   * tab label. A title without the pattern is taken verbatim, badgeless. */
+  function parseTerminalTitle(title) {
+    var text = String(title == null ? "" : title);
+    var m = /^(.*?)\s*\[([FBRT])\]\s*—\s*(.*)$/.exec(text);
+    if (m) {
+      var head = m[1] ? m[1] + " — " : "";
+      return { title: (head + m[3]).trim(), badge: m[2] };
+    }
+    return { title: text.trim(), badge: "" };
+  }
+
+  /* setTitle callback from the OSC filter: mirror the last title escape
+   * the tab's process sent (what iTerm2 does) onto the tab itself. An
+   * EMPTY body is the TUI's title CLEAR on unmount → back to the project
+   * name. Only the active tab also drives the window title. */
+  function applyTerminalTitle(tab, title) {
+    if (!tab || tab.kind !== "terminal") return;
+    var parsed = parseTerminalTitle(title);
+    tab.desiredTitle = parsed.title || null;
+    tab.desiredBadge = parsed.badge || null;
+    refreshTabLabels();
+    if (activeTab === tab) {
+      setWindowTitle(tab.desiredTitle || "DrCode — " + projectTitle(tab.project));
+    }
+  }
+
   function nextTabId() {
     return "t" + nextTabSeq++;
   }
@@ -229,11 +288,23 @@
       elTerm: null,
       tabEl: null,
       labelEl: null,
+      badgeEl: null,
+      desiredTitle: null,
+      desiredBadge: null,
     };
     tabs.push(tab);
 
     var tabEl = document.createElement("li");
     tabEl.className = "tab";
+    var badge = document.createElement("span");
+    badge.className = "tab-badge";
+    badge.classList.add("hidden");
+    // Inline styling keeps the shell's stylesheet untouched — this is a
+    // presentation-only marker, not a drcode feature.
+    badge.style.flex = "none";
+    badge.style.color = "#4f9cf9";
+    badge.style.fontWeight = "600";
+    tabEl.appendChild(badge);
     var label = document.createElement("span");
     label.className = "tab-label";
     tabEl.appendChild(label);
@@ -249,6 +320,7 @@
     tabEl.addEventListener("click", function () { activateTab(tab); });
     tab.tabEl = tabEl;
     tab.labelEl = label;
+    tab.badgeEl = badge;
     elTabs.appendChild(tabEl);
 
     var pane = document.createElement("div");
@@ -278,8 +350,14 @@
         tab.labelEl.textContent = "New project";
         tab.tabEl.title = "New project";
       } else {
-        tab.labelEl.textContent = projectTitle(tab.project);
+        // The process's announced title (when present) wins over the
+        // plain project name — the iTerm2 behavior this shell mirrors.
+        tab.labelEl.textContent = tab.desiredTitle || projectTitle(tab.project);
         tab.tabEl.title = tab.project || "";
+      }
+      if (tab.badgeEl) {
+        tab.badgeEl.textContent = tab.desiredBadge ? "[" + tab.desiredBadge + "]" : "";
+        tab.badgeEl.classList.toggle("hidden", !tab.desiredBadge);
       }
     });
   }
@@ -310,7 +388,9 @@
       sendResize(tab);
       if (tab.term) tab.term.focus();
     }
-    if (tab.project) setWindowTitle("DrCode — " + projectTitle(tab.project));
+    if (tab.project) {
+      setWindowTitle(tab.desiredTitle || "DrCode — " + projectTitle(tab.project));
+    }
     updateFontBtnVisibility();
   }
 
@@ -780,11 +860,12 @@
     );
     ws.binaryType = "arraybuffer";
     tab.ws = ws;
-    tab.filter = makeOsc52Filter(
+    tab.filter = makeOscFilter(
       function (bytes) {
         if (tab.term) tab.term.write(bytes);
       },
-      copyToClipboard
+      copyToClipboard,
+      function (title) { applyTerminalTitle(tab, title); }
     );
 
     ws.onopen = function () {
@@ -816,6 +897,10 @@
     if (event.event === "started") {
       tab.started = true;
       if (event.project) tab.project = event.project;
+      // Fresh session: drop any title the previous process announced
+      // (drcode re-announces on mount; a stale badge must not linger).
+      tab.desiredTitle = null;
+      tab.desiredBadge = null;
       if (elWelcome.parentNode === tab.pane) elWelcome.remove();
       if (tab.elTerm) tab.elTerm.classList.remove("hidden");
       refreshTabLabels();
@@ -858,6 +943,11 @@
       return;
     }
     // Crash (or external kill): offer a restart instead of closing.
+    // The process is gone — its announced title/badge are history.
+    tab.desiredTitle = null;
+    tab.desiredBadge = null;
+    refreshTabLabels();
+    if (activeTab === tab) setWindowTitle("DrCode — " + projectTitle(tab.project));
     dialogTab = tab;
     elExitText.textContent =
       "The drcode process exited unexpectedly with code " + code +
@@ -884,6 +974,8 @@
     tab.project = null;
     tab.kind = "welcome";
     tab.started = false;
+    tab.desiredTitle = null;
+    tab.desiredBadge = null;
     if (tab.term) {
       try { tab.term.dispose(); } catch (err) { /* already gone */ }
       tab.term = null;
@@ -929,6 +1021,10 @@
     if (activeTab !== tab) activateTab(tab);
     elWelcomeError.classList.add("hidden");
     tab.project = project;
+    // A (re)launch is a fresh session: the previous process's announced
+    // title/badge are stale until the new one sends its own.
+    tab.desiredTitle = null;
+    tab.desiredBadge = null;
     if (!tab.elTerm) {
       tab.kind = "terminal";
       createTerminalHost(tab);

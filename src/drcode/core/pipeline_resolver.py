@@ -405,7 +405,7 @@ class PipelineResolverLayer(CoreState):
         reached_agent = False
         try:
             self._current_tool[task_id] = None
-            self._touch_activity(task_id)
+            self._touch_activity(task_id, bookkeeping=True)
             # A trigger that raced a merge: the audit re-stamp / startup
             # scan acted on a batched mergedness snapshot, and between
             # that snapshot and this round the hook (or a hand) merged

@@ -330,7 +330,12 @@ class CoreState:
     ) -> None: ...
 
     def _touch_activity(
-        self, task_id: str, tool: str | None = None, *, done: bool = False
+        self,
+        task_id: str,
+        tool: str | None = None,
+        *,
+        done: bool = False,
+        bookkeeping: bool = False,
     ) -> None: ...
 
     def _poll_activity(self) -> None: ...

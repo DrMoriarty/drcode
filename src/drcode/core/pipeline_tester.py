@@ -294,7 +294,7 @@ class PipelineTesterLayer(CoreState):
             self.tester_running = True
             self._current_tool[task_id] = None
             self._tps_samples.pop(task_id, None)
-            self._touch_activity(task_id)
+            self._touch_activity(task_id, bookkeeping=True)
             self.refresh_status()
             # New testing round: created up front, filled by
             # _persist_tester_messages as the run progresses. An empty round

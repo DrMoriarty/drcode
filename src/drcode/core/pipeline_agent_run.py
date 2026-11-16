@@ -93,7 +93,7 @@ class PipelineAgentRunLayer(CoreState):
         # after the dispatch. The zombie sweep already treats a missing
         # stamp as "clock starts on first sight", so a reset here keeps
         # both branches consistent.
-        self._touch_activity(task_id)
+        self._touch_activity(task_id, bookkeeping=True)
         self.host.host_spawn_worker(
             partial(self._run_agent_worker, task_id),
             name=f"agent run {task_id}",
@@ -547,7 +547,7 @@ class PipelineAgentRunLayer(CoreState):
         self._agent_net_retry_at.pop(task_id, None)
         self._current_tool[task_id] = None
         self._tps_samples.pop(task_id, None)
-        self._touch_activity(task_id)
+        self._touch_activity(task_id, bookkeeping=True)
         self.refresh_status()
         # Per-task worktree isolation (project setting
         # `task_isolation: worktree`, see drcode.task_env): the whole

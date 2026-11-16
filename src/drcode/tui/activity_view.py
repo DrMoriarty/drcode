@@ -30,13 +30,36 @@ class ActivityLayer(DrCodeState):
     _NUDGE_RESTART_DELAY = 1.0
 
     def _touch_activity(
-        self, task_id: str, tool: str | None = None, *, done: bool = False
+        self,
+        task_id: str,
+        tool: str | None = None,
+        *,
+        done: bool = False,
+        bookkeeping: bool = False,
     ) -> None:
         """Record a sign of life from the run of `task_id` (parallel
         slots: every running run keeps its own activity stamp). `tool`
         marks a tool call start; `done` clears the current-tool marker
-        (result arrived)."""
-        self._last_activity[task_id] = time.monotonic()
+        (result arrived).
+
+        `bookkeeping` marks a boundary touch (run registration,
+        retry/outage re-entry): NOT real activity — it must neither
+        reset the "last event" age in the status line nor mask a
+        genuinely silent run (a network-outage retry loop re-enters the
+        run every few seconds). The stamp is refreshed only when it is
+        missing (first registration) or already beyond the stall limit
+        — the anti-false-abort reset a fresh registration needs (a
+        stale predecessor stamp would otherwise make the watchdog abort
+        the run on its very next tick)."""
+        now = time.monotonic()
+        if bookkeeping:
+            limit = self.settings.stall_nudge.minutes
+            stamped = self._last_activity.get(task_id)
+            if stamped is not None and (
+                limit is None or now - stamped < limit * 60
+            ):
+                return
+        self._last_activity[task_id] = now
         if done:
             self._current_tool[task_id] = None
         elif tool is not None:

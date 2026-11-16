@@ -1442,13 +1442,26 @@ async def test_mechanical_floor_small_capped_window_fits_via_measured_headroom(
     is re-run against the full window when needed, and the result fits."""
     from drcode.providers import AgentRole
 
-    # AGENTS.md sized so the scenario still fits at HEAD's coding framing
-    # (system prompt + tool schemas ≈ 3.1k tokens and growing): framing +
-    # the floor's irreducible minimum (original prompt + note ≈ 700) plus
-    # the output reserve must stay under the 5700-token limit.
-    (project_root / "AGENTS.md").write_text("# Project rules\n\n" + "rule " * 250)
     app = _coding_window_app(project_root, monkeypatch, 6_000)
     task = _seed_big_transcript(app, "long task " * 200, fill=5_500)
+
+    # AGENTS.md sized from the MEASURED coding framing (system prompt + tool
+    # schemas, ≈3.9k tokens and growing) so the scenario keeps fitting the
+    # window however much the framing grows: framing + the floor's
+    # irreducible minimum (original prompt + note ≈ 700) plus the output
+    # reserve plus a modest AGENTS.md must stay under the 5700-token limit.
+    measured = app._mechanical_framing(task, AgentRole.CODING)
+    assert measured is not None
+    base_window, base_framing, base_output = measured
+    base_limit = base_window - max(base_window * 5 // 100, 1)
+    slack = base_limit - base_framing - base_output - 750  # floor minimum + margin
+    assert slack >= 150, (
+        "coding framing grew past the small-capped-window scenario; "
+        "raise the test window"
+    )
+    (project_root / "AGENTS.md").write_text(
+        "# Project rules\n\n" + "rule " * (slack * 4 // 5)
+    )
 
     async with app.run_test() as pilot:
         await pilot.pause()

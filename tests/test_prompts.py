@@ -380,7 +380,14 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
             "isolated worktree\n"
             "`.drcode/worktrees/<task-id>`; otherwise the project root): "
             "{project_path}\n"
-            "Relative tool paths resolve against it; run_bash starts there.\n"
+            "Relative tool paths resolve against it; run_bash starts there. "
+            "Every\n"
+            "run_bash call spawns a FRESH shell already in this directory — "
+            "never\n"
+            "prefix commands with `cd {project_path}` (it is a no-op); use "
+            "relative\n"
+            "paths. A `cd` inside one command does not persist to the next "
+            "call.\n"
         )
     # The read-only subagent reads the parent's tree — same header, no shell.
     from drcode.prompts import SUBAGENT_SYSTEM_PROMPT
@@ -390,7 +397,11 @@ def test_system_prompt_templates_carry_placeholder_header() -> None:
         "worktree\n"
         "`.drcode/worktrees/<task-id>`; otherwise the project root): "
         "{project_path}\n"
-        "Relative tool paths resolve against it.\n"
+        "Relative tool paths resolve against it. There is no persistent shell "
+        "to\n"
+        "`cd` around in — every tool call resolves relative paths against "
+        "this\n"
+        "directory, so never prefix paths with the project location.\n"
     )
 
 

@@ -362,6 +362,12 @@ class GoalParentPicker(ModalScreen[str | None]):
 
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Close", priority=True),
+        # The filter input keeps the focus (typing must land there); the
+        # arrows move the list cursor from the screen level — Input binds
+        # no up/down, so the keys bubble here (also shows the blurred
+        # highlight cursor that plain mouse/Tab navigation never revealed).
+        Binding("down", "list_down", show=False),
+        Binding("up", "list_up", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -433,13 +439,31 @@ class GoalParentPicker(ModalScreen[str | None]):
                 continue
             listing.append(TaskItem(text, None, goal_id=goal.id))
 
+    def action_list_down(self) -> None:
+        self.query_one("#goal-parent-list", ListView).action_cursor_down()
+
+    def action_list_up(self) -> None:
+        self.query_one("#goal-parent-list", ListView).action_cursor_up()
+
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    @on(Input.Submitted, "#goal-parent-input")
+    def _input_submitted(self) -> None:
+        """Enter in the filter picks the highlighted row (the first one
+        before the arrows were touched) — "type a few chars, Enter"."""
+        item = self.query_one("#goal-parent-list", ListView).highlighted_child
+        if isinstance(item, TaskItem) and item.goal_id:
+            self.dismiss(item.goal_id)
 
     @on(ListView.Selected, "#goal-parent-list")
     def _picked(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem) and item.goal_id:
+            # stop() — the event must not bubble to the app's
+            # on_list_view_selected, which routes goal_id rows to the
+            # full-screen GoalScreen.
+            event.stop()
             self.dismiss(item.goal_id)
 
 
@@ -452,6 +476,12 @@ class GoalAssignPicker(ModalScreen[str | None]):
 
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Close", priority=True),
+        # The filter input keeps the focus (typing must land there); the
+        # arrows move the list cursor from the screen level — Input binds
+        # no up/down, so the keys bubble here (also shows the blurred
+        # highlight cursor that plain mouse/Tab navigation never revealed).
+        Binding("down", "list_down", show=False),
+        Binding("up", "list_up", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -513,13 +543,32 @@ class GoalAssignPicker(ModalScreen[str | None]):
                 continue
             listing.append(TaskItem(text, None, goal_id=goal.id))
 
+    def action_list_down(self) -> None:
+        self.query_one("#goal-assign-list", ListView).action_cursor_down()
+
+    def action_list_up(self) -> None:
+        self.query_one("#goal-assign-list", ListView).action_cursor_up()
+
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    @on(Input.Submitted, "#goal-assign-input")
+    def _input_submitted(self) -> None:
+        """Enter in the filter picks the highlighted row (the first one
+        before the arrows were touched) — "type a few chars, Enter"."""
+        item = self.query_one("#goal-assign-list", ListView).highlighted_child
+        if isinstance(item, TaskItem) and item.goal_id:
+            self.dismiss(item.goal_id)
 
     @on(ListView.Selected, "#goal-assign-list")
     def _picked(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem) and item.goal_id:
+            # stop() — the event must not bubble to the app's
+            # on_list_view_selected, which routes goal_id rows to the
+            # full-screen GoalScreen (the reported bug: a click assigned
+            # the goal AND popped the roadmap view open).
+            event.stop()
             self.dismiss(item.goal_id)
 
 

@@ -801,3 +801,67 @@ def test_goal_reparent_validates_and_orders(project_root: Path) -> None:
     # Make top-level works.
     manager.goals.reparent(child.id, None)
     assert child.parent_id is None
+
+
+async def test_goal_assign_picker_keyboard_and_click(app: DrCodeApp) -> None:
+    """Regression: the Ctrl+L goal picker was keyboard-dead — the filter
+    input kept the focus and the arrows moved nothing (no cursor ever
+    appeared) — and a click on a row bubbled ListView.Selected up to the
+    app's on_list_view_selected, which routes goal_id rows to the
+    full-screen GoalScreen (the picker assigned the goal correctly but
+    popped the roadmap view open on top)."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        first = app.manager.goals.create("First goal")
+        second = app.manager.goals.create("Second goal")
+
+        app.action_new_task()
+        await pilot.pause()
+        app.action_assign_new_task_goal()
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, GoalAssignPicker)
+        listing = picker.query_one("#goal-assign-list", ListView)
+        ids = [i.goal_id for i in listing.children if isinstance(i, TaskItem)]
+        assert ids == [first.id, second.id]
+
+        # Arrows move the list cursor while the filter input keeps the
+        # focus (typing must keep landing there). The index starts None
+        # — no highlight at all, which is why the cursor "never
+        # appeared" — the first down highlights row 0.
+        goal_input = picker.query_one("#goal-assign-input", Input)
+        assert picker.focused is goal_input
+        assert listing.index is None
+        await pilot.press("down")
+        await pilot.pause()
+        assert listing.index == 0
+        assert picker.focused is goal_input
+        await pilot.press("down")
+        await pilot.pause()
+        assert listing.index == 1
+        await pilot.press("up")
+        await pilot.pause()
+        assert listing.index == 0
+
+        # Enter in the filter picks the highlighted row.
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._new_task_goal_id == second.id
+
+        # A fresh picker: clicking a row assigns it WITHOUT opening the
+        # full-screen GoalScreen.
+        app._new_task_goal_id = None
+        app.query_one("#nt-goal", Static).update("")
+        app.action_assign_new_task_goal()
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, GoalAssignPicker)
+        listing = picker.query_one("#goal-assign-list", ListView)
+        row = listing.children[1]
+        assert isinstance(row, TaskItem)
+        await pilot.click(row)
+        await pilot.pause()
+        assert app._new_task_goal_id == second.id
+        assert not any(isinstance(s, GoalScreen) for s in app.screen_stack)

@@ -126,45 +126,25 @@ def ensure_payload(payload_dir: Path | None, build_if_missing: bool) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# icon (generated, pure build-time artifact)
+# icon (from the real asset desktop/icon.png; resize is a pure build-time artifact)
 # ---------------------------------------------------------------------------
+
+ICON_ASSET = DESKTOP / "icon.png"
 
 
 def generate_icon(path: Path, size: int = 512) -> Path:
-    """Render the placeholder app icon with Pillow (terminal glyph on tile)."""
+    """Write the app icon asset (desktop/icon.png) to `path` at `size`."""
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image
     except ImportError as exc:
-        raise SystemExit(
-            "Pillow is required for icon generation (desktop group)"
-        ) from exc
+        raise SystemExit("Pillow is required for icon packaging (desktop group)") from exc
 
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    radius = size // 5
-    # rounded dark tile with an accent prompt mark
-    draw.rounded_rectangle(
-        [0, 0, size - 1, size - 1], radius=radius, fill=(22, 24, 29, 255)
-    )
-    draw.rounded_rectangle(
-        [0, 0, size - 1, size - 1],
-        radius=radius,
-        outline=(79, 156, 249, 255),
-        width=size // 40,
-    )
-    # ">_" glyph drawn as thick lines (no font dependency)
-    accent = (79, 156, 249, 255)
-    w = size // 14  # stroke width
-    pad = size // 4
-    # ">" as two strokes
-    x0, y0 = pad, size // 3
-    x1, y1 = pad + size // 5, size // 2
-    draw.line([(x0, y0), (x1, y1)], fill=accent, width=w)
-    draw.line([(x1, y1), (x0, y0 + size // 6 + size // 6)], fill=accent, width=w)
-    # "_" as a horizontal stroke
-    ux0, ux1 = pad + size // 3, size - pad
-    uy = size - pad - size // 10
-    draw.line([(ux0, uy), (ux1, uy)], fill=accent, width=w)
+    if not ICON_ASSET.is_file():
+        raise SystemExit(f"app icon asset not found: {ICON_ASSET} — it is a required file")
+
+    img = Image.open(ICON_ASSET).convert("RGBA")
+    if size != img.width:
+        img = img.resize((size, size), Image.Resampling.LANCZOS)
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(path)
     return path
@@ -172,7 +152,7 @@ def generate_icon(path: Path, size: int = 512) -> Path:
 
 def ensure_icns(png_path: Path, icns_path: Path) -> Path:
     """macOS icns via iconutil (ships with macOS)."""
-    if icns_path.exists():
+    if icns_path.exists() and icns_path.stat().st_mtime >= png_path.stat().st_mtime:
         return icns_path
     iconset = icns_path.parent / "DrCode.iconset"
     iconset.mkdir(parents=True, exist_ok=True)

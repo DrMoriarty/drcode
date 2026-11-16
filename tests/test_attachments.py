@@ -130,15 +130,50 @@ def test_send_carries_attachments(manager: TaskManager, project_root: Path) -> N
     assert (storage.attachment_root(task.id) / att2.filename).exists()
 
 
-def test_send_duplicate_text_dropped_with_attachments(manager: TaskManager) -> None:
+def test_send_duplicate_text_dropped_without_attachments(manager: TaskManager) -> None:
+    task = manager.create("T", "first")
+    manager.send(task.id, "first")
+    before = len(task.pending_input)
+    # Same text re-send: dropped — a plain re-send of the same package.
+    manager.send(task.id, "first")
+    assert len(task.pending_input) == before
+
+
+def test_send_duplicate_text_merges_new_attachments(manager: TaskManager) -> None:
     task = manager.create("T", "first")
     att = ImageAttachment(filename="a.png", media_type="image/png")
     manager.send(task.id, "first", [att])
-    before = len(task.pending_input)
-    # Same text re-send: dropped (attachments of the duplicate go nowhere —
-    # no new file was saved for the re-send).
+    assert len(task.pending_input) == 1
+    # Same text WITH a new image reference is not a pure re-send: the
+    # reference is merged into the still-queued entry (the bytes are
+    # caller-saved on disk before the call).
+    att2 = ImageAttachment(filename="b.png", media_type="image/png")
+    manager.send(task.id, "first", [att2])
+    assert len(task.pending_input) == 1
+    assert task.pending_input[0].attachments == [att, att2]
+    # Re-merging an already-present filename is a no-op (no duplicates).
     manager.send(task.id, "first", [ImageAttachment(filename="b.png")])
+    assert task.pending_input[0].attachments == [att, att2]
+
+
+def test_send_retry_prompt_match_drops_attachments(manager: TaskManager) -> None:
+    # A text that sits in the transcript as the prompt of an unfinished
+    # attempt (a request with no final response after it) cannot take
+    # attachments: the prompt is consumed already — the duplicate branch
+    # drops the references, nothing is merged.
+    task = manager.create("T", "first")
+    task.messages = [
+        {
+            "kind": "request",
+            "parts": [{"part_kind": "user-prompt", "content": "retry me"}],
+        }
+    ]
+    manager.storage.save(task)
+    att = ImageAttachment(filename="c.png", media_type="image/png")
+    before = len(task.pending_input)
+    manager.send(task.id, "retry me", [att])
     assert len(task.pending_input) == before
+    assert all(e.attachments == [] for e in task.pending_input)
 
 
 # -- transcript helpers ---------------------------------------------------------

@@ -70,6 +70,7 @@ from ..usage_store import UsageStore, usage_file
 from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
+from .attachments import StagedImage
 from .blocks import (  # noqa: F401
     AssistantBlock,
     ChatLog,
@@ -245,6 +246,19 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     }
     # Same dim style as the new-task form's hint line (#nt-hint); the
     # padding aligns the text with the editor above it.
+    # Attachment chips (one per staged image) sit between the editor and
+    # the key-hint line; same dim family as the hints, only muted so the
+    # chips read as content, not chrome.
+    #chat-attachments {
+        width: auto;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    #nt-attachments {
+        width: 80%;
+        color: $text-muted;
+        text-align: center;
+    }
     #chat-hint {
         width: auto;
         color: $text-disabled;
@@ -996,6 +1010,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # bookkeeping for the run-start / manual-change model events — see
         # `CoreState._emit_run_model_event`).
         self._last_agent_model_keys: dict[str, str] = {}
+        # Staged image attachments of the chat editor and the new-task form
+        # (see drcode.tui.attachments): bytes held in memory while the
+        # message is composed; on submit they are written to the task's
+        # attachment directory and only the ImageAttachment references ride
+        # into manager.send / manager.create (the FR #407e1959 contract).
+        self._chat_attachments: list[StagedImage] = []
+        self._form_attachments: list[StagedImage] = []
 
     # -- per-role model resolution (implemented in core.state.CoreState) -----
 
@@ -1027,6 +1048,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 yield ChatLog(id="chat-log")
                 yield TodoPanel("", id="todo-panel", classes="hidden")
                 yield ChatInput(placeholder="Type a message…", id="chat-input")
+                # Attachment chips (see drcode.tui.attachments): one chip
+                # per staged image, visible while the editor holds unsent
+                # screenshots; rendered by _render_attachment_chips.
+                yield Static("", id="chat-attachments", classes="hidden")
                 # Dim key hints for the editor above (Send/Voice live here
                 # instead of the footer): rendered by _render_chat_hint.
                 yield Static("", id="chat-hint")
@@ -1037,6 +1062,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                         id="nt-note",
                     )
                     yield NewTaskInput(placeholder="Describe the task…", id="nt-input")
+                    # Attachment chips of the form's staged images (sent
+                    # with the first message on create).
+                    yield Static("", id="nt-attachments", classes="hidden")
                     yield DepsInput(
                         placeholder="Depends on — comma-separated task ids (Ctrl+G)",
                         id="nt-deps",
@@ -1049,8 +1077,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                     yield Static("type: feature", id="nt-kind-label")
                     yield Static(
                         "tab — switch type   ctrl+g — depends on   "
-                        "ctrl+l — goal   ctrl+enter — create   "
-                        "ctrl+h — create on hold   esc — cancel",
+                        "ctrl+l — goal   ctrl+v — image   ctrl+j — file   "
+                        "ctrl+enter — create   ctrl+h — create on hold   "
+                        "esc — cancel",
                         id="nt-hint",
                     )
                     yield Static("", id="nt-kinds")

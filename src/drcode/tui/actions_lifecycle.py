@@ -24,6 +24,7 @@ from ..agent import (
     is_pending_retry,
 )
 from ..models import (
+    ImageAttachment,
     Task,
     TaskKind,
     TaskStatus,
@@ -31,6 +32,7 @@ from ..models import (
 from ..settings import (
     EscAbort,
 )
+from .attachments import StagedImage, save_staged
 from .confirm_dialog import ConfirmDialog
 from .deps_picker import DependencyPicker
 from .sidebar import TaskItem
@@ -683,10 +685,13 @@ class TaskLifecycleLayer(DrCodeState):
         """Send the chat editor's content (Enter in the chat input)."""
         text = self.chat_input.text.strip()
         task = self.viewed
-        if not text:
+        staged = list(self._chat_attachments)
+        if not text and not staged:
             # An empty Enter over an open MULTIPLE-choice clarification is a
             # valid "nothing selected" answer (the tool docstring tells the
-            # agent so); without one an empty input stays a no-op.
+            # agent so); without one an empty input stays a no-op. With
+            # staged images an empty text IS sendable (an image-only
+            # message).
             if (
                 task is None
                 or task.clarification is None
@@ -699,29 +704,64 @@ class TaskLifecycleLayer(DrCodeState):
         self.chat_input.clear()
         self._clarification_picks = {}
         self._clarification_multi = {}
-        self._submit_user_text(task, text)
+        self._submit_user_text(task, text, attachments=staged)
 
-    def _submit_user_text(self, task: Task, text: str) -> None:
+    def _submit_user_text(
+        self, task: Task, text: str, attachments: list[StagedImage] | None = None
+    ) -> None:
         if task.status is TaskStatus.DRAFT:
             # A draft never takes chat input: its text is composed in the
             # new-task editor (belt-and-braces — view_task never opens the
             # chat pane for a draft).
             self.action_open_draft(task.id)
             return
-        # A re-send of a text that is still queued (an identical entry sits
-        # in pending_input) or already in flight (the transcript holds it as
+        stripped = text.strip()
+        staged = list(attachments or [])
+        pending_match = any(e.text == stripped for e in task.pending_input)
+        # A re-send of a text already in flight (the transcript holds it as
         # the prompt of the unfinished attempt) is a no-op: send() ignores
         # it, and drawing/promoting it again would show the comment twice.
-        stripped = text.strip()
-        if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
-            task.messages, stripped
-        ):
+        # Images cannot ride such a send either — the prompt is consumed
+        # already — so staged images are kept (the user can retry on the
+        # next message) and the user is told why.
+        if not pending_match and is_pending_retry(task.messages, stripped):
+            if staged:
+                self.notify(
+                    "The text is already in flight — images can only ride a "
+                    "not-yet-consumed message",
+                    title="Attach image",
+                    timeout=6,
+                )
+            return
+        # The duplicate guard only covers the TEXT-only re-send: the same
+        # text WITH new staged images is a real send — the images are
+        # saved and manager.send merges the references into the still-
+        # queued entry (no second bubble, no duplicate prompt).
+        refs: list[ImageAttachment] = []
+        if staged:
+            refs = save_staged(self.manager.storage, task.id, staged)
+            self._drop_staged_attachments("chat")
+        if pending_match and not refs:
             return
         # Capture the pre-run state: _advance() promotes the task to ACTIVE
         # (promote_next) and flips its status, so the render decision below
         # must use the ORIGINAL status, not the post-promotion one.
         was_active = task.status is TaskStatus.ACTIVE
-        self.manager.send(task.id, text)
+        self.manager.send(task.id, text, attachments=refs or None)
+        if pending_match:
+            # Merged into an already queued/visible entry: the text bubble
+            # exists, only the images were added — the transcript-driven
+            # timeline shows the placeholders when the entry is consumed.
+            self.refresh_sidebar()
+            self.refresh_status()
+            return
+        line = text
+        if refs:
+            # The pre-drawn bubble mirrors the consumed prompt's display
+            # (transcript.extract_render): text, then one placeholder per
+            # image — UserBlock renders text verbatim, so the literal
+            # "[image image/png]" lines are safe.
+            line = "\n\n".join([text, *(f"[image {a.media_type}]" for a in refs)])
         if not was_active and self.viewed_id == task.id:
             # Draw the queued message BEFORE advancing the pipeline. The run
             # worker started by _advance() executes eagerly (Textual installs
@@ -734,7 +774,7 @@ class TaskLifecycleLayer(DrCodeState):
             # skips it and the bubble shows exactly once. For an active task
             # run_agent() renders the message itself (see the was_active
             # branch below), so no pre-draw there.
-            self._write_history_line("user-pending", text)
+            self._write_history_line("user-pending", line)
         if was_active:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back

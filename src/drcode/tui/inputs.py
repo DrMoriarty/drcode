@@ -9,6 +9,8 @@ from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.widgets import Input, TextArea
 
+from .attachments import load_staged_from_path_text
+
 
 class WordNavTextArea(TextArea):
     """TextArea with macOS-style Option+Arrow word navigation, a working
@@ -86,6 +88,23 @@ class WordNavTextArea(TextArea):
             app._copy_with_fallback(text)
             app._show_copy_toast(text)
 
+    async def _on_paste(self, event: events.Paste) -> None:
+        # A bracketed paste whose text is exactly a path to an existing
+        # image file (a file copied in Finder/Explorer, a dragged or typed
+        # path) is staged as an attachment instead of littering the editor
+        # with the path; anything else falls through to the normal text
+        # paste. Images never arrive AS bytes through a terminal paste —
+        # the clipboard-image scenario is the explicit ctrl+v action (see
+        # TaskFormLayer.attach_clipboard_image).
+        if not self.read_only:
+            staged = load_staged_from_path_text(event.text)
+            if staged is not None:
+                event.stop()
+                event.prevent_default()
+                self._app().stage_attachment(staged)
+                return
+        await super()._on_paste(event)
+
     def action_copy(self) -> None:
         """Copy the selection via the app's clipboard fallback.
 
@@ -153,11 +172,22 @@ class NewTaskInput(WordNavTextArea):
         # focused (and it is the default focus at startup). Off the footer
         # (show=False): the app binding already shows "New goal" there.
         Binding("ctrl+y", "app.new_goal", "New goal", priority=True, show=False),
+        # Same attach pair as ChatInput (clipboard image / file path) —
+        # staged into the form's own bucket and sent with the FIRST
+        # message on create.
+        Binding("ctrl+v", "attach_clipboard", "Paste image", priority=True),
+        Binding("ctrl+j", "attach_file", "Attach file", priority=True),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 
     def action_toggle_kind(self) -> None:
         self._app().toggle_new_task_kind()
+
+    def action_attach_clipboard(self) -> None:
+        self._app().attach_clipboard_image()
+
+    def action_attach_file(self) -> None:
+        self._app().attach_file_dialog()
 
     def action_submit_new_task(self) -> None:
         self._app().submit_new_task()
@@ -250,6 +280,15 @@ class ChatInput(WordNavTextArea):
         # focused. Off the footer (show=False): the app binding already
         # shows "New goal" there.
         Binding("ctrl+y", "app.new_goal", "New goal", priority=True, show=False),
+        # ctrl+v — attach the clipboard IMAGE (the primary screenshot
+        # scenario: the shot is already in the clipboard); it deliberately
+        # shadows TextArea's stock ctrl+v paste action and falls back to a
+        # normal text paste when the clipboard holds no image (see
+        # TaskFormLayer.attach_clipboard_image). ctrl+j — attach an image
+        # file by path (AttachPathScreen); ctrl+f stays the app-level
+        # "Find task" (the search dialog must open while composing too).
+        Binding("ctrl+v", "attach_clipboard", "Paste image", priority=True),
+        Binding("ctrl+j", "attach_file", "Attach file", priority=True),
     ]
 
     def __init__(self, **kwargs: object) -> None:
@@ -261,6 +300,12 @@ class ChatInput(WordNavTextArea):
 
     def action_submit(self) -> None:
         self._app().submit_chat_input()
+
+    def action_attach_clipboard(self) -> None:
+        self._app().attach_clipboard_image()
+
+    def action_attach_file(self) -> None:
+        self._app().attach_file_dialog()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # "Cancel recording" only makes sense while a dictation is in

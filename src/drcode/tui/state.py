@@ -37,6 +37,7 @@ from ..core.state import CoreState
 from ..models import Task, TaskEvent
 from ..providers import AgentRole
 from ..settings import CompletedRetention, WebFetchMode
+from .attachments import StagedImage
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
 from .command_providers import WorkflowPreset
 from .github_dialog import GitHubSetup
@@ -116,6 +117,27 @@ class DrCodeState(CoreState, App[None]):
     def _copy_with_fallback(self, text: str) -> None: ...
 
     def _show_copy_toast(self, text: str) -> None: ...
+
+    # -- image attachments (implemented in TaskFormLayer, see
+    #    drcode.tui.attachments) --------------------------------------------
+
+    # Staged image attachments (bytes in memory until submit), assigned in
+    # DrCodeApp.__init__ — see the module docstring: the layers can only see
+    # them through these class-level annotations.
+    _chat_attachments: list[StagedImage]
+    _form_attachments: list[StagedImage]
+
+    def stage_attachment(self, staged: StagedImage) -> None: ...
+
+    def attach_clipboard_image(self) -> None: ...
+
+    def attach_file_dialog(self) -> None: ...
+
+    def _render_attachment_chips(self) -> None: ...
+
+    def _drop_staged_attachments(
+        self, target: str, *, notify: bool = False
+    ) -> None: ...
 
     def _model_setup_done(self, setup: ModelSetup | None) -> None: ...
 

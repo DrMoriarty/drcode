@@ -225,6 +225,7 @@ class SettingsPalette(CommandPalette):
         "GitHub integration:",
         "Notifications:",
         "Voice:",
+        "MCP server:",
         "Maximize",
         "Minimize",
         "Screenshot",
@@ -456,6 +457,15 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
                 "Speech recognition (push-to-talk dictation into the "
                 "input fields) and spoken announcements, via an "
                 "OpenAI-compatible audio API (project setting)",
+            ),
+            CommandEntry(
+                f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
+                app.action_toggle_mcp_enabled,
+                "Embedded MCP server (Streamable HTTP on localhost, "
+                "endpoint published in .drcode/mcp.json) that lets "
+                "external AI agents manage drcode tasks; hot start/stop, "
+                "no restart needed (project setting, "
+                "docs/mcp-server-design.md)",
             ),
         ]
 

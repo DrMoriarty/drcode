@@ -3858,14 +3858,51 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             "Git",
         ]
         # The main-menu provider no longer carries the task entries: it
-        # keeps only the workflow/github/notifications/voice preferences.
+        # keeps the integration preferences (github/notifications/voice)
+        # and the MCP-server toggle.
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         main_names = [c.name for c in main]
         assert main_names == [
             (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
+            f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
         ]
+        # The MCP toggle entry drives the hot-switching handler.
+        mcp_entry = main[-1]
+        assert mcp_entry.callback == app.action_toggle_mcp_enabled
+
+
+async def test_mcp_toggle_hot_switches_the_server(app: DrCodeApp) -> None:
+    """The "MCP server" settings command hot-starts/stops the embedded
+    server without a restart: enabling starts it right away (endpoint
+    published in .drcode/mcp.json), disabling shuts it down and removes
+    the descriptor; the setting is persisted either way."""
+    from drcode.mcp.endpoint import endpoint_path, load_endpoint
+    from drcode.settings import ProjectSettingsStore
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")  # skip the first-start setup dialog
+        await pilot.pause()
+        assert app.settings.mcp_enabled is False
+        assert app.mcp_service.running is False
+
+        # Toggle on: hot start, endpoint published, setting persisted.
+        app.action_toggle_mcp_enabled()
+        await pilot.pause()
+        try:
+            assert app.settings.mcp_enabled is True
+            assert ProjectSettingsStore(app.project_root).load().mcp_enabled is True
+            assert app.mcp_service.running is True
+            assert load_endpoint(app.project_root) is not None
+        finally:
+            # Toggle off: hot stop, endpoint removed, setting persisted.
+            app.action_toggle_mcp_enabled()
+        await pilot.pause()
+        assert app.settings.mcp_enabled is False
+        assert ProjectSettingsStore(app.project_root).load().mcp_enabled is False
+        assert app.mcp_service.running is False
+        assert not endpoint_path(app.project_root).exists()
 
 
 async def test_task_settings_dialog_draft_isolation_and_apply(

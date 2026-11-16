@@ -750,19 +750,28 @@ class TaskManager:
 
         A re-send of a text that is still queued in `pending_input` — or
         already sitting in the transcript as the prompt of an unfinished
-        attempt — is ignored: the user re-typing a comment that the busy
-        pipeline has not visibly reacted to yet must not duplicate the
-        message (it would show twice in the chat history and reach the
-        model twice). The duplicate check matches TEXT equality only: a
-        genuinely new message with an image attached always carries new
-        bytes on disk, so a same-text hit here can only be a re-send of
-        the very same (already queued) package — dropping the duplicate
-        with its attachments is correct."""
+        attempt — is not duplicated: the user re-typing a comment that the
+        busy pipeline has not visibly reacted to yet must not show it twice
+        or reach the model twice. The duplicate check matches TEXT equality
+        only; a same-text hit WITH image references is not a pure re-send —
+        the new references are merged into the still-queued entry (the UI
+        staged and saved the bytes to the attachment directory before
+        calling). A same-text hit with NO attachments can only be a re-send
+        of the very same (already queued) package and is dropped, and a
+        hit on the unfinished-attempt prompt cannot merge at all (the text
+        is already a consumed prompt in the transcript) — those attachments
+        are dropped with it."""
         task = self.get(task_id)
         stripped = text.strip()
-        if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
-            task.messages, stripped
-        ):
+        matching = [e for e in task.pending_input if e.text == stripped]
+        if matching or is_pending_retry(task.messages, stripped):
+            if matching:
+                # Merge NEW references (by filename) into the queued entry;
+                # the bytes are already on disk (see the docstring).
+                known = {a.filename for a in matching[0].attachments}
+                merged = [a for a in (attachments or []) if a.filename not in known]
+                if merged:
+                    matching[0].attachments.extend(merged)
             task.touch()
             self.storage.save(task)
             return task

@@ -24,6 +24,17 @@ from ..providers import AgentRole, set_project_custom_model
 from ..task_manager import validate_dependencies
 from .actions_models import custom_entry_from_setup
 from .agents_dialog import AgentsMdDialog
+from .attach_dialog import AttachPathScreen
+from .attachments import (
+    MAX_IMAGE_BYTES,
+    MAX_STAGED_IMAGES,
+    StagedImage,
+    load_staged_file,
+    read_clipboard_image,
+    read_clipboard_text,
+    render_chip_line,
+    save_staged,
+)
 from .inputs import DepsInput, NewTaskInput
 from .setup_dialog import ModelSetup
 from .state import DrCodeState
@@ -148,6 +159,10 @@ class TaskFormLayer(DrCodeState):
         self._editing_task_id = None
         self.new_task_input.clear()
         self._clear_deps_field()
+        # A fresh form starts without staged images (a leftover from an
+        # earlier composition would silently ride the new task's first
+        # message).
+        self._drop_staged_attachments("form")
         # A fresh form has no preset goal (the GoalScreen's T sets it
         # AFTER entering the form).
         self._new_task_goal_id = None
@@ -187,10 +202,110 @@ class TaskFormLayer(DrCodeState):
         affordance next to its field does not take a footer slot. The
         voice part appears only while dictation is configured (everything
         empty = voice off, see voice_dictation_configured)."""
-        text = "enter — send · shift+enter — newline"
+        text = "enter — send · shift+enter — newline · ctrl+v — image · ctrl+j — file"
         if self.voice_dictation_configured:
             text += " · ctrl+b — voice"
         self.query_one("#chat-hint", Static).update(text)
+
+    # -- image attachments (chat editor + new-task form) -----------------------
+    #
+    # The staging target is chosen by mode (`_new_task_mode`): the form's
+    # bucket rides manager.create's first message, the chat editor's bucket
+    # manager.send (both take ImageAttachment references — the bytes are
+    # written to the task's attachment directory on submit, see
+    # _submit_user_text / _submit_new_form and the FR #407e1959 contract).
+
+    def _attachment_bucket(self) -> list[StagedImage]:
+        return self._form_attachments if self._new_task_mode else self._chat_attachments
+
+    def stage_attachment(self, staged: StagedImage) -> None:
+        """Stage an image for the next send (paste path / clipboard / file
+        dialog all land here). Duplicate bytes are ignored — a screenshot
+        pasted twice must not attach twice."""
+        if len(staged.data) > MAX_IMAGE_BYTES:
+            self.notify(
+                "Image is too large — the limit is "
+                f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB",
+                title="Attach image",
+                severity="error",
+                timeout=6,
+            )
+            return
+        bucket = self._attachment_bucket()
+        if any(s.data == staged.data for s in bucket):
+            self.notify(
+                "This image is already attached", title="Attach image", timeout=4
+            )
+            return
+        if len(bucket) >= MAX_STAGED_IMAGES:
+            self.notify(
+                f"At most {MAX_STAGED_IMAGES} images per message",
+                title="Attach image",
+                severity="error",
+                timeout=6,
+            )
+            return
+        bucket.append(staged)
+        self._render_attachment_chips()
+
+    def _render_attachment_chips(self) -> None:
+        """The `[image/png]` chip lines under both editors (hidden when the
+        bucket is empty)."""
+        chat = self.query_one("#chat-attachments", Static)
+        form = self.query_one("#nt-attachments", Static)
+        chat.update(render_chip_line(self._chat_attachments))
+        chat.set_class(not self._chat_attachments, "hidden")
+        form.update(render_chip_line(self._form_attachments))
+        form.set_class(not self._form_attachments, "hidden")
+
+    def _drop_staged_attachments(self, target: str, *, notify: bool = False) -> None:
+        """Discard a bucket's staged images (form close / edit mode —
+        attachments are only supported on fresh creations). The target is
+        explicit: the form lifecycle flips `_new_task_mode` before cleanup
+        runs, so a mode-derived bucket would pick the wrong one."""
+        bucket = self._form_attachments if target == "form" else self._chat_attachments
+        if bucket:
+            bucket.clear()
+            self._render_attachment_chips()
+            if notify:
+                self.notify(
+                    "Attachments are supported on new tasks only — "
+                    "staged images dropped",
+                    title="Attach image",
+                    timeout=6,
+                )
+
+    def attach_clipboard_image(self) -> None:
+        """ctrl+v in an editor: stage the clipboard IMAGE — the primary
+        screenshot scenario. No image on the clipboard → the key keeps its
+        normal paste semantics and inserts the clipboard text (the stock
+        TextArea ctrl+v binding is shadowed by ours); nothing readable →
+        a toast."""
+        staged = read_clipboard_image()
+        if staged is not None:
+            self.stage_attachment(staged)
+            return
+        widget = self.new_task_input if self._new_task_mode else self.chat_input
+        text = read_clipboard_text()
+        if text and not widget.read_only:
+            widget.insert(text)
+            return
+        self.notify("The clipboard holds no image", title="Attach image", timeout=5)
+
+    def attach_file_dialog(self) -> None:
+        """ctrl+j in an editor: pick an image file by path (ctrl+f stays
+        the app-level "Find task")."""
+        self.push_screen(AttachPathScreen(), self._on_attach_path)
+
+    def _on_attach_path(self, path: str | None) -> None:
+        if not path:
+            return
+        try:
+            staged = load_staged_file(path)
+        except ValueError as e:
+            self.notify(str(e), title="Attach file", severity="error", timeout=6)
+            return
+        self.stage_attachment(staged)
 
     def _new_task_chrome(self) -> None:
         """Note + hint line of the new-task form, per mode: fresh creation,
@@ -258,6 +373,10 @@ class TaskFormLayer(DrCodeState):
         self._editing_task_id = task.id
         self.new_task_input.load_text(self.manager.editable_condition(task.id))
         self._load_deps_field(task.depends_on)
+        # Editing rewrites the condition: staged images from a previous
+        # composition have nowhere to go (attachments only ride a fresh
+        # creation) — dropped with a note on submit, cleared here.
+        self._drop_staged_attachments("form")
         # The edit path never re-links the task: show its current goal as
         # read-only info (the Link/Unlink palette commands own the link).
         self._new_task_goal_id = None
@@ -305,6 +424,9 @@ class TaskFormLayer(DrCodeState):
         self._editing_task_id = task.id
         self.new_task_input.load_text(self.manager.editable_condition(task.id))
         self._load_deps_field(task.depends_on)
+        # See action_edit_task: the draft-edit path never carries staged
+        # images either.
+        self._drop_staged_attachments("form")
         # The draft path never re-links the task: show its current goal as
         # read-only info (the Link/Unlink palette commands own the link).
         self._new_task_goal_id = None
@@ -347,6 +469,9 @@ class TaskFormLayer(DrCodeState):
         # session: consumed by the submit, dropped by a cancel.
         self._new_task_goal_id = None
         self.query_one("#nt-goal", Static).update("")
+        # Same session rule for staged images: consumed by the create, or
+        # gone when the form closes without one.
+        self._drop_staged_attachments("form")
         # Content may be stale (a run streamed while the form was open, or
         # finished in the background): don't resurrect it.
         self._clear_stream_label()
@@ -493,6 +618,9 @@ class TaskFormLayer(DrCodeState):
 
     def _submit_new_form(self, *, hold: bool, draft: bool = False) -> None:
         if self._editing_task_id is not None:
+            # Attachments are a fresh-creation feature: an edit rewrites
+            # the condition text and has no first message to ride.
+            self._drop_staged_attachments("form", notify=True)
             if draft:
                 self._save_task_edit_as_draft()
             else:
@@ -514,6 +642,19 @@ class TaskFormLayer(DrCodeState):
             draft=draft,
             goal_id=self._new_task_goal_id,
         )
+        # The staged images ride the task's FIRST message (the initial
+        # PendingInput). The task id only exists after create(), so the
+        # bytes are written to the task's attachment directory here and the
+        # references are folded into the queued entry — the contract
+        # (references stored in metadata, bytes on disk via
+        # Storage.save_attachment) is exactly what manager.create keeps.
+        if self._form_attachments:
+            refs = save_staged(self.manager.storage, task.id, self._form_attachments)
+            self._form_attachments = []
+            self._render_attachment_chips()
+            if task.pending_input:
+                task.pending_input[0].attachments.extend(refs)
+                self.manager.storage.save(task)
         if deps:
             self.manager.set_dependencies(task.id, deps)
         if draft:

@@ -512,6 +512,40 @@ async def test_header_dependency_link_opens_picker_and_links(
         assert "app.pick_dependency" in extra
 
 
+async def test_dependency_picker_click_does_not_view_picked_task(
+    app: DrCodeApp,
+) -> None:
+    """Regression: a CLICK on a candidate row bubbled ListView.Selected
+    up to the app's on_list_view_selected, which routed the task_id row
+    to view_task — the picker added the dependency but the app switched
+    the chat pane to the picked candidate (the GoalAssignPicker leak,
+    fixed by event.stop() in the picker's _picked)."""
+    from drcode.tui.deps_picker import DependencyPicker
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        viewed = app.manager.create("viewed", "x")
+        dep = app.manager.create("candidate", "x")
+        app.view_task(viewed.id)
+        await pilot.pause()
+
+        app.action_pick_dependency()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, DependencyPicker)
+        listing = screen.query_one("#deps-picker-list", ListView)
+        row = next(w for w in listing.children if isinstance(w, TaskItem))
+
+        await pilot.click(row)
+        await pilot.pause()
+
+        # The pick landed (edge added, picker closed)…
+        assert not isinstance(app.screen, DependencyPicker)
+        assert app.manager.get(viewed.id).depends_on == [dep.id]
+        # …but the viewed task did NOT switch to the clicked candidate.
+        assert app.viewed_id == viewed.id
+
+
 async def test_header_dependency_link_only_for_editable_statuses(
     app: DrCodeApp,
 ) -> None:

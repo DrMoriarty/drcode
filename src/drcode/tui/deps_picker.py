@@ -157,4 +157,8 @@ class DependencyPicker(ModalScreen[str | None]):
     def _picked(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, TaskItem) and item.task_id:
+            # stop() — the event must not bubble to the app's
+            # on_list_view_selected, which routes task_id rows to
+            # view_task (the same leak GoalParentPicker had).
+            event.stop()
             self.dismiss(item.task_id)

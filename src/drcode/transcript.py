@@ -332,6 +332,60 @@ def drop_model_switch_notes(messages: list[dict[str, Any]]) -> list[dict[str, An
     return cleaned
 
 
+def prompt_text_element(content: Any) -> str | None:
+    """The text element of a serialized user-prompt content (None when the
+    content carries no text).
+
+    A plain str is returned as is. A multimodal content — a list of strings
+    and image items (serialized `BinaryContent` dicts: `{"kind": "binary",
+    "media_type": ..., "data": "<base64>"}`; serialized `ImageUrl` dicts:
+    `{"kind": "image-url", "url": ..., "media_type": ...}`) — contributes
+    its string and `{"text": ...}` items joined with blank lines; the image
+    items contribute nothing (they are rendered/stripped separately, see
+    `prompt_image_placeholders`). None when nothing textual remains.
+    """
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, (list, tuple)):
+        texts = [
+            item
+            if isinstance(item, str)
+            else item.get("text")
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+            else ""
+            for item in content
+        ]
+        joined = "\n\n".join(t for t in texts if t)
+        return joined or None
+    return None
+
+
+def prompt_image_placeholders(content: Any) -> list[str]:
+    """`[image <media_type>]` placeholder lines for the image items of a
+    serialized user-prompt content (empty for a plain-text content).
+
+    Used wherever a multimodal prompt must degrade to text: the chat
+    render, the tester handover, the compaction summarizer (a model
+    without vision must see the image was there, never a silent drop —
+    and never the megabytes of base64 either)."""
+    if not isinstance(content, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in content:
+        if isinstance(item, str) or (
+            isinstance(item, dict) and isinstance(item.get("text"), str)
+        ):
+            continue
+        if isinstance(item, dict):
+            kind = item.get("kind")
+            media = item.get("media_type") or "unknown"
+            if kind == "image-url" or "url" in item:
+                out.append(f"[image {media}: {item.get('url', '?')}]")
+            else:
+                out.append(f"[image {media}]")
+    return out
+
+
 def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     """True when `text` is already the prompt of an unfinished attempt in the
     serialized transcript (possible only for legacy tasks whose interrupted
@@ -344,7 +398,14 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
         if msg.get("kind") != "request" and msg.get("role") != "request":
             continue
         for part in msg.get("parts", []):
-            if part.get("part_kind") == "user-prompt" and part.get("content") == text:
+            if part.get("part_kind") != "user-prompt":
+                continue
+            # A multimodal prompt matches by its text element: the images
+            # ride in the same part's content list but never identify it.
+            if (
+                part.get("content") == text
+                or prompt_text_element(part.get("content")) == text
+            ):
                 idx = i
     if idx is None:
         return False
@@ -359,9 +420,15 @@ def is_pending_retry(messages: list[dict[str, Any]], text: str) -> bool:
     return True
 
 
-def backdate_user_prompt(messages: list[ModelMessage], text: str, at: datetime) -> None:
+def backdate_user_prompt(
+    messages: list[ModelMessage], text: str | list[Any], at: datetime
+) -> None:
     """Stamp the user request carrying `text` with `at` — the moment the
     user typed the prompt — in place.
+
+    `text` is what the pipeline sent as the prompt: a plain str, or a
+    multimodal content list (text element + image items) — a multimodal
+    prompt matches by its text element, the images never identify it.
 
     pydantic-ai timestamps the ModelRequest it builds from a consumed
     pending prompt with the consumption time, which can be minutes after
@@ -373,7 +440,10 @@ def backdate_user_prompt(messages: list[ModelMessage], text: str, at: datetime) 
         if not isinstance(msg, ModelRequest):
             continue
         for part in msg.parts:
-            if isinstance(part, UserPromptPart) and part.content == text:
+            if isinstance(part, UserPromptPart) and (
+                part.content == text
+                or prompt_text_element(part.content) == prompt_text_element(text)
+            ):
                 part.timestamp = at
                 msg.timestamp = at
                 return
@@ -383,16 +453,18 @@ def first_user_prompt(messages: list[dict[str, Any]]) -> str:
     """First user prompt of a serialized transcript — the original task text.
 
     Used to hand the tester the task's initial assignment (the title alone is
-    often too terse to paraphrase into a commit message).
+    often too terse to paraphrase into a commit message). A multimodal
+    prompt contributes its text element only — the tester may run on a
+    model without vision, so the images degrade to placeholder lines.
     """
     for msg in messages:
         if msg.get("kind") != "request" and msg.get("role") != "request":
             continue
         for part in msg.get("parts", []):
             if part.get("part_kind") == "user-prompt":
-                content = part.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+                text = prompt_text_element(part.get("content"))
+                if text and text.strip():
+                    return text.strip()
     return ""
 
 
@@ -413,8 +485,13 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
         for part in msg.get("parts", []):
             if part.get("part_kind") == "user-prompt":
                 content = part.get("content")
-                if isinstance(content, str) and content.strip():
-                    text = content.strip()
+                # A multimodal prompt contributes its text element (plus the
+                # image placeholders — the tester may run on a model without
+                # vision; it must see the images existed, never a silent
+                # drop, and never the base64 either).
+                text = prompt_text_element(content)
+                if text and text.strip():
+                    text = text.strip()
                     if text.startswith(
                         (
                             COMPACTION_SUMMARY_PREFIX,
@@ -424,7 +501,8 @@ def all_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
                         )
                     ):
                         continue
-                    prompts.append(text)
+                    placeholders = prompt_image_placeholders(content)
+                    prompts.append("\n\n".join([text, *placeholders]))
     return prompts
 
 
@@ -541,6 +619,20 @@ def extract_display(
                             out.append((part_at, "note", ""))
                         else:
                             out.append((part_at, "user", content))
+                    elif isinstance(content, list) and content:
+                        # Multimodal user prompt (text element + image items):
+                        # render the text and a `[image <media_type>]`
+                        # placeholder per image — the megabytes of base64 in
+                        # the serialized content must never reach the chat,
+                        # but a silent drop would hide the attachment from
+                        # the human too. Machinery prefixes are str-only, so
+                        # a list content is always a real user message.
+                        part_at = _parse_stamp(part.get("timestamp")) or at
+                        text = prompt_text_element(content) or ""
+                        lines = [text, *prompt_image_placeholders(content)]
+                        display = "\n\n".join(line for line in lines if line)
+                        if display:
+                            out.append((part_at, "user", display))
             continue
         for part in msg.get("parts", []):
             kind = part.get("part_kind")

@@ -16,6 +16,7 @@ from .models import (
     Goal,
     GoalStatus,
     GoalType,
+    ImageAttachment,
     PendingInput,
     Task,
     TaskEvent,
@@ -57,13 +58,16 @@ RemovalListener = Callable[[str], None]
 CompletionListener = Callable[[Task, TaskStatus, str], None]
 
 
-def _remove_scratch_background(task: Task) -> None:
+def _remove_scratch_background(task: Task, storage: Storage | None = None) -> None:
     """remove_scratch off the UI thread when one is under us: the
     completion paths run on the Textual event loop, and deleting a large
     /tmp/drcode/<id> tree synchronously froze the whole UI for the
     deletion's duration. Called without a running loop (plain sync
     callers, worker threads like the tester's set_verification tool) the
     removal runs inline — it is off the UI thread there already.
+
+    With `storage` passed, the task's attachment directory (the image
+    files behind `PendingInput.attachments`) is removed with the scratch.
 
     Re-queue race guard: a task that was re-queued (new input on the
     completed task) while the deletion was pending may already use a
@@ -75,6 +79,12 @@ def _remove_scratch_background(task: Task) -> None:
             if task.status is not TaskStatus.COMPLETED:
                 return
             remove_scratch(task.id)
+            if storage is not None:
+                # The attached images live in the task's own directory and
+                # are never needed again once the task is completed: their
+                # (consumed) copies are inside the transcript or were
+                # dropped at the compaction.
+                storage.delete_attachments(task.id)
         except Exception:  # noqa: BLE001, S110 - a cleanup job must never crash anything
             pass
 
@@ -577,6 +587,7 @@ class TaskManager:
         origin: str = "user",
         depends_on: list[str] | None = None,
         goal_id: str | None = None,
+        attachments: list[ImageAttachment] | None = None,
     ) -> Task:
         # Creation-time validation passes task_id=None (self-reference is
         # impossible — the id does not exist yet, so a dep naming it comes
@@ -617,7 +628,12 @@ class TaskManager:
             if not draft:
                 self._goal_reactivate_if_done(goal, task)
         if first_message.strip():
-            task.pending_input.append(PendingInput(text=first_message.strip()))
+            task.pending_input.append(
+                PendingInput(
+                    text=first_message.strip(),
+                    attachments=list(attachments or []),
+                )
+            )
         if draft:
             # An agent-created draft (project setting "agent creates
             # drafts"): the prompt stays in pending_input exactly like on
@@ -714,7 +730,12 @@ class TaskManager:
                 self._goal_reactivate_if_done(goal, task)
         return task
 
-    def send(self, task_id: str, text: str) -> Task:
+    def send(
+        self,
+        task_id: str,
+        text: str,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> Task:
         """Add user input to a task (appended chronologically). A completed
         (or being-tested) task re-enters the pipeline; an answered
         clarification goes to the head of the queue. Promotion (activation)
@@ -722,12 +743,21 @@ class TaskManager:
         _advance(), which never starts new development while any testing is
         incomplete.
 
+        `attachments` carries the image references (see `ImageAttachment`)
+        that were already saved to the task's attachment directory by the
+        caller — the file bytes never ride through this API. Empty/None =
+        a plain text-only message.
+
         A re-send of a text that is still queued in `pending_input` — or
         already sitting in the transcript as the prompt of an unfinished
         attempt — is ignored: the user re-typing a comment that the busy
         pipeline has not visibly reacted to yet must not duplicate the
         message (it would show twice in the chat history and reach the
-        model twice)."""
+        model twice). The duplicate check matches TEXT equality only: a
+        genuinely new message with an image attached always carries new
+        bytes on disk, so a same-text hit here can only be a re-send of
+        the very same (already queued) package — dropping the duplicate
+        with its attachments is correct."""
         task = self.get(task_id)
         stripped = text.strip()
         if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
@@ -736,7 +766,9 @@ class TaskManager:
             task.touch()
             self.storage.save(task)
             return task
-        task.pending_input.append(PendingInput(text=stripped))
+        task.pending_input.append(
+            PendingInput(text=stripped, attachments=list(attachments or []))
+        )
         if task.status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
             old = task.status
             task.status = TaskStatus.QUEUED
@@ -1126,7 +1158,7 @@ class TaskManager:
         )
         if task.status is TaskStatus.COMPLETED:
             task.completed_at = _now()
-            _remove_scratch_background(task)
+            _remove_scratch_background(task, self.storage)
         task.touch()
         self._save_changed(task, old, origin)
         return task
@@ -1181,7 +1213,7 @@ class TaskManager:
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
         task.unfinished = False
-        _remove_scratch_background(task)
+        _remove_scratch_background(task, self.storage)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -1228,7 +1260,7 @@ class TaskManager:
         task.completed_at = _now()
         task.review_pending = False
         task.review_rejections = 0
-        _remove_scratch_background(task)
+        _remove_scratch_background(task, self.storage)
         self._fire_removed(task_id)
         task.touch()
         self._save_changed(task, old, "user")
@@ -1275,7 +1307,7 @@ class TaskManager:
             return task
         task.status = TaskStatus.COMPLETED
         task.completed_at = _now()
-        _remove_scratch_background(task)
+        _remove_scratch_background(task, self.storage)
         task.touch()
         self._save_changed(task, old, "system")
         return task
@@ -1294,7 +1326,7 @@ class TaskManager:
         task.unfinished = False
         task.review_rejections = 0
         task.fix_rounds = 0
-        _remove_scratch_background(task)
+        _remove_scratch_background(task, self.storage)
         task.touch()
         self._save_changed(task, old, origin)
         return task

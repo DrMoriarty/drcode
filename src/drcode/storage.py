@@ -39,17 +39,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import ValidationError
 
 from .config import PROJECT_STATE_DIRNAME
 from .gitignore import ensure_drcode_gitignored
-from .models import TRANSCRIPT_KEYS, Task
+from .models import TRANSCRIPT_KEYS, ImageAttachment, Task
 from .transcript import build_skeleton
 
 # Sidecar file suffix: `<id>.transcript.json` next to `<id>.json`. Every
@@ -127,6 +129,13 @@ class Storage:
         """The append-only compaction archive of `task_id` (may not exist —
         it is created on the first archived compaction)."""
         return self.tasks_dir / f"{task_id}{ARCHIVE_SUFFIX}"
+
+    def attachment_root(self, task_id: str) -> Path:
+        """Per-task directory holding the attached image files
+        (`.drcode/tasks/<id>/attachments/`). A subdirectory named after the
+        task id never collides with the `*.json` metadata glob above. Not
+        created here — `save_attachment` creates it lazily."""
+        return self.tasks_dir / task_id / "attachments"
 
     def task_file_paths(self) -> list[Path]:
         """The metadata files of the archive (sidecar transcripts and
@@ -319,4 +328,43 @@ class Storage:
         self.task_path(task_id).unlink(missing_ok=True)
         self.transcript_path(task_id).unlink(missing_ok=True)
         self.archive_path(task_id).unlink(missing_ok=True)
+        # The whole per-task directory (attachment files) goes with the
+        # task — best-effort, like every cleanup path here.
+        shutil.rmtree(self.tasks_dir / task_id, ignore_errors=True)
         self._transcript_order.pop(task_id, None)
+
+    # -- attachments ------------------------------------------------------------
+
+    _ATTACHMENT_EXTENSIONS: ClassVar[dict[str, str]] = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+
+    def save_attachment(
+        self, task_id: str, data: bytes, media_type: str
+    ) -> ImageAttachment:
+        """Persist an image's bytes under the task's attachment directory
+        and return the reference to store in `PendingInput.attachments`."""
+        ext = self._ATTACHMENT_EXTENSIONS.get(media_type, ".bin")
+        directory = self.attachment_root(task_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex[:12]}{ext}"
+        (directory / filename).write_bytes(data)
+        return ImageAttachment(filename=filename, media_type=media_type)
+
+    def read_attachment(
+        self, task_id: str, attachment: ImageAttachment
+    ) -> bytes | None:
+        """The stored image bytes, None when the file is gone (a cleanup
+        raced the consumption, or the metadata survived a manual deletion) —
+        the consumer degrades such a loss to a placeholder, never a crash."""
+        try:
+            return (self.attachment_root(task_id) / attachment.filename).read_bytes()
+        except OSError:
+            return None
+
+    def delete_attachments(self, task_id: str) -> None:
+        """Remove the task's whole attachment directory (best-effort)."""
+        shutil.rmtree(self.attachment_root(task_id), ignore_errors=True)

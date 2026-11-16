@@ -176,16 +176,39 @@ class TodoItem(BaseModel):
     done: bool = False
 
 
+class ImageAttachment(BaseModel):
+    """One image attached to a queued user message.
+
+    Only a REFERENCE: the image bytes live on disk under
+    `.drcode/tasks/<id>/attachments/<filename>` (see `drcode.storage`),
+    never base64-inlined into the task metadata — a metadata file that
+    carried megabytes of base64 would make every `load_all` parse them
+    at startup. The consumer (`core/pipeline_agent_run._consume_turn_input`)
+    reads the file and turns it into a `BinaryContent` item of a
+    multimodal user prompt.
+    """
+
+    filename: str
+    media_type: str = "image/png"
+
+
 class PendingInput(BaseModel):
     """A user message queued before the agent consumes it.
 
     `at` is when the user typed the message — the chat thread places it by
     this stamp (not by the consumption order), so comments sent while the
     task was queued or running keep their chronological place in the thread.
+
+    `attachments` carries the task's image references (empty = a plain
+    text-only message, the historical shape — old task JSONs load without
+    any migration). The re-queue paths (`task.pending_input[:0] = consumed`
+    on a failed/cancelled run start) move whole PendingInput objects, so
+    attachments survive the restore by construction.
     """
 
     text: str
     at: datetime = Field(default_factory=_now)
+    attachments: list[ImageAttachment] = Field(default_factory=list)
 
 
 # The three serialized transcripts a task carries (the coding agent's full

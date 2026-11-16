@@ -72,6 +72,12 @@ TOP_TOOL_RESULTS = 5
 # Cap of one tool-result label in the top-list (chars).
 _TOOL_LABEL_CAP = 60
 
+# ≈-token stand-in for a URL-referenced image in a multimodal user prompt
+# (the gateway fetches the bytes server-side, the size is unknowable here —
+# the point is to not claim 0). Base64-inline payloads are measured by their
+# own length instead, which is the honest number.
+IMAGE_URL_ESTIMATE_TOKENS = 1000
+
 
 def format_tokens(n: int) -> str:
     """Compact human token count (e.g. 45k, 1.2M, 980) — shared by the
@@ -435,13 +441,42 @@ def analyze_transcript(messages: list[dict[str, Any]]) -> TranscriptStats:
             kind = part.get("part_kind")
             if kind == "user-prompt":
                 content = part.get("content")
-                if not isinstance(content, str) or not content:
-                    continue
-                if content.startswith(COMPACTION_SUMMARY_PREFIX):
-                    stats.compacted = True
-                    bump("summary", content[len(COMPACTION_SUMMARY_PREFIX) :])
-                else:
-                    bump("user_prompts", content, "user_prompt_count")
+                if isinstance(content, str):
+                    if not content:
+                        continue
+                    if content.startswith(COMPACTION_SUMMARY_PREFIX):
+                        stats.compacted = True
+                        bump("summary", content[len(COMPACTION_SUMMARY_PREFIX) :])
+                    else:
+                        bump("user_prompts", content, "user_prompt_count")
+                elif isinstance(content, list) and content:
+                    # Multimodal prompt (text element + image items): the
+                    # images are NOT free — a serialized BinaryContent rides
+                    # in the transcript as base64 and is re-sent to the API
+                    # on every request. Count the text items by the usual
+                    # chars/4 and the base64 payload by its own length (the
+                    # gateway bills it as input tokens the same way).
+                    total = 0
+                    for item in content:
+                        if isinstance(item, str):
+                            total += estimate_tokens(item)
+                        elif isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                total += estimate_tokens(text)
+                                continue
+                            data = item.get("data")
+                            if isinstance(data, str):
+                                total += estimate_tokens(data)
+                            elif isinstance(item.get("url"), str):
+                                # A URL reference: the gateway fetches the
+                                # bytes server-side, the size is unknowable
+                                # here — a modest stand-in per image keeps
+                                # the estimate from claiming 0.
+                                total += IMAGE_URL_ESTIMATE_TOKENS
+                    if total:
+                        stats.user_prompts += total
+                        stats.user_prompt_count += 1
             elif kind == "retry-prompt":
                 # ModelRetry prompts: model-facing corrections, NOT user
                 # messages — reported as their own line.

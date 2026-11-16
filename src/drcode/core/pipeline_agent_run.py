@@ -20,6 +20,7 @@ from typing import Any
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.messages import (
+    BinaryContent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
 )
@@ -50,7 +51,7 @@ from ..core.usage import (
     _is_retryable_network_error,
     _network_retry_delay,
 )
-from ..models import PendingInput, Task, TaskKind, TaskStatus
+from ..models import ImageAttachment, PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole, resolve_available, subagent_usage_key
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
@@ -294,7 +295,7 @@ class PipelineAgentRunLayer(CoreState):
                     # over (the epilogue below decides what the task
                     # becomes).
                     break
-                text, consumed, workflow_instructions = turn
+                content, consumed, workflow_instructions = turn
                 try:
                     # Context compaction gate: before the history for the
                     # next turn is loaded, the fill is checked against the
@@ -305,7 +306,7 @@ class PipelineAgentRunLayer(CoreState):
                     await self._maybe_compact(task)
                     history = resumable_history(task.messages)
                     async with agent.iter(
-                        text,
+                        content,
                         message_history=history,
                         deps=AgentDeps(
                             root=root,
@@ -382,7 +383,7 @@ class PipelineAgentRunLayer(CoreState):
                                         # the outage wait).
                                         stream.finish_node()
                                 self._agent_model_request_done(
-                                    task, task_id, run, consumed, text, role
+                                    task, task_id, run, consumed, content, role
                                 )
                             elif Agent.is_call_tools_node(node):
                                 if await self._agent_tools_node(
@@ -435,7 +436,7 @@ class PipelineAgentRunLayer(CoreState):
                     # the next activation resumes it without re-sending text.
                     cancelled = True
                     self._agent_turn_cancelled(
-                        task, task_id, run, consumed, text, generation
+                        task, task_id, run, consumed, content, generation
                     )
                     raise
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
@@ -447,11 +448,11 @@ class PipelineAgentRunLayer(CoreState):
                         e
                     ) and _is_retryable_network_error(e):
                         self._agent_turn_network_error(
-                            task, task_id, run, consumed, text, generation, role, e
+                            task, task_id, run, consumed, content, generation, role, e
                         )
                         return
                     self._agent_turn_failed(
-                        task, task_id, run, consumed, text, generation, e
+                        task, task_id, run, consumed, content, generation, e
                     )
                     break
         except asyncio.CancelledError:
@@ -659,7 +660,10 @@ class PipelineAgentRunLayer(CoreState):
         task: Task,
         task_id: str,
         workflow_instructions: str | None,
-    ) -> tuple[str | None, list[PendingInput], str | None] | None:
+    ) -> (
+        tuple[str | list[str | BinaryContent] | None, list[PendingInput], str | None]
+        | None
+    ):
         """Consume the next turn's input (chronological message flow: the
         transcript is the single chronological record — the original
         prompt lives in it exactly once and is NEVER re-queued/re-sent;
@@ -670,9 +674,16 @@ class PipelineAgentRunLayer(CoreState):
         interrupted, runs one continuation turn without new text to pick
         the interrupted work back up).
 
-        Returns (text, consumed entries, possibly-injected workflow
-        instructions) or None when there is nothing to run (no queued
-        input, no unfinished attempt) — the caller ends the run.
+        Returns (prompt content, consumed entries, possibly-injected
+        workflow instructions) or None when there is nothing to run (no
+        queued input, no unfinished attempt) — the caller ends the run.
+        The content is a plain str for a text-only batch; when any
+        consumed entry carries image attachments it is a multimodal
+        content list (text element first, then one BinaryContent per
+        image — pydantic-ai accepts it as UserContent directly). The
+        chat-display text of the batch stays a plain str regardless
+        (see _consumed_prompts below and the `_write_history_line`
+        loop, which render `entry.text`).
 
         Async because of the interrupted-but-finished branch below: the
         mid-run gate can pause the run on the TERMINAL empty tools node
@@ -697,12 +708,21 @@ class PipelineAgentRunLayer(CoreState):
                     f"{workflow_instructions}\n\n{text}"
                 )
                 workflow_instructions = None
+            content: str | list[str | BinaryContent] = text
+            attachments = [a for entry in consumed for a in entry.attachments]
+            if attachments:
+                content = self._build_multimodal_prompt(
+                    task, task_id, text, attachments
+                )
             # Remember the consumed batch until the transcript picks
             # it up (the first node-boundary persist): a view_task()
             # re-render in between finds neither copy and wipes the
             # prompt from the chat — the record lets
             # _render_task_history draw it anyway. Dropped when the
-            # run ends or the batch is re-queued (below).
+            # run ends or the batch is re-queued (below). The record
+            # keeps the plain TEXT (never the multimodal content list):
+            # it is a chat-display projection, not model context — the
+            # base64 payloads must not ride through the render path.
             self._consumed_prompts[task_id] = (text, list(consumed))
             if self.viewed_id == task_id:
                 for entry in consumed:
@@ -714,7 +734,7 @@ class PipelineAgentRunLayer(CoreState):
                         # (an unfinished attempt's prompt renders from
                         # there) — draw the user block once.
                         self._write_history_line("user", entry.text)
-            return text, consumed, workflow_instructions
+            return content, consumed, workflow_instructions
         if task.unfinished:
             if not ends_with_open_request(task.messages):
                 # The interrupted attempt actually finished its
@@ -755,13 +775,64 @@ class PipelineAgentRunLayer(CoreState):
             return None, [], workflow_instructions
         return None
 
+    # Caps of ONE consumed prompt's image attachments: the multimodal
+    # content is serialized into the transcript as base64 and re-sent to
+    # the API on every request of the run — a pile of screenshots must not
+    # blow the context window in a single turn.
+    MAX_PROMPT_IMAGES = 6
+    MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+    def _build_multimodal_prompt(
+        self,
+        task: Task,
+        task_id: str,
+        text: str,
+        attachments: list[ImageAttachment],
+    ) -> list[str | BinaryContent]:
+        """The multimodal content of the consumed prompt: the text element
+        first, then one `BinaryContent` per attached image.
+
+        Limits: at most MAX_PROMPT_IMAGES images per prompt, at most
+        MAX_IMAGE_BYTES bytes per image — anything over is skipped with a
+        service event, never silently. A missing file (a cleanup raced the
+        consumption, or the metadata outlived a manual deletion) degrades
+        to a placeholder text item: the run must never die because an
+        attachment vanished."""
+        items: list[str | BinaryContent] = [text] if text else []
+        taken = 0
+        dropped: list[str] = []
+        for att in attachments:
+            if taken >= self.MAX_PROMPT_IMAGES:
+                dropped.append(
+                    f"{att.filename} (over the {self.MAX_PROMPT_IMAGES}-image prompt limit)"
+                )
+                continue
+            data = self.manager.storage.read_attachment(task_id, att)
+            if data is None:
+                items.append(f"[image {att.media_type} — file missing]")
+                continue
+            if len(data) > self.MAX_IMAGE_BYTES:
+                dropped.append(
+                    f"{att.filename} ({len(data)} bytes, over the "
+                    f"{self.MAX_IMAGE_BYTES}-byte per-image limit)"
+                )
+                continue
+            items.append(BinaryContent(data=data, media_type=att.media_type))
+            taken += 1
+        if dropped:
+            self._show_event(
+                task,
+                "Skipped attached image(s): " + "; ".join(dropped) + ".",
+            )
+        return items
+
     def _agent_model_request_done(
         self,
         task: Task,
         task_id: str,
         run: AgentRun[AgentDeps, str],
         consumed: list[PendingInput],
-        text: str | None,
+        content: str | list[Any] | None,
         role: AgentRole,
     ) -> None:
         """Bookkeeping after one completed model request node: backdate
@@ -773,10 +844,10 @@ class PipelineAgentRunLayer(CoreState):
         # the user typed it, so the chat thread stays chronological even
         # when the prompt sat in pending_input for a while before this
         # run picked it up.
-        if consumed and text is not None:
+        if consumed and content is not None:
             backdate_user_prompt(
                 run.all_messages(),
-                text,
+                content,
                 consumed[0].at,
             )
         # The stream is closed: this request's usage is final. Refresh
@@ -814,7 +885,7 @@ class PipelineAgentRunLayer(CoreState):
         self,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
-        text: str | None,
+        content: str | list[Any] | None,
     ) -> None:
         """Backdate the consumed prompt the run's transcript already holds.
 
@@ -828,13 +899,13 @@ class PipelineAgentRunLayer(CoreState):
         applies the same backdating the node completion would have — a
         no-op when the prompt never reached the transcript (the caller
         re-queues it with its original stamps then)."""
-        if run is None or not consumed or text is None:
+        if run is None or not consumed or content is None:
             return
         try:
             messages = run.all_messages()
         except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
             return
-        backdate_user_prompt(messages, text, consumed[0].at)
+        backdate_user_prompt(messages, content, consumed[0].at)
 
     async def _agent_tools_node(
         self,
@@ -977,7 +1048,7 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
-        text: str | None,
+        content: str | list[Any] | None,
         generation: int,
     ) -> None:
         """Interrupted (abort, nudge, or a newer run taking over): keep
@@ -994,7 +1065,7 @@ class PipelineAgentRunLayer(CoreState):
             # sanitize: drop the API-invalid tail (tool calls without
             # results, the empty interrupted request) so later messages
             # can append in any order.
-            self._backdate_consumed_prompt(run, consumed, text)
+            self._backdate_consumed_prompt(run, consumed, content)
             self._persist_task_messages(task, run)
             if run is None and consumed:
                 # Cancelled before the run context was even entered (e.g.
@@ -1023,7 +1094,7 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
-        text: str | None,
+        content: str | list[Any] | None,
         generation: int,
         role: AgentRole,
         error: Exception,
@@ -1077,7 +1148,7 @@ class PipelineAgentRunLayer(CoreState):
         # in the transcript with the consumption stamp (the completion
         # bookkeeping that backdates it was skipped) — correct it before
         # the persist freezes the wrong stamp.
-        self._backdate_consumed_prompt(run, consumed, text)
+        self._backdate_consumed_prompt(run, consumed, content)
         self._persist_task_messages(task, run)
         task.messages = sanitized_messages(task.messages)
         if run is None and consumed:
@@ -1120,7 +1191,7 @@ class PipelineAgentRunLayer(CoreState):
         task_id: str,
         run: AgentRun[AgentDeps, str] | None,
         consumed: list[PendingInput],
-        text: str | None,
+        content: str | list[Any] | None,
         generation: int,
         error: Exception,
     ) -> None:
@@ -1140,7 +1211,7 @@ class PipelineAgentRunLayer(CoreState):
             # hang in the dialog (and would be shown for whatever the
             # user does next).
             self._drop_stream_preview(task_id, generation)
-        self._backdate_consumed_prompt(run, consumed, text)
+        self._backdate_consumed_prompt(run, consumed, content)
         self._persist_task_messages(task, run)
         task.messages = sanitized_messages(task.messages)
         # Not lost: unfinished marks the attempt; promotion resumes it

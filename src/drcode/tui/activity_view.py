@@ -55,9 +55,7 @@ class ActivityLayer(DrCodeState):
         if bookkeeping:
             limit = self.settings.stall_nudge.minutes
             stamped = self._last_activity.get(task_id)
-            if stamped is not None and (
-                limit is None or now - stamped < limit * 60
-            ):
+            if stamped is not None and (limit is None or now - stamped < limit * 60):
                 return
         self._last_activity[task_id] = now
         if done:

@@ -27,6 +27,8 @@ from .transcript import (
     COMPACTION_SUMMARY_PREFIX,
     MODEL_SWITCH_NOTE_PREFIX,
     estimate_tokens,
+    prompt_image_placeholders,
+    prompt_text_element,
     sanitized_messages,
     serialize_messages,
 )
@@ -107,14 +109,23 @@ def _is_request(msg: dict[str, Any]) -> bool:
 
 
 def _user_prompt_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    """String user-prompt parts of a serialized request, in order."""
+    """User-prompt parts of a serialized request, in order.
+
+    Both content shapes count: a plain str and a multimodal list (text
+    element + image items) — a leading multimodal original prompt must be
+    recognized and preserved like a text one, not silently dropped into
+    the summary. The compaction-machinery parts (summary / resume note /
+    background mark) are always plain strs, so a list content is by
+    definition real user content."""
     return [
         part
         for part in msg.get("parts", [])
         if isinstance(part, dict)
         and part.get("part_kind") == "user-prompt"
-        and isinstance(part.get("content"), str)
-        and part["content"]
+        and (
+            (isinstance(part.get("content"), str) and part["content"])
+            or (isinstance(part.get("content"), list) and part["content"])
+        )
     ]
 
 
@@ -182,6 +193,41 @@ def _without_summary_parts(msg: dict[str, Any]) -> dict[str, Any] | None:
     return {**msg, "parts": parts} if parts else None
 
 
+def _strip_prompt_images(msg: dict[str, Any]) -> dict[str, Any]:
+    """Copy of a serialized request with the image items stripped from its
+    multimodal user-prompt parts (the text element survives verbatim; a
+    part left with an EMPTY list — an image-only prompt — is dropped, and
+    a request left without parts is dropped whole: an empty ModelRequest
+    is not API-valid). Plain messages come back untouched (same object —
+    the common path, no copying)."""
+    if not _is_request(msg):
+        return msg
+    changed = False
+    kept_parts: list[Any] = []
+    for part in msg.get("parts", []):
+        if (
+            isinstance(part, dict)
+            and part.get("part_kind") == "user-prompt"
+            and isinstance(part.get("content"), list)
+        ):
+            filtered = [
+                item
+                for item in part["content"]
+                if isinstance(item, str)
+                or (isinstance(item, dict) and isinstance(item.get("text"), str))
+            ]
+            changed = True
+            if filtered:
+                kept_parts.append({**part, "content": filtered})
+            continue
+        kept_parts.append(part)
+    if not changed:
+        return msg
+    if not kept_parts:
+        return {}
+    return {**msg, "parts": kept_parts}
+
+
 def split_original_prompts(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -202,6 +248,17 @@ def split_original_prompts(
     `preserved` and stays in `rest`, where the summarizer sees it as part
     of the conversation history — it must not be re-preserved verbatim on
     every compaction cycle.
+
+    Multimodal original prompts (a list-content user-prompt part with
+    image items) are preserved with the image items STRIPPED — only the
+    text element survives. DELIBERATE choice: the images were already
+    seen by the model that worked on the round being summarized, and the
+    summary describes what was done about them; re-preserving the base64
+    payloads would keep megabytes riding in every subsequent request of
+    the compacted transcript for no informational gain (and a fresh
+    compaction would never shrink them again, since `preserved` bypasses
+    the summarizer). The text element — the actual user words — stays
+    verbatim.
     """
     i = 0
     preserved: list[dict[str, Any]] = []
@@ -215,7 +272,12 @@ def split_original_prompts(
             if trimmed is not None:
                 preserved.append(trimmed)
             break
-        preserved.append(msg)
+        stripped = _strip_prompt_images(msg)
+        if stripped:
+            # An image-only original prompt (no text element) leaves
+            # nothing to preserve — it is dropped whole, not carried as an
+            # API-invalid empty request.
+            preserved.append(stripped)
         i += 1
     return preserved, messages[i:]
 
@@ -413,6 +475,22 @@ def render_history_blocks(messages: list[dict[str, Any]]) -> list[tuple[str, str
                     and not content.startswith(BACKGROUND_COMPACTION_MARK_PREFIX)
                 ):
                     blocks.append(("user", f"[user]\n{content}"))
+                elif isinstance(content, list) and content:
+                    # Multimodal user prompt: the text element verbatim plus
+                    # one placeholder line per image. The summarizer may run
+                    # on a model WITHOUT vision — and even a vision model
+                    # must not be handed the megabytes of base64 inside a
+                    # plain-text render. The images degrade to placeholders,
+                    # never a silent drop, never an error.
+                    text = prompt_text_element(content)
+                    if text and text.startswith(
+                        (COMPACTION_SUMMARY_PREFIX, BACKGROUND_COMPACTION_MARK_PREFIX)
+                    ):
+                        continue
+                    lines = [text or "", *prompt_image_placeholders(content)]
+                    rendered = "\n".join(line for line in lines if line)
+                    if rendered:
+                        blocks.append(("user", f"[user]\n{rendered}"))
             elif kind == "tool-return":
                 # Tool returns live in request messages (ModelRequest with a
                 # ToolReturnPart) — they must be rendered BEFORE the generic

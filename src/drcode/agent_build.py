@@ -666,6 +666,11 @@ def build_agent(
     @agent.tool(
         description=(
             "Run a shell command in the project root and return its output.\n"
+            "Every call starts a FRESH shell already in this working "
+            "directory (the\nproject root) — do NOT prefix commands with "
+            "`cd <project>`; use\nrelative paths or rely on the current "
+            "directory. A one-off `cd` into a\nsubdirectory inside a single "
+            "command is fine, but it never persists\nto the next call.\n"
             "The command is killed after `timeout` seconds (default 120); "
             "pass a\nlarger timeout for long-running commands (builds, test "
             "suites) —\nvalues above 3600 (60 minutes) are clamped to 3600.\n"
@@ -1390,6 +1395,11 @@ def build_tester_agent(
     @agent.tool(
         description=(
             "Run a shell command in the project root and return its output.\n"
+            "Every call starts a FRESH shell already in this working "
+            "directory (the\nproject root) — do NOT prefix commands with "
+            "`cd <project>`; use\nrelative paths or rely on the current "
+            "directory. A one-off `cd` into a\nsubdirectory inside a single "
+            "command is fine, but it never persists\nto the next call.\n"
             "The command is killed after `timeout` seconds (default 120); "
             "pass a\nlarger timeout for long-running checks (full test "
             "suites, builds) —\nvalues above 3600 (60 minutes) are clamped "
@@ -1742,7 +1752,13 @@ def build_resolver_agent(
     @agent.tool(
         description=(
             "Run a shell command in the resolved worktree and return its "
-            "output.\nThe command is killed after `timeout` seconds "
+            "output.\n"
+            "Every call starts a FRESH shell already in this working "
+            "directory (the\nresolved worktree) — do NOT prefix commands "
+            "with `cd <worktree>`;\nuse relative paths or rely on the "
+            "current directory. A one-off `cd`\ninto a subdirectory inside "
+            "a single command is fine, but it never\npersists to the next "
+            "call.\nThe command is killed after `timeout` seconds "
             "(default 120); pass a\nlarger timeout for long-running "
             "commands — values above 3600 (60\nminutes) are clamped to "
             "3600. Use it for quick read-only inspection\n(git log/diff, "

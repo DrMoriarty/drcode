@@ -35,11 +35,7 @@ from drcode import agent_model
 from drcode.agent import serialize_messages
 from drcode.models import TaskEvent, TaskKind, TaskStatus
 from drcode.providers import AgentRole
-from drcode.settings import (
-    ProjectSettings,
-    parallel_tasks_label,
-    subagents_label,
-)
+from drcode.settings import ProjectSettings
 from drcode.storage import Storage
 from drcode.task_search import TaskHit
 from drcode.tui.app import DrCodeApp
@@ -3790,7 +3786,6 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     from drcode.tui.command_providers import (
         ProjectSettingsCommandsProvider,
         TaskSettingsCommandProvider,
-        TaskSettingsEntriesProvider,
     )
     from drcode.tui.task_settings_dialog import TaskSettingsDialog
 
@@ -3871,28 +3866,6 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
         ]
-        # The per-field sub-menu entries (quick toggles) are unchanged.
-        entries = TaskSettingsEntriesProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [
-            f"Workflow preset: {app.workflow_preset_label()}",
-            f"Task isolation: {app._task_isolation_label()}",
-            f"Isolation start branch: {app._isolation_start_branch_label()}",
-            f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
-            f"Worktree removal: {app.settings.worktree_removal.label}",
-            f"Worktree snapshot: {app.settings.worktree_snapshot.label}",
-            f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
-            f"Subagents (researcher): {subagents_label(app.settings.subagents_researcher)}",
-            f"Web fetch (research): {app.settings.web_fetch_mode.label}",
-            "Web fetch hosts…",
-            f"Verification: {app.settings.verification.label}",
-            f"Max development rounds: {app.settings.max_dev_rounds}",
-            f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
-            f"Git (tester): {app.settings.git_policy.tester.label}",
-            f"Git (research): {app.settings.git_policy.research.label}",
-            f"Auto-delete completed tasks: {app.settings.completed_retention.label}",
-            "Keep computer awake: " + ("on" if app.settings.keep_awake else "off"),
-            f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
-        ] == [c.name for c in entries]
 
 
 async def test_task_settings_dialog_draft_isolation_and_apply(

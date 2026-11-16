@@ -2,9 +2,11 @@
 
 Everything reachable from the "Settings" palette: the main palette
 (``SettingsPalette``) with its narrowed layout and deterministic entry
-order, the "Model settings…" and "Task settings…" sub-menu palettes, the
-providers that supply the main-menu entries and the per-option selection
-palettes for each project preference.
+order, the "Model settings…" sub-menu palette, the providers that supply
+the main-menu entries and the per-option selection palettes for each
+project preference. The task-management preferences are NOT here — they
+live in the modal ``TaskSettingsDialog``, opened by the single
+"Task settings…" entry (``TaskSettingsCommandProvider``).
 """
 
 from __future__ import annotations
@@ -300,44 +302,6 @@ class ModelSettingsPalette(SettingsPalette):
     )
 
 
-class TaskSettingsPalette(SettingsPalette):
-    """Sub-menu of the Settings palette with the task-management entries.
-
-    Opened from the single "Task settings…" entry of the main Settings
-    menu: the project preferences that govern how tasks behave, grouped
-    into three labeled sections — Workflow (preset, isolation, parallel
-    tasks, worktree removal), Testing (verification, dev rounds, stall
-    nudge) and Git (tester/research policies, retention). Same narrowed
-    layout and spaced list as the parent; the entry order is its own
-    (task entries only), so the shared prefix-sort in
-    `SettingsPalette._entry_rank` orders this menu independently.
-    """
-
-    # Same prefix-matching contract as SettingsPalette.ENTRY_ORDER, but
-    # scoped to this sub-menu: the task-management preferences in their
-    # fixed logical order, grouped by section (the section labels live
-    # only in the docstrings/help texts — the palette is a flat list).
-    ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
-        # -- Workflow --
-        "Workflow preset:",
-        "Task isolation:",
-        "Isolation start branch:",
-        "Parallel tasks:",
-        "Worktree removal:",
-        "Subagents (coder):",
-        "Subagents (researcher):",
-        # -- Testing --
-        "Verification:",
-        "Max development rounds:",
-        "Nudge stalled agent after:",
-        # -- Git --
-        "Git (tester):",
-        "Git (research):",
-        "Auto-delete completed tasks:",
-        "Keep computer awake:",
-    )
-
-
 class ServiceCommandsProvider(CommandListProvider):
     """App-specific commands in the Settings palette.
 
@@ -435,9 +399,8 @@ class ModelSettingsCommandProvider(CommandListProvider):
 class TaskSettingsCommandProvider(CommandListProvider):
     """The single "Task settings…" entry in the main Settings palette.
 
-    Opens the TaskSettingsPalette sub-menu with the seven project
-    preferences that govern task behavior (retention, finalization,
-    worktree removal, dev rounds, stall nudge, isolation, parallelism).
+    Opens the modal TaskSettingsDialog (via ``action_open_task_settings``)
+    with all the task-management project preferences in one form.
     """
 
     def _commands(self) -> list[CommandEntry]:
@@ -463,10 +426,10 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
     project, not the user. Escape dismisses the selection window and keeps
     the current value.
 
-    The six task-management preferences (retention, finalization, dev
-    rounds, stall nudge, isolation, parallelism) are not here — they live
-    in the "Task settings…" sub-menu (TaskSettingsPalette), whose entries
-    are provided by TaskSettingsEntriesProvider.
+    The task-management preferences (retention, finalization, worktree
+    removal, dev rounds, stall nudge, isolation, parallelism, …) are not
+    here — they live in the modal TaskSettingsDialog, opened by the
+    "Task settings…" entry (TaskSettingsCommandProvider).
     """
 
     def _commands(self) -> list[CommandEntry]:
@@ -493,186 +456,6 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
                 "Speech recognition (push-to-talk dictation into the "
                 "input fields) and spoken announcements, via an "
                 "OpenAI-compatible audio API (project setting)",
-            ),
-        ]
-
-
-class TaskSettingsEntriesProvider(CommandListProvider):
-    """The task-management entries of the "Task settings…" sub-menu,
-    grouped into three sections: Workflow (preset, isolation, parallel
-    tasks, worktree removal), Testing (verification, dev rounds, stall
-    nudge) and Git (tester/research policies, retention).
-
-    One entry per project preference; its current value is shown after the
-    ":". Picking an entry opens the option-selection palette (same UX as the
-    theme picker); choosing an option there persists it into
-    `<project>/.drcode/settings.json`, so the choice is scoped to the
-    project, not the user. Escape dismisses the selection window and keeps
-    the current value.
-    """
-
-    def _commands(self) -> list[CommandEntry]:
-        app = cast("DrCodeApp", self.app)
-        return [
-            CommandEntry(
-                f"Workflow preset: {app.workflow_preset_label()}",
-                app.action_change_workflow_preset,
-                "Apply a named combination of the workflow settings "
-                "(verification, per-role git policies, isolation, "
-                "worktree removal) in one pick — Local sandbox, "
-                "Team / PR flow or Minimal; any manual change of an "
-                "individual setting flips this display to Custom",
-            ),
-            # -- Workflow --
-            CommandEntry(
-                f"Task isolation: {app._task_isolation_label()}",
-                app.action_change_task_isolation,
-                "Give each task its own git worktree (.drcode/"
-                "worktrees/<id>, branch drcode/<id>) so an interrupted "
-                "task never leaves its changes to the next one — needs "
-                "a git repository, otherwise tasks run in the shared "
-                "project directory (project setting)",
-            ),
-            CommandEntry(
-                f"Isolation start branch: {app._isolation_start_branch_label()}",
-                app.action_change_isolation_start_branch,
-                "Which commit NEW task branches are forked from under "
-                "worktree isolation: auto (the main checkout's current "
-                "branch — a detached HEAD then refuses the isolation "
-                "instead of forking from an unknown commit) or a named "
-                "branch such as main, used even when the checkout is "
-                "detached (project setting)",
-            ),
-            CommandEntry(
-                f"Parallel tasks: {parallel_tasks_label(app.settings.parallel_tasks)}",
-                app.action_change_parallel_tasks,
-                "How many tasks may develop in parallel, each in its "
-                "own git worktree — needs Task isolation: worktree, "
-                "otherwise tasks run one at a time (project setting; "
-                "the tester stays single)",
-            ),
-            CommandEntry(
-                f"Worktree removal: {app.settings.worktree_removal.label}",
-                app.action_change_worktree_removal,
-                "When the per-task worktree directory (.drcode/"
-                "worktrees/<id>) is deleted automatically: with the "
-                "task, on task completion, or never — the branch "
-                "drcode/<id> with the committed work always survives "
-                "(project setting)",
-            ),
-            CommandEntry(
-                f"Worktree snapshot: {app.settings.worktree_snapshot.label}",
-                app.action_change_worktree_snapshot,
-                "When a settling task's worktree gets the automatic "
-                "snapshot commit on drcode/<id>: always, only when the "
-                "run made no commits of its own (a deliberate uncommitted "
-                "tail is kept — and any removal keeps the worktree with "
-                "it), or never (project setting)",
-            ),
-            CommandEntry(
-                f"Subagents (coder): {subagents_label(app.settings.subagents_coder)}",
-                app.action_change_subagents_coder,
-                "How many delegate_research calls the CODING agent has "
-                "per run (total budget — subagents may run in parallel "
-                "within it, the slots are never renewed): each returns "
-                "only its final report, saving the agent's context; off "
-                "removes the tool entirely (project setting)",
-            ),
-            CommandEntry(
-                f"Subagents (researcher): "
-                f"{subagents_label(app.settings.subagents_researcher)}",
-                app.action_change_subagents_researcher,
-                "The same delegation cap for the RESEARCH agent's runs "
-                "(its resolved model serves the subagents; the counter "
-                "is per run) — off removes the delegate_research tool "
-                "(project setting)",
-            ),
-            CommandEntry(
-                f"Web fetch (research): {app.settings.web_fetch_mode.label}",
-                app.action_change_web_fetch_mode,
-                "Whether the RESEARCH agent may read web pages through "
-                "its structured web_fetch tool (off / allowlist / all "
-                "hosts) — external requests from run_bash are refused "
-                "for every role either way (bash stays local-only): "
-                "GET-only, private and metadata addresses refused, size- "
-                "capped, HTML reduced to text and every result framed as "
-                "untrusted content. The coding agent, the tester and the "
-                "resolver never get the tool (project setting)",
-            ),
-            CommandEntry(
-                "Web fetch hosts…",
-                app.action_edit_web_fetch_hosts,
-                "Edit the web-fetch allow and block lists (the block list "
-                "always wins; an empty allow list in allowlist mode "
-                "refuses every host). A listed host also matches its "
-                "subdomains (project setting)",
-            ),
-            # -- Testing --
-            CommandEntry(
-                f"Verification: {app.settings.verification.label}",
-                app.action_change_verification,
-                "Whether the QA tester round runs after development: "
-                "tester (verify before completion) or none (tasks "
-                "complete right away — project setting)",
-            ),
-            CommandEntry(
-                f"Max development rounds: {app.settings.max_dev_rounds}",
-                app.action_change_max_dev_rounds,
-                "How many consecutive failed development rounds a task "
-                "gets when the tester attributes the failure to the "
-                "task's own changes, before the failure completes the "
-                "task as failed and a bug report is created instead "
-                "(project setting)",
-            ),
-            CommandEntry(
-                f"Nudge stalled agent after: {app.settings.stall_nudge.label}",
-                app.action_change_stall_nudge,
-                "Abort and restart an agent/tester run that has shown no "
-                "activity for this long (project setting)",
-            ),
-            # -- Git --
-            CommandEntry(
-                f"Git (tester): {app.settings.git_policy.tester.label}",
-                app.action_change_git_tester,
-                "What the QA tester may do to git after a passed "
-                "verification: commit + push, local commit only, or "
-                "off (verify without committing — project setting; "
-                "dormant while Verification is none)",
-            ),
-            CommandEntry(
-                f"Git (research): {app.settings.git_policy.research.label}",
-                app.action_change_git_research,
-                "What the research agent's git_commit_docs may do: "
-                "commit + push, local commit only, or off (no commit "
-                "step at all — edited files are still tracked for the "
-                "report; project setting)",
-            ),
-            CommandEntry(
-                f"Auto-delete completed tasks: "
-                f"{app.settings.completed_retention.label}",
-                app.action_change_completed_retention,
-                "Delete completed tasks older than the retention period at app "
-                "startup (project setting)",
-            ),
-            CommandEntry(
-                f"Keep computer awake: {'on' if app.settings.keep_awake else 'off'}",
-                app.action_toggle_keep_awake,
-                "Hold a system-sleep assertion while the pipeline has "
-                "work (any task queued/active/testing or a run in "
-                "flight) — a sleeping machine tears the network down "
-                "and kills the runs (project setting; does not stop "
-                "the lid-closed clamshell sleep)",
-            ),
-            CommandEntry(
-                f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
-                app.action_toggle_mcp_enabled,
-                "Expose this live TUI to external AI agents over "
-                "Streamable HTTP on an ephemeral loopback port — they "
-                "then drive tasks through the same pipeline as your own "
-                "clicks. The port, the bearer token and the owning pid "
-                "are published in .drcode/mcp.json (mode 0600, never "
-                "shown in the UI); toggling starts/stops the server "
-                "immediately (project setting)",
             ),
         ]
 

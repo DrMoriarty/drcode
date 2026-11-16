@@ -122,9 +122,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # so it reads this set): the system commands (theme, quit, …) plus our
     # own service commands (AGENTS.md refresh and friends). The model
     # entries (provider catalog, per-role picks) live in the "Model
-    # settings…" sub-menu and the task-management preferences in the
-    # "Task settings…" sub-menu; both sub-palettes' providers are passed
-    # explicitly by their open actions.
+    # settings…" sub-menu (its provider is passed explicitly by
+    # action_open_model_settings) and the task-management preferences in
+    # the modal TaskSettingsDialog, opened by the "Task settings…" entry.
     COMMANDS: ClassVar = {
         get_system_commands_provider,
         ModelSettingsCommandProvider,

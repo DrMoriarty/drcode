@@ -1,9 +1,9 @@
 """Task settings dialog — the single modal form for the task-management
 project preferences (variant A of the settings redesign).
 
-Opened from the Settings palette's "Task settings…" entry (it replaces
-the old TaskSettingsPalette sub-menu; the per-field palettes and their
-``action_set_*`` actions stay for quick toggles). The dialog:
+Opened from the Settings palette's single "Task settings…" entry
+(``TaskSettingsCommandProvider`` → ``action_open_task_settings``).
+The dialog:
 
 - works on a DEEP COPY of the saved settings: nothing is persisted until
   Apply (ESC dismisses with None and discards everything);

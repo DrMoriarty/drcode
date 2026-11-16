@@ -326,6 +326,42 @@
     if (setTitle) setTitle(title);
   }
 
+  /* ---------------- tab switching (Cmd+{ / Cmd+}) ----------------
+   * Cmd+Shift+[ / Cmd+Shift+] switch to the previous/next tab, CYCLIC
+   * (last tab wraps to the first — standard macOS behavior). The combo
+   * is matched by ev.code ("BracketLeft"/"BracketRight"), never by
+   * ev.key: the physical key is layout-independent, while on a Cyrillic
+   * layout the same press yields "х"/"ъ" and the brace characters never
+   * appear. Two delivery points share maybeTabSwitchShortcut below —
+   * xterm's custom key handler (terminal focused) and the window keydown
+   * listener (focus anywhere else) — and the same physical press reaches
+   * BOTH when the terminal has focus (xterm's handler runs on the
+   * textarea, the window listener sees the same event again at the
+   * bubbling tail). The dedupe is by ev.timeStamp: the two handlers get
+   * the SAME DOM event object (identical stamp → already handled), while
+   * a held-key repeat is a brand-new event with a new stamp and keeps
+   * cycling through the tabs. */
+  var lastTabSwitchStamp = -1;
+
+  function switchTabByOffset(offset) {
+    if (!tabs.length) return;
+    var idx = tabs.indexOf(activeTab);
+    if (idx < 0) idx = 0;
+    // activateTab does the refit + PTY resize + focus for the new tab.
+    activateTab(tabs[(idx + offset + tabs.length) % tabs.length]);
+  }
+
+  function maybeTabSwitchShortcut(ev) {
+    if (ev.isComposing) return false; // IME composition — never a shortcut
+    if (!(ev.metaKey || ev.ctrlKey) || !ev.shiftKey || ev.altKey) return false;
+    var offset = ev.code === "BracketLeft" ? -1 : ev.code === "BracketRight" ? 1 : 0;
+    if (!offset) return false;
+    if (ev.timeStamp === lastTabSwitchStamp) return true; // same press, already handled
+    lastTabSwitchStamp = ev.timeStamp;
+    switchTabByOffset(offset);
+    return true;
+  }
+
   function closeTab(tab) {
     if (!tab || tab.closing) return;
     tab.closing = true;
@@ -540,6 +576,16 @@
       if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN || !tab.started) return true;
       ev.preventDefault();
       tab.ws.send(new TextEncoder().encode(encodeEnter(ev)));
+      return false;
+    }
+    // Cmd+{ / Cmd+} (Cmd+Shift+[ / Cmd+Shift+]) MUST be intercepted
+    // before the metaKey gate below — that gate deliberately lets every
+    // metaKey event through to xterm.js, and the combo would be forwarded
+    // toward the PTY. The window keydown listener covers the same combo
+    // when focus is outside the terminal; maybeTabSwitchShortcut dedupes
+    // the double delivery (see the comment at its definition).
+    if (maybeTabSwitchShortcut(ev)) {
+      ev.preventDefault();
       return false;
     }
     if (!ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return true;
@@ -1195,6 +1241,12 @@
         // the combo to the PTY.
         ev.preventDefault();
         openSettings();
+      } else if (maybeTabSwitchShortcut(ev)) {
+        // Cmd+{ / Cmd+} when focus is outside the terminal (welcome
+        // screen, settings dialog, tab bar). The in-terminal delivery
+        // goes through terminalKeyHandler; the shared handler dedupes
+        // the double event by its timeStamp.
+        ev.preventDefault();
       }
     });
 

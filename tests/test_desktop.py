@@ -1557,3 +1557,63 @@ def test_exit_process_flushes_streams(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [3]
     assert fake_out.getvalue() == "last words"
     assert fake_err.getvalue() == "last warning"
+
+
+# ---------------------------------------------------------------------------
+# web/term.js — tab-switching shortcuts (Cmd+{ / Cmd+}, Cmd+Shift+[ / ])
+# ---------------------------------------------------------------------------
+#
+# The JS terminal client is exercised manually (it needs a GUI session),
+# so the shortcut wiring is checked statically: both delivery points —
+# xterm's custom key handler (terminal focused) and the window keydown
+# listener (focus anywhere else) — must route the combo through the shared,
+# timestamp-deduped maybeTabSwitchShortcut.
+
+
+def _term_js() -> str:
+    return (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+
+def test_tab_switch_shortcut_matched_by_physical_key() -> None:
+    """The combo is matched by ev.code (layout-independent), never by
+    ev.key: on a Cyrillic layout the same physical key yields «х»/«ъ»
+    and the brace keycaps never appear."""
+    src = _term_js()
+    assert '"BracketLeft"' in src
+    assert '"BracketRight"' in src
+    # No ev.key-based matching of the brackets/braces crept in.
+    assert 'ev.key === "[' not in src
+    assert 'ev.key === "{"' not in src
+    assert 'ev.key === "]"' not in src
+    assert 'ev.key === "}"' not in src
+
+
+def test_tab_switch_shortcut_in_both_handlers() -> None:
+    src = _term_js()
+    terminal_handler = src[src.index("function terminalKeyHandler") :]
+    window_block = src[src.index('window.addEventListener("keydown"') :]
+    assert "maybeTabSwitchShortcut" in terminal_handler
+    assert "maybeTabSwitchShortcut" in window_block
+    # Inside terminalKeyHandler the interception sits BEFORE the metaKey
+    # pass-through gate — that gate deliberately lets every metaKey event
+    # through to xterm.js, and the combo would reach the PTY.
+    assert terminal_handler.index("maybeTabSwitchShortcut(") < terminal_handler.index(
+        "if (!ev.ctrlKey || ev.metaKey"
+    )
+
+
+def test_tab_switch_shortcut_cyclic_and_deduped() -> None:
+    """Cyclic wrap (last tab → first, macOS-style) over the tab order,
+    and a shared handler deduping the double delivery: xterm's handler
+    and the window listener receive the SAME DOM event (identical
+    timeStamp), while a held-key repeat is a new event with a new stamp."""
+    src = _term_js()
+    assert "% tabs.length" in src
+    assert "timeStamp" in src
+    assert src.count("maybeTabSwitchShortcut(") >= 3  # definition + 2 call sites
+
+
+def test_index_html_documents_tab_switch_shortcut() -> None:
+    html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
+    assert "switch tabs" in html
+    assert "[" in html and "]" in html

@@ -66,6 +66,23 @@ on inactive tabs, several terminals inside one tab.
   needs nothing (the macOS bundle declares `NSMicrophoneUsageDescription`
   so the child's push-to-talk prompts correctly).
 
+## Keyboard shortcuts
+
+- `F11` — fullscreen.
+- `⌘/Ctrl+⇧+[` / `⌘/Ctrl+⇧+]` (the `Cmd+{` / `Cmd+}` keycaps) — previous /
+  next tab, cyclic (the last tab wraps to the first, standard macOS
+  behavior). Matched by the physical key (`ev.code` `BracketLeft` /
+  `BracketRight`), so it works on any keyboard layout (a Cyrillic layout
+  turns the key into «х»/«ъ» — `ev.key`-based matching would break);
+  works with focus in the terminal and on the UI. Implemented in
+  `web/term.js`: `terminalKeyHandler` intercepts the combo before xterm.js
+  can forward it to the PTY, the window `keydown` listener covers focus
+  outside the terminal, and both share one handler deduped by the event's
+  `timeStamp`.
+- `⌘/Ctrl+⇧+R` — restart the active tab's session.
+- `⌘/Ctrl+,` — terminal font dialog; `⌘/Ctrl+=` / `⌘/Ctrl+-` /
+  `⌘/Ctrl+0` — font size up / down / reset.
+
 ## Building
 
 ```bash

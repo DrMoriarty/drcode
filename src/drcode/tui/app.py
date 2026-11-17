@@ -202,6 +202,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     #task-statusbar { dock: top; height: auto; background: $panel; padding: 0 1; }
     #task-status-row { height: 1; }
     #task-status-left { width: 1fr; color: $text; }
+    #task-status-mid { width: auto; color: $text; }
     #task-status-right { width: auto; color: $text; }
     # Second header row (deps/goal/issue/branch + warning markers); the
     # .hidden toggle keeps it at zero height when there is nothing to show.
@@ -1041,6 +1042,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 with Vertical(id="task-statusbar"):
                     with Horizontal(id="task-status-row"):
                         yield Static("", id="task-status-left")
+                        yield Static("", id="task-status-mid")
                         yield Static("", id="task-status-right")
                     # Second header row: depends on / goal / issue / branch
                     # + warning markers; hidden when all of them are empty.

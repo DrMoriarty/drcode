@@ -9,7 +9,9 @@ the composition in ``ChatViewLayer``.
 
 from __future__ import annotations
 
+from rich.cells import cell_len
 from rich.markup import escape
+from rich.text import Text
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
@@ -117,6 +119,7 @@ class TaskStatusLayer(DrCodeState):
                 self.refresh_bindings()
         try:
             left = self.query_one("#task-status-left", Static)
+            mid = self.query_one("#task-status-mid", Static)
             right = self.query_one("#task-status-right", Static)
             extra = self.query_one("#task-status-extra", Static)
         except NoMatches:
@@ -137,19 +140,25 @@ class TaskStatusLayer(DrCodeState):
         if self._new_task_mode:
             self._set_extra_row(extra, "")
             update_static_if_changed(left, "")
+            update_static_if_changed(mid, "")
             update_static_if_changed(right, "")
             return
         task = self.viewed
         if task is None:
             self._set_extra_row(extra, "")
             update_static_if_changed(left, "")
+            update_static_if_changed(mid, "")
             update_static_if_changed(right, "")
             return
-        created = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
         kind = {
             TaskKind.BUG: "[bold red]bug[/]",
             TaskKind.RESEARCH: "[bold yellow]research[/]",
         }.get(task.kind, "[bold green]feature[/]")
+        # The task's own id is a link too: clicking it copies the
+        # short id (with the `#` prefix) to the clipboard
+        # (action_copy_task_id).
+        id_markup = f"[@click=app.copy_task_id('{task.id}')]#{task.id}[/]"
+        title_plain = task.title_display
         status_colors = {
             TaskStatus.DRAFT: "bright_black",
             TaskStatus.QUEUED: "yellow",
@@ -160,38 +169,150 @@ class TaskStatusLayer(DrCodeState):
             TaskStatus.AWAITING_CLARIFICATION: "yellow",
         }
         status_color = status_colors[task.status]
-        status = f"[{status_color}]{task.status.value}[/]"
         # Duration counter: only for the statuses where the time spent is
         # meaningful and live — the developer working (ACTIVE) and the
         # tester verifying (TESTING). Stamped at every status transition
         # (fire_status_change), so this measures the current continuous
         # stay, never a cumulative one; survives restarts via the stamp.
-        # Rendered in the status's own color, one space after the status
-        # (the other fragments stay separated by the wide join).
+        # Rendered in the status's own color, one space after the status.
+        timer_plain: str | None = None
         if (
             task.status in (TaskStatus.ACTIVE, TaskStatus.TESTING)
             and task.status_changed_at is not None
         ):
             seconds = max(0, int((_now() - task.status_changed_at).total_seconds()))
-            status += f" [{status_color}]⏱ {self._fmt_age(seconds)}[/]"
-        parts = [
-            kind,
-            # The task's own id is a link too: clicking it copies the
-            # short id (with the `#` prefix) to the clipboard
-            # (action_copy_task_id).
-            (
-                f"[@click=app.copy_task_id('{task.id}')]#{task.id}[/] "
-                f"{escape(task.title_display)}"
-            ),
-            f"[dim]{created}[/]",
-            status,
-        ]
+            timer_plain = f"⏱ {self._fmt_age(seconds)}"
+        # The verification marker stays glued to the status fragment
+        # (single space — it reads as one unit with the status word).
+        # Both the markup and its plain-text width are kept in lockstep:
+        # the measurement below must mirror the rendered fragments exactly.
+        marker_plain = ""
+        marker_markup = ""
         if task.verification is VerificationStatus.PASSED:
-            parts.append("[green]✓ testing[/]")
+            marker_plain, marker_markup = " ✓ testing", " [green]✓ testing[/]"
         elif task.verification is VerificationStatus.FAILED:
-            parts.append("[red]✗ testing[/]")
-        update_static_if_changed(left, "   ".join(parts))
-        self._update_ctx_counter(right, task)
+            marker_plain, marker_markup = " ✗ testing", " [red]✗ testing[/]"
+        # Context counter (rightmost of the right cluster, in its own
+        # widget so its [@click] area and the ctx-warn/ctx-crit coloring
+        # cover exactly the counter). The helper drives both.
+        counter = self._ctx_counter(task)
+        right.remove_class("ctx-warn", "ctx-crit")
+        if counter is None:
+            right.tooltip = None
+            counter_markup = counter_plain = ""
+        else:
+            counter_markup, counter_plain, warn_class = counter
+            if warn_class:
+                right.add_class(warn_class)
+            right.tooltip = "Click: context layout (≈ breakdown + exact usage)"
+
+        # --- adaptive layout ------------------------------------------------
+        # The title fills ALL the room between the #id and the right cluster
+        # (date · status · counter). When less than 40 cells remain for it,
+        # the right cluster degrades stepwise (compact date → timer-only or
+        # hidden status → truncated title); the room is recomputed after
+        # every step. Widths are measured over PLAIN text (markup tags take
+        # no columns) with rich's cell_len — the same measure the rendering
+        # itself uses, so emoji (🧠/⏱) are counted at their true cell width.
+        row = self.query_one("#task-status-row")
+        total = row.container_size.width or None
+        kind_plain = Text.from_markup(kind).plain
+
+        def title_room(date_plain: str, status_plain: str) -> int | None:
+            """Cells left for the title under the given right-cluster
+            fragments (None when the row has no real width yet — pre-layout,
+            then nothing degrades or truncates)."""
+            if total is None:
+                return None
+            left_fixed = cell_len(kind_plain) + 3 + cell_len(f"#{task.id}") + 1
+            right_widths = [
+                w
+                for w in (
+                    cell_len(date_plain),
+                    cell_len(status_plain),
+                    cell_len(counter_plain),
+                )
+                if w
+            ]
+            return (
+                total - left_fixed - sum(right_widths) - max(0, len(right_widths) - 1)
+            )
+
+        date_plain = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        # The MEASURED status fragment must mirror the RENDERED markup
+        # exactly — status word + (" " + timer) + marker, glued pieces
+        # included. Measuring the bare status word alone overestimates the
+        # title room by the timer/marker widths: the degradation steps fire
+        # late and step (c) truncates the title past the physical row, so
+        # the tail is hard-clipped without an ellipsis.
+        status_full_plain = (
+            task.status.value
+            + (f" {timer_plain}" if timer_plain is not None else "")
+            + marker_plain
+        )
+        # Step-b variant: a timer status keeps only the live ⏱ (in the
+        # status's color, the verification marker still glued to it), a
+        # timerless status (queued/hold/completed/draft/
+        # awaiting_clarification) hides entirely — marker included.
+        status_step_b_plain = (
+            f"{timer_plain}{marker_plain}" if timer_plain is not None else ""
+        )
+        status_plain = status_full_plain
+        status_word_hidden = False
+        room = title_room(date_plain, status_plain)
+        if room is not None and room < 40:
+            # Step a: compact the creation date.
+            date_plain = task.created_at.astimezone().strftime("%d.%m %H:%M")
+            room = title_room(date_plain, status_plain)
+        if room is not None and room < 40:
+            # Step b: drop the status word.
+            status_plain = status_step_b_plain
+            status_word_hidden = True
+            room = title_room(date_plain, status_plain)
+        if room is not None and room < 0:
+            # Step d (physical-fit floor): a negative room means the right
+            # cluster no longer FITS beside the fixed left prefix (type +
+            # #id) — the auto-width widgets win the layout and squeeze
+            # the 1fr left below its own content, hard-clipping the id.
+            # The timer is the most ephemeral piece → drop it first, then
+            # the date; the counter stays (the spec keeps it untouched).
+            status_plain = ""
+            status_word_hidden = True
+            room = title_room(date_plain, status_plain)
+        if room is not None and room < 0:
+            date_plain = ""
+            room = title_room(date_plain, status_plain)
+        if room is not None:
+            # Step c (and the general overflow case): the title is cut with
+            # an ellipsis to exactly the remaining room.
+            title_plain = self._truncate_cells(title_plain, room)
+
+        date_markup = f"[dim]{date_plain}[/]" if date_plain else ""
+        if status_plain:
+            if status_word_hidden:
+                status_markup = f"[{status_color}]{timer_plain}[/]{marker_markup}"
+            else:
+                status_markup = (
+                    f"[{status_color}]{task.status.value}[/]"
+                    + (f" [{status_color}]{timer_plain}[/]" if timer_plain else "")
+                    + marker_markup
+                )
+        else:
+            status_markup = ""
+        left_markup = f"{kind}   {id_markup} {escape(title_plain)}"
+        # The right cluster in text order: date → status → counter, single
+        # spaces between the fragments. The date+status live in the mid
+        # widget, the counter in the right one — the single space between
+        # them is the trailing space of the mid content, so the adjacency
+        # of the two auto-width widgets reads as one cluster.
+        mid_markup = " ".join(
+            fragment for fragment in (date_markup, status_markup) if fragment
+        )
+        if mid_markup:
+            mid_markup += " "
+        update_static_if_changed(left, left_markup)
+        update_static_if_changed(mid, mid_markup)
+        update_static_if_changed(right, counter_markup)
         self._set_extra_row(extra, self._task_status_extra(task))
 
     def _dependency_status_part(self, task: Task, label: str = "deps: ") -> str:
@@ -389,6 +510,61 @@ class TaskStatusLayer(DrCodeState):
         self._show_copy_toast(branch)
 
     @staticmethod
+    def _truncate_cells(text: str, max_cells: int) -> str:
+        """Plain-text truncation by DISPLAY cells (not characters): cut
+        `text` so it fits `max_cells` terminal columns, marking the cut
+        with an ellipsis. Markup is never passed here — the caller
+        truncates first and escapes afterwards (tags take no columns)."""
+        if max_cells <= 0:
+            return ""
+        if cell_len(text) <= max_cells:
+            return text
+        # Text.truncate crops IN PLACE and returns None (not self) —
+        # mutate a throwaway Text and read the result back.
+        cropped = Text(text)
+        cropped.truncate(max_cells, overflow="ellipsis")
+        return cropped.plain
+
+    def _ctx_counter(self, task: Task) -> tuple[str, str, str] | None:
+        """The context-counter fragment (markup, plain text) plus the warn
+        class to put on the right widget — or None when the task has no
+        context reading yet.
+
+        The counter is clickable: it opens the modal context-layout dialog
+        (action_show_ctx_dialog) — the 🧠 figure itself is wrapped in the
+        same [@click] markup the task-id mention links use.
+        """
+        agent, tokens = self._agent_ctx(task)
+        if not tokens:
+            return None
+        role_config = self.resolved_config(self._agent_ctx_role(task, agent))
+        max_tokens = role_config.max_context_tokens
+        warn_class = ""
+        if max_tokens > 0:
+            pct = round(tokens * 100 / max_tokens)
+            text = (
+                f"🧠{self._fmt_ctx_tokens(tokens)}/"
+                f"{self._fmt_ctx_tokens(max_tokens)}·{pct}%"
+            )
+            # Red from the compaction threshold, yellow when the remaining
+            # headroom is twice the red-zone headroom: threshold 80 →
+            # yellow from 60, threshold 90 → yellow from 80. The threshold
+            # follows the shown agent's role's resolved config (a research
+            # task's dev transcript uses the research model, a testing
+            # round the tester's, a resolver round the resolver's), so a
+            # per-model compaction limit from the catalog is reflected
+            # here too.
+            threshold = min(max(role_config.compaction_threshold, 1), 100)
+            warn_pct = 2 * threshold - 100
+            if pct >= threshold:
+                warn_class = "ctx-crit"
+            elif warn_pct > 0 and pct >= warn_pct:
+                warn_class = "ctx-warn"
+        else:
+            text = f"🧠{self._fmt_ctx_tokens(tokens)}"
+        return f"[@click=app.show_ctx_dialog]{text}[/]", text, warn_class
+
+    @staticmethod
     def _fmt_ctx_tokens(n: int) -> str:
         if n >= 1000:
             return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
@@ -421,55 +597,6 @@ class TaskStatusLayer(DrCodeState):
         if agent == AGENT_RESOLVER:
             return AgentRole.RESOLVER
         return self._task_role(task)
-
-    def _update_ctx_counter(self, right: Static, task: Task) -> None:
-        """Right corner of the task status bar: current context fill in
-        tokens and percent of the allowed maximum — of the agent that is
-        active on the task right now (dev run, testing round, resolver
-        round), or of the one that worked last.
-
-        Source of truth: the latest model request usage. For a run in
-        progress — the per-agent live value; otherwise (finished task,
-        history view) — the value computed from the persisted transcript,
-        i.e. the final value is saved in the task history together with
-        the per-response usage and survives restarts.
-
-        The counter is clickable: it opens the modal context-layout dialog
-        (action_show_ctx_dialog) — the 🧠 figure itself is wrapped in the
-        same [@click] markup the task-id mention links use.
-        """
-        right.remove_class("ctx-warn", "ctx-crit")
-        agent, tokens = self._agent_ctx(task)
-        if not tokens:
-            update_static_if_changed(right, "")
-            right.tooltip = None
-            return
-        right.tooltip = "Click: context layout (≈ breakdown + exact usage)"
-        role_config = self.resolved_config(self._agent_ctx_role(task, agent))
-        max_tokens = role_config.max_context_tokens
-        if max_tokens > 0:
-            pct = round(tokens * 100 / max_tokens)
-            text = (
-                f"🧠 {self._fmt_ctx_tokens(tokens)}/"
-                f"{self._fmt_ctx_tokens(max_tokens)}·{pct}%"
-            )
-            # Red from the compaction threshold, yellow when the remaining
-            # headroom is twice the red-zone headroom: threshold 80 →
-            # yellow from 60, threshold 90 → yellow from 80. The threshold
-            # follows the shown agent's role's resolved config (a research
-            # task's dev transcript uses the research model, a testing
-            # round the tester's, a resolver round the resolver's), so a
-            # per-model compaction limit from the catalog is reflected
-            # here too.
-            threshold = min(max(role_config.compaction_threshold, 1), 100)
-            warn_pct = 2 * threshold - 100
-            if pct >= threshold:
-                right.add_class("ctx-crit")
-            elif warn_pct > 0 and pct >= warn_pct:
-                right.add_class("ctx-warn")
-        else:
-            text = f"🧠 {self._fmt_ctx_tokens(tokens)}"
-        update_static_if_changed(right, f"[@click=app.show_ctx_dialog]{text}[/]")
 
     def action_show_ctx_dialog(self) -> None:
         """Click on the context counter: open the modal dialog with the

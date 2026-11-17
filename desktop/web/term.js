@@ -556,6 +556,48 @@
     },
   };
 
+  /* ---------------- WebGL fallback toast ----------------
+   * macOS can revoke a WKWebView's WebGL context under memory pressure;
+   * xterm.js then silently falls back from the fast WebGL renderer to the
+   * DOM renderer and the only symptom is "the terminal got slow" — easy
+   * to mistake for network/server lag. Surface it as an unobtrusive,
+   * auto-hiding toast, shown ONCE per tab (keyed by tab id: font changes
+   * re-run the WebGL setup path and must not re-toast; a repeated context
+   * loss on the same tab must not spam either). No WebGL reload is
+   * attempted after a loss — re-arming a half-dead context is risky;
+   * alerting the user is the whole job here. */
+
+  var WEBGL_FALLBACK_MESSAGE = "WebGL renderer unavailable — slow DOM fallback is active (the terminal may feel sluggish).";
+  var elToast = null;
+  var toastTimer = null;
+  var TOAST_VISIBLE_MS = 6000;
+  var toastShownKeys = {}; // dedup key -> true ("once per key")
+
+  function showToast(message) {
+    if (!elToast) {
+      elToast = document.createElement("div");
+      elToast.className = "toast hidden";
+      document.body.appendChild(elToast);
+    }
+    elToast.textContent = message;
+    elToast.classList.remove("hidden");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      toastTimer = null;
+      if (elToast) elToast.classList.add("hidden");
+    }, TOAST_VISIBLE_MS);
+  }
+
+  function showToastOnce(key, message) {
+    if (toastShownKeys[key]) return;
+    toastShownKeys[key] = true;
+    showToast(message);
+  }
+
+  function webglFallbackToast(tab) {
+    showToastOnce(tab.id, WEBGL_FALLBACK_MESSAGE);
+  }
+
   /* ---------------- terminal setup (per tab) ---------------- */
 
   function createTerminalFor(tab) {
@@ -591,11 +633,13 @@
       tab.webgl = new window.WebglAddon.WebglAddon();
       tab.webgl.onContextLoss(function () {
         if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
-      }); // xterm falls back to DOM renderer
+        webglFallbackToast(tab); // xterm falls back to DOM renderer — say so
+      });
       tab.term.loadAddon(tab.webgl);
     } catch (err) {
       tab.webgl = null;
       /* no WebGL — the default renderer keeps everything working */
+      webglFallbackToast(tab);
     }
     tab.term.attachCustomKeyEventHandler(function (ev) {
       return terminalKeyHandler(tab, ev);
@@ -628,10 +672,12 @@
       tab.webgl = new window.WebglAddon.WebglAddon();
       tab.webgl.onContextLoss(function () {
         if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
+        webglFallbackToast(tab);
       });
       tab.term.loadAddon(tab.webgl);
     } catch (err) {
       tab.webgl = null; /* DOM renderer fallback */
+      webglFallbackToast(tab);
     }
   }
 

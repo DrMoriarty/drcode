@@ -12,6 +12,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -2109,3 +2111,171 @@ def test_cocoa_cmd_w_noop_off_macos(monkeypatch: pytest.MonkeyPatch) -> None:
     # Unpatched: the original handler consumed it, super never sees it.
     assert original_events == [event]
     assert not super_events
+
+
+# ---------------------------------------------------------------------------
+# web/term.js — WebGL fallback toast (static wiring + node-run logic)
+# ---------------------------------------------------------------------------
+
+
+def _toast_region(js: str) -> str:
+    """The self-contained toast block, bounded by its section comment and
+    the next section marker — executed verbatim by the node logic test."""
+    start = js.index("/* ---------------- WebGL fallback toast")
+    end = js.index("/* ---------------- terminal setup (per tab) ---------------- */")
+    return js[start:end]
+
+
+def test_term_js_webgl_fallback_toast_wiring() -> None:
+    """Both silent WebGL fallback paths — context loss and the failed
+    addon load/creation (the catch also covers a machine without WebGL
+    entirely) — must surface the once-per-tab toast; normal operation and
+    the font-change recreate path must not toast on their own."""
+    js = _term_js()
+    region = _toast_region(js)
+
+    # Helper trio exists; the tab-level wrapper dedups by tab id.
+    assert "function showToast(message)" in region
+    assert "function showToastOnce(key, message)" in region
+    wrapper = region[region.index("function webglFallbackToast") :]
+    assert "showToastOnce(tab.id" in wrapper
+
+    setup = js[js.index("function createTerminalFor") : js.index("/* ---------------- font settings")]
+    recreate = js[js.index("function recreateWebgl") : js.index("function refitAfterFontChange")]
+    for block in (setup, recreate):
+        # Exactly two trigger points per block: the onContextLoss callback
+        # and the catch branch — nothing unconditional (a mere font change
+        # must never re-toast).
+        assert block.count("webglFallbackToast(tab)") == 2
+        loss_at = block.index("onContextLoss")
+        assert block.index("webglFallbackToast(tab)", loss_at) > loss_at
+    # The catch branch is the "no WebGL at all" path and also toasts.
+    assert "webglFallbackToast(tab);" in setup[setup.index("} catch (err)") :]
+
+    css = (DESKTOP_DIR / "web" / "style.css").read_text(encoding="utf-8")
+    toast = css[css.index(".toast {") : css.index(".boot-error")]
+    assert "position: absolute;" in toast
+    # Above .font-btn (z-index 15), below .overlay (20): a toast must not
+    # block a dialog the user is interacting with.
+    assert "z-index: 16;" in toast
+
+
+TOAST_NODE_DRIVER = """
+const fs = require("fs");
+const region = fs.readFileSync(process.argv[2], "utf8");
+
+// Minimal DOM stub: enough surface for the toast helper (createElement /
+// appendChild / classList add+remove+contains). Timers are recorded, not
+// run — the test fires the auto-hide callback explicitly.
+function makeEl() {
+  const classes = new Set();
+  return {
+    className: "",
+    textContent: "",
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+    },
+  };
+}
+const created = [];
+const appended = [];
+const documentStub = {
+  createElement: () => { const el = makeEl(); created.push(el); return el; },
+  body: { appendChild: (el) => appended.push(el) },
+};
+const timers = [];
+const setTimeoutStub = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+const clearTimeoutStub = () => {};
+
+const holder = {};
+const src = region +
+  "\\n;holder.api = { showToast: showToast, showToastOnce: showToastOnce," +
+  " webglFallbackToast: webglFallbackToast, visibleMs: TOAST_VISIBLE_MS };";
+new Function(
+  "document", "setTimeout", "clearTimeout", "holder", src
+)(documentStub, setTimeoutStub, clearTimeoutStub, holder);
+const api = holder.api;
+
+const el = () => created[0];
+
+api.showToast("first");
+const state1 = {
+  created: created.length,
+  appended: appended.length,
+  text: el().textContent,
+  hidden: el().classList.contains("hidden"),
+  timers: timers.length,
+  timerMs: timers[0].ms,
+};
+timers[0].fn(); // the scheduled auto-hide fires
+const state2 = { hidden: el().classList.contains("hidden") };
+
+api.showToastOnce("k1", "m1");
+const state3 = {
+  created: created.length,
+  text: el().textContent,
+  hidden: el().classList.contains("hidden"),
+};
+api.showToastOnce("k1", "m2-ignored");
+const state4 = { text: el().textContent };
+timers[1].fn();
+api.showToastOnce("k2", "m3");
+const state5 = { text: el().textContent };
+
+console.log(JSON.stringify({
+  visibleMs: api.visibleMs,
+  hasWebglToast: typeof api.webglFallbackToast,
+  state1, state2, state3, state4, state5,
+}));
+"""
+
+
+def test_term_js_toast_logic(tmp_path: Path) -> None:
+    """The extracted toast helper actually runs (node): it shows a single
+    element, hides it via the scheduled timer, dedups repeated keys, and
+    re-shows for a new key."""
+    if shutil.which("node") is None:
+        pytest.skip("node is not available")
+    region_file = tmp_path / "toast_region.js"
+    region_file.write_text(_toast_region(_term_js()), encoding="utf-8")
+    driver_file = tmp_path / "toast_driver.js"
+    driver_file.write_text(TOAST_NODE_DRIVER, encoding="utf-8")
+
+    proc = subprocess.run(
+        ["node", str(driver_file), str(region_file)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+
+    assert result["visibleMs"] > 0
+    assert result["hasWebglToast"] == "function"
+
+    # First show: exactly one element, created AND appended, visible, one
+    # auto-hide timer scheduled with the module's visibility window.
+    s1 = result["state1"]
+    assert s1["created"] == s1["appended"] == 1
+    assert s1["text"] == "first"
+    assert s1["hidden"] is False
+    assert s1["timers"] == 1
+    assert s1["timerMs"] == result["visibleMs"]
+
+    # The timer hides the toast...
+    assert result["state2"]["hidden"] is True
+
+    # ...and a later showToastOnce reuses the same element (no stacking).
+    s3 = result["state3"]
+    assert s3["created"] == 1
+    assert s3["text"] == "m1"
+    assert s3["hidden"] is False
+
+    # A repeated key is a no-op: no re-toast, no extra timer churn.
+    assert result["state4"]["text"] == "m1"
+
+    # A new key toasts again (once-per-key, not once-per-session).
+    assert result["state5"]["text"] == "m3"

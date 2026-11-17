@@ -353,6 +353,27 @@ kbd {
 .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
 .dialog-actions .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 
+/* Transient notice (e.g. the WebGL → DOM renderer fallback): bottom-center,
+ * above the font button (15), below dialogs (.overlay 20) — a toast must
+ * never block a dialog the user is interacting with. Auto-hidden by JS
+ * after a few seconds; .hidden keeps it out of hit-testing. */
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  max-width: 70vw;
+  background: rgba(38, 42, 50, 0.95);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 7px 14px;
+  border-radius: 7px;
+  font-size: 12px;
+  z-index: 16;
+  user-select: none;
+  pointer-events: none;
+}
+
 .boot-error {
   position: absolute;
   top: 12px;

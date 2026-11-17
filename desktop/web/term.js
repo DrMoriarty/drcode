@@ -463,6 +463,38 @@
     return true;
   }
 
+  /* Cmd-W — close the active tab (macOS habit): the same logic as the
+   * "×" button on the tab — closeTab() kills the tab's PTY, disposes the
+   * xterm pane and, on the LAST tab, closes the window. The native side
+   * must NOT intercept the combo for this to work: _fix_cocoa_cmd_w in
+   * app.py routes the keydown to the page, and without the shell
+   * (browser mode) it arrives here unintercepted anyway. Matched by
+   * ev.code ("KeyW") first, like Cmd+T/Cmd+{ — the physical key is
+   * layout-independent. One press reaches BOTH delivery points when the
+   * terminal has focus; the dedupe is by ev.timeStamp, same as above.
+   * Dialog rule: over the settings dialog Cmd-W dismisses the dialog
+   * (its Escape twin), over the crash dialog it is swallowed — Escape
+   * ignores that dialog too, and closing a crashed tab out from under
+   * it would silently drop the restart offer. */
+  var lastCloseTabStamp = -1;
+
+  function maybeCloseTabShortcut(ev) {
+    if (ev.isComposing) return false; // IME composition — never a shortcut
+    if (!ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+    if (ev.code !== "KeyW" && ev.key !== "w" && ev.key !== "W") return false;
+    if (ev.timeStamp === lastCloseTabStamp) return true; // same press, already handled
+    lastCloseTabStamp = ev.timeStamp;
+    if (elSettingsDialog && !elSettingsDialog.classList.contains("hidden")) {
+      closeSettings();
+      return true;
+    }
+    if (elExitDialog && !elExitDialog.classList.contains("hidden")) {
+      return true; // crash dialog up — the tab stays until it is answered
+    }
+    if (activeTab) closeTab(activeTab);
+    return true;
+  }
+
   function closeTab(tab) {
     if (!tab || tab.closing) return;
     tab.closing = true;
@@ -692,6 +724,12 @@
     // Cmd+T is intercepted here for the same reason: the metaKey gate
     // below would forward it toward the PTY.
     if (maybeNewTabShortcut(ev)) {
+      ev.preventDefault();
+      return false;
+    }
+    // Cmd-W too: intercepted so it is not forwarded to the PTY, and so
+    // the active tab closes no matter where the focus sits.
+    if (maybeCloseTabShortcut(ev)) {
       ev.preventDefault();
       return false;
     }
@@ -1370,6 +1408,12 @@
         // button. The in-terminal delivery goes through
         // terminalKeyHandler; the shared handler dedupes the double
         // event by its timeStamp (see the comment at its definition).
+        ev.preventDefault();
+      } else if (maybeCloseTabShortcut(ev)) {
+        // Cmd-W when focus is outside the terminal: close the active
+        // tab (or dismiss the settings dialog above it). The
+        // in-terminal delivery goes through terminalKeyHandler; the
+        // shared handler dedupes the double event by its timeStamp.
         ev.preventDefault();
       } else if (maybeTabSwitchShortcut(ev)) {
         // Cmd+{ / Cmd+} when focus is outside the terminal (welcome

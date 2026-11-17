@@ -1617,3 +1617,182 @@ def test_index_html_documents_tab_switch_shortcut() -> None:
     html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
     assert "switch tabs" in html
     assert "[" in html and "]" in html
+
+
+# web/term.js — Cmd-W closes the active tab
+# ---------------------------------------------------------------------------
+#
+# Same static-check pattern as the tab-switch shortcuts above: the JS
+# terminal client needs a GUI session, so the Cmd-W wiring is verified
+# structurally — both delivery points (xterm's custom key handler and the
+# window keydown listener) must route the combo through the shared,
+# timestamp-deduped maybeCloseTabShortcut, which never closes a tab under
+# an open dialog.
+
+
+def test_close_tab_shortcut_matched_by_physical_key() -> None:
+    """Cmd-W is matched by ev.code ("KeyW") first — layout-independent —
+    with the ev.key spelling kept as a fallback, mirroring the Cmd+T
+    pattern."""
+    src = _term_js()
+    assert '"KeyW"' in src
+    assert 'ev.key !== "w"' in src
+
+
+def test_close_tab_shortcut_in_both_handlers() -> None:
+    src = _term_js()
+    terminal_handler = src[src.index("function terminalKeyHandler") :]
+    window_block = src[src.index('window.addEventListener("keydown"') :]
+    assert "maybeCloseTabShortcut" in terminal_handler
+    assert "maybeCloseTabShortcut" in window_block
+    # Inside terminalKeyHandler the interception sits BEFORE the metaKey
+    # pass-through gate — that gate lets every metaKey event through to
+    # xterm.js, and the combo would reach the PTY.
+    assert terminal_handler.index("maybeCloseTabShortcut(") < terminal_handler.index(
+        "if (!ev.ctrlKey || ev.metaKey"
+    )
+
+
+def test_close_tab_shortcut_closes_active_tab_and_dedupes() -> None:
+    """The shared handler dedupes the double delivery (xterm's handler
+    and the window listener see the SAME DOM event, identical
+    timeStamp) and drives closeTab(activeTab) — the same logic as the
+    tab "×" button, PTY kill included."""
+    src = _term_js()
+    handler = src[src.index("function maybeCloseTabShortcut") :]
+    handler = handler[: handler.index("\n  function ", 1)]
+    assert "lastCloseTabStamp" in src
+    assert "ev.timeStamp === lastCloseTabStamp" in handler
+    assert "closeTab(activeTab)" in handler
+
+
+def test_close_tab_shortcut_defers_to_open_dialogs() -> None:
+    """Over the settings dialog Cmd-W dismisses it (its Escape twin);
+    over the crash dialog it is swallowed — closing the crashed tab out
+    from under the dialog would drop the restart offer."""
+    src = _term_js()
+    handler = src[src.index("function maybeCloseTabShortcut") :]
+    handler = handler[: handler.index("\n  function ", 1)]
+    assert "elSettingsDialog" in handler
+    assert "closeSettings()" in handler
+    assert "elExitDialog" in handler
+    # The crash-dialog branch returns BEFORE closeTab(activeTab).
+    assert handler.index("elExitDialog") < handler.index("closeTab(activeTab)")
+
+
+def test_index_html_documents_close_tab_shortcut() -> None:
+    html = (DESKTOP_DIR / "web" / "index.html").read_text(encoding="utf-8")
+    assert "close tab" in html
+
+
+# desktop/app.py — _fix_cocoa_cmd_w (native Cmd-W must reach the page)
+# ---------------------------------------------------------------------------
+
+
+def _fake_cocoa_module(monkeypatch: pytest.MonkeyPatch) -> tuple:
+    """Stand-in for webview.platforms.cocoa with a patchable WebKitHost.
+
+    The real class would need a live NSView instance; the fake mirrors
+    the shape _fix_cocoa_cmd_w relies on: a BrowserView.WebKitHost class
+    whose keyDown_ consumes some combos itself, a base class playing the
+    super() responder chain, and an AppKit namespace with the mask.
+    """
+    import types
+
+    super_events: list[object] = []
+    original_events: list[object] = []
+
+    class _FakeResponder:
+        def keyDown_(self, event: object) -> None:
+            super_events.append(event)
+
+    class _FakeWebKitHost(_FakeResponder):
+        def keyDown_(self, event: object) -> None:
+            original_events.append(event)
+
+    class _FakeBrowserView:
+        WebKitHost = _FakeWebKitHost
+
+    fake = types.ModuleType("webview.platforms.cocoa")
+    fake.BrowserView = _FakeBrowserView  # type: ignore[attr-defined]
+    fake.AppKit = types.SimpleNamespace(NSCommandKeyMask=1 << 20)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", fake)
+    return fake, original_events, super_events
+
+
+class _SimpleEvent:
+    def __init__(self, char: str | None, cmd: bool) -> None:
+        self._char = char
+        self._cmd = cmd
+
+    def modifierFlags(self) -> int:
+        return (1 << 20) if self._cmd else 0
+
+    def characters(self) -> str | None:
+        return self._char
+
+
+def test_cocoa_cmd_w_reaches_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plain Cmd-W must NOT hit the original handler (native
+    performClose_) — it goes through super() to the WKWebView responder
+    chain, exactly what the unintercepted Cmd-T path does."""
+    import app as app_mod  # type: ignore[import-not-found]
+
+    fake, original_events, super_events = _fake_cocoa_module(monkeypatch)
+    app_mod._fix_cocoa_cmd_w()
+
+    event = _SimpleEvent("w", cmd=True)
+    fake.BrowserView.WebKitHost.keyDown_(object.__new__(fake.BrowserView.WebKitHost), event)
+    assert not original_events
+    assert super_events == [event]
+
+
+def test_cocoa_cmd_q_stays_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cmd-Q (and every other intercepted combo) is handed to the
+    original keyDown_ untouched — app quit keeps its native behavior."""
+    import app as app_mod  # type: ignore[import-not-found]
+
+    fake, original_events, super_events = _fake_cocoa_module(monkeypatch)
+    app_mod._fix_cocoa_cmd_w()
+
+    event = _SimpleEvent("q", cmd=True)
+    fake.BrowserView.WebKitHost.keyDown_(object.__new__(fake.BrowserView.WebKitHost), event)
+    assert original_events == [event]
+    assert not super_events
+
+
+def test_cocoa_cmd_w_only_without_other_modifiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper matches exactly the branch the original would have
+    closed the window on (CommandKeyMask + 'w'); anything else — e.g. a
+    non-command key event — falls through to the original."""
+    import app as app_mod  # type: ignore[import-not-found]
+
+    fake, original_events, super_events = _fake_cocoa_module(monkeypatch)
+    app_mod._fix_cocoa_cmd_w()
+
+    host = fake.BrowserView.WebKitHost
+    self_ = object.__new__(host)
+    plain = _SimpleEvent("w", cmd=False)
+    host.keyDown_(self_, plain)
+    assert original_events == [plain]
+    assert not super_events
+
+
+def test_cocoa_cmd_w_noop_off_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off macOS the patch must not touch anything (the cocoa import
+    would fail there anyway — the guard comes first)."""
+    import app as app_mod  # type: ignore[import-not-found]
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake, original_events, super_events = _fake_cocoa_module(monkeypatch)
+    app_mod._fix_cocoa_cmd_w()
+
+    event = _SimpleEvent("w", cmd=True)
+    fake.BrowserView.WebKitHost.keyDown_(
+        object.__new__(fake.BrowserView.WebKitHost), event
+    )
+    # Unpatched: the original handler consumed it, super never sees it.
+    assert original_events == [event]
+    assert not super_events

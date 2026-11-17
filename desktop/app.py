@@ -126,6 +126,49 @@ def _fix_frozen_pywebview_js() -> None:
     webview.util.get_js_dir = _get_js_dir
 
 
+def _fix_cocoa_cmd_w() -> None:
+    """Stop pywebview's cocoa host from closing the WINDOW on Cmd-W.
+
+    ``webview.platforms.cocoa.WebKitHost.keyDown_`` intercepts Cmd-W and
+    calls ``window.performClose_``, so the keydown never reaches the page
+    and term.js cannot close just the active tab (the macOS convention).
+    The wrapper routes a plain Cmd-W through ``super().keyDown_`` —
+    exactly the path Cmd-T / Cmd+{ already take — where the page's
+    ``maybeCloseTabShortcut`` closes the active tab (and the window once
+    it is the last one). Every other combination, Cmd-Q included, is
+    handed to the original method untouched.
+
+    Works in dev mode and in frozen builds alike: in a PyInstaller bundle
+    the pure-python pywebview modules (including this one) live in the
+    PYZ and import normally; the method is looked up per class at call
+    time, so patching before ``webview.start()`` is enough.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from webview.platforms import cocoa
+    except ImportError:  # pragma: no cover - non-cocoa backend
+        return
+    host = getattr(cocoa.BrowserView, "WebKitHost", None)
+    if host is None or not hasattr(host, "keyDown_"):  # pragma: no cover
+        return
+    original = host.keyDown_
+    # cocoa.py imports AppKit itself; resolve the mask through getattr so
+    # both pyright and the frozen build stay happy (1 << 20 = SDK value).
+    cmd_mask = int(getattr(getattr(cocoa, "AppKit", None), "NSCommandKeyMask", 1 << 20))
+
+    def keyDown_(self, event):
+        if event.modifierFlags() & cmd_mask and event.characters() == "w":
+            # Forward to the WKWebView responder chain — what every
+            # unintercepted combo (Cmd-T, Cmd+{) already does — so the
+            # page sees the keydown and decides what Cmd-W means.
+            super(host, self).keyDown_(event)
+            return
+        original(self, event)
+
+    host.keyDown_ = keyDown_
+
+
 class DesktopApi:
     """Methods exposed to the web page as ``window.pywebview.api.*``.
 
@@ -322,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[desktop] serving on {ctx.base_url}, window url ready", flush=True)
 
     _fix_frozen_pywebview_js()
+    _fix_cocoa_cmd_w()
 
     window_holder: dict = {}
     api = DesktopApi(window_holder, ctx, payload)

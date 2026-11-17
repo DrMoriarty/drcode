@@ -185,6 +185,94 @@ def test_evict_marked_matches_call_in_other_message() -> None:
     assert "src/big.py" in stub_part["content"]
 
 
+# -- extractive digest in the stub ---------------------------------------------------
+
+
+def test_stub_digest_keeps_head_and_signatures() -> None:
+    """The file-inspecting heuristic: the head, the def/class/import
+    signature lines (Paritok: a signature is worth more than a debug
+    line), and the `| `-prefixed excerpt format under the unchanged
+    `[tool result evicted:` prefix."""
+    content = "\n".join(
+        ["import os", "", "def load(path):", "    return open(path).read()"]
+        + [f"    debug line {i}" for i in range(200)]
+        + ["def main():", "    run()"]
+    )
+    stub = eviction.evicted_stub("read_file", {"path": "a.py"}, content)
+    assert eviction.is_evicted_stub(stub)
+    assert stub.startswith("[tool result evicted: read_file(")
+    assert "re-run the tool if needed]" in stub
+    assert "[extractive digest:" in stub
+    assert "| import os" in stub
+    assert "| def load(path):" in stub
+    assert "| def main():" in stub
+    assert "|     debug line 7" not in stub  # the middle stays out
+    # Bounded whatever the original weighed.
+    assert len(stub) < eviction.DIGEST_BUDGET_CHARS + 300
+
+
+def test_stub_digest_run_bash_prioritizes_errors_and_tail() -> None:
+    """The output heuristic (run_bash and every other tool): error/warning
+    lines first, then the tail (the outcome), then the head."""
+    lines = [f"step {i} ok" for i in range(40)]
+    lines[20] = "error: disk quota exceeded"
+    lines[21] = "warning: 3 targets skipped"
+    lines[-1] = "exit code 1"
+    stub = eviction.evicted_stub("run_bash", {"command": "make all"}, "\n".join(lines))
+    assert "| error: disk quota exceeded" in stub
+    assert "| warning: 3 targets skipped" in stub
+    assert "| exit code 1" in stub  # the tail
+    assert "| step 0 ok" in stub  # the head fills the rest
+    assert "| step 30 ok" not in stub
+
+
+def test_stub_digest_fallback_is_the_one_liner() -> None:
+    """Blank content (or nothing fitting the budget) — the stub is exactly
+    the historical one-liner, no digest block at all."""
+    expected = eviction.evicted_stub("run_bash", {"command": "ls"})
+    assert eviction.evicted_stub("run_bash", {"command": "ls"}, "   \n  ") == expected
+    assert "\n" not in expected
+    # No content argument at all: the historical shape, used by tests and
+    # any caller without the original at hand.
+    assert eviction.evicted_stub("read_file", {"path": "a.py"}) == (
+        eviction.evicted_stub("read_file", {"path": "a.py"})
+    )
+    assert "\n" not in eviction.evicted_stub("read_file", {"path": "a.py"})
+
+
+def test_stub_digest_bounded_on_giant_result() -> None:
+    stub = eviction.evicted_stub("read_file", {"path": "big.py"}, "y" * 200_000)
+    assert eviction.is_evicted_stub(stub)
+    # The digest excerpt is capped per line and in total.
+    assert len(stub) < eviction.DIGEST_BUDGET_CHARS + 300
+    assert "y" * (eviction.DIGEST_LINE_CAP + 5) not in stub
+
+
+def test_evict_marked_builds_digest_from_content() -> None:
+    """The batch pass extracts the digest from the return being collapsed —
+    built ONLY from that content (plus the call's args), never from disk."""
+    content = "def foo():\n    return 1\n" + "x" * 5000
+    data = big_return_transcript(content)
+    result = eviction.evict_marked(data, ["c1"])
+    (stub_part,) = stubs_in(result.new_messages)
+    assert "| def foo():" in stub_part["content"]
+    assert "|     return 1" in stub_part["content"]
+    # The body is gone; only the per-line-capped excerpt survives.
+    assert "x" * 5000 not in stub_part["content"]
+    assert "x" * (eviction.DIGEST_LINE_CAP + 5) not in stub_part["content"]
+
+
+def test_digest_is_json_ish_content() -> None:
+    """A non-string tool return (grep/glob results are lists) digests via
+    the same chars/4 text convention as everywhere else — the JSON dump
+    is one line, copied verbatim into the excerpt."""
+    stub = eviction.evicted_stub(
+        "grep_search", {"pattern": "x"}, ["hit one", "hit two"]
+    )
+    assert "| " in stub
+    assert '["hit one", "hit two"]' in stub
+
+
 # -- compaction rendering works with stubs ------------------------------------------
 
 
@@ -202,10 +290,14 @@ def test_render_keeps_call_and_stub_adjacent() -> None:
     call_idx = kinds.index("tool-call")
     assert kinds[call_idx + 1] == "tool-result"
     assert "tool result evicted" in call_group[call_idx + 1][1]
-    # And the whole transcript renders with the stub in place of the body.
+    # And the whole transcript renders with the stub in place of the body:
+    # the extractive digest keeps at most DIGEST_LINE_CAP (160) chars of a
+    # line, so the 5000-char body is gone even though a digest excerpt of
+    # it remains.
     rendered = "\n\n".join(text for _, text in blocks)
-    assert "y" * 100 not in rendered
+    assert "y" * 200 not in rendered
     assert "tool result evicted" in rendered
+    assert "| " in rendered  # the digest excerpt lines
 
 
 def test_chunking_and_mechanical_floor_survive_stubs() -> None:
@@ -672,9 +764,10 @@ async def test_pre_compaction_eviction_lightens_the_summarizer_input(
         await pilot.pause()
 
     assert any("Context compacted" in t for t in event_texts(task))
-    # The summarizer request carried the stub, not the collapsed body.
+    # The summarizer request carried the stub, not the collapsed body —
+    # the digest excerpt is capped at DIGEST_LINE_CAP (160) chars per line.
     assert "tool result evicted" in scripted.calls[-1]
-    assert "y" * 100 not in scripted.calls[-1]
+    assert "y" * 200 not in scripted.calls[-1]
 
 
 async def test_live_run_pauses_evicts_and_resumes(

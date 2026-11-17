@@ -6,7 +6,11 @@ it needed. The agent marks such results with the `mark_unneeded` tool
 (recording tool-call ids on `Task.marked_unneeded`); this module holds
 the LLM-free mechanics of the DEFERRED batch eviction:
 
-- the stub a marked tool-return's content collapses into,
+- the stub a marked tool-return's content collapses into — a one-liner
+  plus an EXTRACTIVE digest of the original (verbatim copies of the most
+  informative lines, picked by cheap per-tool-kind heuristics — the
+  Paritok insight that a function signature is worth more than a debug
+  line; no LLM, no disk reads, built in the same batch pass),
 - the ≈token accounting of the pending marks (chars/4, same convention
   as compaction/context_layout — every figure built from it is "≈"),
 - the collapse itself: replace the CONTENT of each marked `tool-return`
@@ -30,6 +34,7 @@ into the same eviction batch the marks go through.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -75,8 +80,139 @@ AUTO_EVICTION_KEEP_RECENT = 5
 AUTO_EVICTION_PAUSE_FRACTION = 6
 
 
-def evicted_stub(tool_name: str, args: Any) -> str:
-    """The stub text replacing an evicted tool result's content."""
+# -- extractive digest ----------------------------------------------------------------
+#
+# The Paritok insight, applied LLM-free: a stub that keeps verbatim copies of
+# the most informative lines of the ORIGINAL result (its "function signature
+# is worth more than a debug line") lets the agent remember what the result
+# held without re-running the tool. The extraction is cheap per-tool-kind
+# heuristics over the content being evicted — no disk reads, no model calls —
+# and runs inside the same batch pass as the collapse itself, so nothing is
+# added between turns.
+
+# Total chars/4-style budget for the digest block (header + lines): the stub
+# must stay short whatever the original weighed.
+DIGEST_BUDGET_CHARS = 600
+
+# One digest line is capped, so a single huge line (minified JS, a wall of
+# one-character output) cannot eat the whole budget.
+DIGEST_LINE_CAP = 160
+
+# How many leading lines count as the result's "head" (the header + the first
+# significant lines).
+DIGEST_HEAD_LINES = 4
+
+# How many trailing lines count as the "tail" (the outcome/summary of a
+# command's output lives at the end).
+DIGEST_TAIL_LINES = 6
+
+# Hard cap on digest lines (budget permitting).
+DIGEST_MAX_LINES = 12
+
+# The file-inspecting tool kinds: their results are read like source/paths —
+# head + signature lines are what matters. Every other tool (run_bash and
+# the rest) gets the output heuristic: error/warning lines first, then the
+# tail, then the head.
+DIGEST_FILE_TOOLS = frozenset({"read_file", "grep_search", "glob_files"})
+
+_ERROR_LINE_RE = re.compile(
+    r"\b(errors?|warnings?|failed|failure|fail(?:ed|ure)?s?|exceptions?|"
+    r"traceback|fatal|panic|refused|denied|abort(?:ed|ion)?)\b",
+    re.IGNORECASE,
+)
+
+_SIGNATURE_RE = re.compile(
+    r"^\s*(?:async\s+def\s|def\s|class\s|import\s|from\s+\S+\s+import|"
+    r"export\s+(?:default\s+)?(?:function|class|const|let)|"
+    r"function\s|fn\s|pub\s+fn\s|interface\s|type\s)"
+)
+
+
+def _digest_picked_indices(lines: list[str], tool_name: str) -> list[int]:
+    """Which line indices of the (non-empty) result lines the digest keeps.
+
+    Priority for the file-inspecting kinds: the head, then signature lines
+    (def/class/import — identifiers, the expensive stuff), then error lines.
+    For run_bash and every other tool: error/warning lines, then the tail
+    (the outcome), then the head. Duplicate indices collapse; the output is
+    returned in the original order so the digest stays readable as an
+    excerpt of the result.
+    """
+    errors = [i for i, ln in enumerate(lines) if _ERROR_LINE_RE.search(ln)]
+    heads = list(range(min(DIGEST_HEAD_LINES, len(lines))))
+    if tool_name in DIGEST_FILE_TOOLS:
+        sigs = [i for i, ln in enumerate(lines) if _SIGNATURE_RE.match(ln)]
+        priority = heads + sigs + errors
+    else:
+        tails = (
+            list(range(max(heads[-1] + 1, len(lines) - DIGEST_TAIL_LINES), len(lines)))
+            if len(lines) > DIGEST_HEAD_LINES
+            else []
+        )
+        priority = errors + tails + heads
+    seen: set[int] = set()
+    picked: list[int] = []
+    for i in priority:
+        if i in seen:
+            continue
+        seen.add(i)
+        picked.append(i)
+        if len(picked) >= DIGEST_MAX_LINES:
+            break
+    return sorted(picked)
+
+
+def extractive_digest(tool_name: str, content: Any) -> str:
+    """The extractive digest block for an evicted tool-return content.
+
+    Copies of the most informative lines of the original (per-tool-kind
+    heuristics, see _digest_picked_indices), each capped at
+    DIGEST_LINE_CAP, all together bounded by DIGEST_BUDGET_CHARS, every
+    line prefixed `| ` so the excerpt cannot be mistaken for the full
+    result. Built ONLY from the content being evicted — nothing is read
+    from disk. Returns "" when the heuristics yield nothing (blank
+    content, nothing fits the budget): the caller falls back to the
+    historical one-line stub.
+    """
+    text = _return_text(content)
+    if not text.strip():
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    picked = _digest_picked_indices(lines, tool_name)
+    if not picked:
+        return ""
+    header = f"[extractive digest: {len(picked)} of {len(lines)} lines]"
+    out = [header]
+    used = len(header)
+    for i in picked:
+        line = lines[i]
+        if len(line) > DIGEST_LINE_CAP:
+            line = line[:DIGEST_LINE_CAP] + "…"
+        piece = f"| {line}"
+        if used + 1 + len(piece) > DIGEST_BUDGET_CHARS:
+            break
+        out.append(piece)
+        used += 1 + len(piece)
+    if len(out) == 1:
+        return ""
+    return "\n".join(out)
+
+
+def evicted_stub(tool_name: str, args: Any, content: Any = None) -> str:
+    """The stub text replacing an evicted tool result's content.
+
+    The first line is the historical one-liner — its
+    `[tool result evicted:` prefix is what `is_evicted_stub` (and every
+    consumer of it: `marked_tokens`, the auto-layer's re-selection, the
+    pipeline gates) recognizes, so it must never change. When the
+    ORIGINAL content is passed (as `evict_marked` does at collapse time)
+    an extractive digest of the most informative lines is appended after
+    it; without content, or when the digest heuristics yield nothing
+    (blank result, budget exhausted), the stub is exactly the historical
+    one-liner.
+    """
     if isinstance(args, str):
         args_text = args
     else:
@@ -86,9 +222,15 @@ def evicted_stub(tool_name: str, args: Any) -> str:
             args_text = str(args)
     if len(args_text) > ARGS_SUMMARY_CAP:
         args_text = args_text[:ARGS_SUMMARY_CAP] + "…"
-    return (
+    base = (
         f"[tool result evicted: {tool_name}({args_text}) — re-run the tool if needed]"
     )
+    if content is None:
+        return base
+    digest = extractive_digest(tool_name, content)
+    if not digest:
+        return base
+    return f"{base}\n{digest}"
 
 
 def is_evicted_stub(content: Any) -> bool:
@@ -224,8 +366,12 @@ def evict_marked(
     mutated ones are copied, so the input list is never modified.
 
     The tool-call parts are never touched: the call/return pair required
-    by the model APIs survives, and the stub itself tells the model how to
-    get the content back (re-run the tool).
+    by the model APIs survives. The stub tells the model how to get the
+    content back (re-run the tool) AND carries an extractive digest —
+    verbatim copies of the most informative lines of the original,
+    selected by the per-tool-kind heuristics of `extractive_digest` at
+    collapse time (no disk reads, no model calls, bounded by
+    DIGEST_BUDGET_CHARS).
     """
     marked_set = set(marked)
     result = EvictionResult(new_messages=list(messages))
@@ -260,7 +406,12 @@ def evict_marked(
                 call_id = part["tool_call_id"]
                 seen.add(call_id)
                 tool_name, args = calls.get(call_id, (part.get("tool_name", "?"), {}))
-                new_parts.append({**part, "content": evicted_stub(tool_name, args)})
+                new_parts.append(
+                    {
+                        **part,
+                        "content": evicted_stub(tool_name, args, part.get("content")),
+                    }
+                )
                 touched = True
                 result.evicted.append(call_id)
             else:

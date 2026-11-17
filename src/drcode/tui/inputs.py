@@ -96,6 +96,15 @@ class WordNavTextArea(TextArea):
         # paste. Images never arrive AS bytes through a terminal paste —
         # the clipboard-image scenario is the explicit ctrl+v action (see
         # TaskFormLayer.attach_clipboard_image).
+        #
+        # The prevent_default() before the super() call matters: Textual's
+        # event dispatcher walks the whole MRO and invokes _on_paste of
+        # EVERY class that defines it (message_pump._get_dispatch_methods),
+        # so the stock TextArea._on_paste would run AGAIN after this one —
+        # a plain super() call alone inserted the paste text twice. Flagging
+        # the event as handled breaks the dispatcher's walk right after this
+        # method returns; the explicit super() call keeps the handler
+        # self-contained (it also inserts when invoked directly, e.g. tests).
         if not self.read_only:
             staged = load_staged_from_path_text(event.text)
             if staged is not None:
@@ -103,6 +112,7 @@ class WordNavTextArea(TextArea):
                 event.prevent_default()
                 self._app().stage_attachment(staged)
                 return
+        event.prevent_default()
         await super()._on_paste(event)
 
     def action_copy(self) -> None:

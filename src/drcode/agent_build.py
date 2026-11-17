@@ -403,14 +403,19 @@ def build_agent(
     the standing reminder of the real budget does. Same tail zone, so no
     leading prefix is touched. With `subagent_gate` (the pipeline's
     per-run `SubagentGate`, created at activation BEFORE this build) the
-    line is STATE-AWARE: the supplier re-reads the gate per request, so
-    the reminder always names the REMAINING slots and, once the budget
-    is spent, switches to the short "slots used — further delegation is
-    unavailable" text that visibly extinguishes retry attempts (the
-    a7be0f94 transcript: the constant reminder kept being re-discussed
-    for 50+ requests after both calls were spent). The text changes at
-    most once per run, so only that one small tail invalidation is paid.
-    Without a gate (schema estimation, tests) the line is built once
+    line is STATE- and TURN-aware: the supplier re-reads the gate per
+    request (so the reminder always names the REMAINING slots and, once
+    the budget is spent, switches to the "slots used — further delegation
+    is unavailable" text) AND counts the run's requests, decaying the
+    block accordingly — the full text for the first turns, a short
+    one-liner for turns 4–8, and NOTHING from turn 9 on, in both states.
+    The decay is deliberate: delegation fires almost exclusively on the
+    early turns (an archive analysis put ~90% of the calls within the
+    first three), while the constant late-run reminder only provoked the
+    model into re-arguing "delegation not needed" on every request
+    (the #9c5b23de transcript). Within the window a refund may flip the
+    text back — bounded by `subagents.MAX_SLOT_REFUNDS_PER_RUN`. Without
+    a gate (schema estimation, tests) the line is built once
     from `subagent_limit` and stays constant.
 
     `research_web_fetch` (the project's web fetch policy, read at
@@ -449,21 +454,35 @@ def build_agent(
     # called — see `agent_tools.subagent_notice`. It rides the same trailing
     # synthetic message as the checklist (one extra user message per request,
     # never one per block), so the cached prefix is untouched. With a gate
-    # the supplier is STATE-AWARE: recomputed per request, it counts the
-    # remaining slots down and switches to the "slots used" text once the
-    # budget is spent — normally at most ONE text change per run, so only
-    # that one small tail invalidation is ever paid. DOCUMENTED EXCEPTION:
-    # a failed spawn refunds its slot (subagents.MAX_SLOT_REFUNDS_PER_RUN,
-    # capped at 2 per run), which lowers `used` again — the note then
-    # flips back to the "N calls left" text mid-run. That flicker is
-    # truthful and bounded by the refund cap; keep it as the ONLY reason
-    # the tail text may change more than once.
+    # the supplier is STATE- and TURN-aware: recomputed per request, it
+    # counts the remaining slots down, switches to the "slots used" text
+    # once the budget is spent, and DECAYS with the run's request counter —
+    # the full text for the first SUBAGENT_NOTICE_FULL_TURNS requests, a
+    # one-liner up to SUBAGENT_NOTICE_LAST_TURN, then nothing at all
+    # (delegation happens early; past the window the repeated reminder is
+    # pure noise, and a late retry is damped by run_delegate_tool's own
+    # refusal). Within the window a refund may flip the text back — the
+    # DOCUMENTED EXCEPTION, bounded by subagents.MAX_SLOT_REFUNDS_PER_RUN
+    # (capped at 2 per run).
     if subagent_gate is not None:
-        tail_blocks.append(
-            lambda: subagent_notice(
-                subagent_gate.limit, subagent_gate.used, role=delegation_role
+        # The request counter of the run: ONE supplier call == ONE outgoing
+        # model request (`TailInjectionModel` reads each supplier exactly
+        # once per request). The notice decays with it — full text on the
+        # first turns, a one-liner for a few more, nothing after the window
+        # (see `agent_tools.subagent_notice`).
+        turn_counter = 0
+
+        def _delegation_notice() -> str | None:
+            nonlocal turn_counter
+            turn_counter += 1
+            return subagent_notice(
+                subagent_gate.limit,
+                subagent_gate.used,
+                role=delegation_role,
+                turn=turn_counter,
             )
-        )
+
+        tail_blocks.append(_delegation_notice)
     elif effective_limit > 0:
         delegation_note = subagent_notice(effective_limit, role=delegation_role)
         if delegation_note is not None:

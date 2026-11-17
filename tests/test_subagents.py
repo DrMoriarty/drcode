@@ -236,6 +236,97 @@ def test_notice_is_state_aware() -> None:
     assert len(exhausted) < 320
 
 
+def test_notice_decays_after_the_turn_window() -> None:
+    """The notice DECAYS with the run's request counter: the full text on
+    turns 1–3, a short one-liner with the same meaning on turns 4–8, and
+    NOTHING from turn 9 on — in BOTH states, including "slots used" (the
+    late-run extinguisher is deliberate noise; a late retry attempt is
+    damped by run_delegate_tool's own plain-text refusal). Delegation
+    happens early (~90% of archive calls within the first three turns),
+    so the constant late reminder only cost reasoning turns (#9c5b23de)."""
+    from drcode.agent import subagent_notice
+
+    # Turns 1–3: the full text, fresh state.
+    for turn in (1, 2, 3):
+        block = subagent_notice(2, 0, role=AgentRole.CODING, turn=turn)
+        assert block is not None, turn
+        assert "You have 2 delegate_research calls left this run" in block
+        assert "a FAILED call" in block  # the full refund wording
+    # Turns 4–8: the SHORT one-liner, same meaning.
+    for turn in (4, 5, 8):
+        block = subagent_notice(2, 0, role=AgentRole.CODING, turn=turn)
+        assert block is not None, turn
+        assert "You have 2 delegate_research calls left this run" in block
+        assert "a FAILED call" not in block  # the triggers dropped
+        assert len(block) < 120  # a genuine one-liner
+    # Turn 9 and beyond: no block at all, while slots remain.
+    for turn in (9, 10, 50):
+        assert subagent_notice(2, 0, role=AgentRole.CODING, turn=turn) is None
+
+    # The exhausted state obeys the same window.
+    for turn in (1, 3):
+        block = subagent_notice(2, 2, role=AgentRole.CODING, turn=turn)
+        assert block is not None, turn
+        assert "further delegation is unavailable" in block
+        assert "Continue with direct reads" in block
+    for turn in (4, 8):
+        block = subagent_notice(2, 2, role=AgentRole.CODING, turn=turn)
+        assert block is not None, turn
+        assert "further delegation is unavailable" in block
+        assert len(block) < 120
+    for turn in (9, 12):
+        assert subagent_notice(2, 2, role=AgentRole.CODING, turn=turn) is None
+
+    # A refund after the window does NOT resurrect the block: the decay
+    # turns are counted per request, not per state change.
+    assert subagent_notice(2, 1, role=AgentRole.CODING, turn=9) is None
+    # The feature being OFF stays None on every turn.
+    assert subagent_notice(0, 0, role=AgentRole.CODING, turn=1) is None
+    assert subagent_notice(0, 5, role=AgentRole.CODING, turn=15) is None
+
+
+def test_gate_supplier_counts_requests_and_decays(fake_config: Config) -> None:
+    """With the gate wired the supplier counts the run's model requests
+    (ONE supplier call == ONE request), so the tail block decays by
+    itself: full text on the first requests, the one-liner next, nothing
+    after the window — without any pipeline involvement."""
+    from drcode.agent_model import TailInjectionModel
+
+    gate = SubagentGate(2)
+    ag = build_agent(
+        fake_config, kind=TaskKind.FEATURE, subagent_limit=2, subagent_gate=gate
+    )
+    assert isinstance(ag.model, TailInjectionModel)
+
+    def tail_text() -> str | None:
+        written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
+        if not written:
+            return None
+        return _tail_text(written)
+
+    # One supplier call per turn: capture the text of the first ten
+    # requests and check the decay profile turn by turn.
+    texts = [tail_text() for _ in range(10)]
+    # Turns 1–3: the full standing reminder.
+    for turn, text in enumerate(texts[:3], start=1):
+        assert text is not None, turn
+        assert "You have 2 delegate_research calls left this run" in text
+        assert "a FAILED call" in text
+    # Turns 4–8: the short one-liner.
+    for turn, text in enumerate(texts[3:8], start=4):
+        assert text is not None, turn
+        assert "You have 2 delegate_research calls left this run" in text
+        assert "a FAILED call" not in text
+        assert len(text) < 120
+    # Turns 9–10: the block is gone entirely.
+    for turn, text in enumerate(texts[8:], start=9):
+        assert text is None, turn
+    # A refund mid-run does not resurrect the block past the window —
+    # the turn counter keeps advancing regardless of the gate state.
+    gate.used = 1
+    assert tail_text() is None
+
+
 def test_gate_notice_supplier_reflects_the_gate(fake_config: Config) -> None:
     """With the pipeline's gate wired, the tail block is recomputed per
     request: it names the remaining slots and, once the gate is spent,

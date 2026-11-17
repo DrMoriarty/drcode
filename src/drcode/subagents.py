@@ -39,11 +39,17 @@ The gate counter (`SubagentGate`) is per parent run (generation): the
 pipeline creates one per activation and hands it to the agent deps AND
 to the state-aware tail notice (`agent_tools.subagent_notice`, via
 `build_agent`). It carries the run's TOTAL slot budget: every spawn
-spends one slot for good (`used`/`remaining`), a spent budget refuses
-further delegations with a plain explanatory tool result — never a
-crash of the parent run — and the tail notice switches to the "slots
-used" text at the same moment. A failing subagent (network, model
-refusal, usage cap) is likewise converted into a plain tool result.
+spends one slot (`used`/`remaining`), and a FAILED spawn (network,
+model refusal, usage cap) returns its slot — but at most
+MAX_SLOT_REFUNDS_PER_RUN (2) times per run, so a systematically
+failing subagent still eats the budget; an empty answer and a
+cancellation never refund. A spent budget refuses further delegations
+with a plain explanatory tool result — never a crash of the parent
+run — and the tail notice switches to the "slots used" text at the
+same moment (a refund flips it back — an accepted, documented
+exception to the one-text-change-per-run cache argument). A failing
+subagent (network, model refusal, usage cap) is likewise converted
+into a plain tool result.
 
 PROMPTING is what makes the tool get called — the wiring alone does not.
 A whole 119-task drcode-bench run with the slots enabled fired ZERO
@@ -195,25 +201,38 @@ def git_read(root: Path, args: list[str]) -> str:
     return out or "(empty output)"
 
 
+# Slot refunds per run: a FAILED spawn gives its slot back so one timeout
+# or outage does not burn the run's whole delegation budget (#73775cab —
+# two ~16-minute subagent timeouts left a long research run with zero
+# delegations done). Capped so a systematically failing subagent still
+# spends the budget in the end.
+MAX_SLOT_REFUNDS_PER_RUN = 2
+
+
 @dataclass
 class SubagentGate:
     """Per-parent-run budget of delegate_research calls.
 
     `limit` is the run's TOTAL slot count (the project's
-    subagents_coder/subagents_researcher setting): every spawn spends one
-    slot for good — `used` never decreases, `remaining` is what is left.
-    `active` tracks the currently running spawns (always a subset of the
-    spent slots, so the total budget subsumes the old concurrency-only
-    cap). Plain int arithmetic on the event loop (tool bodies of one run
-    all execute on it) is race-free; the pipeline creates one gate per
-    run so a superseded run's gate dies with it — and hands the SAME
-    object to the state-aware tail notice, so the reminder always names
-    the remaining slots and switches to the "slots used" text at the
-    moment the budget is spent."""
+    subagents_coder/subagents_researcher setting): a spawn spends one
+    slot (`used` grows, `remaining` shrinks) and a FAILED spawn (model/
+    network error, usage cap, no result) returns it — but at most
+    MAX_SLOT_REFUNDS_PER_RUN times per run (`refunds`), so a
+    systematically failing subagent still eats the budget in the end; an
+    empty answer and a cancellation never refund. `active` tracks the
+    currently running spawns (always a subset of the spent slots, so the
+    total budget subsumes the old concurrency-only cap). Plain int
+    arithmetic on the event loop (tool bodies of one run all execute on
+    it) is race-free; the pipeline creates one gate per run so a
+    superseded run's gate dies with it — and hands the SAME object to
+    the state-aware tail notice, so the reminder always names the
+    remaining slots and switches to the "slots used" text at the moment
+    the budget is spent (and flips back after a refund)."""
 
     limit: int
     active: int = 0
     used: int = 0
+    refunds: int = 0
 
     @property
     def remaining(self) -> int:
@@ -480,7 +499,11 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
     summary. Every failure
     mode — gate exhausted, model/network error, usage cap — comes back
     as a PLAIN tool result with an actionable explanation: the parent
-    run must never crash because a subagent did.
+    run must never crash because a subagent did. A failed spawn
+    additionally RETURNS its slot to the gate (at most
+    MAX_SLOT_REFUNDS_PER_RUN times per run) and the result text names
+    the actual budget afterwards, so the model never hears two
+    different stories about what it can still delegate.
 
     The parent's web-fetch permission is INHERITED when present (a
     RESEARCH parent with a non-off mode — `deps.web_fetch_gate`): the
@@ -636,10 +659,37 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
                 deps.manager.stats.record_subagent_spawn(failed=True)
             except Exception:  # noqa: BLE001, S110 - statistics never fatal
                 pass
+            # Slot refund (a pure budget notion, separate from the stats:
+            # the failure above is still counted as a failure): a spawn
+            # that died inside the nested run gives its slot back, so a
+            # timeout or an outage does not burn the run's whole
+            # delegation budget — capped at MAX_SLOT_REFUNDS_PER_RUN per
+            # run, after which a failure spends the slot like before.
+            # An empty answer (handled above) and a cancellation never
+            # reach this branch.
+            if gate.refunds < MAX_SLOT_REFUNDS_PER_RUN:
+                gate.refunds += 1
+                gate.used -= 1
+                log_service_event(
+                    deps,
+                    "subagent",
+                    f"subagent slot refunded ({gate.refunds}/"
+                    f"{MAX_SLOT_REFUNDS_PER_RUN}): failed spawn did not "
+                    "spend the run's slot",
+                )
+                calls = "call" if gate.remaining == 1 else "calls"
+                return (
+                    f"The subagent failed ({type(e).__name__}: {e}). The "
+                    "run's slot was returned to the budget — you have "
+                    f"{gate.remaining} delegate_research {calls} left this "
+                    "run: retry the delegation (perhaps with a narrower "
+                    "brief) or continue without it."
+                )
             return (
-                f"The subagent failed ({type(e).__name__}: {e}). You can "
-                "retry the delegation (perhaps with a narrower brief) or "
-                "continue without it."
+                f"The subagent failed ({type(e).__name__}: {e}). The "
+                "failed spawn spent the run's slot (the refund budget is "
+                "exhausted) — further delegation is unavailable; continue "
+                "with direct reads."
             )
     finally:
         gate.active -= 1

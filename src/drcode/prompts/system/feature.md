@@ -80,8 +80,11 @@ partly have.
 
 Each call returns ONLY the subagent's final report. The run has a TOTAL
 budget of delegate_research calls (the exact count is stated in the tool
-description and the tail reminder): parallel calls are fine, but every call
-spends one of the run's slots for good — spent slots are not renewed. The
+description and the tail reminder): parallel calls are fine, and every
+call spends one of the run's slots — a FAILED call (model or network
+error, timeout) returns its slot, but at most twice per run (a timeout
+can be retried, while a systematically failing subagent still eats the
+budget; an empty answer spends the slot). The
 subagent can only read
 (files, grep, glob, task archive) and cannot ask you questions — write the
 brief as a SELF-CONTAINED task in three parts:

@@ -313,6 +313,70 @@ async def test_unmerged_dependency_branch_keeps_dependents_blocked(
         )
 
 
+async def test_unblock_tick_fills_free_slot_while_other_slot_runs(
+    git_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """parallel_limit 2: a development run in slot 1 must not suppress the
+    30s unblock tick — a manual merge of the dependency unblocks the
+    dependent into the FREE slot while the unrelated run keeps going (a
+    run in flight owns the occupied slot, not the whole pipeline). The
+    repeated ticks must not spam the deduplicated gate events either."""
+    _save_settings(git_root, isolation=TaskIsolation.WORKTREE, parallel=2)
+    app = DrCodeApp(git_root)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        dep = app.manager.create("dependency", "do s")
+        x = app.manager.create("x", "do x")
+        app.manager.set_dependencies(x.id, [dep.id])
+        # Real, unmerged work on the dependency's branch.
+        env = app.task_env
+        await asyncio.to_thread(env.ensure_root, dep.id)
+        wt = env.worktree_path(dep.id)
+        (wt / "feature.txt").write_text("work")
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-q", "-m", "dep work")
+        _complete(app, dep)
+        # Occupy slot 1 with an unrelated, gated development run.
+        a = app.manager.create("busy", "work a")
+        release = asyncio.Event()
+        _gate_on(scripted, monkeypatch, release, "work a")
+        scripted.steps = [text_response("done")]
+        app._advance()
+        await wait_until(
+            lambda: app.agent_running, pilot, what="slot 1 run in flight"
+        )
+        await wait_until(
+            lambda: app._dep_gate.get(x.id, {}).get(dep.id) == "unmerged",
+            pilot,
+            what="dependency gate records the unmerged branch",
+        )
+        assert x.status is TaskStatus.QUEUED
+        assert a.status is TaskStatus.ACTIVE
+        # Extra ticks while the dependency is still unmerged: the blocked
+        # announcement stays deduplicated (one "Task waits" line only).
+        app._poll_dependency_unblock()
+        app._poll_dependency_unblock()
+        await pilot.pause()
+        events = [e.text for e in app.manager.get(x.id).events]
+        assert sum("Task waits: dependency" in e for e in events) == 1
+        # The manual merge unblocks the dependent into the free slot even
+        # though the unrelated slot-1 run is still in flight.
+        _git(git_root, "merge", "--no-ff", "-q", f"drcode/{dep.id}")
+        app._poll_dependency_unblock()
+        await wait_until(
+            lambda: x.status is TaskStatus.ACTIVE,
+            pilot,
+            what="dependent promoted into the free slot",
+        )
+        assert app.manager.get(a.id).status is TaskStatus.ACTIVE, (
+            "the unrelated slot-1 run must be untouched by the tick"
+        )
+        release.set()
+
+
 # -- ESC matrix -----------------------------------------------------------------------
 
 

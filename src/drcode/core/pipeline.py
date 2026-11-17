@@ -306,7 +306,9 @@ class PipelineCoreLayer(CoreState):
         the reviewer has not judged yet keeps the pipeline in the
         "development finished, verdict outstanding" state (it stays
         TESTING), and the review worker advances the pipeline on its own
-        completion.
+        completion — under parallel slots an in-flight review also leaves
+        the free development slots to the queue (on a single slot it
+        still owns the pipeline outright).
         """
         if not self.host.host_active:
             # Teardown race: deferred set_timer callbacks (retry backoffs,
@@ -334,17 +336,25 @@ class PipelineCoreLayer(CoreState):
                     self.refresh_sidebar()
             if self._review_running:
                 # A review worker is in flight; its completion path advances
-                # the pipeline (a second dispatch here would cancel it).
-                return
-            review = self._next_review()
-            if review is not None:
-                # Set synchronously: two _advance() calls within one tick must
-                # not start two review workers (mirrors the tester_running flag).
-                self._review_running = True
-                self._review_task_id = review.id
-                self.refresh_status()
-                self.run_external_review(review.id)
-                return
+                # the pipeline (a second dispatch here would cancel it —
+                # hence no re-dispatch below either). Single slot: nothing
+                # else may run meanwhile. Parallel slots: the in-flight
+                # review is unrelated to the queued dependents and does not
+                # keep free development slots idle (same narrowing as a
+                # tester run in flight) — fall through to the promotion
+                # tail.
+                if self.parallel_limit == 1:
+                    return
+            else:
+                review = self._next_review()
+                if review is not None:
+                    # Set synchronously: two _advance() calls within one tick must
+                    # not start two review workers (mirrors the tester_running flag).
+                    self._review_running = True
+                    self._review_task_id = review.id
+                    self.refresh_status()
+                    self.run_external_review(review.id)
+                    return
             if not (self.workflow is not None and self.workflow.has("on_review")):
                 # No external review hook: a TESTING task the tester already
                 # passed (left over when the workflow file was removed

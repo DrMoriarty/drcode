@@ -62,7 +62,12 @@ class PipelineDepsLayer(CoreState):
         # TESTING task is ready) outranks promotion; a tester run already
         # in flight does not — under parallel slots the free development
         # slots are filled anyway (mirrors _advance()'s narrowed block).
-        if self._review_running:
+        # The same narrowing applies to the external review: in flight it
+        # owns the pipeline only on a single slot — a review verdict is
+        # unrelated to the queued dependents and must not idle a free
+        # development slot (mirrors _advance_gate()'s narrowed review
+        # guard).
+        if self._review_running and self.parallel_limit == 1:
             return
         if not self.tester_running and self._next_testing() is not None:
             return
@@ -101,13 +106,16 @@ class PipelineDepsLayer(CoreState):
         when something calls _advance() — a manual `git merge
         drcode/<dep>` (or a foreign merge) would otherwise sit unnoticed
         while the pipeline idles. When there are queued tasks with
-        dependencies, free development slots and no development/review
-        run in flight, this re-fires the gate so a hand-merge unblocks
-        the dependents by itself. A busy tester does not suppress the
-        tick — _advance() applies its own (narrowed) promotion gates.
+        dependencies and a free development slot, this re-fires the gate
+        so a hand-merge unblocks the dependents by itself. A busy tester
+        does not suppress the tick, and under parallel slots neither does
+        a development or review run in ANOTHER slot — the free-slot check
+        below is what governs (a run occupying every slot returns early,
+        which also keeps single-slot pipelines from re-entering the gate
+        mid-run). _advance() applies its own (narrowed) promotion gates.
         Works for parallelism 1 too (it fixes the pre-existing
         "manual merge not noticed while idle" gap)."""
-        if self.agent_running or self._review_running:
+        if self.parallel_limit == 1 and (self.agent_running or self._review_running):
             return
         if (
             len(self.manager.active_tasks()) - len(self._zombie_active_ids())

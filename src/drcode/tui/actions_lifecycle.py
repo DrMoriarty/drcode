@@ -775,6 +775,13 @@ class TaskLifecycleLayer(DrCodeState):
             # run_agent() renders the message itself (see the was_active
             # branch below), so no pre-draw there.
             self._write_history_line("user-pending", line)
+            if refs:
+                # The drawn bubble carries the "[image <media>]" placeholder
+                # lines, but the consuming run's dedup matches the PLAIN
+                # prompt text (pipeline_agent_run's consumption loop) —
+                # register it too, or the run draws the message a second
+                # time and the user's message is doubled in the chat.
+                self._pending_rendered.append(text)
         if was_active:
             # A comment to the running task interrupts it: the exclusive
             # "agent" group cancels the in-flight run (its message goes back

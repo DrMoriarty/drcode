@@ -18,6 +18,14 @@ gets to draw its own "user-pending" bubble (whose is_pending_retry guard
 is still False: the transcript is not persisted yet). The fix draws the
 bubble before advancing the pipeline, so the consuming run sees the text
 in `_pending_rendered` and skips its own draw.
+
+A third doubling shape: a message sent WITH staged images. The pre-drawn
+"user-pending" bubble carries the "[image <media>]" placeholder lines,
+but the consuming run's dedup matches the PLAIN prompt text in
+`_pending_rendered` — with images the two diverged, the dedup missed and
+the run drew the message a second time (the doubled bubble right after
+the "Model:" event line). The fix registers the plain text alongside the
+drawn bubble.
 """
 
 from __future__ import annotations
@@ -224,6 +232,130 @@ async def test_retype_while_active_reaches_model_once(
     # The superseded run's held request never fired; the retry run sent
     # the comment exactly once.
     assert scripted.calls == ["extra note"]
+
+
+async def test_message_with_images_rendered_once_with_eager_worker(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message sent WITH staged images (a clipboard screenshot + a file
+    path) must show exactly once.
+
+    Production sequence that doubled the message (verified on a baseline
+    without the fix — this test fails there with "the message was drawn
+    twice live"):
+
+    1. `_submit_user_text` pre-draws the "user-pending" bubble BEFORE
+       `_advance()`, because Textual's eager task factory can run the
+       consuming worker synchronously inside `_advance()`. The drawn line
+       is the DECORATED text: prompt + "[image <media>]" placeholder lines
+       per attachment. `_write_history_line("user-pending", …)` registers
+       exactly that decorated string in `_pending_rendered`.
+    2. The consuming run (core/pipeline_agent_run.py) dedups per pending
+       entry against the PLAIN `entry.text`. With images the two strings
+       diverge, so the `_pending_rendered` check misses; the transcript is
+       not persisted yet (first node-boundary persist happens later), so
+       the `is_pending_retry` guard is False too — and the run draws the
+       plain "user" block: the message appears twice, right after the
+       run-start "Model: …" event line.
+    3. The fix registers the PLAIN prompt text in `_pending_rendered`
+       alongside the decorated bubble (when refs are present), so the
+       consuming run's check hits and its own draw is skipped.
+
+    The first assertion below pins the invariant directly: right after the
+    submit, the plain prompt text is registered in `_pending_rendered`.
+    The rest asserts the end-to-end outcome: exactly one bubble, live and
+    after a fresh re-render.
+    """
+    from drcode.tui.attachments import StagedImage
+
+    app = DrCodeApp(project_root)
+    text = "вот два скриншота, разберись"
+
+    onscreen = {"n": 0, "max": 0}
+    orig_line = DrCodeApp._write_history_line
+
+    def spy_line(self: DrCodeApp, role: str, line_text: str, at: Any = None) -> Any:
+        if text in str(line_text):
+            onscreen["n"] += 1
+            onscreen["max"] = max(onscreen["max"], onscreen["n"])
+        return orig_line(self, role, line_text, at)
+
+    monkeypatch.setattr(DrCodeApp, "_write_history_line", spy_line)
+
+    staged = [
+        StagedImage(
+            filename="Clipboard.png", media_type="image/png", data=b"\x89PNG-clip"
+        ),
+        StagedImage(
+            filename="dropped.png", media_type="image/png", data=b"\x89PNG-file"
+        ),
+    ]
+    scripted.steps = [text_response("Разобрался по скриншотам.")]
+    async with app.run_test() as pilot:
+        # Emulate the production loop: Textual's real app installs
+        # asyncio.eager_task_factory, the pilot env does not.
+        asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
+        await pilot.pause()
+        # Create the task AFTER the startup advance: a queued task existing
+        # at mount is promoted right away and would consume the scripted
+        # step meant for this message's run.
+        task = app.manager.create(
+            "research", "посмотри скриншоты", kind=TaskKind.RESEARCH
+        )
+        orig_view = DrCodeApp.view_task
+
+        def spy_view(self: DrCodeApp, task_id: str) -> None:
+            if task_id == task.id:
+                onscreen["n"] = 0
+            return orig_view(self, task_id)
+
+        monkeypatch.setattr(DrCodeApp, "view_task", spy_view)
+
+        # Direct invariant snapshot: _advance() is the point where the eager
+        # consuming worker may already read `_pending_rendered`, so capture
+        # the registration state right before it (after the submit's
+        # pre-draw + plain-text registration, before any consumption can
+        # remove the entry).
+        at_advance = {"plain_registered": False}
+        orig_advance = DrCodeApp._advance
+
+        def spy_advance(self: DrCodeApp) -> Any:
+            at_advance["plain_registered"] = text in self._pending_rendered
+            return orig_advance(self)
+
+        monkeypatch.setattr(DrCodeApp, "_advance", spy_advance)
+
+        app.view_task(task.id)
+        app._submit_user_text(task, text, attachments=staged)
+        assert at_advance["plain_registered"], (
+            "the plain prompt text must be registered in _pending_rendered "
+            "before the pipeline advance — the consuming run dedups against "
+            "the PLAIN text, and only this registration keeps it from "
+            "drawing the message a second time"
+        )
+        for _ in range(5):
+            await pilot.pause()
+            assert onscreen["max"] <= 1, "the message was drawn twice live"
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED and not app.agent_running,
+            pilot,
+            what="research completed",
+        )
+        await pilot.pause()
+
+        # Fresh re-render (what reopening the task shows): exactly once.
+        app.view_task(task.id)
+        for _ in range(60):
+            await pilot.pause()
+            if not app._chat_batching:
+                break
+        hits = sum(
+            1 for w in app.query_one("#chat-log").children if text in str(w.render())
+        )
+        assert hits == 1
 
 
 async def test_requeue_message_rendered_once_with_eager_worker(

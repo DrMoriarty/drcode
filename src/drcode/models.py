@@ -463,6 +463,18 @@ class Task(BaseModel):
     # successful hook re-run) clears the signal again. Persisted like every
     # other Task field; False for old task files (plain default).
     hook_merge_failed: bool = False
+    # The `completed_at` stamp of the COMPLETED task for which the resolver
+    # round's no-op verdict ("nothing to resolve — no parked merge and no
+    # triage report") was last ANNOUNCED in its chat. The no-op round's
+    # triggers (the startup scan, the audit re-stamp) keep firing while the
+    # task sits parked in exactly that state, so the event is deduplicated
+    # per completion: repeated verdicts for the same `completed_at` are
+    # suppressed, and the state's change re-arms the announcement (a
+    # re-queue gives a fresh `completed_at`; a parked merge clears the
+    # stamp in the round itself; a merged branch clears it with the flag).
+    # The ROUND still runs every time — only the event is deduplicated.
+    # Persisted like every other Task field; None for old task files.
+    resolver_noop_noted_at: datetime | None = None
     # True when the on_tester_passed hook (install/deploy) was SKIPPED by
     # the pipeline because the main checkout sat in a half-done merge
     # (MERGE_HEAD set — installing would ship conflict markers). The

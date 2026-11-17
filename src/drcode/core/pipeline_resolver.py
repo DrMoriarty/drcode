@@ -423,6 +423,9 @@ class PipelineResolverLayer(CoreState):
             ):
                 if task.hook_merge_failed:
                     task.hook_merge_failed = False
+                    # The branch is merged — the no-op note's state is gone
+                    # too; a future no-op round (a fresh failure) speaks again.
+                    task.resolver_noop_noted_at = None
                     task.touch()
                     self.manager.storage.save(task)
                 self._show_event(
@@ -443,18 +446,41 @@ class PipelineResolverLayer(CoreState):
             # Skip instead. A SURVIVING worktree is deliberately not
             # skipped here: prepare's base-into-worktree merge may park a
             # real conflict that this round exists to resolve.
+            parked = await asyncio.to_thread(self._parked_merge_exists, task_id)
+            if parked and task.resolver_noop_noted_at is not None:
+                # A park appeared since the last no-op note: the state the
+                # note described is gone, so the note's dedup is lifted —
+                # a later no-op round (after the park is resolved) may
+                # announce itself again.
+                task.resolver_noop_noted_at = None
+                task.touch()
+                self.manager.storage.save(task)
             if (
                 task.status is TaskStatus.COMPLETED
                 and not self.task_env.worktree_path(task_id).is_dir()
-                and not (await asyncio.to_thread(self._parked_merge_exists, task_id))
+                and not parked
             ):
-                self._show_event(
-                    task,
-                    "Conflict resolver: nothing to resolve — no parked "
-                    "merge and no triage report; the worktree is not "
-                    "recreated.",
-                    kind="workflow",
-                )
+                # The verdict is meaningful only on its FIRST showing: the
+                # no-op round's triggers (the startup scan, the audit
+                # re-stamp) keep firing while the task sits parked in
+                # exactly this state — one event per TUI session, and
+                # restarts within a minute duplicate even that. The event
+                # is deduplicated per completion (the round itself still
+                # runs, the flag logic is untouched): a repeated verdict
+                # for the same `completed_at` is suppressed; a re-queue /
+                # re-accept (fresh `completed_at`), an appeared park
+                # (cleared above) or a merged branch (cleared with the
+                # flag) re-arm it.
+                if task.resolver_noop_noted_at != task.completed_at:
+                    task.resolver_noop_noted_at = task.completed_at
+                    task.touch()
+                    self._show_event(
+                        task,
+                        "Conflict resolver: nothing to resolve — no parked "
+                        "merge and no triage report; the worktree is not "
+                        "recreated.",
+                        kind="workflow",
+                    )
                 return
             # The resolver works in the task's worktree, resolved against
             # its isolation PIN (see run_agent): a mid-task toggle of the

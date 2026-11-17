@@ -153,6 +153,67 @@ async def test_resolver_skips_fully_merged_branch(
         assert not live.hook_merge_failed
 
 
+async def test_noop_verdict_shown_once_until_state_changes(
+    isolated: Path, env: TaskEnvironment, configured_env: None
+) -> None:
+    """A COMPLETED task with an unmerged branch, no worktree and nothing
+    parked: the resolver round's "nothing to resolve" verdict is shown
+    ONCE — repeated triggers (a second `_maybe_start_resolver`, i.e. the
+    re-stamp/startup-scan/restart pattern) do not append the event again
+    while the task sits in the same state. The state changing (a re-queue
+    with a fresh `completed_at`) re-arms the announcement. The round
+    itself still runs every time — only the event is deduplicated."""
+    app = DrCodeApp(isolated)
+    task = _finished_task(app)
+    _commit_on_branch(env, task.id)
+    wt = env.worktree_path(task.id)
+    _git(isolated, "worktree", "remove", "--force", str(wt))
+    assert not wt.is_dir()
+    assert env.unmerged_commits(task.id) == 1
+    task.hook_merge_failed = True
+    app.manager.storage.save(task)
+
+    _quiesce(app)
+    noop = "nothing to resolve"
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        live = app.manager.get(task.id)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: any(noop in t for t in event_texts(live)),
+            pilot,
+            what="no-op verdict",
+        )
+        await wait_until(
+            lambda: not app._resolver_running, pilot, what="round finished"
+        )
+        # The flag survives the no-op round (the dedup suppresses only the
+        # event, the round logic is untouched).
+        assert live.hook_merge_failed
+        # Immediate re-trigger (the re-stamp / restart pattern): no second
+        # verdict, the worktree still not recreated.
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: not app._resolver_running, pilot, what="second round finished"
+        )
+        assert sum(1 for t in event_texts(live) if noop in t) == 1
+        assert not wt.is_dir()
+        # A state change (re-queue with completed_at reset, then a fresh
+        # completion — new stamp): the next no-op round speaks again.
+        live.status = TaskStatus.QUEUED
+        live.completed_at = None
+        app.manager.storage.save(live)
+        live.status = TaskStatus.COMPLETED
+        live.completed_at = datetime.now(UTC)
+        app.manager.storage.save(live)
+        app._maybe_start_resolver(task.id)
+        await wait_until(
+            lambda: sum(1 for t in event_texts(live) if noop in t) == 2,
+            pilot,
+            what="re-armed no-op verdict",
+        )
+
+
 async def test_resolver_runs_for_unmerged_branch(
     isolated: Path,
     env: TaskEnvironment,

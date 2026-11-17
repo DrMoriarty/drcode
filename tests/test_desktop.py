@@ -31,7 +31,11 @@ from pty_session import (  # type: ignore[import-not-found]
     child_environment,
     payload_argv,
 )
-from server import ShellContext, run_server  # type: ignore[import-not-found]
+from server import (  # type: ignore[import-not-found]
+    FRAME_MAX_BYTES,
+    ShellContext,
+    run_server,
+)
 
 # ---------------------------------------------------------------------------
 # projects.py — recents storage
@@ -588,6 +592,132 @@ async def test_server_ws_bridge_roundtrip(tmp_path: Path) -> None:
                     break
             assert saw_marker, "child PTY output never reached the ws"
             assert exit_code == 0
+    finally:
+        await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# server.py — pump(): output coalescing
+# ---------------------------------------------------------------------------
+
+
+async def _drain_frames(
+    ws: aiohttp.ClientWebSocketResponse, quiet: float = 0.4, timeout: float = 5.0
+) -> list[bytes | dict]:
+    """Read frames until the stream is quiet for ``quiet`` seconds."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    frames: list[bytes | dict] = []
+    while loop.time() < deadline:
+        try:
+            msg = await asyncio.wait_for(ws.receive(), timeout=quiet)
+        except TimeoutError:
+            break
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            frames.append(msg.data)
+        elif msg.type == aiohttp.WSMsgType.TEXT:
+            frames.append(json.loads(msg.data))
+        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+            break
+    return frames
+
+
+async def _connect_with_sinks(ctx: ShellContext, base_url: str):
+    """Open a ws connection and wait until the server side registered the
+    sinks for the default tab (the handshake alone is not a guarantee)."""
+    http = aiohttp.ClientSession()
+    ws = await http.ws_connect(f"{base_url}/ws?token={ctx.token}")
+    deadline = asyncio.get_event_loop().time() + 5
+    state = ctx.tab("default")
+    while state.frame_sink is None or state.event_sink is None:
+        assert asyncio.get_event_loop().time() < deadline, "sinks never registered"
+        await asyncio.sleep(0.02)
+    return http, ws, state
+
+
+async def test_server_ws_coalesces_output_burst(tmp_path: Path) -> None:
+    """60 tiny chunks queued in one synchronous burst reach the client as
+    ONE (or a few) coalesced binary frame(s), byte-exact and in order."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            chunks = [f"<chunk-{i:03d}>".encode() for i in range(60)]
+            sink = state.frame_sink
+            assert sink is not None
+            # One synchronous stretch: all 60 puts land on the loop before
+            # the pump task gets to run, i.e. they are all "already queued"
+            # at the moment of the first send.
+            for chunk in chunks:
+                sink(chunk)
+            frames = await _drain_frames(ws)
+        finally:
+            await http.close()
+
+        binary = [f for f in frames if isinstance(f, bytes)]
+        assert binary, "no output frames reached the client"
+        # Order and content survive the coalescing exactly.
+        assert b"".join(binary) == b"".join(chunks)
+        # The burst was collapsed instead of forwarded chunk by chunk.
+        assert len(binary) < len(chunks)
+        assert len(binary) <= 5
+        # Nothing else (no json events) was emitted for pure byte traffic.
+        assert not [f for f in frames if not isinstance(f, bytes)]
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_bytes_and_events_keep_queue_order(tmp_path: Path) -> None:
+    """A json event queued between byte chunks goes out as its own text
+    frame BETWEEN the bytes: bytes-before, event, bytes-after."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            sink = state.frame_sink
+            event_sink = state.event_sink
+            assert sink is not None and event_sink is not None
+            sink(b"AAA-before")
+            sink(b"BBB-before")
+            marker = {"event": "error", "message": "order-marker", "tab": "default"}
+            event_sink(marker)
+            sink(b"CCC-after")
+            frames = await _drain_frames(ws)
+        finally:
+            await http.close()
+
+        assert frames == [
+            b"AAA-beforeBBB-before",  # bytes before the event, coalesced
+            marker,  # the event as its own text frame
+            b"CCC-after",  # bytes after the event, in their own frame
+        ]
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_coalesced_frames_capped(tmp_path: Path) -> None:
+    """A firehose burst larger than FRAME_MAX_BYTES is split into several
+    frames, each bounded by the cap (plus one read chunk), never merged
+    into one unbounded frame, order intact."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            chunk = b"x" * 100_000
+            chunks = [bytes([ord("0") + i]) + chunk for i in range(12)]
+            sink = state.frame_sink
+            assert sink is not None
+            for c in chunks:
+                sink(c)
+            frames = await _drain_frames(ws)
+        finally:
+            await http.close()
+
+        binary = [f for f in frames if isinstance(f, bytes)]
+        assert len(binary) > 1, "cap did not split the burst"
+        # Bound: FRAME_MAX_BYTES plus at most one chunk that over-shot.
+        assert all(len(f) <= FRAME_MAX_BYTES + len(chunk) for f in binary)
+        assert b"".join(binary) == b"".join(chunks)
     finally:
         await runner.cleanup()
 

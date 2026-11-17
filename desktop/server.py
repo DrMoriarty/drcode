@@ -20,6 +20,13 @@ messages may restate it). Events are always marked with the same tab:
     {"event": "exited",  "code": 0, "tab": "..."}  # 0 = clean, else crashed
     {"event": "error",   "message": "...", "tab": "..."}
 
+Raw terminal bytes go out as binary frames. The pump coalesces whatever
+has already accumulated in the outgoing queue into one frame (capped at
+FRAME_MAX_BYTES) — under a burst of PTY output this is the difference
+between hundreds of tiny ws frames per second and a few large ones.
+Order is strictly preserved; JSON events are never mixed into the byte
+stream (separate text frames, in queue order relative to the bytes).
+
 Each tab holds at most one PTY session; the context holds any number of
 tabs (a tab's session outlives a ws reconnect by design — the client
 kills it explicitly with the ``kill`` control message).
@@ -50,6 +57,12 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 
 # Tab id for connections that do not name one (tests, first-run probes).
 DEFAULT_TAB = "default"
+
+# Upper bound of one coalesced binary frame (pump() drains the queue into
+# a batch until it reaches this size). Bounds memory under a firehose of
+# PTY output; the batch may overshoot by at most one PTY read chunk
+# (READ_CHUNK in pty_session.py).
+FRAME_MAX_BYTES = 256 * 1024
 
 
 class TabState:
@@ -235,14 +248,46 @@ def _websocket(
         state.event_sink = _event_sink
 
         async def pump() -> None:
+            # Coalescing: under a burst of PTY output (a pytest -n auto run,
+            # a big diff) the queue accumulates dozens of small chunks; one
+            # ws frame per chunk (loopback TCP framing → WKWebView → JS
+            # onmessage → term.write each time) makes the UI lag. Drain
+            # everything ALREADY queued into one binary frame instead —
+            # order is preserved, and an interactive print still pays only
+            # the latency of the single frame it was anyway (the queue is
+            # empty by then). The batch is capped so a firehose cannot grow
+            # the buffer unboundedly; whatever does not fit stays queued
+            # and goes out in the next frame. JSON events are NEVER merged
+            # into the byte stream: they ride as separate text frames, in
+            # queue order relative to the bytes around them.
+            pending: tuple[str, Any] | None = None
             while True:
-                kind, payload = await out_queue.get()
+                if pending is None:
+                    kind, payload = await out_queue.get()
+                else:
+                    kind, payload = pending
+                    pending = None
                 if kind == "close":
                     return
-                if kind == "bytes":
-                    await ws.send_bytes(payload)
-                else:
+                if kind == "json":
                     await ws.send_json(payload)
+                    continue
+                # bytes: coalesce everything already queued, in order.
+                batch = bytearray(payload)
+                while len(batch) < FRAME_MAX_BYTES:
+                    try:
+                        nkind, npayload = out_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nkind == "bytes":
+                        batch.extend(npayload)
+                    else:
+                        # A json event (or the close sentinel): it must be
+                        # its own text frame, AFTER the bytes queued before
+                        # it — hold it back, flush the batch, handle next.
+                        pending = (nkind, npayload)
+                        break
+                await ws.send_bytes(bytes(batch))
 
         pump_task = loop.create_task(pump())
         try:

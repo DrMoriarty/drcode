@@ -205,9 +205,14 @@ class TaskManager:
                 t.queue_seq = self._next_queue_seq()
                 self.storage.save(t)
         # On startup at most one task may have been active when the app closed.
+        # The demotion also stamps task.unfinished: the process died mid-run,
+        # so nothing could set the interrupted-attempt marker — without it the
+        # task sits in the queue forever (promote_next only activates tasks
+        # with pending_input or unfinished) instead of auto-resuming.
         for t in self.tasks.values():
             if t.status is TaskStatus.ACTIVE:
                 self._close_out_stale_active(t)
+                t.unfinished = True
                 t.status = TaskStatus.QUEUED
                 self.storage.save(t)
         # Goal-progress loop closure: every transition INTO COMPLETED of a
@@ -567,6 +572,10 @@ class TaskManager:
                     t.queue_seq = self._next_queue_seq()
                     changed = True
                 if t.status is TaskStatus.ACTIVE:
+                    # Mirror the startup demotion: the peer died mid-run, so
+                    # nobody stamped the interrupted-attempt marker — without
+                    # it promote_next would skip this task forever.
+                    t.unfinished = True
                     t.status = TaskStatus.QUEUED
                     changed = True
                 self.tasks[t.id] = t

@@ -815,6 +815,34 @@ def test_startup_demotes_stale_active(project_root: Path) -> None:
     assert Storage(project_root).load_all()[0].status is TaskStatus.QUEUED
 
 
+def test_startup_demotion_marks_unfinished_and_resumes(
+    project_root: Path,
+) -> None:
+    """A run killed by an app restart never gets to stamp task.unfinished
+    (only the live pipeline does, on abort/error) — the startup demotion
+    must set the marker itself, or the task would sit in the queue
+    forever: promote_next only activates tasks with pending_input or
+    unfinished (incident f34709d8)."""
+    storage = Storage(project_root)
+    task = Task(title="stale", status=TaskStatus.ACTIVE)
+    assert not task.unfinished
+    storage.save(task)
+
+    manager = TaskManager(project_root)
+    demoted = manager.get(task.id)
+    assert demoted.status is TaskStatus.QUEUED
+    assert demoted.unfinished
+    # The marker is persisted too, not just in memory.
+    assert Storage(project_root).load_all()[0].unfinished
+    # And the auto-resume picks it up: a fresh manager re-activates the
+    # task as an unfinished-resume (no text re-sent), exactly like an
+    # attempt aborted by the live pipeline.
+    promoted = manager.promote_next()
+    assert promoted is not None and promoted.id == task.id
+    assert promoted.status is TaskStatus.ACTIVE
+    assert promoted.pending_input == []
+
+
 def test_startup_keeps_testing_for_retest(project_root: Path) -> None:
     storage = Storage(project_root)
     task = Task(title="in testing", status=TaskStatus.TESTING)
@@ -940,9 +968,14 @@ def test_reload_demotes_foreign_active_task(
     (added,) = manager.reload_new_tasks()
     assert added is manager.get(stale.id)
     assert added.status is TaskStatus.QUEUED
+    # The interrupted-attempt marker rides along (same as the startup
+    # demotion): the auto-resume can pick the task up.
+    assert added.unfinished
     # The demotion is persisted, not just in memory.
     fresh = TaskManager(project_root)
-    assert fresh.get(stale.id).status is TaskStatus.QUEUED
+    reloaded = fresh.get(stale.id)
+    assert reloaded.status is TaskStatus.QUEUED
+    assert reloaded.unfinished
 
 
 def test_promote_next_picks_up_external_task(

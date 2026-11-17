@@ -685,11 +685,25 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
                     "run: retry the delegation (perhaps with a narrower "
                     "brief) or continue without it."
                 )
+            # Same budget story as the tail notice (`agent_tools.subagent_notice`):
+            # with refunds exhausted the slot is spent, but delegation is
+            # unavailable ONLY when nothing remains — a failed call at a
+            # limit of 3–4 can still leave remaining slots.
+            if gate.remaining <= 0:
+                return (
+                    f"The subagent failed ({type(e).__name__}: {e}). The "
+                    "failed spawn spent the run's slot (the refund budget "
+                    "is exhausted) — further delegation is unavailable; "
+                    "continue with direct reads."
+                )
+            calls = "call" if gate.remaining == 1 else "calls"
             return (
                 f"The subagent failed ({type(e).__name__}: {e}). The "
                 "failed spawn spent the run's slot (the refund budget is "
-                "exhausted) — further delegation is unavailable; continue "
-                "with direct reads."
+                "exhausted) — you have "
+                f"{gate.remaining} delegate_research {calls} left this "
+                "run: continue with direct reads or retry the delegation "
+                "(a further failure will not be refunded)."
             )
     finally:
         gate.active -= 1

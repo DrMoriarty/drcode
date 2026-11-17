@@ -543,7 +543,10 @@ def test_failure_refund_capped_at_two_per_run(
     third = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate baz"))
     assert "The subagent failed" in third
     assert "refund budget is exhausted" in third
-    assert "further delegation is unavailable" in third
+    # One slot remains (limit 2, two refunded): the failure text must tell
+    # the SAME story as the tail notice — delegation is still available.
+    assert "further delegation is unavailable" not in third
+    assert "1 delegate_research call left" in third
     assert gate.used == 1 and gate.remaining == 1 and gate.refunds == 2
 
     texts = [e.text for e in task.events]
@@ -552,6 +555,46 @@ def test_failure_refund_capped_at_two_per_run(
     day = manager.stats.snapshot(1)[0][1]
     assert day.subagent_spawns == 0
     assert day.subagent_failures == 3
+
+
+def test_failure_after_refund_cap_names_remaining_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """With a limit above the refund cap the first post-cap failure still
+    leaves slots: the failure text must name the remaining calls, never
+    claim delegation is unavailable — the tail notice would otherwise
+    tell a different budget story (#914c53f2)."""
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(boom),
+    )
+    task = manager.create("T", "delegate me")
+    deps = _deps(project_root, manager, task.id, limit=3)
+    gate = deps.subagent_gate
+    assert gate is not None
+
+    for i in range(2):  # both failures refunded (cap = 2)
+        out = asyncio.run(run_delegate_tool(deps, fake_config, f"Investigate {i}"))
+        assert "slot was returned" in out
+    assert gate.used == 0 and gate.remaining == 3 and gate.refunds == 2
+
+    third = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate two"))
+    assert "The subagent failed" in third
+    assert "refund budget is exhausted" in third
+    # One slot spent, two remain — delegation is still available and the
+    # text must match the tail notice's budget story.
+    assert "further delegation is unavailable" not in third
+    assert "2 delegate_research calls left" in third
+    assert gate.used == 1 and gate.remaining == 2 and gate.refunds == 2
+    texts = [e.text for e in task.events]
+    assert sum("slot refunded" in t for t in texts) == 2
 
 
 def test_empty_answer_spends_the_slot(

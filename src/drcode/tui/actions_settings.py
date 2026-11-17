@@ -851,19 +851,26 @@ class SettingsLayer(DrCodeState):
                 )
         hooks = self.workflow
         if hooks is None:
-            parts.append("Hooks: .drcode/workflow.py — not present")
+            # The workflow layer is off entirely — nothing to show, and
+            # the security warning is only relevant when the file exists.
+            pass
         elif hooks.load_error:
             parts.append(
                 f"Hooks: .drcode/workflow.py — unparseable ({hooks.load_error})"
             )
+            parts.append(
+                "Security: .drcode/workflow.py is arbitrary code running with "
+                "your user permissions — never trust it from a repository you "
+                "did not author."
+            )
         else:
             defined = ", ".join(hooks.defined_hooks()) or "no hook functions defined"
             parts.append(f"Hooks: .drcode/workflow.py — {defined}")
-        parts.append(
-            "Security: .drcode/workflow.py is arbitrary code running with "
-            "your user permissions — never trust it from a repository you "
-            "did not author."
-        )
+            parts.append(
+                "Security: .drcode/workflow.py is arbitrary code running with "
+                "your user permissions — never trust it from a repository you "
+                "did not author."
+            )
         return parts
 
     def action_change_github(self) -> None:

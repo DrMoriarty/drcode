@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -718,6 +719,149 @@ async def test_server_ws_coalesced_frames_capped(tmp_path: Path) -> None:
         # Bound: FRAME_MAX_BYTES plus at most one chunk that over-shot.
         assert all(len(f) <= FRAME_MAX_BYTES + len(chunk) for f in binary)
         assert b"".join(binary) == b"".join(chunks)
+    finally:
+        await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# server.py — pump(): client-side flow control (pause/resume)
+# ---------------------------------------------------------------------------
+
+
+async def test_server_ws_flow_control_pause_resume(tmp_path: Path) -> None:
+    """pause stops binary frames (JSON events still flow); resume releases
+    the withheld bytes with neither loss nor reordering — including bytes
+    queued between the pause and the resume."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            sink = state.frame_sink
+            assert sink is not None
+
+            await ws.send_json({"type": "pause"})
+            # Give the pump time to apply the pause (the frame must be
+            # received and queued before the test-side bytes are).
+            await asyncio.sleep(0.3)
+
+            sink(b"held-A")
+            sink(b"held-B")
+            marker = {"event": "error", "message": "flow-probe", "tab": "default"}
+            state.event_sink(marker)
+
+            # While paused: the event arrives, the bytes do not.
+            frames = await _drain_frames(ws, quiet=0.4, timeout=1.5)
+            assert frames == [marker], "paused bytes leaked or event lost"
+
+            # Still paused: more output piles up server-side.
+            sink(b"held-C")
+
+            await ws.send_json({"type": "resume"})
+            sink(b"after-resume")
+            frames2 = await _drain_frames(ws)
+
+            binary = [f for f in frames2 if isinstance(f, bytes)]
+            # Nothing lost, nothing reordered: the client sees exactly the
+            # sunk byte stream, in sink order.
+            assert b"".join(binary) == b"held-Aheld-Bheld-C" + b"after-resume"
+            # No stray json events mixed in.
+            assert not [f for f in frames2 if not isinstance(f, bytes)]
+        finally:
+            await http.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_flow_control_json_not_blocked(tmp_path: Path) -> None:
+    """A paused connection still delivers json events arriving AFTER the
+    pause — start/exit/error must never wait on the byte stream."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            await ws.send_json({"type": "pause"})
+            await asyncio.sleep(0.3)
+            state.frame_sink(b"held")  # type: ignore[union-attr]
+
+            sink_event = state.event_sink
+            assert sink_event is not None
+            first = {"event": "error", "message": "e1", "tab": "default"}
+            second = {"event": "error", "message": "e2", "tab": "default"}
+            sink_event(first)
+            sink_event(second)
+
+            frames = await _drain_frames(ws, quiet=0.4, timeout=1.5)
+            assert frames == [first, second]
+        finally:
+            await http.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_flow_control_resets_on_reconnect(tmp_path: Path) -> None:
+    """The pause lives on the connection, not the tab: a fresh ws attach to
+    the same tab is never stuck paused."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http1, ws1, _state = await _connect_with_sinks(ctx, base_url)
+        await ws1.send_json({"type": "pause"})
+        await asyncio.sleep(0.3)
+        await http1.close()
+
+        http2, ws2, state2 = await _connect_with_sinks(ctx, base_url)
+        try:
+            sink = state2.frame_sink
+            assert sink is not None
+            sink(b"fresh-connection")
+            frames = await _drain_frames(ws2, quiet=0.4, timeout=1.5)
+            binary = b"".join(f for f in frames if isinstance(f, bytes))
+            assert b"fresh-connection" in binary
+        finally:
+            await http2.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_flow_control_cap_overflow_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past PAUSE_BUFFER_MAX_BYTES the pause is given up: output flows
+    again (bytes never dropped), and the client's later resume is a no-op."""
+    import server as server_module  # type: ignore[import-not-found]
+
+    monkeypatch.setattr(server_module, "PAUSE_BUFFER_MAX_BYTES", 1000)
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            sink = state.frame_sink
+            assert sink is not None
+
+            await ws.send_json({"type": "pause"})
+            await asyncio.sleep(0.3)
+
+            chunk_a = b"a" * 600
+            chunk_b = b"b" * 600  # 1200 held > 1000 cap → overflow → resume
+            sink(chunk_a)
+            sink(chunk_b)
+            frames = await _drain_frames(ws)
+            binary = [f for f in frames if isinstance(f, bytes)]
+            assert b"".join(binary) == chunk_a + chunk_b
+
+            # Still (client-side) paused: the server keeps sending anyway.
+            sink(b"flows-despite-pause")
+            frames2 = await _drain_frames(ws, quiet=0.4, timeout=1.5)
+            binary2 = b"".join(f for f in frames2 if isinstance(f, bytes))
+            assert b"flows-despite-pause" in binary2
+
+            # The client's eventual resume is harmless.
+            await ws.send_json({"type": "resume"})
+            sink(b"post-resume")
+            frames3 = await _drain_frames(ws, quiet=0.4, timeout=1.5)
+            binary3 = b"".join(f for f in frames3 if isinstance(f, bytes))
+            assert b"post-resume" in binary3
+        finally:
+            await http.close()
     finally:
         await runner.cleanup()
 
@@ -1702,6 +1846,41 @@ def test_exit_process_flushes_streams(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _term_js() -> str:
     return (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+
+
+def test_term_js_flow_control_wiring() -> None:
+    """The client reports the xterm.js backlog to the shell server: every
+    write goes through a processed-callback, pause/resume frames are
+    edge-triggered with a hysteresis gap, and a fresh connection resets
+    the accounting (the server's pause state is per-connection too)."""
+    src = _term_js()
+    # The single term.write path counts the chunk and releases it in the
+    # write callback (fired when xterm.js has actually processed the data).
+    assert "tab.flowOutstanding += bytes.length" in src
+    assert "tab.term.write(bytes, function () {" in src
+    assert "tab.flowOutstanding -= bytes.length" in src
+
+    # Thresholds exist and the resume threshold is below the pause one
+    # (either literal form: "1 * 1024 * 1024" or "1024 * 1024").
+    def _flow_bytes(match: re.Match[str]) -> int:
+        value = int(match.group(1))
+        if match.group(2):
+            value *= 1024 * 1024
+        return value
+
+    pause = re.search(r"FLOW_PAUSE_BYTES = (\d+)( \* 1024 \* 1024)?", src)
+    resume = re.search(r"FLOW_RESUME_BYTES = (\d+)( \* 1024 \* 1024)?", src)
+    assert pause is not None and resume is not None
+    assert _flow_bytes(pause) > _flow_bytes(resume)
+    # Both control frames are sent, gated by the flowPaused edge flag.
+    assert '"type": "pause"' in src
+    assert '"type": "resume"' in src
+    assert "tab.flowPaused = true" in src
+    assert "tab.flowPaused = false" in src
+    # A fresh ws connection starts with a clean slate.
+    assert "tab.flowOutstanding = 0" in src
+    # The counter is only clamped at zero, never trimmed (no byte loss).
+    assert "if (tab.flowOutstanding < 0) tab.flowOutstanding = 0;" in src
 
 
 def test_tab_switch_shortcut_matched_by_physical_key() -> None:

@@ -92,6 +92,21 @@
   var MAX_FONT_SIZE = 40;
   var FONT_STEP = 1;
 
+  /* ---- client-side flow control ---- */
+  /* xterm.js queues term.write() data internally; under a firehose of PTY
+   * output (a pytest -n auto run) that queue grows faster than the parser
+   * drains it and the visible terminal falls seconds behind reality. The
+   * write callback reports when a chunk has actually been processed, so
+   * the outstanding-byte count below is a true backlog measure. Crossing
+   * FLOW_PAUSE_BYTES sends {"type": "pause"} to the shell server (it stops
+   * sending binary frames, JSON events keep flowing); draining back under
+   * FLOW_RESUME_BYTES sends {"type": "resume"}. The hysteresis gap keeps a
+   * borderline stream from pause/resume thrash. Terminal output is never
+   * dropped by design: if the server's own buffer cap overflows, IT gives
+   * up the pause — a lost throttle is recoverable, lost bytes are not. */
+  var FLOW_PAUSE_BYTES = 4 * 1024 * 1024;
+  var FLOW_RESUME_BYTES = 1024 * 1024;
+
   /* ---- tab model ---- */
   /* tabs[] holds one object per tab, in tab-bar order:
    *   { id, kind: "welcome"|"terminal", project, started, closing,
@@ -291,6 +306,8 @@
       badgeEl: null,
       desiredTitle: null,
       desiredBadge: null,
+      flowOutstanding: 0, // bytes queued into xterm.js, not yet processed
+      flowPaused: false,  // pause frame sent, resume not yet sent
     };
     tabs.push(tab);
 
@@ -917,6 +934,22 @@
 
   /* ---------------- websocket bridge (one ws per tab) ---------------- */
 
+  /* Flow-control bookkeeping: called after every write callback and keeps
+   * the pause/resume frames in sync with the xterm.js backlog. Pauses are
+   * edge-triggered (only on the crossing), never re-sent while active —
+   * the server treats a repeat pause as a no-op anyway. */
+  function flowUpdate(tab) {
+    if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+    if (tab.flowOutstanding < 0) tab.flowOutstanding = 0;
+    if (!tab.flowPaused && tab.flowOutstanding >= FLOW_PAUSE_BYTES) {
+      tab.flowPaused = true;
+      tab.ws.send(JSON.stringify({ type: "pause", tab: tab.id }));
+    } else if (tab.flowPaused && tab.flowOutstanding <= FLOW_RESUME_BYTES) {
+      tab.flowPaused = false;
+      tab.ws.send(JSON.stringify({ type: "resume", tab: tab.id }));
+    }
+  }
+
   function connectTab(tab) {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     var ws = new WebSocket(
@@ -925,9 +958,21 @@
     );
     ws.binaryType = "arraybuffer";
     tab.ws = ws;
+    // A fresh connection starts with a clean flow-control slate — the
+    // server's pause state is per-connection and resets on reconnect too.
+    tab.flowOutstanding = 0;
+    tab.flowPaused = false;
     tab.filter = makeOscFilter(
       function (bytes) {
-        if (tab.term) tab.term.write(bytes);
+        if (tab.term) {
+          // The callback fires when xterm.js has actually processed the
+          // chunk (not merely queued it) — that is the backlog signal.
+          tab.flowOutstanding += bytes.length;
+          tab.term.write(bytes, function () {
+            tab.flowOutstanding -= bytes.length;
+            flowUpdate(tab);
+          });
+        }
       },
       copyToClipboard,
       function (title) { applyTerminalTitle(tab, title); }

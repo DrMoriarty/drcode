@@ -15,6 +15,8 @@ messages may restate it). Events are always marked with the same tab:
     {"type": "resize",  "cols": 120, "rows": 30}
     {"type": "restart", "cols": 120, "rows": 30}   # kill + respawn same project
     {"type": "kill"}
+    {"type": "pause",  "tab": "..."}   # flow control: withhold binary frames
+    {"type": "resume", "tab": "..."}   # ...release the withheld bytes again
   server -> client (text, JSON):
     {"event": "started", "project": "...", "tab": "..."}
     {"event": "exited",  "code": 0, "tab": "..."}  # 0 = clean, else crashed
@@ -26,6 +28,16 @@ FRAME_MAX_BYTES) — under a burst of PTY output this is the difference
 between hundreds of tiny ws frames per second and a few large ones.
 Order is strictly preserved; JSON events are never mixed into the byte
 stream (separate text frames, in queue order relative to the bytes).
+
+Flow control: the client counts the bytes it has queued into xterm.js but
+not yet processed (the term.write callback) and reports congestion with
+{"type": "pause"} — the pump then withholds that connection's binary
+frames in memory (JSON events keep flowing; stdin is never blocked). The
+withheld bytes are buffered up to PAUSE_BUFFER_MAX_BYTES; beyond the cap
+the pause is given up and sending resumes wholesale, because a lost
+terminal stream is worse than a lost throttle. The pause state lives on
+the connection (not the tab), so a fresh ws attach to the same tab starts
+unpaused.
 
 Each tab holds at most one PTY session; the context holds any number of
 tabs (a tab's session outlives a ws reconnect by design — the client
@@ -63,6 +75,12 @@ DEFAULT_TAB = "default"
 # PTY output; the batch may overshoot by at most one PTY read chunk
 # (READ_CHUNK in pty_session.py).
 FRAME_MAX_BYTES = 256 * 1024
+
+# Flow control: while the client has signaled {"type": "pause"}, the pump
+# withholds binary frames in memory up to this many bytes. Past the cap it
+# gives the pause up and resumes sending — terminal output must not be
+# lost, an ignored pause only costs the throttling effect.
+PAUSE_BUFFER_MAX_BYTES = 16 * 1024 * 1024
 
 
 class TabState:
@@ -244,6 +262,12 @@ def _websocket(
         def _event_sink(event: dict[str, Any]) -> None:
             loop.call_soon_threadsafe(out_queue.put_nowait, ("json", event))
 
+        def _flow_signal(direction: str) -> None:
+            # Pause/resume arrive on the loop thread (ws text frames), so a
+            # direct put is safe; it doubles as the wake-up the pump needs
+            # while it sits paused in out_queue.get().
+            out_queue.put_nowait(("flow", direction))
+
         state.frame_sink = _frame_sink
         state.event_sink = _event_sink
 
@@ -261,6 +285,21 @@ def _websocket(
             # into the byte stream: they ride as separate text frames, in
             # queue order relative to the bytes around them.
             pending: tuple[str, Any] | None = None
+            # Client-side flow control: while the client is paused, binary
+            # output is withheld here instead of being sent (JSON events
+            # still flow; stdin is untouched). None = not paused.
+            held: bytearray | None = None
+
+            async def _flush_held(buf: bytearray) -> None:
+                # Send withheld bytes in FRAME_MAX_BYTES-sized frames,
+                # order intact — the withheld stream keeps the framing
+                # contract of the unpumped path.
+                while len(buf) > FRAME_MAX_BYTES:
+                    await ws.send_bytes(bytes(buf[:FRAME_MAX_BYTES]))
+                    del buf[:FRAME_MAX_BYTES]
+                if buf:
+                    await ws.send_bytes(bytes(buf))
+
             while True:
                 if pending is None:
                     kind, payload = await out_queue.get()
@@ -269,8 +308,55 @@ def _websocket(
                     pending = None
                 if kind == "close":
                     return
+                if kind == "flow":
+                    # {"type": "pause"} / {"type": "resume"} from the client.
+                    if payload == "pause":
+                        held = bytearray()
+                    elif held is not None:  # resume
+                        await _flush_held(held)
+                        held = None
+                    continue
                 if kind == "json":
+                    # Control events are never flow-controlled: the client
+                    # must learn about start/exit/error regardless of the
+                    # byte-stream pause.
                     await ws.send_json(payload)
+                    continue
+                if held is not None:
+                    # Paused: withhold bytes in memory. JSON events keep
+                    # flowing (handled above); a resume flushes in order.
+                    # ``buf`` is the same buffer under a non-Optional name —
+                    # the pause can only end by clearing ``held`` below.
+                    buf = held
+                    buf.extend(payload)
+                    overflow = False
+                    while True:
+                        try:
+                            nkind, npayload = out_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if nkind == "close":
+                            return
+                        if nkind == "flow":
+                            if npayload == "resume":
+                                await _flush_held(buf)
+                                held = None
+                                break
+                            continue  # pause while already paused: no-op
+                        if nkind == "json":
+                            await ws.send_json(npayload)
+                            continue
+                        buf.extend(npayload)
+                        if len(buf) > PAUSE_BUFFER_MAX_BYTES:
+                            overflow = True
+                            break
+                    if overflow:
+                        # The client cannot keep up even with the buffer:
+                        # resume sending wholesale — losing the throttle is
+                        # recoverable, losing terminal output is not. The
+                        # client's later resume becomes a harmless no-op.
+                        await _flush_held(buf)
+                        held = None
                     continue
                 # bytes: coalesce everything already queued, in order.
                 batch = bytearray(payload)
@@ -282,9 +368,10 @@ def _websocket(
                     if nkind == "bytes":
                         batch.extend(npayload)
                     else:
-                        # A json event (or the close sentinel): it must be
-                        # its own text frame, AFTER the bytes queued before
-                        # it — hold it back, flush the batch, handle next.
+                        # A json event (or the close/flow sentinel): it must
+                        # be its own text frame (or handled on its own),
+                        # AFTER the bytes queued before it — hold it back,
+                        # flush the batch, handle next.
                         pending = (nkind, npayload)
                         break
                 await ws.send_bytes(bytes(batch))
@@ -297,7 +384,9 @@ def _websocket(
                     if state.session is not None:
                         state.session.write(msg.data)
                 elif msg.type == WSMsgType.TEXT:
-                    await _handle_control(ctx, msg.data, tab_id)
+                    await _handle_control(
+                        ctx, msg.data, tab_id, flow_signal=_flow_signal
+                    )
                 elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                     break
         finally:
@@ -314,7 +403,12 @@ def _websocket(
     return handler
 
 
-async def _handle_control(ctx: ShellContext, raw: str, conn_tab: str) -> None:
+async def _handle_control(
+    ctx: ShellContext,
+    raw: str,
+    conn_tab: str,
+    flow_signal: Callable[[str], None] | None = None,
+) -> None:
     if os.environ.get("DRCODE_DESKTOP_DEBUG") == "1":
         print(f"[desktop] control: {raw[:200]}", flush=True)
     try:
@@ -363,6 +457,12 @@ async def _handle_control(ctx: ShellContext, raw: str, conn_tab: str) -> None:
             state.session.resize(rows, cols)
     elif kind == "kill":
         await ctx.stop_session(tab_id)
+    elif kind in ("pause", "resume") and flow_signal is not None:
+        # Client-side flow control of the binary stream. The pause state
+        # lives in the connection's pump (the "flow" queue item), NOT on
+        # the tab: a reconnect to the same tab gets a fresh pump and is
+        # therefore never stuck paused. Unknown payload values are ignored.
+        flow_signal(kind)
 
 
 async def run_server(ctx: ShellContext) -> tuple[web.AppRunner, str]:

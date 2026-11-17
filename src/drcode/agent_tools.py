@@ -754,19 +754,49 @@ def _update_goal(
     )
 
 
-def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None:
-    """The run's delegation note as a prompt block, STATE-AWARE.
+#: Turns (model requests of the run) that still get the FULL notice text.
+SUBAGENT_NOTICE_FULL_TURNS = 3
+#: Last turn (model request of the run) that gets ANY notice text; after
+#: it the block disappears entirely — both states, including "slots used".
+SUBAGENT_NOTICE_LAST_TURN = 8
+
+
+def subagent_notice(
+    limit: int, used: int = 0, *, role: AgentRole, turn: int = 1
+) -> str | None:
+    """The run's delegation note as a prompt block, STATE- and TURN-aware.
 
     `limit` is the run's TOTAL delegate_research budget (the project's
     `subagents_coder`/`subagents_researcher` setting) and `used` how many
     of its slots the run has currently spent (`SubagentGate.used`, read
     per request by the supplier `build_agent` wires) — a refund for a
     failed spawn lowers `used` again, so the standing reminder can
-    reappear mid-run. Three states:
+    reappear mid-run. `turn` is the run's request counter (ONE supplier
+    call = ONE outgoing model request; `build_agent` counts it in its
+    closure) — the DECAY PROFILE is keyed on it:
+
+    - turns 1–3 → the FULL text (the standing "N calls left this run"
+      reminder, or the "slots used" note when the budget is already
+      spent). The early turns are where delegation actually happens:
+      an archive analysis (1321 tasks, 27 delegations) put 52% of the
+      calls on turn 1 and ~90% within the first three turns.
+    - turns 4–8 → a SHORT one-line version with the same meaning
+      (remaining slots / budget spent). Past turn 3 the reminder has
+      done its job — the tool has been either used or consciously
+      skipped — and the full text started to read as nagging (the
+      #9c5b23de transcript: the agent re-argued "delegation not needed"
+      against the constant ~76-token block on every request).
+    - turn > 8 → None for BOTH states, including "slots used — further
+      delegation is unavailable": after the window the repeated
+      extinguisher is deliberate noise (a late retry attempt gets the
+      plain-text refusal from `run_delegate_tool` itself, which damps
+      further attempts), so no permanent reminder is kept.
+
+    Text states within a turn:
 
     - limit <= 0 → None: the feature is off, no block at all (the
       TailInjectionModel passes the request through untouched).
-    - used < limit → the standing "N calls left this run" reminder (N =
+    - used < limit → the "N calls left this run" reminder (N =
       remaining; the wording names the PER-RUN BUDGET explicitly — an
       earlier "you have N available" phrasing read as a renewable
       resource and the agent of the a7be0f94 transcript burned real
@@ -776,56 +806,72 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
       119-task benchmark run (drcode-bench, slots enabled), while a
       standing reminder of the real budget in the live context does get
       acted on.
-    - used >= limit → a short "slots used" note. Once the budget is
-      spent, the standing reminder is pure noise: the model kept
+    - used >= limit → the "slots used" note. Once the budget is spent,
+      the standing reminder is pure noise: the model kept
       re-discussing it on every remaining request of a 78-message run
       (the a7be0f94 transcript — both calls spent by message 4, the
       reminder re-acknowledged in thinking for 50+ more requests, part
       of it leaking into visible output). The explicit "further
       delegation is unavailable" line is preferred over dropping the
-      block entirely: it visibly extinguishes retry attempts and matches
-      the plain-text refusal `run_delegate_tool` now returns.
+      block entirely while still inside the window: it visibly
+      extinguishes retry attempts and matches the plain-text refusal
+      `run_delegate_tool` returns.
 
-    Both texts go to the TAIL of every model request
+    All texts go to the TAIL of every model request
     (`agent_model.TailInjectionModel`, wired by `build_agent`), never
     into the leading system zone — that zone is the cached prefix, and a
     per-request reminder there would invalidate it on every request. The
-    text is normally stable except for ONE change per run
-    (available → exhausted) — the same cache argument that justifies
-    the tail injection itself. One documented exception: a FAILED spawn
-    refunds its slot (capped, see `subagents.MAX_SLOT_REFUNDS_PER_RUN`),
-    which lowers `used` again — the note then flips BACK to the standing
-    "N calls left" text mid-run. That flicker is the point (the model
-    must hear the truthful budget after a refund); it is bounded by the
-    refund cap, so at most a couple of extra tail invalidations per run.
+    decay profile changes the tail a few times per run (full → short →
+    gone, plus the state flips), but each change still invalidates only
+    the small trailing zone. The refund flicker stays as before: a
+    FAILED spawn refunds its slot (capped, see
+    `subagents.MAX_SLOT_REFUNDS_PER_RUN`), lowering `used` again — the
+    note flips BACK to the "N calls left" text within whatever turn
+    window is still open. That flicker is the point (the model must
+    hear the truthful budget after a refund); it is bounded by the
+    refund cap.
 
-    The block stays SHORT on purpose — it is repeated on every request of
-    every run with slots enabled, so it buys its keep as a pointer to the
-    triggers, not as a second copy of the tool description (which the model
-    sees in the schema and the system prompt already). `role` picks the
-    WRITE/GREP counterpart: the research role documents rather than edits."""
+    Both long texts stay SHORT on purpose — they are repeated on every
+    request inside the window, so they buy their keep as a pointer to
+    the triggers, not as a second copy of the tool description (which
+    the model sees in the schema and the system prompt already). `role`
+    picks the WRITE/GREP counterpart of the full text: the research role
+    documents rather than edits."""
     if limit <= 0:
         return None
+    if turn > SUBAGENT_NOTICE_LAST_TURN:
+        return None
     if used >= limit:
-        if limit == 1:
+        if turn <= SUBAGENT_NOTICE_FULL_TURNS:
+            if limit == 1:
+                return (
+                    "The delegate_research slot of this run is used "
+                    "— further delegation is unavailable. "
+                    "Continue with direct reads."
+                )
             return (
-                "The delegate_research slot of this run is used "
+                f"All {limit} delegate_research slots of this run are used "
                 "— further delegation is unavailable. Continue with direct reads."
             )
         return (
-            f"All {limit} delegate_research slots of this run are used "
-            "— further delegation is unavailable. Continue with direct reads."
+            "All delegate_research slots of this run are used "
+            "— further delegation is unavailable."
         )
     remaining = limit - used
     call_word = "call" if remaining == 1 else "calls"
-    verb = "document" if role is AgentRole.RESEARCH else "edit"
+    if turn <= SUBAGENT_NOTICE_FULL_TURNS:
+        verb = "document" if role is AgentRole.RESEARCH else "edit"
+        return (
+            f"You have {remaining} delegate_research {call_word} left this run "
+            f"(of {limit} total) — a TOTAL budget per run; a FAILED call "
+            "(error/timeout) returns its slot, max 2 refunds per run. Free "
+            "context for wide-but-shallow reading (map call sites, recon over "
+            f">3-5 files, survey a subsystem first). Read only the files you "
+            f"will {verb} yourself."
+        )
     return (
         f"You have {remaining} delegate_research {call_word} left this run "
-        f"(of {limit} total) — a TOTAL budget per run; a FAILED call "
-        "(error/timeout) returns its slot, max 2 refunds per run. Free "
-        "context for wide-but-shallow reading (map call sites, recon over "
-        f">3-5 files, survey a subsystem first). Read only the files you "
-        f"will {verb} yourself."
+        "— a TOTAL per-run budget."
     )
 
 

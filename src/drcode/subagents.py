@@ -47,7 +47,11 @@ cancellation never refund. A spent budget refuses further delegations
 with a plain explanatory tool result — never a crash of the parent
 run — and the tail notice switches to the "slots used" text at the
 same moment (a refund flips it back — an accepted, documented
-exception to the one-text-change-per-run cache argument). A failing
+exception). The tail notice also DECAYS with the run's request
+counter (full text for the first turns, a one-liner up to turn 8,
+nothing after — see `agent_tools.subagent_notice`), so the reminder
+never nags through a long run: delegation happens early, and a late
+retry is damped by this tool's own refusal text. A failing
 subagent (network, model refusal, usage cap) is likewise converted
 into a plain tool result.
 
@@ -63,9 +67,11 @@ places carry the prompting, all of them deliberate:
 - the tool description built in `agent_build` — the same triggers plus the
   economics (the parent's own reads are permanent context and move it
   toward a compaction; a subagent's reads are free);
-- `agent_tools.subagent_notice` — one line put into the request TAIL on
-  every request while the limit is above 0, right next to the live
-  checklist (`agent_model.TailInjectionModel`). The tail, never leading
+- `agent_tools.subagent_notice` — a line put into the request TAIL
+  while the limit is above 0, right next to the live
+  checklist (`agent_model.TailInjectionModel`), decaying with the run's
+  request counter (full text on turns 1–3, a one-liner on 4–8, nothing
+  after). The tail, never leading
   dynamic instructions: the leading system zone is the server-side prefix
   cache.
 """
@@ -526,8 +532,9 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
     if gate.remaining <= 0:
         # The run's budget is spent: refuse in plain text (never crash)
         # with the SAME "no further delegation" fact the state-aware tail
-        # notice now carries (`agent_tools.subagent_notice`) — the model
-        # must not hear two different stories about its budget.
+        # notice carries while its turn window is open
+        # (`agent_tools.subagent_notice`) — the model must not hear two
+        # different stories about its budget.
         slots = "slot" if gate.limit == 1 else "slots"
         return (
             f"Subagent limit reached ({gate.used} of {gate.limit} {slots} "

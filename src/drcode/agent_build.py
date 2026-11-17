@@ -451,8 +451,13 @@ def build_agent(
     # never one per block), so the cached prefix is untouched. With a gate
     # the supplier is STATE-AWARE: recomputed per request, it counts the
     # remaining slots down and switches to the "slots used" text once the
-    # budget is spent — at most ONE text change per run, so only that one
-    # small tail invalidation is ever paid.
+    # budget is spent — normally at most ONE text change per run, so only
+    # that one small tail invalidation is ever paid. DOCUMENTED EXCEPTION:
+    # a failed spawn refunds its slot (subagents.MAX_SLOT_REFUNDS_PER_RUN,
+    # capped at 2 per run), which lowers `used` again — the note then
+    # flips back to the "N calls left" text mid-run. That flicker is
+    # truthful and bounded by the refund cap; keep it as the ONLY reason
+    # the tail text may change more than once.
     if subagent_gate is not None:
         tail_blocks.append(
             lambda: subagent_notice(
@@ -1239,8 +1244,10 @@ def build_agent(
     # all. The actual limit is baked into the description (the tool is
     # rebuilt per run, so a settings change reaches the very next
     # activation). The limit is the run's TOTAL budget (each call spends
-    # one slot for good — SubagentGate.used), not a pure concurrency cap:
-    # several subagents may still run in parallel within it.
+    # one slot — SubagentGate.used; a FAILED call returns its slot, at
+    # most MAX_SLOT_REFUNDS_PER_RUN times per run), not a pure
+    # concurrency cap: several subagents may still run in parallel
+    # within it.
     if effective_limit > 0:
 
         async def delegate_research(ctx: RunContext[AgentDeps], task: str) -> str:
@@ -1251,8 +1258,11 @@ def build_agent(
         # and an f-string docstring yields an empty description.
         delegate_research.__doc__ = f"""Spawn a READ-ONLY research subagent and delegate a piece of THIS
             task to it. You have {effective_limit} delegate_research call{"" if effective_limit == 1 else "s"} for this run (each
-            call spends one of the run's slots for good; you may run
-            several subagents in parallel within the budget); the
+            call spends one of the run's slots; a FAILED call — model or
+            network error, timeout — returns its slot, at most twice per
+            run, so a timeout can be retried while a systematically
+            failing subagent still eats the budget; you may run several
+            subagents in parallel within the budget); the
             call returns the subagent's final report (its intermediate tool
             traffic stays invisible to your context) plus a one-line usage
             summary. The subagent can only read: read_file, grep_search,

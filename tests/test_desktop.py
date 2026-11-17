@@ -1742,7 +1742,9 @@ def test_cocoa_cmd_w_reaches_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
     app_mod._fix_cocoa_cmd_w()
 
     event = _SimpleEvent("w", cmd=True)
-    fake.BrowserView.WebKitHost.keyDown_(object.__new__(fake.BrowserView.WebKitHost), event)
+    fake.BrowserView.WebKitHost.keyDown_(
+        object.__new__(fake.BrowserView.WebKitHost), event
+    )
     assert not original_events
     assert super_events == [event]
 
@@ -1756,7 +1758,9 @@ def test_cocoa_cmd_q_stays_native(monkeypatch: pytest.MonkeyPatch) -> None:
     app_mod._fix_cocoa_cmd_w()
 
     event = _SimpleEvent("q", cmd=True)
-    fake.BrowserView.WebKitHost.keyDown_(object.__new__(fake.BrowserView.WebKitHost), event)
+    fake.BrowserView.WebKitHost.keyDown_(
+        object.__new__(fake.BrowserView.WebKitHost), event
+    )
     assert original_events == [event]
     assert not super_events
 

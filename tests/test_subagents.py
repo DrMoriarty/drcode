@@ -33,6 +33,7 @@ from drcode.models import TaskKind
 from drcode.providers import AgentRole
 from drcode.settings import ProjectSettings
 from drcode.subagents import (
+    MAX_SLOT_REFUNDS_PER_RUN,
     _subagent_model_config,
     build_subagent_agent,
     git_read,
@@ -93,8 +94,9 @@ def test_delegate_tool_absent_at_zero(fake_config: Config) -> None:
 def test_delegate_tool_registered_with_baked_limit(fake_config: Config) -> None:
     """Above 0 the tool exists and its description carries the ACTUAL
     limit (rebuilt per run, so the model always sees the real budget).
-    The limit is the run's TOTAL call budget (each call spends one slot
-    for good), not a pure concurrency cap."""
+    The limit is the run's TOTAL call budget (each call spends one slot,
+    a FAILED call refunds it up to the per-run cap), not a pure
+    concurrency cap."""
     ag = build_agent(fake_config, kind=TaskKind.FEATURE, subagent_limit=3)
     assert "delegate_research" in _tool_names(ag)
     assert "3 delegate_research calls for this run" in _description(
@@ -158,8 +160,10 @@ def test_delegation_note_injected_at_request_tail(fake_config: Config) -> None:
         assert block is not None
         assert "You have 2 delegate_research calls left this run" in block
         assert "delegate_research" in block
-        # Budget, not a renewable resource.
-        assert "not renewed" in block
+        # Budget, not a renewable resource — except the capped refund of
+        # a FAILED call, which the wording names explicitly.
+        assert "a FAILED call" in block
+        assert "max 2 refunds per run" in block
         # Not in the static instructions.
         assert "You have 2 delegate_research" not in _instructions_text(ag)
 
@@ -209,7 +213,8 @@ def test_notice_is_state_aware() -> None:
     fresh = subagent_notice(2, 0, role=AgentRole.CODING)
     assert fresh is not None
     assert "You have 2 delegate_research calls left this run" in fresh
-    assert "not renewed" in fresh
+    assert "a FAILED call" in fresh
+    assert "max 2 refunds per run" in fresh
     after_one = subagent_notice(2, 1, role=AgentRole.CODING)
     assert after_one is not None
     assert "You have 1 delegate_research call left this run" in after_one
@@ -468,7 +473,9 @@ def test_subagent_failure_is_plain_result(
     manager: TaskManager,
 ) -> None:
     """A crashing subagent model (network error, refusal, anything) is
-    converted into a plain tool result — the parent run keeps going."""
+    converted into a plain tool result — the parent run keeps going —
+    and the failed spawn REFUNDS its slot: the budget survives a
+    timeout-sized failure."""
 
     def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         raise RuntimeError("kaboom")
@@ -484,15 +491,165 @@ def test_subagent_failure_is_plain_result(
 
     assert "The subagent failed" in out
     assert "kaboom" in out
+    # The slot refund is named with the actual budget (one story only).
+    assert "slot was returned" in out
+    assert "2 delegate_research calls left" in out
     assert deps.subagent_gate is not None
     assert deps.subagent_gate.active == 0  # released in the failure path too
+    assert deps.subagent_gate.used == 0  # refunded
+    assert deps.subagent_gate.remaining == 2
+    assert deps.subagent_gate.refunds == 1
     texts = [e.text for e in task.events]
     assert any("subagent failed" in t and "kaboom" in t for t in texts)
-    # A failed delegation counts only the failure, never a spawn.
+    assert any("slot refunded (1/2)" in t for t in texts)
+    # A failed delegation counts only the failure, never a spawn —
+    # the refund is a pure budget notion, the stats are untouched.
     assert manager.stats.subagent_usage() == (0, 0)
     day = manager.stats.snapshot(1)[0][1]
     assert day.subagent_spawns == 0
     assert day.subagent_failures == 1
+
+
+def test_failure_refund_capped_at_two_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """The first MAX_SLOT_REFUNDS_PER_RUN failures return their slot; from
+    the next failure on the slot is spent for good — a systematically
+    failing subagent still eats the budget in the end."""
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(boom),
+    )
+    task = manager.create("T", "delegate me")
+    deps = _deps(project_root, manager, task.id, limit=2)
+    gate = deps.subagent_gate
+    assert gate is not None
+
+    first = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+    assert "slot was returned" in first
+    assert gate.used == 0 and gate.remaining == 2 and gate.refunds == 1
+
+    second = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate bar"))
+    assert "slot was returned" in second
+    assert gate.used == 0 and gate.remaining == 2 and gate.refunds == 2
+
+    third = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate baz"))
+    assert "The subagent failed" in third
+    assert "refund budget is exhausted" in third
+    assert "further delegation is unavailable" in third
+    assert gate.used == 1 and gate.remaining == 1 and gate.refunds == 2
+
+    texts = [e.text for e in task.events]
+    assert sum("slot refunded" in t for t in texts) == 2
+    # Three failures counted, never a spawn.
+    day = manager.stats.snapshot(1)[0][1]
+    assert day.subagent_spawns == 0
+    assert day.subagent_failures == 3
+
+
+def test_empty_answer_spends_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """An empty subagent answer is NOT a failure: the plain empty-answer
+    text comes back and the slot stays spent — no refund."""
+
+    def empty(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return text_response("   ")
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(empty),
+    )
+    task = manager.create("T", "delegate me")
+    deps = _deps(project_root, manager, task.id, limit=2)
+
+    out = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+
+    assert out.startswith("The subagent returned an empty answer.")
+    assert deps.subagent_gate is not None
+    assert deps.subagent_gate.used == 1  # spent, no refund
+    assert deps.subagent_gate.remaining == 1
+    assert deps.subagent_gate.refunds == 0
+    texts = [e.text for e in task.events]
+    assert not any("slot refunded" in t for t in texts)
+    # Counted as a successful spawn, not a failure.
+    day = manager.stats.snapshot(1)[0][1]
+    assert day.subagent_spawns == 1
+    assert day.subagent_failures == 0
+
+
+def test_cancellation_does_not_refund(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """asyncio.CancelledError (abort/nudge/a newer parent run) propagates
+    and the slot stays spent — no refund for a cancelled spawn."""
+
+    async def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(boom),
+    )
+    task = manager.create("T", "delegate me")
+    deps = _deps(project_root, manager, task.id, limit=2)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+
+    gate = deps.subagent_gate
+    assert gate is not None
+    assert gate.used == 1  # spent, no refund
+    assert gate.remaining == 1
+    assert gate.refunds == 0
+    assert gate.active == 0  # released by the finally, as before
+    texts = [e.text for e in task.events]
+    assert not any("slot refunded" in t for t in texts)
+    # Neither a failure nor a spawn in the stats (the run was cancelled).
+    day = manager.stats.snapshot(1)[0][1]
+    assert day.subagent_spawns == 0
+    assert day.subagent_failures == 0
+
+
+def test_notice_flickers_after_refund_then_stays_exhausted() -> None:
+    """After a refund the state-aware tail notice flips BACK to the
+    standing "N calls left" text (the model must hear the truthful
+    budget); once the refund cap is exhausted and the budget is spent
+    again, the "used up" text is final."""
+    from drcode.agent import subagent_notice
+
+    gate = SubagentGate(2)
+    gate.used = 2
+    spent = subagent_notice(gate.limit, gate.used, role=AgentRole.CODING)
+    assert spent is not None
+    assert "further delegation is unavailable" in spent
+
+    # The refund lowers `used` — the standing reminder comes back.
+    gate.used -= 1
+    back = subagent_notice(gate.limit, gate.used, role=AgentRole.CODING)
+    assert back is not None
+    assert "You have 1 delegate_research call left this run" in back
+
+    # Cap exhausted + budget spent again: the exhausted text, final.
+    gate.refunds = MAX_SLOT_REFUNDS_PER_RUN
+    gate.used = gate.limit
+    done = subagent_notice(gate.limit, gate.used, role=AgentRole.CODING)
+    assert done is not None
+    assert "further delegation is unavailable" in done
+    assert "You have" not in done
 
 
 def test_no_gate_returns_configuration_hint(

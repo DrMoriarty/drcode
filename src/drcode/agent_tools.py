@@ -759,8 +759,10 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
 
     `limit` is the run's TOTAL delegate_research budget (the project's
     `subagents_coder`/`subagents_researcher` setting) and `used` how many
-    of its slots the run has already spent (`SubagentGate.used`, read per
-    request by the supplier `build_agent` wires). Three states:
+    of its slots the run has currently spent (`SubagentGate.used`, read
+    per request by the supplier `build_agent` wires) — a refund for a
+    failed spawn lowers `used` again, so the standing reminder can
+    reappear mid-run. Three states:
 
     - limit <= 0 → None: the feature is off, no block at all (the
       TailInjectionModel passes the request through untouched).
@@ -788,9 +790,14 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
     (`agent_model.TailInjectionModel`, wired by `build_agent`), never
     into the leading system zone — that zone is the cached prefix, and a
     per-request reminder there would invalidate it on every request. The
-    text changes AT MOST ONCE per run (available → exhausted), so the
-    tail zone stays stable except for that one small invalidation — the
-    same cache argument that justifies the tail injection itself.
+    text is normally stable except for ONE change per run
+    (available → exhausted) — the same cache argument that justifies
+    the tail injection itself. One documented exception: a FAILED spawn
+    refunds its slot (capped, see `subagents.MAX_SLOT_REFUNDS_PER_RUN`),
+    which lowers `used` again — the note then flips BACK to the standing
+    "N calls left" text mid-run. That flicker is the point (the model
+    must hear the truthful budget after a refund); it is bounded by the
+    refund cap, so at most a couple of extra tail invalidations per run.
 
     The block stays SHORT on purpose — it is repeated on every request of
     every run with slots enabled, so it buys its keep as a pointer to the
@@ -814,10 +821,11 @@ def subagent_notice(limit: int, used: int = 0, *, role: AgentRole) -> str | None
     verb = "document" if role is AgentRole.RESEARCH else "edit"
     return (
         f"You have {remaining} delegate_research {call_word} left this run "
-        f"(of {limit} total) — a TOTAL budget per run, not renewed once "
-        "spent. Free context for wide-but-shallow reading (mapping call "
-        "sites, recon over >3-5 files, surveying a subsystem before you "
-        f"touch it). Read only the files you will {verb} yourself."
+        f"(of {limit} total) — a TOTAL budget per run; a FAILED call "
+        "(error/timeout) returns its slot, max 2 refunds per run. Free "
+        "context for wide-but-shallow reading (map call sites, recon over "
+        f">3-5 files, survey a subsystem first). Read only the files you "
+        f"will {verb} yourself."
     )
 
 

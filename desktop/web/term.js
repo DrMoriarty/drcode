@@ -442,6 +442,27 @@
     return true;
   }
 
+  /* Cmd+T — new tab (macOS habit): opens a fresh welcome tab, exactly what
+   * the "+" button next to the tab bar does (same in-page tab model — no
+   * second OS window). Matched by ev.code ("KeyT"), never by ev.key: the
+   * physical key is layout-independent, on a Cyrillic layout the same press
+   * yields "е". Like the tab-switch combo, one physical press reaches BOTH
+   * the xterm custom handler and the window keydown listener when the
+   * terminal has focus — the dedupe is by ev.timeStamp (same DOM event
+   * object → identical stamp → already handled; a held-key repeat is a new
+   * event with a new stamp and keeps opening tabs). */
+  var lastNewTabStamp = -1;
+
+  function maybeNewTabShortcut(ev) {
+    if (ev.isComposing) return false; // IME composition — never a shortcut
+    if (!ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+    if (ev.code !== "KeyT" && ev.key !== "t" && ev.key !== "T") return false;
+    if (ev.timeStamp === lastNewTabStamp) return true; // same press, already handled
+    lastNewTabStamp = ev.timeStamp;
+    createTab("welcome", null);
+    return true;
+  }
+
   function closeTab(tab) {
     if (!tab || tab.closing) return;
     tab.closing = true;
@@ -665,6 +686,12 @@
     // when focus is outside the terminal; maybeTabSwitchShortcut dedupes
     // the double delivery (see the comment at its definition).
     if (maybeTabSwitchShortcut(ev)) {
+      ev.preventDefault();
+      return false;
+    }
+    // Cmd+T is intercepted here for the same reason: the metaKey gate
+    // below would forward it toward the PTY.
+    if (maybeNewTabShortcut(ev)) {
       ev.preventDefault();
       return false;
     }
@@ -1337,6 +1364,13 @@
         // the combo to the PTY.
         ev.preventDefault();
         openSettings();
+      } else if (maybeNewTabShortcut(ev)) {
+        // Cmd+T when focus is outside the terminal (welcome screen,
+        // settings dialog, tab bar): new welcome tab, same as the "+"
+        // button. The in-terminal delivery goes through
+        // terminalKeyHandler; the shared handler dedupes the double
+        // event by its timeStamp (see the comment at its definition).
+        ev.preventDefault();
       } else if (maybeTabSwitchShortcut(ev)) {
         // Cmd+{ / Cmd+} when focus is outside the terminal (welcome
         // screen, settings dialog, tab bar). The in-terminal delivery

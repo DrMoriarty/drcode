@@ -29,6 +29,16 @@ esac
 # (numpy-free: the voice PCM path runs on stdlib array via sounddevice's
 # raw streams).
 uv sync --group build
+
+# Code-index grammars (drcode.code_index, §2.4 of docs/code-index-design.md):
+# the language pack downloads parsers on demand — impossible in the frozen,
+# network-free bundle. Prefetch the mainstream set into build/ts-pack-cache
+# (drcode.spec ships it as drcode/ts_parsers; drcode_entry.py points the
+# pack at it). Best effort: a failed download degrades at runtime to
+# "file not indexed" and never breaks the build.
+.venv/bin/python -m drcode.code_index.prefetch --dest build/ts-pack-cache || \
+  echo "warning: code-index grammar prefetch failed — the bundle ships without it" >&2
+
 .venv/bin/pyinstaller --noconfirm --clean drcode.spec
 
 mkdir -p dist

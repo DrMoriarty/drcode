@@ -2519,7 +2519,9 @@ def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
     js = _term_js()
     # recreateWebgl lives in the font-settings section — append its body so
     # the budget-renewal step runs against the real implementation.
-    recreate = js[js.index("function recreateWebgl") : js.index("function refitAfterFontChange")]
+    recreate = js[
+        js.index("function recreateWebgl") : js.index("function refitAfterFontChange")
+    ]
     region = _toast_region(js) + "\n;" + _recovery_region(js) + "\n;" + recreate
     out = _run_js_driver(WEBGL_RECOVERY_NODE_DRIVER, region, tmp_path)
 
@@ -2527,7 +2529,10 @@ def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
 
     loss = out["loss"]
     assert loss["webglGone"] and loss["addonDisposed"]
-    assert loss["toastText"] == "WebGL renderer unavailable — slow DOM fallback is active (the terminal may feel sluggish)."
+    assert (
+        loss["toastText"]
+        == "WebGL renderer unavailable — slow DOM fallback is active (the terminal may feel sluggish)."
+    )
     assert loss["toastVisible"]
     assert loss["delayTimerScheduled"]
 

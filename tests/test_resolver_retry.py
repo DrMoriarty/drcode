@@ -139,6 +139,7 @@ async def test_retry_survives_stale_needs_human(
         config: Any,
         root: Path | None = None,
         task_id: str | None = None,
+        code_index: bool = False,
         announce_wait: Any = None,
     ) -> Agent[Any, str]:
         return Agent(state.model())

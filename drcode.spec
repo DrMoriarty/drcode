@@ -93,6 +93,19 @@ a = Analysis(
         # not found". It is a core dependency, so a plain `uv sync` puts
         # it into the build venv.
         *collect_data_files("sounddevice"),
+        # Code-index grammars (drcode.code_index, §2.4 of
+        # docs/code-index-design.md): the language pack downloads its
+        # parsers on demand — impossible in a frozen, network-free app.
+        # scripts/build-binary.sh prefetches the mainstream set into
+        # build/ts-pack-cache BEFORE PyInstaller runs; the directory is
+        # shipped here and drcode_entry.py points DRCODE_TS_PACK_CACHE
+        # at it. Optional by design: when the prefetch did not run (a
+        # from-source build), the tools degrade to "not indexed".
+        *(
+            [(str(ROOT / "build" / "ts-pack-cache"), "drcode/ts_parsers")]
+            if (ROOT / "build" / "ts-pack-cache").is_dir()
+            else []
+        ),
     ],
     # anyio imports its backend dynamically — PyInstaller can't see it
     # from static analysis alone; sounddevice is a core dependency
@@ -121,6 +134,13 @@ a = Analysis(
         *collect_submodules("starlette"),
         "sse_starlette",
         *collect_submodules("sse_starlette"),
+        # tree-sitter-language-pack (drcode.code_index) resolves its
+        # grammars through its native binding at runtime, not through
+        # statically analyzable imports — without the explicit collection
+        # the frozen app would fail at the FIRST code-index call instead
+        # of at import time.
+        "tree_sitter_language_pack",
+        *collect_submodules("tree_sitter_language_pack"),
     ],
     hookspath=[],
     hooksconfig={},

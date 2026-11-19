@@ -50,6 +50,7 @@ from textual.widgets import (
 )
 
 from ..settings import (
+    CODE_INDEX_MODE_OPTIONS,
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
     GIT_POLICY_OPTIONS,
@@ -62,6 +63,7 @@ from ..settings import (
     WEB_FETCH_MODE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     WORKTREE_SNAPSHOT_OPTIONS,
+    CodeIndexMode,
     CompletedRetention,
     EscAbort,
     GitPolicy,
@@ -107,6 +109,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.subagents_coder = src.subagents_coder
     dst.subagents_researcher = src.subagents_researcher
     dst.web_fetch_mode = src.web_fetch_mode
+    dst.code_index_mode = src.code_index_mode
     dst.web_fetch_allow_hosts = list(src.web_fetch_allow_hosts)
     dst.web_fetch_block_hosts = list(src.web_fetch_block_hosts)
     dst.agent_creates_drafts = src.agent_creates_drafts
@@ -439,6 +442,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-web-fetch-block",
                     placeholder="(empty — nothing blocked)",
                 )
+                with Horizontal(classes="ts-row"), Vertical(classes="ts-col"):
+                    yield Label("Code index", classes="ts-label")
+                    yield Select(
+                        [(o.label, o) for o in CODE_INDEX_MODE_OPTIONS],
+                        value=d.code_index_mode,
+                        allow_blank=False,
+                        id="ts-code-index-mode",
+                    )
                 yield ToggleRow(
                     "Agent creates drafts — the agents' task-creation tools "
                     "(research: bug/feature, tester: bug) create DRAFT tasks; "
@@ -660,6 +671,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-subagents-coder", d.subagents_coder)
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-web-fetch-mode", d.web_fetch_mode)
+        self._set_select("#ts-code-index-mode", d.code_index_mode)
         self._set_select("#ts-verification", d.verification)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
@@ -689,6 +701,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                 d.subagents_researcher != o.subagents_researcher
             ),
             "#ts-web-fetch-mode": d.web_fetch_mode is not o.web_fetch_mode,
+            "#ts-code-index-mode": d.code_index_mode is not o.code_index_mode,
             "#ts-web-fetch-allow": d.web_fetch_allow_hosts != o.web_fetch_allow_hosts,
             "#ts-web-fetch-block": d.web_fetch_block_hosts != o.web_fetch_block_hosts,
             "#ts-verification": d.verification is not o.verification,
@@ -878,6 +891,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             event.value is not self._draft.web_fetch_mode
         ):
             self._draft.web_fetch_mode = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-code-index-mode")
+    def _code_index_mode_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, CodeIndexMode) and (
+            event.value is not self._draft.code_index_mode
+        ):
+            self._draft.code_index_mode = event.value
             self._refresh()
 
     @on(Input.Changed, "#ts-web-fetch-allow")

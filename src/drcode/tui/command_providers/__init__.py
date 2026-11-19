@@ -18,6 +18,7 @@ from .models import ProjectModelSettingsCommandProvider, role_model_options_prov
 from .settings import (
     WORKFLOW_PRESETS,
     AgentChainsCommandProvider,
+    CodeIndexOptionsProvider,
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
     GitResearchOptionsProvider,
@@ -50,6 +51,7 @@ from .themes import ThemeOptionsProvider
 __all__ = [
     "WORKFLOW_PRESETS",
     "AgentChainsCommandProvider",
+    "CodeIndexOptionsProvider",
     "CommandEntry",
     "CommandListProvider",
     "DevRoundsOptionsProvider",

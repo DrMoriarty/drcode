@@ -3867,9 +3867,10 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
             f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
+            f"Code index: {app.settings.code_index_mode.label}",
         ]
         # The MCP toggle entry drives the hot-switching handler.
-        mcp_entry = main[-1]
+        mcp_entry = main[3]
         assert mcp_entry.callback == app.action_toggle_mcp_enabled
 
 

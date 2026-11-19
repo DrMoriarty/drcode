@@ -46,6 +46,7 @@ from .agent_tools import (
     load_agents_md,
     subagent_notice,
 )
+from .code_index.agent_tools import register_code_index_tools
 from .config import Config
 from .merge_resolver import conflict_marker_hits, unresolved_conflict_paths
 from .models import Clarification, ClarificationItem, TaskKind, TaskStatus
@@ -57,7 +58,7 @@ from .prompts import (
 )
 from .providers import AgentRole
 from .service_events import log_service_event
-from .settings import GitPolicy
+from .settings import CodeIndexMode, GitPolicy, ProjectSettings
 from .subagents import SubagentGate, run_delegate_tool
 from .task_manager import TaskManager
 from .tool_runtime import (
@@ -85,6 +86,7 @@ __all__ = [
     "build_resolver_agent",
     "build_resolver_reviewer_agent",
     "build_tester_agent",
+    "code_index_tools_for",
 ]
 
 
@@ -136,6 +138,23 @@ def _network_desc(*, web_fetch_available: bool) -> str:
     )
 
 
+def code_index_tools_for(settings: ProjectSettings, role: AgentRole) -> bool:
+    """The single role-gating seam of the code index (§5, modeled after
+    `web_fetch.web_fetch_policy_for`): whether the role's agent gets the
+    `code_symbols` / `code_outline` tools. Coding, tester and resolver —
+    yes, when the project's `code_index_mode` is ON; RESEARCH — never
+    (its code reading goes through the delegated subagents, which INHERIT
+    the parent run's decision via `AgentDeps.code_index` / the
+    `build_agent` kwarg). The OFF default returns False for every role —
+    the tools are not registered at all, which is itself the switch.
+    Read at activation; the three accounting mirrors (§8.2) call this
+    same helper so the context-fill estimates cannot drift from the real
+    wiring."""
+    if role is AgentRole.RESEARCH:
+        return False
+    return settings.code_index_mode is CodeIndexMode.ON
+
+
 @dataclass
 class AgentDeps:
     """Dependencies for the coding agent: project root, task manager, task id.
@@ -171,7 +190,12 @@ class AgentDeps:
     `wait_announcer` is the run's provider slot-wait announcer (see
     `agent_model.ThrottledModel`), forwarded to the nested
     `delegate_research` subagent's model so ITS queued requests are
-    audible in the parent task's chat too. None = silent."""
+    audible in the parent task's chat too. None = silent.
+
+    `code_index` mirrors the project's code_index_mode decision for THIS
+    run (resolved per role by `code_index_tools_for`): the nested
+    `delegate_research` subagents inherit it — they are read-only code
+    researchers and the main beneficiaries of the index."""
 
     root: Path
     manager: TaskManager
@@ -183,6 +207,7 @@ class AgentDeps:
     record_usage: Callable[[RunUsage], None] | None = None
     web_fetch_gate: WebFetchGate | None = None
     wait_announcer: agent_model.WaitAnnouncer | None = None
+    code_index: bool = False
 
 
 @dataclass
@@ -348,6 +373,7 @@ def build_agent(
     eviction_hint: bool = False,
     todo_supplier: Callable[[], str | None] | None = None,
     research_web_fetch: WebFetchPolicy | None = None,
+    code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
@@ -433,6 +459,14 @@ def build_agent(
     `max_parallel_requests` cap is saturated, a request queued for longer
     than `agent_model.THROTTLE_WAIT_ANNOUNCE_SECONDS` reports the wait as a
     service event instead of looking like a hung run.
+
+    `code_index` (the project's code_index_mode, resolved per role by
+    `code_index_tools_for` and read at activation) registers the
+    `code_symbols` / `code_outline` tools — coding kinds only: the
+    RESEARCH kind never gets them (its code reading is delegated), and
+    at False (the default) the tools are not registered at all. The
+    delegate_research subagents inherit the parent run's decision
+    through `AgentDeps.code_index` (see `subagents.build_subagent_agent`).
     """
     scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config, announce_wait)
@@ -1257,6 +1291,16 @@ def build_agent(
             "clarification; end your turn now and do not call any more tools."
         )
 
+    # Symbolic code index (project setting code_index_mode, resolved per
+    # role at activation): registered ONLY when enabled — at the default
+    # OFF the tools do not exist for the model at all. The tools are
+    # local, millisecond reads, so there is no per-run budget gate (§5);
+    # the output caps in queries bound the context cost. RESEARCH kinds
+    # never get them (their code reading is delegated to the subagents).
+    register_code_index_tools(
+        agent, enabled=code_index and kind is not TaskKind.RESEARCH
+    )
+
     # Read-only subagent delegation (project settings subagents_coder /
     # subagents_researcher): registered ONLY when the effective limit is
     # above 0 — at the default 0 the tool does not exist for the model at
@@ -1325,6 +1369,7 @@ def build_tester_agent(
     root: Path | None = None,
     review_gate: bool = False,
     task_id: str | None = None,
+    code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
@@ -1348,6 +1393,11 @@ def build_tester_agent(
     `task_id` (the verified task, known at activation) bakes the real
     scratch-directory path into run_bash's description; without it the
     description keeps the literal `<task-id>` placeholder.
+
+    `code_index` (the project's code_index_mode, resolved per role by
+    `code_index_tools_for` and read at activation) registers the
+    `code_symbols` / `code_outline` tools on the tester too; at False
+    (the default) they are not registered at all.
 
     `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
@@ -1420,6 +1470,11 @@ def build_tester_agent(
         """Regex search in file contents. `include` is an optional glob mask
         filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
         return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
+
+    # Symbolic code index (project setting code_index_mode, resolved per
+    # role at activation): same tools as the coding agent, no per-run
+    # budget gate — local millisecond reads (see register_code_index_tools).
+    register_code_index_tools(agent, enabled=code_index)
 
     @agent.tool(
         description=(
@@ -1697,6 +1752,7 @@ def build_resolver_agent(
     *,
     root: Path | None = None,
     task_id: str | None = None,
+    code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the merge-conflict resolver agent.
@@ -1713,6 +1769,11 @@ def build_resolver_agent(
     `task_id` (the conflicted task, known at activation) bakes the real
     scratch-directory path into the write tools' descriptions; without it
     the descriptions keep the literal `<task-id>` placeholder.
+
+    `code_index` (the project's code_index_mode, resolved per role by
+    `code_index_tools_for` and read at activation) registers the
+    `code_symbols` / `code_outline` tools on the resolver too; at False
+    (the default) they are not registered at all.
 
     `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
@@ -1735,6 +1796,11 @@ def build_resolver_agent(
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
     attach_batch_guard(agent, config.tool_batch_limit)
     _resolver_shared_tools(agent, config)
+
+    # Symbolic code index (project setting code_index_mode, resolved per
+    # role at activation): same tools as the coding agent, no per-run
+    # budget gate — local millisecond reads (see register_code_index_tools).
+    register_code_index_tools(agent, enabled=code_index)
 
     @agent.tool(
         sequential=True,

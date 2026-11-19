@@ -153,6 +153,70 @@ async def test_supersede_during_continuation_turn_keeps_unfinished(
     assert not task.unfinished
 
 
+async def test_empty_response_after_resume_keeps_unfinished(
+    project_root: Path,
+    configured_env: None,
+    scripted: ScriptedState,
+) -> None:
+    """Regression for incident #0dc7fc65: a watchdog nudge resumed the
+    interrupted attempt and the gateway answered with an EMPTY response
+    (no text, no tool call). The run loop saw a closed exchange, the
+    epilogue auto-completed the research task — and the completion
+    listener tore down the worktree/branch with the partially-done work.
+
+    The state seeded here is exactly what the epilogue saw after the turn
+    boundary cleared the unfinished flag: ACTIVE, nothing pending, a
+    transcript whose last message is a contentless model response. The
+    epilogue must re-flag the attempt (unfinished) and NOT auto-complete;
+    a real follow-up message then completes the task normally."""
+    app = DrCodeApp(project_root)
+    task = app.manager.create("stalled", "", kind=TaskKind.RESEARCH)
+    task.status = TaskStatus.ACTIVE
+    task.unfinished = False  # the turn boundary already cleared it
+    task.messages = serialize_messages(
+        [
+            ModelRequest(parts=[UserPromptPart(content="fix it")]),
+            text_response(""),  # the gateway's contentless answer
+        ]
+    )
+    app.manager.storage.save(task)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._agent_run_epilogue(task, task.id)
+        await pilot.pause()
+        # THE FIX: no auto-completion on a contentless answer — the task
+        # stays ACTIVE, paused on the unfinished marker.
+        assert task.status is TaskStatus.ACTIVE
+        assert task.unfinished
+        # Persisted (an app restart's auto-resume keys off the flag).
+        raw = json.loads(
+            (project_root / ".drcode" / "tasks" / f"{task.id}.json").read_text()
+        )
+        assert raw["unfinished"] is True
+        # The user sees why.
+        assert any("empty response" in e.text for e in task.events), [
+            e.text for e in task.events
+        ]
+
+        # A real follow-up message resumes and completes the task.
+        scripted.steps = [text_response("resumed work")]
+        app.manager.send(task.id, "continue")
+        await pilot.pause()
+        app.run_agent(task.id)
+        await wait_until(
+            lambda: task.status is TaskStatus.COMPLETED and not app.agent_running,
+            pilot,
+            what="task completed after a real follow-up answer",
+        )
+    assert any(
+        p.get("content") == "resumed work"
+        for m in task.messages
+        for p in m.get("parts", [])
+    )
+    assert not task.unfinished
+
+
 async def test_ctrl_r_marks_unfinished_when_worker_cancelled_pre_step(
     project_root: Path,
     configured_env: None,

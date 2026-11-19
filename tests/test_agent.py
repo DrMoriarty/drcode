@@ -31,6 +31,7 @@ from drcode.agent import (
     all_user_prompts,
     build_compaction_prompt,
     compacted_messages,
+    ends_with_empty_response,
     ends_with_open_request,
     extract_display,
     extract_previous_summary,
@@ -151,6 +152,36 @@ def test_ends_with_open_request() -> None:
     assert ends_with_open_request(data)
     data2 = serialize_messages([user_msg("q"), text_response("a")])
     assert not ends_with_open_request(data2)
+
+
+def test_ends_with_empty_response() -> None:
+    assert not ends_with_empty_response([])
+    assert not ends_with_empty_response(serialize_messages([user_msg("q")]))
+    # A real answer (text) and a pending tool call are NOT empty.
+    assert not ends_with_empty_response(
+        serialize_messages([user_msg("q"), text_response("a")])
+    )
+    assert not ends_with_empty_response(
+        serialize_messages([user_msg("q"), tool_call_response()])
+    )
+    # An empty assistant message — the gateway answered with no parts.
+    assert ends_with_empty_response(
+        serialize_messages([user_msg("q"), ModelResponse(parts=[])])
+    )
+    # A text part with EMPTY content is just as contentless.
+    assert ends_with_empty_response(
+        serialize_messages([user_msg("q"), text_response("")])
+    )
+    # A thinking-only response carries nothing usable either.
+    assert ends_with_empty_response(
+        serialize_messages(
+            [user_msg("q"), ModelResponse(parts=[ThinkingPart(content="hmm")])]
+        )
+    )
+    # A tool RESULT (a request) at the tail is not a response at all.
+    assert not ends_with_empty_response(
+        serialize_messages([user_msg("q"), tool_call_response(), tool_return_msg()])
+    )
 
 
 def test_is_pending_retry() -> None:

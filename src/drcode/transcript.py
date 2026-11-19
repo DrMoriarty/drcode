@@ -102,6 +102,30 @@ def ends_with_open_request(data: list[dict[str, Any]]) -> bool:
     return last.get("kind") == "request" or last.get("role") == "request"
 
 
+def ends_with_empty_response(data: list[dict[str, Any]]) -> bool:
+    """True when the transcript ends with a model response that carries no
+    usable content — no text part with text and no tool call.
+
+    The same invalid tail `resumable_history` trims (an empty assistant
+    message the gateway returned without any part arriving), but as a
+    PREDICATE: a run that ends on such a response finished "cleanly" from
+    the run loop's point of view while the model actually said nothing —
+    the caller must not treat it as a completed answer."""
+    if not data:
+        return False
+    last = data[-1]
+    if last.get("kind") != "response" and last.get("role") != "response":
+        return False
+    for part in last.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("part_kind") == "tool-call":
+            return False
+        if part.get("part_kind") == "text" and part.get("content"):
+            return False
+    return True
+
+
 def _usage_context_tokens(input_tokens: int, output_tokens: int) -> int:
     """Tokens held by the model's context slot: prompt + generated output,
     matching llama.cpp's slot `n_tokens`. pydantic-ai normalizes usage from

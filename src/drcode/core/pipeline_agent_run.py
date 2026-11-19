@@ -34,6 +34,7 @@ from ..agent import (
     build_title_agent,
     build_title_prompt,
     clean_generated_title,
+    ends_with_empty_response,
     ends_with_open_request,
     is_pending_retry,
     last_response_usage,
@@ -1276,6 +1277,34 @@ class PipelineAgentRunLayer(CoreState):
         # the gate ticks again). An in-flight one is left alone — the
         # worker stitches on completion, the transcript is stable now.
         self._finish_background_compaction(task)
+        if (
+            task.status is TaskStatus.ACTIVE
+            and not task.pending_input
+            and not task.unfinished
+            and ends_with_empty_response(task.messages)
+        ):
+            # A "clean" run end whose final answer is EMPTY (no text, no
+            # tool call — the same invalid tail `resumable_history` trims):
+            # the model said nothing, so this is not a completed answer.
+            # Auto-completing here would mark the task done with zero
+            # content and tear down its worktree/branch (incident #0dc7fc65:
+            # a watchdog nudge resumed an interrupted attempt, the gateway
+            # answered with an empty response, the run loop saw a closed
+            # exchange and this epilogue completed the research task — the
+            # partially-done work was deleted with the worktree). Treat it
+            # like an interrupted attempt instead: keep the task ACTIVE
+            # paused on the unfinished flag — a new message or a restart
+            # (auto-resume) picks the attempt back up.
+            task.unfinished = True
+            self.manager.storage.save(task)
+            self._show_event(
+                task,
+                "The model returned an empty response (no text, no tool "
+                "call) — the attempt is kept unfinished instead of being "
+                "completed; send a message to resume it.",
+            )
+            self.refresh_sidebar()
+            return
         if task.status is TaskStatus.AWAITING_CLARIFICATION:
             # The user may have answered while the run was still finishing
             # (the answer sits in pending_input and send()'s clarification

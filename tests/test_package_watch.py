@@ -12,6 +12,7 @@ metadata or repo files are touched.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import drcode
@@ -138,3 +139,102 @@ def test_watched_files_exist_in_the_real_package() -> None:
     root = Path(drcode.__file__).resolve().parent
     for rel in package_watch.WATCHED_FILES:
         assert (root / rel).is_file(), rel
+
+
+# -- frozen (PyInstaller onedir) bundle fingerprinting ----------------------
+
+
+def _fake_bundle(tmp_path: Path) -> Path:
+    """A synthetic onedir bundle: fake executable + _internal contents.
+
+    Four native libraries on purpose — one beyond `_NATIVE_LIB_CAP` —
+    to pin the capped sorted scan."""
+    root = tmp_path / "bundle"
+    internal = root / "_internal"
+    internal.mkdir(parents=True)
+    (internal / "PYZ-00.pyz").write_bytes(b"pyz")
+    (internal / "base_library.zip").write_bytes(b"zip")
+    (internal / "_ctypes.so").write_bytes(b"so1")
+    (internal / "extra.dylib").write_bytes(b"so2")
+    (internal / "zlib.dll").write_bytes(b"so3")
+    (internal / "aaa_beyond_cap.dll").write_bytes(b"so4")
+    (internal / "not-native.txt").write_text("x", encoding="utf-8")
+    exe = root / "drcode"
+    exe.write_bytes(b"MZ")
+    return root
+
+
+def _freeze(monkeypatch, root: Path) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(root / "drcode"))
+
+
+def test_capture_frozen_fingerprints_bundle(tmp_path: Path, monkeypatch) -> None:
+    root = _fake_bundle(tmp_path)
+    _freeze(monkeypatch, root)
+    fingerprint = package_watch.capture()
+    assert fingerprint is not None
+    files = fingerprint["files"]
+    assert isinstance(files, dict)
+    # The executable is the anchor entry; the _internal watched files and
+    # exactly three (sorted, capped) native libs join it.
+    assert "<executable>" in files
+    assert "PYZ-00.pyz" in files
+    assert "base_library.zip" in files
+    natives = [
+        name
+        for name in files
+        if name not in ("<executable>", "PYZ-00.pyz", "base_library.zip")
+    ]
+    # Sorted scan, capped: the alphabetically first three win.
+    assert sorted(natives) == ["_ctypes.so", "aaa_beyond_cap.dll", "extra.dylib"]
+    assert "zlib.dll" not in files
+    assert all(value != "missing" for value in files.values())
+
+
+def test_capture_frozen_detects_rebuild(tmp_path: Path, monkeypatch) -> None:
+    root = _fake_bundle(tmp_path)
+    _freeze(monkeypatch, root)
+    baseline = package_watch.capture()
+    assert baseline is not None
+    # build-binary.sh rewrites the archive under the live process.
+    pyz = root / "_internal" / "PYZ-00.pyz"
+    os.utime(pyz, ns=(1_000_000_000, 1_000_000_000))
+    current = package_watch.capture()
+    assert current is not None
+    reason = package_watch.drift(baseline, current)
+    assert reason is not None
+    assert "PYZ-00.pyz" in reason
+
+
+def test_capture_frozen_none_when_executable_unstatable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _fake_bundle(tmp_path)
+    _freeze(monkeypatch, root)
+    monkeypatch.setattr(sys, "executable", str(root / "no-such-binary"))
+    assert package_watch.capture() is None
+
+
+def test_capture_frozen_none_without_internal_contents(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The executable stats but nothing under _internal does (onefile /
+    # exotic layout): the fingerprint would be blind — degrade to None.
+    root = _fake_bundle(tmp_path)
+    _freeze(monkeypatch, root)
+    for path in (root / "_internal").iterdir():
+        path.unlink()
+    assert package_watch.capture() is None
+
+
+def test_drift_since_baseline_frozen(tmp_path: Path, monkeypatch) -> None:
+    root = _fake_bundle(tmp_path)
+    _freeze(monkeypatch, root)
+    monkeypatch.setattr(package_watch, "_BASELINE", None)
+    assert package_watch.drift_since_baseline() is None
+    # A rebuild lands after the baseline was pinned.
+    (root / "_internal" / "base_library.zip").write_bytes(b"rewritten")
+    reason = package_watch.drift_since_baseline()
+    assert reason is not None
+    assert "base_library.zip" in reason

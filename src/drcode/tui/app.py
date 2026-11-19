@@ -2217,25 +2217,47 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             return None
         if reason is None:
             return None
-        self.notify(
-            f"The drcode package was upgraded on disk ({reason}). "
-            "Loaded modules are stale — restart the app (Ctrl+C, "
-            "`uv run drcode`) before opening screens; a lazy import "
-            "may otherwise fail with a confusing ImportError.",
-            title="Package upgraded",
-            severity="warning",
-            timeout=12,
-        )
+        frozen = getattr(sys, "frozen", False)
+        if frozen:
+            # The onedir bundle was rebuilt under the live session
+            # (build-binary.sh while DrCode Desktop kept it alive,
+            # 17.11): lazy imports re-read the replaced PyInstaller
+            # archive and die with a cryptic zlib.error — restart first.
+            self.notify(
+                f"The app bundle was rebuilt on disk ({reason}) — "
+                "build-binary.sh under a live session? Restart this "
+                "tab/app before it crashes: a lazy import may fail "
+                "with a cryptic zlib.error.",
+                title="App bundle rebuilt",
+                severity="warning",
+                timeout=12,
+            )
+        else:
+            self.notify(
+                f"The drcode package was upgraded on disk ({reason}). "
+                "Loaded modules are stale — restart the app (Ctrl+C, "
+                "`uv run drcode`) before opening screens; a lazy import "
+                "may otherwise fail with a confusing ImportError.",
+                title="Package upgraded",
+                severity="warning",
+                timeout=12,
+            )
         task = self.viewed
         if task is not None:
-            task.events.append(
-                TaskEvent(
-                    kind="package",
-                    text=f"Package upgraded on disk while the app runs "
-                    f"({reason}) — in-memory modules are stale, restart "
-                    f"recommended",
+            if frozen:
+                event_text = (
+                    f"App bundle rebuilt on disk while the app runs "
+                    f"({reason}) — lazy imports read the replaced "
+                    f"PyInstaller archive, restart this tab/app before "
+                    f"it crashes"
                 )
-            )
+            else:
+                event_text = (
+                    f"Package upgraded on disk while the app runs "
+                    f"({reason}) — in-memory modules are stale, restart "
+                    f"recommended"
+                )
+            task.events.append(TaskEvent(kind="package", text=event_text))
             task.touch()
             self.manager.storage.save(task)
         return reason

@@ -349,6 +349,7 @@ def build_agent(
     todo_supplier: Callable[[], str | None] | None = None,
     research_web_fetch: WebFetchPolicy | None = None,
     announce_wait: agent_model.WaitAnnouncer | None = None,
+    request_turns: Callable[[], int] | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -433,6 +434,14 @@ def build_agent(
     `max_parallel_requests` cap is saturated, a request queued for longer
     than `agent_model.THROTTLE_WAIT_ANNOUNCE_SECONDS` reports the wait as a
     service event instead of looking like a hung run.
+
+    `request_turns` (wired by the pipeline when the delegation gate
+    exists) makes the delegation notice's decay window count the TASK's
+    cumulative model requests (`task.model_request_count`, persisted) —
+    incremented once per supplier call — instead of a per-build closure:
+    every re-entry into the run of the same task continues the window.
+    Without it a local closure counter is used (build sites without a
+    task).
     """
     scratch = _scratch_desc(task_id)
     model = agent_model.build_model(config, announce_wait)
@@ -469,17 +478,30 @@ def build_agent(
         # model request (`TailInjectionModel` reads each supplier exactly
         # once per request). The notice decays with it — full text on the
         # first turns, a one-liner for a few more, nothing after the window
-        # (see `agent_tools.subagent_notice`).
+        # (see `agent_tools.subagent_notice`). When the pipeline supplied
+        # `request_turns`, the counter is the TASK's persistent cumulative
+        # request count (`task.model_request_count`) — it survives every
+        # rebuild of the agent within the task's run lifecycle (network
+        # retry, mid-run compaction/eviction pause, watchdog restart,
+        # clarification answer), so a re-entry CONTINUES the decay window
+        # instead of restarting it (#8c746feb: two activations of 9
+        # requests each produced ~16 reminders instead of one window). The
+        # closure counter below is only the fallback for build sites
+        # without a task (schema estimation, tests).
         turn_counter = 0
 
         def _delegation_notice() -> str | None:
             nonlocal turn_counter
-            turn_counter += 1
+            if request_turns is not None:
+                turn = request_turns()
+            else:
+                turn_counter += 1
+                turn = turn_counter
             return subagent_notice(
                 subagent_gate.limit,
                 subagent_gate.used,
                 role=delegation_role,
-                turn=turn_counter,
+                turn=turn,
             )
 
         tail_blocks.append(_delegation_notice)

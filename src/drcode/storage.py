@@ -315,6 +315,21 @@ class Storage:
         except OSError:
             pass
 
+    def save_metadata(self, task: Task) -> None:
+        """Persist ONLY the metadata file, never the sidecar transcript.
+
+        For high-frequency metadata updates during a live run (the
+        per-request `model_request_count` bump of the delegation-notice
+        decay window): `save()` would rewrite the whole sidecar on every
+        call while the transcripts are in memory — megabytes per model
+        request. A metadata-only write carries no staleness risk: the
+        metadata and the sidecar hold disjoint fields, and this write uses
+        the same in-memory task object as `save()`."""
+        try:
+            _atomic_write_text(self.task_path(task.id), task.model_dump_json(indent=2))
+        except OSError:
+            pass
+
     def _flush_transcript(self, task: Task) -> None:
         ts = task._transcripts
         transcripts = {key: getattr(ts, key) for key in TRANSCRIPT_KEYS}

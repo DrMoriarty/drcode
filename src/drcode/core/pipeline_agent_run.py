@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -619,6 +620,31 @@ class PipelineAgentRunLayer(CoreState):
                 self.manager.storage.save(task)
 
             subagent_gate.on_change = _record_subagent_budget
+
+            # The decay window of the delegation tail notice counts the
+            # TASK's cumulative model requests, not the build's: the
+            # supplier below is handed to build_agent and called exactly
+            # once per outgoing request (TailInjectionModel reads each
+            # supplier once per request), incrementing the persisted
+            # `task.model_request_count`. A re-entry into the run of the
+            # same task — network retry, mid-run compaction/eviction
+            # pause, watchdog restart, clarification answer — rebuilds the
+            # agent and lands here again, but the counter lives on the
+            # task, so the decay window CONTINUES instead of restarting
+            # (#8c746feb: two activations of 9 requests each produced ~16
+            # reminders instead of one window). Persisted metadata-only
+            # (the transcripts are in memory during a run — a full `save`
+            # would rewrite the megabyte sidecar per request). Reset only
+            # when the user sends new input into a COMPLETED/TESTING task
+            # (TaskManager.send's re-queue branch — a full new run).
+            def _next_notice_turn() -> int:
+                task.model_request_count += 1
+                self.manager.storage.save_metadata(task)
+                return task.model_request_count
+
+            request_turns: Callable[[], int] | None = _next_notice_turn
+        else:
+            request_turns = None
         # Managed web reading (project setting web_fetch_mode): RESEARCH
         # only — web_fetch_policy_for returns None for every other role, so
         # the tool is not registered there at all. Read at activation, so a
@@ -634,6 +660,10 @@ class PipelineAgentRunLayer(CoreState):
             # makes the delegation tail notice state-aware and enforces
             # the budget inside run_delegate_tool.
             subagent_gate=subagent_gate,
+            # The delegation notice's decay window keyed on the task's
+            # cumulative request count (survives agent rebuilds); None
+            # without a gate.
+            request_turns=request_turns,
             # The research agent's web_fetch tool (SSRF-guarded, capped,
             # framed as untrusted content): None when the mode is off.
             research_web_fetch=web_fetch_policy,

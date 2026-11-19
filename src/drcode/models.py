@@ -367,6 +367,23 @@ class Task(BaseModel):
     # `unfinished=True`, which keeps the budget).
     subagent_slots_used: int = 0
     subagent_slot_refunds: int = 0
+    # Cumulative number of OUTGOING model requests this task has produced
+    # (incremented once per request by the delegation-notice supplier the
+    # pipeline wires into build_agent — one supplier call == one request).
+    # This is the DECAY WINDOW counter of the delegate_research tail notice
+    # (`agent_tools.subagent_notice`): the window must be keyed on the
+    # task's TOTAL request count, not on a per-build closure — the closure
+    # died with every agent rebuild (network retry, mid-run compaction
+    # pause, watchdog restart, clarification answer), so each re-entry
+    # restarted the full-text window and the agent got ~16 reminders on 18
+    # requests across two activations (#8c746feb). Persisted like the
+    # budget mirrors above, so the window even survives an app restart.
+    # Reset ONLY when the user sends new input into a COMPLETED/TESTING
+    # task (send()'s re-queue branch — a full new run gets a fresh
+    # window); a clarification answer, an unfinished-attempt resume, a
+    # nudge restart and an automatic fix-round re-queue all CONTINUE the
+    # count.
+    model_request_count: int = 0
     # True when the user CANCELLED the task (Ctrl+X): the status is
     # COMPLETED (cancel completes immediately, skipping the tester) but the
     # task's work was never honestly finished — the goal auto-lifecycle

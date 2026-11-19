@@ -805,6 +805,14 @@ class TaskManager:
             # Human intervention breaks the fix loop too: the consecutive
             # failed development rounds restart.
             task.fix_rounds = 0
+            # Full new run: the delegation notice's decay window
+            # (`model_request_count`) restarts — the user explicitly took
+            # the completed/testing task back into development, so the
+            # next run gets the full-text window again. Every other
+            # re-entry into the run of the same task (clarification
+            # answer, unfinished resume, nudge restart, automatic
+            # fix-round re-queue) CONTINUES the count.
+            task.model_request_count = 0
             # The task is honest work again: a stale cancel marker (the
             # goal auto-lifecycle skips cancelled "completions") is
             # cleared — the next completion will be a real one.

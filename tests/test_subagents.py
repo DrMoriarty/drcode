@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -325,6 +326,89 @@ def test_gate_supplier_counts_requests_and_decays(fake_config: Config) -> None:
     # the turn counter keeps advancing regardless of the gate state.
     gate.used = 1
     assert tail_text() is None
+
+
+def test_notice_window_survives_agent_rebuilds(fake_config: Config) -> None:
+    """The decay window counts the TASK's cumulative model requests, not
+    the build's: the pipeline hands `request_turns` (backed by the
+    persisted task.model_request_count) into build_agent, so a REBUILD of
+    the agent — network retry, mid-run compaction/eviction pause,
+    watchdog restart, clarification answer — CONTINUES the window instead
+    of restarting it (#8c746feb: two activations of 9 requests each got
+    ~16 reminders instead of one window)."""
+    from drcode.agent_model import TailInjectionModel
+
+    turns = {"n": 0}
+
+    def request_turns() -> int:
+        turns["n"] += 1
+        return turns["n"]
+
+    def built() -> Agent[AgentDeps, str]:
+        return build_agent(
+            fake_config,
+            kind=TaskKind.FEATURE,
+            subagent_limit=2,
+            subagent_gate=SubagentGate(2),
+            request_turns=request_turns,
+        )
+
+    ag1 = built()
+    assert isinstance(ag1.model, TailInjectionModel)
+
+    def tail_text(ag) -> str | None:
+        written = ag.model._messages_with_tail([])  # type: ignore[attr-defined]
+        if not written:
+            return None
+        return _tail_text(written)
+
+    # Activation 1: requests 1–9 — the usual decay profile.
+    texts = [tail_text(ag1) for _ in range(9)]
+    for turn, text in enumerate(texts[:3], start=1):
+        assert text is not None, turn
+        assert "a FAILED call" in text  # the full text
+    for turn, text in enumerate(texts[3:8], start=4):
+        assert text is not None, turn
+        assert "a FAILED call" not in text  # the one-liner
+        assert len(text) < 120
+    assert texts[8] is None
+    # Activation 2: a rebuild of the agent over the SAME task (e.g. the
+    # user answered a clarification) — the window continues at request 10
+    # and stays closed for the whole second activation.
+    ag2 = built()
+    assert isinstance(ag2.model, TailInjectionModel)
+    assert all(tail_text(ag2) is None for _ in range(9))
+    assert turns["n"] == 18
+
+
+def test_request_count_resets_only_on_full_new_run(manager: TaskManager) -> None:
+    """The persisted request counter of the decay window continues across
+    a clarification answer (the main observed case) and is reset ONLY by
+    the user sending new input into a COMPLETED/TESTING task — a full new
+    run gets a fresh window."""
+    from drcode.models import TaskStatus
+
+    task = manager.create("T", "do it")
+    task.model_request_count = 7
+    manager.storage.save(task)
+    # A clarification pause + the user's answer: the count CONTINUES.
+    task.status = TaskStatus.AWAITING_CLARIFICATION
+    manager.storage.save(task)
+    manager.send(task.id, "42, obviously")
+    assert task.model_request_count == 7
+    # Plain queued input (no status change): continues too.
+    manager.send(task.id, "and also this")
+    assert task.model_request_count == 7
+    # The counter is persisted metadata: it survives a reload.
+    reloaded = manager.storage.load_one(manager.storage.task_path(task.id))
+    assert reloaded is not None and reloaded.model_request_count == 7
+    # New input into a COMPLETED task: a full new run — fresh window.
+    task.status = TaskStatus.COMPLETED
+    manager.storage.save(task)
+    manager.send(task.id, "one more round")
+    assert task.model_request_count == 0
+    reloaded = manager.storage.load_one(manager.storage.task_path(task.id))
+    assert reloaded is not None and reloaded.model_request_count == 0
 
 
 def test_gate_notice_supplier_reflects_the_gate(fake_config: Config) -> None:

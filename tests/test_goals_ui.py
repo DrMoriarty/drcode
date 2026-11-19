@@ -465,6 +465,43 @@ async def test_new_task_form_goal_picker(app: DrCodeApp) -> None:
         assert app._new_task_goal_id is None
 
 
+async def test_new_task_goal_picker_indents_sub_goals(app: DrCodeApp) -> None:
+    """Sub-goals render indented under their parents in the picker's
+    flat list: the store's display tree is flattened to (goal, depth)
+    pairs, so a child follows its parent and its row carries the
+    two-space depth indent a top-level goal lacks."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        parent = app.manager.goals.create("Parent goal")
+        child = app.manager.goals.create(
+            "Child goal", parent_id=parent.id
+        )
+        grandchild = app.manager.goals.create(
+            "Grandchild goal", parent_id=child.id
+        )
+        other = app.manager.goals.create("Other goal")
+
+        app.action_new_task()
+        await pilot.pause()
+        app.action_assign_new_task_goal()
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, GoalAssignPicker)
+        listing = picker.query_one("#goal-assign-list", ListView)
+        items = [i for i in listing.children if isinstance(i, TaskItem)]
+        # Depth-first: each goal right before its subtree.
+        assert [i.goal_id for i in items] == [
+            parent.id,
+            child.id,
+            grandchild.id,
+            other.id,
+        ]
+        assert not items[0].text.startswith(" ")
+        assert items[1].text.startswith("  ") and "Child goal" in items[1].text
+        assert items[2].text.startswith("    ") and "Grandchild goal" in items[2].text
+        assert not items[3].text.startswith(" ")
+
+
 async def test_new_task_goal_picker_not_offered_while_editing(
     app: DrCodeApp,
 ) -> None:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -240,6 +241,33 @@ class GoalStore:
     def display_children(self, goal_id: str) -> list[Goal]:
         """Children of `goal_id` in display order (the tree's next level)."""
         return sorted(self.children(goal_id), key=self._order_key)
+
+    def flattened(
+        self,
+        keep: Callable[[Goal], bool] | None = None,
+    ) -> list[tuple[Goal, int]]:
+        """Depth-first walk of the display tree as (goal, depth) pairs:
+        top-level goals in display order, each immediately followed by
+        its own subtree — the order a picker renders indented rows in.
+        A goal failing `keep` is skipped, but its subtree still walks
+        (a filtered-out parent must not hide its children — e.g. the
+        assign picker drops archived goals, not whole branches). A
+        manual parent_id cycle cannot loop us (defensive visited set,
+        same guard as descendant_ids)."""
+        result: list[tuple[Goal, int]] = []
+        seen: set[str] = set()
+
+        def walk(goals: list[Goal], depth: int) -> None:
+            for goal in goals:
+                if goal.id in seen:
+                    continue
+                seen.add(goal.id)
+                if keep is None or keep(goal):
+                    result.append((goal, depth))
+                walk(self.display_children(goal.id), depth + 1)
+
+        walk(self.top_level(), 0)
+        return result
 
     def descendant_ids(self, goal_id: str) -> set[str]:
         """All strict descendants of `goal_id` (the whole subtree below

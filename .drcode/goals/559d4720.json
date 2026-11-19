@@ -1,0 +1,10 @@
+{
+  "id": "559d4720",
+  "title": "Фаза 1: ядро индекса + code_symbols/code_outline (MVP)",
+  "description": "MVP: пакет src/drcode/code_index/, настройка-включатель, два первых инструмента, зеркала учёта, тесты, сборка.",
+  "notes": "Этапы работ (docs/code-index-design.md §12, фаза 1):\n1. Пакет `src/drcode/code_index/{extract,store,queries}.py`: SymbolExtractor на py-tree-sitter-language-pack (tags-запросы + таблица node-kind'ов, определение языка по расширению); store — формат §3 (stat-ключ, атомарная запись, lock+кэш, базовая stat-инвалидация); queries — find_symbols/outline.\n2. settings.py: enum CodeIndexMode (OFF/ON), поле code_index_mode, OPTIONS, label, хинт; дефолт OFF.\n3. agent_build.py: хелпер code_index_tools_for(settings, role) (роль-гейтинг: coding/tester/resolver + сабагенты), регистрация code_symbols и code_outline паттерном web_fetch (def без декоратора + __doc__ f-string).\n4. Три зеркала учёта: core/pipeline_agent_run.py (kwarg-шов), core/pipeline_compaction.py:486, tui/task_status_view.py:634, context_layout.py:223-231.\n5. Тесты tests/test_code_index.py по образцу test_task_search.py: инкрементальность, повреждение → rebuild, stale self-heal, role-gating, инвариант «зеркала согласованы».\n6. Сборка: зависимость в pyproject.toml + грамматики в drcode.spec (prefetch, не on-demand — frozen-бандл, §2.4).\nКритерий готовности: включённая настройка даёт агентам code_symbols/code_outline; выключенная — поведение не меняется; зеркала согласованы.",
+  "type": "milestone",
+  "parent_id": "7ecd82a5",
+  "order": 0,
+  "created_at": "2026-11-19T10:39:59.331817Z"
+}

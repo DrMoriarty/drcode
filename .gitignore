@@ -27,3 +27,4 @@ wheels/
 .drcode/goals/*.state.json
 *.log
 .drcode/mcp.json
+.drcode/fastcontext-scout

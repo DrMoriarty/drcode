@@ -71,6 +71,7 @@ from ..agent import (
     all_user_prompts,
     build_resolver_agent,
     build_resolver_reviewer_agent,
+    code_index_tools_for,
     last_response_usage,
     resumable_history,
     run_context_tokens,
@@ -581,6 +582,10 @@ class PipelineResolverLayer(CoreState):
                 # descriptions (no literal <task-id> placeholder for the
                 # model to copy verbatim into a path argument).
                 task_id=task_id,
+                # The code-index tools (code_symbols/code_outline) when
+                # the project's code_index_mode is ON — read at
+                # activation, so a settings change reaches the next round.
+                code_index=code_index_tools_for(self.settings, AgentRole.RESOLVER),
                 # Provider slot-wait visibility (see _wait_announcer).
                 announce_wait=self._wait_announcer(task_id, AgentRole.RESOLVER),
             )

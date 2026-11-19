@@ -31,6 +31,7 @@ from textual.content import Content
 from textual.widgets import Button, LoadingIndicator
 
 from ...settings import (
+    CODE_INDEX_MODE_OPTIONS,
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
     GIT_POLICY_OPTIONS,
@@ -226,6 +227,7 @@ class SettingsPalette(CommandPalette):
         "Notifications:",
         "Voice:",
         "MCP server:",
+        "Code index:",
         "Maximize",
         "Minimize",
         "Screenshot",
@@ -466,6 +468,13 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
                 "external AI agents manage drcode tasks; hot start/stop, "
                 "no restart needed (project setting, "
                 "docs/mcp-server-design.md)",
+            ),
+            CommandEntry(
+                f"Code index: {app.settings.code_index_mode.label}",
+                app.action_change_code_index_mode,
+                "Symbolic code index for the agents: code_symbols/"
+                "code_outline tools backed by a tree-sitter index "
+                "(docs/code-index-design.md, project setting)",
             ),
         ]
 
@@ -747,6 +756,29 @@ class WebFetchModeOptionsProvider(CommandListProvider):
                 mode.label,
                 mode is current,
                 partial(app.action_set_web_fetch_mode, mode),
+            )
+            entries.append(marked._replace(help=mode.description))
+        return entries
+
+
+class CodeIndexOptionsProvider(CommandListProvider):
+    """Options of the "Code index" setting (off / on).
+
+    Same selection-palette UX as WebFetchModeOptionsProvider: pick an
+    option to apply it immediately, Escape keeps the current one. The
+    active option is marked with "(current)"; each entry's help text
+    comes from the mode itself (`CodeIndexMode.description`).
+    """
+
+    def _commands(self) -> list[CommandEntry]:
+        app = cast("DrCodeApp", self.app)
+        current = app.settings.code_index_mode
+        entries: list[CommandEntry] = []
+        for mode in CODE_INDEX_MODE_OPTIONS:
+            marked = _marked_option(
+                mode.label,
+                mode is current,
+                partial(app.action_set_code_index_mode, mode),
             )
             entries.append(marked._replace(help=mode.description))
         return entries

@@ -1214,6 +1214,16 @@ class TaskManager:
             ):
                 t.status = TaskStatus.ACTIVE
                 t.queue_head = False
+                # Activation boundary for the delegate_research budget: a
+                # task resumed from an interrupted attempt (unfinished=True —
+                # network retry, demote-on-failure, app restart) KEEPS the
+                # slots it spent (the budget is per activation, not per
+                # run); a fresh activation (new queue pickup, or a
+                # clarification answer — the user explicitly continued the
+                # task) starts with a full budget again.
+                if not t.unfinished:
+                    t.subagent_slots_used = 0
+                    t.subagent_slot_refunds = 0
                 # Stamp the activation moment: the expanded-header session
                 # statistics measure activation → completion from it.
                 t.activated_at = _now()

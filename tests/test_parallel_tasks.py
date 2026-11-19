@@ -1174,6 +1174,33 @@ def _to_active(app: DrCodeApp, task: Task, *, unfinished: bool = False) -> None:
     app.manager.storage.save(task)
 
 
+async def test_nudge_resets_subagent_budget(
+    configured_env: None, parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nudge restart (manual Ctrl+R or the stall watchdog) is an explicit
+    restart of the run: the delegate_research budget starts over — the
+    promote_next reset never fires for a nudged task (it stays ACTIVE), so
+    _nudge_run must do it itself, also on a re-nudge of an already
+    unfinished task."""
+    app = parallel_app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task = app.manager.create("budget", "work b")
+        _to_active(app, task, unfinished=True)
+        task.subagent_slots_used = 2
+        task.subagent_slot_refunds = 1
+        app.manager.storage.save(task)
+        # The scheduled restart itself is out of scope here — only the
+        # bookkeeping of the nudge is under test.
+        monkeypatch.setattr(app, "run_agent", lambda task_id: None)
+
+        assert app._nudge_run(task) is True
+        await pilot.pause()
+        reloaded = app.manager.get(task.id)
+        assert reloaded.subagent_slots_used == 0
+        assert reloaded.subagent_slot_refunds == 0
+
+
 async def test_zombie_active_does_not_block_slot(
     configured_env: None, parallel_app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:

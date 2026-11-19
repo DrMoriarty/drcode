@@ -648,6 +648,60 @@ def test_failure_refund_capped_at_two_per_run(
     assert day.subagent_failures == 3
 
 
+def test_gate_budget_mirrors_to_task_and_survives_a_reseed(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_config: Config,
+    project_root: Path,
+    manager: TaskManager,
+) -> None:
+    """The gate OBJECT is per run, the BUDGET per activation: every
+    spend/refund is mirrored onto the task through `on_change`, and a
+    fresh gate seeded from the mirrored counters — what a restarted run
+    builds in _prepare_agent_run — continues the spent budget instead of
+    handing the slots back (the #8c746feb restart bug)."""
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(
+        "drcode.subagents._build_subagent_model",
+        lambda cfg, announce_wait=None: FunctionModel(boom),
+    )
+    task = manager.create("T", "delegate me")
+    deps = _deps(project_root, manager, task.id, limit=2)
+    gate = deps.subagent_gate
+    assert gate is not None
+
+    def mirror() -> None:
+        task.subagent_slots_used = gate.used
+        task.subagent_slot_refunds = gate.refunds
+
+    gate.on_change = mirror
+
+    # A refunded failure: used back to 0, refunds up — both mirrored.
+    first = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate foo"))
+    assert "slot was returned" in first
+    assert task.subagent_slots_used == 0
+    assert task.subagent_slot_refunds == 1
+
+    # A spent failure (refund cap exhausted): mirrored too.
+    second = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate bar"))
+    assert "slot was returned" in second
+    third = asyncio.run(run_delegate_tool(deps, fake_config, "Investigate baz"))
+    assert "refund budget is exhausted" in third
+    assert task.subagent_slots_used == 1
+    assert task.subagent_slot_refunds == 2
+
+    # The restarted run re-seeds its gate from the mirrored counters:
+    # one slot is gone, not two.
+    reseeded = SubagentGate(
+        2, used=task.subagent_slots_used, refunds=task.subagent_slot_refunds
+    )
+    assert reseeded.used == 1
+    assert reseeded.refunds == 2
+    assert reseeded.remaining == 1
+
+
 def test_failure_after_refund_cap_names_remaining_calls(
     monkeypatch: pytest.MonkeyPatch,
     fake_config: Config,

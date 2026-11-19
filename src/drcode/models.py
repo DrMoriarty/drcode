@@ -352,6 +352,21 @@ class Task(BaseModel):
     # agent resumes the attempt without new user text on the next
     # activation (run_agent's continuation turn).
     unfinished: bool = False
+    # The delegate_research budget spent within the CURRENT activation
+    # (`SubagentGate.used`/`.refunds` mirrored here by the pipeline on
+    # every spend/refund): the gate object is per RUN, but the budget is
+    # per ACTIVATION — a non-user restart of the run (network retry, a
+    # comment takeover) re-enters run_agent whole and re-seeds the gate
+    # from these counters, so spent slots are never returned by a
+    # restart. Reset at the activation boundaries: promote_next of a task
+    # WITHOUT an interrupted attempt (a fresh queue pickup or a
+    # clarification answer — both start a new activation) and a run
+    # restart via _nudge_run (Ctrl+R / stall watchdog — the user/watchdog
+    # explicitly restarted the run). Persisted like `unfinished`, so the
+    # budget even survives an app restart (the startup demotion keeps
+    # `unfinished=True`, which keeps the budget).
+    subagent_slots_used: int = 0
+    subagent_slot_refunds: int = 0
     # True when the user CANCELLED the task (Ctrl+X): the status is
     # COMPLETED (cancel completes immediately, skipping the tester) but the
     # task's work was never honestly finished — the goal auto-lifecycle

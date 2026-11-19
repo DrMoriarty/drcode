@@ -598,7 +598,27 @@ class PipelineAgentRunLayer(CoreState):
         # delegation tail notice state-aware (build_agent closes a
         # supplier over it — the reminder names the remaining slots and
         # switches to the "slots used" text once the budget is spent).
-        subagent_gate = SubagentGate(subagent_limit) if subagent_limit > 0 else None
+        # The gate OBJECT is per run, but the BUDGET is per activation:
+        # it is re-seeded from the task's mirrored counters, so a
+        # non-user restart (network retry, comment takeover — run_agent
+        # re-enters whole and lands here again) continues the spent
+        # budget instead of returning the slots; the counters themselves
+        # reset at the activation boundaries (promote_next of a
+        # non-unfinished task, _nudge_run).
+        subagent_gate = None
+        if subagent_limit > 0:
+            subagent_gate = SubagentGate(
+                subagent_limit,
+                used=task.subagent_slots_used,
+                refunds=task.subagent_slot_refunds,
+            )
+
+            def _record_subagent_budget() -> None:
+                task.subagent_slots_used = subagent_gate.used
+                task.subagent_slot_refunds = subagent_gate.refunds
+                self.manager.storage.save(task)
+
+            subagent_gate.on_change = _record_subagent_budget
         # Managed web reading (project setting web_fetch_mode): RESEARCH
         # only — web_fetch_policy_for returns None for every other role, so
         # the tool is not registered there at all. Read at activation, so a

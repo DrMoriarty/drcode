@@ -36,9 +36,17 @@ compactions). Spawns/finishes land in the task's service-event log
 for observability in the chat.
 
 The gate counter (`SubagentGate`) is per parent run (generation): the
-pipeline creates one per activation and hands it to the agent deps AND
+pipeline creates one per run and hands it to the agent deps AND
 to the state-aware tail notice (`agent_tools.subagent_notice`, via
-`build_agent`). It carries the run's TOTAL slot budget: every spawn
+`build_agent`). The BUDGET it carries is per ACTIVATION, not per run:
+the pipeline mirrors `used`/`refunds` onto the task
+(`subagent_slots_used`/`subagent_slot_refunds` via the gate's
+`on_change` hook) and re-seeds every rebuilt gate from them, so a
+non-user restart of the run (network retry, a comment takeover) does
+NOT return spent slots. The counters reset only at activation
+boundaries: promote_next of a task without an interrupted attempt (a
+fresh queue pickup or a clarification answer) and a run restart via
+_nudge_run (Ctrl+R / stall watchdog). It carries the run's TOTAL slot budget: every spawn
 spends one slot (`used`/`remaining`), and a FAILED spawn (network,
 model refusal, usage cap) returns its slot — but at most
 MAX_SLOT_REFUNDS_PER_RUN (2) times per run, so a systematically
@@ -81,6 +89,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -230,8 +239,11 @@ class SubagentGate:
     total budget subsumes the old concurrency-only cap). Plain int
     arithmetic on the event loop (tool bodies of one run all execute on
     it) is race-free; the pipeline creates one gate per run so a
-    superseded run's gate dies with it — and hands the SAME object to
-    the state-aware tail notice, so the reminder always names the
+    superseded run's gate dies with it — while the BUDGET itself lives
+    on the task (`used`/`refunds` are mirrored out through `on_change`
+    and re-seeded into the next run's gate): a restarted run continues
+    the activation's budget instead of starting over. The pipeline hands
+    the SAME object to the state-aware tail notice, so the reminder always names the
     remaining slots and switches to the "slots used" text at the moment
     the budget is spent (and flips back after a refund)."""
 
@@ -239,6 +251,17 @@ class SubagentGate:
     active: int = 0
     used: int = 0
     refunds: int = 0
+    # Optional change hook invoked by run_delegate_tool after every
+    # BUDGET mutation (a spend or a refund — `active` is run-local and
+    # never reported): the pipeline wires it to mirror `used`/`refunds`
+    # onto the task (`subagent_slots_used`/`subagent_slot_refunds`), so
+    # the per-activation budget survives a run restart. Not part of the
+    # budget arithmetic itself.
+    on_change: Callable[[], None] | None = None
+
+    def _budget_changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
     @property
     def remaining(self) -> int:
@@ -552,6 +575,7 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
         )
     gate.active += 1
     gate.used += 1
+    gate._budget_changed()
     label = _brief_label(brief)
     log_service_event(
         deps,
@@ -677,6 +701,7 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             if gate.refunds < MAX_SLOT_REFUNDS_PER_RUN:
                 gate.refunds += 1
                 gate.used -= 1
+                gate._budget_changed()
                 log_service_event(
                     deps,
                     "subagent",

@@ -608,6 +608,38 @@ def test_promote_next_resumes_unfinished(manager: TaskManager) -> None:
     assert manager.promote_next() is task
 
 
+def test_promote_next_resets_subagent_budget_on_fresh_activation(
+    manager: TaskManager,
+) -> None:
+    """A FRESH activation (a new queue pickup, or a clarification answer —
+    the task is not resuming an interrupted attempt) starts the
+    delegate_research budget over; the spent slots of the previous
+    activation are not carried in."""
+    task = manager.create("t", "x")
+    task.subagent_slots_used = 2
+    task.subagent_slot_refunds = 1
+    assert manager.promote_next() is task
+    assert task.subagent_slots_used == 0
+    assert task.subagent_slot_refunds == 0
+
+
+def test_promote_next_keeps_subagent_budget_on_unfinished_resume(
+    manager: TaskManager,
+) -> None:
+    """A non-user restart of the same activation (network retry,
+    demote-on-failure, app restart — unfinished=True) must NOT return
+    spent slots: the budget is per activation, and the restarted run's
+    gate is re-seeded from these persisted counters."""
+    task = manager.create("t", "x")
+    task.pending_input.clear()
+    task.unfinished = True
+    task.subagent_slots_used = 2
+    task.subagent_slot_refunds = 1
+    assert manager.promote_next() is task
+    assert task.subagent_slots_used == 2
+    assert task.subagent_slot_refunds == 1
+
+
 def test_promote_next_noop_when_active_exists(manager: TaskManager) -> None:
     manager.create("a", "input")
     manager.promote_next()

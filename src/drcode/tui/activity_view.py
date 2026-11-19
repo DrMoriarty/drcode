@@ -441,6 +441,19 @@ class ActivityLayer(DrCodeState):
                 task.unfinished = True
                 task.touch()
                 self.manager.storage.save(task)
+            # A nudge restart (manual Ctrl+R or the stall watchdog) is an
+            # explicit RESTART of the run: the delegate_research budget
+            # starts over (the promote_next reset only fires for re-queued
+            # tasks — a nudged task stays ACTIVE, so the reset must happen
+            # here, OUTSIDE the unfinished guard: a re-nudge of an already
+            # unfinished task restarts the run just the same). The
+            # transcript resumes, the budget does not.
+            task.subagent_slots_used = 0
+            task.subagent_slot_refunds = 0
+            # Persist (the guard above saved only its own flag change —
+            # before this reset).
+            task.touch()
+            self.manager.storage.save(task)
             self._schedule_pipeline_timer(
                 self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
             )

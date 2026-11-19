@@ -670,10 +670,23 @@ class PipelineAgentRunLayer(CoreState):
         )
         # One gate per activation: it carries the run's policy AND the
         # fetch budget, so a superseded run's gate dies with it (the same
-        # reasoning as the subagent gate).
-        web_fetch_gate = (
-            WebFetchGate(web_fetch_policy) if web_fetch_policy is not None else None
-        )
+        # reasoning as the subagent gate). The BUDGET is per activation:
+        # seeded from the task's mirrored counter, so a non-user restart
+        # (network retry, demote-on-failure — run_agent re-enters whole
+        # and lands here again) continues the spent budget instead of
+        # returning the fetches; `on_change` mirrors every spend/refund
+        # back onto the task. The counter resets at the activation
+        # boundaries (promote_next of a non-unfinished task, _nudge_run).
+        web_fetch_gate = None
+        if web_fetch_policy is not None:
+            fetch_gate = WebFetchGate(web_fetch_policy, used=task.web_fetch_used)
+            web_fetch_gate = fetch_gate
+
+            def _record_web_fetch_budget() -> None:
+                task.web_fetch_used = fetch_gate.used
+                self.manager.storage.save(task)
+
+            fetch_gate.on_change = _record_web_fetch_budget
         return root, agent, workflow_instructions, subagent_gate, web_fetch_gate
 
     async def _consume_turn_input(

@@ -560,6 +560,40 @@ def test_gate_default_budget() -> None:
     assert WebFetchGate(ALLOW_ALL).limit == FETCHES_PER_RUN
 
 
+def test_gate_refund_fires_on_change_and_reseed_keeps_budget() -> None:
+    """The budget is per ACTIVATION, not per run: `on_change` mirrors every
+    spend/refund onto the task (`web_fetch_used`), and the restarted run's
+    gate re-seeds from that counter — a network retry / demote-on-failure /
+    app restart never hands the spent fetches back (the twin of the
+    SubagentGate fix for #3e551667)."""
+    mirror: list[int] = []
+    gate = WebFetchGate(ALLOW_ALL, limit=2)
+    gate.on_change = lambda: mirror.append(gate.used)
+
+    # Two spends, one refund (the #91217764 discipline: a failed fetch
+    # returns its slot) — each mutation mirrored.
+    assert gate.take() is None
+    assert gate.take() is None
+    gate.give_back()
+    assert gate.used == 1
+    assert mirror == [1, 2, 1]
+
+    # The restarted run re-seeds its gate from the mirrored counter:
+    # one fetch is gone, not returned.
+    reseeded = WebFetchGate(ALLOW_ALL, limit=2, used=1)
+    assert reseeded.limit - reseeded.used == 1
+    assert reseeded.take() is None  # the last free slot
+    refusal = reseeded.take()
+    assert refusal is not None
+    assert "budget exhausted (2 of 2" in refusal
+
+
+def test_give_back_never_goes_negative() -> None:
+    gate = WebFetchGate(ALLOW_ALL, limit=2)
+    gate.give_back()
+    assert gate.used == 0
+
+
 # -- the tool body ---------------------------------------------------------------
 
 

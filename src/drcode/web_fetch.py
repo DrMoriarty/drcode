@@ -288,12 +288,25 @@ class WebFetchGate:
     Same shape and reasoning as `subagents.SubagentGate`: plain int
     arithmetic on the event loop is race-free (all tool bodies of one run
     execute there), and the pipeline creates one per activation, so a
-    superseded run's gate dies with it.
+    superseded run's gate dies with it. The BUDGET itself lives on the
+    task (`used` is mirrored out through `on_change` and re-seeded into
+    the next run's gate): a non-user restart (network retry, demote-on-
+    failure, app restart with an unfinished resume) continues the
+    activation's budget instead of handing the spent fetches back.
     """
 
     policy: WebFetchPolicy
     limit: int = FETCHES_PER_RUN
     used: int = 0
+    # Optional change hook invoked after every BUDGET mutation (a spend
+    # or a slot refund): the pipeline wires it to mirror `used` onto the
+    # task (`web_fetch_used`), so the per-activation budget survives a
+    # run restart. Not part of the budget arithmetic itself.
+    on_change: Callable[[], None] | None = None
+
+    def _budget_changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
     def take(self) -> str | None:
         """Claim one fetch; returns the plain refusal text when exhausted."""
@@ -304,7 +317,15 @@ class WebFetchGate:
                 "or ask the user if another source is really needed."
             )
         self.used += 1
+        self._budget_changed()
         return None
+
+    def give_back(self) -> None:
+        """Return a slot claimed by `take` for a FAILED fetch (the refund
+        discipline in `run_web_fetch`): the model gets the budget back, the
+        mirror on the task follows through `on_change`."""
+        self.used = max(0, self.used - 1)
+        self._budget_changed()
 
 
 # ---------------------------------------------------------------------------
@@ -944,12 +965,12 @@ async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
         # model gets the explanation as a plain tool result rather than a
         # retry prompt that hides the reason. A failed fetch returns its
         # budget slot.
-        gate.used -= 1
+        gate.give_back()
         reason = str(e)
         log_service_event(deps, "web-fetch", f"web_fetch {url} failed: {reason}")
         return _fetch_failure_text(reason)
     except Exception as e:  # noqa: BLE001 - a fetch failure never kills the run
-        gate.used -= 1
+        gate.give_back()
         log_service_event(
             deps, "web-fetch", f"web_fetch {url} failed: {type(e).__name__}: {e}"
         )

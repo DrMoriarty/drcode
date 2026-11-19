@@ -450,6 +450,7 @@ class ActivityLayer(DrCodeState):
             # transcript resumes, the budget does not.
             task.subagent_slots_used = 0
             task.subagent_slot_refunds = 0
+            task.web_fetch_used = 0
             # Persist (the guard above saved only its own flag change —
             # before this reset).
             task.touch()

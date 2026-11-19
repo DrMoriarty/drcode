@@ -238,6 +238,15 @@ async def test_guard_recheck_blocks_rerun_until_clean(app_env: DrCodeApp) -> Non
         await asyncio.to_thread(app._unmerged_completed_ids)
         app._maybe_rerun_pending_installs()
         await wait_until(lambda: marker.exists(), pilot, what="deferred install ran")
+        # The worker clears install_pending only AFTER the hook subprocess
+        # returns — under parallel-suite load the marker can appear while
+        # the worker is still in flight; wait on the state (same race as
+        # test_deferred_rerun_after_manual_merge_once).
+        await wait_until(
+            lambda: not task.install_pending,
+            pilot,
+            what="deferred install state cleared",
+        )
         await pilot.pause()
         assert len(marker.read_text().splitlines()) == 1  # exactly once
         assert not task.install_pending

@@ -28,6 +28,7 @@ from drcode.tui.goal_screen import (
 )
 from drcode.tui.inputs import ChatInput, NewTaskInput
 from drcode.tui.sidebar import TaskItem
+from tests.network_mocks import wait_until
 
 
 @pytest.fixture
@@ -380,10 +381,13 @@ async def test_goal_screen_research_task(app: DrCodeApp) -> None:
         screen = _open_screen(app)
         await pilot.pause()
         screen.action_research_task()
-        await pilot.pause()
-        # The screen closes; an ordinary research task is created with the
-        # goal reference and the chat input holds the prompt stub.
-        assert not isinstance(app.screen, GoalScreen)
+        # The screen close is an async round-trip — under xdist load a
+        # single pause() can race the switch; poll instead of asserting.
+        await wait_until(
+            lambda: not isinstance(app.screen, GoalScreen),
+            pilot,
+            what="GoalScreen closed",
+        )
         research = [
             t for t in app.manager.tasks.values() if t.kind is TaskKind.RESEARCH
         ]

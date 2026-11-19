@@ -12,7 +12,7 @@ receive live here too.
 from __future__ import annotations
 
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import RunUsage
 
 from . import agent_model, task_search, tools
@@ -375,6 +376,7 @@ def build_agent(
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
+    mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[AgentDeps, str]:
     """Build the coding agent. Every task kind gets a dedicated system prompt:
     bug tasks instruct minimal changes, feature tasks encourage refactoring and
@@ -538,6 +540,13 @@ def build_agent(
         deps_type=AgentDeps,
         model_settings=agent_model.base_model_settings(config),
         retries=10,
+        # External MCP servers (docs/mcp-client-design.md §2): the caller
+        # resolves them per role via mcp.mcp_toolsets_for at activation —
+        # always prefixed, fresh per activation; None/[] changes nothing
+        # (the pre-feature behavior). The context-layout estimation path
+        # deliberately passes nothing: MCP tool schemas are counted by the
+        # stage-2 budget work, not here.
+        toolsets=list(mcp_toolsets) if mcp_toolsets else None,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime):
     # wrapped around the agent's own function toolset so every registered
@@ -1371,6 +1380,7 @@ def build_tester_agent(
     task_id: str | None = None,
     code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
+    mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[TesterDeps, str]:
     """Build the QA tester agent.
 
@@ -1418,6 +1428,9 @@ def build_tester_agent(
         deps_type=TesterDeps,
         model_settings=agent_model.base_model_settings(config),
         retries=10,
+        # External MCP servers (docs/mcp-client-design.md §2): resolved per
+        # role by the caller; None/[] changes nothing.
+        toolsets=list(mcp_toolsets) if mcp_toolsets else None,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
     attach_batch_guard(agent, config.tool_batch_limit)
@@ -1754,6 +1767,7 @@ def build_resolver_agent(
     task_id: str | None = None,
     code_index: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
+    mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the merge-conflict resolver agent.
 
@@ -1792,6 +1806,9 @@ def build_resolver_agent(
         deps_type=ResolverDeps,
         model_settings=agent_model.base_model_settings(config),
         retries=10,
+        # External MCP servers (docs/mcp-client-design.md §2): resolved per
+        # role by the caller; None/[] changes nothing.
+        toolsets=list(mcp_toolsets) if mcp_toolsets else None,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
     attach_batch_guard(agent, config.tool_batch_limit)
@@ -1931,6 +1948,7 @@ def build_resolver_reviewer_agent(
     *,
     root: Path | None = None,
     announce_wait: agent_model.WaitAnnouncer | None = None,
+    mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[ResolverDeps, str]:
     """Build the intent-preservation reviewer of a resolved merge.
 
@@ -1949,6 +1967,11 @@ def build_resolver_reviewer_agent(
         deps_type=ResolverDeps,
         model_settings=agent_model.base_model_settings(config),
         retries=10,
+        # External MCP servers (docs/mcp-client-design.md §2): the seam
+        # exists for format completeness, but the production caller passes
+        # NOTHING here on purpose — the reviewer is a read-only intent
+        # check and must not gain external side-effecting tools.
+        toolsets=list(mcp_toolsets) if mcp_toolsets else None,
     )
     # Degenerate-batch guard (dedup + per-response cap, see tool_runtime).
     attach_batch_guard(agent, config.tool_batch_limit)

@@ -349,6 +349,9 @@ class PipelineTesterLayer(CoreState):
                 task_id=task_id,
                 # Provider slot-wait visibility (see _wait_announcer).
                 announce_wait=self._wait_announcer(task_id, AgentRole.TESTER),
+                # External MCP servers (docs/mcp-client-design.md §2), read
+                # at activation; empty roles matrix = none.
+                mcp_toolsets=self._mcp_toolsets(task, AgentRole.TESTER),
             )
             deps = TesterDeps(
                 root=root,

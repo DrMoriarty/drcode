@@ -71,6 +71,24 @@ def _mcp_submodules():
     return names
 
 
+def _fastmcp_submodules():
+    """fastmcp submodules, enumerated from the filesystem WITHOUT importing
+    (see the hiddenimports comment for why collect_submodules is unsafe
+    here). No exclusions: optional-but-broken subtrees (fastmcp.cli,
+    fastmcp.apps, the openapi transforms) sit in the bundle unused — the
+    client path (fastmcp.client.*) imports none of them."""
+    import fastmcp
+
+    root = Path(fastmcp.__file__).parent
+    names = ["fastmcp"]
+    for path in sorted(root.rglob("*.py")):
+        parts = list(path.relative_to(root.parent).with_suffix("").parts)
+        if "__init__" in parts:
+            parts.remove("__init__")
+        names.append(".".join(parts))
+    return names
+
+
 a = Analysis(
     [str(ROOT / "drcode_entry.py")],
     pathex=[str(ROOT / "src")],
@@ -128,6 +146,21 @@ a = Analysis(
         # request instead of at import time.
         "mcp",
         *_mcp_submodules(),
+        # External MCP client path (drcode.mcp.client_toolsets, §6 of
+        # docs/mcp-client-design.md): pydantic-ai's MCPToolset rides on
+        # the fastmcp client, which drcode's own server code never
+        # imports — static analysis misses it entirely. The tree is
+        # enumerated from the FILESYSTEM (same trick as _mcp_submodules)
+        # rather than PyInstaller's collect_submodules: that one imports
+        # every subpackage to walk it, and the slim fastmcp install has
+        # optional subtrees that fail to import (fastmcp.cli demands the
+        # full package's typer CLI, fastmcp.apps the prefab-ui extra) —
+        # collection would die at build time exactly like mcp.cli did.
+        # Bundling an unimportable optional module is harmless: nothing
+        # on the client path imports it. A half-collected bundle fails
+        # at the first request instead of at import time.
+        "fastmcp",
+        *_fastmcp_submodules(),
         "uvicorn",
         *collect_submodules("uvicorn"),
         "starlette",

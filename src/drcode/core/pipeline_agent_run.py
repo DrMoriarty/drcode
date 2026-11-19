@@ -684,6 +684,12 @@ class PipelineAgentRunLayer(CoreState):
             # longer than agent_model.THROTTLE_WAIT_ANNOUNCE_SECONDS says so
             # in the task's chat instead of looking like a hung run.
             announce_wait=self._wait_announcer(task_id, role),
+            # External MCP servers (docs/mcp-client-design.md §2): read at
+            # activation from the user + project mcp-servers.json layers,
+            # gated by the roles matrix (empty = none, the safe default).
+            # Note the MAIN project root — under worktree isolation the
+            # project config lives in the main checkout's .drcode/.
+            mcp_toolsets=self._mcp_toolsets(task, role),
         )
         # One gate per activation: it carries the run's policy AND the
         # fetch budget, so a superseded run's gate dies with it (the same

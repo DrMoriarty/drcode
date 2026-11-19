@@ -2268,7 +2268,9 @@ def _run_js_driver(driver: str, region: str, tmp_path: Path) -> dict:
     half-upgraded Homebrew leaves node linked against a removed
     libsimdutf), fall back to bun, which runs the same CommonJS driver.
     A genuine script failure is never masked: the fallback triggers only
-    on a dyld loader error in the runner's stderr."""
+    on a dyld loader error in the runner's stderr, and if EVERY available
+    runner is loader-broken the test is skipped — a broken interpreter is
+    an environment defect, not a regression in the shipped JS."""
     if shutil.which("node") is None and shutil.which("bun") is None:
         pytest.skip("neither node nor bun is available")
     region_file = tmp_path / "js_region.js"
@@ -2277,6 +2279,7 @@ def _run_js_driver(driver: str, region: str, tmp_path: Path) -> dict:
     driver_file.write_text(driver, encoding="utf-8")
 
     last: subprocess.CompletedProcess[str] | None = None
+    loader_broken = True  # stays True only if EVERY failure is a loader error
     for runner in filter(None, (shutil.which("node"), shutil.which("bun"))):
         last = subprocess.run(
             [runner, str(driver_file), str(region_file)],
@@ -2288,7 +2291,10 @@ def _run_js_driver(driver: str, region: str, tmp_path: Path) -> dict:
         if last.returncode == 0:
             return json.loads(last.stdout)
         if "dyld[" not in last.stderr:
+            loader_broken = False
             break  # the script itself failed — don't mask it with another runner
+    if loader_broken and last is not None:
+        pytest.skip(f"JS runner cannot load (broken dylib): {last.stderr.strip()}")
     assert last is not None and last.returncode == 0, (
         last.stderr if last else "no JS runner available"
     )

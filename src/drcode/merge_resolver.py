@@ -530,11 +530,95 @@ def _venv_env(python_cmd: list[str], base_env: dict[str, str] | None) -> dict[st
 
 def _python_files(worktree: Path) -> list[str]:
     """Tracked .py files of the worktree (git ls-files — the worktree may
-    sit on a branch with different content than the main checkout)."""
+    sit on a branch with different content than the main checkout).
+    Deduplicated: with a merge parked in the index `git ls-files` lists
+    every unmerged path once per STAGE — three entries per conflicted
+    file (the 368b22bd command showed `agent_build.py`/`models.py` three
+    times each) — so the conflicted set used to be compiled threefold."""
     code, out = _git("ls-files", "*.py", cwd=worktree)
     if code != 0:
         return []
-    return [line for line in out.splitlines() if line.strip()]
+    return list(dict.fromkeys(line for line in out.splitlines() if line.strip()))
+
+
+def _compile_python(worktree: Path) -> list[str]:
+    """Interpreter for the py_compile chunks. In a frozen (PyInstaller)
+    bundle `sys.executable` is the drcode binary itself — it CAN run
+    `-m py_compile`, but bootstrapping the whole frozen runtime per chunk
+    is dramatically slower than a plain interpreter (the 368b22bd round:
+    every 400-file chunk timed out on a loaded machine and the round was
+    abandoned). Prefer a real interpreter: the worktree's own .venv, the
+    main checkout's .venv (an isolated task worktree usually has only a
+    skeleton venv), then a PATH python3; the frozen stub stays only as
+    the last resort."""
+    if not getattr(sys, "frozen", False):
+        return [sys.executable]
+    candidates: list[Path] = []
+    if (venv := _venv_python(worktree)) is not None:
+        candidates.append(venv)
+    if (main_root := _main_checkout_root(worktree)) is not None and (
+        main_python := _venv_python(main_root)
+    ) is not None:
+        candidates.append(main_python)
+    if (path_python := shutil.which("python3")) is not None:
+        candidates.append(Path(path_python))
+    candidates.append(Path(sys.executable))
+    for candidate in candidates:
+        if candidate.exists():
+            return [str(candidate)]
+    return [sys.executable]
+
+
+def _compile_chunks(
+    worktree: Path, py_files: list[str], python_cmd: list[str]
+) -> CheckResult:
+    """Byte-compile `py_files` in chunks (a single command line with
+    thousands of paths can overflow the OS arg limit). A chunk TIMEOUT is
+    a FAILED check with an explicit message — never an escaping
+    exception: an uncaught `TimeoutExpired` used to bubble into the
+    resolver round's generic error path and restart the WHOLE round on
+    backoff, burning the entire retry budget on an environmental problem
+    no repair round can fix (368b22bd). The per-chunk timeout scales with
+    the chunk size (1 s per file, at least `_TIMEOUT`) — a fixed 120 s
+    per command is not headroom enough for a cold interpreter on a
+    loaded machine."""
+    chunk = 400
+    ok = True
+    output: list[str] = []
+    for i in range(0, len(py_files), chunk):
+        files = py_files[i : i + chunk]
+        timeout = max(_TIMEOUT, len(files))
+        try:
+            proc = subprocess.run(
+                [*python_cmd, "-m", "py_compile", *files],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                **child_priority_kwargs(),
+            )
+        except subprocess.TimeoutExpired:
+            ok = False
+            output.append(
+                f"py_compile timed out after {timeout} s (chunk of "
+                f"{len(files)} files, interpreter {python_cmd[0]}) — an "
+                "environment problem, not a compile error"
+            )
+            # Remaining chunks would time out for the same reason.
+            break
+        if proc.returncode != 0:
+            ok = False
+            output.append(
+                strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()[
+                    :4000
+                ]
+            )
+    return CheckResult(
+        name="compile (py_compile of tracked .py files)",
+        ok=ok,
+        output="\n".join(output)[:8000],
+    )
 
 
 def compile_check(worktree: Path) -> CheckResult:
@@ -549,33 +633,7 @@ def compile_check(worktree: Path) -> CheckResult:
             skipped=True,
             output="no tracked .py files",
         )
-    # Chunk the compile check: a single command line with thousands of
-    # paths can overflow the OS arg limit.
-    chunk = 400
-    ok = True
-    output: list[str] = []
-    for i in range(0, len(py_files), chunk):
-        proc = subprocess.run(
-            [sys.executable, "-m", "py_compile", *py_files[i : i + chunk]],
-            cwd=worktree,
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
-            check=False,
-            **child_priority_kwargs(),
-        )
-        if proc.returncode != 0:
-            ok = False
-            output.append(
-                strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()[
-                    :4000
-                ]
-            )
-    return CheckResult(
-        name="compile (py_compile of tracked .py files)",
-        ok=ok,
-        output="\n".join(output)[:8000],
-    )
+    return _compile_chunks(worktree, py_files, _compile_python(worktree))
 
 
 # The funnel judges the RESULT OF THE MERGE, not pre-existing lint debt in
@@ -637,37 +695,7 @@ def mechanical_checks(
     marker scan to the conflicted set; None scans the unmerged index
     entries (or skips when no merge is in progress)."""
     results: list[CheckResult] = [conflict_marker_check(worktree, paths)]
-    py_files = _python_files(worktree)
-    if py_files:
-        # Chunk the compile check: a single command line with thousands of
-        # paths can overflow the OS arg limit.
-        chunk = 400
-        ok = True
-        output: list[str] = []
-        for i in range(0, len(py_files), chunk):
-            proc = subprocess.run(
-                [sys.executable, "-m", "py_compile", *py_files[i : i + chunk]],
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-                check=False,
-                **child_priority_kwargs(),
-            )
-            if proc.returncode != 0:
-                ok = False
-                output.append(
-                    strip_malloc_stack_logging_noise(proc.stdout + proc.stderr).strip()[
-                        :4000
-                    ]
-                )
-        results.append(
-            CheckResult(
-                name="compile (py_compile of tracked .py files)",
-                ok=ok,
-                output="\n".join(output)[:8000],
-            )
-        )
+    results.append(compile_check(worktree))
     # ruff/pyright MUST come from the project's own environment: a random
     # PATH binary carries a different default ruleset/version and reports
     # phantom failures (e.g. DTZ005 from an old ruff) that roll back a

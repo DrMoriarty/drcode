@@ -308,6 +308,8 @@
       desiredBadge: null,
       flowOutstanding: 0, // bytes queued into xterm.js, not yet processed
       flowPaused: false,  // pause frame sent, resume not yet sent
+      webglRecoverTimer: null,   // pending delayed recovery after a context loss
+      webglRecoverAttempts: [],  // timestamps of past recovery attempts (budgeted)
     };
     tabs.push(tab);
 
@@ -527,6 +529,10 @@
       dialogTab = null;
       hideDialog();
     }
+    if (tab.webglRecoverTimer) {
+      clearTimeout(tab.webglRecoverTimer);
+      tab.webglRecoverTimer = null;
+    }
     if (tab.term) {
       try { tab.term.dispose(); } catch (err) { /* already gone */ }
     }
@@ -563,9 +569,9 @@
    * to mistake for network/server lag. Surface it as an unobtrusive,
    * auto-hiding toast, shown ONCE per tab (keyed by tab id: font changes
    * re-run the WebGL setup path and must not re-toast; a repeated context
-   * loss on the same tab must not spam either). No WebGL reload is
-   * attempted after a loss — re-arming a half-dead context is risky;
-   * alerting the user is the whole job here. */
+   * loss on the same tab must not spam either). A lost context itself is
+   * handled by the recovery section below — the toast only reports what
+   * the user actually sees (fallback active / renderer restored). */
 
   var WEBGL_FALLBACK_MESSAGE = "WebGL renderer unavailable — slow DOM fallback is active (the terminal may feel sluggish).";
   var elToast = null;
@@ -596,6 +602,93 @@
 
   function webglFallbackToast(tab) {
     showToastOnce(tab.id, WEBGL_FALLBACK_MESSAGE);
+  }
+
+  /* ---------------- WebGL context-loss recovery ----------------
+   * A revoked WebGL context leaves the glyph atlas invalid: the renderer
+   * either stays on WebGL and draws garbage (overlapping glyphs, drifting
+   * lines) or silently degrades to the DOM renderer. Disposing alone (the
+   * old behavior) never heals the picture — the user had to change the
+   * font by hand to get WebGL back.
+   *
+   * Recovery here reuses the SAME full-recreate path the font change
+   * uses — dispose the dead addon and load a fresh WebglAddon with a
+   * fresh glyph atlas — never a re-arm of the half-dead context (a fresh
+   * addon constructs a brand-new context, which is the proven-safe way
+   * in). The delay before the attempt gives a memory-pressured webview a
+   * beat to settle. Attempts are budgeted (N per rolling window) so a
+   * webview that keeps refusing to hand out a healthy context cannot
+   * thrash: once the budget is gone the tab stays on the DOM fallback
+   * (functional, just slower). A programmatic page reload — which would
+   * drop the client tab model along with its live PTY sessions — is
+   * deliberately NOT part of the ladder.
+   *
+   * All of this is presentation-only: the PTY, the ws connection and the
+   * terminal buffer are untouched, and the DOM renderer keeps the session
+   * readable the whole time. */
+
+  var WEBGL_RESTORED_MESSAGE = "WebGL renderer restored.";
+  var WEBGL_RECOVER_DELAY_MS = 300;   // settle before re-arming under memory pressure
+  var WEBGL_RECOVER_MAX_ATTEMPTS = 3; // per rolling window
+  var WEBGL_RECOVER_WINDOW_MS = 10000;
+
+  function attachWebgl(tab) {
+    try {
+      tab.webgl = new window.WebglAddon.WebglAddon();
+      tab.webgl.onContextLoss(function () {
+        handleWebglContextLoss(tab);
+      });
+      tab.term.loadAddon(tab.webgl);
+      return true;
+    } catch (err) {
+      tab.webgl = null; /* DOM renderer fallback */
+      return false;
+    }
+  }
+
+  function disposeWebgl(tab) {
+    if (!tab.webgl) return;
+    try { tab.webgl.dispose(); } catch (err) { /* already gone */ }
+    tab.webgl = null;
+  }
+
+  function handleWebglContextLoss(tab) {
+    disposeWebgl(tab);       // xterm falls back to the DOM renderer at once
+    webglFallbackToast(tab); // once per tab — repeated losses must not spam
+    scheduleWebglRecovery(tab);
+  }
+
+  function scheduleWebglRecovery(tab) {
+    if (tab.webglRecoverTimer) clearTimeout(tab.webglRecoverTimer);
+    tab.webglRecoverTimer = setTimeout(function () {
+      tab.webglRecoverTimer = null;
+      recoverWebgl(tab);
+    }, WEBGL_RECOVER_DELAY_MS);
+  }
+
+  function webglRecoverBudgetExhausted(tab) {
+    var now = Date.now();
+    tab.webglRecoverAttempts = tab.webglRecoverAttempts.filter(function (at) {
+      return now - at < WEBGL_RECOVER_WINDOW_MS;
+    });
+    return tab.webglRecoverAttempts.length >= WEBGL_RECOVER_MAX_ATTEMPTS;
+  }
+
+  function recoverWebgl(tab) {
+    if (!tab.term || !tab.elTerm || !tab.elTerm.parentNode) return; // tab is gone/closed
+    if (tab.webgl) return; // already healthy (e.g. a font change recreated it meanwhile)
+    if (webglRecoverBudgetExhausted(tab)) {
+      webglFallbackToast(tab); // DOM fallback stays; the session is untouched
+      return;
+    }
+    tab.webglRecoverAttempts.push(Date.now());
+    disposeWebgl(tab); // no-op unless a stale addon survived the loss event
+    if (!attachWebgl(tab)) {
+      webglFallbackToast(tab);
+      return;
+    }
+    tab.webglRecoverAttempts = []; // healthy again — a fresh budget for the next loss
+    showToastOnce(tab.id + ":restored", WEBGL_RESTORED_MESSAGE);
   }
 
   /* ---------------- terminal setup (per tab) ---------------- */
@@ -629,16 +722,8 @@
     tab.fit = new window.FitAddon.FitAddon();
     tab.term.loadAddon(tab.fit);
     tab.term.open(tab.elTerm);
-    try {
-      tab.webgl = new window.WebglAddon.WebglAddon();
-      tab.webgl.onContextLoss(function () {
-        if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
-        webglFallbackToast(tab); // xterm falls back to DOM renderer — say so
-      });
-      tab.term.loadAddon(tab.webgl);
-    } catch (err) {
-      tab.webgl = null;
-      /* no WebGL — the default renderer keeps everything working */
+    if (!attachWebgl(tab)) {
+      /* no WebGL at all — the default renderer keeps everything working */
       webglFallbackToast(tab);
     }
     tab.term.attachCustomKeyEventHandler(function (ev) {
@@ -665,20 +750,17 @@
    */
 
   function recreateWebgl(tab) {
-    if (!tab.webgl) return;
-    try { tab.webgl.dispose(); } catch (err) { /* already gone */ }
-    tab.webgl = null;
-    try {
-      tab.webgl = new window.WebglAddon.WebglAddon();
-      tab.webgl.onContextLoss(function () {
-        if (tab.webgl) { tab.webgl.dispose(); tab.webgl = null; }
-        webglFallbackToast(tab);
-      });
-      tab.term.loadAddon(tab.webgl);
-    } catch (err) {
-      tab.webgl = null; /* DOM renderer fallback */
+    if (!tab.term) return;
+    disposeWebgl(tab);
+    if (!attachWebgl(tab)) {
       webglFallbackToast(tab);
+      return;
     }
+    /* A user-driven font change just proved the webview can hand out a
+     * healthy context — renew the recovery budget. (This also re-arms
+     * WebGL on a tab whose recovery budget ran out: it is the same
+     * attach path, and the user explicitly asked for a re-render.) */
+    tab.webglRecoverAttempts = [];
   }
 
   function refitAfterFontChange(tab) {

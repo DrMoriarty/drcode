@@ -2127,8 +2127,8 @@ def _toast_region(js: str) -> str:
 
 
 def test_term_js_webgl_fallback_toast_wiring() -> None:
-    """Both silent WebGL fallback paths — context loss and the failed
-    addon load/creation (the catch also covers a machine without WebGL
+    """The WebGL fallback paths — context loss and the failed addon
+    load/creation (the catch also covers a machine without WebGL
     entirely) — must surface the once-per-tab toast; normal operation and
     the font-change recreate path must not toast on their own."""
     js = _term_js()
@@ -2140,17 +2140,47 @@ def test_term_js_webgl_fallback_toast_wiring() -> None:
     wrapper = region[region.index("function webglFallbackToast") :]
     assert "showToastOnce(tab.id" in wrapper
 
-    setup = js[js.index("function createTerminalFor") : js.index("/* ---------------- font settings")]
-    recreate = js[js.index("function recreateWebgl") : js.index("function refitAfterFontChange")]
+    # Initial setup and the font-change recreate path: each toasts ONLY
+    # when the addon attach fails (nothing unconditional — a mere font
+    # change must never re-toast).
+    setup = js[
+        js.index("function createTerminalFor") : js.index(
+            "/* ---------------- font settings"
+        )
+    ]
+    recreate = js[
+        js.index("function recreateWebgl") : js.index("function refitAfterFontChange")
+    ]
     for block in (setup, recreate):
-        # Exactly two trigger points per block: the onContextLoss callback
-        # and the catch branch — nothing unconditional (a mere font change
-        # must never re-toast).
-        assert block.count("webglFallbackToast(tab)") == 2
-        loss_at = block.index("onContextLoss")
-        assert block.index("webglFallbackToast(tab)", loss_at) > loss_at
-    # The catch branch is the "no WebGL at all" path and also toasts.
-    assert "webglFallbackToast(tab);" in setup[setup.index("} catch (err)") :]
+        assert block.count("webglFallbackToast(tab)") == 1
+        assert "if (!attachWebgl(tab))" in block
+
+    # The recovery section owns the context-loss wiring: attachWebgl
+    # registers onContextLoss → handleWebglContextLoss, which disposes the
+    # dead addon (DOM fallback kicks in at once) and schedules a
+    # budgeted recreate.
+    recovery = js[
+        js.index("/* ---------------- WebGL context-loss recovery") : js.index(
+            "/* ---------------- terminal setup (per tab) ---------------- */"
+        )
+    ]
+    loss_at = recovery.index("onContextLoss")
+    handler_at = recovery.index("handleWebglContextLoss(tab)", loss_at)
+    loss_handler = recovery[
+        recovery.index("function handleWebglContextLoss") : recovery.index(
+            "function scheduleWebglRecovery"
+        )
+    ]
+    assert handler_at > loss_at
+    assert loss_handler.index("disposeWebgl(tab)") < loss_handler.index(
+        "webglFallbackToast(tab)"
+    )
+    assert "scheduleWebglRecovery(tab)" in loss_handler
+    assert "function recoverWebgl" in recovery
+    # Recovery is budgeted, never a page reload (a reload would drop the
+    # client tab model with its live PTY sessions).
+    assert "WEBGL_RECOVER_MAX_ATTEMPTS" in recovery
+    assert "location.reload" not in js
 
     css = (DESKTOP_DIR / "web" / "style.css").read_text(encoding="utf-8")
     toast = css[css.index(".toast {") : css.index(".boot-error")]
@@ -2232,26 +2262,44 @@ console.log(JSON.stringify({
 """
 
 
+def _run_js_driver(driver: str, region: str, tmp_path: Path) -> dict:
+    """Run a node driver script against a JS region and return its JSON
+    output. If the node binary itself cannot load (broken dylib — e.g. a
+    half-upgraded Homebrew leaves node linked against a removed
+    libsimdutf), fall back to bun, which runs the same CommonJS driver.
+    A genuine script failure is never masked: the fallback triggers only
+    on a dyld loader error in the runner's stderr."""
+    if shutil.which("node") is None and shutil.which("bun") is None:
+        pytest.skip("neither node nor bun is available")
+    region_file = tmp_path / "js_region.js"
+    region_file.write_text(region, encoding="utf-8")
+    driver_file = tmp_path / "js_driver.js"
+    driver_file.write_text(driver, encoding="utf-8")
+
+    last: subprocess.CompletedProcess[str] | None = None
+    for runner in filter(None, (shutil.which("node"), shutil.which("bun"))):
+        last = subprocess.run(
+            [runner, str(driver_file), str(region_file)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if last.returncode == 0:
+            return json.loads(last.stdout)
+        if "dyld[" not in last.stderr:
+            break  # the script itself failed — don't mask it with another runner
+    assert last is not None and last.returncode == 0, (
+        last.stderr if last else "no JS runner available"
+    )
+    raise AssertionError("unreachable")  # the assert above always raises
+
+
 def test_term_js_toast_logic(tmp_path: Path) -> None:
     """The extracted toast helper actually runs (node): it shows a single
     element, hides it via the scheduled timer, dedups repeated keys, and
     re-shows for a new key."""
-    if shutil.which("node") is None:
-        pytest.skip("node is not available")
-    region_file = tmp_path / "toast_region.js"
-    region_file.write_text(_toast_region(_term_js()), encoding="utf-8")
-    driver_file = tmp_path / "toast_driver.js"
-    driver_file.write_text(TOAST_NODE_DRIVER, encoding="utf-8")
-
-    proc = subprocess.run(
-        ["node", str(driver_file), str(region_file)],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, proc.stderr
-    result = json.loads(proc.stdout)
+    result = _run_js_driver(TOAST_NODE_DRIVER, _toast_region(_term_js()), tmp_path)
 
     assert result["visibleMs"] > 0
     assert result["hasWebglToast"] == "function"
@@ -2279,3 +2327,211 @@ def test_term_js_toast_logic(tmp_path: Path) -> None:
 
     # A new key toasts again (once-per-key, not once-per-session).
     assert result["state5"]["text"] == "m3"
+
+
+# web/term.js — WebGL context-loss recovery (node-run logic)
+# ---------------------------------------------------------------------------
+
+
+def _recovery_region(js: str) -> str:
+    """The self-contained WebGL recovery block, bounded by its section
+    comment and the terminal-setup marker (concatenated with the toast
+    region it depends on, then executed verbatim by the node test)."""
+    start = js.index("/* ---------------- WebGL context-loss recovery")
+    end = js.index("/* ---------------- terminal setup (per tab) ---------------- */")
+    return js[start:end]
+
+
+WEBGL_RECOVERY_NODE_DRIVER = """
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+
+// Controllable state: the fake addon's failure mode and the clock the
+// recovery budget's rolling window reads.
+const state = { throwMode: null, now: 1000000 };
+
+class FakeWebglAddon {
+  constructor() {
+    if (state.throwMode === "construct") throw new Error("no WebGL context");
+    this.disposed = false;
+    this.lossCb = null;
+  }
+  onContextLoss(cb) { this.lossCb = cb; }
+  dispose() {
+    if (state.throwMode === "dispose") throw new Error("context gone");
+    this.disposed = true;
+  }
+  fireLoss() { if (this.lossCb) this.lossCb(); }
+}
+
+// Timers are recorded, not run — the test fires them explicitly by delay.
+const timers = [];
+let timerSeq = 0;
+const setTimeoutStub = (fn, ms) => {
+  const id = ++timerSeq;
+  timers.push({ id, fn, ms });
+  return id;
+};
+const clearTimeoutStub = (id) => {
+  const i = timers.findIndex((t) => t.id === id);
+  if (i >= 0) timers.splice(i, 1);
+};
+function fireTimers(ms) {
+  for (let i = timers.length - 1; i >= 0; i--) {
+    if (timers[i].ms === ms) timers.splice(i, 1)[0].fn();
+  }
+}
+
+// Minimal DOM stub for the toast helpers (same shape as the toast driver).
+function makeEl() {
+  const classes = new Set();
+  return {
+    className: "",
+    textContent: "",
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+    },
+  };
+}
+const created = [];
+const documentStub = {
+  createElement: () => { const el = makeEl(); created.push(el); return el; },
+  body: { appendChild: () => {} },
+};
+const DateStub = { now: () => state.now };
+
+function makeTab(id) {
+  return {
+    id,
+    term: { addons: [], loadAddon(a) { this.addons.push(a); } },
+    elTerm: { parentNode: {} },
+    webgl: null,
+    webglRecoverTimer: null,
+    webglRecoverAttempts: [],
+  };
+}
+const windowStub = { WebglAddon: { WebglAddon: FakeWebglAddon } };
+
+const holder = {};
+const full = src +
+  "\\n;holder.api = { attachWebgl, handleWebglContextLoss, scheduleWebglRecovery," +
+  " recoverWebgl, recreateWebgl, delay: WEBGL_RECOVER_DELAY_MS," +
+  " restoredMessage: WEBGL_RESTORED_MESSAGE };";
+new Function(
+  "document", "setTimeout", "clearTimeout", "Date", "window", "holder", full
+)(documentStub, setTimeoutStub, clearTimeoutStub, DateStub, windowStub, holder);
+const api = holder.api;
+
+const tab = makeTab("t1");
+const toastText = () => (created.length ? created[0].textContent : null);
+const toastVisible = () => (created.length ? !created[0].classList.contains("hidden") : null);
+const out = {};
+
+// 1. A healthy attach loads exactly one addon, schedules nothing.
+out.attach = {
+  ok: api.attachWebgl(tab),
+  addonCount: tab.term.addons.length,
+  timers: timers.length,
+};
+
+// 2. Context loss: the dead addon is disposed (xterm drops to the DOM
+//    renderer at once), the once-per-tab fallback toast shows, and ONE
+//    delayed recovery timer is armed.
+tab.webgl.fireLoss();
+out.loss = {
+  webglGone: tab.webgl === null,
+  addonDisposed: tab.term.addons[0].disposed,
+  toastText: toastText(),
+  toastVisible: toastVisible(),
+  delayTimerScheduled: timers.some((t) => t.ms === api.delay),
+};
+
+// 3. The recovery timer fires with a cooperative webview: a fresh addon
+//    (fresh glyph atlas) is attached, the budget is renewed and the
+//    restored toast shows under its own dedup key.
+fireTimers(api.delay);
+out.recovered = {
+  webglBack: tab.webgl !== null,
+  freshAddon: tab.term.addons.length === 2 && !tab.term.addons[1].disposed,
+  attempts: tab.webglRecoverAttempts.length,
+  toastText: toastText(),
+};
+
+// 4. Repeated losses with a refusing webview (constructor throws) burn
+//    the budget one attempt per loss, never crash.
+state.throwMode = "construct";
+for (let i = 0; i < 3; i++) {
+  api.handleWebglContextLoss(tab);
+  fireTimers(api.delay);
+}
+out.budget = {
+  attempts: tab.webglRecoverAttempts.length,
+  webglStillNull: tab.webgl === null,
+};
+
+// 5. Over budget: a further recovery is a no-op (attempt not recorded).
+api.scheduleWebglRecovery(tab);
+fireTimers(api.delay);
+out.exhausted = { attempts: tab.webglRecoverAttempts.length };
+
+// 6. Beyond the rolling window the budget is fresh again (the attempt
+//    is recorded once more, the constructor still refuses).
+state.now += 60000;
+api.scheduleWebglRecovery(tab);
+fireTimers(api.delay);
+out.afterWindow = { attempts: tab.webglRecoverAttempts.length };
+
+// 7. A user-driven font change renews the budget on success.
+state.throwMode = null;
+api.recreateWebgl(tab);
+out.recreate = {
+  webglBack: tab.webgl !== null,
+  attempts: tab.webglRecoverAttempts.length,
+};
+
+// 8. recoverWebgl is a no-op while the addon is already healthy.
+const addonsBefore = tab.term.addons.length;
+const timersBefore = timers.length;
+api.recoverWebgl(tab);
+out.guard = {
+  noNewAddon: tab.term.addons.length === addonsBefore,
+  noNewTimer: timers.length === timersBefore,
+};
+
+console.log(JSON.stringify(out));
+"""
+
+
+def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
+    """The context-loss recovery path actually runs (node): a loss
+    disposes the addon and arms a delayed recreate; a successful recreate
+    restores WebGL and renews the budget; a refusing webview exhausts the
+    budget into a stable DOM fallback, which the rolling window and a
+    font change both renew."""
+    js = _term_js()
+    # recreateWebgl lives in the font-settings section — append its body so
+    # the budget-renewal step runs against the real implementation.
+    recreate = js[js.index("function recreateWebgl") : js.index("function refitAfterFontChange")]
+    region = _toast_region(js) + "\n;" + _recovery_region(js) + "\n;" + recreate
+    out = _run_js_driver(WEBGL_RECOVERY_NODE_DRIVER, region, tmp_path)
+
+    assert out["attach"] == {"ok": True, "addonCount": 1, "timers": 0}
+
+    loss = out["loss"]
+    assert loss["webglGone"] and loss["addonDisposed"]
+    assert loss["toastText"] == "WebGL renderer unavailable — slow DOM fallback is active (the terminal may feel sluggish)."
+    assert loss["toastVisible"]
+    assert loss["delayTimerScheduled"]
+
+    recovered = out["recovered"]
+    assert recovered["webglBack"] and recovered["freshAddon"]
+    assert recovered["attempts"] == 0  # budget renewed on success
+    assert recovered["toastText"] == "WebGL renderer restored."
+
+    assert out["budget"] == {"attempts": 3, "webglStillNull": True}
+    assert out["exhausted"] == {"attempts": 3}
+    assert out["afterWindow"] == {"attempts": 1}
+    assert out["recreate"] == {"webglBack": True, "attempts": 0}
+    assert out["guard"] == {"noNewAddon": True, "noNewTimer": True}

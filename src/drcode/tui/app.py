@@ -224,9 +224,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # Read-only todo checklist between the chat log and the input: hidden
     # while the viewed task has no checklist, auto-sized to its items
     # otherwise (capped, so a long list cannot crush the chat log).
+    # The cap is a viewport cap, not a content cap: overflow-y turns the
+    # panel scrollable so a long checklist stays fully readable (the
+    # header line counts toward the cap too — items start at line 2).
     #todo-panel {
         height: auto;
-        max-height: 10;
+        max-height: 16;
+        overflow-y: auto;
         border-top: solid $panel;
         background: $surface;
         padding: 0 1;

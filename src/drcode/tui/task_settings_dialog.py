@@ -68,7 +68,6 @@ from textual.widgets import (
 )
 
 from ..settings import (
-    CODE_INDEX_MODE_OPTIONS,
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
     GIT_POLICY_OPTIONS,
@@ -249,6 +248,13 @@ class TaskSettingsDialogBase(ModalScreen[ProjectSettings | None]):
     }
     Select {
         width: 1fr;
+    }
+    /* The pre-run compaction threshold: a SHORT numeric field (6
+       characters) sitting LEFT of its description, on one line with the
+       description's first line. */
+    #ts-compaction-resume {
+        width: 10; /* 6 editable characters + the border */
+        margin-top: 0;
     }
     # "Changed" marker: a border-tint is useless under the compact form
     # styles (the border the signal used to color is gone). Boolean
@@ -869,14 +875,15 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     placeholder="(empty — nothing blocked)",
                 )
                 yield Label("Code index", classes="ts-section")
-                with Horizontal(classes="ts-row"), Vertical(classes="ts-col"):
-                    yield Label("Code index", classes="ts-label")
-                    yield Select(
-                        [(o.label, o) for o in CODE_INDEX_MODE_OPTIONS],
-                        value=d.code_index_mode,
-                        allow_blank=False,
-                        id="ts-code-index-mode",
-                    )
+                yield ToggleRow(
+                    "Code index — the agents get the code_symbols/"
+                    "code_callers/code_refs tools (a tree-sitter symbol "
+                    "index of the project; the first ON costs one full "
+                    "indexing pass); off: nothing is indexed, the agents "
+                    "navigate with grep/read as before",
+                    value=d.code_index_mode is CodeIndexMode.ON,
+                    toggle_id="ts-code-index-mode",
+                )
                 yield Label("Context management", classes="ts-section")
                 yield ToggleRow(
                     "Context-eviction hint — remind the model about "
@@ -901,18 +908,20 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     value=d.todo_tail,
                     toggle_id="ts-todo-tail",
                 )
-                yield Label(
-                    "Pre-run compaction threshold (tokens) — when a task "
-                    "resumes after ≥3 min idle (cache burnt out) and its "
-                    "transcript exceeds this fill, compact it before the "
-                    "first turn; below 20000 = off",
-                    classes="ts-label",
-                )
-                yield Input(
-                    value=str(d.compaction_resume_min_tokens),
-                    id="ts-compaction-resume",
-                    placeholder="0 = off (minimum 20000)",
-                )
+                with Horizontal(classes="ts-row"):
+                    yield Input(
+                        value=str(d.compaction_resume_min_tokens),
+                        id="ts-compaction-resume",
+                        placeholder="0",
+                        max_length=6,
+                    )
+                    yield Label(
+                        "Pre-run compaction threshold (tokens) — when a "
+                        "task resumes after ≥3 min idle (cache burnt out) "
+                        "and its transcript exceeds this fill, compact it "
+                        "before the first turn; below 20000 = off",
+                        classes="ts-label",
+                    )
                 yield ToggleRow(
                     "Background compaction — prepare the context summary "
                     "before the compaction threshold is crossed, without "
@@ -988,7 +997,7 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         self._set_select("#ts-subagents-coder", d.subagents_coder)
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-web-fetch-mode", d.web_fetch_mode)
-        self._set_select("#ts-code-index-mode", d.code_index_mode)
+        self._set_toggle("#ts-code-index-mode", d.code_index_mode is CodeIndexMode.ON)
         self._set_select("#ts-verification", d.verification)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
@@ -1073,12 +1082,11 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
             self._draft.web_fetch_mode = event.value
             self._refresh()
 
-    @on(Select.Changed, "#ts-code-index-mode")
-    def _code_index_mode_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, CodeIndexMode) and (
-            event.value is not self._draft.code_index_mode
-        ):
-            self._draft.code_index_mode = event.value
+    @on(RadioButton.Changed, "#ts-code-index-mode")
+    def _code_index_mode_changed(self, event: RadioButton.Changed) -> None:
+        value = CodeIndexMode.ON if event.value else CodeIndexMode.OFF
+        if value is not self._draft.code_index_mode:
+            self._draft.code_index_mode = value
             self._refresh()
 
     @on(Input.Changed, "#ts-web-fetch-allow")

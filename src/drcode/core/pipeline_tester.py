@@ -369,6 +369,10 @@ class PipelineTesterLayer(CoreState):
                 # create_bug_report creates a DRAFT task when the setting
                 # is on (the user finishes it in the editor).
                 agent_creates_drafts=self.settings.agent_creates_drafts,
+                # Pipeline triggers for the tester's send_task_input tool
+                # (extra input into a bug report the tester created) — see
+                # _input_delivery_hooks.
+                input_hooks=self._input_delivery_hooks(),
             )
             try:
                 # The tester needs the original assignment (to paraphrase it

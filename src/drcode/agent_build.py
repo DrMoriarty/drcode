@@ -25,6 +25,7 @@ from pydantic_ai.usage import RunUsage
 
 from . import agent_model, task_search, tools
 from .agent_tools import (
+    InputDeliveryHooks,
     _commit_tracked_files,
     _create_goal,
     _create_report_task,
@@ -37,6 +38,7 @@ from .agent_tools import (
     _read_linked_goal,
     _retry_failed_here,
     _run_project_check,
+    _send_task_input,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -194,7 +196,12 @@ class AgentDeps:
     `code_index` mirrors the project's code_index_mode decision for THIS
     run (resolved per role by `code_index_tools_for`): the nested
     `delegate_research` subagents inherit it — they are read-only code
-    researchers and the main beneficiaries of the index."""
+    researchers and the main beneficiaries of the index.
+
+    `input_hooks` carries the pipeline triggers the send_task_input tool
+    fires after a successful delivery (restart the receiver's in-flight
+    run, schedule _advance) — see agent_tools.InputDeliveryHooks. None =
+    delivery still works, the hooks degrade to no-ops."""
 
     root: Path
     manager: TaskManager
@@ -207,6 +214,7 @@ class AgentDeps:
     web_fetch_gate: WebFetchGate | None = None
     wait_announcer: agent_model.WaitAnnouncer | None = None
     code_index: bool = False
+    input_hooks: InputDeliveryHooks | None = None
 
 
 @dataclass
@@ -244,7 +252,12 @@ class TesterDeps:
     `agent_creates_drafts` mirrors the project setting: the tester's
     create_bug_report tool (including the fix-loop-end bug report) then
     creates a DRAFT task the user must finish before it enters the
-    queue."""
+    queue.
+
+    `input_hooks` carries the pipeline triggers the send_task_input tool
+    fires after a successful delivery — see agent_tools.InputDeliveryHooks
+    and the AgentDeps note. None = delivery still works, the hooks
+    degrade to no-ops."""
 
     root: Path
     manager: TaskManager
@@ -253,6 +266,7 @@ class TesterDeps:
     review_gate: bool = False
     max_dev_rounds: int = 3
     agent_creates_drafts: bool = False
+    input_hooks: InputDeliveryHooks | None = None
 
 
 @dataclass
@@ -955,6 +969,27 @@ def build_agent(
             return text + _deps_suffix(research) + _goal_suffix(ctx, research)
 
         @agent.tool(sequential=True)
+        async def send_task_input(
+            ctx: RunContext[AgentDeps], task_id: str, text: str
+        ) -> str:
+            """Deliver extra input into a task YOU created earlier with
+            create_bug_report/create_feature_request/create_research_task
+            (e.g. an addition to its assignment after the user asked for a
+            detail mid-run). The text is delivered exactly like user input:
+            a queued task gets it as pending user input; a task whose agent
+            run is already in flight is interrupted and restarts with your
+            text as the next user prompt; a COMPLETED/TESTING task is
+            re-queued for a fresh round. NEVER edit another task's
+            .drcode/tasks/<id>.json file instead — the running task's
+            in-memory save overwrites such external edits and the input is
+            silently lost. The tool refuses (and sends nothing) when the
+            target task was not created by your own run: delivery is
+            ownership-checked against a persisted provenance stamp."""
+            return await _run_tool(
+                _send_task_input, ctx.deps, task_id, text, "research agent"
+            )
+
+        @agent.tool(sequential=True)
         async def set_task_dependencies(
             ctx: RunContext[AgentDeps], task_id: str, deps: list[str]
         ) -> str:
@@ -1586,6 +1621,22 @@ def build_tester_agent(
         # content instead of a phantom task entering the queue
         # (origin="system" — see the research variant of this tool above).
         return await _run_tool(_create_tester_bug_report, ctx.deps, title, description)
+
+    @agent.tool(sequential=True)
+    async def send_task_input(
+        ctx: RunContext[TesterDeps], task_id: str, text: str
+    ) -> str:
+        """Deliver extra input into a task YOU created earlier with
+        create_bug_report (e.g. a missed repro detail or an extra observed
+        symptom for a report still waiting in the queue). The text is
+        delivered exactly like user input: a queued task gets it as pending
+        user input; a task whose agent run is already in flight is
+        interrupted and restarts with your text as the next user prompt; a
+        COMPLETED/TESTING task is re-queued for a fresh round. The tool
+        refuses (and sends nothing) when the target task was not created by
+        your own run: delivery is ownership-checked against a persisted
+        provenance stamp."""
+        return await _run_tool(_send_task_input, ctx.deps, task_id, text, "tester")
 
     # The commit tool exists only when the project's tester git policy
     # allows it: with policy off the model cannot commit even if it

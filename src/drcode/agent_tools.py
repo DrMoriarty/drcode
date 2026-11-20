@@ -21,7 +21,8 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
 __all__ = [
     "REPORT_DESC_MIN_CHARS",
     "TODO_MIN_ITEMS",
+    "InputDeliveryHooks",
     "_commit_tracked_files",
     "_create_goal",
     "_create_report_task",
@@ -75,6 +77,7 @@ __all__ = [
     "_read_goal",
     "_retry_failed_here",
     "_run_project_check",
+    "_send_task_input",
     "_set_task_dependencies",
     "_todo_create",
     "_todo_update",
@@ -234,6 +237,13 @@ def _create_report_task(
         depends_on=depends_on,
         goal_id=goal_id,
     )
+    # Persistent provenance (Task.created_by_task_id): the send_task_input
+    # tool later allows extra input ONLY into tasks this very run created,
+    # and the check reads this persisted field — a TUI restart between the
+    # creation and the follow-up input must not forget the creator.
+    task.created_by_task_id = deps.task_id
+    task.touch()
+    deps.manager.storage.save(task)
     # Label of the tool-result text and queue placement per kind: a bug
     # report joins the head of the queue, a feature request and a research
     # task the tail (the ordinary TaskManager.create placement).
@@ -260,7 +270,8 @@ def _create_report_task(
                 f"{label} #{task.id} '{task.title}' created as a draft — the "
                 "user must finish it before it enters the queue."
             )
-            + warning,
+            + warning
+            + _send_task_input_hint(),
         )
     warning = _file_overlap_warning(deps, task, description)
     placement = (
@@ -268,7 +279,168 @@ def _create_report_task(
         if kind is TaskKind.BUG
         else "at the tail of the queue"
     )
-    return task, f"{label} #{task.id} '{task.title}' created {placement}." + warning
+    return task, (
+        f"{label} #{task.id} '{task.title}' created {placement}."
+        + warning
+        + _send_task_input_hint()
+    )
+
+
+def _send_task_input_hint() -> str:
+    """The one-line suffix of every agent task-creation result pointing at
+    the send_task_input tool (the safe replacement for the incident-prone
+    manual editing of another task's JSON file)."""
+    return (
+        " To append more input to it later, call the send_task_input tool "
+        "(it works on tasks you created yourself)."
+    )
+
+
+@dataclass
+class InputDeliveryHooks:
+    """The pipeline triggers the send_task_input tool fires after a
+    successful delivery — exactly the two steps the TUI performs after a
+    user send on an ACTIVE task: restart the receiver's in-flight run
+    (`run_agent` — the exclusive `agent-<task-id>` worker group supersedes
+    it, pending input is picked up by the fresh run) and schedule the
+    pipeline's single `_advance()` gate. The pipeline builds the hooks as
+    `loop.call_soon_threadsafe` wrappers: the tool body may run on a worker
+    thread, the pipeline lives on the app's event loop. Both hooks are
+    optional and no-op when absent — tests and probe builds (no live
+    pipeline behind the deps) still deliver the input; the ordinary
+    pipeline events then advance it later. A hook failure after a
+    successful mutation is logged, never raised: the input is already
+    delivered and the next pipeline event re-advances."""
+
+    advance: Callable[[], None] | None = None
+    restart_run: Callable[[str], None] | None = None
+
+    def schedule_advance(self) -> None:
+        if self.advance is not None:
+            try:
+                self.advance()
+            except Exception as e:  # noqa: BLE001 - post-step, never fatal
+                print(
+                    f"drcode: send_task_input advance hook failed: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
+    def restart_task_run(self, task_id: str) -> None:
+        if self.restart_run is not None:
+            try:
+                self.restart_run(task_id)
+            except Exception as e:  # noqa: BLE001 - post-step, never fatal
+                print(
+                    f"drcode: send_task_input restart hook failed: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
+
+def _send_task_input(
+    deps: AgentDeps | TesterDeps,
+    task_id: str,
+    text: str,
+    sender_label: str = "agent",
+) -> str:
+    """Deliver extra input into ANOTHER task as user input, through the
+    manager (never through direct file edits — the #e5449310 incident: an
+    agent edited `.drcode/tasks/<id>.json` behind the live manager and the
+    running task's next in-memory save wiped the edit).
+
+    Ownership: the target must carry the persisted provenance stamp
+    `created_by_task_id == deps.task_id` (set by _create_report_task at
+    creation) — an agent may append input only into tasks ITS OWN run
+    created, never into foreign or unknown ones (checked BEFORE any
+    mutation: a refused call sends nothing). Raises ValueError (→
+    ModelRetry via _run_tool) for unknown ids, foreign tasks and empty
+    text; the message is a plain, actionable error, not a run crash.
+    Delivery goes through TaskManager.send, so re-queue of
+    COMPLETED/TESTING targets, verification reset and duplicate-text
+    deduplication all come from that one path unchanged. The caller (the
+    registered tool wrapper) must invoke the hooks of `deps` afterwards —
+    restart_task_run for an ACTIVE target and schedule_advance always."""
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError(
+            "send_task_input: the input text is empty — write the "
+            "addition you want to deliver into the task."
+        )
+    target = deps.manager.tasks.get(task_id)
+    if target is None:
+        raise ValueError(
+            f"send_task_input: no task with id '{task_id}' — use one of the "
+            "short ids shown in the queue or the create_* tool result."
+        )
+    creator = target.created_by_task_id
+    if creator != deps.task_id:
+        if creator is None and target.id == deps.task_id:
+            reason = (
+                "it is the very task of your current run — use "
+                "ask_clarifying_question instead"
+            )
+        elif creator is None:
+            reason = (
+                "it was not created by an agent (user, headless CLI or GitHub import)"
+            )
+        else:
+            reason = f"it was created by task #{creator}, not by your run"
+        raise ValueError(
+            f"send_task_input: task #{target.id} is out of your reach — "
+            f"{reason}. The tool delivers input only into tasks YOUR OWN run "
+            "created (the provenance is persisted in the task file)."
+        )
+    pre_status = target.status
+    was_active = pre_status is TaskStatus.ACTIVE
+    delivered = deps.manager.send(task_id, stripped)
+    # Audit trail on both sides (chat-visible service events, never model
+    # context): who appended what into which task.
+    preview = stripped if len(stripped) <= 160 else stripped[:157] + "..."
+    delivered.events.append(
+        TaskEvent(
+            kind="system",
+            text=(
+                f"Additional input delivered by the {sender_label} of task "
+                f'#{deps.task_id} (send_task_input): "{preview}"'
+            ),
+        )
+    )
+    delivered.touch()
+    deps.manager.storage.save(delivered)
+    sender = deps.manager.tasks.get(deps.task_id)
+    if sender is not None:
+        sender.events.append(
+            TaskEvent(
+                kind="system",
+                text=(
+                    f"Input delivered into task #{delivered.id} "
+                    f"'{delivered.title}' by the {sender_label} "
+                    f'(send_task_input): "{preview}"'
+                ),
+            )
+        )
+        sender.touch()
+        deps.manager.storage.save(sender)
+    hooks = getattr(deps, "input_hooks", None) or InputDeliveryHooks()
+    if was_active:
+        hooks.restart_task_run(task_id)
+        outcome = (
+            "delivered — the in-flight run is interrupted and the task "
+            "restarts with your text as the next user prompt"
+        )
+    elif pre_status in (TaskStatus.COMPLETED, TaskStatus.TESTING):
+        outcome = (
+            "delivered — the task is re-queued for a fresh development "
+            "round (its verification label was reset)"
+        )
+    else:
+        outcome = (
+            "delivered — the text is queued as pending user input and "
+            "reaches the agent on its next activation"
+        )
+    hooks.schedule_advance()
+    return f"Input {outcome}."
 
 
 def _file_overlap_warning(

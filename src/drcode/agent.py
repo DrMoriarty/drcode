@@ -36,6 +36,7 @@ from .agent_model import (
 )
 from .agent_tools import (
     TODO_MIN_ITEMS,
+    InputDeliveryHooks,
     _commit_tracked_files,
     _create_goal,
     _git_push,
@@ -45,6 +46,7 @@ from .agent_tools import (
     _read_linked_goal,
     _retry_failed_here,
     _run_project_check,
+    _send_task_input,
     _set_task_dependencies,
     _todo_create,
     _todo_update,
@@ -176,6 +178,7 @@ __all__ = [
     "AgentDeps",
     "AsyncOpenAI",
     "ClarifyQuestion",
+    "InputDeliveryHooks",
     "ModelFetchError",
     "ResolutionVerdict",
     "ResolverDeps",
@@ -201,6 +204,7 @@ __all__ = [
     "_run_project_check",
     "_run_tool",
     "_run_tool_logged",
+    "_send_task_input",
     "_set_task_dependencies",
     "_todo_create",
     "_todo_update",

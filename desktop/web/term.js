@@ -110,6 +110,16 @@
    * up the pause — a lost throttle is recoverable, lost bytes are not. */
   var FLOW_PAUSE_BYTES = 1024 * 1024;
   var FLOW_RESUME_BYTES = 256 * 1024;
+  /* The pause/resume DECISION is throttled. flowUpdate runs on every write
+   * callback (thousands per second while a backlog drains) and only counts
+   * the bytes and arms a timer — the heavy part (threshold comparison,
+   * preparing a ws.send) runs at most once per interval. The edge-triggered
+   * flowPaused flag keeps its meaning: repeat decisions between crossings
+   * are no-ops, and no crossing is missed by the throttle — every decision
+   * reads the CURRENT backlog and every callback after a fired timer
+   * re-arms it, so the transition fires at most FLOW_DECISION_INTERVAL_MS
+   * late. */
+  var FLOW_DECISION_INTERVAL_MS = 80;
 
   /* ---- tab model ---- */
   /* tabs[] holds one object per tab, in tab-bar order:
@@ -336,6 +346,7 @@
       desiredBadge: null,
       flowOutstanding: 0, // bytes queued into xterm.js, not yet processed
       flowPaused: false,  // pause frame sent, resume not yet sent
+      flowTimer: null,    // pending throttled pause/resume decision
       webglRecoverTimer: null,   // pending delayed recovery after a context loss
       webglRecoverAttempts: [],  // timestamps of past recovery attempts (budgeted)
     };
@@ -413,8 +424,20 @@
     if (!tab) return;
     activeTab = tab;
     tabs.forEach(function (t) {
-      t.pane.classList.toggle("hidden", t !== tab);
+      var hiding = t !== tab;
+      var wasHidden = t.pane.classList.contains("hidden");
+      t.pane.classList.toggle("hidden", hiding);
       t.tabEl.classList.toggle("active", t === tab);
+      // Render lifecycle: only the tab that is ACTUALLY leaving recycles
+      // its WebGL addon (an already-hidden background tab has none), and
+      // the tab coming to front re-arms it. The xterm buffer, the PTY and
+      // the ws connection are never touched here — content survives the
+      // round-trip by construction.
+      if (hiding) {
+        if (!wasHidden) deactivateTabRender(t);
+      } else {
+        activateTabRender(t);
+      }
     });
     if (tab.kind === "welcome") {
       // Move the shared welcome node into this pane (appendChild on an
@@ -561,6 +584,10 @@
       clearTimeout(tab.webglRecoverTimer);
       tab.webglRecoverTimer = null;
     }
+    if (tab.flowTimer) {
+      clearTimeout(tab.flowTimer);
+      tab.flowTimer = null;
+    }
     if (tab.term) {
       try { tab.term.dispose(); } catch (err) { /* already gone */ }
     }
@@ -680,6 +707,39 @@
     tab.webgl = null;
   }
 
+  /* ---------------- hidden-tab render recycling ----------------
+   * A background tab must not compete for GPU/CPU with the one the user
+   * is watching: on deactivation its WebGL addon is disposed (the pane is
+   * display:none, so even the DOM fallback it drops to costs nothing
+   * while hidden) and any pending context-loss recovery timer is
+   * cancelled — recovery would re-arm a GPU context for a tab nobody is
+   * watching. On the next activation the addon is re-created through the
+   * SAME fresh-context path the context-loss recovery and the font change
+   * use (attachWebgl → a brand-new WebglAddon with a fresh glyph atlas),
+   * never a re-arm of a stale context. Only the renderer is recycled: the
+   * xterm buffer, scrollback, the PTY and the ws connection are untouched,
+   * so switching back restores the exact same picture. */
+
+  function deactivateTabRender(tab) {
+    if (tab.webglRecoverTimer) {
+      clearTimeout(tab.webglRecoverTimer);
+      tab.webglRecoverTimer = null;
+    }
+    disposeWebgl(tab);
+  }
+
+  function activateTabRender(tab) {
+    if (!tab.started || !tab.term || tab.webgl) return;
+    if (!attachWebgl(tab)) {
+      webglFallbackToast(tab); // once per tab (deduped) — DOM fallback stays
+      return;
+    }
+    /* The activation re-attach is user-initiated (they switched to the
+     * tab): like recreateWebgl below, a proven-healthy attach renews the
+     * recovery budget. */
+    tab.webglRecoverAttempts = [];
+  }
+
   function handleWebglContextLoss(tab) {
     disposeWebgl(tab);       // xterm falls back to the DOM renderer at once
     webglFallbackToast(tab); // once per tab — repeated losses must not spam
@@ -780,6 +840,14 @@
   function recreateWebgl(tab) {
     if (!tab.term) return;
     disposeWebgl(tab);
+    if (tab.pane && tab.pane.classList.contains("hidden")) {
+      /* A font change fans out to every live tab, hidden ones included.
+       * A hidden tab carries no WebGL addon (see deactivateTabRender) and
+       * must not get a GPU context back while nobody watches: leave it to
+       * the DOM fallback — the next activation re-attaches through
+       * activateTabRender. */
+      return;
+    }
     if (!attachWebgl(tab)) {
       webglFallbackToast(tab);
       return;
@@ -1093,8 +1161,22 @@
   /* Flow-control bookkeeping: called after every write callback and keeps
    * the pause/resume frames in sync with the xterm.js backlog. Pauses are
    * edge-triggered (only on the crossing), never re-sent while active —
-   * the server treats a repeat pause as a no-op anyway. */
+   * the server treats a repeat pause as a no-op anyway. The decision is
+   * throttled (see FLOW_DECISION_INTERVAL_MS): the per-chunk cost here is
+   * one counter update in the write callback plus at most one pending
+   * timer, never a send decision per chunk. */
   function flowUpdate(tab) {
+    if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+    if (tab.flowTimer) return; // a decision is already scheduled
+    tab.flowTimer = setTimeout(function () {
+      tab.flowTimer = null;
+      flowDecide(tab);
+    }, FLOW_DECISION_INTERVAL_MS);
+  }
+
+  /* The throttled decision: runs at most once per
+   * FLOW_DECISION_INTERVAL_MS per tab, always against the live backlog. */
+  function flowDecide(tab) {
     if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
     if (tab.flowOutstanding < 0) tab.flowOutstanding = 0;
     if (!tab.flowPaused && tab.flowOutstanding >= FLOW_PAUSE_BYTES) {
@@ -1116,6 +1198,13 @@
     tab.ws = ws;
     // A fresh connection starts with a clean flow-control slate — the
     // server's pause state is per-connection and resets on reconnect too.
+    // A throttled decision still pending from the dead socket must not
+    // fire against the new one: cancel it (the next write callback
+    // re-arms, and the fresh slate makes that decision correct).
+    if (tab.flowTimer) {
+      clearTimeout(tab.flowTimer);
+      tab.flowTimer = null;
+    }
     tab.flowOutstanding = 0;
     tab.flowPaused = false;
     tab.filter = makeOscFilter(

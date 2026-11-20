@@ -1968,6 +1968,183 @@ def test_term_js_flow_control_wiring() -> None:
     # The counter is only clamped at zero, never trimmed (no byte loss).
     assert "if (tab.flowOutstanding < 0) tab.flowOutstanding = 0;" in src
 
+    # The pause/resume DECISION is throttled: the per-chunk path (the
+    # write callback) only counts bytes and arms at most one timer; the
+    # threshold logic and the ws.send live in the scheduled flowDecide.
+    # A pending decision never survives a reconnect — it is cancelled
+    # together with the slate (connectTab), and with the tab (closeTab).
+    assert "var FLOW_DECISION_INTERVAL_MS" in src
+    assert "if (tab.flowTimer) return;" in src
+    assert "tab.flowTimer = setTimeout(function () {" in src
+    assert "function flowDecide(tab)" in src
+    # The send frames live in the scheduled flowDecide only — they are no
+    # longer reached from the per-chunk flowUpdate body.
+    flow_update = src[src.index("function flowUpdate") : src.index("function flowDecide")]
+    assert '"type": "pause"' not in flow_update
+    assert '"type": "resume"' not in flow_update
+    flow_decide = src[src.index("function flowDecide") : src.index("function connectTab")]
+    assert '{ type: "pause", tab: tab.id }' in flow_decide
+    assert '{ type: "resume", tab: tab.id }' in flow_decide
+    assert "clearTimeout(tab.flowTimer);" in src
+
+
+FLOW_THROTTLE_NODE_DRIVER = """
+const fs = require("fs");
+const region = fs.readFileSync(process.argv[2], "utf8");
+
+// WebSocket is only probed for readyState !== OPEN; send frames are recorded.
+const WebSocket = { OPEN: 1 };
+
+// Timers are recorded, not run — the test fires them explicitly by delay.
+const timers = [];
+let timerSeq = 0;
+const setTimeoutStub = (fn, ms) => {
+  const id = ++timerSeq;
+  timers.push({ id, fn, ms });
+  return id;
+};
+const clearTimeoutStub = (id) => {
+  const i = timers.findIndex((t) => t.id === id);
+  if (i >= 0) timers.splice(i, 1);
+};
+function fireTimers(ms) {
+  for (let i = timers.length - 1; i >= 0; i--) {
+    if (timers[i].ms === ms) timers.splice(i, 1)[0].fn();
+  }
+}
+
+const holder = {};
+new Function(
+  "WebSocket", "setTimeout", "clearTimeout", "holder",
+  region + "\\n;holder.api = { flowUpdate: flowUpdate, flowDecide: flowDecide," +
+  " interval: FLOW_DECISION_INTERVAL_MS };"
+)(WebSocket, setTimeoutStub, clearTimeoutStub, holder);
+const api = holder.api;
+
+function mkTab(id) {
+  const sent = [];
+  return {
+    id,
+    sent,
+    ws: { readyState: WebSocket.OPEN, send: (d) => sent.push(JSON.parse(d)) },
+    flowOutstanding: 0,
+    flowPaused: false,
+    flowTimer: null,
+  };
+}
+const out = {};
+
+// 1. A firehose burst of write callbacks crosses the pause threshold: the
+//    per-chunk path schedules exactly ONE decision and sends NOTHING...
+const t1 = mkTab("t1");
+const writeCb = (len) => { t1.flowOutstanding += len; api.flowUpdate(t1); };
+for (let i = 0; i < 1000; i++) writeCb(4096); // ~4 MiB >> 1 MiB pause
+out.burst = { sends: t1.sent.length, pendingTimers: timers.length };
+
+// 2. ...the scheduled decision fires once and sends exactly one pause.
+fireTimers(api.interval);
+out.decided = {
+  sends: t1.sent.length,
+  types: t1.sent.map((f) => f.type),
+  paused: t1.flowPaused,
+  timerCleared: t1.flowTimer === null,
+  timersLeft: timers.length,
+};
+
+// 3. Draining back under the resume threshold sends exactly one resume.
+t1.flowOutstanding = 0;
+writeCb(0);
+fireTimers(api.interval);
+out.resume = { sends: t1.sent.length, types: t1.sent.map((f) => f.type) };
+
+// 4. Edge-triggered: more callbacks between crossings send nothing.
+for (let i = 0; i < 100; i++) writeCb(1024);
+fireTimers(api.interval);
+out.edge = { sends: t1.sent.length };
+
+// 5. A socket that is not OPEN neither schedules nor sends.
+const t2 = mkTab("t2");
+t2.ws.readyState = 3;
+t2.flowOutstanding += 4096;
+api.flowUpdate(t2);
+out.closed = { timers: timers.length, sends: t2.sent.length };
+
+// 6. Reconnect semantics: a pending throttled decision from the dead
+//    socket must not fire against the new one (connectTab cancels it with
+//    the slate — reproduced with the same clearTimeout call).
+const t3 = mkTab("t3");
+t3.flowOutstanding = 5 * 1024 * 1024;
+api.flowUpdate(t3);
+clearTimeoutStub(t3.flowTimer);
+t3.flowTimer = null;
+t3.flowOutstanding = 0;
+t3.flowPaused = false;
+fireTimers(api.interval);
+out.reconnect = { sends: t3.sent.length, timers: timers.length };
+
+console.log(JSON.stringify(out));
+"""
+
+
+def test_term_js_flow_throttle_logic(tmp_path: Path) -> None:
+    """The throttled flow-control decision actually runs (node): a firehose
+    burst schedules exactly one decision and sends nothing until it fires;
+    the fired decision emits one pause; draining emits one resume; repeat
+    decisions between crossings are no-ops; a dead socket never schedules."""
+    js = _term_js()
+    start = js.index("/* Flow-control bookkeeping")
+    end = js.index("function connectTab")
+    interval_m = re.search(r"FLOW_DECISION_INTERVAL_MS = (\d+)", js)
+    assert interval_m is not None
+    interval = interval_m.group(1)
+    constants = (
+        "var FLOW_PAUSE_BYTES = 1024 * 1024;\n"
+        "var FLOW_RESUME_BYTES = 256 * 1024;\n"
+        # Extracted from term.js so the driver tracks the real interval.
+        f"var FLOW_DECISION_INTERVAL_MS = {interval};\n"
+    )
+    region = constants + js[start:end]
+    out = _run_js_driver(FLOW_THROTTLE_NODE_DRIVER, region, tmp_path)
+
+    assert out["burst"] == {"sends": 0, "pendingTimers": 1}
+    assert out["decided"]["sends"] == 1
+    assert out["decided"]["types"] == ["pause"]
+    assert out["decided"]["paused"] is True
+    assert out["decided"]["timerCleared"] and out["decided"]["timersLeft"] == 0
+    assert out["resume"]["sends"] == 2
+    assert out["resume"]["types"] == ["pause", "resume"]
+    assert out["edge"] == {"sends": 2}
+    assert out["closed"] == {"timers": 0, "sends": 0}
+    assert out["reconnect"] == {"sends": 0, "timers": 0}
+
+
+def test_term_js_hidden_tab_webgl_recycling() -> None:
+    """Background tabs drop their WebGL addon and re-attach it on the next
+    activation through the same fresh-context attach path the context-loss
+    recovery uses — only the renderer is recycled, never the terminal
+    itself (buffer, PTY and ws survive the round-trip by construction)."""
+    src = _term_js()
+    # activateTab drives the lifecycle per pane toggle.
+    assert "deactivateTabRender(t)" in src
+    assert "activateTabRender(t)" in src
+    lifecycle = src[src.index("function deactivateTabRender") : src.index(
+        "/* ---------------- terminal setup (per tab) ---------------- */"
+    )]
+    # Deactivation: dispose the addon and cancel any pending context-loss
+    # recovery (it would re-arm a GPU context for an unwatched tab).
+    deact = lifecycle[: lifecycle.index("function activateTabRender")]
+    assert "clearTimeout(tab.webglRecoverTimer);" in deact
+    assert "disposeWebgl(tab);" in deact
+    # Activation: the same attachWebgl path the recovery and font change use.
+    act = lifecycle[lifecycle.index("function activateTabRender") :]
+    assert "attachWebgl(tab)" in act
+    # Content preservation: the recycle path never disposes the terminal.
+    assert "term.dispose" not in lifecycle
+    # The font-change fan-out leaves hidden tabs rendererless (activation
+    # re-attaches instead of handing a GPU context to an unwatched tab).
+    recreate = src[src.index("function recreateWebgl") : src.index("function refitAfterFontChange")]
+    assert 'tab.pane.classList.contains("hidden")' in recreate
+
 
 def test_tab_switch_shortcut_matched_by_physical_key() -> None:
     """The combo is matched by ev.code (layout-independent), never by
@@ -2691,8 +2868,10 @@ const DateStub = { now: () => state.now };
 function makeTab(id) {
   return {
     id,
+    started: true,
     term: { addons: [], loadAddon(a) { this.addons.push(a); } },
     elTerm: { parentNode: {} },
+    pane: makeEl(), // no "hidden" class = visible
     webgl: null,
     webglRecoverTimer: null,
     webglRecoverAttempts: [],
@@ -2703,7 +2882,8 @@ const windowStub = { WebglAddon: { WebglAddon: FakeWebglAddon } };
 const holder = {};
 const full = src +
   "\\n;holder.api = { attachWebgl, handleWebglContextLoss, scheduleWebglRecovery," +
-  " recoverWebgl, recreateWebgl, delay: WEBGL_RECOVER_DELAY_MS," +
+  " recoverWebgl, recreateWebgl, activateTabRender, deactivateTabRender," +
+  " delay: WEBGL_RECOVER_DELAY_MS," +
   " restoredMessage: WEBGL_RESTORED_MESSAGE };";
 new Function(
   "document", "setTimeout", "clearTimeout", "Date", "window", "holder", full
@@ -2786,6 +2966,37 @@ out.guard = {
   noNewTimer: timers.length === timersBefore,
 };
 
+// 9. Hidden-tab recycling: deactivation disposes the addon and cancels a
+//    pending recovery timer (no GPU context for an unwatched tab). Only
+//    RECOVERY timers are counted — toast auto-hide timers legitimately
+//    linger from the earlier steps.
+const recoveryTimers = () => timers.filter((t) => t.ms === api.delay).length;
+tab.webglRecoverAttempts = [state.now - 1000, state.now - 2000]; // burnt budget
+api.scheduleWebglRecovery(tab);
+api.deactivateTabRender(tab);
+out.deactivate = {
+  webglGone: tab.webgl === null,
+  recoveryTimersLeft: recoveryTimers(),
+  timerFieldCleared: tab.webglRecoverTimer === null,
+};
+
+// 10. Activation re-attaches a FRESH addon through the same attach path
+//     and renews the burnt recovery budget; no timers are armed.
+api.activateTabRender(tab);
+out.activate = {
+  webglBack: tab.webgl !== null,
+  freshAddon: tab.term.addons[tab.term.addons.length - 1] !== null &&
+    !tab.term.addons[tab.term.addons.length - 1].disposed,
+  attempts: tab.webglRecoverAttempts.length,
+  recoveryTimersLeft: recoveryTimers(),
+};
+
+// 11. A hidden tab (pane has the class) gets NO WebGL back from the
+//     font-change recreate path — activation owns the re-attach.
+tab.pane.classList.add("hidden");
+api.recreateWebgl(tab);
+out.hiddenRecreate = { webglGone: tab.webgl === null };
+
 console.log(JSON.stringify(out));
 """
 
@@ -2826,3 +3037,14 @@ def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
     assert out["afterWindow"] == {"attempts": 1}
     assert out["recreate"] == {"webglBack": True, "attempts": 0}
     assert out["guard"] == {"noNewAddon": True, "noNewTimer": True}
+
+    # Hidden-tab recycling: deactivate disposes + cancels recovery;
+    # activate re-attaches fresh and renews the budget; a hidden tab gets
+    # no context back from the font fan-out.
+    assert out["deactivate"] == {
+        "webglGone": True, "recoveryTimersLeft": 0, "timerFieldCleared": True,
+    }
+    assert out["activate"]["webglBack"] and out["activate"]["freshAddon"]
+    assert out["activate"]["attempts"] == 0
+    assert out["activate"]["recoveryTimersLeft"] == 0
+    assert out["hiddenRecreate"] == {"webglGone": True}

@@ -396,21 +396,43 @@ class TaskManager:
         event to ITS OWN chat log (human-facing, never fed to the model).
         n = completed tasks linked to the goal, m = all LIVE tasks linked
         (scanned over `task.goal_id` — a deleted task drops out of both
-        numbers). The goal may have been deleted while its tasks lived:
-        then the link is dangling and the event is skipped — the deletion
-        was a deliberate user act, not a data problem."""
+        numbers). When every linked task is done but the goal is NOT
+        finished (goal_complete also requires no ACTIVE subgoal and no
+        cancelled task), the event names that honestly instead of the
+        "n/m" wording, which would read as "goal closed". The goal may
+        have been deleted while its tasks lived: then the link is
+        dangling and the event is skipped — the deletion was a
+        deliberate user act, not a data problem."""
         goal = self.goals.goals.get(task.goal_id) if task.goal_id else None
         if goal is None:
             return
         linked = [t for t in self.tasks.values() if t.goal_id == goal.id]
         total = len(linked)
         done = sum(1 for t in linked if t.status is TaskStatus.COMPLETED)
-        task.events.append(
-            TaskEvent(
-                kind="goals",
-                text=f"цель {goal.title_display} ({goal.id}): {done}/{total} задач завершено",
+        if done == total and not self.goal_complete(goal):
+            # All linked tasks are done, but the goal is NOT finished
+            # (an ACTIVE subgoal somewhere in the subtree, or a cancelled
+            # task — cancel is an opt-out, not a completion). The bare
+            # "n/m задач завершено" would read as "goal closed", so it
+            # says honestly why the goal stays open: subgoals by name
+            # when they are the reason, the generic wording otherwise.
+            active_subs = any(
+                (desc := self.goals.goals.get(d)) is not None
+                and desc.status is GoalStatus.ACTIVE
+                for d in self.goals.descendant_ids(goal.id)
             )
-        )
+            reason = " из-за незавершённых подцелей" if active_subs else ""
+            text = (
+                f"цель {goal.title_display} ({goal.id}): {done}/{total} "
+                f"привязанных задач завершено, но цель остаётся "
+                f"active{reason}"
+            )
+        else:
+            text = (
+                f"цель {goal.title_display} ({goal.id}): "
+                f"{done}/{total} задач завершено"
+            )
+        task.events.append(TaskEvent(kind="goals", text=text))
         task.touch()
         self.storage.save(task)
 

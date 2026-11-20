@@ -29,3 +29,4 @@ wheels/
 *.log
 .drcode/mcp.json
 .drcode/fastcontext-scout
+.drcode/mcp-servers.json

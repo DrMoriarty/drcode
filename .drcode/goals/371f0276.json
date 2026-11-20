@@ -1,0 +1,10 @@
+{
+  "id": "371f0276",
+  "title": "Этап 1: ядро — конфиг mcp-servers.json, mcp_toolsets_for, шов в agent_build, сборка",
+  "description": "MVP MCP-клиента: двухуровневый конфиг mcp-servers.json, резолв toolset'ов, шов в agent_build, гейтинг по ролям, префиксы имён, сборка fastmcp, базовые тесты.",
+  "notes": "Объём (по docs/mcp-client-design.md, §1-§2, §6-§7):\n- McpServersStore + формат записи (§1.2): user ~/.config/drcode/mcp-servers.json + project .drcode/mcp-servers.json, union по id (project побеждает), tolerant-загрузка (битый файл → дефолт + service event, джанк-записи выбрасываются);\n- запись .drcode/mcp-servers.json в GITIGNORE_ENTRIES (src/drcode/gitignore.py:30-41) + mode 0600 при записи;\n- src/drcode/mcp/client_toolsets.py: mcp_toolsets_for(role) — сборка MCPToolset(Client(StdioTransport(...))) / MCPToolset(url, headers=...), PrefixedToolset с префиксом = id (или server.prefix), fresh instance per activation;\n- шов: Agent(..., toolsets=...) в 4 билдерах agent_build.py; пустая матрица roles = ни одна роль (безопасное умолчание); compaction-роль игнорируется;\n- сборка: \"fastmcp\", *collect_submodules(\"fastmcp\") в hiddenimports drcode.spec + смоук frozen-бандла (урок #7a3cc827);\n- тесты: конфиг (merge/битый файл/джанк/gitignore-запись), гейтинг по ролям, шов-регрессия (пустой конфиг = текущий агент), коллизии имён под префиксом.\n\nТочка старта: agent_build.py:501-507 (и 1365-1371, 1728-1734), drcode.spec:48-71.",
+  "type": "milestone",
+  "parent_id": "c82aa981",
+  "order": 0,
+  "created_at": "2026-11-19T11:21:40.721381Z"
+}

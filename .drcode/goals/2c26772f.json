@@ -1,0 +1,10 @@
+{
+  "id": "2c26772f",
+  "title": "Этап 3 (опционально): approval, tool search (DeferredLoadingToolset), health_probe",
+  "description": "Опциональная фаза после этапа 2: ApprovalRequiredToolset для human-in-the-loop, DeferredLoadingToolset (tool search) для больших каталогов тулов, опциональный health_probe pre-flight перед активацией.",
+  "notes": "Из docs/mcp-client-design.md §3.5, §5, §8 — сознательно отложено:\n- ApprovalRequiredToolset (есть в pydantic-ai 2.x): выборочное одобрение вызовов MCP-тулов человеком;\n- DeferredLoadingToolset: тула видны модели по индексу, схема подгружается по запросу — для каталогов, не влезающих в бюджет;\n- health_probe: быстрый pre-flight (образец endpoint_is_live, endpoint.py:227-235), чтобы мёртвый сервер не отъедал init_timeout у рана.\n\nБерётся в работу только если этап 2 покажет необходимость; иначе остаётся идеей.",
+  "type": "idea",
+  "parent_id": "c82aa981",
+  "order": 2,
+  "created_at": "2026-11-19T11:21:40.932987Z"
+}

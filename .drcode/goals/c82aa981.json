@@ -1,0 +1,10 @@
+{
+  "id": "c82aa981",
+  "title": "Клиентская поддержка MCP: внешние серверы как источники инструментов",
+  "description": "Подключение СТОРОННИХ MCP-серверов как источников инструментов для агентов drcode (сейчас есть только встроенный MCP-сервер). Дизайн утверждён: docs/mcp-client-design.md",
+  "notes": "Дизайн-док: docs/mcp-client-design.md (в этом репозитории). Ключевые решения:\n- pydantic-ai 2.56.0: MCPToolset (fastmcp-клиент), подключение через Agent(..., toolsets=[...]);\n- конфиг: отдельный файл mcp-servers.json (user ~/.config/drcode/ + project .drcode/, union по id, project побеждает); .drcode/mcp-servers.json добавить в GITIGNORE_ENTRIES (секреты; прецедент .drcode/mcp.json);\n- шов: mcp_toolsets_for(role) в src/drcode/mcp/client_toolsets.py; в билдерах agent_build — Agent(..., toolsets=...);\n- безопасное умолчание: пустая матрица roles — ни одна роль не получает MCP-тулы;\n- все MCP-тула всегда под префиксом (PrefixedToolset), коллизий с нативными тулами нет;\n- бюджет: tools_allow/tools_deny (FilteredToolset) + chars/4-оценка списка тулов с порогом ~10k;\n- безопасность: SafeToolset (WrapperToolset) — degrade при list_tools failure (пустой набор + service event, ран продолжается), UNTRUSTED-фрейминг вывода по образцу web_fetch TRUST_FRAME, ошибки вызова → ModelRetry (tool_error_behavior='retry');\n- жизненный цикл: fresh MCPToolset per activation, ленивое открытие/refcounting, stdio-потомок терминируется на __aexit__;\n- сборка: fastmcp НЕ собирается сейчас — добавить \"fastmcp\", *collect_submodules(\"fastmcp\") в hiddenimports drcode.spec (урок #7a3cc827 — mcp.client уже закрыт);\n- вне скоупа: выбор SSH-сервера (отдельная задача), нативный SSH-бэкенд, approval/tool-search (фаза 2).\n\nМотивирующий сценарий: SSH-исполнение на удалённой машине через готовые MCP SSH-серверы (tufantunc/ssh-mcp, bvisible/mcp-ssh-manager).",
+  "type": "goal",
+  "parent_id": null,
+  "order": 4,
+  "created_at": "2026-11-19T11:20:29.043757Z"
+}

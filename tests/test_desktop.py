@@ -2414,6 +2414,202 @@ def test_term_js_toast_logic(tmp_path: Path) -> None:
     assert result["state5"]["text"] == "m3"
 
 
+# web/term.js — OSC 52/title filter (static wiring + node-run logic)
+# ---------------------------------------------------------------------------
+
+
+def _osc_region(js: str) -> str:
+    """The self-contained OSC filter block, bounded by its section comment
+    and the tabs marker — executed verbatim by the node logic test."""
+    start = js.index("/* ---------------- OSC 52 interception")
+    end = js.index("/* ---------------- tabs ---------------- */")
+    return js[start:end]
+
+
+def test_term_js_osc_filter_fast_path_wiring() -> None:
+    """The bulk-output fast path: a frame with no ESC (state 0) must be
+    forwarded AS IS (native indexOf scan, zero copies/allocations), an
+    ESC-bearing frame hands over its clean prefix as a subarray view, and
+    only the escape-sequence tail goes through the byte loop. The
+    mid-sequence resume path (state != 0 at frame start) still scans."""
+    region = _osc_region(_term_js())
+
+    assert "function makeOscFilter(forward, copy, setTitle)" in region
+    # The fast path itself: native scan → zero-copy forward.
+    assert "var esc = bytes.indexOf(ESC);" in region
+    assert "if (esc === -1) { forward(bytes); return; }" in region
+    assert "forward(bytes.subarray(0, esc));" in region
+    # One shared scanner body; the fast path enters it at the ESC, the
+    # mid-sequence resume at the frame start.
+    assert "function scan(bytes, i)" in region
+    assert "scan(bytes, esc);" in region
+    assert "scan(bytes, 0);" in region
+    # The byte loop still forwards through the same sink.
+    assert "forward(new Uint8Array(out));" in region
+
+
+OSC_FILTER_NODE_DRIVER = """
+const fs = require("fs");
+const region = fs.readFileSync(process.argv[2], "utf8");
+
+const holder = {};
+new Function("holder", region + "\\n;holder.makeOscFilter = makeOscFilter;")(holder);
+
+// latin1: byte-exact construction/inspection of fake PTY bytes (the
+// filter is byte-level; UTF-8 payloads ride as raw bytes untouched).
+const enc = (s) => new Uint8Array([...Buffer.from(s, "latin1")]);
+const dec = (b) => Buffer.from(b).toString("latin1");
+
+function harness() {
+  const h = { forwarded: [], copies: [], titles: [] };
+  h.filter = holder.makeOscFilter(
+    (b) => h.forwarded.push(b),
+    (t) => h.copies.push(t),
+    (t) => h.titles.push(t)
+  );
+  return h;
+}
+const fwd = (h) => h.forwarded.map(dec).join("");
+
+// 1. Fast path: a frame with NO ESC is forwarded as the SAME object —
+//    one native scan, no copy, no allocation.
+const plain = enc("plain PTY output \\r\\n 123 ");
+const h1 = harness();
+h1.filter(plain);
+const r1 = { n: h1.forwarded.length, same: h1.forwarded[0] === plain,
+             text: fwd(h1), titles: h1.titles.length, copies: h1.copies.length };
+
+//    ...including multibyte UTF-8 (continuation bytes are >= 0x80, an
+//    ESC byte can never appear inside them).
+const utf8 = enc("\\xd0\\xbf\\xd1\\x80\\xd0\\xb8\\xd0\\xb2\\xd0\\xb5\\xd1\\x82 ok");
+const h1b = harness();
+h1b.filter(utf8);
+const r1b = { n: h1b.forwarded.length, same: h1b.forwarded[0] === utf8, text: fwd(h1b) };
+
+// 2. ESC-bearing frame: the clean prefix is handed over (subarray view
+//    of the same buffer), the title escape is consumed, the tail flows on.
+const withTitle = enc("head\\x1b]0;My Title\\x07tail");
+const h2 = harness();
+h2.filter(withTitle);
+const r2 = { text: fwd(h2), titles: h2.titles,
+             prefixSameBuf: h2.forwarded[0] !== undefined &&
+               h2.forwarded[0].buffer === withTitle.buffer };
+
+//    ...and OSC 2 (window title) behaves the same.
+const h2b = harness();
+h2b.filter(enc("\\x1b]2;Win Title\\x07rest"));
+const r2b = { text: fwd(h2b), titles: h2b.titles };
+
+// 3. OSC 52 copy, BEL-terminated: base64 payload decoded, text copied,
+//    the escape itself never forwarded.
+const b64 = Buffer.from("hello \\xe2\\x98\\x83 clip", "latin1").toString("base64");
+const h3 = harness();
+h3.filter(enc("pre\\x1b]52;c;" + b64 + "\\x07post"));
+const r3 = { text: fwd(h3), copies: h3.copies };
+
+// 4. OSC 52 with the ST (ESC \\) terminator instead of BEL.
+const h4 = harness();
+h4.filter(enc("\\x1b]52;c;" + b64 + "\\x1b\\\\z"));
+const r4 = { text: fwd(h4), copies: h4.copies };
+
+// 5. Malformed OSC 52 payload: dropped silently, nothing copied, the
+//    surrounding bytes still forwarded.
+const h5 = harness();
+h5.filter(enc("a\\x1b]52;c;!!!not-base64!!!\\x07b"));
+const r5 = { text: fwd(h5), copies: h5.copies };
+
+// 6. Frame boundary mid-sequence: a trailing lone ESC keeps state 1 and
+//    the NEXT frame completes the title escape.
+const h6 = harness();
+h6.filter(enc("x\\x1b"));
+h6.filter(enc("]2;Split Title\\x07y"));
+const r6 = { text: fwd(h6), titles: h6.titles };
+
+// 7. Frame boundary mid-OSC: OSC 52 split across two frames still copies.
+const h7 = harness();
+h7.filter(enc("a\\x1b]52;c;"));
+h7.filter(enc(b64 + "\\x1b\\\\tail"));
+const r7 = { text: fwd(h7), copies: h7.copies };
+
+// 8. ST split across frames (state 3): ESC ends frame 1, BACKSLASH opens
+//    frame 2 — the title still lands and the tail flows.
+const h8 = harness();
+h8.filter(enc("\\x1b]0;St Title\\x1b"));
+h8.filter(enc("\\\\after"));
+const r8 = { text: fwd(h8), titles: h8.titles };
+
+// 9. ESC NOT followed by '[' inside one frame: both bytes are forwarded
+//    verbatim (an escape other than OSC belongs to xterm.js).
+const h9 = harness();
+h9.filter(enc("a\\x1bZ\\x07b"));
+const r9 = { text: fwd(h9), titles: h9.titles.length, copies: h9.copies.length };
+
+// 10. A title-only frame forwards NOTHING (nothing to render).
+const h10 = harness();
+h10.filter(enc("\\x1b]0;Only Title\\x07"));
+const r10 = { n: h10.forwarded.length, titles: h10.titles };
+
+// 11. Fast path after an escape-bearing frame: state returns to 0 and a
+//     subsequent clean frame is again zero-copy.
+const h11 = harness();
+h11.filter(enc("\\x1b]0;t\\x07"));
+const clean = enc("clean frame");
+h11.filter(clean);
+const r11 = { same: h11.forwarded[h11.forwarded.length - 1] === clean,
+              text: fwd(h11), titles: h11.titles };
+
+console.log(JSON.stringify({ r1, r1b, r2, r2b, r3, r4, r5, r6, r7, r8, r9, r10, r11 }));
+"""
+
+
+def test_term_js_osc_filter_logic(tmp_path: Path) -> None:
+    """The OSC filter actually runs (node): the zero-copy fast path
+    forwards ESC-free frames by identity, title/OSC 52 escapes are
+    intercepted exactly as before (BEL and ST terminators, payload splits
+    across frames, malformed payload dropped), and the frame-boundary
+    state machine is unchanged."""
+    result = _run_js_driver(OSC_FILTER_NODE_DRIVER, _osc_region(_term_js()), tmp_path)
+
+    # 1. No-ESC frames: one forward of the IDENTICAL buffer, nothing else.
+    assert result["r1"] == {
+        "n": 1, "same": True, "text": "plain PTY output \r\n 123 ",
+        "titles": 0, "copies": 0,
+    }
+    # r1b text: the raw UTF-8 bytes of "привет ok" read back latin1 —
+    # the point is that they pass through UNTOUCHED (same=True above).
+    assert result["r1b"] == {
+        "n": 1, "same": True,
+        "text": "привет ok".encode().decode("latin1"),
+    }
+
+    # 2. Title escapes (OSC 0 and OSC 2) intercepted, tail forwarded.
+    assert result["r2"]["text"] == "headtail"
+    assert result["r2"]["titles"] == ["My Title"]
+    assert result["r2"]["prefixSameBuf"] is True
+    assert result["r2b"] == {"text": "rest", "titles": ["Win Title"]}
+
+    # 3–4. OSC 52 copies via both terminators; the escape never forwards.
+    assert result["r3"] == {"text": "prepost", "copies": ["hello ☃ clip"]}
+    assert result["r4"] == {"text": "z", "copies": ["hello ☃ clip"]}
+
+    # 5. Malformed base64: silently dropped, neighbors forwarded.
+    assert result["r5"] == {"text": "ab", "copies": []}
+
+    # 6–8. Splits at every state boundary: lone ESC, mid-OSC payload, mid-ST.
+    assert result["r6"] == {"text": "xy", "titles": ["Split Title"]}
+    assert result["r7"] == {"text": "atail", "copies": ["hello ☃ clip"]}
+    assert result["r8"] == {"text": "after", "titles": ["St Title"]}
+
+    # 9. Non-OSC escape forwarded verbatim; 10. title-only frame forwards nothing.
+    assert result["r9"] == {"text": "a\x1bZ\x07b", "titles": 0, "copies": 0}
+    assert result["r10"] == {"n": 0, "titles": ["Only Title"]}
+
+    # 11. State returns to 0 after an escape frame → zero-copy again.
+    assert result["r11"]["same"] is True
+    assert result["r11"]["text"] == "clean frame"
+    assert result["r11"]["titles"] == ["t"]
+
+
 # web/term.js — WebGL context-loss recovery (node-run logic)
 # ---------------------------------------------------------------------------
 

@@ -200,9 +200,12 @@
       }
     }
 
-    return function process(bytes) {
+    /* The byte-level scanner: consumes bytes[i..], appends the
+     * non-escape output to `out`, mutates state/osc. Kept as a closure
+     * so the fast path below and the mid-sequence entry (state != 0 at
+     * the frame start) share ONE loop body. */
+    function scan(bytes, i) {
       var out = [];
-      var i = 0;
       while (i < bytes.length) {
         var b = bytes[i++];
         if (state === 0) {
@@ -227,6 +230,27 @@
         }
       }
       if (out.length) forward(new Uint8Array(out));
+    }
+
+    return function process(bytes) {
+      /* Fast path: outside any escape sequence (state 0) and no ESC
+       * anywhere in the frame — forward the frame AS IS: one indexOf
+       * scan, zero copies, zero allocations. This is the overwhelmingly
+       * common case for bulk PTY output (a dense test run pours
+       * megabytes per second through here, on the same UI thread that
+       * renders the terminal). An ESC before the filtered prefix is
+       * handed over as a subarray VIEW of the same buffer (no copy);
+       * only the ESC/OSC-bearing tail goes through the byte loop. */
+      if (state === 0) {
+        var esc = bytes.indexOf(ESC);
+        if (esc === -1) { forward(bytes); return; }
+        if (esc > 0) forward(bytes.subarray(0, esc));
+        scan(bytes, esc);
+        return;
+      }
+      /* Resuming mid-sequence (an OSC split across frames): the whole
+       * frame goes through the scanner — its tail may end in any state. */
+      scan(bytes, 0);
     };
   }
 

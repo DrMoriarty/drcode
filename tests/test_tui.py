@@ -3777,21 +3777,29 @@ async def test_settings_menu_model_settings_entry(app: DrCodeApp) -> None:
         await pilot.pause()
 
 
-async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
-    """The main Settings menu collapses the task-management entries
-    into one "Task settings…" item, which opens the modal
-    TaskSettingsDialog with all the preference fields."""
+async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
+    """The main Settings menu carries the TWO task-settings entries:
+    "Project environment…" (the infrastructure dialog) and "Agent
+    runtime…" (the runtime-behavior dialog). The Code index preference
+    lives ONLY in the runtime dialog — no palette entry anymore."""
     from textual.widgets import Label, RadioButton, Select
 
     from drcode.tui.command_providers import (
+        AgentRuntimeCommandProvider,
+        ProjectEnvironmentCommandProvider,
         ProjectSettingsCommandsProvider,
-        TaskSettingsCommandProvider,
     )
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import (
+        AgentRuntimeDialog,
+        ProjectEnvironmentDialog,
+    )
 
     # The main menu has no direct task entries anymore (the ESC stop
-    # behavior moved into the dialog too).
-    assert "Task settings" in SettingsPalette.ENTRY_ORDER
+    # behavior moved into the dialogs too).
+    assert "Project environment" in SettingsPalette.ENTRY_ORDER
+    assert "Agent runtime" in SettingsPalette.ENTRY_ORDER
+    assert "Task settings" not in SettingsPalette.ENTRY_ORDER
+    assert "Code index:" not in SettingsPalette.ENTRY_ORDER
     assert "ESC stop behavior:" not in SettingsPalette.ENTRY_ORDER
     for prefix in (
         "Auto-delete completed tasks:",
@@ -3810,39 +3818,34 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        provider = TaskSettingsCommandProvider(app.screen)
-        commands = provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
-        assert [(c.name, c.callback) for c in commands] == [
-            ("Task settings…", app.action_open_task_settings)
+        env_provider = ProjectEnvironmentCommandProvider(app.screen)
+        env_commands = env_provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [(c.name, c.callback) for c in env_commands] == [
+            ("Project environment…", app.action_open_project_environment)
         ]
-        app.action_open_task_settings()
+        runtime_provider = AgentRuntimeCommandProvider(app.screen)
+        runtime_commands = runtime_provider._commands()  # pyright: ignore[reportAttributeAccessIssue]
+        assert [(c.name, c.callback) for c in runtime_commands] == [
+            ("Agent runtime…", app.action_open_agent_runtime)
+        ]
+
+        # -- environment dialog: the isolation/infra cluster ----------
+        app.action_open_project_environment()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
-        # The 11 field widgets are all there, grouped under their
-        # section headers (plus the workflow-preset header on top).
+        assert isinstance(dialog, ProjectEnvironmentDialog)
         for selector in (
             "#ts-isolation",
             "#ts-start-branch",
             "#ts-parallel",
             "#ts-removal",
-            "#ts-verification",
-            "#ts-dev-rounds",
-            "#ts-nudge",
-            "#ts-esc-abort",
+            "#ts-snapshot",
             "#ts-git-tester",
             "#ts-git-research",
             "#ts-retention",
             "#ts-keep-awake",
-            "#ts-agent-drafts",
-            "#ts-generate-titles",
-            "#ts-eviction-hint",
-            "#ts-todo-tail",
         ):
             assert dialog.query_one(selector)
-        assert dialog.query_one("#ts-verification", Select).value is (
-            app.settings.verification
-        )
         assert dialog.query_one("#ts-keep-awake", RadioButton).value is (
             app.settings.keep_awake
         )
@@ -3853,9 +3856,45 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
         assert sections == [
             "Workflow preset",
             "Workflow",
+            "Git",
+        ]
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # -- runtime dialog: the frequently-tuned behavior -----------
+        app.action_open_agent_runtime()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, AgentRuntimeDialog)
+        for selector in (
+            "#ts-subagents-coder",
+            "#ts-subagents-researcher",
+            "#ts-web-fetch-mode",
+            "#ts-code-index-mode",
+            "#ts-verification",
+            "#ts-dev-rounds",
+            "#ts-nudge",
+            "#ts-esc-abort",
+            "#ts-agent-drafts",
+            "#ts-generate-titles",
+            "#ts-eviction-hint",
+            "#ts-todo-tail",
+        ):
+            assert dialog.query_one(selector)
+        assert dialog.query_one("#ts-verification", Select).value is (
+            app.settings.verification
+        )
+        sections = [
+            str(cast(Label, label).render())
+            for label in dialog.query(".ts-section").results(Label)
+        ]
+        assert sections == [
+            "Subagents",
+            "Research web fetch",
+            "Code index",
             "Context management",
             "Testing",
-            "Git",
+            "Agent behavior",
         ]
         # The main-menu provider no longer carries the task entries: it
         # keeps the integration preferences (github/notifications/voice)
@@ -3867,7 +3906,6 @@ async def test_settings_menu_task_settings_entry(app: DrCodeApp) -> None:
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
             f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
-            f"Code index: {app.settings.code_index_mode.label}",
         ]
         # The MCP toggle entry drives the hot-switching handler.
         mcp_entry = main[3]
@@ -3909,13 +3947,14 @@ async def test_mcp_toggle_hot_switches_the_server(app: DrCodeApp) -> None:
 async def test_task_settings_dialog_draft_isolation_and_apply(
     app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dialog works on a deep copy: nothing is persisted until Apply,
-    ESC discards everything, and Apply persists ONCE and replays the same
-    side effects as the per-field actions (_advance, _update_keepawake)."""
-    from textual.widgets import Button, RadioButton, Select
+    """The runtime dialog works on a deep copy: nothing is persisted
+    until Apply, ESC discards everything, and Apply persists ONCE and
+    replays the same side effects as the per-field actions (_advance,
+    _update_keepawake)."""
+    from textual.widgets import Button, Select
 
     from drcode.settings import ProjectSettingsStore, Verification
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
@@ -3944,21 +3983,18 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
             lambda: events.append("keepawake"),  # pyright: ignore[reportAttributeAccessIssue,reportArgumentType]
         )
 
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
 
-        # Edit two fields through the widgets.
+        # Edit a field through the widget.
         dialog.query_one("#ts-verification", Select).value = Verification.NONE
-        await pilot.pause()
-        dialog.query_one("#ts-keep-awake", RadioButton).value = False
         await pilot.pause()
         # Nothing persisted while editing; the live settings are untouched.
         assert saves == []
         assert events == []
         assert app.settings.verification is Verification.TESTER
-        assert app.settings.keep_awake is True
 
         # ESC cancels: no save, no side effect, nothing changed.
         await pilot.press("escape")
@@ -3969,10 +4005,10 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
 
         # Re-open, change, Apply: one save, both side effects, live
         # settings + file updated.
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
         dialog.query_one("#ts-verification", Select).value = Verification.NONE
         await pilot.pause()
         dialog.query_one("#ts-apply", Button).press()
@@ -3991,15 +4027,15 @@ async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None
     from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
 
         # Default off; toggling updates only the draft.
         toggle = dialog.query_one("#ts-eviction-hint", RadioButton)
@@ -4015,10 +4051,10 @@ async def test_task_settings_dialog_eviction_hint_toggle(app: DrCodeApp) -> None
         assert app.settings.eviction_hint is True
         assert ProjectSettingsStore(app.project_root).load().eviction_hint is True
 
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
         assert dialog.query_one("#ts-eviction-hint", RadioButton).value is True
 
 
@@ -4028,15 +4064,15 @@ async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> Non
     from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
 
         # Default off; toggling updates only the draft.
         toggle = dialog.query_one("#ts-auto-unload", RadioButton)
@@ -4055,10 +4091,10 @@ async def test_task_settings_dialog_auto_unloading_toggle(app: DrCodeApp) -> Non
             ProjectSettingsStore(app.project_root).load().auto_context_unloading is True
         )
 
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
         assert dialog.query_one("#ts-auto-unload", RadioButton).value is True
 
 
@@ -4068,15 +4104,15 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
     from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
 
         # Default off; toggling updates only the draft.
         toggle = dialog.query_one("#ts-todo-tail", RadioButton)
@@ -4092,10 +4128,10 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
         assert app.settings.todo_tail is True
         assert ProjectSettingsStore(app.project_root).load().todo_tail is True
 
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
         assert dialog.query_one("#ts-todo-tail", RadioButton).value is True
 
 
@@ -4106,24 +4142,29 @@ async def test_task_settings_dialog_label_click_toggles(app: DrCodeApp) -> None:
     from textual.widgets import Button, Label, RadioButton
 
     from drcode.settings import ProjectSettingsStore
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
-    async with app.run_test() as pilot:
+    # A taller-than-default terminal: the runtime dialog is long, and the
+    # agent-drafts row must be FULLY visible for the click (a partial row
+    # keeps the click coordinates clipped).
+    async with app.run_test(size=(120, 40)) as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, AgentRuntimeDialog)
 
         row = dialog.query_one("#ts-agent-drafts", RadioButton).parent
         assert row is not None
         label = row.query_one(Label)
         assert dialog.query_one("#ts-agent-drafts", RadioButton).value is False
 
-        # The row sits far down the scrollable form — scroll it fully into
-        # the viewport (a partial row keeps the click coordinates clipped).
-        dialog.query_one("#ts-body").scroll_to(y=6, animate=False)
+        # The row sits far down the scrollable form — center it in the
+        # scroll area (a partial row keeps the click coordinates clipped).
+        body = dialog.query_one("#ts-body")
+        body.scroll_to_center(label, animate=False)
+        await pilot.pause()
         await pilot.pause()
         await pilot.click(label)
         await pilot.pause()
@@ -4143,29 +4184,30 @@ async def test_task_settings_dialog_label_click_toggles(app: DrCodeApp) -> None:
 
 async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:
     """Picking a preset rewrites the field widgets; the first manual
-    change flips the radio row to "Custom"."""
+    change flips the radio row to "Custom". The preset also touches the
+    runtime dialog's verification field — the draft carries it even
+    though the widget lives in the other dialog."""
     from textual.widgets import RadioButton, Select
 
     from drcode.settings import GitPolicy, TaskIsolation, Verification
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_project_environment()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, ProjectEnvironmentDialog)
 
         # Defaults match no preset → "Custom" is selected.
         assert dialog.query_one("#ts-preset-custom", RadioButton).value
 
-        # Pick "Local sandbox": every declared field updates in place.
+        # Pick "Local sandbox": every declared field updates in place
+        # (verification has no widget HERE — check the draft).
         dialog.query_one("#ts-preset-local_sandbox", RadioButton).value = True
         await pilot.pause()
-        assert dialog.query_one("#ts-verification", Select).value is (
-            Verification.TESTER
-        )
+        assert dialog._draft.verification is Verification.TESTER  # pyright: ignore[reportAttributeAccessIssue]
         assert dialog.query_one("#ts-git-tester", Select).value is GitPolicy.LOCAL
         assert dialog.query_one("#ts-git-research", Select).value is GitPolicy.LOCAL
         assert dialog.query_one("#ts-isolation", Select).value is (
@@ -4173,9 +4215,11 @@ async def test_task_settings_dialog_preset_and_custom(app: DrCodeApp) -> None:
         )
         assert dialog.query_one("#ts-preset-custom", RadioButton).value is False
         # Fields the preset changed relative to the saved settings are
-        # marked; the ones it left alone are not.
+        # marked; the ones it left alone are not. (Verification has no
+        # widget in this dialog — its draft change shows up in the
+        # Agent-runtime dialog on its next open.)
         assert dialog.query_one("#ts-isolation", Select).has_class("changed")
-        assert not dialog.query_one("#ts-verification", Select).has_class("changed")
+        assert not dialog.query_one("#ts-retention", Select).has_class("changed")
 
         # A manual change away from the preset → "Custom" auto-selected.
         dialog.query_one("#ts-git-research", Select).value = GitPolicy.OFF
@@ -4190,13 +4234,13 @@ async def test_task_settings_dialog_hints_and_fix_button(app: DrCodeApp) -> None
     from textual.widgets import Button, Select
 
     from drcode.settings import TaskIsolation
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
         # git_available=True: the fixed draft (worktree) is then clean.
-        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        dialog = ProjectEnvironmentDialog(app.settings, git_available=True)
         app.push_screen(dialog)
         await pilot.pause()
         assert not dialog.query("#ts-hints .ts-hint")
@@ -4224,12 +4268,12 @@ async def test_task_settings_dialog_conflict_without_git(app: DrCodeApp) -> None
     from textual.widgets import Select
 
     from drcode.settings import TaskIsolation
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        dialog = TaskSettingsDialog(app.settings, git_available=False)
+        dialog = ProjectEnvironmentDialog(app.settings, git_available=False)
         app.push_screen(dialog)
         await pilot.pause()
         assert not dialog.query("#ts-hints .ts-hint")
@@ -4251,12 +4295,12 @@ async def test_task_settings_dialog_dormant_fields_dim_and_park(
     from textual.widgets import Select
 
     from drcode.settings import TaskIsolation, WorktreeRemoval
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        dialog = ProjectEnvironmentDialog(app.settings, git_available=True)
         app.push_screen(dialog)
         await pilot.pause()
         removal_select = dialog.query_one("#ts-removal", Select)
@@ -4285,12 +4329,12 @@ async def test_task_settings_dialog_rapid_dual_subagent_change(
     in 2 s and toggled the `changed` border endlessly)."""
     from textual.widgets import Select
 
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        dialog = AgentRuntimeDialog(app.settings, git_available=True)
         app.push_screen(dialog)
         await pilot.pause()
         coder = dialog.query_one("#ts-subagents-coder", Select)
@@ -4331,7 +4375,7 @@ async def test_task_settings_dialog_start_branch_survives_branch_load(
 
     from drcode.settings import ProjectSettings, ProjectSettingsStore
     from drcode.tui.app import DrCodeApp
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     def _git(*args: str) -> None:
         subprocess.run(
@@ -4355,10 +4399,10 @@ async def test_task_settings_dialog_start_branch_survives_branch_load(
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        app.action_open_task_settings()
+        app.action_open_project_environment()
         await pilot.pause()
         dialog = app.screen
-        assert isinstance(dialog, TaskSettingsDialog)
+        assert isinstance(dialog, ProjectEnvironmentDialog)
         select = dialog.query_one("#ts-start-branch", Select)
         assert select.value == "main"
 
@@ -4451,12 +4495,12 @@ async def test_task_settings_dialog_worktree_snapshot_field(
     from textual.widgets import Select
 
     from drcode.settings import TaskIsolation, WorktreeSnapshot
-    from drcode.tui.task_settings_dialog import TaskSettingsDialog
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")
         await pilot.pause()
-        dialog = TaskSettingsDialog(app.settings, git_available=True)
+        dialog = ProjectEnvironmentDialog(app.settings, git_available=True)
         app.push_screen(dialog)
         await pilot.pause()
         assert dialog.query_one("#ts-snapshot", Select).has_class("ts-dormant")

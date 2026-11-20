@@ -79,10 +79,11 @@ from .blocks import (  # noqa: F401
 )
 from .chat_view import ChatViewLayer
 from .command_providers import (
+    AgentRuntimeCommandProvider,
     ModelSettingsCommandProvider,
+    ProjectEnvironmentCommandProvider,
     ProjectSettingsCommandsProvider,
     ServiceCommandsProvider,
-    TaskSettingsCommandProvider,
 )
 from .header import ModelStatusHeader
 from .host import TextualHost
@@ -125,11 +126,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # entries (provider catalog, per-role picks) live in the "Model
     # settings…" sub-menu (its provider is passed explicitly by
     # action_open_model_settings) and the task-management preferences in
-    # the modal TaskSettingsDialog, opened by the "Task settings…" entry.
+    # the two modal dialogs, opened by the "Project environment…" and
+    # "Agent runtime…" entries.
     COMMANDS: ClassVar = {
         get_system_commands_provider,
         ModelSettingsCommandProvider,
-        TaskSettingsCommandProvider,
+        ProjectEnvironmentCommandProvider,
+        AgentRuntimeCommandProvider,
         ServiceCommandsProvider,
         ProjectSettingsCommandsProvider,
     }

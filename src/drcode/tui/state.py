@@ -36,7 +36,7 @@ from textual.widgets import ListView, Static
 from ..core.state import CoreState
 from ..models import Task, TaskEvent
 from ..providers import AgentRole
-from ..settings import CodeIndexMode, CompletedRetention, WebFetchMode
+from ..settings import CompletedRetention, WebFetchMode
 from .attachments import StagedImage
 from .blocks import AssistantBlock, ChatLog, ReasoningBlock, ToolCallBlock
 from .command_providers import WorkflowPreset
@@ -325,10 +325,6 @@ class DrCodeState(CoreState, App[None]):
     def action_change_web_fetch_mode(self) -> None: ...
 
     def action_edit_web_fetch_hosts(self) -> None: ...
-
-    def action_set_code_index_mode(self, mode: CodeIndexMode) -> None: ...
-
-    def action_change_code_index_mode(self) -> None: ...
 
     def _task_isolation_label(self) -> str: ...
 

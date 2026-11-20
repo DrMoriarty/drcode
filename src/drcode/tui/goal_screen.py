@@ -5,7 +5,8 @@
   with ctrl+t, an optional parent preset — the GoalScreen's ``N`` creates
   a sub-goal — and an optional pre-enabled "link viewed task" checkbox
   when the palette's "Create goal…" runs over an open task) and EDIT
-  (the GoalScreen's E: description/notes only, the title is fixed).
+  (the GoalScreen's Enter, formerly E: description/notes only, the
+  title is fixed).
   `notes` is the long free-form markdown the AGENT reads only via its
   read_goal tool — it is never injected into a system prompt.
 - ``GoalParentPicker`` — the "M" reparent picker (SearchDialog pattern):
@@ -13,18 +14,23 @@
 - ``GoalAssignPicker`` — the same pattern minus "Make top-level": the
   task statusbar's "+ assign" link assigns a goal to the viewed task.
 - ``GoalScreen`` — the full-screen roadmap view: milestone → sub-goal
-  tree with n/m progress counters, a status filter, Enter-expandable
-  description/notes details and the keyboard action set
-  (N/R/T/E/M/A/D/Ctrl+Up/Down/Esc). The tree itself is collapsible:
-  → (a button and the Right key) toggles the cursor goal's sub-goals
-  and detail rows together, ← (a button and the Left key) lifts the
-  cursor to the parent goal. The screen is a viewer + decision pad:
+  tree with n/m progress counters, a status filter and the keyboard
+  action set (N/R/T/M/A/D/Ctrl+Up/Down/Esc). Enter on a goal row opens
+  the edit dialog (the old E); a CLICK on a goal row (or → / Right)
+  toggles the details — description/notes preview plus EVERY linked
+  task (all statuses) under the goal's whole subtree; Enter or a click
+  on a task row opens that task and closes the screen. The tree itself
+  is collapsible: → (a button and the Right key) toggles the cursor
+  goal's sub-goals and detail rows together, ← (a button and the Left
+  key) lifts the cursor to the parent goal. The screen is a viewer +
+  decision pad:
   every mutation goes through the app's goal actions layer
   (``tui.actions_goals``), which owns persistence and sidebar refresh.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -36,7 +42,13 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, ListView, Static, TextArea
 
-from ..models import Goal, GoalStatus, GoalType
+from ..models import (
+    Goal,
+    GoalStatus,
+    GoalType,
+    TaskKind,
+    VerificationStatus,
+)
 from .sidebar import TaskItem
 
 if TYPE_CHECKING:
@@ -100,7 +112,8 @@ class GoalEditScreen(ModalScreen[GoalCaptureResult | tuple[str, str] | None]):
     to link that task to the created goal right away. Dismisses with a
     :class:`GoalCaptureResult`.
 
-    EDIT (``goal`` given, the GoalScreen's E): the title is a fixed line,
+    EDIT (``goal`` given, the GoalScreen's Enter, formerly ``e``): the
+    title is a fixed line,
     only description and notes are editable. Dismisses with
     (description, notes).
 
@@ -587,27 +600,34 @@ class GoalAssignPicker(ModalScreen[str | None]):
 class GoalScreen(ModalScreen[None]):
     """The full-screen roadmap view (opened from the sidebar's GOALS
     section, a goal row included): a status filter line on top, the
-    milestone → sub-goal tree in the middle (Enter expands the goal's
-    description/notes as collapsible rows right under it) and a key-hint
-    footer. Local bindings shadow the app's globals (the merge-screen
-    pattern): N new (sub-)goal · R research task for the goal · T task
-    from the goal (the standard Ctrl+N form with the link preset) · E
-    edit description/notes · M reparent (picker or Make top-level) · A
-    archive/unarchive · D done/undone (toggle GoalStatus.DONE) ·
-    Ctrl+Up/Down reorder among siblings · F cycle
+    milestone → sub-goal tree in the middle and a key-hint footer.
+    Enter on a goal row (or on its detail rows) opens the edit dialog;
+    a CLICK on a goal row toggles its detail section — description/
+    notes preview right under the row plus, below the goal's WHOLE
+    sub-tree, one row per linked task (every status: draft, hold,
+    completed, …); Enter or a click on a task row opens that task and
+    closes the screen. Local bindings shadow the app's globals (the
+    merge-screen pattern): N new (sub-)goal · R research task for the
+    goal · T task from the goal (the standard Ctrl+N form with the link
+    preset) · Enter edit description/notes · M reparent (picker or Make
+    top-level) · A archive/unarchive · D done/undone (toggle
+    GoalStatus.DONE) · Ctrl+Up/Down reorder among siblings · F cycle
     the status filter · → expand/collapse the cursor goal's sub-goals
     AND its detail rows together ·
     ← lift the cursor to the parent goal · Esc close."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "close", "Close", priority=True),
+        # Priority: must win over ListView's own Enter (= Selected), so
+        # the key can open the edit dialog / the task while a click
+        # stays on the Selected handler (details toggle / task open).
+        Binding("enter", "tree_enter", "Edit", priority=True, show=False),
         Binding("right", "toggle_subtree", "Subtree", show=False),
         Binding("left", "cursor_parent", "Up hierarchy", show=False),
         Binding("f", "cycle_filter", "Filter"),
         Binding("n", "new_goal", "New goal"),
         Binding("r", "research_task", "Research task"),
         Binding("t", "task_from_goal", "Task from goal"),
-        Binding("e", "edit_goal", "Edit"),
         Binding("m", "reparent", "Move"),
         Binding("a", "archive", "Archive"),
         Binding("d", "toggle_done", "Done"),
@@ -679,6 +699,10 @@ class GoalScreen(ModalScreen[None]):
         # The goal a refresh must put the cursor back onto (the ListView
         # index is position-based, a rebuild would drop it).
         self._focus_goal_id = focus_goal_id
+        # Same for a task row (the linked-task rows of an expanded goal):
+        # restored by task_id after a rebuild, the goal hint is the
+        # fallback when the task row is no longer rendered.
+        self._focus_task_id: str | None = None
         # Parent preset of an in-flight N capture (read back in the
         # dismissal callback — the cursor may have moved by then).
         self._pending_parent: str | None = None
@@ -772,9 +796,10 @@ class GoalScreen(ModalScreen[None]):
                 )
             yield ListView(id="goal-tree")
             yield Static(
-                "n new · r research task · t task · e edit · m move · "
+                "n new · r research task · t task · enter edit goal · "
+                "click goal = details · m move · "
                 "a archive/unarchive · d done/undone · f filter · "
-                "ctrl+↑/↓ reorder · enter details · ←/→ tree · esc close",
+                "ctrl+↑/↓ reorder · enter on task = open · ←/→ tree · esc close",
                 id="goal-screen-footer",
             )
 
@@ -850,6 +875,70 @@ class GoalScreen(ModalScreen[None]):
         )
         return rows
 
+    _TASK_STATUS_MARKERS: ClassVar[dict[str, str]] = {
+        "queued": "◷",
+        "draft": "✎",
+        "hold": "⏸",
+        "active": "▶",
+        "testing": "⚑",
+        "completed": "✓",
+        "clarification": "❓",
+    }
+
+    # Sort rank of the linked-task rows: work in motion first, parked
+    # and finished tasks last (created_at breaks the ties).
+    _TASK_STATUS_RANK: ClassVar[dict[str, int]] = {
+        "active": 0,
+        "testing": 1,
+        "clarification": 2,
+        "queued": 3,
+        "draft": 4,
+        "hold": 5,
+        "completed": 6,
+    }
+
+    def _task_rows(self, goal: Goal, depth: int, app: DrCodeApp) -> list[TaskItem]:
+        """The linked-task rows of an expanded goal: EVERY task with
+        ``task.goal_id == goal.id`` — all statuses, draft/hold/completed
+        included — one line each (kind, #id, title, status), indented one
+        level deeper than the sub-goal rows. Enter or a click on a row
+        opens the task (the sidebar's row format, ``Sidebar._task_row_text``)."""
+        linked = [t for t in app.manager.tasks.values() if t.goal_id == goal.id]
+        if not linked:
+            return []
+        linked.sort(
+            key=lambda t: (self._TASK_STATUS_RANK.get(t.status.value, 9), t.created_at)
+        )
+        indent = "  " * (depth + 2)
+        # Rough visible width of the list for the title clip (chars, not
+        # cells — good enough, the markers are narrow glyphs).
+        width = self.query_one("#goal-tree", ListView).size.width or 80
+        rows: list[TaskItem] = []
+        for t in linked:
+            marker = self._TASK_STATUS_MARKERS.get(t.status.value, "⏳")
+            kind_letter = {
+                TaskKind.BUG: "[red]B[/]",
+                TaskKind.RESEARCH: "[yellow]R[/]",
+            }.get(t.kind, "[green]F[/]")
+            if t.verification is VerificationStatus.PASSED:
+                verify = " ✅"
+            elif t.verification is VerificationStatus.FAILED:
+                verify = " ❌"
+            else:
+                verify = ""
+            prefix = f"{indent}{marker} {kind_letter} #{t.id} "
+            budget = max(8, width - len(indent) - 8 - len(t.id) - len(t.status.value))
+            title = t.title_display
+            if len(title) > budget:
+                title = title[: budget - 1] + "…"
+            rows.append(
+                TaskItem(
+                    f"{prefix}{escape(title)} [dim]{t.status.value}[/]{verify}",
+                    t.id,
+                )
+            )
+        return rows
+
     def _rebuild(self) -> None:
         """Re-render the tree, keeping the cursor on its goal.
 
@@ -866,21 +955,55 @@ class GoalScreen(ModalScreen[None]):
     async def _rebuild_worker(self) -> None:
         app = self._app()
         listing = self.query_one("#goal-tree", ListView)
+        highlighted = listing.highlighted_child
+        cursor_task_id = (
+            highlighted.task_id if isinstance(highlighted, TaskItem) else None
+        )
         cursor_id = self._cursor_goal_id() or self._focus_goal_id
         await listing.clear()
+        rows = self._visible_rows()
         items: list[TaskItem] = []
-        for goal, depth in self._visible_rows():
+        # Expanded goals whose sub-tree is currently open (a row at depth
+        # d closes every open sub-tree of depth >= d). The linked-task
+        # rows sit BELOW the whole sub-tree, so they are emitted when the
+        # sub-tree closes — innermost first; a collapsed goal's sub-tree
+        # is not walked at all, so its tasks land right under its detail
+        # rows.
+        open_expanded: list[tuple[Goal, int]] = []
+        for goal, depth in rows:
+            while open_expanded and open_expanded[-1][1] >= depth:
+                closed, closed_depth = open_expanded.pop()
+                items.extend(self._task_rows(closed, closed_depth, app))
             items.append(
                 TaskItem(self._row_text(goal, depth, app), None, goal_id=goal.id)
             )
             if goal.id in self._expanded:
                 items.extend(self._detail_rows(goal, depth))
+                open_expanded.append((goal, depth))
+        while open_expanded:
+            closed, closed_depth = open_expanded.pop()
+            items.extend(self._task_rows(closed, closed_depth, app))
         await listing.extend(items)
-        if cursor_id:
+
+        def restore(match: Callable[[TaskItem], bool]) -> bool:
             for index, child in enumerate(listing.children):
-                if isinstance(child, TaskItem) and child.goal_id == cursor_id:
+                if isinstance(child, TaskItem) and match(child):
                     listing.index = index
-                    break
+                    return True
+            return False
+
+        # The task row first (its position shifts with every detail row);
+        # when it is gone (the details were collapsed), fall back to the
+        # goal hint, then to the plain goal cursor.
+        if not (
+            (cursor_task_id and restore(lambda c: c.task_id == cursor_task_id))
+            or (cursor_id and restore(lambda c: c.goal_id == cursor_id))
+            or (
+                self._focus_goal_id
+                and restore(lambda c: c.goal_id == self._focus_goal_id)
+            )
+        ):
+            restore(lambda c: c.task_id == self._focus_task_id)
         if listing.index is None and listing.children:
             # No cursor to restore (first open, or the filter hid the old
             # row): land on the first row so the action keys work right
@@ -890,6 +1013,7 @@ class GoalScreen(ModalScreen[None]):
         # is still settling, highlighted_child is None and the move
         # actions fall back to the goal it was about to restore.
         self._focus_goal_id = cursor_id
+        self._focus_task_id = cursor_task_id
         self._update_top()
 
     def _refresh_all(self) -> None:
@@ -900,16 +1024,52 @@ class GoalScreen(ModalScreen[None]):
 
     @on(ListView.Selected, "#goal-tree")
     def _goal_selected(self, event: ListView.Selected) -> None:
-        """Enter (or a click) on a goal row toggles its description/notes
-        detail section."""
+        """A CLICK on a row (Enter is intercepted by the screen's
+        priority ``enter`` binding and never reaches the ListView, so
+        Selected here means a mouse click): on a goal row it toggles the
+        detail section, on a task row it opens the task."""
         item = event.item
-        if isinstance(item, TaskItem) and item.goal_id:
+        if not isinstance(item, TaskItem):
+            return
+        if item.task_id:
+            event.stop()
+            self._open_task(item.task_id)
+            return
+        if item.goal_id:
             if item.goal_id in self._expanded:
                 self._expanded.discard(item.goal_id)
             else:
                 self._expanded.add(item.goal_id)
             event.stop()
             self._rebuild()
+
+    def action_tree_enter(self) -> None:
+        """Enter (the priority binding): on a task row — open the task
+        and close the screen; on a goal or detail row — the edit dialog
+        (the old ``e``). A no-op when the tree does not hold the focus,
+        so a focused →/← button keeps its own Enter."""
+        listing = self.query_one("#goal-tree", ListView)
+        if self.focused is not listing:
+            return
+        item = listing.highlighted_child
+        if isinstance(item, TaskItem):
+            if item.task_id:
+                self._open_task(item.task_id)
+            elif item.goal_id:
+                self.action_edit_goal()
+
+    def _open_task(self, task_id: str) -> None:
+        """Dismiss the screen and open the task — the SearchDialog flow
+        (view_task + chat_input.focus(), view_task clears the new-task
+        mode; a DRAFT redirect keeps the focus in the editor)."""
+        from .app import DrCodeApp  # lazy: widget→app edge, avoids a cycle
+
+        app = self.app
+        self.dismiss(None)
+        assert isinstance(app, DrCodeApp)
+        app.view_task(task_id)
+        if not app._new_task_mode:
+            app.chat_input.focus()
 
     @on(Button.Pressed, "#goal-tree-expand")
     def _expand_pressed(self) -> None:
@@ -1028,7 +1188,8 @@ class GoalScreen(ModalScreen[None]):
         self._app().start_goal_task(goal.id)
 
     def action_edit_goal(self) -> None:
-        """E: edit the cursor goal's description/notes."""
+        """Enter (formerly ``e``): edit the cursor goal's description/
+        notes."""
         goal = self._require_cursor()
         if goal is None:
             return

@@ -142,17 +142,15 @@ def _network_desc(*, web_fetch_available: bool) -> str:
 def code_index_tools_for(settings: ProjectSettings, role: AgentRole) -> bool:
     """The single role-gating seam of the code index (§5, modeled after
     `web_fetch.web_fetch_policy_for`): whether the role's agent gets the
-    `code_symbols` / `code_outline` tools. Coding, tester and resolver —
-    yes, when the project's `code_index_mode` is ON; RESEARCH — never
-    (its code reading goes through the delegated subagents, which INHERIT
-    the parent run's decision via `AgentDeps.code_index` / the
-    `build_agent` kwarg). The OFF default returns False for every role —
-    the tools are not registered at all, which is itself the switch.
-    Read at activation; the three accounting mirrors (§8.2) call this
-    same helper so the context-fill estimates cannot drift from the real
-    wiring."""
-    if role is AgentRole.RESEARCH:
-        return False
+    `code_symbols` / `code_outline` tools. Coding, tester, resolver AND
+    research — yes, when the project's `code_index_mode` is ON (the
+    research agent reads code directly for its elementary lookups; its
+    delegated subagents INHERIT the parent run's decision via
+    `AgentDeps.code_index` / the `build_agent` kwarg). The OFF default
+    returns False for every role — the tools are not registered at all,
+    which is itself the switch. Read at activation; the three accounting
+    mirrors (§8.2) call this same helper so the context-fill estimates
+    cannot drift from the real wiring."""
     return settings.code_index_mode is CodeIndexMode.ON
 
 
@@ -465,11 +463,11 @@ def build_agent(
 
     `code_index` (the project's code_index_mode, resolved per role by
     `code_index_tools_for` and read at activation) registers the
-    `code_symbols` / `code_outline` tools — coding kinds only: the
-    RESEARCH kind never gets them (its code reading is delegated), and
-    at False (the default) the tools are not registered at all. The
-    delegate_research subagents inherit the parent run's decision
-    through `AgentDeps.code_index` (see `subagents.build_subagent_agent`).
+    `code_symbols` / `code_outline` tools for every kind, research
+    included, and at False (the default) the tools are not registered
+    at all. The delegate_research subagents inherit the parent run's
+    decision through `AgentDeps.code_index` (see
+    `subagents.build_subagent_agent`).
 
     `request_turns` (wired by the pipeline when the delegation gate
     exists) makes the delegation notice's decay window count the TASK's
@@ -1326,11 +1324,10 @@ def build_agent(
     # role at activation): registered ONLY when enabled — at the default
     # OFF the tools do not exist for the model at all. The tools are
     # local, millisecond reads, so there is no per-run budget gate (§5);
-    # the output caps in queries bound the context cost. RESEARCH kinds
-    # never get them (their code reading is delegated to the subagents).
-    register_code_index_tools(
-        agent, enabled=code_index and kind is not TaskKind.RESEARCH
-    )
+    # the output caps in queries bound the context cost. Research kinds
+    # get them on the same terms (their elementary lookups stay local;
+    # delegated subagents inherit the same decision).
+    register_code_index_tools(agent, enabled=code_index)
 
     # Read-only subagent delegation (project settings subagents_coder /
     # subagents_researcher): registered ONLY when the effective limit is

@@ -197,11 +197,13 @@ Delegate when:
 - you need the project's PAST work on the topic — the subagent can search the
   task archive too.
 
-The code-index tools belong to the subagent, not to you (your role has no
-code tooling): when the project enables the code index, name the target
-symbols and modules in the brief — the subagent can answer with
-code_symbols / code_callers / code_refs / code_outline instead of grepping
-and reading whole files.
+When the project enables the code index, you have YOUR OWN code_* tools
+(code_symbols / code_outline / code_refs / code_callers) for elementary
+symbol lookups — use them directly instead of grepping and reading whole
+files, and before spending a delegate_research slot on a lookup. A
+delegated subagent inherits your code-index access: for the wide reading
+name the target symbols and modules in the brief, and the subagent can
+answer with code_symbols / code_callers / code_refs / code_outline too.
 
 Read yourself what you must know EXACTLY: the files you will quote, edit or
 document, and any verification read of a claim from a report. Never delegate

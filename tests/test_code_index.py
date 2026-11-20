@@ -275,14 +275,21 @@ class TestRoleGating:
     def test_helper_gates_by_role_and_mode(self) -> None:
         off = ProjectSettings()
         assert off.code_index_mode is CodeIndexMode.OFF
-        for role in (AgentRole.CODING, AgentRole.TESTER, AgentRole.RESOLVER):
+        for role in (
+            AgentRole.CODING,
+            AgentRole.TESTER,
+            AgentRole.RESOLVER,
+            AgentRole.RESEARCH,
+        ):
             assert code_index_tools_for(off, role) is False
-        assert code_index_tools_for(off, AgentRole.RESEARCH) is False
         on = ProjectSettings(code_index_mode=CodeIndexMode.ON)
-        for role in (AgentRole.CODING, AgentRole.TESTER, AgentRole.RESOLVER):
+        for role in (
+            AgentRole.CODING,
+            AgentRole.TESTER,
+            AgentRole.RESOLVER,
+            AgentRole.RESEARCH,
+        ):
             assert code_index_tools_for(on, role) is True
-        # Research NEVER gets the tools — even when the mode is ON.
-        assert code_index_tools_for(on, AgentRole.RESEARCH) is False
 
     @pytest.fixture
     def fake_config(self) -> Config:
@@ -296,14 +303,15 @@ class TestRoleGating:
         self, fake_config: Config, project_root: Path
     ) -> None:
         coding = build_agent(fake_config, kind=TaskKind.FEATURE, root=project_root)
+        research = build_agent(fake_config, kind=TaskKind.RESEARCH, root=project_root)
         tester = build_tester_agent(fake_config, root=project_root)
         resolver = build_resolver_agent(fake_config, root=project_root)
         subagent = build_subagent_agent(fake_config, root=project_root)
-        for agent in (coding, tester, resolver, subagent):
+        for agent in (coding, research, tester, resolver, subagent):
             names = self._tool_names(agent)
             assert "code_symbols" not in names and "code_outline" not in names
 
-    def test_on_registers_for_coding_tester_resolver_subagent(
+    def test_on_registers_for_coding_tester_resolver_research_subagent(
         self, fake_config: Config, project_root: Path
     ) -> None:
         coding = build_agent(
@@ -320,13 +328,18 @@ class TestRoleGating:
                 "code_refs",
                 "code_callers",
             } <= names
-        # Research kinds never get them — even with the mode ON.
+        # The RESEARCH kind gets the tools on the same terms as coding —
+        # its elementary lookups no longer force a delegate_research slot.
         research = build_agent(
             fake_config, kind=TaskKind.RESEARCH, root=project_root, code_index=True
         )
         names = self._tool_names(research)
-        assert "code_symbols" not in names and "code_outline" not in names
-        assert "code_refs" not in names and "code_callers" not in names
+        assert {
+            "code_symbols",
+            "code_outline",
+            "code_refs",
+            "code_callers",
+        } <= names
 
     def test_tool_descriptions_are_assigned(
         self, fake_config: Config, project_root: Path
@@ -417,6 +430,49 @@ class TestMirrorsAgree:
         }
         assert set(resolver_counted) == resolver_real
         assert "code_outline" in resolver_counted
+
+    def test_research_schemas_match_real_wiring(
+        self, fake_config: Config, project_root: Path
+    ) -> None:
+        """RESEARCH joins the gated roles: the counted schemas (mirror 1)
+        must show the tools exactly when the research run registers them
+        (the pipeline resolves the flag per role via code_index_tools_for)."""
+        from drcode.context_layout import coding_tool_schemas
+
+        real = {
+            t.name
+            for t in build_agent(
+                fake_config,
+                kind=TaskKind.RESEARCH,
+                root=project_root,
+                code_index=True,
+            )._function_toolset.tools.values()
+        }
+        counted = {
+            name: text
+            for name, text in coding_tool_schemas(
+                fake_config,
+                TaskKind.RESEARCH,
+                root=project_root,
+                code_index=True,
+            )
+        }
+        assert set(counted) == real
+        assert {
+            "code_symbols",
+            "code_outline",
+            "code_refs",
+            "code_callers",
+        } <= counted.keys()
+        # OFF: neither side knows the tools.
+        off_real = build_agent(fake_config, kind=TaskKind.RESEARCH, root=project_root)
+        off_counted = dict(
+            coding_tool_schemas(fake_config, TaskKind.RESEARCH, root=project_root)
+        )
+        assert "code_symbols" not in {
+            t.name for t in off_real._function_toolset.tools.values()
+        }
+        assert "code_symbols" not in off_counted
 
     def test_task_reports_forward_the_mirror(
         self, fake_config: Config, project_root: Path

@@ -339,8 +339,10 @@ docstring обязан присваиваться, иначе pydantic-ai бер
 **Role-gating**: хелпер `code_index_tools_for(settings, role) -> bool`
 (по образцу `web_fetch_policy_for` — единственный шов, который шарят
 pipeline, compaction-учёт и context-layout; `web_fetch.py:267-281`).
-Роли: **coding, tester, resolver** — да; research — нет (его переговорный
-инструментарий — web_fetch и делегированные сабагенты; код он не пишет);
+Роли: **coding, tester, resolver, research** — да (research получает
+инструменты на общих основаниях: его элементарные lookup'ы не должны
+тратить слот `delegate_research` на вложенный запуск; сабагенты
+наследуют решение родительского прогона);
 subagent'ы `delegate_research` — **да, унаследованно** (они read-only
 исследователи кода — главный выгодоприобретатель). Отсутствие настройки-вкл
 → None → инструменты не регистрируются (это само по себе переключатель).
@@ -550,7 +552,7 @@ stat-ключи, потерянный апдейт = пере-парс.
 ```python
 class CodeIndexMode(StrEnum):
     OFF = "off"   # инструменты не регистрируются, индекс не строится
-    ON  = "on"    # индекс + инструменты для coding/tester/resolver/сабагентов
+    ON  = "on"    # индекс + инструменты для coding/tester/resolver/research/сабагентов
 
 class ProjectSettings(...):
     code_index_mode: CodeIndexMode = CodeIndexMode.OFF

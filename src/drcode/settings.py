@@ -248,12 +248,11 @@ class CodeIndexMode(str, enum.Enum):
     docs/code-index-design.md §8).
 
     ON registers the `code_symbols` and `code_outline` tools for the
-    coding agent, the tester, the conflict resolver and the
-    `delegate_research` subagents (the read-only code researchers are
-    the main beneficiaries), backed by `.drcode/code_index.json` — a
+    coding agent, the tester, the conflict resolver, the research
+    agent and the `delegate_research` subagents (which inherit the
+    parent run's decision), backed by `.drcode/code_index.json` — a
     tree-sitter-derived, stat-invalidated cache of the project's
-    definitions. The RESEARCH agent deliberately never gets the tools
-    (its code reading goes through the subagents). OFF (the default):
+    definitions. OFF (the default):
     no tools are registered and no index is ever built — zero behavior
     change; the first ON costs one full indexing pass, paid lazily at
     the first code_* call. Only ON/OFF on purpose: intermediate modes
@@ -278,9 +277,10 @@ class CodeIndexMode(str, enum.Enum):
         """One-line explanation shown in the Settings palette."""
         if self is CodeIndexMode.ON:
             return (
-                "The coding agent, the tester, the resolver and the research "
-                "subagents get code_symbols/code_outline (a tree-sitter "
-                "symbol index of the project)."
+                "The coding agent, the tester, the resolver, the research "
+                "agent and the delegate_research subagents get "
+                "code_symbols/code_outline (a tree-sitter symbol index of "
+                "the project)."
             )
         return (
             "No code-index tools; nothing is indexed (the default — the "

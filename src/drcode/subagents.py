@@ -381,7 +381,7 @@ def build_subagent_agent(
     model_config = _subagent_model_config(config)
     agent = Agent(
         _build_subagent_model(model_config, announce_wait),
-        instructions=_subagent_instructions(root, web_fetch_policy),
+        instructions=_subagent_instructions(root, web_fetch_policy, code_index),
         deps_type=SubagentDeps,
         model_settings=agent_model.base_model_settings(model_config),
         # Short runs: fewer retries than the parent agents keep.
@@ -496,13 +496,31 @@ def _web_fetch_prompt_note() -> str:
     )
 
 
-def _subagent_instructions(root: Path, web_fetch_policy: WebFetchPolicy | None) -> str:
+def _code_index_prompt_note() -> str:
+    """The dynamic system-prompt sentence describing the inherited
+    code-index tools — substituted ONLY when they are actually registered,
+    so the prompt never promises tools the model does not have."""
+    return (
+        " The code-index lookups are ALSO available to you (inherited from"
+        " the parent run's code_index_mode): code_symbols (find a"
+        " definition), code_outline (a file's structure without reading it"
+        " whole), code_refs (every textual occurrence of an identifier,"
+        " definitions marked) and code_callers (LIKELY callers, inferred —"
+        " verify the returned line). Prefer them over grep+read whole"
+        ' files; an empty result means "not indexed" — fall back to'
+        " grep_search."
+    )
+
+
+def _subagent_instructions(
+    root: Path, web_fetch_policy: WebFetchPolicy | None, code_index: bool = False
+) -> str:
     """The subagent's system prompt with the tool list kept truthful: the
-    bundled template carries a `{web_fetch_note}` placeholder where the
-    inherited-`web_fetch` sentence goes (empty when the tool is absent).
-    A project override WITHOUT the placeholder gets the note appended, so
-    a stale custom template cannot silently hide (or hallucinate) the
-    tool either way."""
+    bundled template carries `{web_fetch_note}` / `{code_index_note}`
+    placeholders where the inherited-tools sentences go (empty when the
+    tool is absent). A project override WITHOUT a placeholder gets the
+    note appended, so a stale custom template cannot silently hide (or
+    hallucinate) the tool either way."""
     from .prompts import load_subagent_prompt
 
     template = load_subagent_prompt(root)
@@ -511,9 +529,14 @@ def _subagent_instructions(root: Path, web_fetch_policy: WebFetchPolicy | None) 
         if web_fetch_policy is not None and web_fetch_policy.enabled
         else ""
     )
+    code_note = _code_index_prompt_note() if code_index else ""
     if "{web_fetch_note}" in template:
-        return template.replace("{web_fetch_note}", note)
-    return template + (f"\n\n{note.strip()}" if note else "")
+        template = template.replace("{web_fetch_note}", note)
+    else:
+        template = template + (f"\n\n{note.strip()}" if note else "")
+    if "{code_index_note}" in template:
+        return template.replace("{code_index_note}", code_note)
+    return template + (f"\n\n{code_note.strip()}" if code_note else "")
 
 
 def _brief_label(brief: str) -> str:

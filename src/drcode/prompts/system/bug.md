@@ -56,6 +56,12 @@ Delegate when:
 - you are scanning many files for the error text, an identifier or a pattern
   and only need the hits.
 
+When the code-index tools are enabled for this project, start the footprint
+survey YOURSELF with code_symbols (locate the failing definition) and
+code_callers / code_refs (its likely callers and every textual occurrence) —
+then put those results into the brief's STARTING POINTS and delegate only the
+wide reading that remains.
+
 Read yourself what you must know EXACTLY: the files you are about to change,
 the stack frames that matter, and any verification read of a claim from a
 report. Never delegate a single-file lookup or the reproduction itself.

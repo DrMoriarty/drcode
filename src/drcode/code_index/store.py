@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from typing import Any
 
 from drcode.version import APP_VERSION
 
+from .ctags_adapter import CtagsExtractor
 from .extract import (
     MAX_INDEXED_FILE_BYTES,
     FileIndex,
@@ -44,6 +46,7 @@ __all__ = [
     "BuildInfo",
     "clear_code_index_cache",
     "load_index",
+    "read_main_head",
     "take_build_notice",
 ]
 
@@ -66,13 +69,65 @@ _IGNORED_DIRS = {
     ".pytest_cache",
     ".ruff_cache",
     "dist",
+    "dist-desktop",
     "build",
+    "build-desktop",
     ".tox",
     ".idea",
     ".vscode",
 }
 
 _DEFAULT_EXTRACTOR = SymbolExtractor()
+
+# The §2.2 optional coverage adapter: consulted ONLY when the primary
+# tree-sitter extractor yields no record (unknown extension / unavailable
+# grammar). Inert (everything → None) when no universal-ctags binary is
+# usable — the feature never requires it.
+_FALLBACK_EXTRACTOR = CtagsExtractor()
+
+
+def _extract_record(path: Path, text: str) -> FileIndex | None:
+    """Primary tree-sitter extraction, then the ctags coverage fallback
+    (§2.2) — the composition point that keeps `extract.py` pure."""
+    record = _DEFAULT_EXTRACTOR.extract(path, text)
+    if record is None:
+        record = _FALLBACK_EXTRACTOR.extract(path, text)
+    return record
+
+
+def read_main_head(project_root: Path) -> str | None:
+    """The main checkout's HEAD commit (the §6.4 branch-change sentinel).
+    Pure file reads (`.git/HEAD` → ref file); the `git rev-parse`
+    subprocess is only the packed-refs fallback. None = not a git
+    checkout / detached-unresolvable / any failure — the guard then
+    stays silent (it is an optimization, not correctness: the stat keys
+    alone keep every record honest)."""
+    root = Path(project_root)
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        return None  # not a checkout root (or a worktree .git FILE)
+    try:
+        content = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not content.startswith("ref: "):
+        return content or None  # detached HEAD — the sha itself
+    ref_file = git_dir / content.removeprefix("ref: ").strip()
+    try:
+        return ref_file.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +203,7 @@ def reparse_entry(
     except OSError:
         record = None
     else:
-        record = _DEFAULT_EXTRACTOR.extract(path, text)
+        record = _extract_record(path, text)
     try:
         stat = path.stat()
         key: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
@@ -163,39 +218,45 @@ def reparse_entry(
                 cached.entries[rel] = record
             cached.file_keys[rel] = key
         if persist and key is not None:
-            disk = _load_disk_index(root)
+            disk, _head = _load_disk_index(root)
             disk[rel] = [
                 list(key),
                 file_index_to_disk(record) if record is not None else None,
             ]
-            _write_disk_index(root, disk)
+            _write_disk_index(root, disk, read_main_head(root))
     return record
 
 
-def _load_disk_index(project_root: Path) -> dict[str, list[Any]]:
-    """The persisted index as a raw {relpath: [key, record]} dict, or {}
-    on any problem (missing, corrupted, unexpected shape) — the caller
-    then re-parses the project and rewrites the file."""
+def _load_disk_index(project_root: Path) -> tuple[dict[str, list[Any]], str | None]:
+    """The persisted index as a raw {relpath: [key, record]} dict plus the
+    HEAD sentinel it was built under, or ({}, None) on any problem
+    (missing, corrupted, unexpected shape) — the caller then re-parses
+    the project and rewrites the file."""
     try:
         data = json.loads(_index_path(project_root).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
+        return {}, None
     if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
-        return {}
+        return {}, None
     if data.get("version") != INDEX_VERSION:
-        return {}
-    return data["entries"]
+        return {}, None
+    head = data.get("head")
+    return data["entries"], head if isinstance(head, str) else None
 
 
-def _write_disk_index(project_root: Path, entries: dict[str, list[object]]) -> None:
-    """Persist the index atomically (tmp + os.replace, §3.3); any failure
-    is swallowed — the in-memory cache still serves this process and the
-    next successful write catches up."""
+def _write_disk_index(
+    project_root: Path, entries: dict[str, list[object]], head: str | None
+) -> None:
+    """Persist the index atomically (tmp + os.replace, §3.3) with the
+    HEAD sentinel of the main checkout (§6.4); any failure is swallowed —
+    the in-memory cache still serves this process and the next successful
+    write catches up."""
     try:
         text = json.dumps(
             {
                 "version": INDEX_VERSION,
                 "generator": f"drcode-{APP_VERSION}",
+                "head": head,
                 "entries": entries,
             },
             ensure_ascii=False,
@@ -211,15 +272,18 @@ def _write_disk_index(project_root: Path, entries: dict[str, list[object]]) -> N
 
 def _discover_files(root: Path) -> list[Path]:
     """Every candidate source file under the project root (known
-    extension, size cap, ignored dirs pruned) — os.walk with pruning, so
-    a 10²–10³-file project stays milliseconds."""
-    extractor = _DEFAULT_EXTRACTOR
+    extension — tree-sitter's table OR the ctags fallback's, size cap,
+    ignored dirs pruned) — os.walk with pruning, so a 10²–10³-file
+    project stays milliseconds."""
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
         for name in filenames:
             path = Path(dirpath) / name
-            if extractor.language_for(path) is None:
+            if (
+                _DEFAULT_EXTRACTOR.language_for(path) is None
+                and _FALLBACK_EXTRACTOR.language_for(path) is None
+            ):
                 continue
             found.append(path)
     return found
@@ -248,7 +312,6 @@ def load_index(
     a pure read."""
     root = Path(project_root)
     started = time.monotonic()
-    extractor = _DEFAULT_EXTRACTOR
     # Fast path outside the lock: stat everything once (task_search's
     # load_archive does the same — no reason to serialize the walk).
     stat_entries: list[tuple[Path, str, tuple[int, int]]] = []
@@ -268,7 +331,24 @@ def load_index(
         if not isinstance(cached, _CachedIndex):
             cached = None  # Broken/foreign entry: rebuild from scratch.
         old_keys = cached.file_keys if cached else {}
-        disk = _load_disk_index(root) if persist else {}
+        disk: dict[str, list[Any]] = {}
+        persisted_head: str | None = None
+        if persist:
+            disk, persisted_head = _load_disk_index(root)
+        # §6.4 HEAD guard: the index was built on another branch of the
+        # main checkout — the base layer is wholesale suspect, so it is
+        # dropped and rebuilt (stat keys alone cannot see a branch switch
+        # that happened while this process was down). An optimization in
+        # the design; the simple full-drop is the honest version of it.
+        current_head = read_main_head(root) if persist else None
+        head_guard_fired = bool(
+            persist
+            and persisted_head
+            and current_head
+            and persisted_head != current_head
+        )
+        if head_guard_fired:
+            disk = {}
         entries: dict[str, FileIndex] = {}
         file_keys: dict[str, tuple[int, int]] = {}
         disk_dirty = False
@@ -299,7 +379,7 @@ def load_index(
                     text = path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue  # Unreadable: skip (the index stays honest).
-                record = extractor.extract(path, text)
+                record = _extract_record(path, text)
                 changed = True
             if record is None:
                 # Unknown/unavailable language: the file is honestly
@@ -326,7 +406,11 @@ def load_index(
             if rel in entries
         )
         if persist and (
-            changed or disk_dirty or stale_on_disk or (cached is None and stat_entries)
+            changed
+            or disk_dirty
+            or stale_on_disk
+            or head_guard_fired
+            or (cached is None and stat_entries)
         ):
             serialized: dict[str, list[object]] = {}
             for rel, key in file_keys.items():
@@ -335,7 +419,7 @@ def load_index(
                     list(key),
                     file_index_to_disk(record) if record is not None else None,
                 ]
-            _write_disk_index(root, serialized)
+            _write_disk_index(root, serialized, current_head)
         ms = int((time.monotonic() - started) * 1000)
         languages = {rec.language for rec in entries.values()}
         symbols = sum(len(rec.symbols) for rec in entries.values())

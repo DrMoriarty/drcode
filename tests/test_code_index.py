@@ -314,13 +314,19 @@ class TestRoleGating:
         subagent = build_subagent_agent(fake_config, root=project_root, code_index=True)
         for agent in (coding, tester, resolver, subagent):
             names = self._tool_names(agent)
-            assert {"code_symbols", "code_outline"} <= names
+            assert {
+                "code_symbols",
+                "code_outline",
+                "code_refs",
+                "code_callers",
+            } <= names
         # Research kinds never get them — even with the mode ON.
         research = build_agent(
             fake_config, kind=TaskKind.RESEARCH, root=project_root, code_index=True
         )
         names = self._tool_names(research)
         assert "code_symbols" not in names and "code_outline" not in names
+        assert "code_refs" not in names and "code_callers" not in names
 
     def test_tool_descriptions_are_assigned(
         self, fake_config: Config, project_root: Path
@@ -456,3 +462,307 @@ class TestSettings:
         assert store.load().code_index_mode is CodeIndexMode.ON
         store.path.write_text(json.dumps({"code_index_mode": "bogus"}))
         assert store.load().code_index_mode is CodeIndexMode.OFF
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: refs / callers / import graph (§4.2, §4.3, §5.2, §5.3), the
+# ctags coverage adapter (§2.2) and the §6.4 HEAD guard.
+# ---------------------------------------------------------------------------
+
+_CALLS_SAMPLE_APP = """import helpers
+
+
+def run_app():
+    helpers.setup()
+    return setup()
+"""
+
+_CALLS_SAMPLE_HELPERS = """COUNT = 1
+
+
+def setup():
+    return COUNT
+"""
+
+_CALLS_SAMPLE_LOOSE = """def loose_caller():
+    return setup() + 1
+"""
+
+
+def _calls_project(project_root: Path) -> Path:
+    (project_root / "app.py").write_text(_CALLS_SAMPLE_APP)
+    (project_root / "helpers.py").write_text(_CALLS_SAMPLE_HELPERS)
+    (project_root / "loose.py").write_text(_CALLS_SAMPLE_LOOSE)
+    return project_root
+
+
+@pytest.mark.skipif(not _PYTHON_READY, reason="python grammar unavailable")
+class TestRefs:
+    def test_refs_groups_and_marks_definitions(self, project_root: Path) -> None:
+        _calls_project(project_root)
+        out = queries.refs(project_root, "setup", limit=50)
+        assert "textual" in out  # the honest noise caveat (§5.2)
+        assert "[def]" in out
+        assert "app.py:" in out and "helpers.py:" in out
+        hits = queries.ref_hits(project_root, "setup")
+        by_file = {h.rel for h in hits}
+        assert by_file == {"app.py", "helpers.py", "loose.py"}
+        defs = [h for h in hits if h.is_def]
+        assert {(h.rel, h.line) for h in defs} == {("helpers.py", 4)}
+        calls = [h for h in hits if h.is_call and not h.is_def]
+        assert {(h.rel, h.line) for h in calls} == {
+            ("app.py", 5),
+            ("app.py", 6),
+            ("loose.py", 2),
+        }
+        # Scope prefixes (`helpers.setup`) stay textual hits in refs but
+        # are NOT calls of `helpers`.
+        helper_hits = [h for h in queries.ref_hits(project_root, "helpers")]
+        assert helper_hits and not any(h.is_call for h in helper_hits)
+
+    def test_refs_empty_and_capped(self, project_root: Path) -> None:
+        _calls_project(project_root)
+        assert "grep_search" in queries.refs(project_root, "no_such_name_here")
+        out = queries.refs(project_root, "setup", limit=1)
+        assert "more hit(s)" in out
+
+
+@pytest.mark.skipif(not _PYTHON_READY, reason="python grammar unavailable")
+class TestCallers:
+    def test_callers_found_ranked_and_labeled(self, project_root: Path) -> None:
+        _calls_project(project_root)
+        out = queries.callers(project_root, "setup", limit=10)
+        assert out.startswith("callers are INFERRED")  # the honest label
+        assert "defined at: helpers.py:4" in out
+        assert "run_app (app.py:" in out
+        # Import proximity ranking: the importer of helpers.py outranks
+        # the non-importing loose caller.
+        assert out.index("run_app") < out.index("loose_caller")
+
+    def test_scope_prefix_and_nested_def_are_not_edges(
+        self, project_root: Path
+    ) -> None:
+        _calls_project(project_root)
+        # `helpers.setup()` creates the edge for `setup`, never for
+        # `helpers` (§4.3 step 4) — and `helpers` has no definition hits
+        # in any body here at all.
+        assert queries.caller_hits(project_root, "helpers") == []
+        hits = queries.caller_hits(project_root, "setup")
+        assert hits, "the direct `setup()` call must be found"
+        # Definition lines never come back as caller hits.
+        assert all((h.caller_rel, h.context_line) != ("helpers.py", 4) for h in hits)
+
+    def test_no_definition_still_reports_mentions(self, project_root: Path) -> None:
+        (project_root / "ghost.py").write_text("def user():\n    return ghost_fn()\n")
+        out = queries.callers(project_root, "ghost_fn")
+        assert "no indexed definition" in out
+        assert "user (ghost.py:" in out
+
+    def test_structured_hits_carry_ranking_signals(self, project_root: Path) -> None:
+        _calls_project(project_root)
+        hits = queries.caller_hits(project_root, "setup")
+        top = hits[0]
+        assert top.caller_name == "run_app"
+        assert top.is_call
+        assert top.import_distance == 1  # app.py imports helpers.py
+        assert top.score > 0
+
+
+@pytest.mark.skipif(not _PYTHON_READY, reason="python grammar unavailable")
+class TestImportGraph:
+    def test_family_resolution_and_hops(self, project_root: Path) -> None:
+        _calls_project(project_root)
+        (project_root / "chain.py").write_text(
+            "import app\n\n\ndef go():\n    return 1\n"
+        )
+        entries, _ = load_index(project_root)
+        graph = queries.ImportGraph(entries)
+        importers = graph.importers_of("helpers.py")
+        assert importers.get("app.py") == 1
+        assert importers.get("chain.py") == 2  # importer of an importer
+
+    def test_python_suffix_resolution_with_src_prefix(self, project_root: Path) -> None:
+        pkg = project_root / "src" / "mypkg"
+        pkg.mkdir(parents=True)
+        (pkg / "x.py").write_text("VALUE = 1\n")
+        (project_root / "src" / "main.py").write_text(
+            "from mypkg.x import VALUE\n\n\ndef main():\n    return VALUE\n"
+        )
+        entries, _ = load_index(project_root)
+        graph = queries.ImportGraph(entries)
+        assert graph.importers_of("src/mypkg/x.py").get("src/main.py") == 1
+
+
+class TestCtagsAdapter:
+    """The §2.2 coverage adapter, exercised through a stub u-ctags
+    binary (real universal-ctags is optional and never required)."""
+
+    @staticmethod
+    def _stub_binary(tmp_path: Path) -> Path:
+        stub = tmp_path / "ctags-stub"
+        stub.write_text(
+            """#!/bin/sh
+case "$1" in
+  --version) echo "Universal Ctags 6.1.0(p5.9.20240616.0)";;
+  --print-language)
+    case "$2" in
+      *.nim) echo "Nim";;
+      *) echo "unknown";;
+    esac;;
+  *)
+    echo '{"_type":"tag","name":"do_stuff","kind":"function","line":3,"end":7,"signature":"proc do_stuff(a: int)"}'
+    echo '{"_type":"tag","name":"Helper","kind":"class","line":10}'
+    echo '{"_type":"ptag"}'
+    echo '{"_type":"tag","name":"localvar","kind":"local","line":12}'
+    ;;
+esac
+"""
+        )
+        stub.chmod(0o755)
+        return stub
+
+    def test_kind_mapping_and_scope_of_unknowns(self, tmp_path: Path) -> None:
+        from drcode.code_index.ctags_adapter import CtagsExtractor
+
+        ext = CtagsExtractor(binary=str(self._stub_binary(tmp_path)))
+        source = tmp_path / "m.nim"
+        source.write_text(
+            "proc do_stuff(a: int) =\n"
+            "  discard\n"
+            "\n"
+            "# padding\n"
+            "# padding\n"
+            "# padding\n"
+            "# padding\n"
+            "# padding\n"
+            "# padding\n"
+            "type Helper = object\n"
+        )
+        assert ext.language_for(source) == "Nim"
+        record = ext.extract(source, source.read_text())
+        assert record is not None and record.language == "nim"
+        assert [(s.name, s.kind) for s in record.symbols] == [
+            ("do_stuff", "function"),
+            ("Helper", "class"),  # no `end` field → end_line = line
+        ]
+        assert record.symbols[0].end_line == 7
+        assert record.symbols[0].signature == "proc do_stuff(a: int)"
+        # No signature field → the definition's own file line (§3.2).
+        assert record.symbols[1].signature == "type Helper = object"
+        # The un-mappable `local` kind is dropped (§2.3 scope).
+        assert all(s.kind != "local" for s in record.symbols)
+
+    def test_never_touches_tree_sitter_or_non_source_extensions(
+        self, tmp_path: Path
+    ) -> None:
+        from drcode.code_index.ctags_adapter import CtagsExtractor
+
+        ext = CtagsExtractor(binary=str(self._stub_binary(tmp_path)))
+        assert ext.language_for(tmp_path / "a.py") is None
+        assert ext.language_for(tmp_path / "README.md") is None
+        assert ext.language_for(tmp_path / "data.json") is None
+
+    def test_legacy_bsd_ctags_is_rejected(self) -> None:
+        # The machine's real ctags (BSD on macOS, if present) must not be
+        # mistaken for universal-ctags: an incapable binary means "no
+        # ctags coverage at all", never a crash.
+        import shutil
+
+        from drcode.code_index.ctags_adapter import CtagsExtractor
+
+        binary = shutil.which("ctags")
+        if binary is None:
+            pytest.skip("no ctags on PATH")
+        ext = CtagsExtractor(binary=binary)
+        if not ext._is_capable():
+            assert ext.language_for(Path("m.nim")) is None
+        # Either way: a capable binary answers, an incapable one refuses.
+
+    def test_store_falls_back_to_ctags_for_unknown_extensions(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from drcode.code_index import store as store_mod
+        from drcode.code_index.ctags_adapter import CtagsExtractor
+
+        monkeypatch.setattr(
+            store_mod,
+            "_FALLBACK_EXTRACTOR",
+            CtagsExtractor(binary=str(self._stub_binary(project_root))),
+        )
+        (project_root / "app.nim").write_text("proc main() =\n  discard\n")
+        # .rst is neither tree-sitter's business nor a probed ctags
+        # extension (docs are excluded from probing on purpose).
+        (project_root / "notes.rst").write_text("hi\n====\n")
+        entries, info = load_index(project_root, persist=False)
+        assert info.files == 1
+        record = entries["app.nim"]
+        assert record.language == "nim"
+        assert [s.name for s in record.symbols] == ["do_stuff", "Helper"]
+        assert "notes.rst" not in entries
+
+
+class TestHeadGuard:
+    """§6.4: the persisted index records the main checkout's HEAD; a
+    changed HEAD invalidates the whole base layer (a branch switch that
+    happened while the process was down is invisible to stat keys)."""
+
+    def _git(self, *args: str) -> None:
+        import subprocess
+
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_head_change_rebuilds_the_base_layer(self, project_root: Path) -> None:
+        from drcode.code_index.store import read_main_head
+
+        (project_root / "a.py").write_text("def f():\n    return 1\n")
+        self._git("init", "-q", str(project_root))
+        self._git("-C", str(project_root), "add", ".")
+        self._git("-C", str(project_root), "commit", "-qm", "one")
+        _entries, info = load_index(project_root)
+        assert info.built_now
+        head = read_main_head(project_root)
+        assert head and store_head(project_root) == head
+
+        # A branch switch to the SAME commit keeps the same HEAD sha —
+        # no rebuild (the guard is about content, not branch names).
+        self._git("-C", str(project_root), "checkout", "-qb", "other")
+        clear_code_index_cache()
+        _, warm = load_index(project_root)
+        assert not warm.built_now
+
+        # A real HEAD change (new commit) drops the base layer.
+        (project_root / "a.py").write_text("def f():\n    return 2\n")
+        self._git("-C", str(project_root), "add", ".")
+        self._git("-C", str(project_root), "commit", "-qm", "two")
+        assert read_main_head(project_root) != head
+        clear_code_index_cache()
+        _, rebuilt = load_index(project_root)
+        assert rebuilt.built_now
+        assert store_head(project_root) == read_main_head(project_root)
+
+        # Not a git checkout → the guard stays silent.
+        plain = project_root.parent / "plain"
+        plain.mkdir()
+        assert read_main_head(plain) is None
+
+
+def store_head(project_root: Path) -> str | None:
+    from drcode.code_index import store as store_mod
+
+    return store_mod._load_disk_index(project_root)[1]
+
+
+class TestSubagentPromptNote:
+    def test_note_only_when_enabled(self, project_root: Path) -> None:
+        from drcode.subagents import _subagent_instructions
+
+        off = _subagent_instructions(project_root, None, False)
+        assert "code_callers" not in off
+        assert "{code_index_note}" not in off
+        on = _subagent_instructions(project_root, None, True)
+        assert "code_callers" in on and "code_symbols" in on
+        assert "{" not in on.replace("{project_path}", "")

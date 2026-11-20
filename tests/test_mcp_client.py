@@ -34,7 +34,7 @@ from drcode.mcp.client_config import (
     project_servers_file,
     user_servers_file,
 )
-from drcode.mcp.client_toolsets import mcp_toolsets_for, resolve_prefix
+from drcode.mcp.client_toolsets import SafeToolset, mcp_toolsets_for, resolve_prefix
 from drcode.models import TaskKind
 from drcode.providers import AgentRole
 
@@ -68,7 +68,14 @@ def project_config(root: Path, data: object) -> None:
 
 
 def _tool_names(toolsets: list) -> list[str]:
-    return sorted(t.prefix for t in toolsets if isinstance(t, PrefixedToolset))
+    # Stage 2: every assembled toolset is SafeToolset(PrefixedToolset(...)).
+    names = []
+    for toolset in toolsets:
+        if isinstance(toolset, SafeToolset):
+            toolset = toolset.wrapped
+        assert isinstance(toolset, PrefixedToolset)
+        names.append(toolset.prefix)
+    return sorted(names)
 
 
 def _agent_tool_names(agent) -> list[str]:
@@ -332,7 +339,10 @@ def test_role_gating_is_exact(project_root: Path) -> None:
     )
     coding = mcp_toolsets_for(AgentRole.CODING, project_root=project_root)
     assert _tool_names(coding) == ["ssh"]  # prefix defaults to the id
-    assert all(isinstance(t, PrefixedToolset) for t in coding)
+    assert all(
+        isinstance(t, SafeToolset) and isinstance(t.wrapped, PrefixedToolset)
+        for t in coding
+    )
     for role in (AgentRole.RESEARCH, AgentRole.TESTER, AgentRole.RESOLVER):
         assert mcp_toolsets_for(role, project_root=project_root) == []
 

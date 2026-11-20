@@ -55,6 +55,14 @@ MCP_ROLE_KEYS: tuple[str, ...] = (
 DEFAULT_INIT_TIMEOUT = 5.0
 DEFAULT_CALL_TIMEOUT = 300.0
 
+# §3.3 of the design doc: after a successful list_tools the tool list is
+# cost-estimated by the chars/4 heuristic (transcript.estimate_tokens); a
+# server whose list exceeds the budget does NOT attach — one full catalog
+# from a real server (bvisible/mcp-ssh-manager, 37 tools) is ≈43.5k "tokens",
+# a third of a typical window. Overridable per file with the top-level
+# `tool_budget_tokens` key (project layer wins on merge).
+DEFAULT_TOOL_BUDGET_TOKENS = 10_000
+
 
 class McpServerEntry(BaseModel):
     """One external MCP server record (§1.2 of the design doc).
@@ -138,6 +146,9 @@ class McpServersFile(BaseModel):
 
     servers: list[McpServerEntry] = Field(default_factory=list)
     roles: dict[str, list[str]] = Field(default_factory=dict)
+    # Estimated-tokens ceiling for one server's tool list (§3.3); junk in
+    # the file degrades to the default, never invalidates the layer.
+    tool_budget_tokens: int = DEFAULT_TOOL_BUDGET_TOKENS
 
     @model_validator(mode="before")
     @classmethod
@@ -166,6 +177,18 @@ class McpServersFile(BaseModel):
                     continue  # unknown role key / junk value: ignored
                 roles[key] = [i for i in ids if isinstance(i, str) and i.strip()]
         data["roles"] = roles
+        budget = data.get("tool_budget_tokens")
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or budget <= 0
+            or (isinstance(budget, float) and not budget.is_integer())
+        ):
+            # Junk = the key is treated as ABSENT (the field default
+            # applies, the layer does not override the other one).
+            data.pop("tool_budget_tokens", None)
+        else:
+            data["tool_budget_tokens"] = int(budget)
         return data
 
     def server_by_id(self, server_id: str) -> McpServerEntry | None:
@@ -248,6 +271,8 @@ class McpServersStore:
         by_id: dict[str, McpServerEntry] = {}
         user_roles: dict[str, list[str]] = {}
         project_roles: dict[str, list[str]] | None = None
+        user_budget: int | None = None
+        project_budget: int | None = None
 
         for path, layer in self._layers():
             if path is None:
@@ -262,11 +287,20 @@ class McpServersStore:
                 by_id[server.id] = server  # later (project) layer wins
             if layer == "project":
                 project_roles = dict(parsed.roles)
+                if "tool_budget_tokens" in parsed.model_fields_set:
+                    project_budget = parsed.tool_budget_tokens
             else:
                 user_roles.update(parsed.roles)
+                if "tool_budget_tokens" in parsed.model_fields_set:
+                    user_budget = parsed.tool_budget_tokens
 
         merged.servers = list(by_id.values())
         merged.roles = {**user_roles, **(project_roles or {})}
+        # The specific layer sits on top, as for the role matrix.
+        if project_budget is not None:
+            merged.tool_budget_tokens = project_budget
+        elif user_budget is not None:
+            merged.tool_budget_tokens = user_budget
         return merged, warnings
 
     def _layers(self) -> list[tuple[Path | None, str]]:

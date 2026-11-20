@@ -37,8 +37,13 @@ async def _started(app: DrCodeApp, pilot) -> None:
 
 
 def _footer_move_keys(app: DrCodeApp) -> list[str]:
+    # The move pair is a Binding group: the grouped FooterKey entries
+    # carry an empty description, the full wording rides in the tooltip
+    # (falling back to the binding's description).
     return sorted(
-        k.key for k in app.query(FooterKey) if k.description in ("Move up", "Move down")
+        k.key
+        for k in app.query(FooterKey)
+        if (k.tooltip or k.description) in ("Move up", "Move down")
     )
 
 
@@ -58,6 +63,10 @@ async def test_queued_task_keeps_move_bindings_dispatchable(
         assert app.check_action("move_task_up", ()) is True
         assert app.check_action("move_task_down", ()) is True
         assert _footer_move_keys(app) == ["ctrl+down", "ctrl+up"]
+        # Both entries render inside ONE KeyGroup (single "Move" label).
+        groups = app.query("Footer KeyGroup")
+        assert len(groups) == 1
+        assert len(groups.first().query(FooterKey)) == 2
 
 
 async def test_impossible_move_toasts_instead_of_dying_silently(

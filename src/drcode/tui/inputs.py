@@ -33,7 +33,7 @@ class WordNavTextArea(TextArea):
         # namespace displaces the TextArea bindings; visibility/disabled
         # state is still gated by the app's check_action (COMPLETED tasks
         # hide both, new-task mode hides both).
-        Binding("ctrl+x", "app.cancel_task", "Cancel task"),
+        Binding("ctrl+x", "app.cancel_task", "Cancel", tooltip="Cancel task"),
         Binding("ctrl+d", "app.done_task", "Done"),
         # Same story: the stock TextArea binding (cursor_line_end) would
         # shadow the app-level "Edit held" action while this input is
@@ -151,9 +151,17 @@ class NewTaskInput(WordNavTextArea):
     check_action on the editing mode (the footer then shows exactly one)."""
 
     BINDINGS: ClassVar = [
-        Binding("tab", "toggle_kind", "Toggle type", priority=True),
+        Binding(
+            "tab", "toggle_kind", "Type", tooltip="Toggle task type", priority=True
+        ),
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
-        Binding("ctrl+g", "focus_deps", "Depends on", priority=True),
+        Binding(
+            "ctrl+g",
+            "focus_deps",
+            "Deps",
+            tooltip="Depends on (comma-separated task ids)",
+            priority=True,
+        ),
         # Push-to-talk (voice dictation): ctrl+b — ctrl+g is taken by
         # "Depends on" here, and this is the only ctrl-letter free in BOTH
         # this editor and ChatInput (TextArea owns ctrl+u/y/k/w, the app
@@ -162,21 +170,52 @@ class NewTaskInput(WordNavTextArea):
         # Off the footer (show=False): the key is advertised in the form's
         # hint line (#nt-hint) only while voice is configured.
         Binding("ctrl+b", "push_to_talk", "Voice", priority=True, show=False),
-        Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
-        Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
+        # Short footer descriptions with the full wording in the tooltip —
+        # kept in sync with the app-level ctrl+h/ctrl+d bindings (only one
+        # of the pair is ever shown, gated by the app's check_action).
+        Binding(
+            "ctrl+h",
+            "app.submit_new_task_hold",
+            "+Hold",
+            tooltip="Create the task on hold",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+h",
+            "app.save_task_edit_hold",
+            "Save hold",
+            tooltip="Save the task back on hold",
+            priority=True,
+        ),
         # Ctrl+L — assign a goal to the task being composed (the same
         # GoalAssignPicker the task header's "+ assign" link opens).
         # Fresh creation only: the app's check_action hides the key
         # while editing (the edit/draft modes never re-link).
-        Binding("ctrl+l", "app.assign_new_task_goal", "Assign goal", priority=True),
+        Binding(
+            "ctrl+l",
+            "app.assign_new_task_goal",
+            "Goal",
+            tooltip="Assign a goal",
+            priority=True,
+        ),
         # Ctrl+D — create as draft / save as draft while editing one
         # (gated by the app's check_action like the ctrl+h pair above).
         # The widget binding out-prioritizes the app's global ctrl+d
         # ("Done"), which is guarded to no-op in the form anyway.
         Binding(
-            "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
+            "ctrl+d",
+            "app.submit_new_task_draft",
+            "+Draft",
+            tooltip="Create the task as a draft",
+            priority=True,
         ),
-        Binding("ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True),
+        Binding(
+            "ctrl+d",
+            "app.save_task_edit_draft",
+            "Save draft",
+            tooltip="Save the task back as a draft",
+            priority=True,
+        ),
         # Ctrl+Y — goal capture: the stock TextArea owns ctrl+y (Redo), so
         # the app-level binding alone never fires while this editor is
         # focused (and it is the default focus at startup). Off the footer
@@ -185,8 +224,20 @@ class NewTaskInput(WordNavTextArea):
         # Same attach pair as ChatInput (clipboard image / file path) —
         # staged into the form's own bucket and sent with the FIRST
         # message on create.
-        Binding("ctrl+v", "attach_clipboard", "Paste image", priority=True),
-        Binding("ctrl+j", "attach_file", "Attach file", priority=True),
+        Binding(
+            "ctrl+v",
+            "attach_clipboard",
+            "Image",
+            tooltip="Paste image from clipboard",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+j",
+            "attach_file",
+            "File",
+            tooltip="Attach a file",
+            priority=True,
+        ),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 
@@ -229,14 +280,50 @@ class DepsInput(Input):
 
     BINDINGS: ClassVar = [
         Binding("ctrl+enter", "submit_new_task", "Create", priority=True),
-        Binding("ctrl+g,tab", "focus_editor", "Back to editor", priority=True),
-        Binding("ctrl+h", "app.submit_new_task_hold", "Create on hold", priority=True),
-        Binding("ctrl+h", "app.save_task_edit_hold", "Save on hold", priority=True),
-        Binding("ctrl+l", "app.assign_new_task_goal", "Assign goal", priority=True),
         Binding(
-            "ctrl+d", "app.submit_new_task_draft", "Create as draft", priority=True
+            "ctrl+g,tab",
+            "focus_editor",
+            "Editor",
+            tooltip="Back to the editor",
+            priority=True,
         ),
-        Binding("ctrl+d", "app.save_task_edit_draft", "Save as draft", priority=True),
+        # Same shortened footer descriptions/tooltips as NewTaskInput —
+        # only one of each same-key pair is ever shown (app check_action).
+        Binding(
+            "ctrl+h",
+            "app.submit_new_task_hold",
+            "+Hold",
+            tooltip="Create the task on hold",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+h",
+            "app.save_task_edit_hold",
+            "Save hold",
+            tooltip="Save the task back on hold",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+l",
+            "app.assign_new_task_goal",
+            "Goal",
+            tooltip="Assign a goal",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+d",
+            "app.submit_new_task_draft",
+            "+Draft",
+            tooltip="Create the task as a draft",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+d",
+            "app.save_task_edit_draft",
+            "Save draft",
+            tooltip="Save the task back as a draft",
+            priority=True,
+        ),
         Binding("escape", "cancel_new_task", "Cancel", priority=True),
     ]
 
@@ -297,8 +384,20 @@ class ChatInput(WordNavTextArea):
         # TaskFormLayer.attach_clipboard_image). ctrl+j — attach an image
         # file by path (AttachPathScreen); ctrl+f stays the app-level
         # "Find task" (the search dialog must open while composing too).
-        Binding("ctrl+v", "attach_clipboard", "Paste image", priority=True),
-        Binding("ctrl+j", "attach_file", "Attach file", priority=True),
+        Binding(
+            "ctrl+v",
+            "attach_clipboard",
+            "Image",
+            tooltip="Paste image from clipboard",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+j",
+            "attach_file",
+            "File",
+            tooltip="Attach a file",
+            priority=True,
+        ),
     ]
 
     def __init__(self, **kwargs: object) -> None:

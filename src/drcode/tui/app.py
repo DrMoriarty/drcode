@@ -396,9 +396,34 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         text-align: center;
         color: $text-disabled;
     }
+
+    # --- Compact footer --------------------------------------------------
+    # The footer is a single height:1 line with no wrapping and no
+    # ellipsis — entries that don't fit just vanish past the right edge.
+    # With the new-task form focused ~13 entries render at once (the
+    # form's priority bindings + the app row). Besides Footer(compact=True)
+    # drop the per-entry right margin and the gap between the key chip and
+    # the description: the distinct key/description backgrounds still
+    # separate the entries visually.
+    Footer.-compact FooterKey {
+        margin-right: 0;
+    }
+    Footer.-compact FooterKey .footer-key--description {
+        padding-left: 0;
+    }
     """
+    # Shared group object for the ctrl+up/ctrl+down move pair: one
+    # identity guarantees textual's consecutive-groupby merges them into
+    # a single KeyGroup footer entry.
+    _MOVE_GROUP: ClassVar = Binding.Group("Move", compact=True)
+    # Footer descriptions are kept SHORT (the full wording rides in
+    # `tooltip`, which textual 8.2.8 shows on hover over the footer
+    # entry): with the new-task form focused the footer accumulates
+    # ~9 extra priority entries and the stock one-line footer has no
+    # wrapping — long descriptions pushed the tail entries past the
+    # right edge of a ~100-column terminal.
     BINDINGS: ClassVar = [
-        ("ctrl+n", "new_task", "New task"),
+        Binding("ctrl+n", "new_task", "New", tooltip="New task"),
         # Ctrl+Y, not ctrl+g: the new-task editor's TextArea binding owns
         # ctrl+g ("Depends on", priority=True) — inside the form the
         # global would never fire. NewTaskInput/ChatInput re-declare
@@ -407,38 +432,67 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # app-level binding below applies.
         ("ctrl+y", "new_goal", "New goal"),
         ("ctrl+d", "done_task", "Done"),
-        ("ctrl+x", "cancel_task", "Cancel task"),
+        Binding("ctrl+x", "cancel_task", "Cancel", tooltip="Cancel task"),
         # Duplicate Tab/Shift+Tab (screen-level tab → app.focus_next/previous,
         # show=False so the footer is not cluttered — the keys keep working).
         Binding("ctrl+o", "focus_sidebar", "Tasks", show=False),
         Binding("ctrl+i", "focus_input", "Input", show=False),
-        ("ctrl+t", "cycle_task_kind", "Change type"),
-        ("ctrl+up", "move_task_up", "Move up"),
-        ("ctrl+down", "move_task_down", "Move down"),
+        Binding("ctrl+t", "cycle_task_kind", "Type", tooltip="Change task type"),
+        # The move pair renders as ONE grouped footer entry (KeyGroup:
+        # both keys, a single "Move" label) instead of two long rows;
+        # identical check_action gate for both (QUEUED + ≥2 in queue).
+        Binding(
+            "ctrl+up",
+            "move_task_up",
+            "Move up",
+            group=_MOVE_GROUP,
+        ),
+        Binding(
+            "ctrl+down",
+            "move_task_down",
+            "Move down",
+            group=_MOVE_GROUP,
+        ),
         # Alt+Up/Down duplicates for macOS, where the system intercepts
         # ctrl+arrows (Mission Control / App Exposé) before the terminal;
-        # show=False so the footer is not cluttered with duplicates.
+        # show=False so the footer is not cluttered with duplicates (and
+        # deliberately NOT in the move group above — they never render).
         Binding("alt+up", "move_task_up", "Move up", show=False),
         Binding("alt+down", "move_task_down", "Move down", show=False),
         ("ctrl+e", "edit_task", "Edit held"),
-        ("ctrl+f", "search_tasks", "Find task"),
+        Binding("ctrl+f", "search_tasks", "Find", tooltip="Search the task archive"),
         ("ctrl+g", "task_statistics", "Stats"),
         ("ctrl+m", "open_merge", "Merge…"),
         ("ctrl+s", "settings", "Settings"),
         # Three bindings on ctrl+h plus two on the held-task keys: the
         # footer (and the key dispatch) picks the first one whose
-        # check_action allows it — so exactly one of Create on hold /
-        # Save on hold / Hold / Resume is shown, depending on whether the
+        # check_action allows it — so exactly one of +Hold / Save hold /
+        # Hold / Resume is shown, depending on whether the
         # new-task form is open (fresh vs editing) and the viewed task's
         # status. The TextArea does not bind ctrl+h, so the key reaches the
         # app while the form editor is focused.
-        ("ctrl+h", "submit_new_task_hold", "Create on hold"),
-        ("ctrl+h", "save_task_edit_hold", "Save on hold"),
+        Binding(
+            "ctrl+h",
+            "submit_new_task_hold",
+            "+Hold",
+            tooltip="Create the task on hold",
+        ),
+        Binding(
+            "ctrl+h",
+            "save_task_edit_hold",
+            "Save hold",
+            tooltip="Save the task back on hold",
+        ),
         ("ctrl+h", "hold_task", "Hold"),
         ("ctrl+h", "resume_task", "Resume"),
-        ("ctrl+delete", "delete_task", "Delete held/completed"),
-        ("escape", "abort_run", "Stop agent"),
-        ("ctrl+r", "nudge_run", "Nudge agent"),
+        Binding(
+            "ctrl+delete",
+            "delete_task",
+            "Delete",
+            tooltip="Delete held/completed task",
+        ),
+        Binding("escape", "abort_run", "Stop", tooltip="Stop the agent run"),
+        Binding("ctrl+r", "nudge_run", "Nudge", tooltip="Nudge the agent"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -1095,7 +1149,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         yield Static("", id="statusbar")
         yield Static("", id="copy-toast", classes="hidden")
         yield Static("", id="voice-indicator", classes="hidden")
-        yield Footer()
+        # compact=True: tighter paddings/margins on every FooterKey — with
+        # the full set of bindings (new-task form focus adds ~9 priority
+        # entries) the stock airy footer overflows a ~100-column terminal
+        # and the tail entries vanish past the right edge.
+        yield Footer(compact=True)
 
     def _set_terminal_title(self, title: str) -> None:
         """Write an OSC 0 sequence so the terminal shows `title` in its tab.

@@ -269,7 +269,8 @@ class TaskLifecycleLayer(DrCodeState):
         accidental double-keystroke, exactly the inertia scenario this
         guards against) is ignored; an ESC after the window expired
         re-arms instead of firing. INSTANT: the historical single-press
-        stop. In both modes the footer binding stays "Stop agent"."""
+        stop. In both modes the footer binding stays "Stop" (the full
+        wording lives in the binding's tooltip)."""
         if self.settings.esc_abort is EscAbort.INSTANT:
             self._abort_active_runs()
             return

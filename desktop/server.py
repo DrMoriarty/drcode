@@ -37,10 +37,14 @@ Flow control: the client counts the bytes it has queued into xterm.js but
 not yet processed (the term.write callback) and reports congestion with
 {"type": "pause"} — the pump then withholds that connection's binary
 frames in memory (JSON events keep flowing; stdin is never blocked). The
-withheld bytes are buffered up to PAUSE_BUFFER_MAX_BYTES; beyond the cap
-the pause is given up and sending resumes wholesale, because a lost
-terminal stream is worse than a lost throttle. The pause state lives on
-the connection (not the tab), so a fresh ws attach to the same tab starts
+withheld bytes are buffered up to PAUSE_BUFFER_MAX_BYTES (16 MiB); beyond
+the cap the pause is given up and sending resumes wholesale, because a
+lost terminal stream is worse than a lost throttle. The client's own
+thresholds are far below the cap (pause at 1 MiB of backlog, resume under
+256 KiB — see FLOW_PAUSE_BYTES/FLOW_RESUME_BYTES in web/term.js), so an
+honored pause never comes near the 16 MiB; the cap is the last-resort
+guard against a stalled or lying client. The pause state lives on the
+connection (not the tab), so a fresh ws attach to the same tab starts
 unpaused.
 
 Each tab holds at most one PTY session; the context holds any number of

@@ -1941,18 +1941,23 @@ def test_term_js_flow_control_wiring() -> None:
     assert "tab.term.write(bytes, function () {" in src
     assert "tab.flowOutstanding -= bytes.length" in src
 
-    # Thresholds exist and the resume threshold is below the pause one
-    # (either literal form: "1 * 1024 * 1024" or "1024 * 1024").
+    # Thresholds are pinned to the tuned values (pause 1 MiB, resume
+    # 256 KiB, a 4:1 hysteresis proportion). Either literal form is
+    # accepted: "1 * 1024 * 1024" or "1024 * 1024".
     def _flow_bytes(match: re.Match[str]) -> int:
         value = int(match.group(1))
-        if match.group(2):
+        if match.group(3):  # two multipliers: * 1024 * 1024
             value *= 1024 * 1024
+        elif match.group(2):  # one multiplier: * 1024
+            value *= 1024
         return value
 
-    pause = re.search(r"FLOW_PAUSE_BYTES = (\d+)( \* 1024 \* 1024)?", src)
-    resume = re.search(r"FLOW_RESUME_BYTES = (\d+)( \* 1024 \* 1024)?", src)
+    pause = re.search(r"FLOW_PAUSE_BYTES = (\d+)( \* 1024)?( \* 1024)?", src)
+    resume = re.search(r"FLOW_RESUME_BYTES = (\d+)( \* 1024)?( \* 1024)?", src)
     assert pause is not None and resume is not None
-    assert _flow_bytes(pause) > _flow_bytes(resume)
+    assert _flow_bytes(pause) == 1024 * 1024
+    assert _flow_bytes(resume) == 256 * 1024
+    assert _flow_bytes(pause) == 4 * _flow_bytes(resume)
     # Both control frames are sent, gated by the flowPaused edge flag.
     assert '"type": "pause"' in src
     assert '"type": "resume"' in src

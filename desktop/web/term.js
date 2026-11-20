@@ -98,14 +98,18 @@
    * drains it and the visible terminal falls seconds behind reality. The
    * write callback reports when a chunk has actually been processed, so
    * the outstanding-byte count below is a true backlog measure. Crossing
-   * FLOW_PAUSE_BYTES sends {"type": "pause"} to the shell server (it stops
-   * sending binary frames, JSON events keep flowing); draining back under
-   * FLOW_RESUME_BYTES sends {"type": "resume"}. The hysteresis gap keeps a
-   * borderline stream from pause/resume thrash. Terminal output is never
+   * FLOW_PAUSE_BYTES (1 MiB) sends {"type": "pause"} to the shell server
+   * (it stops sending binary frames, JSON events keep flowing); draining
+   * back under FLOW_RESUME_BYTES (256 KiB) sends {"type": "resume"}. The
+   * 4:1 hysteresis gap keeps a borderline stream from pause/resume
+   * thrash. 1 MiB of unprocessed bytes is already a noticeable visible
+   * lag (the parser drains a few MiB/s), so the thresholds are kept low;
+   * the server's own 16 MiB pause buffer dwarfs them, so the shell never
+   * exhausts its cap while a pause is honored. Terminal output is never
    * dropped by design: if the server's own buffer cap overflows, IT gives
    * up the pause — a lost throttle is recoverable, lost bytes are not. */
-  var FLOW_PAUSE_BYTES = 4 * 1024 * 1024;
-  var FLOW_RESUME_BYTES = 1024 * 1024;
+  var FLOW_PAUSE_BYTES = 1024 * 1024;
+  var FLOW_RESUME_BYTES = 256 * 1024;
 
   /* ---- tab model ---- */
   /* tabs[] holds one object per tab, in tab-bar order:

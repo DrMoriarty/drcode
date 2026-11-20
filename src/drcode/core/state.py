@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from pydantic_ai.agent import AgentRun
 from pydantic_ai.usage import RunUsage
 
-from ..agent import AgentDeps, ResolverDeps, TesterDeps
+from ..agent import AgentDeps, InputDeliveryHooks, ResolverDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
@@ -416,6 +416,8 @@ class CoreState:
     def _next_testing(self) -> Task | None: ...
 
     def _advance(self) -> None: ...
+
+    def _input_delivery_hooks(self) -> InputDeliveryHooks: ...
 
     def _update_keepawake(self) -> None: ...
 

@@ -29,6 +29,7 @@ from pydantic_ai.usage import UsageLimits
 
 from ..agent import (
     AgentDeps,
+    InputDeliveryHooks,
     SubagentGate,
     backdate_user_prompt,
     build_agent,
@@ -63,6 +64,25 @@ from .state import CoreState
 
 
 class PipelineAgentRunLayer(CoreState):
+    def _input_delivery_hooks(self) -> InputDeliveryHooks:
+        """Pipeline triggers for the agents' send_task_input tool: after a
+        successful delivery the tool restarts the receiver's in-flight run
+        (ACTIVE target) and schedules `_advance()` — exactly what the TUI
+        does after a user send on an ACTIVE task. The tool body may run on
+        a worker thread (tool_runtime), while `run_agent`/`_advance` belong
+        to the app's event loop — hence the `call_soon_threadsafe`
+        wrappers around the running loop (safe from any thread, including
+        the loop thread itself, since async tools run on the loop)."""
+        loop = asyncio.get_running_loop()
+
+        def advance() -> None:
+            loop.call_soon_threadsafe(self._advance)
+
+        def restart_run(task_id: str) -> None:
+            loop.call_soon_threadsafe(self.run_agent, task_id)
+
+        return InputDeliveryHooks(advance=advance, restart_run=restart_run)
+
     def run_agent(self, task_id: str) -> None:
         """(Re)start the development agent for one task, in that task's
         own exclusive worker group (`agent-<task-id>`): a newer run of
@@ -357,6 +377,13 @@ class PipelineAgentRunLayer(CoreState):
                             # Provider slot-wait visibility for the nested
                             # delegate_research runs (see _wait_announcer).
                             wait_announcer=self._wait_announcer(task_id, role),
+                            # Pipeline triggers for the send_task_input
+                            # tool (deliver extra input into a task this
+                            # run created): restart the receiver's
+                            # in-flight run and schedule _advance — the
+                            # same two steps the TUI performs after a user
+                            # send on an ACTIVE task.
+                            input_hooks=self._input_delivery_hooks(),
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit

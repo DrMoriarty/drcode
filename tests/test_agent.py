@@ -2635,10 +2635,11 @@ def test_create_report_task_full_by_default(project_root: Path) -> None:
     assert created.status is TaskStatus.QUEUED
     assert created in manager.queued()
     assert created.events == []
-    assert (
+    assert text.startswith(
         f"Bug report #{created.id} '{created.title}' created at the head of the queue."
-        == (text)
     )
+    # The result points the agent at send_task_input for later additions.
+    assert "send_task_input" in text
 
 
 def test_create_report_task_research_kind_label_and_placement(
@@ -2673,7 +2674,8 @@ def test_create_report_task_research_kind_label_and_placement(
     assert (
         f"Research task #{created.id} '{created.title}' created at the tail "
         "of the queue."
-    ) == text
+    ) in text
+    assert "send_task_input" in text
     # It sits BEHIND an older feature task (tail placement), not at the head.
     later = manager.create("Later feature", "do later")
     assert manager.queued().index(created) < manager.queued().index(later)

@@ -290,6 +290,19 @@ class Task(BaseModel):
     # generation. Tasks created before the flag existed default to False:
     # their exactly-once generation already ran via `title_generated`.
     title_explicit: bool = False
+    # Persistent provenance stamp: the short id of the task whose agent
+    # created THIS task (set by the agents' create_* tools, see
+    # agent_tools._create_report_task, from deps.task_id). None for tasks
+    # created by the user, the headless CLI or the GitHub Issues import.
+    # PERSISTENT on purpose: the ownership check of the send_task_input
+    # tool ("only tasks you created yourself") must survive a TUI restart
+    # between the creation and the follow-up input — an in-memory-only
+    # decision would forget the creator. The #e5449310 incident: a research
+    # agent tried to deliver extra input into its own created feature by
+    # editing the task's JSON behind the live manager — the file edit was
+    # overwritten by the running task's next save_metadata and the input
+    # was lost.
+    created_by_task_id: str | None = None
     kind: TaskKind = TaskKind.FEATURE
     status: TaskStatus = TaskStatus.QUEUED
     verification: VerificationStatus | None = None

@@ -53,7 +53,7 @@ from .endpoint import (
 
 #: The stderr hint when the project has no live MCP endpoint (§1, verbatim).
 NO_SERVER_MESSAGE: Final = (
-    "drcode TUI не запущен или MCP выключен — включите в Settings → MCP server"
+    "drcode TUI не запущен или MCP выключен — включите в Settings → Project environment → MCP server"
 )
 
 #: Timeout of the startup `/healthz` probe. Slightly more generous than

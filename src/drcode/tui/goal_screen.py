@@ -400,9 +400,12 @@ class GoalParentPicker(ModalScreen[str | None]):
 
     _TOP = "__top__"
 
-    def __init__(self, goal: Goal, candidates: list[Goal]) -> None:
+    def __init__(self, goal: Goal, candidates: list[tuple[Goal, int]]) -> None:
         super().__init__()
         self._goal = goal
+        # (goal, tree depth) pairs — the caller flattens the store's
+        # display tree (GoalStore.flattened) so sub-goals render indented
+        # under their parents.
         self._candidates = candidates
 
     def compose(self) -> ComposeResult:
@@ -428,8 +431,11 @@ class GoalParentPicker(ModalScreen[str | None]):
         listing.clear()
         if not query or "top".startswith(query) or "make".startswith(query):
             listing.append(TaskItem("[bold]Make top-level[/]", None, goal_id=self._TOP))
-        for goal in self._candidates:
-            text = f"{_goal_type_marker(goal)} {escape(goal.title_display)}"
+        for goal, depth in self._candidates:
+            text = (
+                f"{'  ' * depth}{_goal_type_marker(goal)} "
+                f"{escape(goal.title_display)}"
+            )
             if goal.status is GoalStatus.DONE:
                 text += " [green]done[/]"
             elif goal.status is GoalStatus.ARCHIVED:
@@ -512,8 +518,11 @@ class GoalAssignPicker(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, candidates: list[Goal]) -> None:
+    def __init__(self, candidates: list[tuple[Goal, int]]) -> None:
         super().__init__()
+        # (goal, tree depth) pairs — the caller flattens the store's
+        # display tree (GoalStore.flattened) so sub-goals render indented
+        # under their parents.
         self._candidates = candidates
 
     def compose(self) -> ComposeResult:
@@ -534,8 +543,11 @@ class GoalAssignPicker(ModalScreen[str | None]):
     def _rebuild(self, query: str) -> None:
         listing = self.query_one("#goal-assign-list", ListView)
         listing.clear()
-        for goal in self._candidates:
-            text = f"{_goal_type_marker(goal)} {escape(goal.title_display)}"
+        for goal, depth in self._candidates:
+            text = (
+                f"{'  ' * depth}{_goal_type_marker(goal)} "
+                f"{escape(goal.title_display)}"
+            )
             if goal.status is GoalStatus.DONE:
                 text += " [green]done[/]"
             hay = f"{goal.title} {goal.id}".lower()
@@ -1048,9 +1060,7 @@ class GoalScreen(ModalScreen[None]):
             return
         app = self._app()
         excluded = app.manager.goals.descendant_ids(goal.id) | {goal.id}
-        candidates = [
-            g for g in app.manager.goals.goals.values() if g.id not in excluded
-        ]
+        candidates = app.manager.goals.flattened(lambda g: g.id not in excluded)
         app.push_screen(GoalParentPicker(goal, candidates), self._reparented)
 
     def _reparented(self, new_parent: str | None) -> None:

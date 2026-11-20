@@ -1232,6 +1232,7 @@ class TaskManager:
                 if not t.unfinished:
                     t.subagent_slots_used = 0
                     t.subagent_slot_refunds = 0
+                    t.web_fetch_used = 0
                 # Stamp the activation moment: the expanded-header session
                 # statistics measure activation → completion from it.
                 t.activated_at = _now()

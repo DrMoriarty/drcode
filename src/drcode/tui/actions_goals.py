@@ -144,11 +144,9 @@ class GoalsActionsLayer(DrCodeState):
         task = self.viewed
         if task is None:
             return
-        candidates = [
-            goal
-            for goal in self.manager.goals.goals.values()
-            if goal.status is not GoalStatus.ARCHIVED and goal.id != task.goal_id
-        ]
+        candidates = self.manager.goals.flattened(
+            lambda g: g.status is not GoalStatus.ARCHIVED and g.id != task.goal_id
+        )
         if not candidates:
             self.notify(
                 "No goals to assign — capture one with Ctrl+Y first.",
@@ -178,12 +176,10 @@ class GoalsActionsLayer(DrCodeState):
         never re-link (the existing goal is shown as read-only)."""
         if not self._new_task_mode or self._editing_task_id is not None:
             return
-        candidates = [
-            goal
-            for goal in self.manager.goals.goals.values()
-            if goal.status is not GoalStatus.ARCHIVED
-            and goal.id != self._new_task_goal_id
-        ]
+        candidates = self.manager.goals.flattened(
+            lambda g: g.status is not GoalStatus.ARCHIVED
+            and g.id != self._new_task_goal_id
+        )
         if not candidates:
             self.notify(
                 "No goals to assign — capture one with Ctrl+Y first.",

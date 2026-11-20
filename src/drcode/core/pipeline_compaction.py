@@ -25,6 +25,7 @@ from ..agent import (
     build_reduce_prompt,
     build_resolver_agent,
     chunk_history_for_summary,
+    code_index_tools_for,
     compacted_messages,
     drop_model_switch_notes,
     ends_with_open_request,
@@ -463,6 +464,10 @@ class PipelineCompactionLayer(CoreState):
                     allow_commit=policy.commits,
                     allow_push=policy.pushes,
                     root=root,
+                    # Mirror rule (§8.2): the tool schemas counted here
+                    # must match the real wiring — the tester carries the
+                    # code-index tools when the mode is ON.
+                    code_index=code_index_tools_for(self.settings, AgentRole.TESTER),
                 )
             elif role is AgentRole.RESOLVER:
                 instructions = load_resolver_prompt(root)
@@ -471,7 +476,15 @@ class PipelineCompactionLayer(CoreState):
                     ("resolver prompt", instructions),
                     ("AGENTS.md", agents_md.strip() or None),
                 ]
-                tools = tool_schemas(build_resolver_agent(cfg, root=root))
+                tools = tool_schemas(
+                    build_resolver_agent(
+                        cfg,
+                        root=root,
+                        code_index=code_index_tools_for(
+                            self.settings, AgentRole.RESOLVER
+                        ),
+                    )
+                )
             else:
                 research_git = self.settings.git_policy.research
                 components = system_components_coding(task.kind, root, research_git)
@@ -484,6 +497,9 @@ class PipelineCompactionLayer(CoreState):
                     # The research agent's web_fetch schema is part of the
                     # framing whenever the tool is registered for this role.
                     research_web_fetch=web_fetch_policy_for(self.settings, role),
+                    # Same mirror rule for the code-index tools (None
+                    # effect at the OFF default).
+                    code_index=code_index_tools_for(self.settings, role),
                 )
         except Exception:  # noqa: BLE001 - a measurement gap must not kill compaction
             return None

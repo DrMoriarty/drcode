@@ -214,13 +214,18 @@ def coding_tool_schemas(
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
+    code_index: bool = False,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
-    no network, pure wiring). `research_git`, `subagent_limit` and
-    `research_web_fetch` match `build_agent` — pass the real setting, or
-    the estimate misses (or invents) the delegate_research / web_fetch
-    schemas. `research_web_fetch` is the RESEARCH policy (None for every
-    other kind — see `web_fetch.web_fetch_policy_for`)."""
+    no network, pure wiring). `research_git`, `subagent_limit`,
+    `research_web_fetch` and `code_index` match `build_agent` — pass the
+    real settings, or the estimate misses (or invents) the
+    delegate_research / web_fetch / code_symbols schemas.
+    `research_web_fetch` is the RESEARCH policy (None for every other
+    kind — see `web_fetch.web_fetch_policy_for`); `code_index` is the
+    project's code_index_mode decision resolved per role by
+    `agent_build.code_index_tools_for` (one of the three §8.2 accounting
+    mirrors)."""
     return tool_schemas(
         build_agent(
             config,
@@ -229,6 +234,7 @@ def coding_tool_schemas(
             research_git=research_git,
             subagent_limit=subagent_limit,
             research_web_fetch=research_web_fetch,
+            code_index=code_index,
         )
     )
 
@@ -239,11 +245,17 @@ def tester_tool_schemas(
     allow_commit: bool = True,
     allow_push: bool = True,
     root: Path | None = None,
+    code_index: bool = False,
 ) -> list[tuple[str, str]]:
-    """Tool wire-texts of the tester agent."""
+    """Tool wire-texts of the tester agent (`code_index` mirrors the
+    tester's code-index decision — see `coding_tool_schemas`)."""
     return tool_schemas(
         build_tester_agent(
-            config, allow_commit=allow_commit, allow_push=allow_push, root=root
+            config,
+            allow_commit=allow_commit,
+            allow_push=allow_push,
+            root=root,
+            code_index=code_index,
         )
     )
 
@@ -267,11 +279,13 @@ def resolver_tool_schemas(
     config: Config,
     *,
     root: Path | None = None,
+    code_index: bool = False,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the resolver agent (read/inspect tools + the
     edit pair + set_resolution — whatever `build_resolver_agent`
-    registers; no network, pure wiring)."""
-    return tool_schemas(build_resolver_agent(config, root=root))
+    registers; no network, pure wiring). `code_index` mirrors the
+    resolver's code-index decision — see `coding_tool_schemas`."""
+    return tool_schemas(build_resolver_agent(config, root=root, code_index=code_index))
 
 
 # -- per-agent selection (shared by the status-bar counter and the dialog) ----
@@ -727,6 +741,7 @@ def task_reports(
     research_git: GitPolicy = GitPolicy.PUSH,
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
+    code_index: bool = False,
     active_goals: list[Goal] | None = None,
     linked_goal: Goal | None = None,
 ) -> tuple[CtxReport | None, CtxReport | None, CtxReport | None, RunUsage, int]:
@@ -771,6 +786,7 @@ def task_reports(
                 research_git=research_git,
                 subagent_limit=subagent_limit,
                 research_web_fetch=research_web_fetch,
+                code_index=code_index,
             ),
             goals_component=goals_system_component(
                 task.kind, task.goal_id, active_goals or [], linked_goal
@@ -792,6 +808,7 @@ def task_reports(
                 allow_commit=tester_allow_commit,
                 allow_push=tester_allow_push,
                 root=project_root,
+                code_index=code_index,
             ),
             exact_tokens=tester_live_tokens,
         )
@@ -803,7 +820,9 @@ def task_reports(
             resolver_messages,
             resolver_config,
             system_components=system_components_resolver(project_root),
-            tools=resolver_tool_schemas(resolver_config, root=project_root),
+            tools=resolver_tool_schemas(
+                resolver_config, root=project_root, code_index=code_index
+            ),
             exact_tokens=resolver_live_tokens,
         )
     usage, requests = cumulative_usage(

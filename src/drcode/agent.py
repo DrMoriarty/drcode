@@ -25,6 +25,7 @@ from .agent_build import (
     build_resolver_agent,
     build_resolver_reviewer_agent,
     build_tester_agent,
+    code_index_tools_for,
 )
 from .agent_model import (
     AsyncOpenAI,
@@ -220,6 +221,7 @@ __all__ = [
     "build_title_prompt",
     "chunk_history_for_summary",
     "clean_generated_title",
+    "code_index_tools_for",
     "compacted_messages",
     "drop_model_switch_notes",
     "ends_with_empty_response",

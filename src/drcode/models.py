@@ -367,6 +367,17 @@ class Task(BaseModel):
     # `unfinished=True`, which keeps the budget).
     subagent_slots_used: int = 0
     subagent_slot_refunds: int = 0
+    # The web_fetch budget spent within the CURRENT activation
+    # (`WebFetchGate.used` mirrored here by the pipeline on every
+    # spend/refund — same shape as the subagent counters above): the gate
+    # object is per RUN, but the budget is per ACTIVATION — a non-user
+    # restart of the run (network retry, demote-on-failure, app restart
+    # with an unfinished resume) re-enters run_agent whole and re-seeds
+    # the gate from this counter, so spent fetches are never returned by
+    # a restart. Reset at the same activation boundaries as the
+    # delegation budget: promote_next of a task WITHOUT an interrupted
+    # attempt and a run restart via _nudge_run.
+    web_fetch_used: int = 0
     # Cumulative number of OUTGOING model requests this task has produced
     # (incremented once per request by the delegation-notice supplier the
     # pipeline wires into build_agent — one supplier call == one request).

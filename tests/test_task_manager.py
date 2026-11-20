@@ -640,6 +640,33 @@ def test_promote_next_keeps_subagent_budget_on_unfinished_resume(
     assert task.subagent_slot_refunds == 1
 
 
+def test_promote_next_resets_web_fetch_budget_on_fresh_activation(
+    manager: TaskManager,
+) -> None:
+    """A FRESH activation starts the web_fetch budget over, together with
+    the delegate_research budget — the spent fetches of the previous
+    activation are not carried in."""
+    task = manager.create("t", "x")
+    task.web_fetch_used = 3
+    assert manager.promote_next() is task
+    assert task.web_fetch_used == 0
+
+
+def test_promote_next_keeps_web_fetch_budget_on_unfinished_resume(
+    manager: TaskManager,
+) -> None:
+    """A non-user restart of the same activation (network retry,
+    demote-on-failure, app restart — unfinished=True) must NOT return
+    spent fetches: the budget is per activation, and the restarted run's
+    gate is re-seeded from this persisted counter."""
+    task = manager.create("t", "x")
+    task.pending_input.clear()
+    task.unfinished = True
+    task.web_fetch_used = 3
+    assert manager.promote_next() is task
+    assert task.web_fetch_used == 3
+
+
 def test_promote_next_noop_when_active_exists(manager: TaskManager) -> None:
     manager.create("a", "input")
     manager.promote_next()

@@ -15,7 +15,12 @@ from rich.text import Text
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
-from ..agent import all_user_prompts, last_context_tokens, subagent_limit_for
+from ..agent import (
+    all_user_prompts,
+    code_index_tools_for,
+    last_context_tokens,
+    subagent_limit_for,
+)
 from ..context_layout import (
     AGENT_DEV,
     AGENT_RESOLVER,
@@ -632,6 +637,12 @@ class TaskStatusLayer(DrCodeState):
             research_git=self.settings.git_policy.research,
             subagent_limit=subagent_limit_for(self.settings, role),
             research_web_fetch=web_fetch_policy_for(self.settings, role),
+            # Mirror rule (§8.2): the counted tool schemas must match the
+            # real wiring — the code-index tools ride the dev, tester and
+            # resolver reports when the mode is ON (the helper returns
+            # the same project decision for all three non-research
+            # roles).
+            code_index=code_index_tools_for(self.settings, role),
             # The goals data for the dev report's dynamic-instructions line:
             # the roadmap block needs the active list, the per-task block
             # the goal behind task.goal_id (None when absent/deleted).

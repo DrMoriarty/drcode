@@ -26,6 +26,7 @@ from ..github import (
     sync_issues,
 )
 from ..settings import (
+    CodeIndexMode,
     CompletedRetention,
     EscAbort,
     GitPolicy,
@@ -47,6 +48,7 @@ from ..workflow import (
     load_role_instructions,
 )
 from .command_providers import (
+    CodeIndexOptionsProvider,
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
     GitResearchOptionsProvider,
@@ -350,6 +352,36 @@ class SettingsLayer(DrCodeState):
         if isinstance(self.screen, CommandPalette):
             return
         self.action_open_task_settings()
+
+    def action_set_code_index_mode(self, mode: CodeIndexMode) -> None:
+        """Settings command: whether the agents get the symbolic code
+        index (code_symbols/code_outline for coding/tester/resolver and
+        the research subagents; docs/code-index-design.md). Persisted per
+        project (.drcode/settings.json); read at activation, so a change
+        reaches the next run of each task, never the in-flight one.
+        OFF registers nothing and builds nothing."""
+        self.settings.code_index_mode = mode
+        self.settings_store.save(self.settings)
+        self.notify(
+            f"Code index: {mode.label}",
+            title="Project settings",
+            timeout=4,
+        )
+
+    def action_change_code_index_mode(self) -> None:
+        """Code-index picker, opened from the "Code index" Settings
+        entry. Same UX as the web-fetch-mode picker: the narrowed
+        SettingsPalette with the two modes; picking one applies it,
+        Escape dismisses without changing anything."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        self.push_screen(
+            SettingsPalette(
+                id="--code-index-palette",
+                providers=[CodeIndexOptionsProvider],
+                placeholder="Search for options…",
+            )
+        )
 
     def action_set_git_tester(self, policy: GitPolicy) -> None:
         """Settings command: what the tester may do to git after a passed

@@ -35,6 +35,7 @@ from ..agent import (
     build_title_agent,
     build_title_prompt,
     clean_generated_title,
+    code_index_tools_for,
     ends_with_empty_response,
     ends_with_open_request,
     is_pending_retry,
@@ -261,6 +262,7 @@ class PipelineAgentRunLayer(CoreState):
                 workflow_instructions,
                 subagent_gate,
                 web_fetch_gate,
+                code_index,
             ) = await self._prepare_agent_run(task, task_id, role, generation)
             # Pre-run forced compaction (project setting
             # compaction_resume_min_tokens): when the task waited long
@@ -347,6 +349,11 @@ class PipelineAgentRunLayer(CoreState):
                             # for THIS run (None = the tool is not
                             # registered, see _prepare_agent_run).
                             web_fetch_gate=web_fetch_gate,
+                            # The code-index decision for THIS run: the
+                            # nested delegate_research subagents inherit
+                            # it (they are the index's main
+                            # beneficiaries).
+                            code_index=code_index,
                             # Provider slot-wait visibility for the nested
                             # delegate_research runs (see _wait_announcer).
                             wait_announcer=self._wait_announcer(task_id, role),
@@ -538,6 +545,7 @@ class PipelineAgentRunLayer(CoreState):
         str | None,
         SubagentGate | None,
         WebFetchGate | None,
+        bool,
     ]:
         """Register the run and assemble everything the turn loop needs:
         the (worktree) root the tools run in, the built agent, the
@@ -650,6 +658,12 @@ class PipelineAgentRunLayer(CoreState):
         # the tool is not registered there at all. Read at activation, so a
         # settings change reaches the next run of each task.
         web_fetch_policy = web_fetch_policy_for(self.settings, role)
+        # Symbolic code index (project setting code_index_mode, §8.2's
+        # role gating): coding/tester/resolver roles get the tools when
+        # ON, research never does; the decision rides the deps so the
+        # delegate_research subagents inherit it. Read at activation, so
+        # a settings change reaches the next run of each task.
+        code_index = code_index_tools_for(self.settings, role)
         agent = build_agent(
             self.resolved_config(role),
             kind=task.kind,
@@ -667,6 +681,9 @@ class PipelineAgentRunLayer(CoreState):
             # The research agent's web_fetch tool (SSRF-guarded, capped,
             # framed as untrusted content): None when the mode is off.
             research_web_fetch=web_fetch_policy,
+            # The code-index tools (code_symbols/code_outline): None
+            # effect at the OFF default — nothing is registered.
+            code_index=code_index,
             # The real scratch path is baked into the write tools'
             # descriptions (no literal <task-id> placeholder for the model
             # to copy verbatim into a path argument).
@@ -700,11 +717,31 @@ class PipelineAgentRunLayer(CoreState):
         )
         # One gate per activation: it carries the run's policy AND the
         # fetch budget, so a superseded run's gate dies with it (the same
-        # reasoning as the subagent gate).
-        web_fetch_gate = (
-            WebFetchGate(web_fetch_policy) if web_fetch_policy is not None else None
+        # reasoning as the subagent gate). The BUDGET is per activation:
+        # seeded from the task's mirrored counter, so a non-user restart
+        # (network retry, demote-on-failure — run_agent re-enters whole
+        # and lands here again) continues the spent budget instead of
+        # returning the fetches; `on_change` mirrors every spend/refund
+        # back onto the task. The counter resets at the activation
+        # boundaries (promote_next of a non-unfinished task, _nudge_run).
+        web_fetch_gate = None
+        if web_fetch_policy is not None:
+            fetch_gate = WebFetchGate(web_fetch_policy, used=task.web_fetch_used)
+            web_fetch_gate = fetch_gate
+
+            def _record_web_fetch_budget() -> None:
+                task.web_fetch_used = fetch_gate.used
+                self.manager.storage.save(task)
+
+            fetch_gate.on_change = _record_web_fetch_budget
+        return (
+            root,
+            agent,
+            workflow_instructions,
+            subagent_gate,
+            web_fetch_gate,
+            code_index,
         )
-        return root, agent, workflow_instructions, subagent_gate, web_fetch_gate
 
     async def _consume_turn_input(
         self,

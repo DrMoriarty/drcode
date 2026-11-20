@@ -243,6 +243,57 @@ WEB_FETCH_MODE_OPTIONS: tuple[WebFetchMode, ...] = (
 )
 
 
+class CodeIndexMode(str, enum.Enum):
+    """Whether the agents get the symbolic code index (project setting,
+    docs/code-index-design.md §8).
+
+    ON registers the `code_symbols` and `code_outline` tools for the
+    coding agent, the tester, the conflict resolver and the
+    `delegate_research` subagents (the read-only code researchers are
+    the main beneficiaries), backed by `.drcode/code_index.json` — a
+    tree-sitter-derived, stat-invalidated cache of the project's
+    definitions. The RESEARCH agent deliberately never gets the tools
+    (its code reading goes through the subagents). OFF (the default):
+    no tools are registered and no index is ever built — zero behavior
+    change; the first ON costs one full indexing pass, paid lazily at
+    the first code_* call. Only ON/OFF on purpose: intermediate modes
+    (language allowlists etc.) are YAGNI — the enum leaves room to grow
+    without changing the field."""
+
+    OFF = "off"
+    ON = "on"
+
+    @property
+    def label(self) -> str:
+        """Human-readable option label for the settings UI."""
+        return "on" if self is CodeIndexMode.ON else "off"
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the code-index tools are registered at all."""
+        return self is CodeIndexMode.ON
+
+    @property
+    def description(self) -> str:
+        """One-line explanation shown in the Settings palette."""
+        if self is CodeIndexMode.ON:
+            return (
+                "The coding agent, the tester, the resolver and the research "
+                "subagents get code_symbols/code_outline (a tree-sitter "
+                "symbol index of the project)."
+            )
+        return (
+            "No code-index tools; nothing is indexed (the default — the "
+            "agents navigate with grep/read as before)."
+        )
+
+
+CODE_INDEX_MODE_OPTIONS: tuple[CodeIndexMode, ...] = (
+    CodeIndexMode.OFF,
+    CodeIndexMode.ON,
+)
+
+
 def normalize_host_entry(value: str) -> str:
     """Normalize one host entry of `web_fetch_allow_hosts`/`_block_hosts`.
 
@@ -657,6 +708,19 @@ class ProjectSettings(BaseModel):
     # costs tokens on every request, which some setups don't want. Read at
     # activation, so a toggle applies to the next activation of each task.
     todo_tail: bool = False
+    # Symbolic code index (docs/code-index-design.md): when ON, the
+    # coding agent, the tester, the resolver and the delegate_research
+    # subagents get the code_symbols/code_outline tools backed by
+    # `.drcode/code_index.json` (tree-sitter definitions, stat-keyed
+    # incremental cache). OFF (the default) registers nothing and builds
+    # nothing — the first ON costs one full indexing pass at the first
+    # code_* call, so it stays an explicit opt-in. The RESEARCH agent
+    # never gets the tools either way (its code reading is delegated).
+    # Read at activation, so a toggle applies to the next activation;
+    # the three accounting mirrors (pipeline_compaction,
+    # task_status_view, context_layout) must receive the same effective
+    # value or the context-fill estimates miss the tool schemas.
+    code_index_mode: CodeIndexMode = CodeIndexMode.OFF
     # When the per-task worktree directory (.drcode/worktrees/<id>) is
     # removed automatically (WorktreeRemoval docstring). Only the
     # directory is governed: the branch `drcode/<id>` lives by RULE 2,

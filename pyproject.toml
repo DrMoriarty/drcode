@@ -29,6 +29,13 @@ dependencies = [
     # import is still guarded lazily in voice.py (a missing system
     # PortAudio library must degrade to a toast, not a crash).
     "sounddevice>=0.5",
+    # Symbolic code index (drcode.code_index, docs/code-index-design.md):
+    # the tree-sitter extractor. The pip package itself is small — the
+    # grammars are DOWNLOADED on demand into a local cache (§2.4), so the
+    # frozen bundle prefetches the mainstream set at build time
+    # (scripts/build-binary.sh) and ships the cache; a missing grammar
+    # degrades to "file not indexed", never a crash.
+    "tree-sitter-language-pack>=1.25",
 ]
 
 [project.optional-dependencies]

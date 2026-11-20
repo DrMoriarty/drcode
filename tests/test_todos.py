@@ -17,6 +17,7 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ModelRequest
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.models.wrapper import WrapperModel
+from textual.widgets import Static
 
 from drcode import agent as agent_mod
 from drcode.agent import AgentDeps
@@ -720,7 +721,7 @@ async def test_todo_panel_renders_items(project_root: Path) -> None:
         await pilot.pause()
         panel = app.query_one("#todo-panel", TodoPanel)
         assert not panel.has_class("hidden")
-        text = str(panel.render())
+        text = str(panel.query_one(Static).render())
         assert "[ ] 1. first" in text
         assert "[x] 2. second" in text
 
@@ -739,7 +740,7 @@ async def test_todo_panel_collapses_when_all_done(project_root: Path) -> None:
         await pilot.pause()
         panel = app.query_one("#todo-panel", TodoPanel)
         assert not panel.has_class("hidden")
-        text = str(panel.render())
+        text = str(panel.query_one(Static).render())
         assert "todos" in text and "2/2" in text
         assert "first" not in text
         assert "second" not in text
@@ -747,7 +748,7 @@ async def test_todo_panel_collapses_when_all_done(project_root: Path) -> None:
 
 def _panel_text(app: DrCodeApp) -> str:
     panel = app.query_one("#todo-panel", TodoPanel)
-    return str(panel.render())
+    return str(panel.query_one(Static).render())
 
 
 async def test_todo_panel_click_toggles_completed_list(project_root: Path) -> None:

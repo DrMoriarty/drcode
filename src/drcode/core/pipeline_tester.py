@@ -28,6 +28,7 @@ from ..agent import (
     TesterDeps,
     all_user_prompts,
     build_tester_agent,
+    code_index_tools_for,
     last_response_usage,
     resumable_history,
     run_context_tokens,
@@ -332,6 +333,10 @@ class PipelineTesterLayer(CoreState):
                 allow_commit=self.settings.git_policy.tester.commits,
                 allow_push=self.settings.git_policy.tester.pushes,
                 root=root,
+                # The code-index tools (code_symbols/code_outline) when
+                # the project's code_index_mode is ON — read at
+                # activation, so a settings change reaches the next round.
+                code_index=code_index_tools_for(self.settings, AgentRole.TESTER),
                 # The external review (`.drcode/workflow.py` on_review)
                 # splits "the tester passed" from "the task is accepted":
                 # a PASSED verdict then leaves the task TESTING.

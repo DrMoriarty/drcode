@@ -345,9 +345,7 @@ async def test_unblock_tick_fills_free_slot_while_other_slot_runs(
         _gate_on(scripted, monkeypatch, release, "work a")
         scripted.steps = [text_response("done")]
         app._advance()
-        await wait_until(
-            lambda: app.agent_running, pilot, what="slot 1 run in flight"
-        )
+        await wait_until(lambda: app.agent_running, pilot, what="slot 1 run in flight")
         await wait_until(
             lambda: app._dep_gate.get(x.id, {}).get(dep.id) == "unmerged",
             pilot,

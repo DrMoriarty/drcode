@@ -205,6 +205,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         eviction_hint: bool = False,
         todo_supplier: Any = None,
         research_web_fetch: Any = None,
+        code_index: bool = False,
         announce_wait: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))

@@ -272,7 +272,15 @@ def _websocket(
         out_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
         def _frame_sink(data: bytes) -> None:
-            loop.call_soon_threadsafe(out_queue.put_nowait, ("bytes", data))
+            # frame_sink is wired to PtySession._on_output, which fires from
+            # _on_readable — a loop.add_reader callback, i.e. ALWAYS on THIS
+            # loop's thread. A direct put is therefore safe (asyncio.Queue is
+            # not thread-safe, but this never crosses a thread) and skips the
+            # call_soon_threadsafe handle + wake-up per chunk on a busy output
+            # stream. The event_sink below MUST keep call_soon_threadsafe:
+            # exit/error events arrive from the reaper running in
+            # asyncio.to_thread.
+            out_queue.put_nowait(("bytes", data))
 
         def _event_sink(event: dict[str, Any]) -> None:
             loop.call_soon_threadsafe(out_queue.put_nowait, ("json", event))

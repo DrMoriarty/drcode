@@ -686,6 +686,13 @@ async def test_server_ws_bytes_and_events_keep_queue_order(tmp_path: Path) -> No
             sink(b"BBB-before")
             marker = {"event": "error", "message": "order-marker", "tab": "default"}
             event_sink(marker)
+            # The bytes sink enqueues DIRECTLY (it only ever fires on the
+            # loop thread via add_reader), while the event sink schedules
+            # its put through call_soon_threadsafe (the reaper calls it
+            # from a worker thread). Give the loop a tick so the scheduled
+            # event put lands in the queue before the trailing bytes —
+            # exactly the ordering production relies on for exit events.
+            await asyncio.sleep(0)
             sink(b"CCC-after")
             frames = await _drain_frames(ws)
         finally:

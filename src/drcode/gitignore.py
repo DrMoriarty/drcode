@@ -34,6 +34,7 @@ GITIGNORE_ENTRIES: tuple[str, ...] = (
     ".drcode/mcp-servers.json",
     ".drcode/github_state.json",
     ".drcode/search_index.json",
+    ".drcode/code_index.json",
     ".drcode/worktrees/",
     ".drcode/merge_reports/",
     ".drcode/stats.json",

@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
@@ -35,6 +36,7 @@ from pty_session import (  # type: ignore[import-not-found]
     payload_argv,
 )
 from server import (  # type: ignore[import-not-found]
+    COALESCE_WINDOW_SECONDS,
     FRAME_MAX_BYTES,
     ShellContext,
     run_server,
@@ -721,6 +723,76 @@ async def test_server_ws_coalesced_frames_capped(tmp_path: Path) -> None:
         # Bound: FRAME_MAX_BYTES plus at most one chunk that over-shot.
         assert all(len(f) <= FRAME_MAX_BYTES + len(chunk) for f in binary)
         assert b"".join(binary) == b"".join(chunks)
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_steady_stream_coalesced(tmp_path: Path) -> None:
+    """An EVEN (non-bursty) byte stream — one tiny chunk every few ms, so
+    each lands while the pump is asleep in out_queue.get() — does not ship
+    one ws frame per chunk: the latency window lets the stream pile up and
+    the pump sends it in far fewer frames, byte-exact and in order."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            chunks = [f"<t-{i:03d}>".encode() for i in range(40)]
+            sink = state.frame_sink
+            assert sink is not None
+
+            async def _trickle() -> None:
+                # 2 ms apart — well inside COALESCE_WINDOW_SECONDS, so the
+                # window (not the drain pass) must do the collapsing.
+                for chunk in chunks:
+                    sink(chunk)
+                    await asyncio.sleep(0.002)
+
+            task = asyncio.ensure_future(_trickle())
+            frames = await _drain_frames(ws, quiet=0.3, timeout=5.0)
+            await task
+        finally:
+            await http.close()
+
+        binary = [f for f in frames if isinstance(f, bytes)]
+        assert binary, "no output frames reached the client"
+        assert b"".join(binary) == b"".join(chunks)
+        # The even stream was collapsed, not forwarded chunk by chunk:
+        # with an 8 ms window and 2 ms spacing a frame covers ~4 chunks.
+        assert len(binary) <= len(chunks) // 2
+        # No json events were emitted for pure byte traffic.
+        assert not [f for f in frames if not isinstance(f, bytes)]
+    finally:
+        await runner.cleanup()
+
+
+async def test_server_ws_single_input_latency_bounded(tmp_path: Path) -> None:
+    """The latency window never delays a lone chunk past the window: an
+    interactive keystroke (a single sunk chunk on an idle connection) goes
+    out within COALESCE_WINDOW_SECONDS plus loop/test slack, intact."""
+    ctx, runner, base_url = await _start_server(str(tmp_path / "unused"), tmp_path)
+    try:
+        http, ws, state = await _connect_with_sinks(ctx, base_url)
+        try:
+            sink = state.frame_sink
+            assert sink is not None
+            await asyncio.sleep(0.1)  # let the pump settle in get()
+
+            started = time.monotonic()
+            sink(b"keystroke")
+            while True:
+                msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    break
+                assert msg.type not in (
+                    aiohttp.WSMsgType.ERROR,
+                    aiohttp.WSMsgType.CLOSE,
+                )
+            latency = time.monotonic() - started
+            assert msg.data == b"keystroke"
+            # Window (8 ms) plus generous slack for loop scheduling/CI.
+            assert latency < COALESCE_WINDOW_SECONDS + 0.5
+        finally:
+            await http.close()
     finally:
         await runner.cleanup()
 

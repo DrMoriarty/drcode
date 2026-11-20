@@ -25,7 +25,11 @@ messages may restate it). Events are always marked with the same tab:
 Raw terminal bytes go out as binary frames. The pump coalesces whatever
 has already accumulated in the outgoing queue into one frame (capped at
 FRAME_MAX_BYTES) — under a burst of PTY output this is the difference
-between hundreds of tiny ws frames per second and a few large ones.
+between hundreds of tiny ws frames per second and a few large ones. For
+an even (non-bursty) stream the queue is empty at the moment the pump
+wakes, so before draining it first waits out a small latency window
+(COALESCE_WINDOW_SECONDS) that lets the stream pile up; an interactive
+keystroke pays exactly that window and nothing more.
 Order is strictly preserved; JSON events are never mixed into the byte
 stream (separate text frames, in queue order relative to the bytes).
 
@@ -81,6 +85,17 @@ FRAME_MAX_BYTES = 256 * 1024
 # gives the pause up and resumes sending — terminal output must not be
 # lost, an ignored pause only costs the throttling effect.
 PAUSE_BUFFER_MAX_BYTES = 16 * 1024 * 1024
+
+# Latency window: how long the pump may hold a byte batch before its first
+# send when the queue is otherwise empty. An even (non-bursty) stream —
+# exactly what a ``pytest -n auto`` run produces — delivers each PTY chunk
+# while the pump is already asleep in ``out_queue.get()``, so the
+# drain-what-is-queued pass alone still ships one tiny ws frame per chunk.
+# The window gives such a stream a few milliseconds to pile up; a single
+# keystroke pays exactly the window (≤ COALESCE_WINDOW_SECONDS added
+# latency, imperceptible for a terminal), a firehose pays it at most once
+# per frame (a batch that already reached FRAME_MAX_BYTES skips it).
+COALESCE_WINDOW_SECONDS = 0.008
 
 
 class TabState:
@@ -284,6 +299,21 @@ def _websocket(
             # and goes out in the next frame. JSON events are NEVER merged
             # into the byte stream: they ride as separate text frames, in
             # queue order relative to the bytes around them.
+            #
+            # The drain-what-is-queued pass alone only collapses bursts
+            # that piled up WHILE the pump was busy. An even stream —
+            # pytest -n auto progress lines, a steady download log — hands
+            # each chunk over while the pump is asleep in get(), so each
+            # would still ship as its own tiny frame. Hence the latency
+            # window: when the queue is empty right after the first chunk
+            # (and the batch is under the cap), hold the batch for
+            # COALESCE_WINDOW_SECONDS before draining, giving the stream
+            # time to accumulate. The sleep runs on the loop, so
+            # call_soon_threadsafe puts from the PTY reader thread land in
+            # the queue during it — no extra yield needed. A single
+            # keystroke pays exactly the window; a firehose never waits
+            # past it (batch ≥ FRAME_MAX_BYTES skips the window and any
+            # further draining).
             pending: tuple[str, Any] | None = None
             # Client-side flow control: while the client is paused, binary
             # output is withheld here instead of being sent (JSON events
@@ -358,8 +388,12 @@ def _websocket(
                         await _flush_held(buf)
                         held = None
                     continue
-                # bytes: coalesce everything already queued, in order.
+                # bytes: coalesce everything already queued, in order —
+                # and, via the latency window, what an even stream
+                # delivers within the window before the first send.
                 batch = bytearray(payload)
+                if out_queue.empty() and len(batch) < FRAME_MAX_BYTES:
+                    await asyncio.sleep(COALESCE_WINDOW_SECONDS)
                 while len(batch) < FRAME_MAX_BYTES:
                     try:
                         nkind, npayload = out_queue.get_nowait()

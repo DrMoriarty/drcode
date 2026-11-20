@@ -208,9 +208,12 @@ async def test_research_task_builds_agent_with_research_role_config(
         code_index: bool = False,
         announce_wait: Any = None,
         mcp_toolsets: Any = None,
+        request_turns: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
+        if request_turns is not None:
+            kwargs["request_turns"] = request_turns
         if mcp_toolsets is not None:
             kwargs["mcp_toolsets"] = mcp_toolsets
         if research_git is not None:

@@ -659,10 +659,11 @@ class PipelineAgentRunLayer(CoreState):
         # settings change reaches the next run of each task.
         web_fetch_policy = web_fetch_policy_for(self.settings, role)
         # Symbolic code index (project setting code_index_mode, §8.2's
-        # role gating): coding/tester/resolver roles get the tools when
-        # ON, research never does; the decision rides the deps so the
-        # delegate_research subagents inherit it. Read at activation, so
-        # a settings change reaches the next run of each task.
+        # role gating): coding/tester/resolver AND research agents get
+        # the tools when ON, on the same terms; the decision rides the
+        # deps so the delegate_research subagents inherit the parent
+        # run's decision. Read at activation, so a settings change
+        # reaches the next run of each task.
         code_index = code_index_tools_for(self.settings, role)
         agent = build_agent(
             self.resolved_config(role),

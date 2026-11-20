@@ -356,7 +356,9 @@ class SettingsLayer(DrCodeState):
     def action_set_code_index_mode(self, mode: CodeIndexMode) -> None:
         """Settings command: whether the agents get the symbolic code
         index (code_symbols/code_outline for coding/tester/resolver and
-        the research subagents; docs/code-index-design.md). Persisted per
+        the research agent, on the same terms — its delegate_research
+        subagents inherit the parent run's decision;
+        docs/code-index-design.md). Persisted per
         project (.drcode/settings.json); read at activation, so a change
         reaches the next run of each task, never the in-flight one.
         OFF registers nothing and builds nothing."""

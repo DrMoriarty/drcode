@@ -42,6 +42,7 @@ import signal
 import socket
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -404,28 +405,137 @@ def _include_matcher(glob: str) -> re.Pattern[str]:
     return re.compile("".join(out) + r"\Z")
 
 
-def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
-    regex = re.compile(pattern)
-    include_re = _include_matcher(include) if include else None
-    results: list[str] = []
+# -- grep_search --------------------------------------------------------------
+# Result-budget knobs. The truncation must be VISIBLE (the agent has to be
+# able to tell "3 hits" from "80 of 2000" — a silent cap made it repeat the
+# same wide grep), and no single noisy file may eat the whole result budget.
+# The per-line format "path:line: text" is part of the tool contract and
+# never changes; the truncation notes ride as extra lines after the hits.
+GREP_SHOWN_LIMIT = 80  # match lines returned before the truncation summary
+GREP_PER_FILE_LIMIT = 20  # match lines returned from any single file
+GREP_COUNT_LIMIT = 10_000  # counting stops here; the summary then says "≥N"
+GREP_MAX_FILE_BYTES = 1_000_000  # files larger than ~1 MB are skipped
+GREP_BINARY_SNIFF_BYTES = 8192  # a NUL byte in the head marks a binary file
+
+
+def _git_ls_files(root: Path) -> list[Path] | None:
+    """Relative paths of every non-ignored file under `root` (tracked plus
+    untracked), via `git ls-files` — the project's .gitignore (nested ones
+    and negations included) is honored by git itself, which is exactly the
+    semantics a source search wants. Returns None when git is unavailable or
+    `root` is not inside a working tree, so the caller falls back to the
+    plain directory walk."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: list[Path] = []
+    for chunk in proc.stdout.split(b"\0"):
+        if chunk:
+            out.append(Path(os.fsdecode(chunk)))
+    return out
+
+
+def _grep_candidates(root: Path) -> Iterator[tuple[str, Path]]:
+    """Yield (project-relative posix path, Path) for the files worth scanning:
+    from `git ls-files` (gitignore-aware) when `root` is a working tree, else
+    from a directory walk pruned by IGNORED_DIRS."""
+    listed = _git_ls_files(root)
+    if listed is not None:
+        for rel in listed:
+            if any(part in IGNORED_DIRS for part in rel.parts):
+                continue
+            yield rel.as_posix(), root / rel
+        return
     for dirpath, dirnames, filenames in root.walk():
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for name in filenames:
             f = Path(dirpath) / name
-            # `include` is a glob mask over the project-relative path (models
-            # naturally send "*.py" / "src/**/*.py", not regexes).
-            if include_re and not include_re.match(f.relative_to(root).as_posix()):
+            yield f.relative_to(root).as_posix(), f
+
+
+def _read_greppable(f: Path) -> str | None:
+    """The file's text, or None when it must not be scanned: over the size
+    cap, binary (NUL byte in the head sniff), or unreadable."""
+    try:
+        if f.stat().st_size > GREP_MAX_FILE_BYTES:
+            return None
+        with f.open("rb") as fh:
+            head = fh.read(GREP_BINARY_SNIFF_BYTES)
+            if b"\0" in head:
+                return None
+            body = head + fh.read()
+    except OSError:
+        return None
+    return body.decode("utf-8", errors="replace")
+
+
+def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
+    regex = re.compile(pattern)
+    include_re = _include_matcher(include) if include else None
+    results: list[str] = []
+    shown = 0  # match lines actually returned
+    total = 0  # matches counted (bounded by GREP_COUNT_LIMIT, reported as ≥N)
+    files_with = 0  # distinct files with at least one match
+    for rel, f in _grep_candidates(root):
+        # `include` is a glob mask over the project-relative path (models
+        # naturally send "*.py" / "src/**/*.py", not regexes).
+        if include_re and not include_re.match(rel):
+            continue
+        text = _read_greppable(f)
+        if text is None:
+            continue
+        per_file = 0
+        file_counted = False
+        file_capped = False
+        for i, line in enumerate(text.splitlines(), 1):
+            if not regex.search(line):
                 continue
-            try:
-                for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
-                    if regex.search(line):
-                        results.append(
-                            f"{f.relative_to(root)}:{i}: {line.strip()[:200]}"
-                        )
-                        if len(results) >= 100:
-                            return results
-            except OSError:
-                continue
+            # Counting never stops early (up to the GREP_COUNT_LIMIT safety
+            # bound), so the truncation summary can quote honest totals.
+            if total < GREP_COUNT_LIMIT:
+                total += 1
+                if not file_counted:
+                    files_with += 1
+                    file_counted = True
+            if per_file < GREP_PER_FILE_LIMIT and shown < GREP_SHOWN_LIMIT:
+                results.append(f"{rel}:{i}: {line.strip()[:200]}")
+                shown += 1
+                per_file += 1
+            elif per_file >= GREP_PER_FILE_LIMIT:
+                file_capped = True
+            if total >= GREP_COUNT_LIMIT and shown >= GREP_SHOWN_LIMIT:
+                break  # both budgets exhausted — nothing more to learn here
+        # A file that hit its own budget gets an explicit marker when the
+        # global summary is not emitted (otherwise the summary covers it).
+        if file_capped and shown < GREP_SHOWN_LIMIT:
+            results.append(
+                f"{rel}: ... (truncated: more than {GREP_PER_FILE_LIMIT} "
+                "matches in this file)"
+            )
+        if total >= GREP_COUNT_LIMIT and shown >= GREP_SHOWN_LIMIT:
+            break
+    if shown >= GREP_SHOWN_LIMIT or total >= GREP_COUNT_LIMIT:
+        results.append(
+            f"showing {shown} of ≥{total} matches in {files_with} files — "
+            "narrow the include or refine the pattern"
+        )
     return results
 
 

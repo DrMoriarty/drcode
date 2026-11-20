@@ -493,9 +493,54 @@ def test_grep_search_skips_ignored_dirs(project_root: Path) -> None:
     assert grep_search(project_root, "needle") == ["ok.py:1: needle"]
 
 
-def test_grep_search_cap_100(project_root: Path) -> None:
+def test_grep_search_per_file_cap_marked(project_root: Path) -> None:
+    # One noisy file must not eat the whole result budget: it is cut at
+    # GREP_PER_FILE_LIMIT lines and the cut is marked explicitly.
     (project_root / "big.txt").write_text("hit\n" * 150)
-    assert len(grep_search(project_root, "hit")) == 100
+    results = grep_search(project_root, "hit")
+    assert len(results) == 20 + 1
+    assert results[0] == "big.txt:1: hit"
+    assert "big.txt: ... (truncated: more than 20 matches in this file)" in results
+
+
+def test_grep_search_truncation_summary(project_root: Path) -> None:
+    # Global cap: 10 files × 10 matches = 100 total → 80 shown + summary;
+    # counting is not interrupted early, so N and M are exact.
+    for n in range(10):
+        (project_root / f"f{n}.txt").write_text("hit\n" * 10)
+    results = grep_search(project_root, "hit")
+    assert len(results) == 80 + 1
+    assert results[-1] == (
+        "showing 80 of ≥100 matches in 10 files — "
+        "narrow the include or refine the pattern"
+    )
+
+
+def test_grep_search_small_result_no_summary(project_root: Path) -> None:
+    (project_root / "a.py").write_text("hit\n")
+    assert grep_search(project_root, "hit") == ["a.py:1: hit"]
+
+
+def test_grep_search_skips_binary_files(project_root: Path) -> None:
+    (project_root / "bin.dat").write_bytes(b"needle\x00needle\n")
+    (project_root / "ok.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["ok.py:1: needle"]
+
+
+def test_grep_search_skips_oversized_files(project_root: Path) -> None:
+    (project_root / "big.log").write_text("needle\n" + "x" * 1_000_001)
+    (project_root / "ok.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["ok.py:1: needle"]
+
+
+def test_grep_search_respects_gitignore(project_root: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+    (project_root / ".gitignore").write_text("vendor/\n*.log\n")
+    (project_root / "vendor").mkdir()
+    (project_root / "vendor" / "lib.py").write_text("needle\n")
+    (project_root / "noise.log").write_text("needle\n")
+    (project_root / "keep.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["keep.py:1: needle"]
 
 
 def test_grep_search_bad_regex_raises(project_root: Path) -> None:

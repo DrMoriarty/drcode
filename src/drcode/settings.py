@@ -947,6 +947,17 @@ class SettingsHint:
     hint. It runs ONLY when the user presses the matching fix button in
     the dialog — never automatically (the settings philosophy: the
     user's choice is never silently rewritten).
+
+    `scope` names the settings dialog the hint belongs to — each dialog
+    renders only the hints of its own fields (see
+    ``drcode.tui.task_settings_dialog``):
+    - "environment" — the Project-environment dialog (infrastructure:
+      isolation, worktrees, retention, git policies, keep-awake);
+    - "runtime" — the Agent-runtime dialog (subagents, web fetch, code
+      index, context management, testing, agent behavior). A hint may
+      name a foreign field (e.g. the verification→git(tester) coupling
+      names the git policy, which lives in the environment dialog) — it
+      still sits with its GOVERNING field, where the user can fix it.
     """
 
     severity: Literal["dormant", "conflict", "info"]
@@ -954,6 +965,8 @@ class SettingsHint:
     fix: Callable[[ProjectSettings], None] | None = None
     # Button label for the fix (shown only when fix is set).
     fix_label: str = ""
+    # Which settings dialog renders this hint (see the class docstring).
+    scope: Literal["environment", "runtime"] = "runtime"
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1016,7 @@ def task_settings_hints(
                 ),
                 fix=lambda s: setattr(s, "task_isolation", TaskIsolation.WORKTREE),
                 fix_label="Enable isolation",
+                scope="environment",
             )
         )
 
@@ -1017,6 +1031,7 @@ def task_settings_hints(
                     "project directory. Init git (git init) or set isolation "
                     "to off."
                 ),
+                scope="environment",
             )
         )
 
@@ -1038,6 +1053,7 @@ def task_settings_hints(
                     "with the same model the ordinary threshold "
                     "compaction is used."
                 ),
+                scope="runtime",
             )
         )
 
@@ -1055,6 +1071,10 @@ def task_settings_hints(
                 ),
                 fix=lambda s: setattr(s.git_policy, "tester", GitPolicy.OFF),
                 fix_label="Set Git (tester): off",
+                # Governing field: verification lives in the Agent-runtime
+                # dialog — the hint sits THERE even though it names the
+                # git policy (an environment field).
+                scope="runtime",
             )
         )
 
@@ -1073,6 +1093,7 @@ def task_settings_hints(
                 ),
                 fix=lambda s: setattr(s, "web_fetch_mode", WebFetchMode.ALL),
                 fix_label="Allow all hosts",
+                scope="runtime",
             )
         )
     if (
@@ -1088,6 +1109,7 @@ def task_settings_hints(
                     f"{WebFetchMode.ALL.label} — every public host is "
                     "fetchable; the list takes effect in allowlist mode."
                 ),
+                scope="runtime",
             )
         )
     if draft.web_fetch_mode is WebFetchMode.OFF and (
@@ -1100,6 +1122,7 @@ def task_settings_hints(
                     "Web fetch: the host lists are parked — web fetch is off, "
                     "so the research agent has no web tool at all."
                 ),
+                scope="runtime",
             )
         )
 
@@ -1122,6 +1145,7 @@ def task_settings_hints(
                         "has NEVER fired — the agents read everything in "
                         "their own context."
                     ),
+                    scope="runtime",
                 )
             )
         elif usage is not None and usage.recent_spawns == 0:
@@ -1135,6 +1159,7 @@ def task_settings_hints(
                         f"has not been used in the last {usage.recent_days} "
                         f"days (total spawns ever: {usage.total_spawns})."
                     ),
+                    scope="runtime",
                 )
             )
 
@@ -1149,6 +1174,7 @@ def task_settings_hints(
                     "are forked from, which only exists under worktree "
                     "isolation."
                 ),
+                scope="environment",
             )
         )
     if not isolated and draft.worktree_removal is not WorktreeRemoval.ON_DELETE:
@@ -1160,6 +1186,7 @@ def task_settings_hints(
                     "parked — there are no task worktrees without "
                     "isolation."
                 ),
+                scope="environment",
             )
         )
     if (
@@ -1174,6 +1201,7 @@ def task_settings_hints(
                     "parked — the snapshot anchors a task worktree, and "
                     "there are none without isolation."
                 ),
+                scope="environment",
             )
         )
 

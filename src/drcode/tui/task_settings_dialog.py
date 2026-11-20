@@ -1,31 +1,49 @@
-"""Task settings dialog — the single modal form for the task-management
-project preferences (variant A of the settings redesign).
+"""Task settings dialogs — the TWO modal forms for the task-management
+project preferences.
 
-Opened from the Settings palette's single "Task settings…" entry
-(``TaskSettingsCommandProvider`` → ``action_open_task_settings``).
-The dialog:
+The former single overloaded "Task settings…" dialog is split by the
+settings' nature (the user's variant 3 of the settings redesign):
+
+- :class:`ProjectEnvironmentDialog` ("Project environment…") — the
+  project INFRASTRUCTURE, configured once and rarely revisited: the
+  workflow presets, the task-isolation cluster (isolation, start
+  branch, parallelism, worktree removal/snapshot), completed-task
+  retention, the per-role git policies and keep-awake;
+- :class:`AgentRuntimeDialog` ("Agent runtime…") — the RUNTIME
+  behavior, tuned more often: subagent budgets, the research agent's
+  web fetch, the code index, the context-management cluster, testing
+  (verification, dev rounds, nudge, ESC stop) and the agent-behavior
+  toggles.
+
+Both are opened from the Settings palette (``ProjectEnvironment`` /
+``AgentRuntimeCommandProvider`` → ``action_open_project_environment`` /
+``action_open_agent_runtime``). Each dialog:
 
 - works on a DEEP COPY of the saved settings: nothing is persisted until
   Apply (ESC dismisses with None and discards everything);
-- offers the workflow presets as a two-column radio grid on top — picking
-  one applies it to the draft and every field widget updates in place;
-  "Custom" is only the display state of a draft matching no preset
-  (mirrors ``action_workflow_preset_custom``);
-- groups the field widgets into sections (Workflow / Context management /
-  Testing / Git) — the closely-related fields sit side by side
-  in two-column rows — marking fields that differ from the saved
-  values and dimming the currently dormant ones (their value parks and
-  activates when the governing field turns on — the user's choice is
-  never silently rewritten);
+- the environment dialog offers the workflow presets as a two-column
+  radio grid on top — picking one applies it to the draft (it may also
+  touch the runtime dialog's `verification` field — the draft is shared
+  state, the runtime dialog picks the change up on its next open) and
+  every field widget of THIS dialog updates in place; "Custom" is only
+  the display state of a draft matching no preset (mirrors
+  ``action_workflow_preset_custom``);
+- groups its field widgets into sections (ts-section headers) — the
+  closely-related fields sit side by side in two-column rows — marking
+  fields that differ from the saved values and dimming the currently
+  dormant ones (their value parks and activates when the governing
+  field turns on — the user's choice is never silently rewritten);
 - re-renders a hint panel on every draft change from
-  :func:`drcode.settings.task_settings_hints` — one shared source of the
-  coupling rules, with an optional fix button per hint the user must
-  press explicitly.
+  :func:`drcode.settings.task_settings_hints` — one shared source of
+  the coupling rules, with an optional fix button per hint the user
+  must press explicitly. Each dialog renders ONLY the hints of its own
+  fields (:attr:`SettingsHint.scope`).
 
 On Apply the draft is handed back to the app layer
 (``SettingsLayer._task_settings_done`` → ``action_apply_task_settings``)
 which persists it once and replays the same side effects as the
-per-field actions.
+per-field actions. The draft is a FULL copy of the settings, so either
+dialog can be applied through the same merge (``copy_task_settings``).
 """
 
 from __future__ import annotations
@@ -94,8 +112,11 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     The app's live settings object is shared (the TaskEnvironment holds
     the same instance so isolation toggles propagate to the next
     activation), so an accepted draft is merged field-by-field instead of
-    replacing the object. Deliberately only the fields the dialog edits —
-    the rest of ProjectSettings (GitHub, voice, …) is untouched.
+    replacing the object. Deliberately only the fields the dialogs edit —
+    the rest of ProjectSettings (GitHub, voice, …) is untouched. BOTH
+    dialogs apply through this one merge: a dialog's draft is a deep copy
+    of the live settings with only its own fields edited, so the fields
+    the OTHER dialog owns pass through unchanged.
     """
     dst.completed_retention = src.completed_retention
     dst.esc_abort = src.esc_abort
@@ -154,10 +175,14 @@ class DialogScroll(VerticalScroll):
             self.refresh()
 
 
-class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
-    """Modal form: preset radio row, sections of field widgets,
-    live hints, Apply / ESC-to-cancel. Returns the accepted draft (the
-    same object it mutated) or None on cancel."""
+class TaskSettingsDialogBase(ModalScreen[ProjectSettings | None]):
+    """Shared machinery of the two task-settings dialogs: the deep-copy
+    draft, the section/row CSS, the changed/dormant marking helpers, the
+    scoped hint panel and the Apply / ESC-to-cancel contract. Subclasses
+    provide the field widgets (:meth:`compose`), their handlers and
+    :meth:`_sync_fields`; :attr:`HINT_SCOPES` selects which of
+    :func:`task_settings_hints`' hints this dialog renders (each dialog
+    shows only the hints of its own fields)."""
 
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Close", priority=True),
@@ -165,8 +190,14 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
 
     AUTO_LABEL = "auto (HEAD branch)"
 
+    # The SettingsHint.scopes this dialog renders (see SettingsHint.scope).
+    HINT_SCOPES: ClassVar[frozenset[str]] = frozenset()
+
+    # The dialog's title line (a Static under #ts-dialog).
+    DIALOG_TITLE: ClassVar[str] = "Task settings"
+
     DEFAULT_CSS = """
-    TaskSettingsDialog {
+    TaskSettingsDialogBase {
         align: center middle;
     }
     #ts-dialog {
@@ -322,10 +353,136 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         return options
 
     def compose(self) -> ComposeResult:
+        raise NotImplementedError
+
+    def _drcode_app(self) -> DrCodeApp:
+        from .app import DrCodeApp
+
+        app = self.app
+        assert isinstance(app, DrCodeApp)
+        return app
+
+    def on_mount(self) -> None:
+        if self._git_available is None:
+            app = self._drcode_app()
+            self._git_available = app.task_env.available
+        self._refresh()
+
+    # -- draft -> widgets ------------------------------------------------------
+
+    def _set_select(self, selector: str, value: object) -> None:
+        select = self.query_one(selector, Select)
+        if select.value != value:
+            # Programmatic sync must never post Select.Changed: Textual
+            # delivers messages asynchronously, so such an event can be
+            # STALE by the time its handler runs (the user has already
+            # moved the widget on) — the handler would re-apply the stale
+            # value into the draft and _refresh() would answer by writing
+            # another widget, regenerating events forever (the
+            # both-subagents-selects flicker loop).
+            with self.prevent(Select.Changed):
+                select.value = value  # type: ignore[assignment]
+
+    def _set_toggle(self, selector: str, value: bool) -> None:
+        toggle = self.query_one(selector, RadioButton)
+        if toggle.value != value:
+            with self.prevent(RadioButton.Changed):  # same staleness rule
+                toggle.value = value
+
+    def _sync_fields(self) -> None:
+        """Push the draft into this dialog's field widgets and mark/dim
+        them (the subclass's field set; after a preset pick where one
+        exists)."""
+
+    def _sync_hints(self) -> None:
+        hints = task_settings_hints(
+            self._draft,
+            git_available=bool(self._git_available),
+            subagent_usage=self._subagent_usage,
+        )
+        panel = self.query_one("#ts-hints", Vertical)
+        self._fixes = {}
+        rows: list[Static | Horizontal] = []
+        for i, hint in enumerate(hints):
+            if hint.scope not in self.HINT_SCOPES:
+                continue  # another dialog's field — rendered there
+            children: list[Static | Button] = [
+                Static(hint.text, classes="ts-hint-text")
+            ]
+            if hint.fix is not None:
+                button_id = f"ts-fix-{i}"
+                self._fixes[button_id] = hint.fix
+                children.append(
+                    Button(
+                        hint.fix_label or "Fix",
+                        id=button_id,
+                        classes="ts-fix",
+                    )
+                )
+            rows.append(Horizontal(*children, classes=f"ts-hint {hint.severity}"))
+        panel.remove_children()
+        if rows:
+            panel.mount(*rows)
+        else:
+            panel.mount(
+                Static(
+                    "No conflicts — every setting takes effect.",
+                    classes="ts-hint-empty",
+                )
+            )
+
+    def _refresh(self) -> None:
+        self._sync_fields()
+        self._sync_hints()
+
+    # -- widgets -> draft ------------------------------------------------------
+    # Only genuine user edits reach these handlers: the programmatic
+    # widget writes in _refresh are wrapped in self.prevent(...) so they
+    # never post Changed messages at all (Textual delivers messages
+    # asynchronously — an un-prevented sync write can come back as a
+    # STALE event and re-enter its handler after the user has already
+    # moved the widget on). The handlers keep the "does the event value
+    # already equal the draft" guard as the second half of the loop
+    # protection.
+
+    @on(Button.Pressed, ".ts-fix")
+    def _fix_pressed(self, event: Button.Pressed) -> None:
+        fix = self._fixes.get(event.button.id or "")
+        if fix is not None:
+            fix(self._draft)
+            self._refresh()
+
+    # -- apply / cancel ----------------------------------------------------------
+
+    @on(Button.Pressed, "#ts-apply")
+    def _apply_pressed(self) -> None:
+        self.dismiss(self._draft)
+
+    @on(Button.Pressed, "#ts-cancel")
+    def _cancel_pressed(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProjectEnvironmentDialog(TaskSettingsDialogBase):
+    """The "Project environment…" dialog — the project INFRASTRUCTURE
+    preferences, set once and rarely revisited: workflow presets, the
+    task-isolation cluster, completed-task retention, the per-role git
+    policies and keep-awake. Renders only the environment-scoped hints
+    (parallel-dormant, worktree-without-git, the parked isolation
+    fields)."""
+
+    DIALOG_TITLE: ClassVar[str] = "Project environment"
+
+    HINT_SCOPES: ClassVar[frozenset[str]] = frozenset({"environment"})
+
+    def compose(self) -> ComposeResult:
         d = self._draft
         matched = workflow_preset_for(d)
         with Vertical(id="ts-dialog"):
-            yield Static("Task settings", id="ts-title")
+            yield Static(self.DIALOG_TITLE, id="ts-title")
             with DialogScroll(id="ts-body"):
                 yield Label("Workflow preset", classes="ts-section")
                 with RadioSet(id="ts-preset"):
@@ -393,6 +550,257 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-retention",
                         )
+                yield Label("Git", classes="ts-section")
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield Label("Git (tester)", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
+                            value=d.git_policy.tester,
+                            allow_blank=False,
+                            id="ts-git-tester",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield Label("Git (research)", classes="ts-label")
+                        yield Select(
+                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
+                            value=d.git_policy.research,
+                            allow_blank=False,
+                            id="ts-git-research",
+                        )
+                yield ToggleRow(
+                    "Keep computer awake",
+                    value=d.keep_awake,
+                    toggle_id="ts-keep-awake",
+                )
+            yield Vertical(id="ts-hints")
+            yield Static("", id="ts-workflow-info")
+            with Horizontal(id="ts-buttons"):
+                yield Button("Apply", variant="primary", id="ts-apply")
+                yield Button("Cancel", id="ts-cancel")
+                yield Static("esc — discard all changes", id="ts-esc-note")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._fill_workflow_info()
+        self.run_worker(self._load_branches(), exclusive=True, group="ts-branches")
+
+    def _fill_workflow_info(self) -> None:
+        """The bottom info block: the status of the optional custom team
+        workflow (the former "Workflow" Settings entry, now folded here —
+        informational, nothing to toggle)."""
+        try:
+            lines = self._drcode_app().workflow_info_lines()
+        except Exception:  # noqa: BLE001 — info must never break the dialog
+            lines = []
+        self.query_one("#ts-workflow-info", Static).update("\n".join(lines))
+
+    async def _load_branches(self) -> None:
+        """Fetch the repository's local branches (off the event loop) and
+        refresh the start-branch options; without git the select keeps
+        just the auto entry."""
+        try:
+            app = self._drcode_app()
+            if app.task_env.available:
+                self._branches = await asyncio.to_thread(app.task_env.local_branches)
+        except Exception:  # noqa: BLE001 — a broken git must not kill the dialog
+            self._branches = []
+        if not self.is_mounted:  # dismissed while git ran
+            return
+        select = self.query_one("#ts-start-branch", Select)
+        # set_options RESETS the selection (to the first option) and posts
+        # a Select.Changed with that reset value — a stale event that would
+        # clobber the draft after this worker returns. Suppress the event
+        # and re-apply the draft value explicitly instead of relying on
+        # set_options preserving it.
+        with self.prevent(Select.Changed):
+            select.set_options(self._branch_options())
+            if select.value != self._draft.isolation_start_branch:
+                select.value = self._draft.isolation_start_branch
+        self._refresh()
+
+    # -- draft -> widgets ------------------------------------------------------
+
+    def _sync_preset(self) -> None:
+        """Press the radio of the preset the draft currently matches, or
+        "Custom" when it matches none (the display-state rule)."""
+        matched = workflow_preset_for(self._draft)
+        for preset in WORKFLOW_PRESETS:
+            radio = self.query_one(f"#ts-preset-{preset.key}", RadioButton)
+            should = matched is preset
+            if radio.value != should:
+                radio.value = should
+        custom_radio = self.query_one("#ts-preset-custom", RadioButton)
+        if custom_radio.value != (matched is None):
+            custom_radio.value = matched is None
+
+    def _sync_fields(self) -> None:
+        """Push the draft into the field widgets (after a preset pick) and
+        mark/dim them."""
+        d = self._draft
+        o = self._original
+        self._sync_preset()
+        self._set_select("#ts-isolation", d.task_isolation)
+        self._set_select("#ts-start-branch", d.isolation_start_branch)
+        self._set_select("#ts-parallel", d.parallel_tasks)
+        self._set_select("#ts-removal", d.worktree_removal)
+        self._set_select("#ts-snapshot", d.worktree_snapshot)
+        self._set_select("#ts-git-tester", d.git_policy.tester)
+        self._set_select("#ts-git-research", d.git_policy.research)
+        self._set_select("#ts-retention", d.completed_retention)
+        self._set_toggle("#ts-keep-awake", d.keep_awake)
+        changed = {
+            "#ts-isolation": d.task_isolation is not o.task_isolation,
+            "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
+            "#ts-parallel": d.parallel_tasks != o.parallel_tasks,
+            "#ts-removal": d.worktree_removal is not o.worktree_removal,
+            "#ts-snapshot": d.worktree_snapshot is not o.worktree_snapshot,
+            "#ts-git-tester": d.git_policy.tester is not o.git_policy.tester,
+            "#ts-git-research": d.git_policy.research is not o.git_policy.research,
+            "#ts-retention": d.completed_retention is not o.completed_retention,
+            "#ts-keep-awake": d.keep_awake != o.keep_awake,
+        }
+        for selector, is_changed in changed.items():
+            widget = self.query_one(selector)
+            if isinstance(widget, RadioButton) and isinstance(widget.parent, ToggleRow):
+                # A toggle's changed marker rides the row's Label, not the
+                # glyph (the glyph renders identically on and off).
+                widget.parent.set_changed(is_changed)
+            else:
+                widget.set_class(is_changed, "changed")
+        dormant: set[str] = set()
+        if d.task_isolation is not TaskIsolation.WORKTREE:
+            dormant |= {
+                "#ts-start-branch",
+                "#ts-parallel",
+                "#ts-removal",
+                "#ts-snapshot",
+            }
+        if d.verification is Verification.NONE:
+            dormant.add("#ts-git-tester")
+        for selector in (
+            "#ts-start-branch",
+            "#ts-parallel",
+            "#ts-removal",
+            "#ts-snapshot",
+            "#ts-git-tester",
+        ):
+            self.query_one(selector).set_class(selector in dormant, "ts-dormant")
+
+    # -- widgets -> draft ------------------------------------------------------
+
+    @on(RadioSet.Changed, "#ts-preset")
+    def _preset_changed(self, event: RadioSet.Changed) -> None:
+        index = event.index
+        matched = workflow_preset_for(self._draft)
+        matched_index = (
+            WORKFLOW_PRESETS.index(matched)
+            if matched is not None
+            else len(WORKFLOW_PRESETS)
+        )
+        if index == matched_index:
+            # The pressed radio is already the truth (programmatic sync,
+            # or a "Custom" pick on a draft matching no preset).
+            return
+        if index >= len(WORKFLOW_PRESETS):
+            # "Custom" picked: a display state, never an applier.
+            self._refresh()
+            return
+        # A preset is a multi-field applier over the draft; it may also
+        # touch verification — an Agent-runtime field that has no widget
+        # HERE. The draft carries it (workflow_preset_for keeps matching),
+        # and the runtime dialog shows it on its next open.
+        WORKFLOW_PRESETS[index].apply(self._draft)
+        self._refresh()
+
+    @on(Select.Changed, "#ts-isolation")
+    def _isolation_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, TaskIsolation) and (
+            event.value is not self._draft.task_isolation
+        ):
+            self._draft.task_isolation = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-start-branch")
+    def _start_branch_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, str) and (
+            event.value != self._draft.isolation_start_branch
+        ):
+            self._draft.isolation_start_branch = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-parallel")
+    def _parallel_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, int) and event.value != self._draft.parallel_tasks:
+            self._draft.parallel_tasks = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-removal")
+    def _removal_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, WorktreeRemoval) and (
+            event.value is not self._draft.worktree_removal
+        ):
+            self._draft.worktree_removal = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-snapshot")
+    def _snapshot_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, WorktreeSnapshot) and (
+            event.value is not self._draft.worktree_snapshot
+        ):
+            self._draft.worktree_snapshot = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-git-tester")
+    def _git_tester_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, GitPolicy) and (
+            event.value is not self._draft.git_policy.tester
+        ):
+            self._draft.git_policy.tester = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-git-research")
+    def _git_research_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, GitPolicy) and (
+            event.value is not self._draft.git_policy.research
+        ):
+            self._draft.git_policy.research = event.value
+            self._refresh()
+
+    @on(Select.Changed, "#ts-retention")
+    def _retention_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, CompletedRetention) and (
+            event.value is not self._draft.completed_retention
+        ):
+            self._draft.completed_retention = event.value
+            self._refresh()
+
+    @on(RadioButton.Changed, "#ts-keep-awake")
+    def _keep_awake_changed(self, event: RadioButton.Changed) -> None:
+        if event.value != self._draft.keep_awake:
+            self._draft.keep_awake = event.value
+            self._refresh()
+
+
+class AgentRuntimeDialog(TaskSettingsDialogBase):
+    """The "Agent runtime…" dialog — the RUNTIME behavior preferences,
+    tuned more often: subagent budgets, the research agent's web fetch,
+    the code index, the context-management cluster, testing and the
+    agent-behavior toggles. Renders only the runtime-scoped hints (web
+    fetch, subagents usage, background compaction, and the cross
+    verification→git(tester) coupling — the hint sits with its
+    GOVERNING field, verification)."""
+
+    DIALOG_TITLE: ClassVar[str] = "Agent runtime"
+
+    HINT_SCOPES: ClassVar[frozenset[str]] = frozenset({"runtime"})
+
+    def compose(self) -> ComposeResult:
+        d = self._draft
+        with Vertical(id="ts-dialog"):
+            yield Static(self.DIALOG_TITLE, id="ts-title")
+            with DialogScroll(id="ts-body"):
+                yield Label("Subagents", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
                         yield Label("Subagents (coder)", classes="ts-label")
@@ -410,6 +818,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-subagents-researcher",
                         )
+                yield Label("Research web fetch", classes="ts-section")
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
                         yield Label("Research web fetch", classes="ts-label")
@@ -442,6 +851,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                     id="ts-web-fetch-block",
                     placeholder="(empty — nothing blocked)",
                 )
+                yield Label("Code index", classes="ts-section")
                 with Horizontal(classes="ts-row"), Vertical(classes="ts-col"):
                     yield Label("Code index", classes="ts-label")
                     yield Select(
@@ -450,21 +860,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                         allow_blank=False,
                         id="ts-code-index-mode",
                     )
-                yield ToggleRow(
-                    "Agent creates drafts — the agents' task-creation tools "
-                    "(research: bug/feature, tester: bug) create DRAFT tasks; "
-                    "a draft does not enter the queue until you open and "
-                    "finish it",
-                    value=d.agent_creates_drafts,
-                    toggle_id="ts-agent-drafts",
-                )
-                yield ToggleRow(
-                    "Generate task titles — the agent names a task from its "
-                    "description on the task's first activation (once per "
-                    "task; a failure keeps the first-line title)",
-                    value=d.generate_task_titles,
-                    toggle_id="ts-generate-titles",
-                )
                 yield Label("Context management", classes="ts-section")
                 yield ToggleRow(
                     "Context-eviction hint — remind the model about "
@@ -545,129 +940,34 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                             allow_blank=False,
                             id="ts-esc-abort",
                         )
-                yield Label("Git", classes="ts-section")
-                with Horizontal(classes="ts-row"):
-                    with Vertical(classes="ts-col"):
-                        yield Label("Git (tester)", classes="ts-label")
-                        yield Select(
-                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
-                            value=d.git_policy.tester,
-                            allow_blank=False,
-                            id="ts-git-tester",
-                        )
-                    with Vertical(classes="ts-col"):
-                        yield Label("Git (research)", classes="ts-label")
-                        yield Select(
-                            [(o.label, o) for o in GIT_POLICY_OPTIONS],
-                            value=d.git_policy.research,
-                            allow_blank=False,
-                            id="ts-git-research",
-                        )
+                yield Label("Agent behavior", classes="ts-section")
                 yield ToggleRow(
-                    "Keep computer awake",
-                    value=d.keep_awake,
-                    toggle_id="ts-keep-awake",
+                    "Agent creates drafts — the agents' task-creation tools "
+                    "(research: bug/feature, tester: bug) create DRAFT tasks; "
+                    "a draft does not enter the queue until you open and "
+                    "finish it",
+                    value=d.agent_creates_drafts,
+                    toggle_id="ts-agent-drafts",
+                )
+                yield ToggleRow(
+                    "Generate task titles — the agent names a task from its "
+                    "description on the task's first activation (once per "
+                    "task; a failure keeps the first-line title)",
+                    value=d.generate_task_titles,
+                    toggle_id="ts-generate-titles",
                 )
             yield Vertical(id="ts-hints")
-            yield Static("", id="ts-workflow-info")
             with Horizontal(id="ts-buttons"):
                 yield Button("Apply", variant="primary", id="ts-apply")
                 yield Button("Cancel", id="ts-cancel")
                 yield Static("esc — discard all changes", id="ts-esc-note")
 
-    def on_mount(self) -> None:
-        if self._git_available is None:
-            app = self._drcode_app()
-            self._git_available = app.task_env.available
-        self._fill_workflow_info()
-        self._refresh()
-        self.run_worker(self._load_branches(), exclusive=True, group="ts-branches")
-
-    def _fill_workflow_info(self) -> None:
-        """The bottom info block: the status of the optional custom team
-        workflow (the former "Workflow" Settings entry, now folded here —
-        informational, nothing to toggle)."""
-        try:
-            lines = self._drcode_app().workflow_info_lines()
-        except Exception:  # noqa: BLE001 — info must never break the dialog
-            lines = []
-        self.query_one("#ts-workflow-info", Static).update("\n".join(lines))
-
-    def _drcode_app(self) -> DrCodeApp:
-        from .app import DrCodeApp
-
-        app = self.app
-        assert isinstance(app, DrCodeApp)
-        return app
-
-    async def _load_branches(self) -> None:
-        """Fetch the repository's local branches (off the event loop) and
-        refresh the start-branch options; without git the select keeps
-        just the auto entry."""
-        try:
-            app = self._drcode_app()
-            if app.task_env.available:
-                self._branches = await asyncio.to_thread(app.task_env.local_branches)
-        except Exception:  # noqa: BLE001 — a broken git must not kill the dialog
-            self._branches = []
-        if not self.is_mounted:  # dismissed while git ran
-            return
-        select = self.query_one("#ts-start-branch", Select)
-        # set_options RESETS the selection (to the first option) and posts
-        # a Select.Changed with that reset value — a stale event that would
-        # clobber the draft after this worker returns. Suppress the event
-        # and re-apply the draft value explicitly instead of relying on
-        # set_options preserving it.
-        with self.prevent(Select.Changed):
-            select.set_options(self._branch_options())
-            if select.value != self._draft.isolation_start_branch:
-                select.value = self._draft.isolation_start_branch
-        self._refresh()
-
     # -- draft -> widgets ------------------------------------------------------
 
-    def _set_select(self, selector: str, value: object) -> None:
-        select = self.query_one(selector, Select)
-        if select.value != value:
-            # Programmatic sync must never post Select.Changed: Textual
-            # delivers messages asynchronously, so such an event can be
-            # STALE by the time its handler runs (the user has already
-            # moved the widget on) — the handler would re-apply the stale
-            # value into the draft and _refresh() would answer by writing
-            # another widget, regenerating events forever (the
-            # both-subagents-selects flicker loop).
-            with self.prevent(Select.Changed):
-                select.value = value  # type: ignore[assignment]
-
-    def _set_toggle(self, selector: str, value: bool) -> None:
-        toggle = self.query_one(selector, RadioButton)
-        if toggle.value != value:
-            with self.prevent(RadioButton.Changed):  # same staleness rule
-                toggle.value = value
-
-    def _sync_preset(self) -> None:
-        """Press the radio of the preset the draft currently matches, or
-        "Custom" when it matches none (the display-state rule)."""
-        matched = workflow_preset_for(self._draft)
-        for preset in WORKFLOW_PRESETS:
-            radio = self.query_one(f"#ts-preset-{preset.key}", RadioButton)
-            should = matched is preset
-            if radio.value != should:
-                radio.value = should
-        custom_radio = self.query_one("#ts-preset-custom", RadioButton)
-        if custom_radio.value != (matched is None):
-            custom_radio.value = matched is None
-
     def _sync_fields(self) -> None:
-        """Push the draft into the field widgets (after a preset pick) and
-        mark/dim them."""
+        """Push the draft into the field widgets and mark/hide them."""
         d = self._draft
         o = self._original
-        self._set_select("#ts-isolation", d.task_isolation)
-        self._set_select("#ts-start-branch", d.isolation_start_branch)
-        self._set_select("#ts-parallel", d.parallel_tasks)
-        self._set_select("#ts-removal", d.worktree_removal)
-        self._set_select("#ts-snapshot", d.worktree_snapshot)
         self._set_select("#ts-subagents-coder", d.subagents_coder)
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-web-fetch-mode", d.web_fetch_mode)
@@ -675,11 +975,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self._set_select("#ts-verification", d.verification)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
-        self._set_select("#ts-git-tester", d.git_policy.tester)
-        self._set_select("#ts-git-research", d.git_policy.research)
-        self._set_select("#ts-retention", d.completed_retention)
         self._set_select("#ts-esc-abort", d.esc_abort)
-        self._set_toggle("#ts-keep-awake", d.keep_awake)
         self._set_toggle("#ts-agent-drafts", d.agent_creates_drafts)
         self._set_toggle("#ts-generate-titles", d.generate_task_titles)
         self._set_toggle("#ts-eviction-hint", d.eviction_hint)
@@ -691,11 +987,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             with self.prevent(Input.Changed):  # same staleness rule
                 resume_input.value = str(d.compaction_resume_min_tokens)
         changed = {
-            "#ts-isolation": d.task_isolation is not o.task_isolation,
-            "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
-            "#ts-parallel": d.parallel_tasks != o.parallel_tasks,
-            "#ts-removal": d.worktree_removal is not o.worktree_removal,
-            "#ts-snapshot": d.worktree_snapshot is not o.worktree_snapshot,
             "#ts-subagents-coder": d.subagents_coder != o.subagents_coder,
             "#ts-subagents-researcher": (
                 d.subagents_researcher != o.subagents_researcher
@@ -707,11 +998,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             "#ts-verification": d.verification is not o.verification,
             "#ts-dev-rounds": d.max_dev_rounds != o.max_dev_rounds,
             "#ts-nudge": d.stall_nudge is not o.stall_nudge,
-            "#ts-git-tester": d.git_policy.tester is not o.git_policy.tester,
-            "#ts-git-research": d.git_policy.research is not o.git_policy.research,
-            "#ts-retention": d.completed_retention is not o.completed_retention,
             "#ts-esc-abort": d.esc_abort is not o.esc_abort,
-            "#ts-keep-awake": d.keep_awake != o.keep_awake,
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
@@ -732,24 +1019,6 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
                 widget.parent.set_changed(is_changed)
             else:
                 widget.set_class(is_changed, "changed")
-        dormant: set[str] = set()
-        if d.task_isolation is not TaskIsolation.WORKTREE:
-            dormant |= {
-                "#ts-start-branch",
-                "#ts-parallel",
-                "#ts-removal",
-                "#ts-snapshot",
-            }
-        if d.verification is Verification.NONE:
-            dormant.add("#ts-git-tester")
-        for selector in (
-            "#ts-start-branch",
-            "#ts-parallel",
-            "#ts-removal",
-            "#ts-snapshot",
-            "#ts-git-tester",
-        ):
-            self.query_one(selector).set_class(selector in dormant, "ts-dormant")
         # Web fetch host lists are HIDDEN entirely (their values are kept,
         # never rewritten — the user's entries come back when the mode
         # turns on): the allow list shows ONLY in allowlist mode, the
@@ -761,113 +1030,7 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         self.query_one("#ts-web-fetch-block-label").set_class(True, "ts-hidden")
         self.query_one("#ts-web-fetch-block").set_class(True, "ts-hidden")
 
-    def _sync_hints(self) -> None:
-        hints = task_settings_hints(
-            self._draft,
-            git_available=bool(self._git_available),
-            subagent_usage=self._subagent_usage,
-        )
-        panel = self.query_one("#ts-hints", Vertical)
-        self._fixes = {}
-        rows: list[Static | Horizontal] = []
-        for i, hint in enumerate(hints):
-            children: list[Static | Button] = [
-                Static(hint.text, classes="ts-hint-text")
-            ]
-            if hint.fix is not None:
-                button_id = f"ts-fix-{i}"
-                self._fixes[button_id] = hint.fix
-                children.append(
-                    Button(
-                        hint.fix_label or "Fix",
-                        id=button_id,
-                        classes="ts-fix",
-                    )
-                )
-            rows.append(Horizontal(*children, classes=f"ts-hint {hint.severity}"))
-        panel.remove_children()
-        if rows:
-            panel.mount(*rows)
-        else:
-            panel.mount(
-                Static(
-                    "No conflicts — every setting takes effect.",
-                    classes="ts-hint-empty",
-                )
-            )
-
-    def _refresh(self) -> None:
-        self._sync_preset()
-        self._sync_fields()
-        self._sync_hints()
-
     # -- widgets -> draft ------------------------------------------------------
-    # Only genuine user edits reach these handlers: the programmatic
-    # widget writes in _refresh are wrapped in self.prevent(...) so they
-    # never post Changed messages at all (Textual delivers messages
-    # asynchronously — an un-prevented sync write can come back as a
-    # STALE event and re-enter its handler after the user has already
-    # moved the widget on). The handlers keep the "does the event value
-    # already equal the draft" guard as the second half of the loop
-    # protection.
-
-    @on(RadioSet.Changed, "#ts-preset")
-    def _preset_changed(self, event: RadioSet.Changed) -> None:
-        index = event.index
-        matched = workflow_preset_for(self._draft)
-        matched_index = (
-            WORKFLOW_PRESETS.index(matched)
-            if matched is not None
-            else len(WORKFLOW_PRESETS)
-        )
-        if index == matched_index:
-            # The pressed radio is already the truth (programmatic sync,
-            # or a "Custom" pick on a draft matching no preset).
-            return
-        if index >= len(WORKFLOW_PRESETS):
-            # "Custom" picked: a display state, never an applier.
-            self._refresh()
-            return
-        WORKFLOW_PRESETS[index].apply(self._draft)
-        self._refresh()
-
-    @on(Select.Changed, "#ts-isolation")
-    def _isolation_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, TaskIsolation) and (
-            event.value is not self._draft.task_isolation
-        ):
-            self._draft.task_isolation = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-start-branch")
-    def _start_branch_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, str) and (
-            event.value != self._draft.isolation_start_branch
-        ):
-            self._draft.isolation_start_branch = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-parallel")
-    def _parallel_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, int) and event.value != self._draft.parallel_tasks:
-            self._draft.parallel_tasks = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-removal")
-    def _removal_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, WorktreeRemoval) and (
-            event.value is not self._draft.worktree_removal
-        ):
-            self._draft.worktree_removal = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-snapshot")
-    def _snapshot_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, WorktreeSnapshot) and (
-            event.value is not self._draft.worktree_snapshot
-        ):
-            self._draft.worktree_snapshot = event.value
-            self._refresh()
 
     @on(Select.Changed, "#ts-subagents-coder")
     def _subagents_coder_changed(self, event: Select.Changed) -> None:
@@ -938,42 +1101,12 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
             self._draft.stall_nudge = event.value
             self._refresh()
 
-    @on(Select.Changed, "#ts-git-tester")
-    def _git_tester_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, GitPolicy) and (
-            event.value is not self._draft.git_policy.tester
-        ):
-            self._draft.git_policy.tester = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-git-research")
-    def _git_research_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, GitPolicy) and (
-            event.value is not self._draft.git_policy.research
-        ):
-            self._draft.git_policy.research = event.value
-            self._refresh()
-
-    @on(Select.Changed, "#ts-retention")
-    def _retention_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, CompletedRetention) and (
-            event.value is not self._draft.completed_retention
-        ):
-            self._draft.completed_retention = event.value
-            self._refresh()
-
     @on(Select.Changed, "#ts-esc-abort")
     def _esc_abort_changed(self, event: Select.Changed) -> None:
         if isinstance(event.value, EscAbort) and (
             event.value is not self._draft.esc_abort
         ):
             self._draft.esc_abort = event.value
-            self._refresh()
-
-    @on(RadioButton.Changed, "#ts-keep-awake")
-    def _keep_awake_changed(self, event: RadioButton.Changed) -> None:
-        if event.value != self._draft.keep_awake:
-            self._draft.keep_awake = event.value
             self._refresh()
 
     @on(RadioButton.Changed, "#ts-agent-drafts")
@@ -1026,23 +1159,3 @@ class TaskSettingsDialog(ModalScreen[ProjectSettings | None]):
         if value != self._draft.compaction_resume_min_tokens:
             self._draft.compaction_resume_min_tokens = value
             self._refresh()
-
-    @on(Button.Pressed, ".ts-fix")
-    def _fix_pressed(self, event: Button.Pressed) -> None:
-        fix = self._fixes.get(event.button.id or "")
-        if fix is not None:
-            fix(self._draft)
-            self._refresh()
-
-    # -- apply / cancel ----------------------------------------------------------
-
-    @on(Button.Pressed, "#ts-apply")
-    def _apply_pressed(self) -> None:
-        self.dismiss(self._draft)
-
-    @on(Button.Pressed, "#ts-cancel")
-    def _cancel_pressed(self) -> None:
-        self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)

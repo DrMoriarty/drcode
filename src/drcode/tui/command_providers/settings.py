@@ -5,8 +5,10 @@ Everything reachable from the "Settings" palette: the main palette
 order, the "Model settings…" sub-menu palette, the providers that supply
 the main-menu entries and the per-option selection palettes for each
 project preference. The task-management preferences are NOT here — they
-live in the modal ``TaskSettingsDialog``, opened by the single
-"Task settings…" entry (``TaskSettingsCommandProvider``).
+live in the TWO modal dialogs of ``task_settings_dialog.py``
+(``ProjectEnvironmentDialog`` / ``AgentRuntimeDialog``), opened by the
+"Project environment…" and "Agent runtime…" entries
+(``ProjectEnvironmentCommandProvider`` / ``AgentRuntimeCommandProvider``).
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from textual.content import Content
 from textual.widgets import Button, LoadingIndicator
 
 from ...settings import (
-    CODE_INDEX_MODE_OPTIONS,
     DEV_ROUNDS_OPTIONS,
     ESC_ABORT_OPTIONS,
     GIT_POLICY_OPTIONS,
@@ -215,19 +216,21 @@ class SettingsPalette(CommandPalette):
     # (provider catalog + the per-role project settings form) live in
     # the "Model settings…" sub-menu (ModelSettingsPalette), and the task
     # management preferences (incl. the ESC stop behavior) live in the
-    # "Task settings…" dialog — not here.
+    # TWO task-settings dialogs ("Project environment…" — the rare
+    # infrastructure, "Agent runtime…" — the frequently tuned behavior),
+    # not here.
     ENTRY_ORDER: ClassVar[tuple[str, ...]] = (
         "Keys",
         "Theme",
         "Find task…",
         "Update/create AGENTS.md",
         "Model settings",
-        "Task settings",
+        "Project environment",
+        "Agent runtime",
         "GitHub integration:",
         "Notifications:",
         "Voice:",
         "MCP server:",
-        "Code index:",
         "Maximize",
         "Minimize",
         "Screenshot",
@@ -399,22 +402,46 @@ class ModelSettingsCommandProvider(CommandListProvider):
         ]
 
 
-class TaskSettingsCommandProvider(CommandListProvider):
-    """The single "Task settings…" entry in the main Settings palette.
+class ProjectEnvironmentCommandProvider(CommandListProvider):
+    """The "Project environment…" entry in the main Settings palette.
 
-    Opens the modal TaskSettingsDialog (via ``action_open_task_settings``)
-    with all the task-management project preferences in one form.
-    """
+    Opens the modal ProjectEnvironmentDialog (via
+    ``action_open_project_environment``): the project INFRASTRUCTURE
+    preferences — workflow presets, task isolation, worktrees,
+    retention, git policies, keep-awake — the "set once" half of the
+    former single Task settings dialog."""
 
     def _commands(self) -> list[CommandEntry]:
         app = cast("DrCodeApp", self.app)
         return [
             CommandEntry(
-                "Task settings…",
-                app.action_open_task_settings,
-                "Task-management preferences: auto-delete, "
-                "finalization, worktree removal, dev rounds, stall "
-                "nudge, isolation, parallelism",
+                "Project environment…",
+                app.action_open_project_environment,
+                "Project infrastructure: workflow preset, task "
+                "isolation, worktrees, auto-delete, git policies, "
+                "keep-awake",
+            ),
+        ]
+
+
+class AgentRuntimeCommandProvider(CommandListProvider):
+    """The "Agent runtime…" entry in the main Settings palette.
+
+    Opens the modal AgentRuntimeDialog (via
+    ``action_open_agent_runtime``): the RUNTIME behavior preferences —
+    subagents, web fetch, code index, context management, testing,
+    agent behavior — the "tune often" half of the former single Task
+    settings dialog."""
+
+    def _commands(self) -> list[CommandEntry]:
+        app = cast("DrCodeApp", self.app)
+        return [
+            CommandEntry(
+                "Agent runtime…",
+                app.action_open_agent_runtime,
+                "Agent runtime behavior: subagents, research web "
+                "fetch, code index, context management, verification, "
+                "dev rounds, nudge",
             ),
         ]
 
@@ -431,8 +458,8 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
 
     The task-management preferences (retention, finalization, worktree
     removal, dev rounds, stall nudge, isolation, parallelism, …) are not
-    here — they live in the modal TaskSettingsDialog, opened by the
-    "Task settings…" entry (TaskSettingsCommandProvider).
+    here — they live in the two modal task-settings dialogs, opened by
+    the "Project environment…" / "Agent runtime…" entries.
     """
 
     def _commands(self) -> list[CommandEntry]:
@@ -468,13 +495,6 @@ class ProjectSettingsCommandsProvider(CommandListProvider):
                 "external AI agents manage drcode tasks; hot start/stop, "
                 "no restart needed (project setting, "
                 "docs/mcp-server-design.md)",
-            ),
-            CommandEntry(
-                f"Code index: {app.settings.code_index_mode.label}",
-                app.action_change_code_index_mode,
-                "Symbolic code index for the agents: code_symbols/"
-                "code_outline tools backed by a tree-sitter index "
-                "(docs/code-index-design.md, project setting)",
             ),
         ]
 
@@ -756,29 +776,6 @@ class WebFetchModeOptionsProvider(CommandListProvider):
                 mode.label,
                 mode is current,
                 partial(app.action_set_web_fetch_mode, mode),
-            )
-            entries.append(marked._replace(help=mode.description))
-        return entries
-
-
-class CodeIndexOptionsProvider(CommandListProvider):
-    """Options of the "Code index" setting (off / on).
-
-    Same selection-palette UX as WebFetchModeOptionsProvider: pick an
-    option to apply it immediately, Escape keeps the current one. The
-    active option is marked with "(current)"; each entry's help text
-    comes from the mode itself (`CodeIndexMode.description`).
-    """
-
-    def _commands(self) -> list[CommandEntry]:
-        app = cast("DrCodeApp", self.app)
-        current = app.settings.code_index_mode
-        entries: list[CommandEntry] = []
-        for mode in CODE_INDEX_MODE_OPTIONS:
-            marked = _marked_option(
-                mode.label,
-                mode is current,
-                partial(app.action_set_code_index_mode, mode),
             )
             entries.append(marked._replace(help=mode.description))
         return entries

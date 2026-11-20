@@ -26,12 +26,12 @@ from ..github import (
     sync_issues,
 )
 from ..settings import (
-    CodeIndexMode,
     CompletedRetention,
     EscAbort,
     GitPolicy,
     ProjectSettings,
     StallNudge,
+    SubagentUsageSummary,
     TaskIsolation,
     Verification,
     WebFetchMode,
@@ -48,7 +48,6 @@ from ..workflow import (
     load_role_instructions,
 )
 from .command_providers import (
-    CodeIndexOptionsProvider,
     DevRoundsOptionsProvider,
     EscAbortOptionsProvider,
     GitResearchOptionsProvider,
@@ -132,11 +131,13 @@ class SettingsLayer(DrCodeState):
         self._update_keepawake()
 
     def action_apply_task_settings(self, draft: ProjectSettings) -> None:
-        """Apply the Task-settings dialog's accepted draft ATOMICALLY:
-        persist once, then replay the same side effects the per-field
-        actions run (see `_apply_settings_side_effects`). The draft is a
-        deep copy made by the dialog; it is merged into the LIVE settings
-        object in place (TaskEnvironment holds the same instance)."""
+        """Apply an accepted task-settings draft ATOMICALLY (either
+        dialog — ProjectEnvironmentDialog or AgentRuntimeDialog — hands
+        back the same shape): persist once, then replay the same side
+        effects the per-field actions run (see
+        `_apply_settings_side_effects`). The draft is a deep copy made by
+        the dialog; it is merged into the LIVE settings object in place
+        (TaskEnvironment holds the same instance)."""
         from .task_settings_dialog import copy_task_settings
 
         copy_task_settings(self.settings, draft)
@@ -153,29 +154,48 @@ class SettingsLayer(DrCodeState):
             return  # ESC / Cancel — nothing persisted, nothing replayed.
         self.action_apply_task_settings(result)
 
-    def action_open_task_settings(self) -> None:
-        """Open the "Task settings…" dialog: all task-management project
-        preferences in one modal form (workflow preset on top, live
-        coupling hints at the bottom, atomic Apply). Runs as the callback
-        of a palette entry — the palette has already dismissed itself by
-        the time this executes, so pushing the dialog is safe."""
-        if isinstance(self.screen, CommandPalette):
-            return
-        from ..settings import SubagentUsageSummary
-        from .task_settings_dialog import TaskSettingsDialog
-
-        # delegate_research usage counts for the "enabled but never used"
-        # hint — read once at open time (they cannot change mid-dialog).
+    def _subagent_usage_summary(self) -> SubagentUsageSummary | None:
+        """delegate_research usage counts for the "enabled but never
+        used" hint — read once at dialog-open time (they cannot change
+        mid-dialog); None when the stats are not readable."""
         try:
             total, recent = self.manager.stats.subagent_usage()
-            usage: SubagentUsageSummary | None = SubagentUsageSummary(
-                total_spawns=total, recent_spawns=recent
-            )
         except Exception:  # noqa: BLE001 - a stats problem must not block settings
-            usage = None
+            return None
+        return SubagentUsageSummary(total_spawns=total, recent_spawns=recent)
+
+    def action_open_project_environment(self) -> None:
+        """Open the "Project environment…" dialog: the project
+        INFRASTRUCTURE preferences (workflow preset, task isolation,
+        worktrees, retention, git policies, keep-awake) in one modal
+        form with live coupling hints and atomic Apply. Runs as the
+        callback of a palette entry — the palette has already dismissed
+        itself by the time this executes, so pushing the dialog is
+        safe."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        from .task_settings_dialog import ProjectEnvironmentDialog
 
         self.push_screen(
-            TaskSettingsDialog(self.settings, subagent_usage=usage),
+            ProjectEnvironmentDialog(self.settings),
+            self._task_settings_done,
+        )
+
+    def action_open_agent_runtime(self) -> None:
+        """Open the "Agent runtime…" dialog: the RUNTIME behavior
+        preferences (subagents, web fetch, code index, context
+        management, testing, agent behavior) in one modal form with live
+        coupling hints and atomic Apply. Runs as the callback of a
+        palette entry — the palette has already dismissed itself by the
+        time this executes, so pushing the dialog is safe."""
+        if isinstance(self.screen, CommandPalette):
+            return
+        from .task_settings_dialog import AgentRuntimeDialog
+
+        self.push_screen(
+            AgentRuntimeDialog(
+                self.settings, subagent_usage=self._subagent_usage_summary()
+            ),
             self._task_settings_done,
         )
 
@@ -345,45 +365,13 @@ class SettingsLayer(DrCodeState):
         )
 
     def action_edit_web_fetch_hosts(self) -> None:
-        """Open the task-settings dialog, where the web-fetch allow/block
+        """Open the Agent-runtime dialog, where the web-fetch allow/block
         host lists are edited (the palette has no free-text field — the
         lists are comma-separated Inputs in the dialog, normalized on
         Apply by `ProjectSettings` itself)."""
         if isinstance(self.screen, CommandPalette):
             return
-        self.action_open_task_settings()
-
-    def action_set_code_index_mode(self, mode: CodeIndexMode) -> None:
-        """Settings command: whether the agents get the symbolic code
-        index (code_symbols/code_outline for coding/tester/resolver and
-        the research agent, on the same terms — its delegate_research
-        subagents inherit the parent run's decision;
-        docs/code-index-design.md). Persisted per
-        project (.drcode/settings.json); read at activation, so a change
-        reaches the next run of each task, never the in-flight one.
-        OFF registers nothing and builds nothing."""
-        self.settings.code_index_mode = mode
-        self.settings_store.save(self.settings)
-        self.notify(
-            f"Code index: {mode.label}",
-            title="Project settings",
-            timeout=4,
-        )
-
-    def action_change_code_index_mode(self) -> None:
-        """Code-index picker, opened from the "Code index" Settings
-        entry. Same UX as the web-fetch-mode picker: the narrowed
-        SettingsPalette with the two modes; picking one applies it,
-        Escape dismisses without changing anything."""
-        if isinstance(self.screen, CommandPalette):
-            return
-        self.push_screen(
-            SettingsPalette(
-                id="--code-index-palette",
-                providers=[CodeIndexOptionsProvider],
-                placeholder="Search for options…",
-            )
-        )
+        self.action_open_agent_runtime()
 
     def action_set_git_tester(self, policy: GitPolicy) -> None:
         """Settings command: what the tester may do to git after a passed

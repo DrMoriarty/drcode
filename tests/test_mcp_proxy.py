@@ -42,7 +42,7 @@ from drcode.mcp import (
 #: The stderr hint of §1 — asserted verbatim: it is the documented
 #: recovery path a confused external agent must be able to follow.
 NO_SERVER_MESSAGE = (
-    "drcode TUI не запущен или MCP выключен — включите в Settings → MCP server"
+    "drcode TUI не запущен или MCP выключен — включите в Settings → Project environment → MCP server"
 )
 
 TOKEN = "fedcba9876543210" * 4

@@ -148,6 +148,9 @@ class SettingsLayer(DrCodeState):
             timeout=4,
         )
         self._apply_settings_side_effects()
+        # The dialog can flip the MCP server toggle — reconcile the
+        # embedded service (a no-op when the setting is unchanged).
+        self._sync_mcp_server()
 
     def _task_settings_done(self, result: ProjectSettings | None) -> None:
         if result is None:
@@ -569,26 +572,6 @@ class SettingsLayer(DrCodeState):
         state = "on" if self.settings.keep_awake else "off"
         self.notify(
             f"Keep computer awake while working: {state}",
-            title="Project settings",
-            timeout=4,
-        )
-
-    def action_toggle_mcp_enabled(self) -> None:
-        """Settings command: whether the embedded MCP server runs
-        (docs/mcp-server-design.md §2).
-
-        Hot switch: enabling starts the server right away (ephemeral
-        loopback port, endpoint published in `.drcode/mcp.json`),
-        disabling shuts it down and removes our descriptor. Both report
-        through `_sync_mcp_server`, which also owns the "already served
-        by another instance" refusal — the setting is persisted either
-        way (the user's choice is never silently rewritten)."""
-        self.settings.mcp_enabled = not self.settings.mcp_enabled
-        self.settings_store.save(self.settings)
-        self._sync_mcp_server()
-        state = "on" if self.settings.mcp_enabled else "off"
-        self.notify(
-            f"MCP server: {state}",
             title="Project settings",
             timeout=4,
         )

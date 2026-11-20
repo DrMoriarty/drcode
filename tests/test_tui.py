@@ -27,7 +27,7 @@ from textual.command import Command, CommandList
 from textual.css.query import NoMatches
 from textual.geometry import Offset
 from textual.selection import Selection as ScreenSelection
-from textual.widgets import ListView, Static, TextArea
+from textual.widgets import ListView, RadioButton, Static, TextArea
 from textual.widgets._list_item import ListItem
 from textual.widgets.text_area import Selection
 
@@ -3844,10 +3844,14 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
             "#ts-git-research",
             "#ts-retention",
             "#ts-keep-awake",
+            "#ts-mcp-enabled",
         ):
             assert dialog.query_one(selector)
         assert dialog.query_one("#ts-keep-awake", RadioButton).value is (
             app.settings.keep_awake
+        )
+        assert dialog.query_one("#ts-mcp-enabled", RadioButton).value is (
+            app.settings.mcp_enabled
         )
         sections = [
             str(cast(Label, label).render())
@@ -3896,29 +3900,42 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
             "Testing",
             "Agent behavior",
         ]
-        # The main-menu provider no longer carries the task entries: it
-        # keeps the integration preferences (github/notifications/voice)
-        # and the MCP-server toggle.
+        # The main-menu provider no longer carries the task entries nor
+        # the MCP toggle (it moved into the environment dialog): it keeps
+        # the integration preferences (github/notifications/voice).
         main = ProjectSettingsCommandsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         main_names = [c.name for c in main]
         assert main_names == [
             (f"GitHub integration: {'on' if app.settings.github_enabled else 'off'}"),
             (f"Notifications: {'on' if app.settings.notifications_enabled else 'off'}"),
             f"Voice: {app.voice_status_label()}",
-            f"MCP server: {'on' if app.settings.mcp_enabled else 'off'}",
         ]
-        # The MCP toggle entry drives the hot-switching handler.
-        mcp_entry = main[3]
-        assert mcp_entry.callback == app.action_toggle_mcp_enabled
 
 
 async def test_mcp_toggle_hot_switches_the_server(app: DrCodeApp) -> None:
-    """The "MCP server" settings command hot-starts/stops the embedded
-    server without a restart: enabling starts it right away (endpoint
-    published in .drcode/mcp.json), disabling shuts it down and removes
-    the descriptor; the setting is persisted either way."""
+    """The "MCP server" toggle of the Project-environment dialog
+    hot-starts/stops the embedded server on Apply without a restart:
+    enabling starts it right away (endpoint published in
+    .drcode/mcp.json), disabling shuts it down and removes the
+    descriptor; the setting is persisted either way."""
+    from textual.widgets import Button
+
     from drcode.mcp.endpoint import endpoint_path, load_endpoint
     from drcode.settings import ProjectSettingsStore
+
+    async def toggle_mcp(value: bool) -> None:
+        """Open the environment dialog, flip the MCP toggle to `value`
+        and Apply."""
+        app.action_open_project_environment()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectEnvironmentDialog)
+        dialog.query_one("#ts-mcp-enabled", RadioButton).value = value
+        await pilot.pause()
+        dialog.query_one("#ts-apply", Button).press()
+        await pilot.pause()
+
+    from drcode.tui.task_settings_dialog import ProjectEnvironmentDialog
 
     async with app.run_test() as pilot:
         await pilot.press("escape")  # skip the first-start setup dialog
@@ -3926,18 +3943,16 @@ async def test_mcp_toggle_hot_switches_the_server(app: DrCodeApp) -> None:
         assert app.settings.mcp_enabled is False
         assert app.mcp_service.running is False
 
-        # Toggle on: hot start, endpoint published, setting persisted.
-        app.action_toggle_mcp_enabled()
-        await pilot.pause()
+        # Toggle on + Apply: hot start, endpoint published, persisted.
+        await toggle_mcp(True)
         try:
             assert app.settings.mcp_enabled is True
             assert ProjectSettingsStore(app.project_root).load().mcp_enabled is True
             assert app.mcp_service.running is True
             assert load_endpoint(app.project_root) is not None
         finally:
-            # Toggle off: hot stop, endpoint removed, setting persisted.
-            app.action_toggle_mcp_enabled()
-        await pilot.pause()
+            # Toggle off + Apply: hot stop, endpoint removed, persisted.
+            await toggle_mcp(False)
         assert app.settings.mcp_enabled is False
         assert ProjectSettingsStore(app.project_root).load().mcp_enabled is False
         assert app.mcp_service.running is False

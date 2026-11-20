@@ -8,7 +8,7 @@ settings' nature (the user's variant 3 of the settings redesign):
   project INFRASTRUCTURE, configured once and rarely revisited: the
   workflow presets, the task-isolation cluster (isolation, start
   branch, parallelism, worktree removal/snapshot), completed-task
-  retention, the per-role git policies and keep-awake;
+  retention, the per-role git policies, keep-awake and the MCP server;
 - :class:`AgentRuntimeDialog` ("Agent runtime…") — the RUNTIME
   behavior, tuned more often: subagent budgets, the research agent's
   web fetch, the code index, the context-management cluster, testing
@@ -144,6 +144,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.worktree_snapshot = src.worktree_snapshot
     dst.isolation_start_branch = src.isolation_start_branch
     dst.keep_awake = src.keep_awake
+    dst.mcp_enabled = src.mcp_enabled
 
 
 def _parse_host_list(text: str) -> list[str]:
@@ -470,9 +471,9 @@ class ProjectEnvironmentDialog(TaskSettingsDialogBase):
     """The "Project environment…" dialog — the project INFRASTRUCTURE
     preferences, set once and rarely revisited: workflow presets, the
     task-isolation cluster, completed-task retention, the per-role git
-    policies and keep-awake. Renders only the environment-scoped hints
-    (parallel-dormant, worktree-without-git, the parked isolation
-    fields)."""
+    policies, keep-awake and the MCP server. Renders only the
+    environment-scoped hints (parallel-dormant, worktree-without-git,
+    the parked isolation fields)."""
 
     DIALOG_TITLE: ClassVar[str] = "Project environment"
 
@@ -568,11 +569,19 @@ class ProjectEnvironmentDialog(TaskSettingsDialogBase):
                             allow_blank=False,
                             id="ts-git-research",
                         )
-                yield ToggleRow(
-                    "Keep computer awake",
-                    value=d.keep_awake,
-                    toggle_id="ts-keep-awake",
-                )
+                with Horizontal(classes="ts-row"):
+                    with Vertical(classes="ts-col"):
+                        yield ToggleRow(
+                            "Keep computer awake",
+                            value=d.keep_awake,
+                            toggle_id="ts-keep-awake",
+                        )
+                    with Vertical(classes="ts-col"):
+                        yield ToggleRow(
+                            "MCP server",
+                            value=d.mcp_enabled,
+                            toggle_id="ts-mcp-enabled",
+                        )
             yield Vertical(id="ts-hints")
             yield Static("", id="ts-workflow-info")
             with Horizontal(id="ts-buttons"):
@@ -649,6 +658,7 @@ class ProjectEnvironmentDialog(TaskSettingsDialogBase):
         self._set_select("#ts-git-research", d.git_policy.research)
         self._set_select("#ts-retention", d.completed_retention)
         self._set_toggle("#ts-keep-awake", d.keep_awake)
+        self._set_toggle("#ts-mcp-enabled", d.mcp_enabled)
         changed = {
             "#ts-isolation": d.task_isolation is not o.task_isolation,
             "#ts-start-branch": d.isolation_start_branch != o.isolation_start_branch,
@@ -659,6 +669,7 @@ class ProjectEnvironmentDialog(TaskSettingsDialogBase):
             "#ts-git-research": d.git_policy.research is not o.git_policy.research,
             "#ts-retention": d.completed_retention is not o.completed_retention,
             "#ts-keep-awake": d.keep_awake != o.keep_awake,
+            "#ts-mcp-enabled": d.mcp_enabled != o.mcp_enabled,
         }
         for selector, is_changed in changed.items():
             widget = self.query_one(selector)
@@ -779,6 +790,12 @@ class ProjectEnvironmentDialog(TaskSettingsDialogBase):
     def _keep_awake_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.keep_awake:
             self._draft.keep_awake = event.value
+            self._refresh()
+
+    @on(RadioButton.Changed, "#ts-mcp-enabled")
+    def _mcp_enabled_changed(self, event: RadioButton.Changed) -> None:
+        if event.value != self._draft.mcp_enabled:
+            self._draft.mcp_enabled = event.value
             self._refresh()
 
 

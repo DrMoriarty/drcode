@@ -290,6 +290,26 @@ def test_completion_appends_goal_progress_event(manager) -> None:
     assert any("переведена" in e and "done" in e for e in events2)
 
 
+def test_completion_all_tasks_done_but_active_subgoal_says_open(manager) -> None:
+    parent = manager.goals.create("roadmap")
+    manager.goals.create("sub", parent_id=parent.id)
+    first = manager.create("a", "do it", kind=TaskKind.RESEARCH, goal_id=parent.id)
+    second = manager.create("b", "do it", kind=TaskKind.RESEARCH, goal_id=parent.id)
+
+    manager.mark_done(first.id)
+    events = [e.text for e in manager.get(first.id).events if e.kind == "goals"]
+    assert len(events) == 1
+    assert "1/2 задач завершено" in events[0]
+
+    manager.mark_done(second.id)
+    events2 = [e.text for e in manager.get(second.id).events if e.kind == "goals"]
+    assert len(events2) == 1
+    assert "2/2 привязанных задач завершено" in events2[0]
+    assert "остаётся active из-за незавершённых подцелей" in events2[0]
+    assert "переведена" not in events2[0]
+    assert manager.goals.get(parent.id).status is GoalStatus.ACTIVE
+
+
 def test_completion_without_goal_has_no_goal_event(manager) -> None:
     task = manager.create("plain", "brief", kind=TaskKind.RESEARCH)
     manager.mark_done(task.id)

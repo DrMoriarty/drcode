@@ -25,6 +25,7 @@ from ..agent import (
 )
 from ..config import Config
 from ..keepawake import statuses_hold_awake
+from ..mcp.client_toolsets import mcp_toolsets_for
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus
 from ..providers import AgentRole
 from ..settings import TaskIsolation, Verification
@@ -160,6 +161,27 @@ class PipelineCoreLayer(CoreState):
             )
 
         return announce
+
+    def _mcp_toolsets(self, task: Task, role: AgentRole) -> list:
+        """External MCP toolsets of one role (docs/mcp-client-design.md
+        §1.3/§2), resolved at activation like every other role-keyed
+        decision. Fresh toolset instances every call; an empty roles
+        matrix — the safe default — yields [] for every role.
+
+        Config warnings (a corrupted layer, a disabled/unknown server, a
+        prefix collision) land in the task's service events (kind "mcp"):
+        chat-only, never the model context.
+        """
+
+        def notify(text: str) -> None:
+            try:
+                self._show_event_once(task, text, kind="mcp")
+            except Exception:  # noqa: BLE001, S110 - visibility never fatal
+                pass
+
+        return mcp_toolsets_for(
+            role, project_root=self.project_root, notify=notify
+        )
 
     def _todo_completion_warning(self, task: Task) -> None:
         """Completion soft gate: when a task leaves development with

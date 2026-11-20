@@ -73,6 +73,12 @@ Delegate when:
   touching it;
 - you are scanning many files for a pattern/string and only need the hits.
 
+When the code-index tools are enabled for this project, the "map the call
+sites" question is answered directly by YOUR OWN code_symbols / code_callers /
+code_refs — run them first (millisecond reads, no context bloat) and put their
+results into the brief's STARTING POINTS; delegate only the wide reading that
+remains.
+
 Read yourself what you must know EXACTLY: the file you are about to edit, its
 immediate neighbours, and any verification read of a claim from a report.
 Never delegate a single-file lookup or anything whose answer you already

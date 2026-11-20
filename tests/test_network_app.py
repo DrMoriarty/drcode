@@ -207,9 +207,12 @@ async def test_research_task_builds_agent_with_research_role_config(
         research_web_fetch: Any = None,
         code_index: bool = False,
         announce_wait: Any = None,
+        mcp_toolsets: Any = None,
     ):
         seen.append((kind.value, config.model, config.base_url))
         kwargs = {"kind": kind, "root": root}
+        if mcp_toolsets is not None:
+            kwargs["mcp_toolsets"] = mcp_toolsets
         if research_git is not None:
             kwargs["research_git"] = research_git
         if subagent_gate is not None:
@@ -1435,22 +1438,26 @@ async def test_mechanical_floor_measured_headroom_fits_window(
 async def test_mechanical_floor_small_capped_window_fits_via_measured_headroom(
     project_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bench scenario (coding cap 5000, threshold 80%, a modest
-    project AGENTS.md): the old flat headroom (32k capped at window//4 =
-    1250) left a message budget the framing alone overflows — the resumed
-    request died deterministically. The MEASURED headroom (framing + output
-    reserve) shrinks the message budget instead, the threshold-scaled trim
-    is re-run against the full window when needed, and the result fits."""
+    """The small-capped-window scenario (threshold 80%, a modest project
+    AGENTS.md): the old flat headroom (32k capped at window//4) left a
+    message budget the framing alone overflows — the resumed request died
+    deterministically. The MEASURED headroom (framing + output reserve)
+    shrinks the message budget instead, the threshold-scaled trim is re-run
+    against the full window when needed, and the result fits. The window
+    (8k) tracks the real coding framing's growth (system prompt + tool
+    schemas): when the framing grows past the scenario, raise the window —
+    never the assertion."""
     from drcode.providers import AgentRole
 
-    app = _coding_window_app(project_root, monkeypatch, 6_000)
-    task = _seed_big_transcript(app, "long task " * 200, fill=5_500)
+    app = _coding_window_app(project_root, monkeypatch, 8_000)
+    task = _seed_big_transcript(app, "long task " * 200, fill=7_300)
 
     # AGENTS.md sized from the MEASURED coding framing (system prompt + tool
-    # schemas, ≈3.9k tokens and growing) so the scenario keeps fitting the
-    # window however much the framing grows: framing + the floor's
+    # schemas — several k tokens and growing) so the scenario keeps fitting
+    # the window however much the framing grows: framing + the floor's
     # irreducible minimum (original prompt + note ≈ 700) plus the output
-    # reserve plus a modest AGENTS.md must stay under the 5700-token limit.
+    # reserve plus a modest AGENTS.md must stay under the 7600-token limit
+    # (8000 minus the 5% safety margin).
     measured = app._mechanical_framing(task, AgentRole.CODING)
     assert measured is not None
     base_window, base_framing, base_output = measured

@@ -52,7 +52,8 @@ def _persist_for(ctx: RunContext[Any]) -> bool:
 
 
 def register_code_index_tools(agent: Agent[Any, Any], *, enabled: bool) -> None:
-    """Register `code_symbols` and `code_outline` on the agent. `enabled`
+    """Register the code-index query tools (`code_symbols`, `code_outline`,
+    `code_refs`, `code_callers`) on the agent. `enabled`
     is the resolved project decision (`agent_build.code_index_tools_for`)
     — when False the tools are not registered AT ALL: the model never
     sees them, which is itself the OFF switch (§5)."""
@@ -110,6 +111,47 @@ def register_code_index_tools(agent: Agent[Any, Any], *, enabled: bool) -> None:
             in the index (unknown language) comes back as an explicit notice —
             read that file directly instead."""
     agent.tool(code_outline)
+
+    async def code_refs(ctx: RunContext[Any], name: str, limit: int = 50) -> str:
+        result = await _run_tool(
+            queries.refs,
+            ctx.deps.root,
+            name,
+            limit=limit,
+            persist=_persist_for(ctx),
+        )
+        _log_first_build(ctx)
+        return result
+
+    code_refs.__doc__ = """List every occurrence of an identifier across indexed files — definitions
+            marked [def], the rest are usages (import sites, calls, plain
+            mentions). This is a TEXTUAL match: same-name locals, strings and
+            comments appear too — read the returned line, not just the
+            location, before treating a hit as a real usage. For "who calls
+            this function" prefer code_callers; an empty result means the
+            identifier lives in an unindexed file — fall back to grep_search."""
+    agent.tool(code_refs)
+
+    async def code_callers(ctx: RunContext[Any], name: str, limit: int = 30) -> str:
+        result = await _run_tool(
+            queries.callers,
+            ctx.deps.root,
+            name,
+            limit=limit,
+            persist=_persist_for(ctx),
+        )
+        _log_first_build(ctx)
+        return result
+
+    code_callers.__doc__ = """List functions that LIKELY call `name`, inferred from identifier matches
+            inside function bodies (NOT a compiler-accurate call graph). Ranked
+            by import proximity plus a lexical score; may include false
+            positives for common names — every hit ships the matching source
+            line so you can verify at a glance. Dynamic dispatch (getattr,
+            reflection) is invisible by design. Use code_symbols to locate the
+            definition first, then this to map its blast radius; an empty
+            result means nothing indexed matched — fall back to grep_search."""
+    agent.tool(code_callers)
 
 
 def _log_first_build(ctx: RunContext[Any]) -> None:

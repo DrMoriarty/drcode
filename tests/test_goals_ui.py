@@ -199,15 +199,171 @@ async def test_goal_screen_tree_and_details(app: DrCodeApp) -> None:
         assert f"#{task.id}" in joined and "◆" in joined
         # Nothing expanded yet: the notes stay out of the rendered rows.
         assert "read_goal" not in joined
-        # Enter on the first row (the parent) expands its details.
+        # Enter on the first row (the parent) opens the EDIT dialog now
+        # (the old `e`); ESC backs out without changing anything.
         listing.index = 0
         await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, GoalEditScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, GoalScreen)
+        # A CLICK on the goal row toggles the detail section.
+        await pilot.click(listing.children[0])
         await pilot.pause()
         texts = [w.text for w in listing.children if isinstance(w, TaskItem)]
         joined = "\n".join(texts)
         assert "the release umbrella" in joined
         # The notes preview is UI-only and rendered expanded.
         assert any("notes:" in t for t in texts)
+
+
+async def test_goal_screen_linked_task_rows(app: DrCodeApp) -> None:
+    """An expanded goal lists EVERY linked task below its whole subtree
+    (all statuses, draft/hold/completed included), one row per task,
+    indented deeper than the sub-goal rows, carrying task_id."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        parent = app.manager.goals.create("Release 1.0")
+        child = app.manager.goals.create("Async core", parent_id=parent.id)
+        active = app.manager.create("running now", "x", goal_id=parent.id)
+        draft = app.manager.create(
+            "a draft", "x", draft=True, goal_id=parent.id
+        )  # stays DRAFT
+        held = app.manager.create("parked", "x", goal_id=child.id)
+        app.manager.set_hold(held.id, on=True)
+        done = app.manager.create("shipped", "x", goal_id=child.id)
+        done_task = app.manager.get(done.id)
+        done_task.status = TaskStatus.COMPLETED
+        unrelated = app.manager.create("no goal", "x")
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+        # The first render rides call_after_refresh — wait for it.
+        await wait_until(lambda: len(listing.children) > 0, pilot, what="tree rows")
+        # Expand the parent via the Right key: the first press folds the
+        # (already folded) subtree, the second opens it AND the details.
+        listing.index = 0
+        await pilot.press("right")
+        await pilot.press("right")
+        await pilot.pause()
+        await pilot.pause()
+        # Expand the sub-goal too (a leaf: one press opens its details).
+        listing.index = next(
+            i
+            for i, w in enumerate(listing.children)
+            if isinstance(w, TaskItem) and w.goal_id == child.id
+        )
+        await pilot.press("right")
+        await pilot.pause()
+        await pilot.pause()
+        items = [w for w in listing.children if isinstance(w, TaskItem)]
+        by_task = {w.task_id: w for w in items if w.task_id}
+        # Every linked task of the goal AND of the sub-goal is rendered
+        # (all statuses); the unrelated task is not.
+        assert set(by_task) == {active.id, draft.id, held.id, done.id}
+        assert unrelated.id not in by_task
+        # The task rows sit below the whole subtree, innermost first:
+        # the sub-goal's tasks right after its detail rows, the parent's
+        # tasks only after the sub-goal's rows — each with a deeper
+        # indent than the sub-goal rows.
+        order = [w.task_id for w in items if w.task_id]
+        child_row_pos = next(i for i, w in enumerate(items) if w.goal_id == child.id)
+        # The sub-goal's tasks open its block (after its detail rows).
+        assert order[:2] and set(order[:2]) == {held.id, done.id}
+        assert all(items.index(by_task[t]) > child_row_pos for t in (held.id, done.id))
+        # The parent's tasks close the block — after ALL sub-goal rows.
+        assert set(order[2:]) == {active.id, draft.id}
+        for tid in (active.id, draft.id, held.id, done.id):
+            row = by_task[tid]
+            assert f"#{tid}" in row.text
+            assert "  " in row.text  # indented
+            assert row.goal_id is None  # cursor helpers see no goal here
+        # All statuses visible in the labels (marker or status word).
+        joined = "\n".join(w.text for w in items if w.task_id)
+        assert "draft" in joined and "hold" in joined and "completed" in joined
+
+
+async def test_goal_screen_task_row_navigation(app: DrCodeApp) -> None:
+    """Enter or a click on a linked-task row opens the task and closes
+    the GoalScreen (the SearchDialog flow: view_task + chat focus)."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        goal = app.manager.goals.create("Async core")
+        task = app.manager.create("migrate", "x", goal_id=goal.id)
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+        await wait_until(lambda: len(listing.children) > 0, pilot, what="tree rows")
+        listing.index = 0
+        await pilot.press("right")  # a leaf goal: one press opens details
+        await pilot.pause()
+        await pilot.pause()
+        items = [w for w in listing.children if isinstance(w, TaskItem)]
+        task_items = [w for w in items if w.task_id]
+        assert [w.task_id for w in task_items] == [task.id]
+        # Enter on the task row navigates.
+        listing.index = listing.children.index(task_items[0])
+        await pilot.press("enter")
+        await wait_until(
+            lambda: not isinstance(app.screen, GoalScreen),
+            pilot,
+            what="GoalScreen closed",
+        )
+        assert app.viewed is not None and app.viewed.id == task.id
+        assert not app._new_task_mode
+        # Re-open: a CLICK on the task row navigates too.
+        app.action_open_goals()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, GoalScreen)
+        listing = screen.query_one("#goal-tree", ListView)
+        listing.index = 0
+        await pilot.press("right")
+        await pilot.pause()
+        task_item = next(
+            w
+            for w in listing.children
+            if isinstance(w, TaskItem) and w.task_id == task.id
+        )
+        await pilot.click(task_item)
+        await wait_until(
+            lambda: not any(isinstance(s, GoalScreen) for s in app.screen_stack),
+            pilot,
+            what="GoalScreen closed after click",
+        )
+        assert app.viewed is not None and app.viewed.id == task.id
+
+
+async def test_goal_screen_task_row_cursor_survives_rebuild(app: DrCodeApp) -> None:
+    """The cursor restore matches task rows by task_id: a rebuild (e.g.
+    a filter cycle or a done-toggle elsewhere) keeps the highlight on
+    the linked-task row."""
+    async with app.run_test() as pilot:
+        await _started(app, pilot)
+        goal = app.manager.goals.create("Async core")
+        task = app.manager.create("migrate", "x", goal_id=goal.id)
+        screen = _open_screen(app)
+        await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+        await wait_until(lambda: len(listing.children) > 0, pilot, what="tree rows")
+        listing.index = 0
+        await pilot.press("right")  # a leaf goal: one press opens details
+        await pilot.pause()
+        await pilot.pause()
+        task_item = next(
+            w
+            for w in listing.children
+            if isinstance(w, TaskItem) and w.task_id == task.id
+        )
+        listing.index = listing.children.index(task_item)
+        # A rebuild with no structural change keeps the task row cursor
+        # (restored by task_id — the rebuild mounts fresh widgets).
+        screen._rebuild()
+        await pilot.pause()
+        await pilot.pause()
+        child = listing.highlighted_child
+        assert isinstance(child, TaskItem) and child.task_id == task.id
 
 
 async def test_goal_screen_done_toggle(app: DrCodeApp) -> None:

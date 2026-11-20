@@ -960,7 +960,9 @@ class GoalScreen(ModalScreen[None]):
             highlighted.task_id if isinstance(highlighted, TaskItem) else None
         )
         cursor_id = self._cursor_goal_id() or self._focus_goal_id
-        await listing.clear()
+        # Compute every row BEFORE clearing: clear() yields to the event
+        # loop, so anything computed after it delays the re-mount and the
+        # user sees an empty list for that whole gap.
         rows = self._visible_rows()
         items: list[TaskItem] = []
         # Expanded goals whose sub-tree is currently open (a row at depth
@@ -983,7 +985,15 @@ class GoalScreen(ModalScreen[None]):
         while open_expanded:
             closed, closed_depth = open_expanded.pop()
             items.extend(self._task_rows(closed, closed_depth, app))
-        await listing.extend(items)
+        # Swap the whole tree in one batch: clear() and mount() are
+        # synchronous calls returning awaitables, so keeping them (and the
+        # batch) free of awaits means no frame is painted between the
+        # removal and the mount — no empty-list flash.
+        async with self.batch():
+            removed = listing.clear()
+            mounted = listing.extend(items)
+        await removed
+        await mounted
 
         def restore(match: Callable[[TaskItem], bool]) -> bool:
             for index, child in enumerate(listing.children):

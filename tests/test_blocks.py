@@ -11,6 +11,7 @@ from textual.content import Content
 
 from drcode.core.blocks import json_text as _json_text
 from drcode.core.blocks import linkify
+from drcode.core.blocks import stamp_label as _stamp_label
 from drcode.tui.blocks import AssistantBlock, ToolCallBlock, UserBlock
 
 
@@ -129,6 +130,37 @@ async def test_tool_call_block_counter_restarts_on_reattach() -> None:
         assert "0s" not in fresh_header.plain
         fresh.stop_spinner()
         assert fresh._elapsed_text() == ""
+
+
+async def test_tool_call_block_counter_never_wraps_stamp() -> None:
+    """While a long tool call runs, the live elapsed counter eats into the
+    header line: the header must shrink so the right-edge event stamp stays
+    on the SAME line (previously the stamp wrapped once header + counter +
+    stamp outgrew the row width)."""
+
+    class _Host(App[None]):
+        CSS = "ToolCallBlock { width: 100; }"
+
+        def compose(self) -> ComposeResult:
+            yield ToolCallBlock(
+                'delegate_research({"task": "GOAL: ' + "map the startup path " * 20 + '"})'
+            )
+
+    async with _Host().run_test(size=(120, 10)) as pilot:
+        block = pilot.app.query_one(ToolCallBlock)
+        block.start_spinner()
+        assert block._run_started is not None
+        block._run_started -= 138  # a " · 2m18s" counter
+        block._redraw()
+        rendered = block.render()
+        assert isinstance(rendered, Content)
+        plain = rendered.plain
+        stamp = _stamp_label(block.at)
+        assert " · 2m18s" in plain
+        assert stamp in plain
+        # One single rendered line, fitting the widget's content width.
+        assert "\n" not in plain
+        assert len(plain) <= block.content_size.width
 
 
 def test_linkify_matches_task_mention() -> None:

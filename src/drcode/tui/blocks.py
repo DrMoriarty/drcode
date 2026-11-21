@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.containers import VerticalScroll
@@ -111,6 +112,20 @@ class UserBlock(Static):
 def _header_line_width(widget: Static) -> int:
     """Usable width of a block's header line (0 before layout → fallback)."""
     return widget.content_size.width or widget.size.width or 80
+
+
+def _fit_cells(text: str, max_cells: int) -> str:
+    """Truncate plain text to `max_cells` display columns with an ellipsis
+    ("" when even the ellipsis does not fit)."""
+    if max_cells <= 0:
+        return ""
+    if cell_len(text) <= max_cells:
+        return text
+    # Text.truncate crops IN PLACE and returns None — mutate a throwaway
+    # Text and read the result back.
+    cropped = Text(text)
+    cropped.truncate(max_cells, overflow="ellipsis")
+    return cropped.plain
 
 
 class ReasoningBlock(Static):
@@ -459,11 +474,21 @@ class ToolCallBlock(Static):
         marker = (
             _SPINNER_FRAMES[self._spin_frame] if self._spin_timer is not None else "⚙"
         )
-        text = Text(f"{arrow} {marker} {self._header}")
+        prefix = f"{arrow} {marker} "
+        stamp = _stamp_label(self.at)
         elapsed = self._elapsed_text()
+        width = _header_line_width(self)
+        # The live " · 2m18s" counter grows while the call runs; truncate
+        # the header so prefix + header + counter + stamp always stays on
+        # ONE line. Without this the counter is not part of the budget and
+        # append_stamp's minimum one-cell gap pushes the row past its
+        # width — the event time wrapped to the next line (worst on the
+        # longest headers, e.g. delegate_research's GOAL preview).
+        budget = width - cell_len(prefix) - cell_len(elapsed) - len(stamp) - 1
+        text = Text(prefix + _fit_cells(self._header, budget))
         if elapsed:
             text.append(elapsed, "dim")
-        _append_stamp(text, _stamp_label(self.at), _header_line_width(self))
+        _append_stamp(text, stamp, width)
         if not self.has_class("collapsed") and self._args:
             if self._body is None:
                 self._body = _json_text(self._args)

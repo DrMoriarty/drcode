@@ -81,7 +81,6 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
 import httpx
-from pydantic_ai.exceptions import ModelRetry
 
 from .providers import AgentRole
 from .service_events import log_service_event
@@ -957,6 +956,8 @@ async def run_web_fetch(deps: AgentDeps | SubagentDeps, url: str) -> str:
     refusal = gate.take()
     if refusal is not None:
         return refusal
+    from pydantic_ai.exceptions import ModelRetry
+
     try:
         page = await _run_tool(fetch, url, gate.policy)
     except (WebFetchError, ModelRetry) as e:

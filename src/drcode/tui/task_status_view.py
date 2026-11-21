@@ -15,12 +15,7 @@ from rich.text import Text
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
-from ..agent import (
-    all_user_prompts,
-    code_index_tools_for,
-    last_context_tokens,
-    subagent_limit_for,
-)
+from ..agent import all_user_prompts, last_context_tokens
 from ..context_layout import (
     AGENT_DEV,
     AGENT_RESOLVER,
@@ -603,6 +598,18 @@ class TaskStatusLayer(DrCodeState):
             return AgentRole.RESOLVER
         return self._task_role(task)
 
+    def _subagent_limit_for(self, role: AgentRole) -> int:
+        # Deferred: pydantic_ai (subagents) off the TUI cold start.
+        from ..agent import subagent_limit_for
+
+        return subagent_limit_for(self.settings, role)
+
+    def _code_index_tools_for(self, role: AgentRole) -> bool:
+        # Deferred: tree-sitter (code_index) off the TUI cold start.
+        from ..agent import code_index_tools_for
+
+        return code_index_tools_for(self.settings, role)
+
     def action_show_ctx_dialog(self) -> None:
         """Click on the context counter: open the modal dialog with the
         ≈ context layout of the viewed task's agents (the development
@@ -635,14 +642,14 @@ class TaskStatusLayer(DrCodeState):
             tester_allow_commit=self.settings.git_policy.tester.commits,
             tester_allow_push=self.settings.git_policy.tester.pushes,
             research_git=self.settings.git_policy.research,
-            subagent_limit=subagent_limit_for(self.settings, role),
+            subagent_limit=self._subagent_limit_for(role),
             research_web_fetch=web_fetch_policy_for(self.settings, role),
             # Mirror rule (§8.2): the counted tool schemas must match the
             # real wiring — the code-index tools ride the dev, tester and
             # resolver reports when the mode is ON (the helper returns
             # the same project decision for all three non-research
             # roles).
-            code_index=code_index_tools_for(self.settings, role),
+            code_index=self._code_index_tools_for(role),
             # The goals data for the dev report's dynamic-instructions line:
             # the roadmap block needs the active list, the per-task block
             # the goal behind task.goal_id (None when absent/deleted).

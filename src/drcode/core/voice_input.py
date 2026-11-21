@@ -52,17 +52,10 @@ import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .. import voice
-from ..voice import (
-    SOUNDDEVICE_AVAILABLE,
-    VOICE_UNAVAILABLE_HINT,
-    MicrophoneRecorder,
-    VoiceClient,
-    VoiceError,
-    config_from_settings,
-)
 
 if TYPE_CHECKING:
     from ..settings import ProjectSettings
+    from ..voice import MicrophoneRecorder
 
 
 class _State(enum.Enum):
@@ -290,6 +283,13 @@ class VoiceInputController:
     def _start(self, target: Any) -> None:
         """Config/availability checks, then open the microphone in a
         worker thread."""
+        from ..voice import (
+            SOUNDDEVICE_AVAILABLE,
+            VOICE_UNAVAILABLE_HINT,
+            MicrophoneRecorder,
+            config_from_settings,
+        )
+
         settings = self._host.voice_settings()
         try:
             config = config_from_settings(settings)
@@ -330,6 +330,8 @@ class VoiceInputController:
         (with the Ctrl+B/ESC hint) is already up from ``_start`` — the
         old confirming status toast here auto-dismissed after a few
         seconds, which is exactly the feedback gap it claimed to fill."""
+        from ..voice import VoiceError
+
         try:
             recorder.start()
         except VoiceError as e:
@@ -357,8 +359,11 @@ class VoiceInputController:
     def _recognize(self, recorder: MicrophoneRecorder, target: Any) -> None:
         """Worker thread: close the stream, upload the WAV to the ASR
         endpoint and hop back into the app thread to insert the text."""
+        from ..voice import VoiceClient, VoiceError, config_from_settings
+
         try:
             wav = recorder.stop()
+
             config = config_from_settings(self._host.voice_settings())
             if config is None or not config.asr_model:
                 raise VoiceError("Voice dictation is not configured")

@@ -14,47 +14,31 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-
-from ..agent import (
+from ..compaction import (
+    _MAX_REDUCE_DEPTH,
+    CHARS_PER_TOKEN,
     GIANT_PROMPT_TOKENS,
     MECHANICAL_HEADROOM_TOKENS,
-    MODEL_SWITCH_NOTE_PREFIX,
+    background_compaction_mark,
     build_compaction_agent,
     build_compaction_prompt,
     build_reduce_prompt,
-    build_resolver_agent,
     chunk_history_for_summary,
-    code_index_tools_for,
     compacted_messages,
-    drop_model_switch_notes,
-    ends_with_open_request,
+    drop_background_marks,
     even_slice_budget,
     extract_previous_summary,
+    find_background_mark,
     is_summary_message,
-    last_context_tokens,
-    load_agents_md,
-    load_resolver_prompt,
     mechanical_compaction_messages,
     prompt_fits_context,
     prompt_fits_window,
     render_history_for_summary,
-    sanitized_messages,
-    serialize_messages,
     slice_budget_tokens,
+    split_at_background_mark,
     split_original_prompts,
-    strip_thinking_parts,
-    subagent_limit_for,
     tester_verdict_issued,
     unwrap_summary_envelope,
-)
-from ..compaction import (
-    _MAX_REDUCE_DEPTH,
-    CHARS_PER_TOKEN,
-    background_compaction_mark,
-    drop_background_marks,
-    find_background_mark,
-    split_at_background_mark,
 )
 from ..config import Config
 from ..context_layout import (
@@ -73,9 +57,18 @@ from ..eviction import (
     marked_tokens,
 )
 from ..models import Task, TaskKind, render_todos
-from ..prompts import load_compaction_prompts
+from ..prompts import load_compaction_prompts, load_resolver_prompt
 from ..providers import AgentRole
-from ..transcript import estimate_tokens
+from ..transcript import (
+    MODEL_SWITCH_NOTE_PREFIX,
+    drop_model_switch_notes,
+    ends_with_open_request,
+    estimate_tokens,
+    last_context_tokens,
+    sanitized_messages,
+    serialize_messages,
+    strip_thinking_parts,
+)
 from ..web_fetch import web_fetch_policy_for
 from .state import CoreState
 
@@ -453,6 +446,15 @@ class PipelineCompactionLayer(CoreState):
         if window <= 0:
             return None
         root = self.project_root
+        # Deferred heavy imports (pydantic_ai via agent_build / agent_tools /
+        # subagents): this module loads on the TUI cold-start path.
+        from ..agent import (
+            build_resolver_agent,
+            code_index_tools_for,
+            load_agents_md,
+            subagent_limit_for,
+        )
+
         try:
             if role is AgentRole.TESTER:
                 policy = self.settings.git_policy.tester
@@ -1458,6 +1460,8 @@ class PipelineCompactionLayer(CoreState):
         if find_background_mark(task.messages) is not None:
             return
         mark_text = background_compaction_mark()
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
         task.messages = task.messages + serialize_messages(
             [ModelRequest(parts=[UserPromptPart(content=mark_text)])]
         )
@@ -1902,6 +1906,8 @@ class PipelineCompactionLayer(CoreState):
             # Notes of EARLIER switches (a run aborted right after one was
             # written) are dropped first: they name a pair of models that
             # no longer applies and would pile up in the merged request.
+            from pydantic_ai.messages import ModelRequest, UserPromptPart
+
             task.messages = drop_model_switch_notes(task.messages)
             note = ModelRequest(
                 parts=[UserPromptPart(content=model_switch_note(old_key, new_key))]

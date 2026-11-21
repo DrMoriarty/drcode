@@ -33,10 +33,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.usage import RunUsage
-
-from ..agent import AgentDeps, InputDeliveryHooks, ResolverDeps, TesterDeps
 from ..config import Config
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
@@ -65,6 +61,10 @@ from .usage import SessionTokenUsage
 from .voice_input import VoiceInputController
 
 if TYPE_CHECKING:
+    from pydantic_ai.agent import AgentRun
+    from pydantic_ai.usage import RunUsage
+
+    from ..agent import AgentDeps, InputDeliveryHooks, ResolverDeps, TesterDeps
     from .pipeline_compaction import BackgroundCompaction
 
 

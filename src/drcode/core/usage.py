@@ -4,9 +4,12 @@ import asyncio
 import re
 import urllib.parse
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
-from pydantic_ai.usage import RunUsage
+if TYPE_CHECKING:
+    # Type-only: the runtime imports happen inside the functions below so
+    # the TUI cold-start path never pays for the pydantic_ai stack.
+    from pydantic_ai.usage import RunUsage
 
 # Transient network-failure handling for every agent's model calls (coding
 # agent and tester alike): a run that dies with a transport error
@@ -43,6 +46,8 @@ def _is_retryable_network_error(e: BaseException) -> bool:
     subclasses ModelAPIError, so the HTTP branch is checked first — every
     other HTTP status (400/401/500/…) is not a network error and falls
     through to the generic failure path."""
+    from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+
     if isinstance(e, ModelHTTPError):
         return e.status_code == 429
     return isinstance(e, ModelAPIError)

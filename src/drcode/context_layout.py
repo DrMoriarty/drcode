@@ -33,18 +33,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.usage import RunUsage
+if TYPE_CHECKING:
+    from pydantic_ai.usage import RunUsage
 
-from .agent import (
-    build_agent,
-    build_resolver_agent,
-    build_tester_agent,
-    goals_instructions,
-    load_agents_md,
-    task_goal_block,
-)
 from .config import Config
 from .models import Goal, Task, TaskKind
 from .prompts import (
@@ -109,6 +102,8 @@ def system_components_coding(
     base, git_workflow, role_instructions = load_system_prompt_components(
         kind, project_root, research_git
     )
+    from .agent import load_agents_md  # deferred: pydantic_ai off the cold start
+
     agents_md = load_agents_md(project_root) if project_root is not None else ""
     return [
         ("base template", base),
@@ -136,6 +131,8 @@ def goals_system_component(
     block; empty registry / no link / deleted goal → None (the hook yields
     None and the block is excluded from the request entirely — there is no
     "absent" placeholder to estimate)."""
+    from .agent import goals_instructions, task_goal_block
+
     if kind is TaskKind.RESEARCH:
         block = goals_instructions(active_goals)
         label = "product goals"
@@ -160,6 +157,8 @@ def system_components_tester(
     base, git_workflow, role_instructions = load_tester_prompt_components(
         allow_commit, project_root, allow_push
     )
+    from .agent import load_agents_md  # deferred: pydantic_ai off the cold start
+
     agents_md = load_agents_md(project_root) if project_root is not None else ""
     return [
         ("base template", base),
@@ -226,6 +225,8 @@ def coding_tool_schemas(
     project's code_index_mode decision resolved per role by
     `agent_build.code_index_tools_for` (one of the three §8.2 accounting
     mirrors)."""
+    from .agent import build_agent
+
     return tool_schemas(
         build_agent(
             config,
@@ -249,6 +250,8 @@ def tester_tool_schemas(
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the tester agent (`code_index` mirrors the
     tester's code-index decision — see `coding_tool_schemas`)."""
+    from .agent import build_tester_agent
+
     return tool_schemas(
         build_tester_agent(
             config,
@@ -268,6 +271,8 @@ def system_components_resolver(
     exactly what `build_resolver_agent` assembles into the instructions
     (the resolver has no git-workflow fragment; see its builder)."""
     base = load_resolver_prompt(project_root)
+    from .agent import load_agents_md  # deferred: pydantic_ai off the cold start
+
     agents_md = load_agents_md(project_root) if project_root is not None else ""
     return [
         ("base template", base),
@@ -285,6 +290,8 @@ def resolver_tool_schemas(
     edit pair + set_resolution — whatever `build_resolver_agent`
     registers; no network, pure wiring). `code_index` mirrors the
     resolver's code-index decision — see `coding_tool_schemas`."""
+    from .agent import build_resolver_agent
+
     return tool_schemas(build_resolver_agent(config, root=root, code_index=code_index))
 
 
@@ -370,7 +377,7 @@ class TranscriptStats:
     tool_calls: int = 0
     # Cumulative exact usage over every model response of the transcript
     # (the billing-grade counters the API reports per request).
-    usage: RunUsage = field(default_factory=RunUsage)
+    usage: RunUsage = field(default_factory=lambda: _new_run_usage())
     # Number of model responses that reported usage (≈ request count).
     requests: int = 0
     # Exact usage of the LAST model response (cache split lives here only).
@@ -378,7 +385,15 @@ class TranscriptStats:
     last_cache_write: int = 0
 
 
+def _new_run_usage() -> RunUsage:
+    from pydantic_ai.usage import RunUsage
+
+    return RunUsage()
+
+
 def _usage_of_response(msg: dict[str, Any]) -> RunUsage | None:
+    from pydantic_ai.usage import RunUsage
+
     u = msg.get("usage") or {}
     usage = RunUsage(
         input_tokens=u.get("input_tokens") or 0,
@@ -534,6 +549,8 @@ def analyze_transcript(messages: list[dict[str, Any]]) -> TranscriptStats:
 def cumulative_usage(transcripts: list[list[dict[str, Any]]]) -> tuple[RunUsage, int]:
     """Exact cumulative (RunUsage, request count) over every model response
     of the given transcripts — the whole-task spend."""
+    from pydantic_ai.usage import RunUsage
+
     total = RunUsage()
     requests = 0
     for messages in transcripts:

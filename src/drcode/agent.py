@@ -1,161 +1,196 @@
-"""Coding and QA tester agents — pure re-export facade.
+# pyright: reportUnsupportedDunderAll=false
+"""Coding and QA tester agents — lazy re-export facade.
 
 The implementation lives in split-out modules: `agent_build` (the deps
 dataclasses and the `build_agent` / `build_tester_agent` wiring),
 `agent_tools` (todo / dependency / commit / push tool helpers),
-`goals` (the product-goal registry store),
-`agent_model` (model / network layer), `service_events` (service-event
-logging), `tool_runtime` (worker-thread tool execution), `compaction`
-(summarizer/compaction block), `transcript` (transcript / usage /
-chat-rendering) and the bundled system prompts in `prompts.system`.
+`goals` (the product-goal registry store), `agent_model` (model /
+network layer), `service_events` (service-event logging), `tool_runtime`
+(worker-thread tool execution), `compaction` (summarizer/compaction
+block), `transcript` (transcript / usage / chat-rendering) and the
+bundled system prompts in `prompts.system`.
+
 Everything is re-exported here so the test-suite and the TUI keep
-importing from ``drcode.agent``; see `__all__`.
+importing from ``drcode.agent`` — see `__all__` — but NOTHING is
+imported eagerly: importing this module is nearly free, and each name
+is resolved on first access through the module-level `__getattr__`
+(PEP 562). This keeps the pydantic_ai/openai stack (via `agent_build` /
+`agent_model`), the MCP SDK, the native PortAudio library and
+tree-sitter out of the TUI's cold-start path; they load on the first
+real use (agent run, model probe, code_* tool, …) instead.
+
+Keep the `__all__` list in sync with the `_EXPORTS` mapping below.
 """
 
 from __future__ import annotations
 
-from . import agent_model, task_search, tools
-from .agent_build import (
-    AgentDeps,
-    ClarifyQuestion,
-    ResolutionVerdict,
-    ResolverDeps,
-    TesterDeps,
-    build_agent,
-    build_resolver_agent,
-    build_resolver_reviewer_agent,
-    build_tester_agent,
-    code_index_tools_for,
-)
-from .agent_model import (
-    AsyncOpenAI,
-    ModelFetchError,
-    TailInjectionModel,
-    fetch_models,
-    probe_model,
-)
-from .agent_tools import (
-    TODO_MIN_ITEMS,
-    InputDeliveryHooks,
-    _commit_tracked_files,
-    _create_goal,
-    _git_push,
-    _list_goals,
-    _mark_unneeded,
-    _read_goal,
-    _read_linked_goal,
-    _retry_failed_here,
-    _run_project_check,
-    _send_task_input,
-    _set_task_dependencies,
-    _todo_create,
-    _todo_update,
-    _track_edited_file,
-    _update_goal,
-    eviction_dynamic_instructions,
-    goals_dynamic_instructions,
-    goals_instructions,
-    load_agents_md,
-    subagent_notice,
-    task_goal_block,
-    todo_instructions,
-)
-from .compaction import (
-    GIANT_PROMPT_TOKENS,
-    MECHANICAL_HEADROOM_TOKENS,
-    build_compaction_agent,
-    build_compaction_prompt,
-    build_reduce_prompt,
-    chunk_history_for_summary,
-    compacted_messages,
-    even_slice_budget,
-    extract_previous_summary,
-    is_summary_message,
-    mechanical_compaction_messages,
-    prompt_fits_context,
-    prompt_fits_window,
-    render_history_for_summary,
-    slice_budget_tokens,
-    split_original_prompts,
-    tester_verdict_issued,
-    unwrap_summary_envelope,
-)
-from .prompts import (
-    BUG_SYSTEM_PROMPT,
-    FEATURE_SYSTEM_PROMPT,
-    RESEARCH_GIT_PROMPT_LOCAL,
-    RESEARCH_GIT_PROMPT_PUSH,
-    RESEARCH_SYSTEM_PROMPT,
-    RESOLVER_REVIEWER_PROMPT,
-    RESOLVER_SYSTEM_PROMPT,
-    TESTER_SYSTEM_PROMPT,
-    TESTER_SYSTEM_PROMPT_NO_COMMIT,
-    load_resolver_prompt,
-    load_resolver_reviewer_prompt,
-    load_system_prompt,
-    load_tester_prompt,
-)
-from .service_events import log_service_event
-from .service_events import log_violation as _log_violation
-from .subagents import (
-    SubagentDeps,
-    SubagentGate,
-    build_subagent_agent,
-    run_delegate_tool,
-    subagent_limit_for,
-)
-from .task_manager import TaskManager
-from .title_gen import (
-    TITLE_MAX_LEN,
-    build_title_agent,
-    build_title_prompt,
-    clean_generated_title,
-)
-from .tool_runtime import (
-    _run_bash_logged,
-    _run_tool,
-    _run_tool_logged,
-    web_fetch_available,
-)
-from .transcript import (
-    COMPACTION_RESUME_PREFIX,
-    COMPACTION_SUMMARY_PREFIX,
-    MODEL_SWITCH_NOTE_PREFIX,
-    _context_status,
-    all_user_prompts,
-    backdate_user_prompt,
-    drop_model_switch_notes,
-    ends_with_empty_response,
-    ends_with_open_request,
-    extract_display,
-    first_user_prompt,
-    is_pending_retry,
-    last_context_tokens,
-    last_response_usage,
-    load_messages,
-    resumable_history,
-    run_context_tokens,
-    sanitized_messages,
-    serialize_messages,
-    strip_thinking_parts,
-)
-from .web_fetch import (
-    FETCHES_PER_RUN,
-    MAX_BYTES,
-    MAX_OUTPUT_CHARS,
-    WebFetchError,
-    WebFetchGate,
-    WebFetchPolicy,
-    fetch,
-    format_page,
-    html_to_text,
-    resolve_addresses,
-    run_web_fetch,
-    web_fetch_policy,
-    web_fetch_policy_for,
-)
+import importlib
+from typing import Any
 
-__all__ = [
+# exported name -> submodule that defines it
+_EXPORTS: dict[str, str] = {
+    # agent_build
+    "AgentDeps": "agent_build",
+    "ClarifyQuestion": "agent_build",
+    "ResolutionVerdict": "agent_build",
+    "ResolverDeps": "agent_build",
+    "TesterDeps": "agent_build",
+    "build_agent": "agent_build",
+    "build_resolver_agent": "agent_build",
+    "build_resolver_reviewer_agent": "agent_build",
+    "build_tester_agent": "agent_build",
+    "code_index_tools_for": "agent_build",
+    # agent_model
+    "AsyncOpenAI": "agent_model",
+    "ModelFetchError": "agent_model",
+    "TailInjectionModel": "agent_model",
+    "fetch_models": "agent_model",
+    "probe_model": "agent_model",
+    # agent_tools
+    "TODO_MIN_ITEMS": "agent_tools",
+    "InputDeliveryHooks": "agent_tools",
+    "_commit_tracked_files": "agent_tools",
+    "_create_goal": "agent_tools",
+    "_git_push": "agent_tools",
+    "_list_goals": "agent_tools",
+    "_mark_unneeded": "agent_tools",
+    "_read_goal": "agent_tools",
+    "_read_linked_goal": "agent_tools",
+    "_retry_failed_here": "agent_tools",
+    "_run_project_check": "agent_tools",
+    "_send_task_input": "agent_tools",
+    "_set_task_dependencies": "agent_tools",
+    "_todo_create": "agent_tools",
+    "_todo_update": "agent_tools",
+    "_track_edited_file": "agent_tools",
+    "_update_goal": "agent_tools",
+    "eviction_dynamic_instructions": "agent_tools",
+    "goals_dynamic_instructions": "agent_tools",
+    "goals_instructions": "agent_tools",
+    "load_agents_md": "agent_tools",
+    "subagent_notice": "agent_tools",
+    "task_goal_block": "agent_tools",
+    "todo_instructions": "agent_tools",
+    # compaction
+    "GIANT_PROMPT_TOKENS": "compaction",
+    "MECHANICAL_HEADROOM_TOKENS": "compaction",
+    "build_compaction_agent": "compaction",
+    "build_compaction_prompt": "compaction",
+    "build_reduce_prompt": "compaction",
+    "chunk_history_for_summary": "compaction",
+    "compacted_messages": "compaction",
+    "even_slice_budget": "compaction",
+    "extract_previous_summary": "compaction",
+    "is_summary_message": "compaction",
+    "mechanical_compaction_messages": "compaction",
+    "prompt_fits_context": "compaction",
+    "prompt_fits_window": "compaction",
+    "render_history_for_summary": "compaction",
+    "slice_budget_tokens": "compaction",
+    "split_original_prompts": "compaction",
+    "tester_verdict_issued": "compaction",
+    "unwrap_summary_envelope": "compaction",
+    # prompts
+    "BUG_SYSTEM_PROMPT": "prompts",
+    "FEATURE_SYSTEM_PROMPT": "prompts",
+    "RESEARCH_GIT_PROMPT_LOCAL": "prompts",
+    "RESEARCH_GIT_PROMPT_PUSH": "prompts",
+    "RESEARCH_SYSTEM_PROMPT": "prompts",
+    "RESOLVER_REVIEWER_PROMPT": "prompts",
+    "RESOLVER_SYSTEM_PROMPT": "prompts",
+    "TESTER_SYSTEM_PROMPT": "prompts",
+    "TESTER_SYSTEM_PROMPT_NO_COMMIT": "prompts",
+    "load_resolver_prompt": "prompts",
+    "load_resolver_reviewer_prompt": "prompts",
+    "load_system_prompt": "prompts",
+    "load_tester_prompt": "prompts",
+    # service_events
+    "log_service_event": "service_events",
+    "_log_violation": "service_events",
+    # subagents
+    "SubagentDeps": "subagents",
+    "SubagentGate": "subagents",
+    "build_subagent_agent": "subagents",
+    "run_delegate_tool": "subagents",
+    "subagent_limit_for": "subagents",
+    # task_manager
+    "TaskManager": "task_manager",
+    # title_gen
+    "TITLE_MAX_LEN": "title_gen",
+    "build_title_agent": "title_gen",
+    "build_title_prompt": "title_gen",
+    "clean_generated_title": "title_gen",
+    # tool_runtime
+    "_run_bash_logged": "tool_runtime",
+    "_run_tool": "tool_runtime",
+    "_run_tool_logged": "tool_runtime",
+    "web_fetch_available": "tool_runtime",
+    # transcript
+    "COMPACTION_RESUME_PREFIX": "transcript",
+    "COMPACTION_SUMMARY_PREFIX": "transcript",
+    "MODEL_SWITCH_NOTE_PREFIX": "transcript",
+    "_context_status": "transcript",
+    "all_user_prompts": "transcript",
+    "backdate_user_prompt": "transcript",
+    "drop_model_switch_notes": "transcript",
+    "ends_with_empty_response": "transcript",
+    "ends_with_open_request": "transcript",
+    "extract_display": "transcript",
+    "first_user_prompt": "transcript",
+    "is_pending_retry": "transcript",
+    "last_context_tokens": "transcript",
+    "last_response_usage": "transcript",
+    "load_messages": "transcript",
+    "resumable_history": "transcript",
+    "run_context_tokens": "transcript",
+    "sanitized_messages": "transcript",
+    "serialize_messages": "transcript",
+    "strip_thinking_parts": "transcript",
+    # web_fetch
+    "FETCHES_PER_RUN": "web_fetch",
+    "MAX_BYTES": "web_fetch",
+    "MAX_OUTPUT_CHARS": "web_fetch",
+    "WebFetchError": "web_fetch",
+    "WebFetchGate": "web_fetch",
+    "WebFetchPolicy": "web_fetch",
+    "fetch": "web_fetch",
+    "format_page": "web_fetch",
+    "html_to_text": "web_fetch",
+    "resolve_addresses": "web_fetch",
+    "run_web_fetch": "web_fetch",
+    "web_fetch_policy": "web_fetch",
+    "web_fetch_policy_for": "web_fetch",
+}
+
+# bare submodules exposed as attributes (``drcode.agent.tools`` etc.)
+_MODULES: frozenset[str] = frozenset({"agent_model", "task_search", "tools"})
+
+# facade name -> the name in the defining submodule (aliases only)
+_ALIASES: dict[str, str] = {"_log_violation": "log_violation"}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _MODULES:
+        module = importlib.import_module(f"drcode.{name}")
+        globals()[name] = module
+        return module
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"drcode.{target}")
+    # Aliased re-exports (e.g. `_log_violation` = `service_events.log_violation`).
+    value = getattr(module, _ALIASES.get(name, name))
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS) | _MODULES)
+
+
+# The names resolve lazily through the module `__getattr__` above; the
+
+__all__ = [  # noqa: F822
     "BUG_SYSTEM_PROMPT",
     "COMPACTION_RESUME_PREFIX",
     "COMPACTION_SUMMARY_PREFIX",

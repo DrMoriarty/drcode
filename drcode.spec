@@ -132,6 +132,41 @@ a = Analysis(
     # (e.g. `textual.widgets._tab` behind TabbedContent) — its PyInstaller hook
     # does not collect those, so bundle every widget submodule explicitly.
     hiddenimports=[
+        # drcode.agent is a LAZY facade: every export resolves through its
+        # module `__getattr__` via a COMPUTED importlib.import_module call —
+        # invisible to static analysis. The same goes for the lazy seams in
+        # core/pipeline_agent_run, core/pipeline_resolver and tui/voice_dialog.
+        # Enumerate the facade's target modules explicitly or the frozen app
+        # dies at the first agent run instead of at import time.
+        "drcode.agent_build",
+        "drcode.agent_model",
+        "drcode.agent_model_openai",
+        "drcode.agent_tools",
+        "drcode.compaction",
+        "drcode.prompts",
+        "drcode.service_events",
+        "drcode.subagents",
+        "drcode.task_manager",
+        "drcode.task_search",
+        "drcode.title_gen",
+        "drcode.tool_runtime",
+        "drcode.tool_runtime_guard",
+        "drcode.transcript",
+        "drcode.tools",
+        "drcode.web_fetch",
+        "drcode.voice.client",
+        "drcode.voice.config",
+        "drcode.voice.playback",
+        "drcode.voice.recorder",
+        "drcode.voice.synth",
+        "drcode.voice._sounddevice",        # drcode's own lazy seams: the `drcode.agent` facade, the `voice`
+        # package and the lazy-seam pipeline modules resolve submodules
+        # through COMPUTED importlib calls (`import_module(f"drcode.{name}")`)
+        # — invisible to static analysis. Collect the whole package
+        # explicitly or the frozen app dies at the first lazy resolution
+        # (agent run, voice toggle, code-index tool). Every drcode module
+        # imports cleanly at build time by construction.
+        *collect_submodules("drcode"),
         "anyio._backends._asyncio",
         "sounddevice",
         *collect_submodules("textual.widgets"),

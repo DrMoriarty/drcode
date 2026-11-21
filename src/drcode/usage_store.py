@@ -38,9 +38,11 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.usage import RunUsage
+if TYPE_CHECKING:
+    from pydantic_ai.usage import RunUsage
+
 
 from . import config as _config
 from .models import _now

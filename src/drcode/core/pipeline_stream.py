@@ -25,24 +25,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pydantic_ai.messages import (
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPart,
-    TextPartDelta,
-    ThinkingPart,
-    ThinkingPartDelta,
-)
-
 from .host import StreamBlock
 
 if TYPE_CHECKING:
+    from pydantic_ai.messages import (
+        TextPartDelta,
+        ThinkingPartDelta,
+    )
+
     from .state import CoreState
 
 
 def stream_delta(event: object) -> ThinkingPartDelta | TextPartDelta | None:
     """The thinking/text delta carried by a stream event, None for any
     other event kind (and for content-less start parts)."""
+    from pydantic_ai.messages import (
+        PartDeltaEvent,
+        PartStartEvent,
+        TextPart,
+        TextPartDelta,
+        ThinkingPart,
+        ThinkingPartDelta,
+    )
+
     if isinstance(event, PartStartEvent):
         # The first chunk of a new text/thinking part arrives as
         # PartStartEvent carrying the content itself (only subsequent
@@ -89,6 +94,8 @@ class NodeStreamView:
         """Consume one stream event: classify it and grow the blocks."""
         layer = self._layer
         layer._touch_activity(self.task_id)
+        from pydantic_ai.messages import ThinkingPartDelta
+
         delta = stream_delta(event)
         if delta is None:
             return

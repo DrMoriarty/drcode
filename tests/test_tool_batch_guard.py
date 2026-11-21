@@ -29,7 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from drcode.agent_build import AgentDeps
 from drcode.config import Config
 from drcode.task_manager import TaskManager
-from drcode.tool_runtime import (
+from drcode.tool_runtime_guard import (
     DEFAULT_TOOL_BATCH_LIMIT,
     BatchGuardToolset,
     attach_batch_guard,

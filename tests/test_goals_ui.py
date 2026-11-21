@@ -174,6 +174,25 @@ def _open_screen(app: DrCodeApp) -> GoalScreen:
     return screen
 
 
+def _tree_cursor_landed(screen: GoalScreen) -> bool:
+    """True once the goal tree has composed AND its cursor sits on a
+    goal row (both ride call_after_refresh — a bare pause() can lose
+    that race under load)."""
+    tree = screen.query("#goal-tree")
+    first = tree.first() if tree else None
+    return isinstance(first, ListView) and isinstance(
+        first.highlighted_child, TaskItem
+    )
+
+
+def _screen_ready(app: DrCodeApp, screen_type, selector: str) -> bool:
+    """True once `screen_type` is the active screen AND its `selector`
+    widget has composed (push_screen installs the screen synchronously;
+    its compose lands a frame later)."""
+    screen = app.screen
+    return isinstance(screen, screen_type) and bool(screen.query(selector))
+
+
 async def test_goal_screen_tree_and_details(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
@@ -203,7 +222,13 @@ async def test_goal_screen_tree_and_details(app: DrCodeApp) -> None:
         # (the old `e`); ESC backs out without changing anything.
         listing.index = 0
         await pilot.press("enter")
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         assert isinstance(app.screen, GoalEditScreen)
         await pilot.press("escape")
         await pilot.pause()
@@ -583,9 +608,23 @@ async def test_goal_screen_task_from_goal(app: DrCodeApp) -> None:
         await _started(app, pilot)
         goal = app.manager.goals.create("Async core")
         screen = _open_screen(app)
-        await pilot.pause()
+        # The first render rides call_after_refresh — without the tree
+        # the cursor is None and T is a silent no-op. Wait for the
+        # cursor before pressing T.
+        await wait_until(
+            lambda: _tree_cursor_landed(screen),
+            pilot,
+            what="goal tree cursor",
+        )
         screen.action_task_from_goal()
-        await pilot.pause()
+        # The screen dismiss + the form's goal-line preset ride an async
+        # round-trip — under load a single pause() can race them; poll
+        # instead of asserting.
+        await wait_until(
+            lambda: "Async core" in str(app.query_one("#nt-goal", Static).content),
+            pilot,
+            what="goal line preset in the new-task form",
+        )
         # The standard new-task form is open with the goal line preset.
         assert app._new_task_mode
         label = str(app.query_one("#nt-goal", Static).content)
@@ -618,7 +657,13 @@ async def test_new_task_form_goal_picker(app: DrCodeApp) -> None:
         app.action_new_task()
         await pilot.pause()
         app.action_assign_new_task_goal()
-        await pilot.pause()
+        # The picker push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalAssignPicker, "#goal-assign-list"),
+            pilot,
+            what="GoalAssignPicker pushed",
+        )
         picker = app.screen
         assert isinstance(picker, GoalAssignPicker)
         listing = picker.query_one("#goal-assign-list", ListView)
@@ -631,7 +676,13 @@ async def test_new_task_form_goal_picker(app: DrCodeApp) -> None:
         listing.focus()
         await pilot.pause()
         await pilot.press("enter")
-        await pilot.pause()
+        # The selection rides an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: app._new_task_goal_id == done.id,
+            pilot,
+            what="goal link preset from the picker",
+        )
         assert app._new_task_goal_id == done.id
         assert "Done goal" in str(app.query_one("#nt-goal", Static).content)
 
@@ -664,7 +715,13 @@ async def test_new_task_goal_picker_indents_sub_goals(app: DrCodeApp) -> None:
         app.action_new_task()
         await pilot.pause()
         app.action_assign_new_task_goal()
-        await pilot.pause()
+        # The picker push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalAssignPicker, "#goal-assign-list"),
+            pilot,
+            what="GoalAssignPicker pushed",
+        )
         picker = app.screen
         assert isinstance(picker, GoalAssignPicker)
         listing = picker.query_one("#goal-assign-list", ListView)
@@ -793,7 +850,13 @@ async def test_goal_create_dialog_links_viewed_task(app: DrCodeApp) -> None:
         task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
         app.view_task(task.id)
         app.open_new_goal_dialog(link_task_id=task.id)
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         screen = app.screen
         assert isinstance(screen, GoalEditScreen)
         # The link checkbox exists over an open task and is pre-enabled.
@@ -817,7 +880,13 @@ async def test_goal_create_dialog_link_can_be_declined(app: DrCodeApp) -> None:
         task = app.manager.create("migrate", "x", kind=TaskKind.RESEARCH)
         app.view_task(task.id)
         app.open_new_goal_dialog(link_task_id=task.id)
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         screen = app.screen
         assert isinstance(screen, GoalEditScreen)
         screen.query_one("#goal-link-task", Checkbox).value = False
@@ -828,7 +897,11 @@ async def test_goal_create_dialog_link_can_be_declined(app: DrCodeApp) -> None:
         assert task.goal_id is None
         # The plain Ctrl+Y path carries no task id: no checkbox at all.
         app.action_new_goal()
-        await pilot.pause()
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         screen = app.screen
         assert isinstance(screen, GoalEditScreen)
         assert not screen.query("#goal-link-task")
@@ -840,7 +913,11 @@ async def test_goal_create_dialog_requires_title(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
         app.action_new_goal()
-        await pilot.pause()
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         screen = app.screen
         assert isinstance(screen, GoalEditScreen)
         screen._save()
@@ -864,7 +941,13 @@ async def test_ctrl_y_opens_goal_capture_from_focused_editors(app: DrCodeApp) ->
         editor.focus()
         await pilot.pause()
         await pilot.press("ctrl+y")
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed (ctrl+y)",
+        )
         assert isinstance(app.screen, GoalEditScreen)
         app.screen.action_cancel()
         await pilot.pause()
@@ -872,7 +955,11 @@ async def test_ctrl_y_opens_goal_capture_from_focused_editors(app: DrCodeApp) ->
         chat.focus()
         await pilot.pause()
         await pilot.press("ctrl+y")
-        await pilot.pause()
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed (ctrl+y)",
+        )
         assert isinstance(app.screen, GoalEditScreen)
 
 
@@ -881,14 +968,40 @@ async def test_goal_screen_subgoal_capture(app: DrCodeApp) -> None:
         await _started(app, pilot)
         parent = app.manager.goals.create("Release 1.0")
         screen = _open_screen(app)
-        await pilot.pause()
+        # The first render rides call_after_refresh — wait for the
+        # cursor so the new goal is captured under it (under load a
+        # single pause() can race the frame).
+        await wait_until(
+            lambda: _tree_cursor_landed(screen),
+            pilot,
+            what="goal tree cursor",
+        )
         screen.action_new_goal()
-        await pilot.pause()
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         dialog = app.screen
         assert isinstance(dialog, GoalEditScreen)
         dialog.query_one("#goal-title", Input).value = "Async core"
         dialog._save()
-        await pilot.pause()
+
+        def child_saved() -> bool:
+            child = next(
+                (
+                    g
+                    for g in app.manager.goals.goals.values()
+                    if g.title == "Async core"
+                ),
+                None,
+            )
+            return child is not None and child.parent_id == parent.id
+
+        # The save dismisses the dialog and the goal is created in the
+        # dismiss callback — an async round-trip a bare pause() can
+        # lose; poll for the reparent instead.
+        await wait_until(child_saved, pilot, what="sub-goal saved under its parent")
         child = _find_goal(app, "Async core")
         assert child.parent_id == parent.id
 
@@ -899,9 +1012,22 @@ async def test_goal_edit_dialog_description_and_notes(app: DrCodeApp) -> None:
         goal = app.manager.goals.create("Async core", description="old desc")
         app.manager.goals.update(goal.id, notes="old notes")
         screen = _open_screen(app)
-        await pilot.pause()
+        # The first render rides call_after_refresh — without the tree
+        # the cursor is None and Enter (edit) is a silent no-op. Wait
+        # for the cursor before opening the edit dialog.
+        await wait_until(
+            lambda: _tree_cursor_landed(screen),
+            pilot,
+            what="goal tree cursor",
+        )
         screen.action_edit_goal()
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         dialog = app.screen
         assert isinstance(dialog, GoalEditScreen)
         # Edit mode: the title is a fixed line — no title input, no
@@ -912,7 +1038,13 @@ async def test_goal_edit_dialog_description_and_notes(app: DrCodeApp) -> None:
         dialog.query_one("#goal-edit-desc", TextArea).text = "new desc"
         dialog.query_one("#goal-edit-notes", TextArea).text = "new notes"
         dialog._save()
-        await pilot.pause()
+        # The save dismisses the dialog and the update lands in the
+        # dismiss callback — poll instead of a bare pause().
+        await wait_until(
+            lambda: app.manager.goals.get(goal.id).description == "new desc",
+            pilot,
+            what="edited description saved",
+        )
         refreshed = app.manager.goals.get(goal.id)
         assert refreshed.title == "Async core"
         assert refreshed.description == "new desc"
@@ -932,8 +1064,13 @@ async def test_goal_create_dialog_buttons_visible_on_small_terminal(
     async with app.run_test(size=(100, 30)) as pilot:
         await _started(app, pilot)
         app.action_new_goal()
-        await pilot.pause()
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after bare pauses.
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         screen = app.screen
         assert isinstance(screen, GoalEditScreen)
         dialog = screen.query_one("#goal-edit-dialog").region
@@ -963,10 +1100,22 @@ async def test_goal_edit_dialog_buttons_visible_on_small_terminal(
         await _started(app, pilot)
         app.manager.goals.create("Async core", description="d")
         screen = _open_screen(app)
-        await pilot.pause()
+        # The first render rides call_after_refresh — without the tree
+        # the cursor is None and Enter (edit) is a silent no-op. Wait
+        # for the cursor before opening the edit dialog.
+        await wait_until(
+            lambda: _tree_cursor_landed(screen),
+            pilot,
+            what="goal tree cursor",
+        )
         screen.action_edit_goal()
-        await pilot.pause()
-        await pilot.pause()
+        # The dialog push is an async round-trip — poll instead of
+        # asserting after bare pauses.
+        await wait_until(
+            lambda: _screen_ready(app, GoalEditScreen, "#goal-edit-dialog"),
+            pilot,
+            what="GoalEditScreen pushed",
+        )
         dialog = app.screen
         assert isinstance(dialog, GoalEditScreen)
         dlg = dialog.query_one("#goal-edit-dialog").region
@@ -1035,7 +1184,13 @@ async def test_goal_assign_picker_keyboard_and_click(app: DrCodeApp) -> None:
         app.action_new_task()
         await pilot.pause()
         app.action_assign_new_task_goal()
-        await pilot.pause()
+        # The picker push is an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: _screen_ready(app, GoalAssignPicker, "#goal-assign-list"),
+            pilot,
+            what="GoalAssignPicker pushed",
+        )
         picker = app.screen
         assert isinstance(picker, GoalAssignPicker)
         listing = picker.query_one("#goal-assign-list", ListView)
@@ -1064,7 +1219,13 @@ async def test_goal_assign_picker_keyboard_and_click(app: DrCodeApp) -> None:
         await pilot.press("down")
         await pilot.press("down")
         await pilot.press("enter")
-        await pilot.pause()
+        # The selection rides an async round-trip — poll instead of
+        # asserting after a bare pause().
+        await wait_until(
+            lambda: app._new_task_goal_id == second.id,
+            pilot,
+            what="goal link preset from the picker",
+        )
         assert app._new_task_goal_id == second.id
 
         # A fresh picker: clicking a row assigns it WITHOUT opening the
@@ -1072,13 +1233,21 @@ async def test_goal_assign_picker_keyboard_and_click(app: DrCodeApp) -> None:
         app._new_task_goal_id = None
         app.query_one("#nt-goal", Static).update("")
         app.action_assign_new_task_goal()
-        await pilot.pause()
+        await wait_until(
+            lambda: _screen_ready(app, GoalAssignPicker, "#goal-assign-list"),
+            pilot,
+            what="GoalAssignPicker pushed",
+        )
         picker = app.screen
         assert isinstance(picker, GoalAssignPicker)
         listing = picker.query_one("#goal-assign-list", ListView)
         row = listing.children[1]
         assert isinstance(row, TaskItem)
         await pilot.click(row)
-        await pilot.pause()
+        await wait_until(
+            lambda: app._new_task_goal_id == second.id,
+            pilot,
+            what="goal link preset from the picker click",
+        )
         assert app._new_task_goal_id == second.id
         assert not any(isinstance(s, GoalScreen) for s in app.screen_stack)

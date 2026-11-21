@@ -402,12 +402,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # ellipsis — entries that don't fit just vanish past the right edge.
     # With the new-task form focused ~13 entries render at once (the
     # form's priority bindings + the app row). Besides Footer(compact=True)
-    # drop the per-entry right margin and the gap between the key chip and
-    # the description: the distinct key/description backgrounds still
-    # separate the entries visually.
-    Footer.-compact FooterKey {
-        margin-right: 0;
-    }
+    # drop the gap between the key chip and the description: the distinct
+    # key/description backgrounds still separate the entry visually. The
+    # per-entry margin-right is left to textual's own compact CSS
+    # (margin-right: 1) so entries keep a visible gap.
     Footer.-compact FooterKey .footer-key--description {
         padding-left: 0;
     }

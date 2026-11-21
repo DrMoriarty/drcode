@@ -116,6 +116,12 @@ class Storage:
         # only it can save+unload a Task object).
         self._transcript_order: OrderedDict[str, None] = OrderedDict()
         self._evict_hook: Callable[[str], bool] | None = None
+        # Monotonic counter of METADATA-affecting changes (a metadata save,
+        # a delete, a legacy migration, externally picked-up task files).
+        # The TUI's sidebar poll uses it as an O(1) change fingerprint —
+        # a transcript-only flush does NOT bump it, so the poll stays quiet
+        # while a run streams megabytes into a sidecar.
+        self.metadata_epoch = 0
 
     # -- paths ----------------------------------------------------------------
 
@@ -145,6 +151,30 @@ class Storage:
             for p in sorted(self.tasks_dir.glob("*.json"))
             if not is_transcript_path(p)
         ]
+
+    def archive_file_count(self) -> int:
+        """Number of metadata files in the archive — one readdir, no file
+        contents read. The cheap "is this archive big enough to bother
+        deferring its load" probe (see TaskManager.defer_load)."""
+        return sum(
+            1 for p in self.tasks_dir.glob("*.json") if not is_transcript_path(p)
+        )
+
+    def tasks_dir_stat(self) -> tuple[int, int] | None:
+        """One-stat snapshot of the tasks directory (mtime_ns, size);
+        None when the directory is gone. Changes on ANY direct child
+        event — a task file written (atomic replace), created or deleted,
+        INCLUDING sidecar transcript flushes — so it serves as the cheap
+        "did anything appear on disk" gate of the external-task poll."""
+        try:
+            st = self.tasks_dir.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def bump_metadata_epoch(self) -> None:
+        """Record a metadata-affecting change (see metadata_epoch)."""
+        self.metadata_epoch += 1
 
     # -- loading ----------------------------------------------------------------
 
@@ -232,6 +262,7 @@ class Storage:
             pass
         if migrated:
             task._transcripts.loaded = False
+            self.bump_metadata_epoch()
         task._transcripts.loader = lambda task_id=task.id: self.read_transcript(task_id)
         return task
 
@@ -314,6 +345,7 @@ class Storage:
             _atomic_write_text(self.task_path(task.id), metadata_text)
         except OSError:
             pass
+        self.bump_metadata_epoch()
 
     def save_metadata(self, task: Task) -> None:
         """Persist ONLY the metadata file, never the sidecar transcript.
@@ -329,6 +361,7 @@ class Storage:
             _atomic_write_text(self.task_path(task.id), task.model_dump_json(indent=2))
         except OSError:
             pass
+        self.bump_metadata_epoch()
 
     def _flush_transcript(self, task: Task) -> None:
         ts = task._transcripts
@@ -347,6 +380,7 @@ class Storage:
         # task — best-effort, like every cleanup path here.
         shutil.rmtree(self.tasks_dir / task_id, ignore_errors=True)
         self._transcript_order.pop(task_id, None)
+        self.bump_metadata_epoch()
 
     # -- attachments ------------------------------------------------------------
 

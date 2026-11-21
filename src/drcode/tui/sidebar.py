@@ -19,6 +19,7 @@ class TaskItem(ListItem):
         goal_id: str | None = None,
         goal_add: bool = False,
         goal_open: bool = False,
+        more_section: str | None = None,
     ) -> None:
         label = Label(text, classes="section-header" if header else "task-item")
         super().__init__(label)
@@ -38,6 +39,9 @@ class TaskItem(ListItem):
         self.goal_id = goal_id
         self.goal_add = goal_add
         self.goal_open = goal_open
+        # The "… N more — show all" row of a lazily mounted section: the
+        # section whose visibility cap the click drops.
+        self.more_section = more_section
 
     def set_text(self, text: str) -> None:
         """Update the row's label in place.

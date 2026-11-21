@@ -28,6 +28,17 @@ from ..providers import AgentRole
 from .sidebar import TaskItem
 from .state import DrCodeState
 
+# A COMPLETED section larger than this is collapsed BY DEFAULT (and its
+# expanded rendering is capped — see SIDEBAR_COMPLETED_VISIBLE): mounting
+# ~900 task rows costs seconds of widget creation and layout on every
+# refresh. A small archive stays expanded — no behavior change there.
+COMPLETED_COLLAPSE_THRESHOLD = 50
+# When the COMPLETED section IS expanded, at most this many rows mount,
+# followed by a "… N more — show all" row (click drops the cap for the
+# session). The section DATA (queue order, the startup view pick) always
+# covers every task — only the widget creation is lazy.
+SIDEBAR_COMPLETED_VISIBLE = 50
+
 
 class SidebarLayer(DrCodeState):
     def refresh_project_info(self) -> None:
@@ -84,31 +95,37 @@ class SidebarLayer(DrCodeState):
         return content[:7]  # detached HEAD
 
     def _sidebar_fingerprint(self) -> tuple:
-        """Lightweight snapshot of everything the sidebar renders: status,
-        verification label, title, the viewed-marker, the queue stamp
-        (the QUEUE section is order-sensitive) and the mergedness color
-        of the ✓ marker per task — plus the GOALS section's rows (order
-        and parent included: the display is a tree, a re-parent or a
-        reorder must redraw). The merge state lives outside the task
-        objects (updated off the event loop by the 10 s git poll), so
-        without it here a color-only change would not redraw — the same
-        staleness trap _poll_sidebar's fingerprint guards against."""
-        merge_state = self._merge_state
+        """Cheap change detector for the 1 s sidebar poll — O(1) plus the
+        (small) GOALS tuple, instead of a sweep over every task's pydantic
+        attributes (a 900-task archive made the old per-task tuple cost
+        milliseconds EVERY second, a constant UI jitter).
+
+        Everything a task row renders falls into two buckets:
+
+        - persisted state (status, kind, verification, title, queue
+          stamps, needs_human, goal link): every mutation saves the task
+          file, which bumps ``Storage.metadata_epoch`` — one integer
+          compare catches it all;
+        - session state, carried explicitly: the viewed marker, the
+          tester's section-order pick, the resolver's ⚙ marker, the
+          merge-state ✓ colors (epoch bumped only on a content change by
+          the 10 s git poll) and the dependency gate.
+
+        The task count additionally covers the wholesale dict replace of
+        the deferred startup load. The GOALS rows stay a real tuple: the
+        goal registry is small, and its display is a tree sensitive to
+        order and parent."""
         return (
+            self.manager.storage.metadata_epoch,
+            len(self.manager.tasks),
+            self.viewed_id,
+            self._tester_task_id,
+            self._resolver_running,
+            self._resolver_task_id,
+            self._merge_state_epoch,
             tuple(
-                (
-                    t.id,
-                    t.status.value,
-                    t.kind.value,
-                    t.verification,
-                    t.title_display,
-                    t.id == self.viewed_id,
-                    t.queue_seq,
-                    t.queue_head,
-                    t.needs_human,
-                    merge_state.get(t.id, ""),
-                )
-                for t in self.manager.all_tasks()
+                (task_id, tuple(sorted(gate)))
+                for task_id, gate in self._dep_gate.items()
             ),
             tuple(
                 (
@@ -244,10 +261,22 @@ class SidebarLayer(DrCodeState):
         actively searches the queue — a settled idle pipeline has nothing
         left to trigger it. This poller closes that gap: external tasks
         appear in the sidebar and, when the pipeline is idle, are promoted
-        right away instead of idling until a restart. The reload is a cheap
-        directory scan (known files are not re-read), so a 1s interval is
-        safe; a failed scan just waits for the next tick.
+        right away instead of idling until a restart. The reload itself is
+        gated on a ONE-STAT snapshot of the tasks directory: with no disk
+        event since the last tick (the common case — writes land only when
+        a task is saved) not even the known-file scan runs, so the poll is
+        a single stat per second regardless of archive size. A failed scan
+        just waits for the next tick.
         """
+        if not self.manager.loaded:
+            # Deferred startup load still in flight — load() picks up
+            # everything written so far; scanning now would only fight it
+            # for the disk lock.
+            return
+        snapshot = self.manager.storage.tasks_dir_stat()
+        if snapshot is not None and snapshot == self._tasks_dir_snapshot:
+            return
+        self._tasks_dir_snapshot = snapshot
         try:
             new = self.manager.reload_new_tasks()
         except Exception:  # noqa: BLE001 - a broken scan must not kill the poller
@@ -426,6 +455,7 @@ class SidebarLayer(DrCodeState):
         goal_id: str | None = None,
         goal_add: bool = False,
         goal_open: bool = False,
+        more_section: str | None = None,
     ) -> TaskItem:
         """Reuse (or create) the mounted row for *key* and sync it to the
         desired *text*/`viewed` class.
@@ -445,6 +475,7 @@ class SidebarLayer(DrCodeState):
                 goal_id=goal_id,
                 goal_add=goal_add,
                 goal_open=goal_open,
+                more_section=more_section,
             )
             if viewed:
                 item.add_class("viewed")
@@ -611,7 +642,9 @@ class SidebarLayer(DrCodeState):
             keys.add(("header", name))
             # A collapsed section keeps only its header line: the "+" shows
             # there is content hidden underneath, "-" means fully expanded.
-            collapsed = name in self._collapsed_sections
+            # A large COMPLETED section is collapsed by default (see
+            # _section_collapsed) — the explicit toggle overrides it.
+            collapsed = self._section_collapsed(name, len(tasks))
             marker = "+" if collapsed else "-"
             items.append(
                 self._sidebar_row(
@@ -623,7 +656,20 @@ class SidebarLayer(DrCodeState):
             )
             if collapsed:
                 continue
-            for t in tasks:
+            # Lazy mounting of a huge expanded COMPLETED section: only the
+            # newest slice mounts, a trailing row offers the rest (the
+            # section DATA — queue order, the startup view pick — is
+            # unaffected; only widget creation is capped).
+            visible = tasks
+            hidden_count = 0
+            if (
+                name == "COMPLETED"
+                and self._completed_limit is not None
+                and len(tasks) > self._completed_limit
+            ):
+                visible = tasks[: self._completed_limit]
+                hidden_count = len(tasks) - self._completed_limit
+            for t in visible:
                 keys.add(("task", t.id))
                 items.append(
                     self._sidebar_row(
@@ -631,6 +677,15 @@ class SidebarLayer(DrCodeState):
                         self._task_row_text(t),
                         task_id=t.id,
                         viewed=t.id == self.viewed_id,
+                    )
+                )
+            if hidden_count:
+                keys.add(("completed-more", name))
+                items.append(
+                    self._sidebar_row(
+                        ("completed-more", name),
+                        f"[dim]… {hidden_count} more — show all[/]",
+                        more_section=name,
                     )
                 )
 
@@ -744,15 +799,36 @@ class SidebarLayer(DrCodeState):
             return ""
         return f" ⇢ {','.join(waiting)}"
 
+    def _section_collapsed(self, name: str, count: int) -> bool:
+        """Effective collapse state of a sidebar section: the explicit
+        user toggle wins; a COMPLETED section over the auto-collapse
+        threshold starts collapsed (mounting hundreds of rows costs
+        seconds) until the user explicitly expands it."""
+        if name in self._collapsed_sections:
+            return True
+        return (
+            name == "COMPLETED"
+            and "COMPLETED" not in self._expanded_sections
+            and count > COMPLETED_COLLAPSE_THRESHOLD
+        )
+
     def toggle_sidebar_section(self, section: str) -> None:
         """Collapse/expand one sidebar category (its header row).
 
         The cursor is put back onto the toggled header — the next
-        space/enter keeps working on it.
+        space/enter keeps working on it. The toggle also records the
+        explicit choice against the COMPLETED auto-collapse: expanding a
+        default-collapsed section keeps it expanded for the session.
         """
-        if section in self._collapsed_sections:
+        count = next(
+            (len(tasks) for name, tasks in self._sidebar_sections() if name == section),
+            0,
+        )
+        if self._section_collapsed(section, count):
             self._collapsed_sections.discard(section)
+            self._expanded_sections.add(section)
         else:
+            self._expanded_sections.discard(section)
             self._collapsed_sections.add(section)
         self.refresh_sidebar()
         sidebar = self.sidebar
@@ -760,6 +836,12 @@ class SidebarLayer(DrCodeState):
             if isinstance(item, TaskItem) and item.section == section:
                 sidebar.index = index
                 break
+
+    def _show_all_section_rows(self, section: str) -> None:
+        """Click on the "… N more — show all" row of a lazily mounted
+        section: drop the visibility cap for the rest of the session."""
+        self._completed_limit = None
+        self.refresh_sidebar()
 
     def _refocus_sidebar_task(self, task_id: str) -> None:
         """Put the ListView cursor onto a task's row, so a series of

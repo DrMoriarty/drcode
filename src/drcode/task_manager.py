@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from pathlib import Path
+from typing import ClassVar
 
 from .goals import GoalStore
 from .models import (
@@ -143,7 +144,7 @@ def validate_dependencies(
 
 
 class TaskManager:
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, *, defer_load: bool = False) -> None:
         self.storage = Storage(project_root)
         # Sidecar-transcript LRU eviction (see Storage.transcript_cache_limit):
         # the storage detects the overage, the manager owns the Task objects
@@ -184,35 +185,29 @@ class TaskManager:
         # slot that is a full prompt reprocess per request). Cleared by the
         # hint itself when the conditions stop holding.
         self._eviction_hints: dict[str, str] = {}
-        # Serializes reload_new_tasks(): it runs both on the app thread
-        # (the periodic disk poll) and on worker threads (promote_next in
-        # the run's finally-blocks) — two concurrent scans must not load
-        # the same new file twice.
+        # Serializes reload_new_tasks() and the deferred archive load: both
+        # run on the app thread and on worker threads — two concurrent
+        # scans must not load the same new file twice.
         self._disk_lock = threading.Lock()
-        self.tasks: dict[str, Task] = {t.id: t for t in self.storage.load_all()}
+        # Whether the archive has been read (see load / _load_archive).
+        self._loaded = False
+        self.tasks: dict[str, Task]
         # Monotonic queue-position counter: bumped when a task is explicitly
         # re-positioned in the queue (kind change to bug → head, to feature
         # → tail). Older tasks without a stamp get one in created_at order,
         # so the stamp reproduces the historical ordering exactly.
-        self._queue_seq = max(
-            (t.queue_seq for t in self.tasks.values() if t.queue_seq is not None),
-            default=0,
-        )
-        for t in sorted(self.tasks.values(), key=lambda t: t.created_at):
-            if t.queue_seq is None:
-                t.queue_seq = self._next_queue_seq()
-                self.storage.save(t)
-        # On startup at most one task may have been active when the app closed.
-        # The demotion also stamps task.unfinished: the process died mid-run,
-        # so nothing could set the interrupted-attempt marker — without it the
-        # task sits in the queue forever (promote_next only activates tasks
-        # with pending_input or unfinished) instead of auto-resuming.
-        for t in self.tasks.values():
-            if t.status is TaskStatus.ACTIVE:
-                self._close_out_stale_active(t)
-                t.unfinished = True
-                t.status = TaskStatus.QUEUED
-                self.storage.save(t)
+        self._queue_seq = 0
+        if defer_load and (
+            self.storage.archive_file_count() > self.LARGE_ARCHIVE_FILE_THRESHOLD
+        ):
+            # Large archive: leave it unread for now — the TUI paints its
+            # first frame and calls load() from a worker thread afterwards
+            # (see DrCodeApp._finish_startup). The dict stays empty until
+            # then; every consumer is either gated on `loaded` or safe on
+            # an empty dict.
+            self.tasks = {}
+        else:
+            self._load_archive()
         # Goal-progress loop closure: every transition INTO COMPLETED of a
         # task with a goal reference appends the "цель Y: n/m задач
         # завершено" service event to the task's own chat log (registered
@@ -228,6 +223,79 @@ class TaskManager:
         # import — it all funnels through create()) bumps the day's
         # "created" counter.
         self.add_creation_listener(self._stats_created)
+
+    # Archives above this many metadata files load DEFERRED when the
+    # caller asks for it (defer_load): reading ~900 task files costs
+    # seconds (and tens on a cold file-system cache) — too long for the
+    # pre-paint path. Below the threshold the load is milliseconds and
+    # every consumer keeps the synchronous contract.
+    LARGE_ARCHIVE_FILE_THRESHOLD: ClassVar[int] = 200
+
+    @property
+    def loaded(self) -> bool:
+        """Whether the task archive has been read (False only between a
+        deferred construction and the load() call)."""
+        return self._loaded
+
+    def load(self) -> None:
+        """Read the task archive (deferred construction only).
+
+        Idempotent, thread-safe: the TUI calls it from a worker thread
+        after the first frame; whatever tasks were created in-memory in
+        the meantime (the user managed to submit a new task during the
+        load window) survive the wholesale replace and are re-stamped to
+        the queue tail — they are the newest tasks. All startup
+        bookkeeping (queue_seq backfill, stale-ACTIVE demotion, legacy
+        migrations) runs here exactly as in the eager path, so the first
+        promotion still sees a fully normalized archive."""
+        if self._loaded:
+            return
+        with self._disk_lock:
+            if self._loaded:
+                return
+            created_in_window = self.tasks
+            self._load_archive()
+            for task_id, task in created_in_window.items():
+                # The in-memory object wins (the reload_new_tasks contract:
+                # in-memory state is never overwritten from disk) and is
+                # re-stamped to the queue tail: its stamp was counted from
+                # the zero pre-load counter and would collide with (and
+                # sort above) the loaded archive's stamps. The window
+                # tasks ARE the newest tasks; the tail is theirs.
+                task.queue_seq = self._next_queue_seq()
+                self.tasks[task_id] = task
+                self.storage.save(task)
+            self.storage.bump_metadata_epoch()
+
+    def _load_archive(self) -> None:
+        """Read the whole archive and run the startup bookkeeping that must
+        land before the first promotion. Not for direct external use —
+        use load() (or the eager __init__ path)."""
+        self.tasks = {t.id: t for t in self.storage.load_all()}
+        self._queue_seq = max(
+            self._queue_seq,
+            max(
+                (t.queue_seq for t in self.tasks.values() if t.queue_seq is not None),
+                default=0,
+            ),
+        )
+        for t in sorted(self.tasks.values(), key=lambda t: t.created_at):
+            if t.queue_seq is None:
+                t.queue_seq = self._next_queue_seq()
+                self.storage.save(t)
+        # On startup at most one task may have been active when the app
+        # closed. The demotion also stamps task.unfinished: the process
+        # died mid-run, so nothing could set the interrupted-attempt
+        # marker — without it the task sits in the queue forever
+        # (promote_next only activates tasks with pending_input or
+        # unfinished) instead of auto-resuming.
+        for t in self.tasks.values():
+            if t.status is TaskStatus.ACTIVE:
+                self._close_out_stale_active(t)
+                t.unfinished = True
+                t.status = TaskStatus.QUEUED
+                self.storage.save(t)
+        self._loaded = True
 
     def _next_queue_seq(self) -> int:
         self._queue_seq += 1
@@ -573,6 +641,12 @@ class TaskManager:
         mid-run) is never overwritten from disk. Returns the tasks that
         were added.
         """
+        if not self._loaded:
+            # Deferred archive load still in flight: load() picks these
+            # files up itself (its glob covers anything written before it
+            # runs), and a concurrent scan would only fight it for the
+            # disk lock.
+            return []
         with self._disk_lock:
             known = set(self.tasks)
             new: list[Task] = []
@@ -600,6 +674,11 @@ class TaskManager:
                 self.tasks[t.id] = t
                 if changed:
                     self.storage.save(t)
+            if ordered:
+                # Externally created task files land on disk without a
+                # save() from this process — bump the change counter the
+                # sidebar's fingerprint reads.
+                self.storage.bump_metadata_epoch()
             return ordered
 
     # -- mutations ------------------------------------------------------------

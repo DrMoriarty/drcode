@@ -668,6 +668,12 @@ class TaskLifecycleLayer(DrCodeState):
                 event.stop()
                 self.action_open_goals(item.goal_id)
                 return
+            if item.more_section:
+                # The "… N more — show all" row of a lazily mounted
+                # section: drop the cap and re-render.
+                event.stop()
+                self._show_all_section_rows(item.more_section)
+                return
             if item.section is not None:
                 # Enter (or a mouse click) on a section header toggles the
                 # category; focus stays in the sidebar for further toggling.

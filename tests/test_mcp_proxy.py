@@ -107,7 +107,15 @@ class StdioSession:
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
 
-    def recv(self, timeout: float = 15.0) -> dict:
+    def recv(self, timeout: float | None = None) -> dict:
+        if timeout is None:
+            # The shim is a real subprocess (interpreter startup + the
+            # drcode import); under CPU load that can outgrow any fixed
+            # deadline — reuse the same env knob as wait_until.
+            try:
+                timeout = float(os.environ.get("DRCODE_TEST_WAIT_TIMEOUT", "30"))
+            except ValueError:
+                timeout = 30.0
         line = self._lines.get(timeout=timeout)
         return json.loads(line)
 

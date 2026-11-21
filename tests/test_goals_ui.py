@@ -508,16 +508,26 @@ async def test_goal_screen_cursor_parent(app: DrCodeApp) -> None:
             item = listing.highlighted_child
             return item.goal_id if isinstance(item, TaskItem) else None
 
-        assert cursor_goal() == parent.id  # first open lands on row 0
+        # The first render rides call_after_refresh — wait for it (under
+        # load a single pause() can race the frame; without the tree the
+        # cursor is None and every Left press is a no-op).
+        await wait_until(
+            lambda: cursor_goal() == parent.id,
+            pilot,
+            what="first open lands on row 0",
+        )
         # Cursor on the grandchild, Left lifts it to the child, again to
-        # the top-level parent.
+        # the top-level parent. The cursor moves through a ListView
+        # refresh round-trip — poll instead of a bare pause().
         listing.index = 2
         await pilot.press("left")
-        await pilot.pause()
-        assert cursor_goal() == child.id
+        await wait_until(
+            lambda: cursor_goal() == child.id, pilot, what="cursor on child"
+        )
         await pilot.press("left")
-        await pilot.pause()
-        assert cursor_goal() == parent.id
+        await wait_until(
+            lambda: cursor_goal() == parent.id, pilot, what="cursor on parent"
+        )
         # Left on a top-level goal stays put.
         await pilot.press("left")
         await pilot.pause()
@@ -525,8 +535,9 @@ async def test_goal_screen_cursor_parent(app: DrCodeApp) -> None:
         # The ← button lifts from the grandchild too.
         listing.index = 2
         screen.query_one("#goal-tree-parent", Button).press()
-        await pilot.pause()
-        assert cursor_goal() == child.id
+        await wait_until(
+            lambda: cursor_goal() == child.id, pilot, what="cursor on child (button)"
+        )
         assert app.focused is listing
 
 
@@ -536,6 +547,15 @@ async def test_goal_screen_research_task(app: DrCodeApp) -> None:
         goal = app.manager.goals.create("Async core", description="the direction")
         screen = _open_screen(app)
         await pilot.pause()
+        listing = screen.query_one("#goal-tree", ListView)
+        # The first render rides call_after_refresh — without the tree
+        # the cursor is None and R is a silent no-op (the screen never
+        # closes). Wait for the cursor before pressing R.
+        await wait_until(
+            lambda: isinstance(listing.highlighted_child, TaskItem),
+            pilot,
+            what="goal tree cursor",
+        )
         screen.action_research_task()
         # The screen close is an async round-trip — under xdist load a
         # single pause() can race the switch; poll instead of asserting.

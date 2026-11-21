@@ -23,6 +23,7 @@ from textual.widgets._footer import FooterKey
 
 from drcode.models import TaskKind
 from drcode.tui.app import DrCodeApp
+from tests.network_mocks import wait_until
 
 
 @pytest.fixture
@@ -62,7 +63,15 @@ async def test_queued_task_keeps_move_bindings_dispatchable(
         await pilot.pause()
         assert app.check_action("move_task_up", ()) is True
         assert app.check_action("move_task_down", ()) is True
-        assert _footer_move_keys(app) == ["ctrl+down", "ctrl+up"]
+        # The footer rebuild is scheduled from bindings_changed via
+        # call_after_refresh (frame-timed): pilot.pause() can return
+        # before that frame runs — poll for the recomposed footer
+        # instead of asserting against a possibly stale one.
+        await wait_until(
+            lambda: _footer_move_keys(app) == ["ctrl+down", "ctrl+up"],
+            pilot,
+            what="footer move keys",
+        )
         # Both entries render inside ONE KeyGroup (single "Move" label).
         groups = app.query("Footer KeyGroup")
         assert len(groups) == 1

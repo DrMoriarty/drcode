@@ -56,22 +56,10 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
-
-from pydantic_ai import Agent
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import (
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-)
-from pydantic_ai.usage import UsageLimits
+from typing import TYPE_CHECKING, Any
 
 from ..agent import (
-    ResolverDeps,
     all_user_prompts,
-    build_resolver_agent,
-    build_resolver_reviewer_agent,
-    code_index_tools_for,
     last_response_usage,
     resumable_history,
     run_context_tokens,
@@ -105,6 +93,48 @@ from ..providers import AgentRole
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
+
+# -- lazy heavy-name seam --------------------------------------------------------
+# The names below pull pydantic_ai / agent_build; they are NOT imported at
+# module level so this module (on the TUI cold-start path) stays cheap. They
+# resolve as module attributes on first access (PEP 562) and are cached as
+# globals — so a test monkeypatching `pipeline_resolver.build_resolver_agent`
+# keeps working, provided run_resolver calls `_ensure_resolver_names()` first
+# (a local import would bypass the monkeypatched attribute).
+_HEAVY_RESOLVER_NAMES = (
+    "build_resolver_agent",
+    "build_resolver_reviewer_agent",
+    "code_index_tools_for",
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _HEAVY_RESOLVER_NAMES:
+        from .. import agent
+
+        value = getattr(agent, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _ensure_resolver_names() -> None:
+    for _name in _HEAVY_RESOLVER_NAMES:
+        if _name not in globals():
+            __getattr__(_name)
+
+
+if TYPE_CHECKING:
+    from pydantic_ai import Agent
+    from pydantic_ai.agent import AgentRun
+
+    from ..agent_build import (
+        ResolverDeps,
+        build_resolver_agent,  # noqa: TC004
+        build_resolver_reviewer_agent,  # noqa: TC004
+        code_index_tools_for,  # noqa: TC004
+    )
+
 from .worker_runtime import work
 
 # How many failed resolver attempts each error class gets before the
@@ -359,6 +389,20 @@ class PipelineResolverLayer(CoreState):
     async def run_resolver(self, task_id: str) -> None:
         """One resolver round: prepare the conflicted merge, run the
         resolver agent, then the mandatory verification funnel."""
+        # Deferred heavy imports (pydantic_ai / agent_build): this module
+        # loads on the TUI cold-start path. `build_resolver_agent` /
+        # `code_index_tools_for` resolve through the module globals — a
+        # seam tests monkeypatch (see the module `__getattr__` below).
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import (
+            FunctionToolCallEvent,
+            FunctionToolResultEvent,
+        )
+        from pydantic_ai.usage import UsageLimits
+
+        from ..agent_build import ResolverDeps
+
+        _ensure_resolver_names()
         self._resolver_running = True
         self._resolver_task_id = task_id
         self.refresh_sidebar()
@@ -929,6 +973,9 @@ class PipelineResolverLayer(CoreState):
         """Run the three verification levels over the agent's resolution.
         Short-circuits on the first failure (the outcome carries what was
         checked so far)."""
+        from ..agent_build import ResolverDeps
+
+        _ensure_resolver_names()
         outcome = ResolverOutcome(verdict="needs-human")
         verdict = deps.verdicts[-1] if deps.verdicts else None
         outcome.agent_resolved = bool(verdict and verdict.resolved)
@@ -1016,6 +1063,8 @@ class PipelineResolverLayer(CoreState):
         pass failed terminally, so the remaining chunks must not be
         reviewed either (a failure of this class will not heal itself on
         them, and the folded verdict already blocks the commit)."""
+        from pydantic_ai.usage import UsageLimits
+
         failures: list[str] = []
         result = None
         prefix = f"chunk {chunk_index}/{chunk_total}: "

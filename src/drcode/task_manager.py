@@ -9,8 +9,6 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from pathlib import Path
 
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-
 from .goals import GoalStore
 from .models import (
     Goal,
@@ -429,8 +427,7 @@ class TaskManager:
             )
         else:
             text = (
-                f"цель {goal.title_display} ({goal.id}): "
-                f"{done}/{total} задач завершено"
+                f"цель {goal.title_display} ({goal.id}): {done}/{total} задач завершено"
             )
         task.events.append(TaskEvent(kind="goals", text=text))
         task.touch()
@@ -1295,6 +1292,10 @@ class TaskManager:
         # (ModelRequest + UserPromptPart), backdated to the moment the user
         # typed the text so the chat thread stays chronological.
         existing = all_user_prompts(task.messages)
+        # Deferred import: keeps the pydantic_ai stack off the TUI cold
+        # start (this module loads before the first frame).
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
         for entry in task.pending_input:
             if entry.text in existing:
                 # A re-queued task may already carry this exact prompt in

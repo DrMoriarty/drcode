@@ -29,7 +29,7 @@ import asyncio
 import sys
 import threading
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual import on
 from textual.app import ComposeResult
@@ -38,18 +38,43 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, RadioButton, Select, Static
 
-from ..voice import (
-    DEFAULT_TTS_VOICE,
-    DEFAULT_VOICE_API_URL,
-    VOICE_LANGUAGE_EN,
-    VOICE_LANGUAGE_RU,
-    VoiceClient,
-    VoiceConfig,
-    play_wav,
-    terminal_voice_language,
-)
+if TYPE_CHECKING:
+    from ..voice.client import VoiceClient  # noqa: TC004
+    from ..voice.playback import play_wav  # noqa: TC004
+    from ..voice.synth import VoiceConfig
 from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 from .toggle_row import ToggleRow
+
+# Voice names resolve lazily (the voice package must not pull the native
+# PortAudio lib at import time). They are module attributes via PEP 562 and
+# cached as globals — a test monkeypatching `voice_dialog.VoiceClient` /
+# `voice_dialog.play_wav` keeps working, provided the methods call
+# `_ensure_voice_names()` first (a local import would bypass the
+# monkeypatched attribute).
+_LAZY_VOICE_NAMES = ("VoiceClient", "play_wav")
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_VOICE_NAMES:
+        from .. import voice
+
+        value = getattr(voice, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _ensure_voice_names() -> None:
+    for _name in _LAZY_VOICE_NAMES:
+        if _name not in globals():
+            __getattr__(_name)
+
+
+def _voice():
+    from .. import voice
+
+    return voice
+
 
 _VOICE_URLS = {
     "transcriptions": "/audio/transcriptions",
@@ -59,8 +84,8 @@ _VOICE_URLS = {
 # The announcement-language dropdown: exactly two options ("ru" and "en";
 # a stored empty value reads as the terminal-derived default).
 LANGUAGE_OPTIONS: list[tuple[str, str]] = [
-    ("Russian", VOICE_LANGUAGE_RU),
-    ("English", VOICE_LANGUAGE_EN),
+    ("Russian", "ru"),
+    ("English", "en"),
 ]
 
 # Spoken on a successful connection check when a TTS model is present:
@@ -68,12 +93,12 @@ LANGUAGE_OPTIONS: list[tuple[str, str]] = [
 # familiar announcer voice confirming the setup — in the language picked
 # in the dialog.
 CHECK_PASSED_PHRASES: dict[str, str] = {
-    VOICE_LANGUAGE_RU: "Проверка голосового соединения пройдена, всё хорошо",
-    VOICE_LANGUAGE_EN: "Voice connection check passed, everything is fine",
+    "ru": "Проверка голосового соединения пройдена, всё хорошо",
+    "en": "Voice connection check passed, everything is fine",
 }
 
 # Kept for backwards compatibility (the Russian default phrase).
-CHECK_PASSED_PHRASE = CHECK_PASSED_PHRASES[VOICE_LANGUAGE_RU]
+CHECK_PASSED_PHRASE = CHECK_PASSED_PHRASES["ru"]
 
 
 @dataclass
@@ -183,7 +208,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
     ) -> None:
         super().__init__()
         self._initial = {
-            "api_url": api_url or DEFAULT_VOICE_API_URL,
+            "api_url": api_url or _voice().DEFAULT_VOICE_API_URL,
             "api_key": api_key or catalog_api_key,
             "asr_model": asr_model,
             "tts_model": tts_model,
@@ -193,9 +218,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
         # (never saved yet) falls back to the terminal locale's language —
         # the same value the announcements would use without a save.
         self._language = (
-            language
-            if language in (VOICE_LANGUAGE_RU, VOICE_LANGUAGE_EN)
-            else terminal_voice_language()
+            language if language in ("ru", "en") else _voice().terminal_voice_language()
         )
         self._initial_tts = {
             "completed": tts_completed,
@@ -217,7 +240,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
             )
             yield Static("Audio API base URL", classes="voice-label")
             yield Input(
-                placeholder=DEFAULT_VOICE_API_URL,
+                placeholder=_voice().DEFAULT_VOICE_API_URL,
                 value=self._initial["api_url"],
                 id="voice-url",
             )
@@ -244,7 +267,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
                 with Vertical():
                     yield Static("TTS voice", classes="voice-label")
                     yield Input(
-                        placeholder=DEFAULT_TTS_VOICE,
+                        placeholder=_voice().DEFAULT_TTS_VOICE,
                         value=self._initial["tts_voice"],
                         id="voice-tts-voice",
                     )
@@ -356,6 +379,8 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
     # -- values -----------------------------------------------------------------
 
     def _config(self) -> VoiceConfig:
+        from ..voice import VoiceConfig
+
         return VoiceConfig(
             base_url=self.query_one("#voice-url", Input).value.strip(),
             api_key=self.query_one("#voice-key", Input).value.strip(),
@@ -363,7 +388,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
             tts_model=self.query_one("#voice-tts-model", Input).value.strip(),
             tts_voice=(
                 self.query_one("#voice-tts-voice", Input).value.strip()
-                or DEFAULT_TTS_VOICE
+                or _voice().DEFAULT_TTS_VOICE
             ),
         )
 
@@ -437,6 +462,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
 
     def _announce_run(self, config: VoiceConfig, phrase: str) -> None:
         try:
+            _ensure_voice_names()
             wav = VoiceClient(config).speech(phrase)
             play_wav(wav)
         except Exception as e:  # noqa: BLE001 - a failed confirmation never
@@ -463,6 +489,7 @@ class VoiceSettingsDialog(ChangedHighlightMixin, ModalScreen[VoiceSetup | None])
     @staticmethod
     def _probe(config: VoiceConfig) -> tuple[bool, str]:
         try:
+            _ensure_voice_names()
             return True, VoiceClient(config).check()
         except Exception as e:  # noqa: BLE001 - the probe reports, never raises
             return False, str(e)

@@ -17,9 +17,11 @@ normalized to 100% and will not match the exact usage.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
-from pydantic_ai.usage import RunUsage
+if TYPE_CHECKING:
+    from pydantic_ai.usage import RunUsage
+
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding

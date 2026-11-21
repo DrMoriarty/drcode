@@ -37,64 +37,66 @@ provider whose host matches the audio URL's host (no second token for the
 common single-gateway case).
 
 The ASR/TTS model ids (e.g. ``gigaam_rnnt_v3_e2e``) contain ``/`` — the
-separator of the agent-catalog ``<provider>/<model-id>`` reference format
-(:func:`drcode.providers._reject_slash`) — so they are stored in the project
-settings directly, never in the model catalog.
+separator of the agent-catalog ``<provider>/<model-id>`` reference format —
+so voice models never mix into the catalog.
+
+COLD START: nothing is imported eagerly. The package `__getattr__` below
+resolves every public name on first use by importing the owning submodule —
+so the NATIVE PortAudio library (loaded by ``sounddevice`` at import time)
+only loads when the recording/playback half is actually touched, and the
+TUI cold start (which imports :class:`TtsSpeaker`) never pays for it.
 """
 
 from __future__ import annotations
 
-from ._sounddevice import (
-    _SOUNDDEVICE_ERROR,
-    SOUNDDEVICE_AVAILABLE,
-    VOICE_UNAVAILABLE_HINT,
-    _bundled_portaudio,
-    availability_hint,
-)
-from .client import ASR_TIMEOUT, CHECK_TIMEOUT, TTS_TIMEOUT, VoiceClient
-from .config import (
-    DEFAULT_TTS_VOICE,
-    DEFAULT_VOICE_API_URL,
-    VOICE_LANGUAGE_EN,
-    VOICE_LANGUAGE_RU,
-    VOICE_PHRASES,
-    VoiceConfig,
-    VoiceError,
-    announcement_phrase,
-    catalog_api_key_for_host,
-    config_from_settings,
-    effective_voice_language,
-    resolve_api_key,
-    terminal_voice_language,
-)
-from .playback import play_wav
-from .recorder import MicrophoneRecorder
-from .synth import TtsSpeaker
+import importlib
+from typing import Any
 
-__all__ = [
-    "ASR_TIMEOUT",
-    "CHECK_TIMEOUT",
-    "DEFAULT_TTS_VOICE",
-    "DEFAULT_VOICE_API_URL",
-    "SOUNDDEVICE_AVAILABLE",
-    "TTS_TIMEOUT",
-    "VOICE_LANGUAGE_EN",
-    "VOICE_LANGUAGE_RU",
-    "VOICE_PHRASES",
-    "VOICE_UNAVAILABLE_HINT",
-    "_SOUNDDEVICE_ERROR",
-    "MicrophoneRecorder",
-    "TtsSpeaker",
-    "VoiceClient",
-    "VoiceConfig",
-    "VoiceError",
-    "_bundled_portaudio",
-    "announcement_phrase",
-    "availability_hint",
-    "catalog_api_key_for_host",
-    "config_from_settings",
-    "effective_voice_language",
-    "play_wav",
-    "resolve_api_key",
-    "terminal_voice_language",
-]
+# public name -> submodule that defines it
+_EXPORTS: dict[str, str] = {
+    # _sounddevice
+    "_SOUNDDEVICE_ERROR": "_sounddevice",
+    "SOUNDDEVICE_AVAILABLE": "_sounddevice",
+    "VOICE_UNAVAILABLE_HINT": "_sounddevice",
+    "_bundled_portaudio": "_sounddevice",
+    "availability_hint": "_sounddevice",
+    # client
+    "ASR_TIMEOUT": "client",
+    "CHECK_TIMEOUT": "client",
+    "TTS_TIMEOUT": "client",
+    "VoiceClient": "client",
+    # config
+    "DEFAULT_TTS_VOICE": "config",
+    "DEFAULT_VOICE_API_URL": "config",
+    "VOICE_LANGUAGE_EN": "config",
+    "VOICE_LANGUAGE_RU": "config",
+    "VOICE_PHRASES": "config",
+    "VoiceConfig": "config",
+    "VoiceError": "config",
+    "announcement_phrase": "config",
+    "catalog_api_key_for_host": "config",
+    "config_from_settings": "config",
+    "effective_voice_language": "config",
+    "resolve_api_key": "config",
+    "terminal_voice_language": "config",
+    # playback
+    "play_wav": "playback",
+    # recorder
+    "MicrophoneRecorder": "recorder",
+    # synth
+    "TtsSpeaker": "synth",
+}
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f".{target}", __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

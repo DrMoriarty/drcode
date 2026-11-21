@@ -67,7 +67,6 @@ from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
 from ..usage_store import UsageStore, usage_file
-from ..voice import TtsSpeaker
 from ..workflow import load_hooks
 from .actions import ActionsLayer
 from .attachments import StagedImage
@@ -598,6 +597,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # notifier voices the configured events (TTS announcements via the
         # audio gateway): the speaker serializes playback one phrase at a
         # time in its own daemon thread and shares the settings getter.
+        # Deferred: the voice package pulls the NATIVE PortAudio library
+        # (sounddevice) at import time — never on the cold-start path.
+        from ..voice import TtsSpeaker
+
         self.voice_tts = TtsSpeaker(lambda: self.settings, on_error=self._notify_error)
         self.notifier = Notifier(
             lambda: self.settings,

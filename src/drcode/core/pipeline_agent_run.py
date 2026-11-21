@@ -16,27 +16,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
-
-from pydantic_ai import Agent
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import (
-    BinaryContent,
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-)
-from pydantic_ai.usage import UsageLimits
+from typing import TYPE_CHECKING, Any
 
 from ..agent import (
-    AgentDeps,
-    InputDeliveryHooks,
-    SubagentGate,
     backdate_user_prompt,
-    build_agent,
-    build_title_agent,
     build_title_prompt,
     clean_generated_title,
-    code_index_tools_for,
     ends_with_empty_response,
     ends_with_open_request,
     is_pending_retry,
@@ -45,7 +30,6 @@ from ..agent import (
     run_context_tokens,
     sanitized_messages,
     serialize_messages,
-    subagent_limit_for,
 )
 from ..core.usage import (
     NETWORK_RETRIES,
@@ -60,7 +44,52 @@ from ..providers import AgentRole, resolve_available, subagent_usage_key
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
+
+if TYPE_CHECKING:
+    from pydantic_ai import Agent
+    from pydantic_ai.agent import AgentRun
+    from pydantic_ai.messages import BinaryContent
+
+    from ..agent_build import (
+        AgentDeps,
+        SubagentGate,  # noqa: TC004
+        build_agent,  # noqa: TC004
+        code_index_tools_for,  # noqa: TC004
+    )
+    from ..agent_tools import InputDeliveryHooks
+    from ..subagents import subagent_limit_for  # noqa: TC004
 from .state import CoreState
+
+# -- lazy heavy-name seam --------------------------------------------------------
+# The names below pull pydantic_ai / agent_build / subagents; they are NOT
+# imported at module level so this module (on the TUI cold-start path) stays
+# cheap. They resolve as module attributes on first access (PEP 562) and are
+# cached as globals — so a test monkeypatching
+# `pipeline_agent_run.build_agent` keeps working, provided the functions call
+# `_ensure_agent_names()` before using them (a local import would bypass the
+# monkeypatched attribute).
+_HEAVY_AGENT_NAMES = (
+    "SubagentGate",
+    "build_agent",
+    "code_index_tools_for",
+    "subagent_limit_for",
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _HEAVY_AGENT_NAMES:
+        from .. import agent
+
+        value = getattr(agent, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _ensure_agent_names() -> None:
+    for _name in _HEAVY_AGENT_NAMES:
+        if _name not in globals():
+            __getattr__(_name)
 
 
 class PipelineAgentRunLayer(CoreState):
@@ -73,6 +102,8 @@ class PipelineAgentRunLayer(CoreState):
         to the app's event loop — hence the `call_soon_threadsafe`
         wrappers around the running loop (safe from any thread, including
         the loop thread itself, since async tools run on the loop)."""
+        from ..agent_tools import InputDeliveryHooks
+
         loop = asyncio.get_running_loop()
 
         def advance() -> None:
@@ -126,6 +157,10 @@ class PipelineAgentRunLayer(CoreState):
         )
 
     async def _maybe_generate_title(self, task: Task, role: AgentRole) -> None:
+        # Deferred heavy imports: pydantic_ai / agent_build stay off the
+        # TUI cold-start path (this module loads before the first frame).
+        from ..title_gen import build_title_agent
+
         """Generate the task's title from its description with the model
         serving the task (project setting ``generate_task_titles``).
 
@@ -212,6 +247,11 @@ class PipelineAgentRunLayer(CoreState):
         # other kinds on the coding model. Everything below — the readiness
         # check, the agent build and the compaction gates — uses it.
         role = self._task_role(task)
+        from pydantic_ai import Agent
+        from pydantic_ai.usage import UsageLimits
+
+        from ..agent_build import AgentDeps
+
         try:
             if not self.resolved_config(role).is_ready:
                 self._show_event(
@@ -579,6 +619,11 @@ class PipelineAgentRunLayer(CoreState):
         on_task_start hook's instructions for the first prompt, the run's
         subagent gate (None when delegation is off) and the run's web-fetch
         gate (None unless this is a RESEARCH task with web fetch enabled)."""
+        # Deferred heavy imports (pydantic_ai / agent_build / subagents):
+        # keep them off the TUI cold-start path. `build_agent` resolves
+        # through the module global — a seam tests monkeypatch (see the
+        # module `__getattr__` below).
+        _ensure_agent_names()
         self._agent_runs[task_id] = generation
         self._agent_failed.discard(task_id)
         self._agent_dead.discard(task_id)
@@ -911,6 +956,8 @@ class PipelineAgentRunLayer(CoreState):
         text: str,
         attachments: list[ImageAttachment],
     ) -> list[str | BinaryContent]:
+        from pydantic_ai.messages import BinaryContent
+
         """The multimodal content of the consumed prompt: the text element
         first, then one `BinaryContent` per attached image.
 
@@ -1061,6 +1108,11 @@ class PipelineAgentRunLayer(CoreState):
         `_compaction_failed` (unless even the hard-level escalation
         proved unable to shrink the transcript —
         `_hard_limit_exhausted`)."""
+        from pydantic_ai.messages import (
+            FunctionToolCallEvent,
+            FunctionToolResultEvent,
+        )
+
         async with node.stream(run.ctx) as node_stream:
             async for event in node_stream:
                 if isinstance(event, FunctionToolCallEvent):

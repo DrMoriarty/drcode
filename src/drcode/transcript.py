@@ -13,19 +13,17 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelMessagesTypeAdapter,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    ToolCallPart,
-    UserPromptPart,
-)
-from pydantic_ai.usage import RunUsage
+if TYPE_CHECKING:
+    # Type-only: the runtime imports happen inside the functions below so
+    # this module (on the TUI cold-start path via `task_manager`) never
+    # pulls the pydantic_ai stack.
+    from pydantic_ai.agent import AgentRun
+    from pydantic_ai.messages import (
+        ModelMessage,
+    )
+    from pydantic_ai.usage import RunUsage
 
 # Marker prefix of the synthetic user message that carries the compaction
 # summary inside the transcript. Lets us (a) feed the previous summary back
@@ -78,6 +76,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def serialize_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+
     return ModelMessagesTypeAdapter.dump_python(messages, mode="json")  # type: ignore[return-value]
 
 
@@ -182,6 +182,8 @@ def last_context_tokens(data: list[dict[str, Any]]) -> int | None:
 def run_context_tokens(run: AgentRun[Any, Any]) -> int | None:
     """Context fill (tokens) after the latest completed model request of a
     live run (usage of the last ModelResponse in the run's transcript)."""
+    from pydantic_ai.messages import ModelResponse
+
     try:
         messages = run.all_messages()
     except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
@@ -205,6 +207,8 @@ def ctx_context_tokens(ctx: Any) -> int | None:
     input + output tokens of the *latest* request — so tools must not
     consult `ctx.usage` directly.
     """
+    from pydantic_ai.messages import ModelResponse
+
     for msg in reversed(ctx.messages):
         if isinstance(msg, ModelResponse):
             usage = msg.usage
@@ -223,6 +227,9 @@ def last_response_usage(run: AgentRun[Any, Any]) -> RunUsage | None:
     from run_context_tokens, which only sums the input side). None when
     the run has no completed model request yet.
     """
+    from pydantic_ai.messages import ModelResponse
+    from pydantic_ai.usage import RunUsage
+
     try:
         messages = run.all_messages()
     except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
@@ -246,6 +253,8 @@ def last_response_usage(run: AgentRun[Any, Any]) -> RunUsage | None:
 
 
 def load_messages(data: list[dict[str, Any]]) -> list[ModelMessage]:
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+
     return ModelMessagesTypeAdapter.validate_python(data)
 
 
@@ -261,6 +270,13 @@ def resumable_history(data: list[dict[str, Any]]) -> list[ModelMessage]:
     kept, so a retried run resumes the attempt where it stopped instead of
     redoing it from scratch.
     """
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+    )
+
     messages = list(load_messages(data))
     cut = 0
     for i, msg in enumerate(messages):
@@ -460,6 +476,8 @@ def backdate_user_prompt(
     while other work runs). The chat thread is ordered by these stamps, so
     the request is backdated to keep the transcript chronological.
     """
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
     for msg in reversed(messages):
         if not isinstance(msg, ModelRequest):
             continue

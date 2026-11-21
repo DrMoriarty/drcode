@@ -13,10 +13,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+if TYPE_CHECKING:
+    from pydantic_ai import Agent
 
 from . import agent_model
 from .config import Config
@@ -96,6 +96,8 @@ def build_compaction_agent(
     behind the provider's `max_parallel_requests` cap says so in the task's
     chat instead of looking like a hung compaction.
     """
+    from pydantic_ai import Agent
+
     system_prompt, _ = load_compaction_prompts()
     return Agent(
         agent_model.build_model(config, announce_wait),
@@ -881,6 +883,8 @@ def compacted_messages(
 ) -> list[dict[str, Any]]:
     """New transcript after compaction: the original user prompts verbatim
     plus one synthetic request carrying the summary."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
     preserved, _ = split_original_prompts(messages)
     request = ModelRequest(
         parts=[
@@ -1068,6 +1072,8 @@ def mechanical_compaction_messages(
     note = _MECHANICAL_NOTE
     if previous:
         note = f"{note}\n\n<previous-summary>\n{previous}\n</previous-summary>"
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
     stub = serialize_messages(
         [
             ModelRequest(

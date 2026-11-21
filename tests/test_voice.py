@@ -1398,9 +1398,9 @@ async def test_voice_check_confirmation_follows_language_select(
     from drcode.tui.app import DrCodeApp
     from drcode.tui.voice_dialog import (
         CHECK_PASSED_PHRASES,
-        VOICE_LANGUAGE_EN,
         VoiceSettingsDialog,
     )
+    from drcode.voice import VOICE_LANGUAGE_EN
 
     spoken: list[str] = []
     played: list[bytes] = []

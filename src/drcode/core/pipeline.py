@@ -10,22 +10,20 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+if TYPE_CHECKING:
+    from pydantic_ai.agent import AgentRun
+
+    from ..agent import AgentDeps, TesterDeps
 
 from ..agent import (
-    AgentDeps,
-    TesterDeps,
     all_user_prompts,
     backdate_user_prompt,
     serialize_messages,
-    todo_instructions,
 )
 from ..config import Config
 from ..keepawake import statuses_hold_awake
-from ..mcp.client_toolsets import mcp_toolsets_for
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus
 from ..providers import AgentRole
 from ..settings import TaskIsolation, Verification
@@ -117,6 +115,8 @@ class PipelineCoreLayer(CoreState):
 
         the state protocol."""
 
+        from ..agent import todo_instructions
+
         return todo_instructions(task)
 
     def _todo_tail_block(self, task_id: str) -> str | None:
@@ -125,6 +125,8 @@ class PipelineCoreLayer(CoreState):
         request, so the tail block always mirrors the CURRENT checklist
         state. None for non-feature tasks and empty lists (the wrapper
         then passes the request through untouched)."""
+        from ..agent import todo_instructions
+
         return todo_instructions(self.manager.get(task_id))
 
     def _wait_announcer(
@@ -179,9 +181,11 @@ class PipelineCoreLayer(CoreState):
             except Exception:  # noqa: BLE001, S110 - visibility never fatal
                 pass
 
-        return mcp_toolsets_for(
-            role, project_root=self.project_root, notify=notify
-        )
+        # Deferred: the MCP client stack (pydantic_ai toolsets) must not
+        # load on the TUI cold start.
+        from ..mcp.client_toolsets import mcp_toolsets_for
+
+        return mcp_toolsets_for(role, project_root=self.project_root, notify=notify)
 
     def _todo_completion_warning(self, task: Task) -> None:
         """Completion soft gate: when a task leaves development with
@@ -700,6 +704,8 @@ class PipelineCoreLayer(CoreState):
         in_flight = self._consumed_prompts.pop(task.id, None)
         if in_flight is None or in_flight[0] in all_user_prompts(task.messages):
             return
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
         request = ModelRequest(parts=[UserPromptPart(content=in_flight[0])])
         # The prompt was typed when it was queued, not when this run
         # consumed it — keep the chat thread chronological (same backdating

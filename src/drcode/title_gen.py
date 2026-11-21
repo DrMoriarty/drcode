@@ -20,9 +20,12 @@ runs only in the agent-run worker (see drcode.core.pipeline_agent_run).
 
 from __future__ import annotations
 
-from pydantic_ai import Agent
+from typing import TYPE_CHECKING
 
 from . import agent_model
+
+if TYPE_CHECKING:
+    from pydantic_ai import Agent
 from .config import Config
 from .prompts import load_title_prompt
 
@@ -52,6 +55,8 @@ def build_title_agent(
     behind the provider's ``max_parallel_requests`` cap says so in the
     task's chat instead of looking like a stalled activation.
     """
+    from pydantic_ai import Agent
+
     return Agent(
         agent_model.build_model(config, announce_wait),
         instructions=load_title_prompt(),

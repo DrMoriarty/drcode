@@ -10,12 +10,16 @@ Split out of :mod:`drcode.tui.chat_view` — see the composition in
 
 from __future__ import annotations
 
-from pydantic_ai.usage import RunUsage
+from typing import TYPE_CHECKING
+
 from rich.cells import cell_len
 from textual.css.query import NoMatches
 from textual.widgets import Static
 
 from ..core.usage import NETWORK_RETRIES
+
+if TYPE_CHECKING:
+    from pydantic_ai.usage import RunUsage
 from ..models import TaskKind, TaskStatus
 from ..providers import AgentRole
 from .header import (

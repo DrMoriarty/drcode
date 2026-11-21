@@ -13,22 +13,11 @@ import json
 import time
 from collections.abc import Callable
 from functools import partial
-from typing import Any
-
-from pydantic_ai import Agent
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import (
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-)
-from pydantic_ai.usage import UsageLimits
+from typing import TYPE_CHECKING, Any
 
 from ..agent import (
     COMPACTION_RESUME_PREFIX,
-    TesterDeps,
     all_user_prompts,
-    build_tester_agent,
-    code_index_tools_for,
     last_response_usage,
     resumable_history,
     run_context_tokens,
@@ -46,6 +35,12 @@ from ..providers import AgentRole
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
+
+if TYPE_CHECKING:
+    from pydantic_ai.agent import AgentRun
+
+    from ..agent import TesterDeps
+
 from .worker_runtime import work
 
 # The user message a paused testing round is resumed with after a SUCCESSFUL
@@ -254,6 +249,17 @@ class PipelineTesterLayer(CoreState):
 
     @work(exclusive=True, group="tester")
     async def run_tester(self, task_id: str) -> None:
+        # Deferred heavy imports (pydantic_ai / agent_build): this module
+        # loads on the TUI cold-start path.
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import (
+            FunctionToolCallEvent,
+            FunctionToolResultEvent,
+        )
+        from pydantic_ai.usage import UsageLimits
+
+        from ..agent_build import TesterDeps, build_tester_agent, code_index_tools_for
+
         """After any task completes, verify the project and label the task."""
         self._tester_task_id = task_id
         self._tester_generation += 1

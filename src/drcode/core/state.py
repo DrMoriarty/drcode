@@ -306,6 +306,8 @@ class CoreState:
 
     def refresh_sidebar(self) -> None: ...
 
+    def _show_all_section_rows(self, section: str) -> None: ...
+
     def refresh_status(self) -> None: ...
 
     def refresh_task_status(self) -> None: ...
@@ -802,6 +804,28 @@ class CoreState:
     # ("none"/"unmerged"/"merged") — refreshed off the event loop in
     # _unmerged_completed_ids; the sidebar colors the ✓ marker by it.
     _merge_state: dict[str, str]
+    # Bumped on every _merge_state replace with changed content — the
+    # sidebar fingerprint reads the epoch, never the dict itself.
+    _merge_state_epoch: int
+    # Explicit expand-override of the COMPLETED auto-collapse (see
+    # sidebar_view._section_collapsed); session-only.
+    _expanded_sections: set[str]
+    # Lazy-mount cap of the expanded COMPLETED section (None = show all).
+    _completed_limit: int | None
+    # One-stat snapshot of the tasks directory feeding the external-task
+    # poll (see sidebar_view._poll_new_tasks).
+    _tasks_dir_snapshot: tuple[int, int] | None
+    # Set once the task-dependent startup tail has run (see
+    # DrCodeApp._finish_startup) — guards it against a double run.
+    _startup_finished: bool
+    # Whether TaskManager actually deferred its archive load (only a
+    # large archive does) — gates the retention-purge top-up in
+    # _finish_startup.
+    _archive_load_deferred: bool
+    # Armed when the model is configured (on_mount or the setup dialog
+    # result): the first _advance() fires in _finish_startup, after the
+    # archive load.
+    _start_pipeline_after_load: bool
     # Task ids already handed to the post-merge worktree removal (see
     # DrCodeApp._remove_merged_completed_worktrees) — one scheduled
     # removal per task per session.

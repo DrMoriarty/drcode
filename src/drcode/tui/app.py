@@ -91,6 +91,7 @@ from .key_compat import apply_alt_enter_fix
 from .pipeline import PipelineLayer
 from .setup_dialog import ModelSetupDialog
 from .sidebar import Sidebar, TaskItem
+from .sidebar_view import SIDEBAR_COMPLETED_VISIBLE
 from .state import LiveTailEntry
 from .sync_output import (
     apply_sync_output_override,
@@ -547,7 +548,17 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # only non-provider settings; the model comes from the catalog /
         # project selections / env (see drcode.providers.resolve).
         self.config = Config(project_root=project_root)
-        self.manager = TaskManager(project_root)
+        # Deferred archive load (large archives): TaskManager leaves a big
+        # archive unread; _finish_startup (via the archive-load worker in
+        # on_mount) loads it AFTER the first frame and starts the pipeline
+        # only then. Small archives load eagerly inside the constructor.
+        self.manager = TaskManager(project_root, defer_load=True)
+        # Whether the archive load was actually deferred (a SMALL archive
+        # loads eagerly inside the constructor even with defer_load=True):
+        # the retention purge below ran against an empty task set then and
+        # is re-run in _finish_startup — the eager path must NOT re-run it
+        # (tasks backdated before mount would suddenly look expired).
+        self._archive_load_deferred = not self.manager.loaded
         # Project-scoped preferences (<project>/.drcode/settings.json), then
         # the startup cleanup: completed tasks older than the retention
         # setting are removed before anything is shown or resumed.
@@ -651,10 +662,11 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._purged_tasks = self.manager.purge_expired_completed(
             self.settings.completed_retention.days
         )
-        # Scratch hygiene: remove /tmp/drcode/<id> directories whose task no
-        # longer exists — leftovers from a crashed previous session (scratch
-        # directories of live tasks, including interrupted ones, are kept).
-        cleanup_orphan_scratches(set(self.manager.tasks))
+        # Scratch hygiene (remove /tmp/drcode/<id> directories whose task no
+        # longer exists — leftovers from a crashed previous session) runs in
+        # _finish_startup, NOT here: with a deferred archive load the task
+        # set is still empty at this point and every scratch would look
+        # orphaned — including those of live tasks.
         # Custom team workflow (opt-in by file presence): .drcode/workflow.py
         # hooks (branch checkout, dev-done, external review, accept) and
         # .drcode/git-workflow.md rules (read at prompt-build time). None =
@@ -894,7 +906,30 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._todo_snapshot: tuple = ()
         # Sidebar sections currently collapsed (Enter/space/click on a
         # section header toggles it); session-only, not persisted.
+        # _expanded_sections is the explicit counterpart for the COMPLETED
+        # auto-collapse: a large completed archive is collapsed BY DEFAULT
+        # (mounting ~900 rows costs seconds) until the user expands it.
         self._collapsed_sections: set[str] = set()
+        self._expanded_sections: set[str] = set()
+        # Lazy mounting of the expanded COMPLETED section: at most
+        # SIDEBAR_COMPLETED_VISIBLE rows plus a "show all" row; None once
+        # the user asked for the full list (session-only).
+        self._completed_limit: int | None = SIDEBAR_COMPLETED_VISIBLE
+        # One-stat snapshot of the tasks directory feeding the
+        # external-task poll (see _poll_new_tasks): the poll re-scans only
+        # when the directory changed, not every second.
+        self._tasks_dir_snapshot: tuple[int, int] | None = None
+        # Bumped whenever _merge_state is replaced with DIFFERENT content —
+        # the sidebar fingerprint reads this instead of sweeping the dict.
+        self._merge_state_epoch = 0
+        # Startup tail that needs the loaded archive (see _finish_startup):
+        # run synchronously for an eagerly loaded archive, otherwise from
+        # the archive-load worker.
+        self._startup_finished = False
+        # Set in on_mount when the model is configured and the pipeline
+        # should start (also by _model_setup_done once the setup dialog is
+        # saved) — consumed by _finish_startup AFTER the archive load.
+        self._start_pipeline_after_load = False
         # Per-run activity bookkeeping (parallel slots): the last moment a
         # run emitted an event (stream delta, tool call/result) — the
         # activity label and the stall watchdog compare it against now.
@@ -1641,31 +1676,6 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 severity="warning",
                 timeout=12,
             )
-        if self.task_env.available:
-            # Sweep worktrees/branches of tasks that no longer exist
-            # (crashed session, retention cleanup) off the startup
-            # path: a few git calls in a worker thread. Runs regardless
-            # of the setting: `cleanup_orphans` itself no-ops when the
-            # setting is off and there is nothing left to sweep, so
-            # leftovers of a session with isolation toggled on are still
-            # cleaned after the user switches it off.
-            self.run_worker(
-                self._worktree_startup_cleanup,
-                exclusive=True,
-                group="worktree-cleanup",
-            )
-        if self.task_env.active:
-            # Remind about completed tasks whose work never reached the
-            # current branch (old "stuck" fixes on drcode/* branches —
-            # see _unmerged_work_startup_scan) plus the header's
-            # unmerged-work counter (`⎇ N` left of the clock): an
-            # immediate first fill plus a 10 s poll — a manual
-            # `git merge drcode/<id>` clears it without a restart (see
-            # _poll_git_indicator / _unmerged_completed_ids). When
-            # isolation is switched ON mid-session (Settings), the same
-            # registration happens there — the poll would otherwise only
-            # appear after a restart.
-            self._ensure_unmerged_tracking()
         # Deferred installs (on_tester_passed skipped over a half-done
         # merge — task.install_pending): poll for the resolution
         # UNCONDITIONALLY. The guard applies with and without isolation,
@@ -1675,15 +1685,10 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self.set_interval(10, self._poll_pending_installs)
         self.refresh_project_info()
         self._render_chat_hint()
+        # First frame with the sidebar SKELETON: on a large archive the
+        # tasks are not loaded yet — the sections fill in when the
+        # archive-load worker finishes (_finish_startup re-renders).
         self.refresh_sidebar()
-        # Open the chat on the task at the top of the first non-empty
-        # sidebar section (same pick the sidebar renders first), not on the
-        # active task / newest entry.
-        initial = self._sidebar_top_task()
-        if initial:
-            self.view_task(initial.id)
-        else:
-            self.action_new_task()
         self.refresh_status()
         self.refresh_connection()
         self.set_interval(30, self.refresh_connection)
@@ -1721,6 +1726,109 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # the next Ctrl+M crash with a cryptic ImportError (see
         # _poll_package_drift).
         self.set_interval(30, self._poll_package_drift)
+        # Model setup: without any configured model the setup dialog takes
+        # precedence (the pipeline stays idle until the dialog is saved or
+        # skipped with ESC — tasks can still be created and browsed, they
+        # just never start). The dialog itself is task-independent — pushed
+        # on mount; the pipeline's first _advance() waits for the archive
+        # load (see _start_pipeline_after_load / _finish_startup).
+        #
+        # Dialog condition: the env vars suppress it as before; after the
+        # startup migrations it only appears when the user catalog has no
+        # providers AND the project has no active model entry (catalog
+        # reference or valid custom model for at least one role).
+        if not (
+            os.environ.get("DRCODE_MODEL")
+            or os.environ.get("DRCODE_BASE_URL")
+            or UserModelsStore().load().providers
+            or project_has_model_selection(self.project_root)
+        ):
+            self.push_screen(ModelSetupDialog(), self._model_setup_done)
+        elif self.resolved_config(AgentRole.CODING).is_ready:
+            self._start_pipeline_after_load = True
+        # Everything below needs the loaded task archive: the initial view
+        # pick, the isolation prestamps, the startup sweeps and the
+        # pipeline's first _advance(). With an eagerly loaded archive
+        # (small project) this is the same synchronous tail on_mount always
+        # had; on a large archive it runs from the archive-load worker once
+        # the tasks are in — the first frame is already painted by then.
+        if self.manager.loaded:
+            self._finish_startup()
+        else:
+            self.run_worker(
+                self._deferred_startup(),
+                exclusive=True,
+                group="archive-load",
+            )
+
+    def _finish_startup(self) -> None:
+        """The task-dependent startup tail, run exactly once.
+
+        Synchronous path: right at the end of on_mount (eagerly loaded
+        archive). Deferred path: from the archive-load worker after
+        TaskManager.load() finished — the first frame is already up, the
+        sidebar fills in here. The order mirrors the historic on_mount
+        tail: sweeps before the first promotion, the prestamped isolation
+        pins before _advance(), the MCP server after it."""
+        if self._startup_finished:
+            return
+        self._startup_finished = True
+        # Retention cleanup for the deferred-load path: the __init__ pass
+        # ran against an empty task set (see _archive_load_deferred).
+        late_purged = (
+            self.manager.purge_expired_completed(self.settings.completed_retention.days)
+            if self._archive_load_deferred
+            else []
+        )
+        if late_purged:
+            self._purged_tasks = [*self._purged_tasks, *late_purged]
+            self.notify(
+                f"Deleted completed tasks: {len(late_purged)} "
+                f"({self.settings.completed_retention.label})",
+                title="Auto cleanup",
+                timeout=6,
+            )
+        # Scratch hygiene (moved out of __init__ — with a deferred load the
+        # task set is empty there and every scratch would look orphaned).
+        cleanup_orphan_scratches(set(self.manager.tasks))
+        if self.task_env.available:
+            # Sweep worktrees/branches of tasks that no longer exist
+            # (crashed session, retention cleanup) off the startup
+            # path: a few git calls in a worker thread. Runs regardless
+            # of the setting: `cleanup_orphans` itself no-ops when the
+            # setting is off and there is nothing left to sweep, so
+            # leftovers of a session with isolation toggled on are still
+            # cleaned after the user switches it off.
+            self.run_worker(
+                self._worktree_startup_cleanup,
+                exclusive=True,
+                group="worktree-cleanup",
+            )
+        if self.task_env.active:
+            # Remind about completed tasks whose work never reached the
+            # current branch (old "stuck" fixes on drcode/* branches —
+            # see _unmerged_work_startup_scan) plus the header's
+            # unmerged-work counter (`⎇ N` left of the clock): an
+            # immediate first fill plus a 10 s poll — a manual
+            # `git merge drcode/<id>` clears it without a restart (see
+            # _poll_git_indicator / _unmerged_completed_ids). When
+            # isolation is switched ON mid-session (Settings), the same
+            # registration happens there — the poll would otherwise only
+            # appear after a restart.
+            self._ensure_unmerged_tracking()
+        self.refresh_sidebar()
+        # Open the chat on the task at the top of the first non-empty
+        # sidebar section (same pick the sidebar renders first), not on the
+        # active task / newest entry — unless the user already started
+        # interacting during the load window (a submitted task, the
+        # new-task form): their choice wins over the startup pick.
+        if self.viewed_id is None and not self._new_task_mode:
+            initial = self._sidebar_top_task()
+            if initial:
+                self.view_task(initial.id)
+            else:
+                self.action_new_task()
+        self.refresh_status()
         # Pre-stamp the isolation pins of tasks that were mid-work at the
         # previous shutdown (see prestamp_isolation_pins): this must land
         # BEFORE the pipeline's first _advance() below — the resumed
@@ -1739,38 +1847,35 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
                 pinned = []
             for t in pinned:
                 self.manager.storage.save(t)
-        # Resume after restart. _advance() re-tests TESTING tasks (the app
-        # died during testing) FIRST — the startup demotion (active ->
-        # queued) leaves pending_input stranded unless the queue is
-        # promoted here. With no model configured anywhere, the setup
-        # dialog takes precedence: the pipeline stays idle until the
-        # dialog is saved (or skipped with ESC — tasks can still be
-        # created and browsed, they just never start).
-        #
-        # Dialog condition: the env vars suppress it as before; after the
-        # startup migrations it only appears when the user catalog has no
-        # providers AND the project has no active model entry (catalog
-        # reference or valid custom model for at least one role).
-        if not (
-            os.environ.get("DRCODE_MODEL")
-            or os.environ.get("DRCODE_BASE_URL")
-            or UserModelsStore().load().providers
-            or project_has_model_selection(self.project_root)
-        ):
-            self.push_screen(ModelSetupDialog(), self._model_setup_done)
-        elif self.resolved_config(AgentRole.CODING).is_ready:
+        # Resume after restart: _advance() re-tests TESTING tasks (the app
+        # died during testing) FIRST, then promotes the queue — the startup
+        # demotion (active -> queued) leaves pending_input stranded unless
+        # the queue is promoted here. Gated on the model being configured;
+        # the setup-dialog path arms the flag from _model_setup_done.
+        if self._start_pipeline_after_load:
             self._advance()
             # Model settings exist — offer to create AGENTS.md if the
             # project has none (the setup-dialog path offers it too,
             # right after the settings are saved).
             self._maybe_offer_agents_md()
-        # Embedded MCP server (§6): started on mount when the project
-        # setting is on. Deliberately AFTER the pipeline's first
-        # _advance() — the server's whole point is mutating a live
-        # pipeline, and starting it against a half-initialised app would
-        # export an endpoint that answers before the gate is ready. The
-        # call is a no-op when the setting is off (no socket is bound).
+        # Embedded MCP server (§6): started when the project setting is
+        # on. Deliberately AFTER the pipeline's first _advance() — the
+        # server's whole point is mutating a live pipeline, and starting
+        # it against a half-initialised app would export an endpoint that
+        # answers before the gate is ready. The call is a no-op when the
+        # setting is off (no socket is bound).
         self._sync_mcp_server()
+
+    async def _deferred_startup(self) -> None:
+        """Load the task archive off the startup path and run the
+        task-dependent startup tail (see _finish_startup)."""
+        started = time.monotonic()
+        await asyncio.to_thread(self.manager.load)
+        self.log(
+            f"archive load: {len(self.manager.tasks)} tasks in "
+            f"{time.monotonic() - started:.2f}s"
+        )
+        self._finish_startup()
 
     @property
     def chat_input(self) -> ChatInput:
@@ -1795,6 +1900,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     # accept-hook merge (see _hook_merge_still_owns): right after the
     # finalization the hook may still be running — do not distrust it yet.
     HOOK_MERGE_AUDIT_GRACE: ClassVar[timedelta] = timedelta(minutes=5)
+
+    def _set_merge_state(self, state: dict[str, str]) -> None:
+        """Replace the per-task mergedness map wholesale (called off the
+        event loop by the 10 s git poll) and bump the change epoch the
+        sidebar fingerprint reads — but ONLY when the content actually
+        changed: an equal re-fill must not wake the poll into a redraw."""
+        if state == self._merge_state:
+            return
+        self._merge_state = state
+        self._merge_state_epoch += 1
 
     def _unmerged_completed_ids(self) -> list[str]:
         """Synchronous half of the unmerged-work tracking: ids of
@@ -1831,7 +1946,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         worker thread."""
         env = self.task_env
         if not env.active:
-            self._merge_state = {}
+            self._set_merge_state({})
             # No isolation — no branches; the only deferred-install
             # blocker is the shared checkout itself (mid-merge / dirty).
             self._install_rerun_ids = self._install_rerun_candidates([])
@@ -1854,7 +1969,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             # place in the tracking.
             candidates.append(task)
         if not candidates:
-            self._merge_state = {}
+            self._set_merge_state({})
             self._install_rerun_ids = self._install_rerun_candidates([])
             self._purge_stale_merge_reports()
             self._merge_poll_done = True
@@ -1869,16 +1984,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # merged — the batched answer yields branch existence for free,
         # which is the white-vs-colored discriminator).
         existing, unmerged_branches = env.drcode_branch_state()
-        self._merge_state = {
-            task.id: (
-                "unmerged"
-                if env.branch(task.id) in unmerged_branches
-                else "merged"
-                if env.branch(task.id) in existing
-                else "none"
-            )
-            for task in candidates
-        }
+        self._set_merge_state(
+            {
+                task.id: (
+                    "unmerged"
+                    if env.branch(task.id) in unmerged_branches
+                    else "merged"
+                    if env.branch(task.id) in existing
+                    else "none"
+                )
+                for task in candidates
+            }
+        )
         result: list[str] = []
         for task in candidates:
             research = task.kind is TaskKind.RESEARCH

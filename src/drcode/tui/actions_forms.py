@@ -99,10 +99,17 @@ class TaskFormLayer(DrCodeState):
             )
         self.refresh_connection()
         self.refresh_status()
-        self._advance()
-        # The settings were just created — the "no AGENTS.md" offer now
-        # applies as well.
-        self._maybe_offer_agents_md()
+        # The pipeline may start now. If the archive is still loading
+        # (deferred startup load), _finish_startup runs the first
+        # _advance() and the AGENTS.md offer once the tasks are in —
+        # promoting into an empty task dict here would strand the queue
+        # until an unrelated event fires _advance() again.
+        self._start_pipeline_after_load = True
+        if self._startup_finished:
+            self._advance()
+            # The settings were just created — the "no AGENTS.md" offer now
+            # applies as well.
+            self._maybe_offer_agents_md()
 
     def _maybe_offer_agents_md(self) -> None:
         """Startup offer: model configured, project root has no AGENTS.md.

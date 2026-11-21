@@ -177,8 +177,9 @@ class GoalsActionsLayer(DrCodeState):
         if not self._new_task_mode or self._editing_task_id is not None:
             return
         candidates = self.manager.goals.flattened(
-            lambda g: g.status is not GoalStatus.ARCHIVED
-            and g.id != self._new_task_goal_id
+            lambda g: (
+                g.status is not GoalStatus.ARCHIVED and g.id != self._new_task_goal_id
+            )
         )
         if not candidates:
             self.notify(

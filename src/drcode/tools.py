@@ -43,7 +43,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -418,25 +418,32 @@ GREP_MAX_FILE_BYTES = 1_000_000  # files larger than ~1 MB are skipped
 GREP_BINARY_SNIFF_BYTES = 8192  # a NUL byte in the head marks a binary file
 
 
-def _git_ls_files(root: Path) -> list[Path] | None:
+def _git_ls_files(root: Path, pathspec: str | None = None) -> list[Path] | None:
     """Relative paths of every non-ignored file under `root` (tracked plus
     untracked), via `git ls-files` — the project's .gitignore (nested ones
     and negations included) is honored by git itself, which is exactly the
-    semantics a source search wants. Returns None when git is unavailable or
-    `root` is not inside a working tree, so the caller falls back to the
-    plain directory walk."""
+    semantics a source search wants. With `pathspec`, only paths matching
+    that one literal project-relative path are listed (git prunes the
+    traversal itself, so this stays O(1)-ish). Returns None when git is
+    unavailable or `root` is not inside a working tree, so the caller falls
+    back to the plain directory walk."""
+    cmd = [
+        "git",
+        "-C",
+        str(root),
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]
+    if pathspec is not None:
+        # :(literal) — a pathspec, not a glob: filenames with [ ] * ? must
+        # match themselves (the caller guarantees a magic-free path).
+        cmd += ["--", f":(literal){pathspec}"]
     try:
         proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
+            cmd,
             capture_output=True,
             check=False,
             timeout=10,
@@ -452,7 +459,59 @@ def _git_ls_files(root: Path) -> list[Path] | None:
     return out
 
 
-def _grep_candidates(root: Path) -> Iterator[tuple[str, Path]]:
+def _include_plan(include: str) -> tuple[str, str | None]:
+    """Split an include mask into (dir_prefix, exact_rel) for the candidate
+    enumeration. `exact_rel` is not None when the mask contains no glob magic
+    at all — the whole mask is then one literal path and no enumeration is
+    needed. `dir_prefix` is the leading run of literal characters cut at the
+    last "/" (always "" or ending in "/"): the include regex is anchored
+    (`re.match` + `\\Z`, `_include_matcher`) and every non-magic character is
+    escaped, so a path the mask matches must start with that prefix — the
+    enumeration may prune to it without changing the result set. An empty
+    prefix (the mask starts with magic, e.g. "*.py" or "**/x.py") prunes
+    nothing."""
+    cut = len(include)
+    for i, ch in enumerate(include):
+        if ch in "*?":
+            cut = i
+            break
+    lit = include[:cut]
+    i = lit.rfind("/")
+    prefix = lit[: i + 1] if i >= 0 else ""
+    if cut == len(include):  # no magic anywhere — the mask IS a path
+        return prefix, include
+    return prefix, None
+
+
+def _exact_candidates(root: Path, rel: str) -> Iterator[tuple[str, Path]]:
+    """The magic-free include fast path: one stat instead of an enumeration.
+    Gitignore fidelity is preserved by asking git itself, with a pathspec
+    limited to this one path — the same source of truth the general
+    enumeration uses. A governing working tree is the project root when it is
+    one, else the path's first-level directory (matching the nested-repo
+    probing of `_grep_candidates`; deeper repos are out of scope there too —
+    their files then come from the plain walk, unfiltered). The IGNORED_DIRS
+    pruning of the enumeration is mirrored here (git knows nothing about it —
+    it is a Python-side filter in every enumeration branch), and an absolute
+    rel is refused: `root / "/abs"` would escape the project root (Path
+    semantics), while the anchored include regex can never match such a path."""
+    p = PurePosixPath(rel)
+    if p.is_absolute() or any(part in IGNORED_DIRS for part in p.parts):
+        return
+    f = root / rel
+    if not f.is_file():
+        return
+    listed = _git_ls_files(root, pathspec=rel)
+    if listed is None:
+        top, sep, rest = rel.partition("/")
+        if sep:
+            listed = _git_ls_files(root / top, pathspec=rest)
+    if listed is not None and not listed:
+        return  # inside a working tree, and git does not list the path
+    yield rel, f
+
+
+def _grep_candidates(root: Path, prefix: str = "") -> Iterator[tuple[str, Path]]:
     """Yield (project-relative posix path, Path) for the files worth scanning:
     from `git ls-files` (gitignore-aware) when `root` is a working tree, else
     from a directory walk pruned by IGNORED_DIRS. When `root` is not a working
@@ -461,31 +520,77 @@ def _grep_candidates(root: Path) -> Iterator[tuple[str, Path]]:
     `git ls-files` (their .gitignore is honored by git itself) — build
     artifacts of nested repos would otherwise flood both the scan and the
     results. Everything else keeps the plain walk; the late filters
-    (`_read_greppable`: size cap + binary sniff) apply everywhere."""
+    (`_read_greppable`: size cap + binary sniff) apply everywhere.
+
+    With a non-empty `prefix` (a literal directory prefix every include match
+    must start with — `_include_plan`) candidates outside it are dropped
+    before yield: the ls-files listings are filtered by a cheap string check,
+    a nested repo entirely outside the prefix is not probed at all, and the
+    plain walk starts at root/<prefix>. The prefix's first-level directory is
+    probed for its own working tree exactly as the unprefixed walk would at
+    the top level, so a nested repo under the prefix keeps its gitignore-aware
+    listing. The result set is identical to prefix="" — only faster. A prefix
+    starting with "/" is refused outright: the anchored include regex matches
+    project-relative paths only, and `root / "/abs"` (Path semantics) would
+    walk the host filesystem outside the project."""
+    if prefix.startswith("/"):
+        return
     listed = _git_ls_files(root)
     if listed is not None:
         for rel in listed:
             if any(part in IGNORED_DIRS for part in rel.parts):
                 continue
-            yield rel.as_posix(), root / rel
+            posix = rel.as_posix()
+            if prefix and not posix.startswith(prefix):
+                continue
+            yield posix, root / rel
         return
-    for dirpath, dirnames, filenames in root.walk():
+    if not prefix:
+        for dirpath, dirnames, filenames in root.walk():
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+            for name in filenames:
+                f = Path(dirpath) / name
+                yield f.relative_to(root).as_posix(), f
+            if Path(dirpath) == root:
+                # Top level only: probe each first-level dir once; a nested
+                # working tree replaces the walk under it entirely.
+                for name in list(dirnames):
+                    sub = _git_ls_files(root / name)
+                    if sub is None:
+                        continue
+                    dirnames.remove(name)
+                    for rel in sub:
+                        if any(part in IGNORED_DIRS for part in rel.parts):
+                            continue
+                        yield f"{name}/{rel.as_posix()}", root / name / rel
+        return
+    # Prefixed walk. The prefix's first-level directory may be a nested
+    # working tree (the unprefixed walk probes it at the top level) — honor
+    # that by listing from it; otherwise the prefix subdirectory holds no
+    # project-root top level, so nothing inside it is probed, matching the
+    # unprefixed behavior below the first level. The unprefixed walk prunes
+    # IGNORED_DIRS at every level from the root, so it never enters a
+    # directory named like one — a prefix running through such a component
+    # can therefore match nothing and yields nothing here either.
+    if any(part in IGNORED_DIRS for part in prefix.split("/")):
+        return
+    top = prefix.split("/", 1)[0]
+    sub = _git_ls_files(root / top)
+    if sub is not None:
+        for rel in sub:
+            if any(part in IGNORED_DIRS for part in rel.parts):
+                continue
+            posix = f"{top}/{rel.as_posix()}"
+            if not posix.startswith(prefix):
+                continue
+            yield posix, root / top / rel
+        return
+    walk_root = root / prefix
+    for dirpath, dirnames, filenames in walk_root.walk():
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for name in filenames:
             f = Path(dirpath) / name
-            yield f.relative_to(root).as_posix(), f
-        if Path(dirpath) == root:
-            # Top level only: probe each first-level dir once; a nested
-            # working tree replaces the walk under it entirely.
-            for name in list(dirnames):
-                sub = _git_ls_files(root / name)
-                if sub is None:
-                    continue
-                dirnames.remove(name)
-                for rel in sub:
-                    if any(part in IGNORED_DIRS for part in rel.parts):
-                        continue
-                    yield f"{name}/{rel.as_posix()}", root / name / rel
+            yield prefix + f.relative_to(walk_root).as_posix(), f
 
 
 def _read_greppable(f: Path) -> str | None:
@@ -507,11 +612,28 @@ def _read_greppable(f: Path) -> str | None:
 def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
     regex = re.compile(pattern)
     include_re = _include_matcher(include) if include else None
+    if include.startswith("/"):
+        # Masks are matched against PROJECT-RELATIVE posix paths (re.match is
+        # anchored at that start) — a leading "/" can never match, and the
+        # pruning below must not let `root / "/abs"` (Path semantics) escape
+        # the project root. The unpruned enumeration was immune (it walks
+        # from root and filters by the anchored regex); here the answer is
+        # simply empty.
+        return []
+    prefix, exact = _include_plan(include) if include else ("", None)
     results: list[str] = []
     shown = 0  # match lines actually returned
     total = 0  # matches counted (bounded by GREP_COUNT_LIMIT, reported as ≥N)
     files_with = 0  # distinct files with at least one match
-    for rel, f in _grep_candidates(root):
+    # A magic-free include needs no enumeration at all (one candidate); a
+    # prefix-bearing one prunes the enumeration to that prefix. Both keep the
+    # candidate set identical to the unpruned enumeration (the include regex
+    # is anchored, `_include_plan`), only faster.
+    if exact is not None:
+        candidates: Iterator[tuple[str, Path]] = _exact_candidates(root, exact)
+    else:
+        candidates = _grep_candidates(root, prefix)
+    for rel, f in candidates:
         # `include` is a glob mask over the project-relative path (models
         # naturally send "*.py" / "src/**/*.py", not regexes).
         if include_re and not include_re.match(rel):

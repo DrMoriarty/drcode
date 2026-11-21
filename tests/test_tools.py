@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import types
@@ -595,6 +596,230 @@ def test_grep_search_bad_regex_raises(project_root: Path) -> None:
 def test_grep_search_unreadable_file_skipped(project_root: Path) -> None:
     (project_root / "adir").mkdir()
     assert grep_search(project_root, "x") == []
+
+
+# -- grep_search include pruning (candidate enumeration shortcut) ---------------
+
+
+def test_grep_search_exact_include_never_enumerates(project_root: Path) -> None:
+    # A magic-free include ("src/api/ops/binary.cpp") is one literal path: no
+    # directory walk and no full `git ls-files` may run — the candidate comes
+    # from a single stat (plus, inside a working tree, a pathspec-limited
+    # ls-files). The real case this fixes: a huge non-repo directory made an
+    # exact-path grep take minutes to read one file.
+    huge = project_root / "experiments"
+    huge.mkdir()
+    for i in range(300):
+        d = huge / f"run{i:03}"
+        d.mkdir()
+        (d / "data.bin").write_text("needle\n")
+    target = project_root / "torchvulkan" / "src" / "api" / "ops"
+    target.mkdir(parents=True)
+    (target / "binary.cpp").write_text("needle\n")
+
+    full_listing: list[Path] | None = [Path("experiments/run000/data.bin")]
+    calls: list[str | None] = []
+
+    def spy(root: Path, pathspec: str | None = None) -> list[Path] | None:
+        calls.append(pathspec)
+        return full_listing  # pretend root IS a repo with that one file
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tools, "_git_ls_files", spy)
+    try:
+        assert grep_search(
+            project_root, "needle", include="torchvulkan/src/api/ops/binary.cpp"
+        ) == ["torchvulkan/src/api/ops/binary.cpp:1: needle"]
+    finally:
+        monkey.undo()
+    # Only pathspec-limited calls — never the full enumeration.
+    assert calls == ["torchvulkan/src/api/ops/binary.cpp"]
+
+
+def test_grep_search_exact_include_missing_path_empty(project_root: Path) -> None:
+    (project_root / "a.py").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="no/such/file.py") == []
+    # A directory under the include mask is not a greppable candidate either.
+    (project_root / "sub").mkdir()
+    assert grep_search(project_root, "needle", include="sub") == []
+
+
+def test_grep_search_exact_include_gitignored_invisible(project_root: Path) -> None:
+    # Gitignore fidelity of the fast path: an exact-path include must not
+    # surface a file the enumeration would skip.
+    # Root is NOT a working tree, but the path's first-level directory is one
+    # on its own: its ls-files governs (tracked file found, ignored not).
+    nested = project_root / "vendor"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / ".gitignore").write_text("*.o\n")
+    (nested / "lib.py").write_text("needle\n")
+    (nested / "build.o").write_text("needle\n")
+    (project_root / "loose.py").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="vendor/lib.py") == [
+        "vendor/lib.py:1: needle"
+    ]
+    assert grep_search(project_root, "needle", include="vendor/build.o") == []
+    assert grep_search(project_root, "needle", include="loose.py") == [
+        "loose.py:1: needle"
+    ]
+    # Now the root becomes a working tree: it governs every path, and git does
+    # not descend into a nested repo — exactly like the ls-files enumeration.
+    subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+    (project_root / ".gitignore").write_text("noise.log\n")
+    (project_root / "noise.log").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="noise.log") == []
+    assert grep_search(project_root, "needle", include="loose.py") == [
+        "loose.py:1: needle"
+    ]
+    assert grep_search(project_root, "needle", include="vendor/lib.py") == []
+
+
+def test_grep_search_include_prefix_and_magic_prunes(project_root: Path) -> None:
+    # "src/**/*.py": the walk starts at src/ — everything outside the literal
+    # prefix is never visited; results are unchanged either way.
+    huge = project_root / "experiments"
+    huge.mkdir()
+    for i in range(200):
+        (huge / f"f{i:03}.py").write_text("needle\n")
+    (project_root / "src" / "deep").mkdir(parents=True)
+    (project_root / "src" / "b.py").write_text("needle\n")
+    (project_root / "src" / "deep" / "c.py").write_text("needle\n")
+    (project_root / "top.py").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="src/**/*.py") == [
+        "src/b.py:1: needle",
+        "src/deep/c.py:1: needle",
+    ]
+
+
+def test_grep_search_include_prefix_file_siblings_safe(project_root: Path) -> None:
+    # Magic right after a file name ("src/lib.p*"): the literal run is NOT cut
+    # at the file name — the walk prunes only to the containing directory, so
+    # siblings the trailing magic can still match ("lib.py2") are not lost.
+    (project_root / "src").mkdir()
+    (project_root / "src" / "lib.py").write_text("needle\n")
+    (project_root / "src" / "lib.py2").write_text("needle\n")
+    (project_root / "src" / "other.py").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="src/lib.p*") == [
+        "src/lib.py:1: needle",
+        "src/lib.py2:1: needle",
+    ]
+
+
+def test_grep_search_include_leading_globstar_unchanged(project_root: Path) -> None:
+    # A mask starting with "**/" has an empty literal prefix — nothing to
+    # prune, the full enumeration runs as before.
+    (project_root / "a" / "x.py").mkdir(parents=True)
+    (project_root / "a" / "x.py" / "f.py").write_text("needle\n")
+    (project_root / "b.py").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="**/f.py") == [
+        "a/x.py/f.py:1: needle"
+    ]
+    assert grep_search(project_root, "needle", include="**/*.py") == [
+        "b.py:1: needle",
+        "a/x.py/f.py:1: needle",
+    ]
+
+
+def test_grep_search_include_into_ignored_dir_empty(project_root: Path) -> None:
+    # The enumeration prunes IGNORED_DIRS on every level from the root — the
+    # pruned paths (exact and prefix) must not surface files the enumeration
+    # would never enter (regression: the fast paths skipped that check).
+    def build(root: Path) -> None:
+        (root / "node_modules" / "inner").mkdir(parents=True)
+        (root / "node_modules" / "direct.js").write_text("needle\n")
+        (root / "node_modules" / "inner" / "dep.js").write_text("needle\n")
+        (root / ".venv" / "lib").mkdir(parents=True)
+        (root / ".venv" / "lib" / "venvlib.py").write_text("needle\n")
+        (root / "__pycache__").mkdir()
+        (root / "__pycache__" / "a.cache").write_text("needle\n")
+        (root / "keep.py").write_text("needle\n")
+
+    # Non-repo root.
+    build(project_root)
+    for mask in [
+        "node_modules/direct.js",
+        "node_modules/inner/dep.js",
+        "node_modules/**/*",
+        ".venv/lib/venvlib.py",
+        "__pycache__/a.cache",
+    ]:
+        assert grep_search(project_root, "needle", include=mask) == [], mask
+    # Repo root: git does not know IGNORED_DIRS — the Python-side filter must
+    # apply on the exact-path fast path too.
+    subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+    subprocess.run(["git", "-C", str(project_root), "add", "keep.py"], check=True)
+    for mask in [
+        "node_modules/direct.js",
+        ".venv/lib/venvlib.py",
+        "__pycache__/a.cache",
+    ]:
+        assert grep_search(project_root, "needle", include=mask) == [], mask
+    assert grep_search(project_root, "needle", include="keep.py") == [
+        "keep.py:1: needle"
+    ]
+
+
+def test_grep_search_include_prefix_through_ignored_dir_empty(
+    project_root: Path,
+) -> None:
+    # A prefix that runs through an IGNORED_DIRS component: the old walk never
+    # entered node_modules/, so the prefixed walk must yield nothing either.
+    (project_root / "node_modules" / "pkg").mkdir(parents=True)
+    (project_root / "node_modules" / "pkg" / "dep.js").write_text("needle\n")
+    assert grep_search(project_root, "needle", include="node_modules/**/*.js") == []
+    assert grep_search(project_root, "needle", include="node_modules/pkg/*.js") == []
+
+
+def test_grep_search_include_absolute_path_empty(project_root: Path) -> None:
+    # A leading "/" can never match a project-relative path (the include
+    # regex is anchored there) — and the pruning must not let `root / "/abs"`
+    # escape the project root and read host files.
+    outside = project_root.parent / "grep-outside-probe"
+    outside.mkdir(exist_ok=True)
+    (outside / "real.py").write_text("needle\n")
+    try:
+        assert grep_search(project_root, "needle", include=f"{outside}/real.py") == []
+        assert grep_search(project_root, "needle", include=f"{outside}/*.py") == []
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_grep_search_include_prefix_inside_nested_repo(project_root: Path) -> None:
+    # ls-files branch of a first-level nested repo + prefix: candidates from
+    # the nested repo's own gitignore-aware listing, cut to the prefix; a
+    # sibling top-level dir outside the prefix is not even probed.
+    nested = project_root / "torchvulkan"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / ".gitignore").write_text("target/\n")
+    api = nested / "src" / "api"
+    api.mkdir(parents=True)
+    (api / "binary.cpp").write_text("needle\n")
+    (nested / "target" / "artifact.o").mkdir(parents=True)
+    (nested / "target" / "artifact.o" / "x.cpp").write_text("needle\n")
+    (nested / "readme.md").write_text("needle\n")
+    probed: list[str] = []
+
+    real_ls = tools._git_ls_files
+    top_names = {project_root.name, "torchvulkan"}
+
+    def spy(root: Path, pathspec: str | None = None) -> list[Path] | None:
+        # Full listings of the project root and the prefix's own top-level dir
+        # are legitimate; anything else would be a probe outside the prefix.
+        if pathspec is None and root.name not in top_names:
+            probed.append(root.name)
+        return real_ls(root, pathspec)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tools, "_git_ls_files", spy)
+    try:
+        assert grep_search(
+            project_root, "needle", include="torchvulkan/src/**/*.cpp"
+        ) == ["torchvulkan/src/api/binary.cpp:1: needle"]
+    finally:
+        monkey.undo()
+    assert probed == []  # no top-level probe outside the prefix was needed
 
 
 # -- check_command -----------------------------------------------------------------

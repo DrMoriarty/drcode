@@ -167,6 +167,10 @@ class TaskFormLayer(DrCodeState):
         # AFTER entering the form).
         self._new_task_goal_id = None
         self.query_one("#nt-goal", Static).update("")
+        # Every fresh creation starts on research (the first entry of
+        # _KIND_CYCLE): the selection never carries over from the previous
+        # task — edits/drafts still set their own kind below.
+        self.new_task_kind = TaskKind.RESEARCH
         self._new_task_mode = True
         # The form is not tied to any task: drop the viewed highlight so the
         # sidebar doesn't single out a task while the user composes a new one.
@@ -501,8 +505,9 @@ class TaskFormLayer(DrCodeState):
                 self._sync_sidebar_cursor(None)
         self.chat_input.focus()
 
-    # Tab cycles the new-task type through all three kinds.
-    _KIND_CYCLE: ClassVar = (TaskKind.FEATURE, TaskKind.BUG, TaskKind.RESEARCH)
+    # Tab cycles the new-task type through all three kinds (research first —
+    # every fresh form also opens on it, see action_new_task).
+    _KIND_CYCLE: ClassVar = (TaskKind.RESEARCH, TaskKind.FEATURE, TaskKind.BUG)
 
     # One-line summary per kind, shown at the bottom of the new-task form;
     # the currently selected kind is highlighted (markup colors mirror the

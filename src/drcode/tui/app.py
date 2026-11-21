@@ -719,7 +719,7 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._esc_armed_at: float = 0.0
         self._esc_last_press: float = 0.0
         self._esc_disarm_timer: Timer | None = None
-        self.new_task_kind: TaskKind = TaskKind.FEATURE
+        self.new_task_kind: TaskKind = TaskKind.RESEARCH
         # Per task: incremented on every run_agent() start; the finally
         # block of a superseded (cancelled) run must not touch shared
         # state.

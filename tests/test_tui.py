@@ -101,7 +101,8 @@ async def test_create_task_through_ui(app: DrCodeApp) -> None:
         tasks = app.manager.all_tasks()
         assert len(tasks) == 1
         task = tasks[0]
-        assert task.kind is TaskKind.FEATURE
+        # A fresh form always opens on research (see _KIND_CYCLE).
+        assert task.kind is TaskKind.RESEARCH
         assert [e.text for e in task.pending_input] == ["Build the thing\nwith details"]
         # No model configured: the run stops at the guard and the task
         # stays active with its prompt kept (it will be sent once a model
@@ -119,10 +120,10 @@ async def test_new_task_form_kind_switch_and_cancel(app: DrCodeApp) -> None:
         nt_input = app.query_one("#nt-input", TextArea)
         nt_input.text = "a bug report"
         await pilot.press("tab")
-        assert app.new_task_kind is TaskKind.BUG
+        assert app.new_task_kind is TaskKind.FEATURE
 
         await pilot.press("tab")
-        assert app.new_task_kind is TaskKind.RESEARCH
+        assert app.new_task_kind is TaskKind.BUG
 
         # esc cancels the form without creating anything.
         await pilot.press("escape")
@@ -1838,7 +1839,7 @@ async def test_edit_held_task_merges_and_queues(app: DrCodeApp) -> None:
         # The user rewrites everything and switches the type, then queues.
         app.new_task_input.text = "rewritten condition"
         await pilot.press("tab")  # feature → bug
-        assert app.new_task_kind is TaskKind.BUG
+        assert app.new_task_kind is TaskKind.BUG  # cycle: research → feature → bug
         await pilot.press("ctrl+enter")
         await pilot.pause()
 

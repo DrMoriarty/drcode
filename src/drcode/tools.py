@@ -455,7 +455,13 @@ def _git_ls_files(root: Path) -> list[Path] | None:
 def _grep_candidates(root: Path) -> Iterator[tuple[str, Path]]:
     """Yield (project-relative posix path, Path) for the files worth scanning:
     from `git ls-files` (gitignore-aware) when `root` is a working tree, else
-    from a directory walk pruned by IGNORED_DIRS."""
+    from a directory walk pruned by IGNORED_DIRS. When `root` is not a working
+    tree itself, FIRST-LEVEL subdirectories that are git working trees on
+    their own get gitignore-aware candidate lists from their own
+    `git ls-files` (their .gitignore is honored by git itself) — build
+    artifacts of nested repos would otherwise flood both the scan and the
+    results. Everything else keeps the plain walk; the late filters
+    (`_read_greppable`: size cap + binary sniff) apply everywhere."""
     listed = _git_ls_files(root)
     if listed is not None:
         for rel in listed:
@@ -468,6 +474,18 @@ def _grep_candidates(root: Path) -> Iterator[tuple[str, Path]]:
         for name in filenames:
             f = Path(dirpath) / name
             yield f.relative_to(root).as_posix(), f
+        if Path(dirpath) == root:
+            # Top level only: probe each first-level dir once; a nested
+            # working tree replaces the walk under it entirely.
+            for name in list(dirnames):
+                sub = _git_ls_files(root / name)
+                if sub is None:
+                    continue
+                dirnames.remove(name)
+                for rel in sub:
+                    if any(part in IGNORED_DIRS for part in rel.parts):
+                        continue
+                    yield f"{name}/{rel.as_posix()}", root / name / rel
 
 
 def _read_greppable(f: Path) -> str | None:

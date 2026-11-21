@@ -543,6 +543,50 @@ def test_grep_search_respects_gitignore(project_root: Path) -> None:
     assert grep_search(project_root, "needle") == ["keep.py:1: needle"]
 
 
+def test_grep_search_nested_gitignore_honored(project_root: Path) -> None:
+    # The project root is NOT a working tree, but a first-level subdir is one
+    # on its own: its .gitignore must apply (git ls-files from that subdir).
+    nested = project_root / "torch-vulkan"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / ".gitignore").write_text("target/\n")
+    (nested / "target").mkdir()
+    (nested / "target" / "build_artifact.o").write_text("needle\n")
+    (nested / "src").mkdir()
+    (nested / "src" / "lib.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["torch-vulkan/src/lib.py:1: needle"]
+
+
+def test_grep_search_nested_repos_cover_their_subtree(project_root: Path) -> None:
+    # A nested working tree replaces the plain walk under it entirely: even
+    # files git would track-but-ignore via nested .gitignores stay consistent,
+    # and the walk never descends into it for a second listing.
+    nested = project_root / "repo"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / "deep").mkdir()
+    (nested / "deep" / "f.py").write_text("needle\n")
+    (project_root / "plain").mkdir()
+    (project_root / "plain" / "g.py").write_text("needle\n")
+    (project_root / "root.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == [
+        "root.py:1: needle",
+        "repo/deep/f.py:1: needle",
+        "plain/g.py:1: needle",
+    ]
+
+
+def test_grep_search_non_repo_subdir_keeps_walk_filters(project_root: Path) -> None:
+    # Subdirs that are not git repos keep the old behavior: plain walk with
+    # IGNORED_DIRS pruning, late size/binary filters decide.
+    (project_root / "build").mkdir()
+    (project_root / "build" / "huge.bin").write_text("needle\n" + "x" * 1_000_001)
+    (project_root / "build" / "ok.py").write_text("needle\n")
+    (project_root / "build" / "node_modules").mkdir()
+    (project_root / "build" / "node_modules" / "dep.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["build/ok.py:1: needle"]
+
+
 def test_grep_search_bad_regex_raises(project_root: Path) -> None:
     with pytest.raises(re.error):
         grep_search(project_root, "[")

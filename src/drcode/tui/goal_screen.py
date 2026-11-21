@@ -446,8 +446,7 @@ class GoalParentPicker(ModalScreen[str | None]):
             listing.append(TaskItem("[bold]Make top-level[/]", None, goal_id=self._TOP))
         for goal, depth in self._candidates:
             text = (
-                f"{'  ' * depth}{_goal_type_marker(goal)} "
-                f"{escape(goal.title_display)}"
+                f"{'  ' * depth}{_goal_type_marker(goal)} {escape(goal.title_display)}"
             )
             if goal.status is GoalStatus.DONE:
                 text += " [green]done[/]"
@@ -558,8 +557,7 @@ class GoalAssignPicker(ModalScreen[str | None]):
         listing.clear()
         for goal, depth in self._candidates:
             text = (
-                f"{'  ' * depth}{_goal_type_marker(goal)} "
-                f"{escape(goal.title_display)}"
+                f"{'  ' * depth}{_goal_type_marker(goal)} {escape(goal.title_display)}"
             )
             if goal.status is GoalStatus.DONE:
                 text += " [green]done[/]"

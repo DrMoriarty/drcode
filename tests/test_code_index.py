@@ -822,3 +822,95 @@ class TestSubagentPromptNote:
         on = _subagent_instructions(project_root, None, True)
         assert "code_callers" in on and "code_symbols" in on
         assert "{" not in on.replace("{project_path}", "")
+
+
+@pytest.mark.skipif(not _PYTHON_READY, reason="python grammar unavailable")
+class TestScaleFuses:
+    """The 10⁵-file guards: build-tree glob pruning, the entry cap,
+    the oversized-disk-index bail-out and the warm-restart no-rewrite."""
+
+    def test_build_tree_dirs_are_pruned_by_glob(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        counting = _counting_extractor(monkeypatch)
+        (project_root / "src.py").write_text(_PY_SAMPLE)
+        torch_dir = project_root / "experiments" / "build-torch214"
+        torch_dir.mkdir(parents=True)
+        (torch_dir / "vendor.c").write_text("int f(void) { return 1; }\n")
+        (project_root / "cmake-build-debug" / "gen.py").parent.mkdir(parents=True)
+        (project_root / "cmake-build-debug" / "gen.py").write_text(_PY_SAMPLE)
+        (project_root / "BuildOutput" / "x.py").parent.mkdir(parents=True)
+        (project_root / "BuildOutput" / "x.py").write_text(_PY_SAMPLE)
+
+        entries, _ = load_index(project_root)
+        assert list(entries) == ["src.py"]
+        # The pruned files were never even parsed.
+        assert counting == ["src.py"]
+
+    def test_warm_restart_does_not_rewrite_the_disk_index(
+        self, py_project: Path
+    ) -> None:
+        load_index(py_project)  # first build → the initial write
+        disk = py_project / ".drcode" / "code_index.json"
+        stat_before = disk.stat()
+        clear_code_index_cache()  # simulated restart: cold in-memory cache
+        entries, info = load_index(py_project)
+        assert entries and not info.built_now
+        stat_after = disk.stat()
+        assert (stat_before.st_mtime_ns, stat_before.st_size) == (
+            stat_after.st_mtime_ns,
+            stat_after.st_size,
+        )
+
+    def test_oversized_disk_index_is_not_parsed(
+        self, py_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from drcode.code_index import store as store_mod
+
+        load_index(py_project)
+        monkeypatch.setattr(store_mod, "_MAX_DISK_INDEX_BYTES", 1)
+        clear_code_index_cache()
+        # The 295 MB-style legacy file is not even read: the project
+        # re-indexes from scratch and stays correct.
+        entries, info = load_index(py_project)
+        assert "sample.py" in entries
+        assert info.built_now
+
+    def test_overflow_refuses_to_index(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from drcode.code_index import store as store_mod
+
+        monkeypatch.setattr(store_mod, "MAX_INDEX_FILES", 1)
+        (project_root / "a.py").write_text(_PY_SAMPLE)
+        (project_root / "b.py").write_text(_PY_SAMPLE)
+        entries, info = load_index(project_root)
+        assert entries == {}
+        assert not info.built_now
+        notice = take_build_notice(project_root)
+        assert notice is not None and "skipped" in notice
+        # Once per process: the second detection re-queues nothing.
+        assert take_build_notice(project_root) is None
+
+    def test_large_but_legal_listing_serves_from_cache(
+        self, py_project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from drcode.code_index import store as store_mod
+
+        calls: list[int] = []
+        original = store_mod._discover_files
+
+        def counting(root: Path, *, limit: int | None = None):
+            calls.append(1)
+            return original(root, limit=limit)
+
+        monkeypatch.setattr(store_mod, "_RESCAN_FILE_LIMIT", 0)
+        monkeypatch.setattr(store_mod, "_discover_files", counting)
+        entries, _ = load_index(py_project)
+        assert entries
+        assert len(calls) == 1
+        # Second call inside the TTL: the cached listing (paths AND stat
+        # keys) is reused — no second walk.
+        entries, _ = load_index(py_project)
+        assert entries
+        assert len(calls) == 1

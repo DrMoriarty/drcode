@@ -27,6 +27,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,63 @@ _IGNORED_DIRS = {
     ".tox",
     ".idea",
     ".vscode",
+    ".cache",
 }
+
+# Glob patterns for directory names that look like build/dependency
+# trees (matched case-insensitively against each path segment). A
+# general mechanism, not a per-name blacklist: PyTorch-style build
+# forests (`build-torch214`, `cmake-build-debug`, `bazel-bin`, …) each
+# hold 10⁵ files of vendor/compile junk that would otherwise inflate
+# the index by orders of magnitude. grep_search keeps the coverage for
+# anything pruned here.
+_IGNORED_DIR_GLOBS = (
+    "build*",  # build-torch214, BuildOutput, build-linux
+    "_build",
+    "cmake-*",  # cmake-build-debug, cmake-build-release-clang
+    "bazel-*",
+    "buck-out",
+    "out",
+    "output",
+    "obj",
+    "objs",
+    "target",  # cargo/maven convention
+    "deps",
+    "_deps",  # CMake FetchContent
+    "vendor",
+    "third_party",
+    "thirdparty",
+    "3rdparty",
+    "external",
+    "extern",
+    "pods",
+    "deriveddata",
+    "*.dSYM",
+)
+
+# Scale fuses for degenerate projects. MAX_INDEX_FILES caps the total
+# entry count: a candidate file set beyond it is not indexed at all
+# (grep_search keeps the coverage) — parsing and persisting that many
+# records would make every code_* call a minutes-long freeze. The cap
+# is generous real-project headroom over the 10⁴-scale a healthy index
+# has after the build-tree pruning above; when it fires, a service
+# event says so (§8.3 mechanism).
+MAX_INDEX_FILES = 50_000
+# A persisted index larger than this is not even parsed at cold start
+# (a legacy/polluted file of that size costs ~a minute of json.loads
+# alone) — treated as unusable, the project re-indexes from scratch.
+_MAX_DISK_INDEX_BYTES = 128 * 1024 * 1024
+
+# The file discovery (walk + stat) is cached per root between calls.
+# Small/medium candidate sets (≤ _RESCAN_FILE_LIMIT) are re-discovered
+# on EVERY call — the stat keys must be fresh for the edit→query
+# self-heal flow, and a few thousand stats stay milliseconds. Beyond
+# the limit a re-walk costs seconds-to-minutes, so the cached listing
+# (paths AND stat keys) is reused until _DISCOVERY_TTL passes — a new
+# or edited file becomes visible within that window, and the query-
+# level reparse_entry self-heal covers proven-stale records regardless.
+_RESCAN_FILE_LIMIT = 20_000
+_DISCOVERY_TTL_SECONDS = 30.0
 
 _DEFAULT_EXTRACTOR = SymbolExtractor()
 
@@ -156,6 +213,23 @@ class _CachedIndex:
 _INDEX_LOCK = threading.Lock()
 _INDEX_CACHES: dict[str, _CachedIndex] = {}
 
+
+@dataclass
+class _DiscoveryCache:
+    """The cached file listing of one root: (path, relpath, stat key)
+    triples plus the overflow flag and the build time (TTL anchor)."""
+
+    entries: list[tuple[Path, str, tuple[int, int]]]
+    overflow: bool
+    at: float
+
+
+_DISCOVERY_LOCK = threading.Lock()
+_DISCOVERY_CACHES: dict[str, _DiscoveryCache] = {}
+# Roots whose overflow service-event was already queued this process —
+# the event is once-per-process, not once-per-TTL-window.
+_OVERFLOW_NOTIFIED: set[str] = set()
+
 # The ONE per-root service-event notice ("code index: N files, M symbols…"),
 # produced by the first build in this process and consumed by the first
 # code_* tool call that sees it (§8.3: lazy first build, one event).
@@ -175,9 +249,17 @@ def clear_code_index_cache(project_root: Path | None = None) -> None:
         if project_root is None:
             _INDEX_CACHES.clear()
             _BUILD_NOTICES.clear()
+            _OVERFLOW_NOTIFIED.clear()
         else:
-            _INDEX_CACHES.pop(str(Path(project_root)), None)
-            _BUILD_NOTICES.pop(str(Path(project_root)), None)
+            key = str(Path(project_root))
+            _INDEX_CACHES.pop(key, None)
+            _BUILD_NOTICES.pop(key, None)
+            _OVERFLOW_NOTIFIED.discard(key)
+    with _DISCOVERY_LOCK:
+        if project_root is None:
+            _DISCOVERY_CACHES.clear()
+        else:
+            _DISCOVERY_CACHES.pop(str(Path(project_root)), None)
 
 
 def take_build_notice(project_root: Path) -> str | None:
@@ -227,18 +309,36 @@ def reparse_entry(
     return record
 
 
+def _is_ignored_dir(name: str) -> bool:
+    """A directory that is never descended into: the explicit
+    `_IGNORED_DIRS` set plus the case-insensitive build/dependency glob
+    patterns (`build-torch214` → `build*`)."""
+    if name in _IGNORED_DIRS:
+        return True
+    lowered = name.lower()
+    return any(fnmatch(lowered, pattern) for pattern in _IGNORED_DIR_GLOBS)
+
+
 def _load_disk_index(project_root: Path) -> tuple[dict[str, list[Any]], str | None]:
     """The persisted index as a raw {relpath: [key, record]} dict plus the
     HEAD sentinel it was built under, or ({}, None) on any problem
-    (missing, corrupted, unexpected shape) — the caller then re-parses
-    the project and rewrites the file."""
+    (missing, corrupted, unexpected shape, or a degenerate oversized
+    legacy index) — the caller then re-parses the project and rewrites
+    the file. An oversized file is not even read: json.loads of a
+    multi-hundred-megabyte document costs ~a minute, and a healthy
+    pruned/capped index cannot reach that size in the first place."""
+    path = _index_path(project_root)
     try:
-        data = json.loads(_index_path(project_root).read_text(encoding="utf-8"))
+        if path.stat().st_size > _MAX_DISK_INDEX_BYTES:
+            return {}, None
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}, None
     if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
         return {}, None
     if data.get("version") != INDEX_VERSION:
+        return {}, None
+    if len(data["entries"]) > MAX_INDEX_FILES:
         return {}, None
     head = data.get("head")
     return data["entries"], head if isinstance(head, str) else None
@@ -270,23 +370,80 @@ def _write_disk_index(
         pass
 
 
-def _discover_files(root: Path) -> list[Path]:
+def _discover_files(
+    root: Path, *, limit: int | None = None
+) -> tuple[list[tuple[Path, str, tuple[int, int]]], bool]:
     """Every candidate source file under the project root (known
     extension — tree-sitter's table OR the ctags fallback's, size cap,
-    ignored dirs pruned) — os.walk with pruning, so a 10²–10³-file
-    project stays milliseconds."""
-    found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
-        for name in filenames:
-            path = Path(dirpath) / name
-            if (
-                _DEFAULT_EXTRACTOR.language_for(path) is None
-                and _FALLBACK_EXTRACTOR.language_for(path) is None
-            ):
-                continue
-            found.append(path)
-    return found
+    ignored dirs pruned by name AND by build-tree glob patterns) as
+    `(path, relpath, (mtime_ns, size))` triples — os.scandir with
+    pruning, so a 10²–10³-file project stays milliseconds. Symlinked
+    directories are never descended into.
+
+    Returns the triples plus an overflow flag: when more than `limit`
+    candidates are found the walk stops early (the caller refuses to
+    index a degenerate file set that large)."""
+    if limit is None:
+        limit = MAX_INDEX_FILES  # Late-bound: tests monkeypatch the cap.
+    found: list[tuple[Path, str, tuple[int, int]]] = []
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            scanner = os.scandir(directory)
+        except OSError:
+            continue
+        with scanner:
+            for entry in scanner:
+                name = entry.name
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if not _is_ignored_dir(name):
+                            stack.append(Path(entry.path))
+                        continue
+                except OSError:
+                    pass  # Treated as a file below; its stat decides.
+                path = Path(entry.path)
+                if (
+                    _DEFAULT_EXTRACTOR.language_for(path) is None
+                    and _FALLBACK_EXTRACTOR.language_for(path) is None
+                ):
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue  # Vanished mid-scan: skip silently.
+                if stat.st_size > MAX_INDEXED_FILE_BYTES:
+                    continue
+                if len(found) >= limit:
+                    return found, True
+                rel = path.relative_to(root).as_posix()
+                found.append((path, rel, (stat.st_mtime_ns, stat.st_size)))
+    return found, False
+
+
+def _discovery_for(root: Path) -> tuple[list[tuple[Path, str, tuple[int, int]]], bool]:
+    """`_discover_files` through the per-root cache. Small/medium
+    candidate sets are re-discovered on every call (fresh stat keys for
+    the edit→query self-heal; still milliseconds); large sets reuse the
+    cached listing until `_DISCOVERY_TTL_SECONDS` pass — a full walk
+    over a huge tree costs seconds-to-minutes per call otherwise."""
+    key = str(root)
+    now = time.monotonic()
+    with _DISCOVERY_LOCK:
+        cached = _DISCOVERY_CACHES.get(key)
+        if (
+            cached is not None
+            and (cached.overflow or len(cached.entries) > _RESCAN_FILE_LIMIT)
+            and now - cached.at < _DISCOVERY_TTL_SECONDS
+        ):
+            return cached.entries, cached.overflow
+    entries, overflow = _discover_files(root)
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHES[key] = _DiscoveryCache(
+            entries=entries, overflow=overflow, at=now
+        )
+    return entries, overflow
 
 
 def load_index(
@@ -309,23 +466,41 @@ def load_index(
     vanished since the last build simply drops out of the entries. The
     on-disk index is rewritten only when something actually changed (a
     re-parse, a vanished file, a broken entry) — the common warm call is
-    a pure read."""
+    a pure read.
+
+    Scale fuses (a project with 10⁵+ files must not turn every call
+    into a minutes-long freeze): build/dependency trees are pruned at
+    discovery; a candidate file set beyond MAX_INDEX_FILES is not
+    indexed at all (an empty index + a one-per-process service event;
+    grep_search keeps the coverage); an oversized persisted index is
+    not even parsed — it re-indexes from scratch."""
     root = Path(project_root)
     started = time.monotonic()
     # Fast path outside the lock: stat everything once (task_search's
     # load_archive does the same — no reason to serialize the walk).
-    stat_entries: list[tuple[Path, str, tuple[int, int]]] = []
-    for path in _discover_files(root):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue  # Vanished mid-scan: skip silently.
-        if stat.st_size > MAX_INDEXED_FILE_BYTES:
-            continue
-        rel = path.relative_to(root).as_posix()
-        stat_entries.append((path, rel, (stat.st_mtime_ns, stat.st_size)))
-
+    stat_entries, overflow = _discovery_for(root)
     cache_key = str(root)
+    if overflow:
+        # Degenerate file set (unpruned build/vendor forests at 10⁵+
+        # scale): refuse to index, serve empty — parsing and persisting
+        # that many records would freeze every call. One service event
+        # per process says so; the entries dict stays honest.
+        with _INDEX_LOCK:
+            _INDEX_CACHES.pop(cache_key, None)
+            if cache_key not in _OVERFLOW_NOTIFIED:
+                _OVERFLOW_NOTIFIED.add(cache_key)
+                _BUILD_NOTICES[cache_key] = (
+                    f"code index: skipped — more than {MAX_INDEX_FILES} "
+                    "candidate source files (build/dependency trees?); "
+                    "grep_search keeps the coverage"
+                )
+        return {}, BuildInfo(
+            files=0,
+            symbols=0,
+            languages=0,
+            ms=int((time.monotonic() - started) * 1000),
+            built_now=False,
+        )
     with _INDEX_LOCK:
         cached = _INDEX_CACHES.get(cache_key)
         if not isinstance(cached, _CachedIndex):
@@ -405,13 +580,7 @@ def load_index(
             for rel, key in file_keys.items()
             if rel in entries
         )
-        if persist and (
-            changed
-            or disk_dirty
-            or stale_on_disk
-            or head_guard_fired
-            or (cached is None and stat_entries)
-        ):
+        if persist and (changed or disk_dirty or stale_on_disk or head_guard_fired):
             serialized: dict[str, list[object]] = {}
             for rel, key in file_keys.items():
                 record = entries.get(rel)

@@ -409,6 +409,18 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     Footer.-compact FooterKey .footer-key--description {
         padding-left: 0;
     }
+    # Grouped footer entries (the Move pair: a KeyGroup + a trailing
+    # FooterLabel): textual's compact CSS pads the group's left edge
+    # (doubling the gap the preceding entry's margin-right already
+    # gives) and zeroes the label's margin, so the next entry touches
+    # the group label. Even it out: no extra space before the group,
+    # one space after its label.
+    Footer.-compact KeyGroup {
+        padding-left: 0;
+    }
+    Footer.-compact FooterLabel {
+        margin-right: 1;
+    }
     """
     # Shared group object for the ctrl+up/ctrl+down move pair: one
     # identity guarantees textual's consecutive-groupby merges them into

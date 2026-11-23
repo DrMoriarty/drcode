@@ -217,6 +217,18 @@ class Config(BaseSettings):
     # the cap entirely. The counter is per run: a new user message starts
     # from zero again.
     request_limit: int | None = 500
+    # Per-run token budget (≈tokens): the cumulative `total_tokens` (input +
+    # output, pydantic-ai's RunUsage) an agent run may spend before pydantic-ai
+    # raises UsageLimitExceeded and the run stops GRACEFULLY — the attempt is
+    # kept unfinished (like an abort, resumable with a new message) and a
+    # service event reports the spent amount. The safety net against a runaway
+    # run (a looping tool, endless retries) burning money: request_limit caps
+    # the number of turns, this caps their cost. Applies to coding/research
+    # agent runs and to delegate_research subagents; None (the default) = no
+    # token budget. Layered like every non-provider setting: env
+    # (DRCODE_RUN_TOKEN_LIMIT) > project drcode.json > user drcode.json >
+    # defaults.
+    run_token_limit: int | None = None
     # Cap on tool calls executed per ONE model response (a "batch"): the
     # first `tool_batch_limit` distinct calls of a response run, the rest get
     # a plain tool result telling the model to re-issue them. Exact

@@ -656,7 +656,17 @@ async def run_delegate_tool(deps: AgentDeps, config: Config, brief: str) -> str:
             async with agent.iter(
                 brief,
                 deps=subagent_deps,
-                usage_limits=UsageLimits(request_limit=model_config.request_limit),
+                usage_limits=UsageLimits(
+                    request_limit=model_config.request_limit,
+                    # The per-run ≈token budget (project setting
+                    # `run_token_limit`) applies to subagents too: each
+                    # delegation is capped at the same cumulative
+                    # input+output total as a full agent run. Exhaustion
+                    # degrades to a plain failed-spawn tool result via the
+                    # generic handler below (the parent never crashes; the
+                    # slot refund rules apply as for any failure).
+                    total_tokens_limit=model_config.run_token_limit,
+                ),
             ) as run:
                 async for _node in run:
                     # Keep the parent's stall-watchdog fed while the

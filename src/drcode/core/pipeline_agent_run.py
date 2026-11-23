@@ -41,6 +41,7 @@ from ..core.usage import (
 )
 from ..models import ImageAttachment, PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole, resolve_available, subagent_usage_key
+from ..read_cache import ReadCache
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
@@ -161,8 +162,19 @@ class PipelineAgentRunLayer(CoreState):
         # TUI cold-start path (this module loads before the first frame).
         from ..title_gen import build_title_agent
 
-        """Generate the task's title from its description with the model
-        serving the task (project setting ``generate_task_titles``).
+        """Generate the task's title from its description (project setting
+        ``generate_task_titles``).
+
+        The call profile is identical to the compaction summarizer's — a
+        tool-less one-shot mini-agent with a bounded prompt and a one-line
+        output — so it is served by the COMPACTION role's model (usually a
+        cheap one) instead of loading the task's coding/research model with
+        a cosmetic call before the main run even starts (see goal c6ee24e4:
+        token economy, plus the title no longer adds to the activation
+        latency of the expensive model). COMPACTION has NO fallback of its
+        own in ``providers.resolve_effective``, so an unset compaction slot
+        (``is_ready == False``) keeps the historical behavior: the model
+        serving the task.
 
         Only DERIVED titles are rewritten: a title that arrived explicitly
         at creation (``task.title_explicit`` — the agents' report tools,
@@ -189,17 +201,27 @@ class PipelineAgentRunLayer(CoreState):
         description = self.manager.editable_condition(task.id)
         if not description:
             return
+        title_role = AgentRole.COMPACTION
+        title_config = self.resolved_config(AgentRole.COMPACTION)
+        if not title_config.is_ready:
+            # No compaction model selected anywhere: fall back to the
+            # task's serving model (the pre-change behavior).
+            title_role = role
+            title_config = self.resolved_config(role)
         try:
             agent = build_title_agent(
-                self.resolved_config(role),
-                # Provider slot-wait visibility (see _wait_announcer).
+                title_config,
+                # Provider slot-wait visibility (see _wait_announcer); the
+                # wait wording stays on the task's slot role — it is shown
+                # in the task's chat, whatever model ends up naming it.
                 announce_wait=self._wait_announcer(task.id, role),
             )
             result = await agent.run(build_title_prompt(description))
             # The title call counts toward the session usage like every
-            # other model call (under the task's serving role).
+            # other model call (under the role that actually served it —
+            # compaction/<model> normally, the task's role on fallback).
             self._record_session_usage(
-                result.usage, role, self.resolved_model_key(role)
+                result.usage, title_role, self.resolved_model_key(title_role)
             )
             title = clean_generated_title(result.output)
         except Exception as e:  # noqa: BLE001 - a failed title must not kill the run
@@ -248,6 +270,7 @@ class PipelineAgentRunLayer(CoreState):
         # check, the agent build and the compaction gates — uses it.
         role = self._task_role(task)
         from pydantic_ai import Agent
+        from pydantic_ai.exceptions import UsageLimitExceeded
         from pydantic_ai.usage import UsageLimits
 
         from ..agent_build import AgentDeps
@@ -323,6 +346,7 @@ class PipelineAgentRunLayer(CoreState):
                 subagent_gate,
                 web_fetch_gate,
                 code_index,
+                read_cache,
             ) = await self._prepare_agent_run(task, task_id, role, generation)
             # Pre-run forced compaction (project setting
             # compaction_resume_min_tokens): when the task waited long
@@ -424,9 +448,20 @@ class PipelineAgentRunLayer(CoreState):
                             # same two steps the TUI performs after a user
                             # send on an ACTIVE task.
                             input_hooks=self._input_delivery_hooks(),
+                            # Per-run read_file dedup (created in
+                            # _prepare_agent_run next to the gates).
+                            read_cache=read_cache,
                         ),
                         usage_limits=UsageLimits(
-                            request_limit=self.config.request_limit
+                            request_limit=self.config.request_limit,
+                            # Per-run ≈token budget (project setting
+                            # `run_token_limit`): a cumulative cap on the
+                            # run's total (input + output) tokens — the
+                            # money safety net against a runaway run.
+                            # Exhaustion raises UsageLimitExceeded, handled
+                            # as a graceful stop below (see
+                            # _agent_turn_budget_exhausted).
+                            total_tokens_limit=self.config.run_token_limit,
                         ),
                     ) as run:
                         # Sync markers for the per-node re-render (below):
@@ -515,6 +550,16 @@ class PipelineAgentRunLayer(CoreState):
                         task, task_id, run, consumed, content, generation
                     )
                     raise
+                except UsageLimitExceeded as e:
+                    # The run's budget (request_limit, or the per-run token
+                    # budget `run_token_limit`) is spent: a graceful stop —
+                    # the attempt is kept unfinished like after an abort
+                    # (no requeue, no failed-queue exclusion), a service
+                    # event reports what the run spent.
+                    self._agent_turn_budget_exhausted(
+                        task, task_id, run, consumed, content, generation, e
+                    )
+                    break
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
                     # A transient network error (transport failure like a
                     # connection refused/timeout, or HTTP 429 rate limiting)
@@ -613,12 +658,14 @@ class PipelineAgentRunLayer(CoreState):
         SubagentGate | None,
         WebFetchGate | None,
         bool,
+        ReadCache,
     ]:
         """Register the run and assemble everything the turn loop needs:
         the (worktree) root the tools run in, the built agent, the
         on_task_start hook's instructions for the first prompt, the run's
-        subagent gate (None when delegation is off) and the run's web-fetch
-        gate (None unless this is a RESEARCH task with web fetch enabled)."""
+        subagent gate (None when delegation is off), the run's web-fetch
+        gate (None unless this is a RESEARCH task with web fetch enabled)
+        and the run's read_file dedup cache."""
         # Deferred heavy imports (pydantic_ai / agent_build / subagents):
         # keep them off the TUI cold-start path. `build_agent` resolves
         # through the module global — a seam tests monkeypatch (see the
@@ -725,6 +772,15 @@ class PipelineAgentRunLayer(CoreState):
             request_turns: Callable[[], int] | None = _next_notice_turn
         else:
             request_turns = None
+        # Per-run read_file dedup (see read_cache.ReadCache): ONE object for
+        # the whole run — shared across the per-turn deps rebuilds and a
+        # mid-run compaction pause (created outside the turn loop for the
+        # same reason the gates are), dying with the run closure so no
+        # orphan map outlives the transcript it must stay consistent with.
+        # A run restart (network retry, watchdog) starts a fresh cache: the
+        # first re-read after a restart costs a full text once, then dedups
+        # again — a safe degradation, never a wrong one.
+        read_cache = ReadCache()
         # Managed web reading (project setting web_fetch_mode): RESEARCH
         # only — web_fetch_policy_for returns None for every other role, so
         # the tool is not registered there at all. Read at activation, so a
@@ -820,6 +876,7 @@ class PipelineAgentRunLayer(CoreState):
             subagent_gate,
             web_fetch_gate,
             code_index,
+            read_cache,
         )
 
     async def _consume_turn_input(
@@ -1267,6 +1324,59 @@ class PipelineAgentRunLayer(CoreState):
         # Drop our streaming preview; a newer run (if any) owns the label
         # now and must not be touched.
         self._drop_stream_preview(task_id, generation)
+
+    def _agent_turn_budget_exhausted(
+        self,
+        task: Task,
+        task_id: str,
+        run: AgentRun[AgentDeps, str] | None,
+        consumed: list[PendingInput],
+        content: str | list[Any] | None,
+        generation: int,
+        error: Exception,
+    ) -> None:
+        """The run hit its usage budget (pydantic-ai's UsageLimits — the
+        per-run token budget `run_token_limit`, or `request_limit`):
+        stop GRACEFULLY instead of failing. Exactly the abort path's
+        transcript care (persist + sanitize + `task.unfinished`), but the
+        task KEEPS its ACTIVE status — it stays paused on the unfinished
+        flag, and a new message (or a restart's auto-resume) continues the
+        attempt; the queue is not touched and the failed-queue exclusion
+        does not fire. A service event reports the spent amount and points
+        at the context dialog (🧠 in the task status bar) and the knob that
+        lifts the budget."""
+        spent = 0
+        if run is not None:
+            try:
+                # `usage` is a property (RunUsage) — the cumulative spend of
+                # the run so far, exact API numbers (never the chars/4 ≈).
+                spent = run.usage.total_tokens or 0
+            except Exception:  # noqa: BLE001, S110 - reporting never fatal
+                pass
+        limit = self.config.run_token_limit
+        limit_txt = f"{limit:,}" if limit else "the configured"
+        self._show_event(
+            task,
+            f"Run budget exhausted ({spent:,} ≈tokens spent of {limit_txt}): "
+            "the attempt is kept unfinished — send a message (or restart "
+            "drcode) to resume it. The 🧠 counter in the task status bar "
+            "opens the context dialog with the per-agent token layout; "
+            "raise `run_token_limit` in drcode.json (env: "
+            "DRCODE_RUN_TOKEN_LIMIT) to lift the budget.",
+        )
+        if self._agent_generations.get(task_id) == generation and (
+            task.status is TaskStatus.ACTIVE
+        ):
+            # The same transcript care an abort takes: persist whatever the
+            # interrupted turn managed to do, then sanitize the API-invalid
+            # tail so later messages can append in any order.
+            self._backdate_consumed_prompt(run, consumed, content)
+            self._persist_task_messages(task, run)
+            task.messages = sanitized_messages(task.messages)
+            task.unfinished = True
+            self.manager.storage.save(task)
+        if self._agent_generations.get(task_id) == generation:
+            self._drop_stream_preview(task_id, generation)
 
     def _agent_turn_network_error(
         self,

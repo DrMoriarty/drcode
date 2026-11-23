@@ -1,11 +1,14 @@
 """Agent-generated task titles (project setting ``generate_task_titles``).
 
-On a task's FIRST activation the pipeline asks the model serving the task
-(the same resolved role config the run itself uses) to write a short title
-from the task's description — before the main run starts, so the user sees
-the new name on the active task from the very beginning. Kept apart from
-the coding/tester agents exactly like the compaction summarizer: a
-tool-less mini-agent that reads the description and returns one line.
+On a task's FIRST activation the pipeline asks a model to write a short
+title from the task's description — before the main run starts, so the
+user sees the new name on the active task from the very beginning. Kept
+apart from the coding/tester agents exactly like the compaction
+summarizer: a tool-less mini-agent that reads the description and returns
+one line. The pipeline serves it from the COMPACTION role's model (the
+same call profile: one shot, bounded input, one-line output) and falls
+back to the task's serving model only when no compaction model is
+selected (see drcode.core.pipeline_agent_run._maybe_generate_title).
 
 Generation is exactly-once per task lifetime: the ``Task.title_generated``
 stamp is set only on SUCCESS, so a failed attempt keeps the historical
@@ -44,7 +47,8 @@ _DESCRIPTION_CAP = 6_000
 def build_title_agent(
     config: Config, announce_wait: agent_model.WaitAnnouncer | None = None
 ) -> Agent[None, str]:
-    """Tool-less title generator over the task's serving role config.
+    """Tool-less title generator over the given role config (the pipeline
+    passes the COMPACTION role's config, falling back to the task's own).
 
     System prompt comes from the bundled ``title.txt`` template; the
     description is passed as a plain-text user prompt (see

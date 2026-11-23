@@ -7,7 +7,10 @@ Permission model:
   /tmp/drcode/<task-id> — /tmp outside that directory is NOT writable, so two
   tasks cannot interfere through shared scratch files;
 - run_bash inspects the command and refuses rm/mv/cp whose path arguments
-  escape that writable area, points the child process's TMPDIR at the
+  escape that writable area, refuses filesystem scans (find/fd/du/rg/
+  grep -r/ls -R) rooted outside it — a whole-disk walk reads personal data
+  and, on macOS, fires TCC privacy prompts (mdfind stays allowed) — and
+  points the child process's TMPDIR at the
   task's scratch directory, and exports DRCODE_TASK_ID / DRCODE_WORKTREE
   so a parallel task's child processes can pick per-task resources
   (ports, caches) — see the parallel development slots. It also redirects
@@ -763,6 +766,9 @@ def _split_segments(command: str) -> list[str]:
 _DESTRUCTIVE_WORD = re.compile(r"(?:^|[\s;&|(])(sudo\s+)?(rm|mv|cp)\b")
 # Conservative fallback for unparsable segments: any `git … stash …` in there.
 _GIT_STASH_WORD = re.compile(r"\bgit\b[^;&|]*\bstash\b")
+# … and a whole-disk filesystem scan (only the unmistakable leading-root
+# forms; anything subtler is parsed or passed by the positional check above).
+_SCAN_ROOT_WORD = re.compile(r"\b(?:find|fd|du)\s+(?:/|~|\"\~|\"\$|\$)")
 
 # `git stash` subcommands allowed through the guard (read-only over the stack).
 _ALLOWED_STASH_SUBCOMMANDS = {"list"}
@@ -1126,6 +1132,233 @@ def _network_violation(
     )
 
 
+# -- bash filesystem-scan guard ------------------------------------------------
+#
+# A recursive scan the agent points OUTSIDE the writable area walks the user's
+# personal filesystem: on macOS every protected location it touches
+# (~/Desktop, ~/Documents, ~/Library with Calendar/Reminders/Contacts
+# databases, /Volumes, …) fires a TCC privacy prompt attributed to DrCode
+# (the responsible app for the agent's child processes) — the 2026-11-23
+# incident: a `find / -name <file> 2>/dev/null | grep -v … | head` in search
+# of one markdown file produced a cascade of ~10 system dialogs plus a read
+# of personal data the task never needed. The same `find <file>` question is
+# answered by scoping the search inside the project root (the default `.` is
+# already safe) or by `mdfind` (Spotlight index — it does not walk the
+# filesystem and is deliberately NOT blocked).
+#
+# Guarded commands: `find`, `fd`, `du`, `rg`, `grep -r/-R`, `ls -R`. The
+# traversal ROOTS are the command's path arguments (for fd/rg/grep the FIRST
+# positional is the pattern and is skipped unless it looks like an absolute
+# path); a root that resolves outside the writable area (project root +
+# scratch dir) is refused. NO explicit root given (`find -name x`) defaults
+# to `.` — allowed, untouched.
+#
+# Deliberately the SAME strictness as the rm/mv/cp and network checks: only
+# the LEADING command of each shell segment is inspected (after env
+# assignments and COMMAND_WRAPPERS); no `$()` analysis, no interpreters
+# (python's os.walk, etc.), no reading a path list from a file. This is a
+# policy guard against casual whole-disk scans, not a filesystem sandbox.
+
+SCAN_ROOT_COMMANDS = frozenset({"find", "fd", "du", "rg", "ls", "grep"})
+# Commands whose FIRST positional is a search pattern, not a traversal root
+# (`rg PATTERN [PATH]…`, `fd [PATTERN] [PATH]…`, `grep [opts] PATTERN [FILE]…`).
+_PATTERN_FIRST_SCAN_COMMANDS = frozenset({"fd", "rg", "grep"})
+# Long options taking a VALUE, per command — their values must not be read as
+# traversal roots (a missed entry only risks a false refusal, an extra one a
+# false pass, so the lists stay minimal).
+_SCAN_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "find": frozenset(),  # expression flags (-name …) come after the roots
+    "fd": frozenset(
+        [
+            "-e",
+            "--extension",
+            "-t",
+            "--type",
+            "-E",
+            "--exclude",
+            "-g",
+            "--glob",
+            "--iglob",
+            "-d",
+            "--max-depth",
+            "-c",
+            "--color",
+            "-S",
+            "--size",
+            "-j",
+            "--threads",
+            "--changed-within",
+            "--changed-before",
+            "--path-separator",
+        ]
+    ),
+    "du": frozenset(
+        [
+            "-B",
+            "--block-size",
+            "-X",
+            "--exclude-from",
+            "--exclude",
+            "-d",
+            "--max-depth",
+            "--threshold",
+        ]
+    ),
+    "rg": frozenset(
+        [
+            "-e",
+            "--regexp",
+            "-t",
+            "--type",
+            "-T",
+            "--type-not",
+            "-g",
+            "--glob",
+            "--iglob",
+            "-d",
+            "--max-depth",
+            "-m",
+            "--max-count",
+            "-A",
+            "-B",
+            "-C",
+            "--context",
+            "--after-context",
+            "--before-context",
+            "--path-separator",
+            "--sort",
+        ]
+    ),
+    "ls": frozenset(["-w", "--width", "-T", "--tabsize", "--block-size"]),
+    "grep": frozenset(
+        [
+            "-e",
+            "--regexp",
+            "-f",
+            "--file",
+            "-m",
+            "--max-count",
+            "-A",
+            "-B",
+            "-C",
+            "--context",
+            "--after-context",
+            "--before-context",
+            "--include",
+            "--exclude",
+            "--exclude-dir",
+            "--label",
+        ]
+    ),
+}
+# fd's --search-path IS a traversal root smuggled through a flag — its value
+# is checked like a positional root.
+_SCAN_ROOT_FLAGS = {"--search-path"}
+
+
+def _scan_violation(command: str, cmd: str, raw: str, root: Path) -> PathViolation:
+    return PathViolation(
+        f"Command refused: '{command}': {cmd} would scan '{raw}', which is "
+        f"outside the allowed locations. A recursive walk of the user's "
+        f"filesystem reads personal data the task does not need, and on macOS "
+        f"every protected location it touches (Desktop, Documents, Library, "
+        f"/Volumes, …) fires a system privacy (TCC) prompt attributed to this "
+        f"app. {_writable_hint(root, None)} Scope the search inside the "
+        f"project (plain `find . -name …` or `find {root} …`, grep_search/glob "
+        f"tools), or — to locate a file anywhere on disk — use `mdfind -name "
+        f"<name>` (Spotlight index: it does not walk the filesystem) and then "
+        f"read only the concrete paths found."
+    )
+
+
+def _scan_recursive(args: list[str], cmd: str) -> bool:
+    """True when the scan command recurses. Only `grep` and `ls` are gated on
+    it (a bare `ls ~` or `grep -n x file` touches one path, not a walk):
+    `grep` needs -r/-R/--recursive, `ls` -R/--recursive — detected inside
+    short clusters too (`-rn`, `-lRa`), like the network guard's `-sSL`."""
+    if cmd not in ("grep", "ls"):
+        return True
+    want = "R" if cmd == "ls" else "r"
+    for w in args:
+        if w.startswith("--"):
+            name = w.partition("=")[0]
+            if name in ("--recursive",):
+                return True
+        elif w.startswith("-"):
+            if want in w[1:]:
+                return True
+    return False
+
+
+def _looks_like_scan_root(word: str) -> bool:
+    """True for a word that reads as a path ROOT rather than a search
+    pattern: absolute, home-relative (`~…`) or variable-expanded
+    (`$HOME`, `${HOME}`). A relative word always resolves INSIDE the project
+    root, so it can never be the out-of-scope scan this guard refuses."""
+    return word.startswith(("/", "~", "$"))
+
+
+def _expand_scan_root(root: Path, word: str) -> Path:
+    p = Path(os.path.expandvars(word)).expanduser()
+    if not p.is_absolute():
+        p = root / p
+    return p.resolve()
+
+
+def _check_scan_command(
+    root: Path,
+    command: str,
+    cmd: str,
+    args: list[str],
+    extra_writable: Path | None,
+) -> None:
+    """Refuse a filesystem scan whose traversal root lies outside the
+    writable area (see the section comment above)."""
+    if not _scan_recursive(args, cmd):
+        return
+    value_flags = _SCAN_VALUE_FLAGS.get(cmd, frozenset())
+    roots: list[str] = []
+    positionals: list[str] = []
+    j = 0
+    end_all = False  # for find: the first expression flag ends the path list
+    while j < len(args):
+        w = args[j]
+        if w == "--":
+            positionals.extend(args[j + 1 :])
+            break
+        if w.startswith("-"):
+            if cmd == "find" and w not in ("-H", "-L", "-P", "-E"):
+                # `-name x` and friends: everything after this is expression.
+                end_all = True
+            name = w.partition("=")[0]
+            if name in _SCAN_ROOT_FLAGS and "=" not in w and j + 1 < len(args):
+                roots.append(args[j + 1])
+                j += 2
+                continue
+            if name in value_flags and "=" not in w:
+                j += 2  # skip the flag's value
+                continue
+            j += 1
+            continue
+        if end_all:
+            break
+        positionals.append(w)
+        j += 1
+    if cmd in _PATTERN_FIRST_SCAN_COMMANDS:
+        # The first positional is the search pattern — a root only when it
+        # itself looks like a path root (`rg pat /`, `grep -r pat ~`).
+        for k, w in enumerate(positionals):
+            if k > 0 or _looks_like_scan_root(w):
+                roots.append(w)
+    else:
+        roots.extend(positionals)
+    for raw in roots:
+        if _looks_like_scan_root(raw) or "/" in raw or raw in (".", ".."):
+            p = _expand_scan_root(root, raw)
+            if not is_writable(root, p, extra_writable):
+                raise _scan_violation(command, cmd, raw, root)
+
+
 def _strip_url_head(raw: str) -> str:
     """The authority of a bare target — `host[:port]` out of
     `[user[:pass]@]host[:port]/path?query#fragment`."""
@@ -1390,6 +1623,15 @@ def check_command(
     parallel task agents would otherwise push and pop each other's stashed
     changes. `git stash list` (read-only) stays allowed.
 
+    Additionally, a filesystem-scan command (`find`, `fd`, `du`, `rg`,
+    `grep -r`, `ls -R`) whose traversal root lies outside the writable area
+    is refused: a recursive walk of the user's filesystem reads personal
+    data the task does not need and, on macOS, fires TCC privacy prompts
+    attributed to DrCode (the 2026-11-23 incident). `find` with no explicit
+    path (default `.`) is untouched, and `mdfind` is deliberately allowed —
+    the refusal suggests it as the safe way to locate a file anywhere. See
+    the "bash filesystem-scan guard" section for the exact scope.
+
     Finally, an outbound request of a network client (`curl`, `wget`, `http`,
     `https`, `ftp`) is refused unless it targets the loopback interface:
     external network access belongs to the managed `web_fetch` tool, while
@@ -1426,6 +1668,8 @@ def check_command(
                     "could not be checked",
                     web_fetch_available=web_fetch_available,
                 ) from None
+            if _SCAN_ROOT_WORD.search(segment):
+                raise _scan_violation(command, "find/fd/du", segment, root) from None
             continue
         i = 0
         # Strip leading env assignments and wrappers in any order
@@ -1452,6 +1696,9 @@ def check_command(
                 words[i + 1 :],
                 web_fetch_available=web_fetch_available,
             )
+            continue
+        if base in SCAN_ROOT_COMMANDS:
+            _check_scan_command(root, command, base, words[i + 1 :], extra_writable)
             continue
         if base not in DESTRUCTIVE_COMMANDS:
             continue

@@ -1397,6 +1397,73 @@ def test_run_bash_refuses_destructive_outside(project_root: Path) -> None:
         asyncio.run(run_bash(project_root, "rm -rf /"))
 
 
+# -- filesystem-scan guard (run_bash) ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The 2026-11-23 incident command, verbatim.
+        (
+            "find / -maxdepth 6 -name 'torchvulkan-blockers.md' 2>/dev/null"
+            " | grep -v build-torch | head"
+        ),
+        "find ~ -name x",
+        "find $HOME -name x",
+        "find /Users/x -name y",
+        "find ../",
+        "sudo find /",
+        "du -sh ~",
+        "ls -R /Users/x",
+        "rg pattern /Volumes/Backup",
+        "grep -r pattern /Users/x",
+        "grep -rn pattern /Users/x",
+        "fd pattern /",
+        "fd --search-path /",
+    ],
+)
+def test_run_bash_refuses_scan_outside_project(
+    project_root: Path, command: str
+) -> None:
+    # A filesystem scan rooted outside the writable area walks the user's
+    # personal data and fires macOS TCC prompts attributed to DrCode.
+    with pytest.raises(PathViolation):
+        check_command(project_root, command)
+
+
+def test_run_bash_refuses_scan_outside_via_run_bash(project_root: Path) -> None:
+    with pytest.raises(PathViolation):
+        asyncio.run(run_bash(project_root, "du -sh ~"))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -name x",
+        "find -maxdepth 6 -name x",  # no path: defaults to `.`
+        "find",
+        "du -sh .",
+        "ls -R",  # no path: defaults to `.`
+        "ls -la ~",  # not recursive: one dir, no walk
+        "grep -n pattern file.txt",  # not recursive
+        "grep -r pattern src",
+        "rg -e pat --type py",
+        "mdfind -name torchvulkan-blockers",  # Spotlight, not a walk — allowed
+    ],
+)
+def test_run_bash_allows_scans_inside_project(project_root: Path, command: str) -> None:
+    check_command(project_root, command)
+
+
+def test_run_bash_allows_scan_of_project_and_scratch(
+    project_root: Path, scratch_root: Path
+) -> None:
+    check_command(project_root, f"find {project_root} -name x")
+    check_command(
+        project_root, f"find {scratch_root} -name x", extra_writable=scratch_root
+    )
+
+
 def test_run_bash_sets_task_tmpdir(project_root: Path, scratch_root: Path) -> None:
     # Child processes get TMPDIR pointed at the task's scratch directory,
     # which is created lazily on the first run_bash call.

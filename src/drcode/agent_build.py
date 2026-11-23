@@ -488,7 +488,11 @@ def build_agent(
     wrapper (`agent_model.TailInjectionModel`): it rides on EVERY model
     request as a synthetic TAIL message, recomputed from `task.todos` at
     request time — so a list created or updated mid-activation is seen by
-    the next request of the same run. Deliberately NOT dynamic instructions:
+    the next request of the same run. The FULL block goes out only while it
+    can buy something (unchecked items, or the list changed since the last
+    full injection); a fully closed unchanged list degrades to a one-line
+    "checklist complete" stub (see `agent_tools.todo_instructions` — the
+    context-economy criterion). Deliberately NOT dynamic instructions:
     those render into the leading system messages, and a mid-activation
     checklist mutation there would invalidate the server-side prefix cache
     almost entirely (the #a0a55d3d incident). The tail instead only ever
@@ -863,7 +867,9 @@ def build_agent(
     # task (`task.todos`, persisted by storage) and is injected into the
     # model context on every request as a synthetic TAIL message (the
     # `todo_supplier` wired at activation — see `agent_model.TailInjectionModel`),
-    # so an abandoned stale list cannot go unnoticed either. Both tools run through
+    # so an abandoned stale list cannot go unnoticed either (a fully closed
+    # unchanged list degrades to a one-line stub — agent_tools.todo_instructions).
+    # Both tools run through
     # _run_tool so the fixable ValueErrors below become ModelRetry
     # prompts for the model.
     if kind is TaskKind.FEATURE:

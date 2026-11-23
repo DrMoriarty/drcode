@@ -624,6 +624,54 @@ def test_todo_instructions_absent_otherwise() -> None:
     )
 
 
+def test_todo_instructions_closed_list_degrades_to_stub() -> None:
+    """The degenerate case of the tail injection: a fully closed checklist
+    that has not changed since the last full block goes out gets only a
+    one-line stub on the following requests — a constant per-request spend
+    for a list that will not change is work in the void (the
+    context-economy criterion)."""
+    from drcode.tui.pipeline import PipelineLayer
+
+    task = Task(
+        title="t",
+        kind=TaskKind.FEATURE,
+        todos=[TodoItem(text="a", done=True), TodoItem(text="b", done=True)],
+    )
+    # First request after the list closed: the full block goes out once
+    # (the state changed relative to "never injected")...
+    text = PipelineLayer._todo_instructions(task)
+    assert text is not None
+    assert "# Task checklist (current state)" in text
+    assert "0 of 2 items are unchecked" in text
+    # ...and every subsequent request gets only the stub.
+    stub = PipelineLayer._todo_instructions(task)
+    assert stub is not None
+    assert "do not reopen items" in stub
+    assert "# Task checklist" not in stub
+
+    # Reopening an item changes the state: the full block comes back.
+    task.todos[1].done = False
+    text = PipelineLayer._todo_instructions(task)
+    assert text is not None
+    assert "# Task checklist (current state)" in text
+    assert "1 of 2 items are unchecked" in text
+
+    # Closing it again: one full block (the state changed), then the stub.
+    task.todos[1].done = True
+    text = PipelineLayer._todo_instructions(task)
+    assert text is not None
+    assert "# Task checklist (current state)" in text
+    stub = PipelineLayer._todo_instructions(task)
+    assert stub is not None
+    assert "do not reopen items" in stub
+
+    # Adding items to a closed list also restores the full block.
+    task.todos.append(TodoItem(text="c"))
+    text = PipelineLayer._todo_instructions(task)
+    assert text is not None
+    assert "3. [ ] c" in text
+
+
 # -- completion soft gate -------------------------------------------------------
 
 

@@ -561,6 +561,19 @@ class Task(BaseModel):
     # every compaction (see tui/pipeline.py), so the agent cannot "forget"
     # it. Rendered by render_todos below.
     todos: list[TodoItem] = Field(default_factory=list)
+    # Fingerprint of the checklist state (text+done per item, see
+    # agent_tools.todo_fingerprint) as of the LAST full tail injection
+    # (agent_tools.todo_instructions). Bookkeeping for the degenerate
+    # case of the tail injection: once the checklist is fully closed AND
+    # unchanged since the last full block went out, subsequent requests
+    # get a one-line "checklist complete" stub instead of the full block —
+    # a constant per-request spend for a list that will not change is work
+    # in the void (the context-economy criterion: a default-on mechanism
+    # must never burn context without a chance of buying anything).
+    # Persisted with the task like every other field (plain default — old
+    # task files load without migration); None = the current state has
+    # never been fully injected (fresh list, or list changed since).
+    todos_injected_fingerprint: str | None = None
     # Tool-call ids whose results the agent marked as no longer needed (the
     # mark_unneeded tool). The mark only RECORDS the decision — nothing is
     # removed at mark time: the pipeline collapses all marked tool-return

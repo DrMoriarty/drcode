@@ -1047,6 +1047,21 @@ def subagent_notice(
     )
 
 
+def todo_fingerprint(todos: list[TodoItem]) -> str:
+    """A stable equality fingerprint of a checklist state (text + done flag
+    per item, in order). Used by `todo_instructions` to detect "the list is
+    unchanged since the last full injection" — the trigger for the
+    degenerate-case stub. A plain deterministic string, not a hash: the
+    lists are tiny and the comparison is per model request."""
+    return repr([(item.text, item.done) for item in todos])
+
+
+_TODO_COMPLETE_STUB = (
+    "Your todo checklist is complete (all items checked off) — do not "
+    "reopen items; finish the task."
+)
+
+
 def todo_instructions(task: Task) -> str | None:
     """The task's current checklist state as a prompt block (feature tasks
     with a non-empty list only — nothing else has todo tools or a
@@ -1060,6 +1075,19 @@ def todo_instructions(task: Task) -> str | None:
     after a `todo_create`/`todo_update` call within the same uninterrupted
     run, not only after a restart or a compaction.
 
+    DEGENERATE CASE (the context-economy criterion): the FULL block is
+    injected only while it can still buy something — unchecked items
+    present, or the list changed since the last full injection (checked
+    off, reopened, items added/removed — the fingerprint in
+    `task.todos_injected_fingerprint` differs). Once the checklist is
+    fully closed AND unchanged, the remaining requests of the run get a
+    ONE-LINE "checklist complete — do not reopen items" stub instead: a
+    constant ~50–150-token per-request spend for a list that will not
+    change is work in the void, and a default-on mechanism must never
+    burn context without a chance of a return. Reopening an item (or
+    creating/replacing the list) changes the state, so the full block
+    comes back immediately.
+
     Deliberately the TAIL, not dynamic instructions: those render into the
     leading system messages, and a mid-activation checklist mutation there
     would invalidate the server-side prefix cache almost entirely (the
@@ -1068,10 +1096,17 @@ def todo_instructions(task: Task) -> str | None:
     reaches the persisted transcript (the "instructions never touch the
     transcript" rule). The list itself lives in `task.todos`; if it were
     only prompt material, an interrupted attempt or a compaction could
-    drop it."""
+    drop it (the compaction summary carries it too — see
+    `core/pipeline_compaction`)."""
     if task.kind is not TaskKind.FEATURE or not task.todos:
         return None
     unchecked = len(task.unchecked_todos)
+    fingerprint = todo_fingerprint(task.todos)
+    if unchecked == 0 and task.todos_injected_fingerprint == fingerprint:
+        # Fully closed and unchanged since the last full injection: the
+        # stub is all the model still needs.
+        return _TODO_COMPLETE_STUB
+    task.todos_injected_fingerprint = fingerprint
     lines = [
         "# Task checklist (current state)",
         "",

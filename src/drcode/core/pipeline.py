@@ -125,7 +125,9 @@ class PipelineCoreLayer(CoreState):
         activation: re-reads the task from the manager for EVERY model
         request, so the tail block always mirrors the CURRENT checklist
         state. None for non-feature tasks and empty lists (the wrapper
-        then passes the request through untouched)."""
+        then passes the request through untouched); a fully closed
+        unchanged checklist degrades to the one-line complete stub
+        (agent_tools.todo_instructions)."""
         from ..agent import todo_instructions
 
         return todo_instructions(self.manager.get(task_id))

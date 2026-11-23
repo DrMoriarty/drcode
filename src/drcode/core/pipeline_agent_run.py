@@ -1259,6 +1259,11 @@ class PipelineAgentRunLayer(CoreState):
                 "Old tool results (automatic clearing) reached ≈1/6 of the "
                 "context window — pausing the run to unload them…"
             )
+        elif self._stale_thinking_due(task):
+            pause_event = (
+                "Stale thinking parts (sliding-window strip) reached ≈1/6 "
+                "of the context window — pausing the run to strip them…"
+            )
         else:
             return False
         self._show_event(task, pause_event)

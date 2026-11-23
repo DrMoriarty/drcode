@@ -136,6 +136,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
     dst.auto_context_unloading = src.auto_context_unloading
+    dst.thinking_keep_recent_turns = src.thinking_keep_recent_turns
     dst.todo_tail = src.todo_tail
     dst.compaction_resume_min_tokens = src.compaction_resume_min_tokens
     dst.background_compaction = src.background_compaction
@@ -900,6 +901,20 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     value=d.auto_context_unloading,
                     toggle_id="ts-auto-unload",
                 )
+                with Horizontal(classes="ts-row"):
+                    yield Input(
+                        value=str(d.thinking_keep_recent_turns),
+                        id="ts-thinking-keep",
+                        placeholder="5",
+                        max_length=3,
+                    )
+                    yield Label(
+                        "Thinking window — model exchanges whose reasoning "
+                        "stays in the history verbatim; older thinking is "
+                        "stripped in batches to cut the re-prefilled tokens "
+                        "(reasoning models only; 0 = off)",
+                        classes="ts-label",
+                    )
                 yield ToggleRow(
                     "Live todo tail — attach the task's live checklist to "
                     "every model request as a trailing message (off: the "
@@ -1012,6 +1027,10 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         if resume_input.value != str(d.compaction_resume_min_tokens):
             with self.prevent(Input.Changed):  # same staleness rule
                 resume_input.value = str(d.compaction_resume_min_tokens)
+        thinking_input = self.query_one("#ts-thinking-keep", Input)
+        if thinking_input.value != str(d.thinking_keep_recent_turns):
+            with self.prevent(Input.Changed):  # same staleness rule
+                thinking_input.value = str(d.thinking_keep_recent_turns)
         changed = {
             "#ts-subagents-coder": d.subagents_coder != o.subagents_coder,
             "#ts-subagents-researcher": (
@@ -1035,6 +1054,9 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
             ),
             "#ts-compaction-resume": (
                 d.compaction_resume_min_tokens != o.compaction_resume_min_tokens
+            ),
+            "#ts-thinking-keep": (
+                d.thinking_keep_recent_turns != o.thinking_keep_recent_turns
             ),
         }
         for selector, is_changed in changed.items():
@@ -1183,4 +1205,19 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
             return
         if value != self._draft.compaction_resume_min_tokens:
             self._draft.compaction_resume_min_tokens = value
+            self._refresh()
+
+    @on(Input.Changed, "#ts-thinking-keep")
+    def _thinking_keep_changed(self, event: Input.Changed) -> None:
+        """Parse the thinking-window field: empty/garbage keeps the
+        previous draft value (the user may be mid-typing), a number
+        clamps to ≥ 0 (0 = the sliding-window strip is off — nothing but
+        the model-switch housekeeping ever touches thinking parts)."""
+        text = event.value.strip()
+        try:
+            value = max(int(text), 0) if text else 0
+        except ValueError:
+            return
+        if value != self._draft.thinking_keep_recent_turns:
+            self._draft.thinking_keep_recent_turns = value
             self._refresh()

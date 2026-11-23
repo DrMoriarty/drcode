@@ -339,6 +339,130 @@ def strip_thinking_parts(
     return cleaned, removed
 
 
+def _stale_thinking_response_indices(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent_turns: int,
+) -> list[int]:
+    """Indices of the messages whose thinking parts lie OUTSIDE the
+    freshness window: the last `keep_recent_turns` THINKING-BEARING model
+    exchanges (`kind: "response"`) keep theirs, every older one is stale.
+
+    The window counts thinking-bearing exchanges only — plain text turns
+    between them do not consume freshness (they carry nothing to keep).
+    Pure, one scan, no mutation. `keep_recent_turns <= 0` marks nothing.
+    """
+    if keep_recent_turns <= 0:
+        return []
+    fresh = 0
+    stale: list[int] = []
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict):
+            continue
+        kind = msg.get("kind") or msg.get("role")
+        if kind != "response":
+            continue
+        if not any(
+            isinstance(p, dict) and p.get("part_kind") == "thinking"
+            for p in msg.get("parts") or []
+        ):
+            continue
+        fresh += 1
+        if fresh > keep_recent_turns:
+            stale.append(index)
+    stale.reverse()
+    return stale
+
+
+def _thinking_tokens_of(message: dict[str, Any]) -> int:
+    """≈ tokens (chars/4) held by one message's thinking parts."""
+    total = 0
+    for part in message.get("parts") or []:
+        if not (isinstance(part, dict) and part.get("part_kind") == "thinking"):
+            continue
+        content = part.get("content")
+        total += estimate_tokens(content if isinstance(content, str) else str(content))
+    return total
+
+
+def stale_thinking_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent_turns: int,
+) -> int:
+    """≈ tokens (chars/4) held by the thinking parts OUTSIDE the freshness
+    window (see strip_stale_thinking) — the batch strip gate's threshold
+    input. Pure, no mutation; 0 when the window disables the strip."""
+    if keep_recent_turns <= 0:
+        return 0
+    return sum(
+        _thinking_tokens_of(messages[index])
+        for index in _stale_thinking_response_indices(
+            messages, keep_recent_turns=keep_recent_turns
+        )
+    )
+
+
+def strip_stale_thinking(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent_turns: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove the thinking parts of the model responses OUTSIDE the
+    freshness window (purely mechanical, no model call).
+
+    The sliding-window half of the thinking discipline — strip_thinking_parts
+    (the model-switch housekeeping) is the other half. The reasoning of the
+    last `keep_recent_turns` THINKING-BEARING model exchanges stays verbatim:
+    fresh reasoning is what the model is still working from, and providers
+    that require thinking blocks around recent tool calls get them. The older
+    exchanges' chain-of-thought is dead weight — every request of the run
+    re-prefills it, thousands of tokens per turn on reasoning models — so it
+    is dropped. Applied in BATCHES at the pipeline's eviction pause points
+    (one prompt-cache invalidation per batch, riding any eviction batch that
+    fires anyway), never per exchange — a per-exchange strip would invalidate
+    the prompt cache more often than it saves.
+
+    `keep_recent_turns <= 0` disables the strip entirely (messages pass
+    through, 0 removed). Returns (cleaned messages, ≈tokens (chars/4)
+    removed). A stripped response that held NOTHING but thinking is dropped
+    entirely — the same rule strip_thinking_parts applies: a response with an
+    empty part list is not API-valid, and thinking-only responses carry no
+    tool calls, so dropping them cannot orphan a later tool result."""
+    if keep_recent_turns <= 0:
+        return messages, 0
+    stale = set(
+        _stale_thinking_response_indices(messages, keep_recent_turns=keep_recent_turns)
+    )
+    if not stale:
+        return messages, 0
+    cleaned: list[dict[str, Any]] = []
+    removed = 0
+    for index, msg in enumerate(messages):
+        if index not in stale or not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        parts = msg.get("parts")
+        if not isinstance(parts, list):
+            cleaned.append(msg)
+            continue
+        kept = [
+            p
+            for p in parts
+            if not (isinstance(p, dict) and p.get("part_kind") == "thinking")
+        ]
+        removed += _thinking_tokens_of(msg)
+        if not kept and (
+            msg.get("kind") == "response" or msg.get("role") == "response"
+        ):
+            # A thinking-only stale response: dropping the parts leaves an
+            # API-invalid empty response — drop the message instead.
+            continue
+        cleaned.append({**msg, "parts": kept} if len(kept) != len(parts) else msg)
+    return cleaned, removed
+
+
 def drop_model_switch_notes(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Remove every synthetic model-switch takeover note from a transcript.
 

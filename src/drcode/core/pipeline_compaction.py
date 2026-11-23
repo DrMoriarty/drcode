@@ -52,6 +52,7 @@ from ..core.usage import _is_context_overflow_error
 from ..eviction import (
     AUTO_EVICTION_PAUSE_FRACTION,
     EVICTION_WINDOW_FRACTION,
+    THINKING_PAUSE_FRACTION,
     auto_evictable_ids,
     evict_marked,
     marked_tokens,
@@ -67,6 +68,8 @@ from ..transcript import (
     last_context_tokens,
     sanitized_messages,
     serialize_messages,
+    stale_thinking_tokens,
+    strip_stale_thinking,
     strip_thinking_parts,
 )
 from ..web_fetch import web_fetch_policy_for
@@ -1028,6 +1031,31 @@ class PipelineCompactionLayer(CoreState):
             marked_tokens(task.messages, ids) * AUTO_EVICTION_PAUSE_FRACTION >= window
         )
 
+    def _stale_thinking_tokens(self, task: Task) -> int:
+        """≈ tokens (chars/4) of the dev transcript's thinking parts
+        OUTSIDE the freshness window (the `thinking_keep_recent_turns`
+        project setting) — the sliding-window strip's threshold input. 0
+        when the setting disables the strip (0) or nothing is stale."""
+        keep = self.settings.thinking_keep_recent_turns
+        if keep <= 0:
+            return 0
+        return stale_thinking_tokens(task.messages, keep_recent_turns=keep)
+
+    def _stale_thinking_due(self, task: Task) -> bool:
+        """Whether stale thinking (the sliding-window strip's selection)
+        has piled up enough to be worth its OWN batch strip (its own
+        prompt-cache invalidation): its ≈volume (chars/4) reached
+        THINKING_PAUSE_FRACTION-th of the serving role's window. Below the
+        threshold the strip still rides every eviction batch that fires
+        anyway — there the invalidation is already paid for."""
+        tokens = self._stale_thinking_tokens(task)
+        if tokens <= 0:
+            return False
+        window = self.resolved_config(self._task_role(task)).max_context_tokens
+        if window <= 0:
+            return False
+        return tokens * THINKING_PAUSE_FRACTION >= window
+
     def _eviction_due(self, task: Task) -> bool:
         """Whether the agent-marked tool results have piled up enough to be
         worth one batch eviction: their ≈size (chars/4, the same estimate
@@ -1052,15 +1080,20 @@ class PipelineCompactionLayer(CoreState):
     def _maybe_evict_marked(self, task: Task, force: bool = False) -> int:
         """Batch eviction of the agent-marked tool results (the deferred
         half of the mark_unneeded tool) PLUS the automatic tool result
-        clearing (the age criterion, `auto_evictable_ids`): collapse ALL
-        selected tool-return contents into short stubs in ONE pass (one
-        prompt-cache invalidation per batch, never per mark). The
+        clearing (the age criterion, `auto_evictable_ids`) PLUS the
+        sliding-window thinking strip (`thinking_keep_recent_turns`):
+        collapse ALL selected tool-return contents into short stubs and
+        drop ALL stale thinking parts in ONE pass (one prompt-cache
+        invalidation per batch, never per mark or per exchange). The
         tool-call/tool-return pairs survive; the stub names the tool and
         its arguments so the model can re-run it. Marked ids are pruned
         (stubbed ones and stale ones left over from a full compaction that
         rewrote the history around them); the automatic ids need no
         bookkeeping — the criterion recomputes from the transcript, whose
-        collapsed contents are stubs it never selects again.
+        collapsed contents are stubs it never selects again; the thinking
+        window recomputes the same way (stripped parts cannot be selected
+        again, the freshest `keep_recent_turns` thinking-bearing exchanges
+        stay verbatim).
 
         Without ``force`` the pass fires when (a) the pending marks'
         ≈size (chars/4) reached a third of the serving role's window (the
@@ -1071,28 +1104,43 @@ class PipelineCompactionLayer(CoreState):
         cost nothing, fresh results stay verbatim behind the
         AUTO_EVICTION_KEEP_RECENT anchor; the per-batch cache
         invalidation is the accepted tradeoff, exactly as in Claude
-        Code). With the setting off (the default) only the marks gates
-        fire. ``force=True`` is the PRE-COMPACTION eviction from
-        _maybe_compact: before the summarizer runs, every mark is honored
-        and every old result collapsed — the unloading alone may pull the
-        fill back under the threshold and spare the summarizer entirely,
-        and a still-needed summarizer works on the lightened history
-        either way.
+        Code), or (c) the stale thinking's ≈volume reached
+        THINKING_PAUSE_FRACTION-th of the window — a standalone strip must
+        earn its own invalidation. Below (c) the stale thinking STILL
+        rides every batch that fires for (a)/(b)/force: there the
+        invalidation is already paid for. With all the gates quiet the
+        pass does not fire. ``force=True`` is the PRE-COMPACTION eviction
+        from _maybe_compact: before the summarizer runs, every mark is
+        honored, every old result collapsed and every stale thinking
+        dropped — the unloading alone may pull the fill back under the
+        threshold and spare the summarizer entirely, and a still-needed
+        summarizer works on the lightened history either way.
 
-        The collapsed ≈size is deposited as an eviction credit
+        The collapsed/stripped ≈size is deposited as an eviction credit
         (`_evicted_ctx_tokens`): every fill reading the dev-transcript
         gates take afterwards predates the eviction, so it is corrected by
         the credit until the next real usage reading lands.
 
         Called only between turns (from _maybe_compact and the mid-run
         pause path), so the history is never mutated mid-stream. Returns
-        the ≈number of tokens the eviction collapsed (0 = nothing
-        evicted)."""
+        the ≈number of tokens the pass collapsed/stripped (0 = nothing)."""
         marked_ids = set(task.marked_unneeded)
         auto_ids = self._auto_eviction_ids(task)
+        thinking_tokens = self._stale_thinking_tokens(task)
         ids = marked_ids | auto_ids
-        if not ids or not (
+        if not ids and thinking_tokens <= 0:
+            return 0
+        role = self._task_role(task)
+        window = self.resolved_config(role).max_context_tokens
+        # The standalone thinking-strip gate (see _stale_thinking_due).
+        thinking_due = (
+            thinking_tokens > 0
+            and window > 0
+            and thinking_tokens * THINKING_PAUSE_FRACTION >= window
+        )
+        if not (
             force
+            or thinking_due
             or (bool(marked_ids) and self._eviction_due(task))
             # The automatic clearing branch (the unconditional between-turns
             # pass) — gated by the `auto_context_unloading` project setting
@@ -1102,8 +1150,6 @@ class PipelineCompactionLayer(CoreState):
             or (self.settings.auto_context_unloading and auto_ids)
         ):
             return 0
-        role = self._task_role(task)
-        window = self.resolved_config(role).max_context_tokens
         pending = marked_tokens(task.messages, ids)
         result = evict_marked(task.messages, ids)
         task.messages = result.new_messages
@@ -1113,6 +1159,16 @@ class PipelineCompactionLayer(CoreState):
             for mark in task.marked_unneeded
             if mark not in evicted_set and mark not in set(result.missing)
         ]
+        # The thinking strip rides the SAME batch pass whenever anything is
+        # stale outside the freshness window — one invalidation covers both
+        # halves (the gate above only decides whether a batch fires at all;
+        # once it does, the strip is free).
+        stripped_tokens = 0
+        if thinking_tokens > 0:
+            task.messages, stripped_tokens = strip_stale_thinking(
+                task.messages,
+                keep_recent_turns=self.settings.thinking_keep_recent_turns,
+            )
         task.touch()
         self.manager.storage.save(task)
         # The live token reading belongs to the pre-eviction transcript;
@@ -1121,7 +1177,7 @@ class PipelineCompactionLayer(CoreState):
         # all predate the eviction) do not over-report.
         self._live_ctx_tokens.pop(task.id, None)
         self._evicted_ctx_tokens[task.id] = (
-            self._evicted_ctx_tokens.get(task.id, 0) + pending
+            self._evicted_ctx_tokens.get(task.id, 0) + pending + stripped_tokens
         )
         marked_evicted = len(evicted_set & marked_ids)
         auto_evicted = len(evicted_set) - marked_evicted
@@ -1132,17 +1188,28 @@ class PipelineCompactionLayer(CoreState):
             )
         elif auto_evicted:
             head = f"auto-cleared {auto_evicted} old tool result(s)"
-        else:
+        elif marked_evicted:
             head = f"collapsed {marked_evicted} marked tool result(s)"
+        else:
+            head = ""
+        if stripped_tokens and head:
+            head = f"{head} and stripped stale thinking (≈{stripped_tokens} tokens)"
+        elif stripped_tokens:
+            head = f"stripped stale thinking (≈{stripped_tokens} tokens)"
+        total = pending + stripped_tokens
+        if evicted_set:
+            tail = " — re-run a tool if you need its result again."
+        else:
+            tail = ""
         self._show_event(
             task,
             f"Context unloading: {head} "
-            f"(≈{pending} tokens of a {window}-token window) — "
-            "re-run a tool if you need its result again.",
+            f"(≈{total} tokens of a {window}-token window)"
+            f"{tail}",
         )
         if self.viewed_id == task.id:
             self.view_task(task.id)
-        return pending
+        return total
 
     def _apply_eviction_credit(self, task_id: str, tokens: int | None) -> int | None:
         """A fill reading corrected by the batch-eviction credit (≈0 when

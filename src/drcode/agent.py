@@ -145,6 +145,8 @@ _EXPORTS: dict[str, str] = {
     "run_context_tokens": "transcript",
     "sanitized_messages": "transcript",
     "serialize_messages": "transcript",
+    "stale_thinking_tokens": "transcript",
+    "strip_stale_thinking": "transcript",
     "strip_thinking_parts": "transcript",
     # web_fetch
     "FETCHES_PER_RUN": "web_fetch",
@@ -301,6 +303,8 @@ __all__ = [  # noqa: F822
     "serialize_messages",
     "slice_budget_tokens",
     "split_original_prompts",
+    "stale_thinking_tokens",
+    "strip_stale_thinking",
     "strip_thinking_parts",
     "subagent_limit_for",
     "subagent_notice",

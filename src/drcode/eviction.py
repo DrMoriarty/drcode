@@ -79,6 +79,18 @@ AUTO_EVICTION_KEEP_RECENT = 5
 # pause per turn would be churn.
 AUTO_EVICTION_PAUSE_FRACTION = 6
 
+# Mid-run pause gate of the sliding-window thinking strip (the same-model
+# half of the thinking discipline, transcript.strip_stale_thinking): the
+# strip rides EVERY eviction batch for free — one prompt-cache invalidation
+# already covers the whole pass — but a STANDALONE strip (no eviction batch
+# firing for other reasons) must earn its own invalidation: it fires only
+# when the stale thinking's ≈volume (chars/4) reached this fraction of the
+# serving role's window. Same value as the auto-clearing's pause fraction:
+# stale thinking renews itself at a similar per-turn pace once past the
+# freshness window, and a strip per exchange would invalidate the cache more
+# often than the dropped tokens save.
+THINKING_PAUSE_FRACTION = 6
+
 
 # -- extractive digest ----------------------------------------------------------------
 #

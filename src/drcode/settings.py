@@ -698,6 +698,22 @@ class ProjectSettings(BaseModel):
     # agent may still want verbatim, so it stays opt-in per project. Read
     # at the eviction gates, so a toggle applies to the next activation.
     auto_context_unloading: bool = False
+    # Sliding-window thinking strip (the same-model half of the thinking
+    # discipline — the model-switch strip in transcript.strip_thinking_parts
+    # is the other half): the thinking parts of the last N THINKING-BEARING
+    # model exchanges of the dev transcript stay verbatim, older ones are
+    # dropped in BATCHES at the eviction pause points (one prompt-cache
+    # invalidation per batch, riding every eviction batch that fires anyway).
+    # Old chain-of-thought is dead weight: every request of the run
+    # re-prefills it, thousands of tokens per turn on reasoning models. The
+    # recent window stays intact deliberately — fresh reasoning is what the
+    # model is still working from, and providers that require thinking
+    # blocks around recent tool calls get them. Default 5; 0 disables the
+    # strip (then nothing but the model-switch housekeeping ever touches
+    # thinking parts). Non-reasoning models are unaffected either way: no
+    # thinking parts, nothing to strip. Read at the eviction gates, so a
+    # toggle applies to the next activation.
+    thinking_keep_recent_turns: int = 5
     # Live todo tail (agent_model.TailInjectionModel): when on, every model
     # request of a feature-task run carries a synthetic TAIL message with
     # the task's current checklist state (recomputed per request, see
@@ -936,6 +952,17 @@ class ProjectSettings(BaseModel):
         (off); anything below 20000 stays persisted but means off."""
         if isinstance(value, bool) or not isinstance(value, int | float):
             return 0
+        return max(int(value), 0)
+
+    @field_validator("thinking_keep_recent_turns", mode="before")
+    @classmethod
+    def _clean_thinking_keep_recent_turns(cls, value: object) -> object:
+        """Coerce junk to the field's default (5) instead of invalidating
+        the WHOLE settings file (same rule as
+        `_clean_compaction_resume_min_tokens`); negative values clamp to 0
+        (the strip off)."""
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return 5
         return max(int(value), 0)
 
 

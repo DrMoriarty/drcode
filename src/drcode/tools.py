@@ -512,6 +512,12 @@ GREP_PER_FILE_LIMIT = 20  # match lines returned from any single file
 GREP_COUNT_LIMIT = 10_000  # counting stops here; the summary then says "≥N"
 GREP_MAX_FILE_BYTES = 1_000_000  # files larger than ~1 MB are skipped
 GREP_BINARY_SNIFF_BYTES = 8192  # a NUL byte in the head marks a binary file
+# Nested-repo probing depth: when the grep root is not a working tree, its
+# subdirectories down to root/a/b/c are probed as working trees on their own
+# (the real case that demanded depth 3: root/experiments/build-torch214/
+# pytorch-src — full PyTorch sources whose tens of thousands of text files a
+# plain walk reads line by line).
+GREP_PROBE_DEPTH = 3
 
 
 def _git_ls_files(root: Path, pathspec: str | None = None) -> list[Path] | None:
@@ -555,6 +561,48 @@ def _git_ls_files(root: Path, pathspec: str | None = None) -> list[Path] | None:
     return out
 
 
+def _probe_repo(sub: Path) -> list[Path] | None:
+    """`sub`'s own gitignore-aware candidate list when it is a git working
+    tree, else None. Gated on a cheap `.git` existence check: the probe is a
+    subprocess with a 10 s timeout (`_git_ls_files`), and running one blindly
+    on every candidate directory of the walk would multiply that delay over
+    the probe levels."""
+    if not (sub / ".git").exists():
+        return None
+    return _git_ls_files(sub)
+
+
+def _probe_walk(
+    base: Path, rel_prefix: str, probe_depth: int
+) -> Iterator[tuple[str, Path]]:
+    """Plain directory walk over `base` (a non-working-tree directory) pruned
+    by IGNORED_DIRS, yielding (project-relative posix path, Path) with
+    `rel_prefix` prepended to every path. Directories carrying a `.git` entry
+    are probed as nested working trees (`_probe_repo`) down to `probe_depth`
+    levels below `base`: a found one is REPLACED by its own `git ls-files`
+    listing and removed from the walk, so a shallower find takes priority and
+    no deeper probe ever runs under a replaced subtree."""
+    for dirpath, dirnames, filenames in base.walk():
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+        for name in filenames:
+            f = Path(dirpath) / name
+            yield rel_prefix + f.relative_to(base).as_posix(), f
+        if len(Path(dirpath).relative_to(base).parts) >= probe_depth:
+            continue
+        for name in list(dirnames):
+            sub = _probe_repo(Path(dirpath) / name)
+            if sub is None:
+                continue
+            dirnames.remove(name)
+            head = (
+                rel_prefix + (Path(dirpath).relative_to(base) / name).as_posix() + "/"
+            )
+            for rel in sub:
+                if any(part in IGNORED_DIRS for part in rel.parts):
+                    continue
+                yield head + rel.as_posix(), Path(dirpath) / name / rel
+
+
 def _include_plan(include: str) -> tuple[str, str | None]:
     """Split an include mask into (dir_prefix, exact_rel) for the candidate
     enumeration. `exact_rel` is not None when the mask contains no glob magic
@@ -584,9 +632,10 @@ def _exact_candidates(root: Path, rel: str) -> Iterator[tuple[str, Path]]:
     Gitignore fidelity is preserved by asking git itself, with a pathspec
     limited to this one path — the same source of truth the general
     enumeration uses. A governing working tree is the project root when it is
-    one, else the path's first-level directory (matching the nested-repo
-    probing of `_grep_candidates`; deeper repos are out of scope there too —
-    their files then come from the plain walk, unfiltered). The IGNORED_DIRS
+    one, else the shallowest `.git`-carrying ancestor of the path within the
+    probe depth (matching the nested-repo probing of `_grep_candidates`;
+    deeper repos are out of scope there too — their files then come from the
+    plain walk, unfiltered). The IGNORED_DIRS
     pruning of the enumeration is mirrored here (git knows nothing about it —
     it is a Python-side filter in every enumeration branch), and an absolute
     rel is refused: `root / "/abs"` would escape the project root (Path
@@ -599,9 +648,19 @@ def _exact_candidates(root: Path, rel: str) -> Iterator[tuple[str, Path]]:
         return
     listed = _git_ls_files(root, pathspec=rel)
     if listed is None:
-        top, sep, rest = rel.partition("/")
-        if sep:
-            listed = _git_ls_files(root / top, pathspec=rest)
+        # Not governed by the root: the shallowest ancestor of the path (up
+        # to GREP_PROBE_DEPTH, `.git`-gated — `_probe_repo`) may be a nested
+        # working tree; if it is, its ls-files governs, exactly like the
+        # nested-repo probing of `_grep_candidates`. Deeper repos (beyond the
+        # probe depth) are out of scope there too — their files then come
+        # from the plain walk, unfiltered.
+        parts = p.parts
+        for i in range(1, min(len(parts), GREP_PROBE_DEPTH + 1)):
+            ancestor = root.joinpath(*parts[:i])
+            if not (ancestor / ".git").exists():
+                continue
+            listed = _git_ls_files(ancestor, pathspec="/".join(parts[i:]))
+            break
     if listed is not None and not listed:
         return  # inside a working tree, and git does not list the path
     yield rel, f
@@ -611,24 +670,36 @@ def _grep_candidates(root: Path, prefix: str = "") -> Iterator[tuple[str, Path]]
     """Yield (project-relative posix path, Path) for the files worth scanning:
     from `git ls-files` (gitignore-aware) when `root` is a working tree, else
     from a directory walk pruned by IGNORED_DIRS. When `root` is not a working
-    tree itself, FIRST-LEVEL subdirectories that are git working trees on
-    their own get gitignore-aware candidate lists from their own
+    tree itself, subdirectories down to depth `GREP_PROBE_DEPTH` (root/a,
+    root/a/b, root/a/b/c) that carry a `.git` entry are probed as git working
+    trees on their own and get gitignore-aware candidate lists from their own
     `git ls-files` (their .gitignore is honored by git itself) — build
     artifacts of nested repos would otherwise flood both the scan and the
-    results. Everything else keeps the plain walk; the late filters
-    (`_read_greppable`: size cap + binary sniff) apply everywhere.
+    results. A found working tree replaces the plain walk under it entirely;
+    because it is removed from the walk, a shallower find takes priority and
+    no deeper probe ever runs below a replaced subtree. Everything else keeps
+    the plain walk (`_probe_walk`); the late filters (`_read_greppable`: size
+    cap + binary sniff) apply everywhere.
 
     With a non-empty `prefix` (a literal directory prefix every include match
     must start with — `_include_plan`) candidates outside it are dropped
     before yield: the ls-files listings are filtered by a cheap string check,
     a nested repo entirely outside the prefix is not probed at all, and the
-    plain walk starts at root/<prefix>. The prefix's first-level directory is
-    probed for its own working tree exactly as the unprefixed walk would at
-    the top level, so a nested repo under the prefix keeps its gitignore-aware
-    listing. The result set is identical to prefix="" — only faster. A prefix
-    starting with "/" is refused outright: the anchored include regex matches
-    project-relative paths only, and `root / "/abs"` (Path semantics) would
-    walk the host filesystem outside the project."""
+    plain walk starts at root/<prefix>. The result set is identical to
+    prefix="" — only faster. Parity is kept by honoring exactly the probes
+    the unprefixed walk would make within the prefix's reach: the prefix's
+    own ancestor chain (root/<p1>, root/<p1>/<p2>, …) is probed shallowest
+    first — a working tree there replaces the whole enumeration with its
+    ls-files listing filtered to the prefix — and below the prefix directory
+    probing continues, but only while the probed directories are still within
+    the absolute probe depth (deeper than root/a/b/c the unprefixed walk
+    never probes either). The unprefixed walk prunes IGNORED_DIRS at every
+    level from the root, so it never enters a directory named like one — a
+    prefix running through such a component can therefore match nothing and
+    yields nothing here either. A prefix starting with "/" is refused
+    outright: the anchored include regex matches project-relative paths only,
+    and `root / "/abs"` (Path semantics) would walk the host filesystem
+    outside the project."""
     if prefix.startswith("/"):
         return
     listed = _git_ls_files(root)
@@ -642,51 +713,34 @@ def _grep_candidates(root: Path, prefix: str = "") -> Iterator[tuple[str, Path]]
             yield posix, root / rel
         return
     if not prefix:
-        for dirpath, dirnames, filenames in root.walk():
-            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
-            for name in filenames:
-                f = Path(dirpath) / name
-                yield f.relative_to(root).as_posix(), f
-            if Path(dirpath) == root:
-                # Top level only: probe each first-level dir once; a nested
-                # working tree replaces the walk under it entirely.
-                for name in list(dirnames):
-                    sub = _git_ls_files(root / name)
-                    if sub is None:
-                        continue
-                    dirnames.remove(name)
-                    for rel in sub:
-                        if any(part in IGNORED_DIRS for part in rel.parts):
-                            continue
-                        yield f"{name}/{rel.as_posix()}", root / name / rel
+        yield from _probe_walk(root, "", GREP_PROBE_DEPTH)
         return
-    # Prefixed walk. The prefix's first-level directory may be a nested
-    # working tree (the unprefixed walk probes it at the top level) — honor
-    # that by listing from it; otherwise the prefix subdirectory holds no
-    # project-root top level, so nothing inside it is probed, matching the
-    # unprefixed behavior below the first level. The unprefixed walk prunes
-    # IGNORED_DIRS at every level from the root, so it never enters a
-    # directory named like one — a prefix running through such a component
-    # can therefore match nothing and yields nothing here either.
+    # Prefixed walk. The prefix's ancestor chain is probed shallowest first:
+    # a nested working tree on it governs every file under the prefix exactly
+    # as the unprefixed walk would (which replaces the whole subtree by the
+    # repo's listing and never descends further).
     if any(part in IGNORED_DIRS for part in prefix.split("/")):
         return
-    top = prefix.split("/", 1)[0]
-    sub = _git_ls_files(root / top)
-    if sub is not None:
+    chain = prefix.split("/")[:-1]  # a non-empty prefix always ends in "/"
+    for i in range(1, min(len(chain), GREP_PROBE_DEPTH) + 1):
+        ancestor_rel = "/".join(chain[:i])
+        sub = _probe_repo(root / ancestor_rel)
+        if sub is None:
+            continue
+        head = ancestor_rel + "/"
         for rel in sub:
             if any(part in IGNORED_DIRS for part in rel.parts):
                 continue
-            posix = f"{top}/{rel.as_posix()}"
+            posix = head + rel.as_posix()
             if not posix.startswith(prefix):
                 continue
-            yield posix, root / top / rel
+            yield posix, root / ancestor_rel / rel
         return
+    # No working tree on the ancestor chain: walk below the prefix directory,
+    # probing nested repos only while they stay within the absolute probe
+    # depth — below root/a/b/c the unprefixed walk never probes either.
     walk_root = root / prefix
-    for dirpath, dirnames, filenames in walk_root.walk():
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
-        for name in filenames:
-            f = Path(dirpath) / name
-            yield prefix + f.relative_to(walk_root).as_posix(), f
+    yield from _probe_walk(walk_root, prefix, GREP_PROBE_DEPTH - len(chain))
 
 
 def _read_greppable(f: Path) -> str | None:

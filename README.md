@@ -156,6 +156,49 @@ If nothing anywhere provides a model (no env vars, an empty catalog and no proje
 
 Without a configured model every message fails with "Model is not configured". If the project root contains an **AGENTS.md**, its content is appended to the agent's instructions — and if it doesn't, the app offers on startup to create one with a pre-filled research task (the same one the Settings palette's "Update/create AGENTS.md" entry runs).
 
+## External MCP servers
+
+Agents can use tools from **external MCP servers** (stdio processes or HTTP
+endpoints) alongside the built-in tools. Servers are configured in a separate
+`mcp-servers.json` file — not in `drcode.json` or `settings.json`, because the
+file carries secrets (env vars, auth headers):
+
+- **User level**: `~/.config/drcode/mcp-servers.json` — servers useful in every
+  project (e.g. an SSH execution server);
+- **Project level**: `<project>/.drcode/mcp-servers.json` — servers of one
+  project. This file is gitignored and written with mode `0600`.
+
+The two layers merge on load (union by the record `id`, the project record
+wins; a per-file `roles`/`tool_budget_tokens` key from the project layer
+overrides the user layer's). A corrupted file is skipped whole with a warning
+in the task's chat, never fatal; a junk record inside a valid file is dropped
+without invalidating the others.
+
+An annotated template covering every field — stdio (`command`/`args`/`env`),
+http (`url`/`headers`), tool allow/deny filters, prefixes, timeouts — lives in
+[`.drcode/mcp-servers.json.example`](.drcode/mcp-servers.json.example): copy it
+to one of the two locations, drop the `_`-prefixed comment keys and edit.
+
+Key rules:
+
+- **The `roles` matrix is the only switch.** A server only reaches an agent
+  when its `id` is listed under that role (`coding`, `tester`, `research`,
+  `resolver`); an empty/absent matrix means no role gets any MCP tools. The
+  compaction summarizer and the read-only research subagents never receive
+  external tools.
+- **Tool names are prefixed**: a server's tools appear to the agent as
+  `<prefix>_<tool>` (the prefix defaults to the record's `id`), so they can
+  never collide with the native tools or with another server's.
+- **Nothing from MCP can kill a run**: an unavailable server degrades to a
+  warning and an empty tool set; a failing tool call becomes a model retry;
+  every output is wrapped in an explicit UNTRUSTED-data frame. A server whose
+  tool list is estimated above `tool_budget_tokens` (default 10000) does not
+  attach — narrow it with the record's `tools_allow`.
+- **MCP tools bypass drcode's own safety policies** (the write jail and the
+  `run_bash` network rules are checks inside the native tools): an MCP tool is
+  the external server's code acting with the server's authority — only connect
+  servers you trust.
+
 ## Task pipeline
 
 Tasks flow through a pipeline, mirrored by the sidebar: QUEUE → NEEDS CLARIFICATION → ACTIVE → TESTING → COMPLETED, plus ON HOLD.

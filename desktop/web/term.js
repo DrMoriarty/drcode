@@ -1439,11 +1439,19 @@
         li.title = "This project is already open in another tab";
       }
       var path = document.createElement("span");
-      path.className = "path";
+      path.className = "path" + (occupied ? " open" : "");
       path.textContent = item.project;
       var when = document.createElement("span");
       when.className = "when";
       when.textContent = item.last_used ? new Date(item.last_used * 1000).toLocaleDateString() : "";
+      if (occupied) {
+        // The "open" badge lives on the LEFT of the row, before the path,
+        // so the status reads first and the highlighted folder name next.
+        var mark = document.createElement("span");
+        mark.className = "open-mark";
+        mark.textContent = "open";
+        li.appendChild(mark);
+      }
       li.appendChild(path);
       li.appendChild(when);
       var remove = document.createElement("span");
@@ -1463,10 +1471,6 @@
       });
       li.appendChild(remove);
       if (occupied) {
-        var mark = document.createElement("span");
-        mark.className = "open-mark";
-        mark.textContent = "open";
-        li.appendChild(mark);
         // Occupied entries are not launchable — clicking explains why.
         li.addEventListener("click", function () {
           showWelcomeError(duplicateMessage(item.project));

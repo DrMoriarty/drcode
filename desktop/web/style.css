@@ -252,18 +252,33 @@ body {
 .recents-list li:hover { background: #2a2f38; }
 .recents-list li.occupied { cursor: not-allowed; }
 .recents-list li.occupied:hover { background: transparent; }
-.recents-list .path { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The path stretches to fill the row (min-width: 0 keeps the ellipsis
+ * working inside flex), so the date lands at the RIGHT edge and the
+ * hover-only remove button can't push it off the margin. */
+.recents-list .path {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Folder name of a project already open in another tab: accent color
+ * plus bold weight, so the live project stands out at a glance. */
+.recents-list .path.open { color: var(--accent); font-weight: 700; }
 .recents-list .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
-/* "open" badge on a recent project already live in another tab. */
+/* "open" badge on a recent project already live in another tab; it sits
+ * on the LEFT of the row, before the (highlighted) folder name. */
 .recents-list .open-mark {
-  color: var(--muted);
+  color: var(--accent);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  border: 1px solid var(--border);
+  border: 1px solid var(--accent);
   border-radius: 4px;
   padding: 1px 6px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 /* Per-entry "remove from recents" button: invisible until the row is
  * hovered, so it never competes with the path for attention. */

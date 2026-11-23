@@ -22,8 +22,17 @@ File format (version 1)::
                                    "output": 8000, "cache_read": 90000,
                                    "cache_write": 3000}
         }
-      }
+      },
+      "recent": [
+        {"at": "2026-11-04T12:03:44", "key": "coding/openai/gpt-5",
+         "input": 3100, "cache_read": 2800, "cache_write": 0, "output": 210}
+      ]
     }
+
+The optional ``recent`` ring holds the last `RECENT_LIMIT` per-request
+records (oldest first) — the rolling cache hit-rate over the last N
+requests is computed from it (`rolling_hit_rate`, `load_recent`); a file
+without it (or with a malformed ring) simply has no rolling history.
 
 The key is ``<role>/<model>`` where ``<model>`` is the resolved model in
 the catalog's "<provider>/<model-id>" reference format (the bare model
@@ -67,6 +76,17 @@ FIELDS: tuple[str, ...] = (
 # Type of one day's model→counters map.
 DayEntry = dict[str, dict[str, int]]
 
+# How many most-recent per-request records the store keeps alongside the
+# day aggregates (the "recent" ring in the file). The aggregates cannot
+# answer "how did the hit-rate move over the LAST N requests" — that needs
+# per-request granularity, which only this ring has.
+RECENT_LIMIT = 500
+
+# Default window (requests) of the rolling hit-rate shown in the stats
+# dialog: recent enough to expose a fresh prefix invalidation, wide enough
+# to smooth the per-request noise (the first request of a run never hits).
+ROLLING_WINDOW = 50
+
 
 def usage_file() -> Path:
     """Path of the user-level usage statistics (XDG_CONFIG_HOME-aware).
@@ -82,6 +102,63 @@ def usage_file() -> Path:
 
 def _empty_entry() -> dict[str, int]:
     return dict.fromkeys(FIELDS, 0)
+
+
+def hit_rate(cache_read: int, input_tokens: int) -> float | None:
+    """The cache hit-rate of an aggregate: ``cache_read / input`` (0..1).
+
+    pydantic-ai's ``input_tokens`` already INCLUDES cache reads and writes
+    (see `transcript._usage_context_tokens`), so this ratio never exceeds 1
+    and directly reads as "the share of billed prompt tokens served from
+    cache". None when there is no input to speak of — an undefined ratio,
+    not a zero: a day with no requests must not display as "0% hits".
+    """
+    if input_tokens <= 0:
+        return None
+    return cache_read / input_tokens
+
+
+def daily_hit_rate(counters: dict[str, int]) -> float | None:
+    """Hit-rate of one (day, model) counter row of the days mapping."""
+    return hit_rate(counters.get("cache_read", 0), counters.get("input", 0))
+
+
+def rolling_hit_rate(
+    records: list[dict[str, Any]],
+    key: str | None = None,
+    n: int | None = None,
+) -> float | None:
+    """Hit-rate over the last `n` per-request records (optionally filtered
+    to one ``<role>/<model>`` key), newest-last order as `load_recent`
+    returns them. The ratio is summed reads over summed input — volume-
+    weighted, so one giant cached request outweighs many small misses —
+    and None when the window holds no input tokens at all."""
+    if key is not None:
+        records = [r for r in records if r.get("key") == key]
+    if n is not None:
+        records = records[-n:]
+    input_total = sum(r.get("input", 0) for r in records)
+    read_total = sum(r.get("cache_read", 0) for r in records)
+    return hit_rate(read_total, input_total)
+
+
+def _clean_record(raw: Any) -> dict[str, Any] | None:
+    """Shape-check one per-request record (tolerant, like `_validated`):
+    a record without a string key is junk and dropped, a bad counter
+    becomes 0 — one malformed line never invalidates the history."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("key"), str):
+        return None
+    at = raw.get("at")
+    record: dict[str, Any] = {
+        "at": at if isinstance(at, str) else "",
+        "key": raw["key"],
+    }
+    for field in ("input", "cache_read", "cache_write", "output"):
+        value = raw.get(field, 0)
+        record[field] = (
+            value if isinstance(value, int) and not isinstance(value, bool) else 0
+        )
+    return record
 
 
 class UsageStore:
@@ -186,13 +263,60 @@ class UsageStore:
             entry["output"] += usage.output_tokens or 0
             entry["cache_read"] += usage.cache_read_tokens or 0
             entry["cache_write"] += usage.cache_write_tokens or 0
-            self._write({"version": VERSION, "days": days})
+            # Per-request granularity for the rolling hit-rate (the day
+            # aggregates alone cannot answer "the last N requests"). The
+            # ring is trimmed to RECENT_LIMIT — the file must stay small.
+            recent = self._recent_from_disk()
+            recent.append(
+                {
+                    "at": _now().isoformat(timespec="seconds"),
+                    "key": key,
+                    "input": usage.input_tokens or 0,
+                    "cache_read": usage.cache_read_tokens or 0,
+                    "cache_write": usage.cache_write_tokens or 0,
+                    "output": usage.output_tokens or 0,
+                }
+            )
+            self._write(
+                {
+                    "version": VERSION,
+                    "days": days,
+                    "recent": recent[-RECENT_LIMIT:],
+                }
+            )
         except ValueError:
             raise
         except (OSError, TypeError):
             # Disk full, read-only config dir, a concurrent replace —
             # usage bookkeeping is best-effort by design.
             pass
+
+    # -- per-request history (rolling hit-rate window) -----------------------
+
+    def _recent_from_disk(self) -> list[dict[str, Any]]:
+        """The persisted per-request ring, shape-checked. Read failures
+        degrade to an empty history — the ring is a metric, losing it in a
+        corrupt file is never worth a failed usage record."""
+        try:
+            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        raw = data.get("recent") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return []
+        records: list[dict[str, Any]] = []
+        for item in raw:
+            record = _clean_record(item)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def load_recent(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """The last `limit` per-request records, oldest → newest (an empty
+        list when the file has no history yet). Read failures are never
+        fatal — same discipline as `load`."""
+        records = self._recent_from_disk()
+        return records if limit is None else records[-limit:]
 
     def _write(self, data: dict[str, Any]) -> None:
         """Atomic persist (tempfile + os.replace, mirroring the other

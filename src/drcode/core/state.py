@@ -57,7 +57,7 @@ from ..task_manager import TaskManager
 from ..usage_store import UsageStore
 from ..workflow import WorkflowHooks
 from .host import PipelineHost
-from .usage import SessionTokenUsage
+from .usage import CacheHitRateMonitor, SessionTokenUsage
 from .voice_input import VoiceInputController
 
 if TYPE_CHECKING:
@@ -764,6 +764,10 @@ class CoreState:
     # -- session usage (expanded header, session-scoped) ---------------------
     _session_usage: SessionTokenUsage
     _usage_store: UsageStore
+    # Runtime cache hit-rate watchdog of the active runs (see
+    # core.usage.CacheHitRateMonitor): raises one deduplicated service
+    # event per episode of consecutive low-hit requests.
+    _cache_hit_monitor: CacheHitRateMonitor
 
     # -- new-task form ------------------------------------------------------
     # Tab-cycle order of the task kinds (TaskFormLayer; the lifecycle

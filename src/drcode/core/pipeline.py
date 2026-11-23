@@ -35,6 +35,7 @@ from .pipeline_net import PipelineNetLayer
 from .pipeline_resolver import PipelineResolverLayer
 from .pipeline_tester import PipelineTesterLayer
 from .state import CoreState
+from .usage import CACHE_ALERT_RATE, CACHE_ALERT_STREAK
 
 
 class PipelineCoreLayer(CoreState):
@@ -163,6 +164,27 @@ class PipelineCoreLayer(CoreState):
             )
 
         return announce
+
+    def _cache_hit_alert(self, task_id: str, key: str, rate: float) -> None:
+        """The alert callback of `core.usage.CacheHitRateMonitor`: a
+        "cache hit-rate упал до X%" service event in the task's chat —
+        the same visibility pattern as the throttle wait announcement
+        above, deduplicated per task and wording by `_show_event_once`
+        (the monitor fires once per low-hit episode on top of that, so a
+        long invalidation is one line, not a flood). Cached prompt tokens
+        cost a fraction of uncached ones, and a collapsing hit-rate is
+        otherwise invisible until the bill arrives (#a0a55d3d)."""
+        try:
+            task = self.manager.get(task_id)
+        except KeyError:  # deleted while the streak accumulated
+            return
+        self._show_event_once(
+            task,
+            f"Cache hit-rate упал до {round(rate * 100)}% "
+            f"({key}; {CACHE_ALERT_STREAK} запрос(ов) подряд ниже "
+            f"{round(CACHE_ALERT_RATE * 100)}% — возможна инвалидация "
+            "префикса кэша).",
+        )
 
     def _mcp_toolsets(self, task: Task, role: AgentRole) -> list:
         """External MCP toolsets of one role (docs/mcp-client-design.md

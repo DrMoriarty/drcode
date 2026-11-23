@@ -90,7 +90,7 @@ def format_tokens(n: int) -> str:
 def system_components_coding(
     kind: TaskKind,
     project_root: Path | None,
-    research_git: GitPolicy = GitPolicy.PUSH,
+    research_git: GitPolicy = GitPolicy.LOCAL,
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of a coding agent run: the base template
     (project override honored), the project's AGENTS.md, the git-workflow
@@ -147,7 +147,7 @@ def goals_system_component(
 
 
 def system_components_tester(
-    allow_commit: bool, project_root: Path | None, allow_push: bool = True
+    allow_commit: bool, project_root: Path | None, allow_push: bool = False
 ) -> list[tuple[str, str | None]]:
     """Labeled system-prompt pieces of the tester run: the base template
     (project override honored), the project's AGENTS.md, the git-workflow
@@ -210,7 +210,7 @@ def coding_tool_schemas(
     config: Config,
     kind: TaskKind,
     root: Path | None = None,
-    research_git: GitPolicy = GitPolicy.PUSH,
+    research_git: GitPolicy = GitPolicy.LOCAL,
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,
@@ -244,7 +244,7 @@ def tester_tool_schemas(
     config: Config,
     *,
     allow_commit: bool = True,
-    allow_push: bool = True,
+    allow_push: bool = False,
     root: Path | None = None,
     code_index: bool = False,
 ) -> list[tuple[str, str]]:
@@ -754,8 +754,8 @@ def task_reports(
     tester_live_tokens: int | None = None,
     resolver_live_tokens: int | None = None,
     tester_allow_commit: bool = True,
-    tester_allow_push: bool = True,
-    research_git: GitPolicy = GitPolicy.PUSH,
+    tester_allow_push: bool = False,
+    research_git: GitPolicy = GitPolicy.LOCAL,
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,

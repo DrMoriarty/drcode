@@ -245,8 +245,8 @@ def test_default_verification_and_git_policy() -> None:
     settings = ProjectSettings()
     # The historical behavior: tester on, both roles commit + push.
     assert settings.verification is Verification.TESTER
-    assert settings.git_policy.tester is GitPolicy.PUSH
-    assert settings.git_policy.research is GitPolicy.PUSH
+    assert settings.git_policy.tester is GitPolicy.LOCAL
+    assert settings.git_policy.research is GitPolicy.LOCAL
 
 
 def test_verification_values_and_labels() -> None:
@@ -413,12 +413,12 @@ def test_legacy_finalization_migration(
     """Each legacy `task_finalization` value maps onto the orthogonal
     fields: the tester policy follows the legacy commit/push combination
     (NONE completes without verification) and the research policy keeps
-    its default (push — the historical behavior)."""
+    its default (local commit)."""
     store = _write_raw_settings(project_root, {"task_finalization": legacy})
     settings = store.load()
     assert settings.verification is verification
     assert settings.git_policy.tester is tester_policy
-    assert settings.git_policy.research is GitPolicy.PUSH
+    assert settings.git_policy.research is GitPolicy.LOCAL
     # Saving writes only the new shape: the legacy key is gone.
     store.save(settings)
     data = json.loads(store.path.read_text())

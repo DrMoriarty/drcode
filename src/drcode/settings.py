@@ -84,11 +84,11 @@ class GitPolicy(str, enum.Enum):
     OFF: the role never touches git — no tool is registered and the
     system prompt promises no commit step (for the tester that means
     verification only; for the research agent the edited files are still
-    tracked, but only for the "edited files" report). LOCAL: the role
-    commits to the task's branch `drcode/<id>` but never pushes — the
-    branch stays local. PUSH (the default): commit + push to the remote
-    (the historical behavior; a push failure is never fatal — logged
-    into the task's event log only).
+    tracked, but only for the "edited files" report). LOCAL (the
+    default): the role commits to the task's branch `drcode/<id>` but
+    never pushes — the branch stays local. PUSH: commit + push to the
+    remote (the historical behavior; a push failure is never fatal —
+    logged into the task's event log only).
     """
 
     OFF = "off"
@@ -116,8 +116,8 @@ class GitPolicy(str, enum.Enum):
 
 
 GIT_POLICY_OPTIONS: tuple[GitPolicy, ...] = (
-    GitPolicy.PUSH,
     GitPolicy.LOCAL,
+    GitPolicy.PUSH,
     GitPolicy.OFF,
 )
 
@@ -131,13 +131,13 @@ class GitPolicySetting(BaseModel):
     silently rewritten) and the app warns about the dormant mode at
     startup, mirroring `parallel_tasks` under isolation off."""
 
-    tester: GitPolicy = GitPolicy.PUSH
-    research: GitPolicy = GitPolicy.PUSH
+    tester: GitPolicy = GitPolicy.LOCAL
+    research: GitPolicy = GitPolicy.LOCAL
 
 
 # Legacy `task_finalization` values → (verification, git_policy.tester).
 # The research policy is NOT part of the legacy setting: it keeps its
-# default (push — the historical behavior) on migration.
+# default (local commit) on migration.
 _LEGACY_FINALIZATION_MAP: dict[str, tuple[Verification, GitPolicy]] = {
     "testing_commit": (Verification.TESTER, GitPolicy.PUSH),
     "testing_commit_no_push": (Verification.TESTER, GitPolicy.LOCAL),

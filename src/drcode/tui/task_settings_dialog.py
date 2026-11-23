@@ -250,6 +250,15 @@ class TaskSettingsDialogBase(ModalScreen[ProjectSettings | None]):
     Select {
         width: 1fr;
     }
+    /* The thinking window: a SHORT numeric field (3 characters) sitting
+       LEFT of its description. Its width MUST be pinned: the Input's
+       default width is 100%, which would squeeze the 1fr description
+       label down to ~one character per wrapped line and blow the
+       auto-height row into a huge blank gap. */
+    #ts-thinking-keep {
+        width: 9; /* 3 editable characters + the padding + the border */
+        margin-top: 0;
+    }
     /* The pre-run compaction threshold: a SHORT numeric field (6
        characters) sitting LEFT of its description, on one line with the
        description's first line. */
@@ -257,12 +266,12 @@ class TaskSettingsDialogBase(ModalScreen[ProjectSettings | None]):
         width: 10; /* 6 editable characters + the border */
         margin-top: 0;
     }
-    # "Changed" marker: a border-tint is useless under the compact form
-    # styles (the border the signal used to color is gone). Boolean
-    # toggles are ToggleRows — their tint goes on the row's Label (the
-    # ToggleRow's own CSS; the glyph renders identically on and off);
-    # for Select the tint goes on the child SelectCurrent
-    # — its opaque background hides the parent's tint.
+    /* The "Changed" marker: a border-tint is useless under the compact
+       form styles (the border the signal used to color is gone). Boolean
+       toggles are ToggleRows — their tint goes on the row's Label (the
+       ToggleRow's own CSS; the glyph renders identically on and off);
+       for Select the tint goes on the child SelectCurrent
+       — its opaque background hides the parent's tint. */
     Select.changed > SelectCurrent {
         background-tint: $warning 25%;
         color: $warning;

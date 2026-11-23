@@ -47,7 +47,7 @@ import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from . import config as _config
@@ -340,6 +340,77 @@ def truncate_tool_output(text: str) -> str:
     return f"{head}{head_sep}{note}\n{tail}"
 
 
+class ReadFileResult(NamedTuple):
+    """Outcome of one full read_file pass.
+
+    `text` is what the model receives (numbered lines, possibly truncated,
+    or the budget refusal); `raw` is the unformatted file content (the
+    dedup cache hashes it to detect "unchanged" reliably, without trusting
+    mtime alone); `truncated` marks a chunk cut by MAX_READ_RESULT_BYTES —
+    a diff against a truncated previous read would compare head+tail
+    slices, not file states, so the cache refuses to diff those."""
+
+    text: str
+    raw: str
+    truncated: bool
+
+
+# Prefix of the context-budget refusal (read_cache checks it so a refused
+# read is never recorded as a cache entry).
+READ_REFUSAL_PREFIX = "Refusing to read '"
+
+
+def _read_file_text(
+    p: Path,
+    path: str,
+    offset: int,
+    limit: int,
+    *,
+    current_usage: int,
+    max_context_tokens: int,
+    compaction_threshold: int,
+) -> ReadFileResult:
+    """One read_file pass against an already-resolved path: numbered chunk,
+    truncation cap, context-budget gate. Returns the raw content alongside
+    the result for the read-dedup cache (see read_cache.py)."""
+    raw = p.read_text(errors="replace")
+    lines = raw.splitlines()
+    start = max(offset - 1, 0)
+    chunk = lines[start : start + limit]
+    numbered = [f"{start + i + 1}: {line}" for i, line in enumerate(chunk)]
+    text = "\n".join(numbered)
+    chunk_bytes = len(text.encode("utf-8"))
+    truncated = False
+    # Hard cap: a single read result larger than MAX_READ_RESULT_BYTES is
+    # truncated to a head+tail slice — the model keeps a usable piece of the
+    # file plus instructions on how to read the rest.
+    if chunk_bytes > MAX_READ_RESULT_BYTES:
+        text = _truncate_read(numbered)
+        chunk_bytes = len(text.encode("utf-8"))
+        truncated = True
+    # Context-budget check: does this read risk exceeding the compaction
+    # threshold? `current_usage` is the tokens the model already holds.
+    threshold = min(max(compaction_threshold, 1), 100)
+    if (
+        max_context_tokens > 0
+        and current_usage + _token_estimate(chunk_bytes)
+        > threshold * max_context_tokens // 100
+    ):
+        # The refusal stays neutral on purpose: exposing the absolute token
+        # count, the current fill and the compaction threshold would feed the
+        # model a "context is nearly full" signal it then worries about. The
+        # gate still protects the window — the read is refused — but the message
+        # only tells the model *that* the budget is taken, not *how much*.
+        return ReadFileResult(
+            f"{READ_REFUSAL_PREFIX}{path}': this read would exceed the model's "
+            f"current context budget. Read the file in smaller pieces by lowering "
+            f"`limit` or raising `offset`, then retry.",
+            raw,
+            truncated,
+        )
+    return ReadFileResult(text or "(empty file)", raw, truncated)
+
+
 def read_file(
     root: Path,
     path: str,
@@ -362,37 +433,15 @@ def read_file(
     truncated) piece is checked against the current context usage and the
     current compaction threshold (default 80% of the context window)."""
     p = resolve_read_path(root, path)
-    lines = p.read_text(errors="replace").splitlines()
-    start = max(offset - 1, 0)
-    chunk = lines[start : start + limit]
-    numbered = [f"{start + i + 1}: {line}" for i, line in enumerate(chunk)]
-    text = "\n".join(numbered)
-    chunk_bytes = len(text.encode("utf-8"))
-    # Hard cap: a single read result larger than MAX_READ_RESULT_BYTES is
-    # truncated to a head+tail slice — the model keeps a usable piece of the
-    # file plus instructions on how to read the rest.
-    if chunk_bytes > MAX_READ_RESULT_BYTES:
-        text = _truncate_read(numbered)
-        chunk_bytes = len(text.encode("utf-8"))
-    # Context-budget check: does this read risk exceeding the compaction
-    # threshold? `current_usage` is the tokens the model already holds.
-    threshold = min(max(compaction_threshold, 1), 100)
-    if (
-        max_context_tokens > 0
-        and current_usage + _token_estimate(chunk_bytes)
-        > threshold * max_context_tokens // 100
-    ):
-        # The refusal stays neutral on purpose: exposing the absolute token
-        # count, the current fill and the compaction threshold would feed the
-        # model a "context is nearly full" signal it then worries about. The
-        # gate still protects the window — the read is refused — but the message
-        # only tells the model *that* the budget is taken, not *how much*.
-        return (
-            f"Refusing to read '{path}': this read would exceed the model's "
-            f"current context budget. Read the file in smaller pieces by lowering "
-            f"`limit` or raising `offset`, then retry."
-        )
-    return text or "(empty file)"
+    return _read_file_text(
+        p,
+        path,
+        offset,
+        limit,
+        current_usage=current_usage,
+        max_context_tokens=max_context_tokens,
+        compaction_threshold=compaction_threshold,
+    ).text
 
 
 def write_file(root: Path, path: str, content: str, *, extra_writable: Path) -> str:

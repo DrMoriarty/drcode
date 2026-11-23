@@ -13,18 +13,24 @@ Covered behaviour:
 - tasks the agent never sees (HOLD, DRAFT) keep the derived title;
 - a failed generation is non-fatal: the old title stays, the run
   completes, a service event tells the user (and the stamp stays off, so
-  the next activation may retry).
+  the next activation may retry);
+- the title call is served by the COMPACTION role's model (the same
+  one-shot profile as the compaction summarizer — a cheap model, and the
+  usage lands under compaction/<model>), falling back to the task's
+  serving model only when no compaction model is selected anywhere
+  (COMPACTION has no fallback of its own in providers.resolve_effective).
 
 All model traffic goes through the in-process ScriptedState stub — no
 network anywhere.
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from drcode import agent_model
+from drcode import agent_model, title_gen
 from drcode.models import TaskKind, TaskStatus
 from drcode.settings import ProjectSettings, ProjectSettingsStore
 from drcode.task_manager import TaskManager
@@ -294,3 +300,118 @@ async def test_failed_generation_does_not_break_the_run(
         assert live.title == DESCRIPTION
         assert not live.title_generated
         assert any("Title generation failed" in e.text for e in live.events)
+
+
+def write_custom_models(project_root: Path, customs: dict[str, dict[str, str]]) -> None:
+    """Activate per-role custom models in the project's drcode.json (no
+    env, no user catalog — the custom entries are the only connections)."""
+    cfg_dir = project_root / ".drcode"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "drcode.json").write_text(
+        json.dumps(
+            {
+                "models": {role: "custom" for role in customs},
+                "custom_models": customs,
+            }
+        )
+    )
+
+
+@pytest.fixture
+def title_spy(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Capture the config the pipeline hands to the title generator (the
+    `drcode.title_gen.build_title_agent` seam — imported at call time by
+    `_maybe_generate_title`, so the monkeypatch is honored) while keeping
+    the real builder behavior."""
+    seen: dict[str, Any] = {}
+    real = title_gen.build_title_agent
+
+    def spy(config: Any, announce_wait: Any = None) -> Any:
+        seen["model"] = config.model
+        seen["announce"] = announce_wait
+        return real(config, announce_wait)
+
+    monkeypatch.setattr(title_gen, "build_title_agent", spy)
+    return seen
+
+
+async def test_title_runs_on_compaction_model(
+    project_root: Path,
+    title_spy: dict[str, Any],
+    scripted: ScriptedState,
+) -> None:
+    """With a compaction model selected, the namer runs on it — not on the
+    task's coding model — and its usage is accounted under
+    compaction/<model>."""
+    enable_titles(project_root)
+    write_custom_models(
+        project_root,
+        {
+            "coding": {
+                "model": "coding-m",
+                "base_url": "http://coding.local/v1",
+                "api_key": "k",
+            },
+            "compaction": {
+                "model": "cheap-m",
+                "base_url": "http://cheap.local/v1",
+                "api_key": "k",
+            },
+        },
+    )
+    task = TaskManager(project_root).create("", DESCRIPTION)
+    # Only the title step and one dev answer are needed — the assertions
+    # fire as soon as the title is generated, before the tester round.
+    scripted.steps = [text_response(GENERATED_TITLE), text_response("готово")]
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        live = app.manager.get(task.id)
+        await wait_until(
+            lambda: live.title_generated,
+            pilot,
+            what="title generated",
+        )
+        await settle(pilot)
+        assert live.title == GENERATED_TITLE
+        assert title_spy["model"] == "cheap-m"
+        # The slot-wait announcer still rides along (provider cap
+        # visibility), worded on the task's slot.
+        assert callable(title_spy["announce"])
+        # The title call's usage landed under the COMPACTION role.
+        today = next(iter(app._usage_store.load().values()), {})
+        assert "compaction/cheap-m" in today
+        assert "coding/cheap-m" not in today
+
+
+async def test_title_falls_back_to_task_model_without_compaction(
+    project_root: Path,
+    title_spy: dict[str, Any],
+    scripted: ScriptedState,
+) -> None:
+    """No compaction model anywhere (env unset, no catalog, no slot): the
+    COMPACTION role resolves not-ready and the namer keeps the historical
+    behavior — the model serving the task."""
+    enable_titles(project_root)
+    write_custom_models(
+        project_root,
+        {
+            "coding": {
+                "model": "coding-m",
+                "base_url": "http://coding.local/v1",
+                "api_key": "k",
+            },
+        },
+    )
+    task = TaskManager(project_root).create("", DESCRIPTION)
+    scripted.steps = [text_response(GENERATED_TITLE), text_response("готово")]
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        live = app.manager.get(task.id)
+        await wait_until(
+            lambda: live.title_generated,
+            pilot,
+            what="title generated",
+        )
+        await settle(pilot)
+        assert live.title == GENERATED_TITLE
+        assert title_spy["model"] == "coding-m"

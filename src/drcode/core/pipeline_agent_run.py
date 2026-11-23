@@ -162,8 +162,19 @@ class PipelineAgentRunLayer(CoreState):
         # TUI cold-start path (this module loads before the first frame).
         from ..title_gen import build_title_agent
 
-        """Generate the task's title from its description with the model
-        serving the task (project setting ``generate_task_titles``).
+        """Generate the task's title from its description (project setting
+        ``generate_task_titles``).
+
+        The call profile is identical to the compaction summarizer's — a
+        tool-less one-shot mini-agent with a bounded prompt and a one-line
+        output — so it is served by the COMPACTION role's model (usually a
+        cheap one) instead of loading the task's coding/research model with
+        a cosmetic call before the main run even starts (see goal c6ee24e4:
+        token economy, plus the title no longer adds to the activation
+        latency of the expensive model). COMPACTION has NO fallback of its
+        own in ``providers.resolve_effective``, so an unset compaction slot
+        (``is_ready == False``) keeps the historical behavior: the model
+        serving the task.
 
         Only DERIVED titles are rewritten: a title that arrived explicitly
         at creation (``task.title_explicit`` — the agents' report tools,
@@ -190,17 +201,27 @@ class PipelineAgentRunLayer(CoreState):
         description = self.manager.editable_condition(task.id)
         if not description:
             return
+        title_role = AgentRole.COMPACTION
+        title_config = self.resolved_config(AgentRole.COMPACTION)
+        if not title_config.is_ready:
+            # No compaction model selected anywhere: fall back to the
+            # task's serving model (the pre-change behavior).
+            title_role = role
+            title_config = self.resolved_config(role)
         try:
             agent = build_title_agent(
-                self.resolved_config(role),
-                # Provider slot-wait visibility (see _wait_announcer).
+                title_config,
+                # Provider slot-wait visibility (see _wait_announcer); the
+                # wait wording stays on the task's slot role — it is shown
+                # in the task's chat, whatever model ends up naming it.
                 announce_wait=self._wait_announcer(task.id, role),
             )
             result = await agent.run(build_title_prompt(description))
             # The title call counts toward the session usage like every
-            # other model call (under the task's serving role).
+            # other model call (under the role that actually served it —
+            # compaction/<model> normally, the task's role on fallback).
             self._record_session_usage(
-                result.usage, role, self.resolved_model_key(role)
+                result.usage, title_role, self.resolved_model_key(title_role)
             )
             title = clean_generated_title(result.output)
         except Exception as e:  # noqa: BLE001 - a failed title must not kill the run

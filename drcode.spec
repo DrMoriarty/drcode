@@ -97,6 +97,13 @@ a = Analysis(
         # Bundled prompt templates: read via `Path(__file__).parent / "prompts"`,
         # which inside a frozen app resolves to <_MEIPASS>/drcode/prompts.
         (str(ROOT / "src" / "drcode" / "prompts"), "drcode/prompts"),
+        # MCP-servers example (drcode.mcp.client_config.ensure_project_example):
+        # read via `Path(__file__).parent / MCP_EXAMPLE_FILENAME`, which in a
+        # frozen app resolves to <_MEIPASS>/drcode/mcp.
+        (
+            str(ROOT / "src" / "drcode" / "mcp" / "mcp-servers.json.example"),
+            "drcode/mcp",
+        ),
         # Single source of the app version (see src/drcode/version.py).
         (str(ROOT / "version"), "."),
         # genai_prices (via pydantic-ai) and pydantic_ai look up their own

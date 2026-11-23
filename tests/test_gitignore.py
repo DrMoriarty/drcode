@@ -117,3 +117,22 @@ def test_unreadable_gitignore_left_alone(project_root: Path) -> None:
     gitignore.write_bytes(b"\xff\xfe\x00")  # not valid UTF-8
     ensure_drcode_gitignored(project_root)  # must not raise
     assert gitignore.read_bytes() == b"\xff\xfe\x00"
+
+
+def test_mcp_example_template_not_ignored(project_root: Path) -> None:
+    """`.drcode/mcp-servers.json.example` (the scaffolded MCP-configuration
+    hint, drcode.mcp.client_config.ensure_project_example) is a
+    team-shareable template — it must NOT match any private entry: only
+    the secret-carrying `mcp-servers.json` itself is ignored."""
+    make_git_repo(project_root)
+    ensure_drcode_gitignored(project_root)
+    text = (project_root / ".gitignore").read_text()
+    assert ".drcode/mcp-servers.json\n" in text
+    assert ".drcode/mcp-servers.json.example" not in text
+    example = ".drcode/mcp-servers.json.example"
+    for entry in GITIGNORE_ENTRIES:
+        assert entry != example
+        # No wildcard entry may swallow the .example suffix.
+        assert not (
+            entry.endswith("*") and example.startswith(entry.rstrip("*"))
+        )

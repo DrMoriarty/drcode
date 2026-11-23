@@ -175,9 +175,11 @@ in the task's chat, never fatal; a junk record inside a valid file is dropped
 without invalidating the others.
 
 An annotated template covering every field — stdio (`command`/`args`/`env`),
-http (`url`/`headers`), tool allow/deny filters, prefixes, timeouts — lives in
-[`.drcode/mcp-servers.json.example`](.drcode/mcp-servers.json.example): copy it
-to one of the two locations, drop the `_`-prefixed comment keys and edit.
+http (`url`/`headers`), tool allow/deny filters, prefixes, timeouts — is
+scaffolded into every project on first start as
+`.drcode/mcp-servers.json.example` (shipped with drcode itself as package
+data): copy it to one of the two locations, drop the `_`-prefixed comment
+keys and edit.
 
 Key rules:
 

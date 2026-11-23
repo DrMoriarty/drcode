@@ -219,9 +219,10 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
            placed below it (the filter field / model table). */
         height: auto;
     }
-    /* The left column is wide enough for its 4-button row (Add / Delete /
-       Check connection / Fetch models — compact, min-width: 0) to fit on
-       ONE line; the right column takes the rest. */
+    /* The left column holds the provider list and its 2-button editor
+       row (Add / Delete — compact, min-width: 0); the right column takes
+       the rest and carries the provider settings fields plus the
+       connection actions under them. */
     #mc-left { width: 50; margin-right: 2; height: auto; }
     #mc-providers { height: 7; margin-top: 1; }
     #mc-right { width: 1fr; height: auto; }
@@ -241,11 +242,12 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         margin-top: 1;
     }
     .mc-btnrow Button { margin-right: 1; }
-    /* The provider row packs FOUR buttons (Add / Delete / Check connection
-       / Fetch models) into the 50-cell left column — only possible with
-       auto-sized (content-width) buttons, so the default min-width: 16 is
-       dropped here. */
-    #mc-provider-btns Button { min-width: 0; }
+    /* Compact button rows: auto-sized (content-width) buttons, so the
+       default min-width: 16 is dropped — the left row packs two editors
+       into the 50-cell column, the right row keeps the connection
+       actions under the settings fields. */
+    #mc-provider-btns Button,
+    #mc-connection-btns Button { min-width: 0; }
     #mc-status {
         width: 100%;
         height: auto;
@@ -334,14 +336,11 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     with Vertical(id="mc-left"):
                         yield Static("Providers", classes="mc-title")
                         yield OptionList(id="mc-providers")
-                        # One row under the provider list: the list editors
-                        # AND the connection actions, all acting on the
-                        # selected provider.
+                        # One row under the provider list: the list editors,
+                        # all acting on the selected provider.
                         with Horizontal(classes="mc-btnrow", id="mc-provider-btns"):
                             yield Button("+ Add", id="mc-add")
                             yield Button("Delete", id="mc-del-provider")
-                            yield Button("Check connection", id="mc-check")
-                            yield Button("Fetch models", id="mc-fetch")
                     with Vertical(id="mc-right"):
                         yield Input(
                             id="mc-name", placeholder="provider name, e.g. local-swap"
@@ -361,6 +360,12 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                                 "max parallel requests (empty / 0 = unlimited)"
                             ),
                         )
+                        # The connection actions sit in the RIGHT column,
+                        # directly under the provider-settings fields they
+                        # act on.
+                        with Horizontal(classes="mc-btnrow", id="mc-connection-btns"):
+                            yield Button("Check connection", id="mc-check")
+                            yield Button("Fetch models", id="mc-fetch")
                 # The model filter and the model table live OUTSIDE the
                 # two-column block: the table spans the full width of the modal.
                 yield Input(

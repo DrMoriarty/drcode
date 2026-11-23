@@ -111,6 +111,14 @@ class Storage:
         # `.drcode/` holds transcripts and the project config — never
         # commit it (the helper is a no-op outside a git repository).
         ensure_drcode_gitignored(project_root)
+        # Every project gets the annotated MCP-servers template on first
+        # start (strictly if-absent, never fatal). Imported HERE, not at
+        # module level: `drcode.mcp.__init__` pulls the embedded-server
+        # half (endpoint → httpx), which must stay off the cold-start
+        # path (the lazy-facade rule of `drcode.agent`).
+        from .mcp.client_config import ensure_project_example
+
+        ensure_project_example(project_root)
         # LRU of sidecar transcripts read this session (task ids, oldest
         # first). Enforced by _evict_hook (installed by the TaskManager —
         # only it can save+unload a Task object).

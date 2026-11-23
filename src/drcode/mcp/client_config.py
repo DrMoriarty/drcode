@@ -40,6 +40,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from drcode import config as _config
 
 MCP_SERVERS_FILENAME = "mcp-servers.json"
+MCP_EXAMPLE_FILENAME = "mcp-servers.json.example"
+
+# The bundled annotated template, shipped as package data next to this
+# module (pyproject `include` + drcode.spec `datas` carry it into wheels
+# and frozen bundles). Read at call time, never at import time.
+_EXAMPLE_PATH = Path(__file__).resolve().parent / MCP_EXAMPLE_FILENAME
 
 # Role keys of the per-role gating matrix ("roles" in the file). COMPACTION
 # is listed for completeness of the format; the implementation IGNORES it —
@@ -213,6 +219,34 @@ def user_servers_file() -> Path:
 def project_servers_file(project_root: Path) -> Path:
     """Path of the project-level catalog: `<project>/.drcode/mcp-servers.json`."""
     return project_root / ".drcode" / MCP_SERVERS_FILENAME
+
+
+def project_example_file(project_root: Path) -> Path:
+    """Path of the scaffolded template: `<project>/.drcode/mcp-servers.json.example`."""
+    return project_root / ".drcode" / MCP_EXAMPLE_FILENAME
+
+
+def ensure_project_example(project_root: Path) -> None:
+    """Scaffold the annotated MCP-servers template into the project.
+
+    On startup every project gets `<root>/.drcode/mcp-servers.json.example`
+    (a hint how external MCP servers are configured) unless it already
+    exists — the file is a template the user may edit/commit, so it is
+    written strictly if-absent (`ensure_user_config_dir` pattern). The
+    `.drcode/` directory is created lazily, only when the file is actually
+    written. Never fatal: an unwritable project directory (no permissions,
+    read-only volume, `.drcode` occupied by a regular file) just means no
+    template — the MCP client stack reads the real `mcp-servers.json` and
+    could not care less.
+    """
+    target = project_example_file(project_root)
+    if target.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_EXAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        pass
 
 
 class McpServersStore:

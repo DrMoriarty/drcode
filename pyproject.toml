@@ -70,8 +70,8 @@ pattern = "^(?P<version>[^\\s]+)$"
 [tool.hatch.build.targets.wheel]
 packages = ["src/drcode"]
 # Bundle the bundled template prompts (system prompts, compaction + init_repo
-# templates) as package data inside the wheel.
-include = ["src/drcode/prompts/**"]
+# templates) and the MCP-servers example as package data inside the wheel.
+include = ["src/drcode/prompts/**", "src/drcode/mcp/mcp-servers.json.example"]
 
 [dependency-groups]
 dev = [

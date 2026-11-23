@@ -407,11 +407,21 @@ def build_subagent_agent(
 
     @agent.tool
     async def grep_search(
-        ctx: RunContext[SubagentDeps], pattern: str, include: str = ""
+        ctx: RunContext[SubagentDeps],
+        pattern: str,
+        include: str = "",
+        timeout: float | None = None,
     ) -> list[str]:
         """Regex search in file contents. `include` is an optional glob mask
-        filtering files by their project-relative path, e.g. '*.py' or 'src/**/*.py'."""
-        return await _run_tool(tools.grep_search, ctx.deps.root, pattern, include)
+        filtering files by their project-relative path, e.g. '*.py' or
+        'src/**/*.py'. A scan is bounded by a 5-minute time budget by default:
+        when it expires you get the partial hits plus an interruption note
+        naming the path where the scan stopped — prefer a more precise
+        `include` mask; pass `timeout` (seconds) only for a genuinely larger
+        scan."""
+        return await _run_tool(
+            tools.grep_search, ctx.deps.root, pattern, include, timeout
+        )
 
     @agent.tool
     async def search_task_archive(

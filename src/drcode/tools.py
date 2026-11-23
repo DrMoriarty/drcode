@@ -518,6 +518,16 @@ GREP_BINARY_SNIFF_BYTES = 8192  # a NUL byte in the head marks a binary file
 # pytorch-src — full PyTorch sources whose tens of thousands of text files a
 # plain walk reads line by line).
 GREP_PROBE_DEPTH = 3
+# Per-call wall-clock budget for the scan itself (the default for the
+# `timeout` parameter): a rare pattern without an include mask over a huge
+# non-git tree (a full PyTorch checkout nested inside the project) once
+# burned 28+ minutes with no early exit — the loop's only breaks fire when
+# BOTH the shown limit AND the count limit are exhausted. The deadline is
+# checked once per candidate file (a cheap monotonic read, never per line);
+# on expiry the agent gets the partial hits in the usual format plus an
+# explicit interruption note naming the candidate where the scan stopped, so
+# it can narrow the include mask or pass an explicit larger timeout.
+GREP_DEFAULT_TIMEOUT_S = 300.0
 
 
 def _git_ls_files(root: Path, pathspec: str | None = None) -> list[Path] | None:
@@ -759,7 +769,19 @@ def _read_greppable(f: Path) -> str | None:
     return body.decode("utf-8", errors="replace")
 
 
-def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
+def grep_search(
+    root: Path, pattern: str, include: str = "", timeout: float | None = None
+) -> list[str]:
+    """Regex search over the greppable files under `root`; hits come back as
+    "rel:line: text" lines. `include` is a glob mask over the project-relative
+    path ("*.py", "src/**/*.py"). The scan runs under a wall-clock budget:
+    `timeout` seconds, the module constant GREP_DEFAULT_TIMEOUT_S (5 minutes)
+    when None. An expired budget returns the partial hits collected so far
+    plus an explicit interruption note naming the candidate path where the
+    scan stopped — narrowing `include` is usually better than raising it."""
+    budget = GREP_DEFAULT_TIMEOUT_S if timeout is None else timeout
+    started = time.monotonic()
+    deadline = started + budget
     regex = re.compile(pattern)
     include_re = _include_matcher(include) if include else None
     if include.startswith("/"):
@@ -783,7 +805,15 @@ def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
         candidates: Iterator[tuple[str, Path]] = _exact_candidates(root, exact)
     else:
         candidates = _grep_candidates(root, prefix)
+    interrupted_at: str | None = None
     for rel, f in candidates:
+        # The time budget is checked once per CANDIDATE FILE — a cheap
+        # monotonic read, never per line — so a huge scan cannot run away
+        # (the in-loop breaks below fire only when both result budgets are
+        # exhausted, which a rare pattern over a huge tree never reaches).
+        if time.monotonic() > deadline:
+            interrupted_at = rel
+            break
         # `include` is a glob mask over the project-relative path (models
         # naturally send "*.py" / "src/**/*.py", not regexes).
         if include_re and not include_re.match(rel):
@@ -825,6 +855,17 @@ def grep_search(root: Path, pattern: str, include: str = "") -> list[str]:
         results.append(
             f"showing {shown} of ≥{total} matches in {files_with} files — "
             "narrow the include or refine the pattern"
+        )
+    if interrupted_at is not None:
+        # The scan ran out of time: the hits above are partial. The note
+        # names the candidate the scan stopped AT (not yet scanned), so the
+        # agent can see where a more precise include mask should resume.
+        elapsed = time.monotonic() - started
+        results.append(
+            f"grep interrupted after {elapsed:.1f}s: the {budget:.0f}s time "
+            f"budget expired at candidate '{interrupted_at}' — results above "
+            "are PARTIAL; pass a more precise include mask (or an explicit "
+            "larger timeout) instead of re-running the same wide search"
         )
     return results
 

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -744,6 +745,74 @@ def test_grep_search_bad_regex_raises(project_root: Path) -> None:
 def test_grep_search_unreadable_file_skipped(project_root: Path) -> None:
     (project_root / "adir").mkdir()
     assert grep_search(project_root, "x") == []
+
+
+def _slow_read(monkeypatch: pytest.MonkeyPatch, delay: float) -> None:
+    """Make every candidate read take `delay` seconds (the stand-in for a
+    huge slow scan — the deadline check is per candidate, so a slowed
+    _read_greppable is exactly what moves the clock)."""
+    real_read = tools._read_greppable
+
+    def slow(f: Path) -> str | None:
+        time.sleep(delay)
+        return real_read(f)
+
+    monkeypatch.setattr(tools, "_read_greppable", slow)
+
+
+def test_grep_search_default_timeout_partial_results(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default time budget (GREP_DEFAULT_TIMEOUT_S) interrupts a slow wide
+    # scan: the agent gets the partial hits in the usual format plus ONE
+    # explicit interruption note — elapsed time, the candidate path the scan
+    # stopped at, and the advice to narrow the include mask.
+    for n in range(40):
+        (project_root / f"f{n:02}.txt").write_text("needle\n")
+    # Budget 0.5s vs 20ms per read: the lazy enumeration (one `git ls-files`
+    # spawn) fits comfortably inside the budget, the 40 reads do not.
+    _slow_read(monkeypatch, delay=0.02)
+    monkeypatch.setattr(tools, "GREP_DEFAULT_TIMEOUT_S", 0.5)
+    results = grep_search(project_root, "needle")
+    hits = [r for r in results if r.endswith(": needle")]
+    notes = [r for r in results if not r.endswith(": needle")]
+    assert hits, "partial results must survive the interruption"
+    assert len(hits) < 40, "the scan must have been cut short"
+    assert len(notes) == 1
+    note = notes[0]
+    assert "interrupted after" in note
+    assert "time budget expired" in note
+    # Names the candidate where the scan stopped (not yet scanned).
+    m = re.search(r"candidate '(f\d+\.txt)'", note)
+    assert m is not None, note
+    assert int(m.group(1)[1:3]) >= len(hits) - 1
+    # Points at the escape hatches: a narrower mask or an explicit timeout.
+    assert "include" in note and "timeout" in note
+
+
+def test_grep_search_explicit_timeout_completes_full_scan(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An explicitly larger timeout lets the same slow scan run to completion:
+    # every file's hit comes back, no interruption note.
+    for n in range(40):
+        (project_root / f"f{n:02}.txt").write_text("needle\n")
+    _slow_read(monkeypatch, delay=0.005)
+    results = grep_search(project_root, "needle", timeout=60.0)
+    assert len(results) == 40
+    assert all(": needle" in r for r in results)
+
+
+def test_grep_search_zero_timeout_returns_only_note(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An already-expired budget interrupts before the first candidate: no
+    # hits, only the interruption note (still actionable).
+    (project_root / "a.py").write_text("needle\n")
+    results = grep_search(project_root, "needle", timeout=0.0)
+    assert len(results) == 1
+    assert "interrupted after" in results[0]
+    assert "candidate 'a.py'" in results[0]
 
 
 # -- grep_search include pruning (candidate enumeration shortcut) ---------------

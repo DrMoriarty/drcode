@@ -131,7 +131,7 @@ def _join_components(
 def load_system_prompt_components(
     kind: TaskKind,
     project_root: Path | None = None,
-    research_git: GitPolicy = GitPolicy.PUSH,
+    research_git: GitPolicy = GitPolicy.LOCAL,
 ) -> tuple[str, str | None, str | None]:
     """(base prompt, git workflow or None, role instructions or None) for a
     coding task of the given kind.
@@ -195,7 +195,7 @@ def load_system_prompt_components(
 def load_tester_prompt_components(
     allow_commit: bool = True,
     project_root: Path | None = None,
-    allow_push: bool = True,
+    allow_push: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """(base prompt, git workflow or None, role instructions or None) for
     the QA tester — the component counterpart of
@@ -223,7 +223,7 @@ def load_tester_prompt_components(
 def load_system_prompt(
     kind: TaskKind,
     project_root: Path | None = None,
-    research_git: GitPolicy = GitPolicy.PUSH,
+    research_git: GitPolicy = GitPolicy.LOCAL,
 ) -> str:
     """Bundled system prompt for a coding task of the given kind.
 
@@ -254,7 +254,7 @@ def load_system_prompt(
 def load_tester_prompt(
     allow_commit: bool = True,
     project_root: Path | None = None,
-    allow_push: bool = True,
+    allow_push: bool = False,
 ) -> str:
     """Bundled QA tester system prompt.
 

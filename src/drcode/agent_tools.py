@@ -1669,7 +1669,7 @@ def _track_edited_file(deps: AgentDeps, resolved: Path) -> None:
 
 
 async def _commit_tracked_files(
-    deps: AgentDeps, root: Path, message: str, allow_push: bool = True
+    deps: AgentDeps, root: Path, message: str, allow_push: bool = False
 ) -> str:
     """Commit EXACTLY the files the research agent created/edited itself.
 

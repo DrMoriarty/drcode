@@ -1429,8 +1429,8 @@ async def test_git_commit_no_push_skips_push_even_with_remote(
 async def test_git_commit_push_variant_still_pushes(
     tmp_path: Path, fake_config: Config
 ) -> None:
-    """Default finalization (commit + push): the same tool body pushes to the
-    configured remote — the split must not have broken the default path."""
+    """Push policy (commit + push): the same tool body pushes to the
+    configured remote."""
     _git_init_repo(tmp_path)
     _git(tmp_path, "config", "user.email", "t@t")
     _git(tmp_path, "config", "user.name", "t")
@@ -1443,7 +1443,7 @@ async def test_git_commit_push_variant_still_pushes(
 
     deps = _tester_deps(tmp_path)
     (tmp_path / "g.txt").write_text("y")
-    tester = agent_mod.build_tester_agent(fake_config)
+    tester = agent_mod.build_tester_agent(fake_config, allow_push=True)
     result = await _run_git_commit(_git_commit_tool(tester), deps, "add g.txt")
     assert "Committed successfully" in result
     assert "Pushed successfully" in result
@@ -1891,7 +1891,9 @@ async def test_git_commit_docs_commits_only_tracked_files(tmp_path: Path) -> Non
     _git_init_repo(origin, bare=True)
     _git(tmp_path, "remote", "add", "origin", str(origin))
 
-    result = await agent_mod._commit_tracked_files(deps, tmp_path, "docs: add guide")
+    result = await agent_mod._commit_tracked_files(
+    deps, tmp_path, "docs: add guide", allow_push=True
+)
 
     assert "Committed successfully" in result
     assert "Pushed successfully" in result

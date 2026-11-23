@@ -4579,18 +4579,20 @@ async def test_settings_git_policy_pickers(app: DrCodeApp) -> None:
         await pilot.pause()
         commands = GitTesterOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         assert [c.name for c in commands] == [
-            "commit + push (current)",
-            "commit locally",
+            "commit locally (current)",
+            "commit + push",
             "off",
         ]
-        # Pick the local policy for the tester.
-        local_cb = next(c.callback for c in commands if c.name == "commit locally")
+        # Pick the local policy for the tester (already the current one).
+        local_cb = next(
+            c.callback for c in commands if c.name.startswith("commit locally")
+        )
         local_cb()
         await pilot.pause()
         assert app.settings.git_policy.tester is GitPolicy.LOCAL
         stored = ProjectSettingsStore(app.project_root).load()
         assert stored.git_policy.tester is GitPolicy.LOCAL
-        assert stored.git_policy.research is GitPolicy.PUSH  # untouched
+        assert stored.git_policy.research is GitPolicy.LOCAL  # untouched
 
         commands = GitResearchOptionsProvider(app.screen)._commands()  # pyright: ignore[reportAttributeAccessIssue]
         off_cb = next(c.callback for c in commands if c.name == "off")

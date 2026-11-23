@@ -120,10 +120,10 @@ def test_tester_prompts_teach_project_environment_checks() -> None:
 def test_tester_prompt_no_push_variant(tmp_path: Path) -> None:
     """The commit-without-push tester git policy selects the dedicated
     template: it teaches the commit flow but never promises a push — and
-    the default (pushing) template does."""
+    the pushing template does."""
     from drcode.prompts import TESTER_SYSTEM_PROMPT_COMMIT_NO_PUSH
 
-    pushy = load_tester_prompt(True, tmp_path)
+    pushy = load_tester_prompt(True, tmp_path, allow_push=True)
     no_push = load_tester_prompt(True, tmp_path, allow_push=False)
     no_commit = load_tester_prompt(False, tmp_path, allow_push=False)
     # The no-push prompt is its own template, distinct from both others.

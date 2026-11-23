@@ -248,6 +248,7 @@ class PipelineAgentRunLayer(CoreState):
         # check, the agent build and the compaction gates — uses it.
         role = self._task_role(task)
         from pydantic_ai import Agent
+        from pydantic_ai.exceptions import UsageLimitExceeded
         from pydantic_ai.usage import UsageLimits
 
         from ..agent_build import AgentDeps
@@ -426,7 +427,15 @@ class PipelineAgentRunLayer(CoreState):
                             input_hooks=self._input_delivery_hooks(),
                         ),
                         usage_limits=UsageLimits(
-                            request_limit=self.config.request_limit
+                            request_limit=self.config.request_limit,
+                            # Per-run ≈token budget (project setting
+                            # `run_token_limit`): a cumulative cap on the
+                            # run's total (input + output) tokens — the
+                            # money safety net against a runaway run.
+                            # Exhaustion raises UsageLimitExceeded, handled
+                            # as a graceful stop below (see
+                            # _agent_turn_budget_exhausted).
+                            total_tokens_limit=self.config.run_token_limit,
                         ),
                     ) as run:
                         # Sync markers for the per-node re-render (below):
@@ -515,6 +524,16 @@ class PipelineAgentRunLayer(CoreState):
                         task, task_id, run, consumed, content, generation
                     )
                     raise
+                except UsageLimitExceeded as e:
+                    # The run's budget (request_limit, or the per-run token
+                    # budget `run_token_limit`) is spent: a graceful stop —
+                    # the attempt is kept unfinished like after an abort
+                    # (no requeue, no failed-queue exclusion), a service
+                    # event reports what the run spent.
+                    self._agent_turn_budget_exhausted(
+                        task, task_id, run, consumed, content, generation, e
+                    )
+                    break
                 except Exception as e:  # noqa: BLE001 - show agent errors in the chat
                     # A transient network error (transport failure like a
                     # connection refused/timeout, or HTTP 429 rate limiting)
@@ -1261,6 +1280,59 @@ class PipelineAgentRunLayer(CoreState):
         # Drop our streaming preview; a newer run (if any) owns the label
         # now and must not be touched.
         self._drop_stream_preview(task_id, generation)
+
+    def _agent_turn_budget_exhausted(
+        self,
+        task: Task,
+        task_id: str,
+        run: AgentRun[AgentDeps, str] | None,
+        consumed: list[PendingInput],
+        content: str | list[Any] | None,
+        generation: int,
+        error: Exception,
+    ) -> None:
+        """The run hit its usage budget (pydantic-ai's UsageLimits — the
+        per-run token budget `run_token_limit`, or `request_limit`):
+        stop GRACEFULLY instead of failing. Exactly the abort path's
+        transcript care (persist + sanitize + `task.unfinished`), but the
+        task KEEPS its ACTIVE status — it stays paused on the unfinished
+        flag, and a new message (or a restart's auto-resume) continues the
+        attempt; the queue is not touched and the failed-queue exclusion
+        does not fire. A service event reports the spent amount and points
+        at the context dialog (🧠 in the task status bar) and the knob that
+        lifts the budget."""
+        spent = 0
+        if run is not None:
+            try:
+                # `usage` is a property (RunUsage) — the cumulative spend of
+                # the run so far, exact API numbers (never the chars/4 ≈).
+                spent = run.usage.total_tokens or 0
+            except Exception:  # noqa: BLE001, S110 - reporting never fatal
+                pass
+        limit = self.config.run_token_limit
+        limit_txt = f"{limit:,}" if limit else "the configured"
+        self._show_event(
+            task,
+            f"Run budget exhausted ({spent:,} ≈tokens spent of {limit_txt}): "
+            "the attempt is kept unfinished — send a message (or restart "
+            "drcode) to resume it. The 🧠 counter in the task status bar "
+            "opens the context dialog with the per-agent token layout; "
+            "raise `run_token_limit` in drcode.json (env: "
+            "DRCODE_RUN_TOKEN_LIMIT) to lift the budget.",
+        )
+        if self._agent_generations.get(task_id) == generation and (
+            task.status is TaskStatus.ACTIVE
+        ):
+            # The same transcript care an abort takes: persist whatever the
+            # interrupted turn managed to do, then sanitize the API-invalid
+            # tail so later messages can append in any order.
+            self._backdate_consumed_prompt(run, consumed, content)
+            self._persist_task_messages(task, run)
+            task.messages = sanitized_messages(task.messages)
+            task.unfinished = True
+            self.manager.storage.save(task)
+        if self._agent_generations.get(task_id) == generation:
+            self._drop_stream_preview(task_id, generation)
 
     def _agent_turn_network_error(
         self,

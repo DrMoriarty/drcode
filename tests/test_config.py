@@ -290,3 +290,36 @@ def test_example_values_use_placeholders() -> None:
     )
     # Placeholders must never reference unknown fields.
     assert set(config_module._EXAMPLE_PLACEHOLDERS) <= set(fields)
+
+
+# -- run_token_limit --------------------------------------------------------------
+
+
+def test_run_token_limit_default(project_root: Path) -> None:
+    # No budget by default: the token cap is opt-in (request_limit remains
+    # the always-on turn cap).
+    assert Config(project_root=project_root).run_token_limit is None
+
+
+def test_run_token_limit_layering(
+    project_root: Path, user_config_dir: Path, monkeypatch
+) -> None:
+    # Same layers as every other non-provider setting:
+    # env > project json > user json > defaults.
+    _write_json(user_config_dir / "drcode.json", {"run_token_limit": 100_000})
+    cfg = Config(project_root=project_root)
+    assert cfg.run_token_limit == 100_000
+
+    _write_json(_project_config(project_root), {"run_token_limit": 250_000})
+    cfg = Config(project_root=project_root)
+    assert cfg.run_token_limit == 250_000
+
+    monkeypatch.setenv("DRCODE_RUN_TOKEN_LIMIT", "300000")
+    cfg = Config(project_root=project_root)
+    assert cfg.run_token_limit == 300_000
+
+
+def test_run_token_limit_in_example(user_config_dir: Path) -> None:
+    ensure_user_config_dir()
+    data = json.loads(config_module.USER_CONFIG_EXAMPLE_FILE.read_text())
+    assert data["run_token_limit"] is None

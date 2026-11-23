@@ -296,6 +296,50 @@ def _truncate_read(numbered: list[str]) -> str:
     return "\n".join(head + tail) + note
 
 
+# Shares of the MAX_TOOL_OUTPUT budget given to the head and tail slices of a
+# truncated command result (same split as _truncate_read), and the chars
+# reserved for the truncation note so the WHOLE result stays within the cap
+# (the note is ~120 chars; for pathologically small caps the reserve shrinks
+# proportionally instead of eating the whole budget).
+_BASH_HEAD_SHARE = 0.75
+_BASH_NOTE_RESERVE = 256
+
+
+def truncate_tool_output(text: str) -> str:
+    """Cut oversized command output to a VISIBLE head+tail slice within
+    MAX_TOOL_OUTPUT (run_bash and friends).
+
+    Truncation must be VISIBLE (same principle as the grep notes): a silent
+    cap let the model mistake "80 of 2000 lines" for the complete result. The
+    head slice keeps the errors/banners, the tail keeps the closing summary
+    (exit stats, prompts), and a note in the middle names the omitted span
+    plus how to re-read it. Slices are snapped to whole lines when the output
+    has them, so no line is cut in half."""
+    if len(text) <= MAX_TOOL_OUTPUT:
+        return text
+    reserve = min(_BASH_NOTE_RESERVE, MAX_TOOL_OUTPUT // 4)
+    budget = MAX_TOOL_OUTPUT - reserve
+    head_budget = int(budget * _BASH_HEAD_SHARE)
+    tail_budget = budget - head_budget
+
+    head = text[:head_budget]
+    nl = head.rfind("\n")
+    if nl != -1:
+        head = head[: nl + 1]
+    tail = text[-tail_budget:]
+    nl = tail.find("\n")
+    if nl != -1:
+        tail = tail[nl + 1 :]
+
+    omitted = len(text) - len(head) - len(tail)
+    note = (
+        f"[output truncated: {omitted} of {len(text)} characters omitted — "
+        f"re-run with a narrower command (head/tail/grep) to see the middle]"
+    )
+    head_sep = "\n" if head and not head.endswith("\n") else ""
+    return f"{head}{head_sep}{note}\n{tail}"
+
+
 def read_file(
     root: Path,
     path: str,
@@ -2011,7 +2055,7 @@ async def run_bash(
         except (ProcessLookupError, PermissionError, OSError):
             pass  # group already gone / partial permission
     raw = stdout.decode(errors="replace") + stderr.decode(errors="replace")
-    out = strip_malloc_stack_logging_noise(raw).strip()[:MAX_TOOL_OUTPUT]
+    out = truncate_tool_output(strip_malloc_stack_logging_noise(raw).strip())
     return f"exit={proc.returncode}\n{out or '(no output)'}"
 
 

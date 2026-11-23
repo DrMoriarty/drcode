@@ -1657,10 +1657,38 @@ def test_run_bash_child_stdin_reads_eof(project_root: Path) -> None:
 
 
 def test_run_bash_output_truncated(project_root: Path, monkeypatch) -> None:
-    monkeypatch.setattr(tools, "MAX_TOOL_OUTPUT", 100)
-    out = asyncio.run(run_bash(project_root, "echo " + "x" * 500))
-    # "exit=0\n" prefix + exactly MAX_TOOL_OUTPUT characters of output.
-    assert out == "exit=0\n" + "x" * 100
+    monkeypatch.setattr(tools, "MAX_TOOL_OUTPUT", 1000)
+    out = asyncio.run(run_bash(project_root, "echo " + "x" * 2000))
+    prefix = "exit=0\n"
+    assert out.startswith(prefix)
+    body = out[len(prefix) :]
+    # Truncation is VISIBLE: head + note + tail, the note names the omitted
+    # span and the whole body stays within MAX_TOOL_OUTPUT.
+    assert "[output truncated:" in body
+    assert "2000 characters omitted" in body
+    assert len(body) <= tools.MAX_TOOL_OUTPUT
+    # Both ends survive: head (75%) and tail (25%) slices of the x-run.
+    head, note, rest = body.partition("[output truncated:")
+    assert note
+    assert head.strip("x\n") == ""
+    tail = rest.split("]\n", 1)[1]
+    assert len(head) > len(tail)
+    assert tail.strip("x\n") == ""
+    # Short output is untouched.
+    ok = asyncio.run(run_bash(project_root, "echo hi"))
+    assert ok == "exit=0\nhi"
+
+
+def test_run_bash_output_truncated_keeps_last_line(
+    project_root: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(tools, "MAX_TOOL_OUTPUT", 1000)
+    script = "echo banner; seq 1 300; echo DONE"
+    out = asyncio.run(run_bash(project_root, script))
+    # The tail slice keeps the closing summary line (snapped to whole lines,
+    # no mid-line cut of "DONE").
+    assert out.rstrip().endswith("DONE")
+    assert "banner" in out
 
 
 def test_ignored_dirs_contents() -> None:

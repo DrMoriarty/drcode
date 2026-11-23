@@ -113,7 +113,7 @@ def _truncate(lines: list[str]) -> str:
 
 
 def _load(
-    project_root: Path, *, persist: bool = True
+    project_root: Path, *, persist: bool | Path = True
 ) -> tuple[dict[str, FileIndex], BuildInfo]:
     return load_index(project_root, persist=persist)
 
@@ -124,7 +124,7 @@ def find_symbols(
     kind: str = "",
     limit: int = 20,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> str:
     """Definitions whose name contains `query` (case-insensitive), ranked
     exact → prefix → substring, shortest path first (§5.1). `kind`
@@ -172,7 +172,7 @@ def outline(
     around: str = "",
     span: int = 0,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> str:
     """A file's skeleton: every definition with line, kind and signature
     (§5.4) — the map, not the code. With `around=<symbol name>`: the
@@ -279,7 +279,9 @@ def _body(root: Path, rel: str, symbol: Symbol, span: int) -> str | None:
     return "\n".join([header, *chunk])
 
 
-def _record_for(root: Path, rel: str, *, persist: bool = True) -> FileIndex | None:
+def _record_for(
+    root: Path, rel: str, *, persist: bool | Path = True
+) -> FileIndex | None:
     """The file's record through the normal stat gate. The query-level
     self-heal (a proved-stale record) goes through `store.reparse_entry`
     instead — see `outline`."""
@@ -576,7 +578,7 @@ def ref_hits(
     name: str,
     entries: dict[str, FileIndex] | None = None,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> list[RefHit]:
     """Every textual occurrence of `\\bname\\b` across the indexed files
     (§5.2 — "managed grep": grep_search scans everything, this scans the
@@ -614,7 +616,7 @@ def ref_hits(
 
 
 def refs(
-    project_root: Path, name: str, limit: int = 50, *, persist: bool = True
+    project_root: Path, name: str, limit: int = 50, *, persist: bool | Path = True
 ) -> str:
     """The formatted §5.2 answer: occurrences grouped by file, definitions
     marked [def], a `N files, M hits` header, the honest textual-match
@@ -891,7 +893,9 @@ class CallerHit:
     score: float
 
 
-def load_entries(project_root: Path, *, persist: bool = True) -> dict[str, FileIndex]:
+def load_entries(
+    project_root: Path, *, persist: bool | Path = True
+) -> dict[str, FileIndex]:
     """The project's per-file index records through the normal
     incremental cache — the public entry point for batch consumers (the
     scout bench adapter) that make MANY queries over one entries
@@ -905,7 +909,7 @@ def definitions_of(
     name: str,
     entries: dict[str, FileIndex] | None = None,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> list[tuple[str, Symbol]]:
     """Every indexed definition named exactly `name` (exact match, all
     files) — §4.3 step 1."""
@@ -929,7 +933,7 @@ def batched_callers(
     entries: dict[str, FileIndex] | None = None,
     graph: ImportGraph | None = None,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> dict[str, list[CallerHit]]:
     """The §4.3 heuristic for MANY names in ONE file pass: identifier
     matches inside function/method bodies → INFERRED caller edges,
@@ -1104,7 +1108,7 @@ def caller_hits(
     entries: dict[str, FileIndex] | None = None,
     graph: ImportGraph | None = None,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> list[CallerHit]:
     """The §4.3 heuristic for ONE name — the thin wrapper over
     `batched_callers` (the same single-pass scan, one identifier)."""
@@ -1125,7 +1129,7 @@ def batched_refs(
     names: list[str],
     entries: dict[str, FileIndex] | None = None,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> dict[str, list[RefHit]]:
     """The §5.2 textual scan for MANY names in ONE file pass — the batch
     twin of `ref_hits` (semantically identical to calling it per name;
@@ -1206,7 +1210,7 @@ def callers(
     name: str,
     limit: int = 30,
     *,
-    persist: bool = True,
+    persist: bool | Path = True,
 ) -> str:
     """The formatted §5.3 answer: the INFERRED service line, where the
     symbol is defined, then `caller (file:line) → matching line`, ranked

@@ -34,19 +34,32 @@ from .store import take_build_notice
 __all__ = ["register_code_index_tools"]
 
 
-def _persist_for(ctx: RunContext[Any]) -> bool:
-    """Whether the index may touch the disk for THIS call: only when the
-    tree being indexed IS the main checkout (§7.1 — the physical index
-    lives at the storage root, never inside a worktree, whose `.drcode/`
-    must stay copy-skip clean). A worktree task (or a deps shape without
-    a manager) gets the in-memory-only §6.2 overlay instead."""
+def _persist_for(ctx: RunContext[Any]) -> bool | Path:
+    """The §7.3 base-layer selector for THIS call: `True` when the tree
+    being indexed IS the main checkout (the index is read AND written at
+    the storage root); the storage-root `Path` for a worktree task — its
+    own `.drcode/` never receives an index file (§7.1: copy-skip clean),
+    but the MAIN checkout's persisted index is loaded as a READ-ONLY
+    base layer so unchanged files are not re-parsed in every worktree;
+    `False` only when there is no usable base at all (deps without a
+    manager, or a failed path resolution) — the pure in-memory §6.2
+    overlay."""
     deps = ctx.deps
     root = getattr(deps, "root", None)
     manager = getattr(deps, "manager", None)
     if root is None or manager is None:
         return False
     try:
-        return Path(root).resolve() == Path(manager.storage.root).resolve()
+        if Path(root).resolve() == Path(manager.storage.root).resolve():
+            return True
+    except (OSError, ValueError):
+        return False
+    storage = getattr(manager, "storage", None)
+    storage_root = getattr(storage, "root", None)
+    if not isinstance(storage_root, (str, Path)) or not storage_root:
+        return False
+    try:
+        return Path(storage_root).resolve()
     except (OSError, ValueError):
         return False
 

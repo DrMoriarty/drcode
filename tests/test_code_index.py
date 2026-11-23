@@ -812,6 +812,149 @@ def store_head(project_root: Path) -> str | None:
     return store_mod._load_disk_index(project_root)[1]
 
 
+@pytest.mark.skipif(not _PYTHON_READY, reason="python grammar unavailable")
+class TestWorktreeBaseLayer:
+    """§7.3: a worktree task loads the MAIN checkout's persisted index as
+    a READ-ONLY base layer (`persist=<storage root>`). A fresh
+    `git worktree add` checkout rewrites every tracked file with fresh
+    mtimes, so reuse beyond stat keys rides on the entries' content
+    hashes; nothing is ever written, into the base or the worktree."""
+
+    @staticmethod
+    def _prepare_base(project_root: Path, *, build: bool = True) -> Path:
+        """A main checkout with a built index; returns the storage root
+        (the base layer path a worktree would borrow)."""
+        (project_root / "sample.py").write_text(_PY_SAMPLE)
+        if build:
+            load_index(project_root)
+        return project_root
+
+    def test_stat_key_match_adopts_the_base_record(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = self._prepare_base(project_root)
+        parsed = _counting_extractor(monkeypatch)
+        entries, info = load_index(base, persist=base)
+        assert not info.built_now  # The base layer is read-only.
+        assert entries and not parsed  # stat key hit, zero parses.
+
+    def test_fresh_mtimes_adopt_by_content_hash(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real worktree shape: identical content, fresh mtimes (a
+        `git worktree add` checkout) — the base record is adopted via the
+        persisted sha256, the file is NOT parsed."""
+        base = self._prepare_base(project_root)
+        # Simulate the fresh checkout: rewrite the file with the SAME
+        # content but a fresh mtime (a plain write changes mtime).
+        (base / "sample.py").write_text(_PY_SAMPLE)
+        stat = (base / "sample.py").stat()
+        stored = json.loads((base / ".drcode" / "code_index.json").read_text())[
+            "entries"
+        ]["sample.py"]
+        assert stored[0] != [stat.st_mtime_ns, stat.st_size]  # stat mismatch
+        parsed = _counting_extractor(monkeypatch)
+        entries, _ = load_index(base, persist=base)
+        assert parsed == []  # Content identity adopted the base record.
+        assert "render" in [s.name for s in entries["sample.py"].symbols]
+        assert "render_all" in [s.name for s in entries["sample.py"].symbols]
+
+    def test_changed_file_reparses_into_the_overlay(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = self._prepare_base(project_root)
+        (base / "extra.py").write_text(_PY_SAMPLE)  # Not in the base layer.
+        (base / "sample.py").write_text(_PY_SAMPLE.replace("render_all", "render_many"))
+        parsed = _counting_extractor(monkeypatch)
+        entries, _ = load_index(base, persist=base)
+        assert sorted(parsed) == ["extra.py", "sample.py"]
+        assert [
+            s.name for s in entries["sample.py"].symbols if s.name.startswith("render")
+        ] == ["render", "render_many"]
+        # The base file on disk is untouched: still the old record.
+        disk = json.loads((base / ".drcode" / "code_index.json").read_text())
+        assert "render_all" in json.dumps(disk["entries"]["sample.py"])
+        assert "extra.py" not in disk["entries"]
+
+    def test_deleted_and_added_files(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = self._prepare_base(project_root)
+        (base / "sample.py").unlink()  # Deleted in the worktree.
+        (base / "added.py").write_text("def added():\n    pass\n")
+        parsed = _counting_extractor(monkeypatch)
+        entries, _ = load_index(base, persist=base)
+        assert "sample.py" not in entries  # Drops out without an error.
+        assert "added.py" in entries
+        assert parsed == ["added.py"]
+        # And nothing leaked into the base file.
+        disk = json.loads((base / ".drcode" / "code_index.json").read_text())
+        assert "sample.py" in disk["entries"] and "added.py" not in disk["entries"]
+
+    def test_worktree_dot_drcode_stays_clean(self, project_root: Path) -> None:
+        base = self._prepare_base(project_root)
+        wt = base.parent / "wt"
+        wt.mkdir()
+        (wt / "sample.py").write_text(_PY_SAMPLE)
+        entries, _ = load_index(wt, persist=base)
+        assert entries
+        assert not (wt / ".drcode").exists()  # §7.1: copy-skip clean.
+
+    def test_head_guard_does_not_fire_for_a_borrowed_base(
+        self, project_root: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """§6.4 is OWN-ROOT only: the worktree IS another branch — the
+        borrowed base is trusted on stat keys + content hashes."""
+        base = self._prepare_base(project_root)
+        # Borrow from a root whose HEAD differs (any non-empty value ≠
+        # the worktree's own absent head).
+        wt = tmp_path_factory.mktemp("wt")
+        (wt / "sample.py").write_text(_PY_SAMPLE)
+        _entries, info = load_index(wt, persist=base)
+        assert not info.built_now  # Served from the borrowed base.
+        assert not (wt / ".drcode" / "code_index.json").exists()
+
+    def test_base_without_a_hash_parses_as_usual(
+        self, project_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A legacy entry (pre-sha256 index) cannot prove identity — the
+        file is parsed, never trusted blindly."""
+        base = self._prepare_base(project_root)
+        index_path = base / ".drcode" / "code_index.json"
+        data = json.loads(index_path.read_text())
+        del data["entries"]["sample.py"][1]["sha"]
+        index_path.write_text(json.dumps(data))
+        clear_code_index_cache()
+        (base / "sample.py").write_text(_PY_SAMPLE)  # Fresh mtime, same text.
+        parsed = _counting_extractor(monkeypatch)
+        entries, _ = load_index(base, persist=base)
+        assert parsed == ["sample.py"]
+        assert "render" in [s.name for s in entries["sample.py"].symbols]
+
+
+class TestPersistSelector:
+    """`agent_tools._persist_for`: True on the main checkout, the storage
+    root (a read-only base layer) in a worktree, False with no manager."""
+
+    @staticmethod
+    def _ctx(root: Path, deps_manager: object) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(deps=SimpleNamespace(root=root, manager=deps_manager))
+
+    def test_selector(self, project_root: Path, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from drcode.code_index.agent_tools import _persist_for
+
+        manager = SimpleNamespace(storage=SimpleNamespace(root=project_root))
+        assert _persist_for(self._ctx(project_root, manager)) is True
+        assert _persist_for(self._ctx(tmp_path / "wt", manager)) == (
+            project_root.resolve()
+        )
+        assert _persist_for(self._ctx(project_root, None)) is False
+
+
 class TestSubagentPromptNote:
     def test_note_only_when_enabled(self, project_root: Path) -> None:
         from drcode.subagents import _subagent_instructions

@@ -102,11 +102,12 @@ def validate_dependencies(
 ) -> list[str]:
     """Normalize and validate a `depends_on` list for `task_id`.
 
-    Strips whitespace, drops empties and duplicates; every id must exist in
-    `tasks`, and the task must not depend on itself. When `task_id` is not
-    None (i.e. the task already exists — creation-time validation passes
-    None, self-reference is impossible then), the new edges are also
-    checked for cycles over the full depends_on graph.
+    Strips whitespace and leading '#' markers, drops empties and
+    duplicates; every id must exist in `tasks`, and the task must not
+    depend on itself. When `task_id` is not None (i.e. the task already
+    exists — creation-time validation passes None, self-reference is
+    impossible then), the new edges are also checked for cycles over the
+    full depends_on graph.
 
     Returns the cleaned id list; raises ValueError on any violation —
     callers (the new-task form, the command palette) surface the message.
@@ -115,7 +116,10 @@ def validate_dependencies(
     """
     cleaned: list[str] = []
     for raw in deps:
-        dep = raw.strip()
+        # A leading '#' is accepted: users paste ids copied from the UI or
+        # from task text, where they are written as "#<id>" so the link
+        # renders. Ids themselves never contain '#'.
+        dep = raw.strip().lstrip("#").strip()
         if not dep:
             continue
         if dep == task_id:

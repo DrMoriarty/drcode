@@ -38,6 +38,7 @@ from ..context_layout import (
     CtxReport,
     format_tokens,
 )
+from ..usage_store import hit_rate
 
 _TAB_LABELS = {
     AGENT_DEV: "Development",
@@ -219,10 +220,17 @@ class ContextDialog(ModalScreen[None]):
             u = self._cumulative
             parts: list[str] = [f"in {format_tokens(u.input_tokens)}"]
             if u.cache_read_tokens or u.cache_write_tokens:
-                parts.append(
+                cache_part = (
                     f"cache {format_tokens(u.cache_read_tokens)}"
                     f"/{format_tokens(u.cache_write_tokens)}"
                 )
+                # Cumulative hit-rate (cache_read / input; pydantic-ai's
+                # input already includes the cache tokens — see
+                # transcript._usage_context_tokens).
+                rate = hit_rate(u.cache_read_tokens or 0, u.input_tokens or 0)
+                if rate is not None:
+                    cache_part += f" · hit {round(rate * 100)}%"
+                parts.append(cache_part)
             parts.append(f"out {format_tokens(u.output_tokens)}")
             parts.append(f"{self._requests} request(s)")
             lines.append("")

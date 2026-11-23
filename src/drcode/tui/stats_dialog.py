@@ -46,7 +46,15 @@ from textual.widgets import DataTable, Sparkline, Static, Tab, Tabs
 
 from ..providers import UserModelsStore, user_models_file
 from ..stats import DayStats, StatsStore, format_seconds
-from ..usage_store import FIELDS, UsageStore, usage_file
+from ..usage_store import (
+    FIELDS,
+    ROLLING_WINDOW,
+    UsageStore,
+    daily_hit_rate,
+    hit_rate,
+    rolling_hit_rate,
+    usage_file,
+)
 
 # The two window sizes the "p" toggle flips between.
 _PERIODS: tuple[int, ...] = (14, 30)
@@ -143,6 +151,14 @@ def _fmt_cost(cost: float) -> str:
         text = f"{cost:.6f}"
     text = text.rstrip("0").rstrip(".")
     return f"${text or '0'}"
+
+
+def _fmt_rate(rate: float | None) -> str:
+    """Hit-rate cell: a percent figure, or an empty cell when the row has
+    no input tokens (an undefined ratio must not read as "0%")."""
+    if rate is None:
+        return ""
+    return f"{round(rate * 100)}%"
 
 
 class StatsDialog(ModalScreen[None]):
@@ -252,6 +268,7 @@ class StatsDialog(ModalScreen[None]):
             "Output",
             "Cache read",
             "Cache write",
+            "Hit-rate",
             "Стоимость",
         )
         self._load_days()
@@ -354,15 +371,19 @@ class StatsDialog(ModalScreen[None]):
         (the store may hold a long history; the parse itself is part of
         the read, and the catalog read belongs off the event loop too)."""
 
-        def read() -> tuple[dict, dict[str, _PriceTriple]]:
-            return self._usage_store.load(), _price_index()
+        def read() -> tuple[dict, dict[str, _PriceTriple], list[dict]]:
+            return (
+                self._usage_store.load(),
+                _price_index(),
+                self._usage_store.load_recent(ROLLING_WINDOW),
+            )
 
         try:
-            days, prices = await asyncio.to_thread(read)
+            days, prices, recent = await asyncio.to_thread(read)
             status = self.query_one("#usage-status", Static)
             table = self.query_one("#usage-table", DataTable)
             self._fill_usage_table(table, days, prices)
-            status.update(self._usage_summary(days))
+            status.update(self._usage_summary(days, recent))
         except Exception:  # noqa: BLE001, S110 - the dialog may be mid-teardown
             # DOM pruning of a popped screen is gradual; dropping the
             # render is the same pattern as the search dialog's.
@@ -378,7 +399,10 @@ class StatsDialog(ModalScreen[None]):
         The cost column shows the USD amount of the row per the model's
         catalog prices; a model whose prices are unknown (or missing the
         cache-read price while the row has cache reads) shows an empty
-        cell — never 0. The period total sums the computable rows only."""
+        cell — never 0. The period total sums the computable rows only.
+        The hit-rate column is the row's daily cache_read/input share —
+        the day window of the metric (the rolling last-N-requests window
+        lives in the status line under the table)."""
         table.clear()
         totals = dict.fromkeys(FIELDS, 0)
         total_cost = 0.0
@@ -401,6 +425,7 @@ class StatsDialog(ModalScreen[None]):
                     day,
                     key,
                     *(_fmt(counters.get(field, 0)) for field in FIELDS),
+                    _fmt_rate(daily_hit_rate(counters)),
                     _fmt_cost(cost) if cost is not None else "",
                 )
         if rows == 0:
@@ -409,18 +434,39 @@ class StatsDialog(ModalScreen[None]):
             "Σ период",
             "",
             *(_fmt(totals[field]) for field in FIELDS),
+            _fmt_rate(hit_rate(totals["cache_read"], totals["input"])),
             _fmt_cost(total_cost) if total_cost else "",
         )
 
     @staticmethod
-    def _usage_summary(days: dict) -> str:
-        """One-line status under the table: the period covered and the
-        row count — or the empty-archive hint."""
+    def _usage_summary(days: dict, recent: list[dict] | None = None) -> str:
+        """One-line status under the table: the period covered, the row
+        count and the ROLLING hit-rate per key over the last
+        `ROLLING_WINDOW` requests — or the empty-archive hint. Keys are
+        ordered by their most recent request (the freshest first), and a
+        key whose rolling window holds no input tokens shows nothing."""
         if not days:
             return "Записей об использовании пока нет."
         span = f"{min(days)} … {max(days)}"
         models = {key for entry in days.values() for key in entry}
-        return f"{len(days)} дн., {len(models)} ключей моделей: {span}"
+        summary = f"{len(days)} дн., {len(models)} ключей моделей: {span}"
+        if not recent:
+            return summary
+        rolling_keys: list[str] = []
+        for record in reversed(recent):
+            key = record.get("key")
+            if isinstance(key, str) and key not in rolling_keys:
+                rolling_keys.append(key)
+        rates = []
+        for key in rolling_keys[:8]:
+            rate = rolling_hit_rate(recent, key=key, n=ROLLING_WINDOW)
+            if rate is not None:
+                rates.append(f"{key} {round(rate * 100)}%")
+        if rates:
+            summary += f" · hit-rate (последние {ROLLING_WINDOW} запр.): " + ", ".join(
+                rates
+            )
+        return summary
 
     # -- actions -----------------------------------------------------------------
 

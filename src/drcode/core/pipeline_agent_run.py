@@ -1033,9 +1033,15 @@ class PipelineAgentRunLayer(CoreState):
                 self.refresh_task_status()
         # Exact per-request usage of the completed model call, into the
         # session totals and the persistent per-day usage store.
-        self._record_session_usage(
-            last_response_usage(run), role, self.resolved_model_key(role)
-        )
+        usage = last_response_usage(run)
+        model_key = self.resolved_model_key(role)
+        self._record_session_usage(usage, role, model_key)
+        # The same request feeds the cache hit-rate watchdog: 5 consecutive
+        # low-hit requests on the same task + model key drop one deduped
+        # service event (see core.usage.CacheHitRateMonitor) — the
+        # prefix-cache invalidations (#a0a55d3d) are otherwise invisible
+        # until the bill arrives.
+        self._cache_hit_monitor.record(task_id, f"{role.value}/{model_key}", usage)
         # A model call went through: the network-retry budget for this
         # task starts over, so the NEXT network error counts from one
         # again — even mid-run, where a single turn makes many model

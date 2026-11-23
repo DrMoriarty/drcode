@@ -33,7 +33,7 @@ from textual.widgets import (
 
 from ..config import Config
 from ..core.pipeline_compaction import BackgroundCompaction
-from ..core.usage import SessionTokenUsage
+from ..core.usage import CacheHitRateMonitor, SessionTokenUsage
 from ..github import GitHubSyncState, GitHubSyncStateStore
 from ..keepawake import KeepAwake
 from ..mcp import McpService
@@ -869,6 +869,12 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # location, while a bare UsageStore() in an agent's verification
         # snippet stays guarded.
         self._usage_store = UsageStore(path=usage_file())
+        # Runtime cache hit-rate watchdog (see core.usage.CacheHitRateMonitor):
+        # feeds on the per-request usage of the active runs and drops a
+        # deduplicated service event into the task's chat when the hit-rate
+        # collapses — the prefix invalidations are otherwise invisible until
+        # the bill arrives.
+        self._cache_hit_monitor = CacheHitRateMonitor(self._cache_hit_alert)
         # True while the new-task form covers the chat view. Must exist from
         # the start: the streaming loop reads it on every text delta, and an
         # unset attribute would crash the run (it did — the AttributeError

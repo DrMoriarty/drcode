@@ -618,6 +618,9 @@ class TaskLifecycleLayer(DrCodeState):
         flat = [t for _name, tasks in self._sidebar_sections() for t in tasks]
         pos = next((i for i, t in enumerate(flat) if t.id == task.id), None)
         self.manager.delete(task.id)
+        # Drop the deleted task's cache hit-rate episode state (session-only
+        # bookkeeping, see core.usage.CacheHitRateMonitor).
+        self._cache_hit_monitor.forget(task.id)
         # The chat pane shows the deleted task: switch to another one (or
         # an empty pane when the backlog is gone entirely).
         self.viewed_id = None

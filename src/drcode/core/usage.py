@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,8 @@ if TYPE_CHECKING:
     # Type-only: the runtime imports happen inside the functions below so
     # the TUI cold-start path never pays for the pydantic_ai stack.
     from pydantic_ai.usage import RunUsage
+
+from ..usage_store import hit_rate
 
 # Transient network-failure handling for every agent's model calls (coding
 # agent and tester alike): a run that dies with a transport error
@@ -212,3 +215,87 @@ class SessionTokenUsage:
         self.cache_read_tokens += usage.cache_read_tokens or 0
         self.cache_write_tokens += usage.cache_write_tokens or 0
         self.output_tokens += usage.output_tokens or 0
+
+
+# -- runtime cache hit-rate alert ------------------------------------------------
+#
+# Cached prompt tokens are many times cheaper than uncached ones, and a
+# prefix-cache invalidation is otherwise invisible: the run keeps working,
+# only the bill grows (incident #a0a55d3d — ~65% of a run's cost came from
+# per-request mutations of the system zone). The monitor watches the
+# per-request hit-rate (cache_read / input, pydantic-ai's input already
+# includes cache reads/writes) of every completed model request of an
+# active run and raises ONE alert per "episode" of consecutive low-hit
+# requests on the same task + model key — the throttle-announcer pattern
+# (agent_model.WaitAnnouncer): visibility in the task's chat, never in the
+# model context, deduplicated.
+
+# A request counts as a cache miss below this hit-rate.
+CACHE_ALERT_RATE = 0.30
+# …and the alert fires after this many consecutive misses.
+CACHE_ALERT_STREAK = 5
+# Requests with a smaller prompt than this never count: providers do not
+# cache below their minimum cacheable prefix (~1024 tokens on the majors),
+# so small tool-loop requests would poison the streak without meaning
+# anything about the big prefix's health.
+CACHE_ALERT_MIN_INPUT = 1024
+
+
+@dataclass
+class _HitStreak:
+    """One episode of consecutive low-hit requests: length plus the summed
+    counters over it (the alert reports the VOLUME-WEIGHTED rate of the
+    episode, not the noisiest single request)."""
+
+    count: int = 0
+    input_tokens: int = 0
+    cache_read: int = 0
+
+
+class CacheHitRateMonitor:
+    """Per-(task, model key) consecutive-miss tracker over live runs.
+
+    Fed from the per-request usage funnel of the coding run
+    (`core/pipeline_agent_run._agent_model_request_done`); `on_alert`
+    (wired to the pipeline's deduplicated service-event emitter) fires
+    once per episode — the streak resets on the first healthy request
+    (rate ≥ `CACHE_ALERT_RATE`), which re-arms the alert. Requests below
+    `CACHE_ALERT_MIN_INPUT` input tokens are skipped entirely (they count
+    neither for nor against the streak)."""
+
+    def __init__(self, on_alert: Callable[[str, str, float], None]) -> None:
+        self._on_alert = on_alert
+        # (task_id, "<role>/<model>") → current low-hit episode.
+        self._streaks: dict[tuple[str, str], _HitStreak] = {}
+
+    def record(self, task_id: str, key: str, usage: RunUsage | None) -> None:
+        """Fold one completed request in; None usage is a no-op."""
+        if usage is None:
+            return
+        input_tokens = usage.input_tokens or 0
+        if input_tokens < CACHE_ALERT_MIN_INPUT:
+            return
+        streak_key = (task_id, key)
+        rate = (usage.cache_read_tokens or 0) / input_tokens
+        if rate >= CACHE_ALERT_RATE:
+            # A healthy request ends the episode and re-arms the alert.
+            self._streaks.pop(streak_key, None)
+            return
+        streak = self._streaks.get(streak_key)
+        if streak is None:
+            streak = self._streaks[streak_key] = _HitStreak()
+        streak.count += 1
+        streak.input_tokens += input_tokens
+        streak.cache_read += usage.cache_read_tokens or 0
+        if streak.count == CACHE_ALERT_STREAK:
+            episode_rate = hit_rate(streak.cache_read, streak.input_tokens) or 0.0
+            self._on_alert(task_id, key, episode_rate)
+        # Past the first alert the streak keeps counting silently: the
+        # episode is already announced, and re-alerting per request would
+        # flood the chat with what is one diagnosis.
+
+    def forget(self, task_id: str) -> None:
+        """Drop the episode state of a task (called on delete; the dict is
+        session-scoped and tiny, this only keeps finished ids from piling
+        up over a long session)."""
+        self._streaks = {k: v for k, v in self._streaks.items() if k[0] != task_id}

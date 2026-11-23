@@ -11,9 +11,15 @@ never the source of truth: every failure degrades to "slower next
 time", never to an agent-visible error.
 
 The physical index lives in the MAIN checkout (`<storage root>/.drcode/`)
-— worktree agents only read it; their own edits reach queries through
-the stat keys (an edited file's stat pair no longer matches and the file
-re-parses into the process cache — §6.2's stat overlay, base version).
+— worktree agents only read it (§7.3: `load_index(root, persist=<storage
+root>)` loads it as a READ-ONLY base layer under the worktree's stat
+overlay); their own edits reach queries through the stat keys (an edited
+file's stat pair no longer matches and the file re-parses into the
+process cache — §6.2's stat overlay). A fresh `git worktree add`
+checkout rewrites every file with fresh mtimes, so base reuse there
+rides on the entries' content hashes (§7.3's identity fallback): same
+sha256 of the decoded text ⇒ same parse ⇒ the base record is adopted
+without a tree-sitter pass.
 
 BLOCKING file I/O: callers on an event loop must run `load_index` in a
 worker thread (`tool_runtime._run_tool` already does).
@@ -21,12 +27,13 @@ worker thread (`tool_runtime._run_tool` already does).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -152,6 +159,41 @@ def _extract_record(path: Path, text: str) -> FileIndex | None:
     return record
 
 
+def _text_sha(text: str) -> str:
+    """The content-identity hash of a file's decoded text (§7.3): the
+    exact text the parser would see, so equal hashes ⇒ equal parse."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _base_record_by_content(
+    path: Path, base_record_raw: object
+) -> tuple[FileIndex | None, str | None]:
+    """§7.3's identity fallback for the worktree base layer: adopt the
+    base checkout's record when the worktree file's text hashes to the
+    sha256 the base entry persisted. Needed because a fresh
+    `git worktree add` checkout rewrites every tracked file with a fresh
+    mtime — the `(mtime_ns, size)` stat key can never match — while the
+    CONTENT of the files the task has not touched is identical. Content
+    identity is also the stronger guarantee (identical text ⇒ identical
+    parse), so a match is never stale.
+
+    Returns `(record, text)`: the adopted record (None when identity is
+    not proven) and the file's decoded text (None when unreadable) — the
+    caller reuses the read for the fallback parse instead of re-reading."""
+    if not isinstance(base_record_raw, dict):
+        return None, None
+    sha = base_record_raw.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return None, None  # Legacy entry without a hash: parse as usual.
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    if _text_sha(text) != sha:
+        return None, text  # Genuinely changed: the caller parses `text`.
+    return file_index_from_disk(base_record_raw), text
+
+
 def read_main_head(project_root: Path) -> str | None:
     """The main checkout's HEAD commit (the §6.4 branch-change sentinel).
     Pure file reads (`.git/HEAD` → ref file); the `git rev-parse`
@@ -205,6 +247,12 @@ class BuildInfo:
 class _CachedIndex:
     entries: dict[str, FileIndex]
     file_keys: dict[str, tuple[int, int]]
+    # rel → sha256 of the file's decoded text, recorded when the file was
+    # last parsed (or carried over from the persisted entry). Persisted
+    # alongside the record so a worktree's base layer can prove content
+    # identity without a parse (§7.3); never lives in FileIndex — the
+    # parse record stays a pure parse result.
+    shas: dict[str, str] = field(default_factory=dict)
 
 
 # One cache per project root, one module-level lock (task_search's
@@ -270,22 +318,26 @@ def take_build_notice(project_root: Path) -> str | None:
 
 
 def reparse_entry(
-    project_root: Path, rel: str, *, persist: bool = True
+    project_root: Path, rel: str, *, persist: bool | Path = True
 ) -> FileIndex | None:
     """Re-parse ONE file unconditionally and refresh its record in the
     cache (and on disk when persisting) — the query-level self-heal
     (§6.4): a query that PROVED its record stale (a body range beyond
     the file, a vanished symbol) must not leave the wrong entry in
-    place. Returns the fresh record (None when the file vanished or its
-    language is not indexable)."""
+    place. `persist` is `load_index`'s base-layer selector (True — own
+    disk; a Path — the read-only worktree mode, cache-only update;
+    False — no disk at all). Returns the fresh record (None when the
+    file vanished or its language is not indexable)."""
     root = Path(project_root)
     path = root / rel
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         record = None
+        sha: str | None = None
     else:
         record = _extract_record(path, text)
+        sha = _text_sha(text)
     try:
         stat = path.stat()
         key: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
@@ -296,15 +348,20 @@ def reparse_entry(
         if cached is not None and key is not None:
             if record is None:
                 cached.entries.pop(rel, None)
+                cached.shas.pop(rel, None)
             else:
                 cached.entries[rel] = record
+                if sha is not None:
+                    cached.shas[rel] = sha
             cached.file_keys[rel] = key
-        if persist and key is not None:
+        if persist is True and key is not None:
             disk, _head = _load_disk_index(root)
-            disk[rel] = [
-                list(key),
-                file_index_to_disk(record) if record is not None else None,
-            ]
+            payload: dict[str, object] | None = (
+                file_index_to_disk(record) if record is not None else None
+            )
+            if payload is not None and sha is not None:
+                payload["sha"] = sha
+            disk[rel] = [list(key), payload]
             _write_disk_index(root, disk, read_main_head(root))
     return record
 
@@ -447,7 +504,7 @@ def _discovery_for(root: Path) -> tuple[list[tuple[Path, str, tuple[int, int]]],
 
 
 def load_index(
-    project_root: Path, *, persist: bool = True
+    project_root: Path, *, persist: bool | Path = True
 ) -> tuple[dict[str, FileIndex], BuildInfo]:
     """The project's per-file index records, through the incremental
     cache: every candidate file is stat'ed (cheap), a matching
@@ -456,11 +513,29 @@ def load_index(
     is re-parsed. Returns the entries plus a BuildInfo for the first
     build's service event (§8.3).
 
-    `persist=False` (worktree-isolated tasks: the agent reads a worktree
-    whose `.drcode/` must never receive an index file — §7.1/§7.3) keeps
-    the index purely in memory: same cache, same stat invalidation, no
-    disk read/write. The worktree process-local cache IS the §6.2 stat
-    overlay, base version.
+    `persist` is the §7.3 base-layer selector:
+
+    - `True` — the tree being indexed IS the main checkout: the own
+      persistent index is read AND written (the historical behavior).
+    - a `Path` — the persistent index of THAT root (the main checkout's
+      storage root for a worktree task, §7.1) is loaded as a READ-ONLY
+      base layer: matching stat keys are adopted without a parse, and a
+      stat mismatch falls back to the entry's content hash (a fresh
+      `git worktree add` checkout rewrites every file with fresh
+      mtimes, so content identity is what makes unchanged files free).
+      NOTHING is ever written — not the base file, not a worktree
+      `.drcode/` (which does not exist, `_COPY_SKIP_DIRS`). The HEAD
+      guard (§6.4) does not apply here: the worktree IS another branch
+      by design, the base layer is trusted on stat keys + content
+      identity alone.
+    - `False` — purely in memory: same cache, same stat invalidation,
+      no disk read/write at all (the §6.2 stat overlay, base version).
+
+    In the Path mode the worktree's process-local cache IS the §6.2
+    stat overlay over the borrowed base: a file the task edits no
+    longer matches base (stat AND hash) and is re-parsed into the
+    overlay; a file deleted in the worktree simply drops out; a file
+    added there is parsed in.
 
     A stale/corrupted entry self-heals by re-parsing; a file that
     vanished since the last build simply drops out of the entries. The
@@ -506,18 +581,34 @@ def load_index(
         if not isinstance(cached, _CachedIndex):
             cached = None  # Broken/foreign entry: rebuild from scratch.
         old_keys = cached.file_keys if cached else {}
+        old_shas = cached.shas if cached else {}
+        # §7.3: the base layer to borrow. True = own persistent index
+        # (read AND write); a Path = another checkout's persisted index,
+        # READ-ONLY (the worktree case); False = no disk at all.
+        base_root = persist if isinstance(persist, Path) else None
+        persisting = persist is True
         disk: dict[str, list[Any]] = {}
         persisted_head: str | None = None
-        if persist:
+        if persisting:
             disk, persisted_head = _load_disk_index(root)
+        elif base_root is not None:
+            # A worktree task borrows the MAIN checkout's persisted
+            # index as its base layer (§7.1: the path comes from the
+            # storage root, never from the worktree's own `.drcode/`,
+            # which must stay copy-skip clean). Stat keys + content
+            # hashes decide what is re-parsed; nothing is written.
+            disk, _base_head = _load_disk_index(base_root)
         # §6.4 HEAD guard: the index was built on another branch of the
         # main checkout — the base layer is wholesale suspect, so it is
         # dropped and rebuilt (stat keys alone cannot see a branch switch
         # that happened while this process was down). An optimization in
         # the design; the simple full-drop is the honest version of it.
-        current_head = read_main_head(root) if persist else None
+        # Deliberately OWN-ROOT only: a worktree task loading the main
+        # checkout's index IS the other-branch case (§7.3) — the base is
+        # trusted there on stat keys + content identity.
+        current_head = read_main_head(root) if persisting else None
         head_guard_fired = bool(
-            persist
+            persisting
             and persisted_head
             and current_head
             and persisted_head != current_head
@@ -526,12 +617,17 @@ def load_index(
             disk = {}
         entries: dict[str, FileIndex] = {}
         file_keys: dict[str, tuple[int, int]] = {}
+        shas: dict[str, str] = {}
         disk_dirty = False
         changed = False
         for path, rel, key in stat_entries:
             record: FileIndex | None = None
+            text: str | None = None  # The file's text, when already read.
             if old_keys.get(rel) == key and cached is not None:
                 record = cached.entries.get(rel)
+                sha = old_shas.get(rel)
+                if record is not None and sha is not None:
+                    shas[rel] = sha
             if record is None:
                 raw = disk.get(rel)
                 if (
@@ -549,13 +645,27 @@ def load_index(
                     record = file_index_from_disk(raw[1])
                     if record is None:
                         disk_dirty = True
+                    elif isinstance(raw[1], dict) and isinstance(
+                        raw[1].get("sha"), str
+                    ):
+                        shas[rel] = raw[1]["sha"]
+                elif base_root is not None and isinstance(raw, list) and len(raw) == 2:
+                    # The worktree base layer beyond stat keys: a fresh
+                    # `git worktree add` checkout rewrote every file with
+                    # fresh mtimes, so the stat key cannot match even for
+                    # content the task never touched — prove identity by
+                    # the persisted content hash instead (§7.3).
+                    record, text = _base_record_by_content(path, raw[1])
             if record is None:
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue  # Unreadable: skip (the index stays honest).
+                if text is None:
+                    try:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue  # Unreadable: skip (the index stays honest).
                 record = _extract_record(path, text)
                 changed = True
+                if persisting:
+                    shas[rel] = _text_sha(text)
             if record is None:
                 # Unknown/unavailable language: the file is honestly
                 # absent (grep_search keeps the coverage) — but remember
@@ -566,7 +676,7 @@ def load_index(
                 continue
             entries[rel] = record
             file_keys[rel] = key
-        fresh = _CachedIndex(entries=entries, file_keys=file_keys)
+        fresh = _CachedIndex(entries=entries, file_keys=file_keys, shas=shas)
         _INDEX_CACHES[cache_key] = fresh
         # Rewrite the persistent index only when something actually
         # changed — a re-parse, a vanished file, a broken entry, or a
@@ -580,14 +690,16 @@ def load_index(
             for rel, key in file_keys.items()
             if rel in entries
         )
-        if persist and (changed or disk_dirty or stale_on_disk or head_guard_fired):
+        if persisting and (changed or disk_dirty or stale_on_disk or head_guard_fired):
             serialized: dict[str, list[object]] = {}
             for rel, key in file_keys.items():
                 record = entries.get(rel)
-                serialized[rel] = [
-                    list(key),
-                    file_index_to_disk(record) if record is not None else None,
-                ]
+                payload: dict[str, object] | None = (
+                    file_index_to_disk(record) if record is not None else None
+                )
+                if payload is not None and rel in shas:
+                    payload["sha"] = shas[rel]
+                serialized[rel] = [list(key), payload]
             _write_disk_index(root, serialized, current_head)
         ms = int((time.monotonic() - started) * 1000)
         languages = {rec.language for rec in entries.values()}

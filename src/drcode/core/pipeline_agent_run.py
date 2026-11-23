@@ -41,6 +41,7 @@ from ..core.usage import (
 )
 from ..models import ImageAttachment, PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole, resolve_available, subagent_usage_key
+from ..read_cache import ReadCache
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
@@ -323,6 +324,7 @@ class PipelineAgentRunLayer(CoreState):
                 subagent_gate,
                 web_fetch_gate,
                 code_index,
+                read_cache,
             ) = await self._prepare_agent_run(task, task_id, role, generation)
             # Pre-run forced compaction (project setting
             # compaction_resume_min_tokens): when the task waited long
@@ -424,6 +426,9 @@ class PipelineAgentRunLayer(CoreState):
                             # same two steps the TUI performs after a user
                             # send on an ACTIVE task.
                             input_hooks=self._input_delivery_hooks(),
+                            # Per-run read_file dedup (created in
+                            # _prepare_agent_run next to the gates).
+                            read_cache=read_cache,
                         ),
                         usage_limits=UsageLimits(
                             request_limit=self.config.request_limit
@@ -613,12 +618,14 @@ class PipelineAgentRunLayer(CoreState):
         SubagentGate | None,
         WebFetchGate | None,
         bool,
+        ReadCache,
     ]:
         """Register the run and assemble everything the turn loop needs:
         the (worktree) root the tools run in, the built agent, the
         on_task_start hook's instructions for the first prompt, the run's
-        subagent gate (None when delegation is off) and the run's web-fetch
-        gate (None unless this is a RESEARCH task with web fetch enabled)."""
+        subagent gate (None when delegation is off), the run's web-fetch
+        gate (None unless this is a RESEARCH task with web fetch enabled)
+        and the run's read_file dedup cache."""
         # Deferred heavy imports (pydantic_ai / agent_build / subagents):
         # keep them off the TUI cold-start path. `build_agent` resolves
         # through the module global — a seam tests monkeypatch (see the
@@ -725,6 +732,15 @@ class PipelineAgentRunLayer(CoreState):
             request_turns: Callable[[], int] | None = _next_notice_turn
         else:
             request_turns = None
+        # Per-run read_file dedup (see read_cache.ReadCache): ONE object for
+        # the whole run — shared across the per-turn deps rebuilds and a
+        # mid-run compaction pause (created outside the turn loop for the
+        # same reason the gates are), dying with the run closure so no
+        # orphan map outlives the transcript it must stay consistent with.
+        # A run restart (network retry, watchdog) starts a fresh cache: the
+        # first re-read after a restart costs a full text once, then dedups
+        # again — a safe degradation, never a wrong one.
+        read_cache = ReadCache()
         # Managed web reading (project setting web_fetch_mode): RESEARCH
         # only — web_fetch_policy_for returns None for every other role, so
         # the tool is not registered there at all. Read at activation, so a
@@ -820,6 +836,7 @@ class PipelineAgentRunLayer(CoreState):
             subagent_gate,
             web_fetch_gate,
             code_index,
+            read_cache,
         )
 
     async def _consume_turn_input(

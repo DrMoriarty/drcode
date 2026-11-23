@@ -90,6 +90,7 @@ from ..merge_resolver import (
 )
 from ..models import Task, TaskStatus
 from ..providers import AgentRole
+from ..read_cache import ReadCache
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
@@ -642,6 +643,8 @@ class PipelineResolverLayer(CoreState):
                 manager=self.manager,
                 task_id=task_id,
                 scratch=scratch_dir(task_id),
+                # Per-round read_file dedup (see read_cache.ReadCache).
+                read_cache=ReadCache(),
             )
             prompt = build_agent_context(
                 self.project_root,
@@ -1022,6 +1025,8 @@ class PipelineResolverLayer(CoreState):
             manager=self.manager,
             task_id=task.id,
             scratch=scratch_dir(task.id),
+            # Per-pass read_file dedup (see read_cache.ReadCache).
+            read_cache=ReadCache(),
         )
         results: list[tuple[str, str]] = []
         for index, chunk in enumerate(chunks):

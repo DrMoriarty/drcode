@@ -60,6 +60,7 @@ from .prompts import (
     load_tester_prompt,
 )
 from .providers import AgentRole
+from .read_cache import ReadCache, read_file_cached
 from .service_events import log_service_event
 from .settings import CodeIndexMode, GitPolicy, ProjectSettings
 from .subagents import SubagentGate, run_delegate_tool
@@ -215,6 +216,11 @@ class AgentDeps:
     wait_announcer: agent_model.WaitAnnouncer | None = None
     code_index: bool = False
     input_hooks: InputDeliveryHooks | None = None
+    # Per-run read_file dedup (see read_cache.ReadCache): created in
+    # _prepare_agent_run next to the gates — ONE object shared by every
+    # per-turn deps rebuild and a mid-run compaction pause, dying with the
+    # run. None = plain uncached reads (the historical behavior).
+    read_cache: ReadCache | None = None
 
 
 @dataclass
@@ -267,6 +273,9 @@ class TesterDeps:
     max_dev_rounds: int = 3
     agent_creates_drafts: bool = False
     input_hooks: InputDeliveryHooks | None = None
+    # Per-run read_file dedup (see read_cache.ReadCache); one fresh cache
+    # per tester round. None = plain uncached reads.
+    read_cache: ReadCache | None = None
 
 
 @dataclass
@@ -285,6 +294,56 @@ class ResolverDeps:
     task_id: str
     scratch: Path
     verdicts: list[ResolutionVerdict] = field(default_factory=list)
+    # Per-run read_file dedup (see read_cache.ReadCache); one fresh cache
+    # per resolver round / reviewer pass. None = plain uncached reads.
+    read_cache: ReadCache | None = None
+
+
+def _task_provider(
+    deps: AgentDeps | TesterDeps | ResolverDeps,
+) -> Callable[[], Any]:
+    """Liveness probe for the read cache: resolve the task so
+    read_file_cached can scan the serialized transcript. Any failure
+    (task deleted mid-run) degrades to None — the cache then answers with
+    the full text (fail-open, never lossy)."""
+
+    def _provider() -> Any:
+        try:
+            return deps.manager.get(deps.task_id)
+        except Exception:  # noqa: BLE001 - any surprise degrades to the full text
+            return None
+
+    return _provider
+
+
+async def _read_file_via_cache(
+    deps: AgentDeps | TesterDeps | ResolverDeps,
+    config: Config,
+    path: str,
+    offset: int,
+    limit: int,
+    tool_call_id: str | None,
+    current_usage: int,
+) -> str:
+    """The shared body of the coding/tester/resolver read_file tools: the
+    deduplicating read (see read_cache) through the usual worker-thread +
+    violation-logging seam. deps.read_cache=None degrades to the plain
+    uncached tools.read_file behavior."""
+    return await _run_tool_logged(
+        deps,
+        "read_file",
+        read_file_cached,
+        deps.read_cache,
+        deps.root,
+        path,
+        offset,
+        limit,
+        tool_call_id,
+        task_provider=_task_provider(deps),
+        current_usage=current_usage,
+        max_context_tokens=config.max_context_tokens,
+        compaction_threshold=config.compaction_threshold,
+    )
 
 
 def _recent_tasks_output(
@@ -638,19 +697,21 @@ def build_agent(
     ) -> str:
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
-        (1-based), up to `limit` lines."""
+        (1-based), up to `limit` lines.
+
+        Re-reading an unchanged file returns a short "unchanged" note instead of
+        the full content (adjust `offset`/`limit` to force a fresh copy); a
+        changed file returns a compact diff against the previous read when that
+        is smaller than the full text."""
         current_usage = ctx_context_tokens(ctx) or 0
-        return await _run_tool_logged(
+        return await _read_file_via_cache(
             ctx.deps,
-            "read_file",
-            tools.read_file,
-            ctx.deps.root,
+            config,
             path,
             offset,
             limit,
-            current_usage=current_usage,
-            max_context_tokens=config.max_context_tokens,
-            compaction_threshold=config.compaction_threshold,
+            ctx.tool_call_id,
+            current_usage,
         )
 
     @agent.tool
@@ -1495,19 +1556,21 @@ def build_tester_agent(
     ) -> str:
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
-        (1-based), up to `limit` lines."""
+        (1-based), up to `limit` lines.
+
+        Re-reading an unchanged file returns a short "unchanged" note instead of
+        the full content (adjust `offset`/`limit` to force a fresh copy); a
+        changed file returns a compact diff against the previous read when that
+        is smaller than the full text."""
         current_usage = ctx_context_tokens(ctx) or 0
-        return await _run_tool_logged(
+        return await _read_file_via_cache(
             ctx.deps,
-            "read_file",
-            tools.read_file,
-            ctx.deps.root,
+            config,
             path,
             offset,
             limit,
-            current_usage=current_usage,
-            max_context_tokens=config.max_context_tokens,
-            compaction_threshold=config.compaction_threshold,
+            ctx.tool_call_id,
+            current_usage,
         )
 
     @agent.tool
@@ -1786,19 +1849,21 @@ def _resolver_shared_tools(agent: Agent[ResolverDeps, str], config: Config) -> N
     ) -> str:
         """Read a text file from anywhere on the filesystem (relative paths resolve
         against the project root). Lines are numbered, starting from `offset`
-        (1-based), up to `limit` lines."""
+        (1-based), up to `limit` lines.
+
+        Re-reading an unchanged file returns a short "unchanged" note instead of
+        the full content (adjust `offset`/`limit` to force a fresh copy); a
+        changed file returns a compact diff against the previous read when that
+        is smaller than the full text."""
         current_usage = ctx_context_tokens(ctx) or 0
-        return await _run_tool_logged(
+        return await _read_file_via_cache(
             ctx.deps,
-            "read_file",
-            tools.read_file,
-            ctx.deps.root,
+            config,
             path,
             offset,
             limit,
-            current_usage=current_usage,
-            max_context_tokens=config.max_context_tokens,
-            compaction_threshold=config.compaction_threshold,
+            ctx.tool_call_id,
+            current_usage,
         )
 
     @agent.tool

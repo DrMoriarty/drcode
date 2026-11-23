@@ -32,6 +32,7 @@ from ..core.usage import (
 from ..github import issue_commit_hint
 from ..models import Task, TaskStatus, VerificationStatus
 from ..providers import AgentRole
+from ..read_cache import ReadCache
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
@@ -379,6 +380,10 @@ class PipelineTesterLayer(CoreState):
                 # (extra input into a bug report the tester created) — see
                 # _input_delivery_hooks.
                 input_hooks=self._input_delivery_hooks(),
+                # Per-round read_file dedup (see read_cache.ReadCache): a
+                # fresh cache per tester round — the round's transcript is
+                # what the entries must stay consistent with.
+                read_cache=ReadCache(),
             )
             try:
                 # The tester needs the original assignment (to paraphrase it

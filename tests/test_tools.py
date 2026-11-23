@@ -588,6 +588,154 @@ def test_grep_search_non_repo_subdir_keeps_walk_filters(project_root: Path) -> N
     assert grep_search(project_root, "needle") == ["build/ok.py:1: needle"]
 
 
+def test_grep_search_nested_repo_at_depths_2_and_3(project_root: Path) -> None:
+    # The nested-repo probe reaches three levels below the root: a working
+    # tree at root/a/repo (depth 2) and one at root/x/y/deep (depth 3) each
+    # replace the plain walk under them — their .gitignore applies and the
+    # walk never reads their ignored build artifacts.
+    for rel, ignore, tracked in (
+        ("a/repo", "build/\n", "src/lib.py"),
+        ("x/y/deep", "dist/\n", "core.c"),
+    ):
+        nested = project_root / rel
+        nested.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(nested)], check=True)
+        (nested / ".gitignore").write_text(ignore)
+        (nested / tracked).parent.mkdir(parents=True, exist_ok=True)
+        (nested / tracked).write_text("needle\n")
+        artifact = nested / ignore.strip("/\n") / "artifact"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("needle\n")
+    (project_root / "keep.py").write_text("needle\n")
+    (project_root / "plain").mkdir()
+    (project_root / "plain" / "n.txt").write_text("needle\n")
+    assert sorted(grep_search(project_root, "needle")) == [
+        "a/repo/src/lib.py:1: needle",
+        "keep.py:1: needle",
+        "plain/n.txt:1: needle",
+        "x/y/deep/core.c:1: needle",
+    ]
+
+
+def test_grep_search_probe_depth_capped_at_3(project_root: Path) -> None:
+    # Beyond depth 3 no probe runs: a working tree at root/a/b/c/d keeps the
+    # plain walk — including files its own .gitignore would exclude.
+    deep = project_root / "a" / "b" / "c" / "d"
+    deep.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(deep)], check=True)
+    (deep / ".gitignore").write_text("gen/\n")
+    (deep / "real.py").write_text("needle\n")
+    (deep / "gen" / "x.py").parent.mkdir(parents=True)
+    (deep / "gen" / "x.py").write_text("needle\n")
+    (project_root / "keep.py").write_text("needle\n")
+    assert sorted(grep_search(project_root, "needle")) == [
+        "a/b/c/d/gen/x.py:1: needle",
+        "a/b/c/d/real.py:1: needle",
+        "keep.py:1: needle",
+    ]
+
+
+def test_grep_search_shallow_repo_wins_over_deeper(project_root: Path) -> None:
+    # A working tree found at a shallower level replaces the walk under it
+    # entirely — no deeper probe ever runs below it: outer's .gitignore hides
+    # inner/ from outer's ls-files, and if inner were probed its i.py would
+    # leak into the results.
+    outer = project_root / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+    (outer / ".gitignore").write_text("inner/\n")
+    (outer / "o.py").write_text("needle\n")
+    inner = outer / "inner"
+    inner.mkdir()
+    subprocess.run(["git", "init", "-q", str(inner)], check=True)
+    (inner / "i.py").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["outer/o.py:1: needle"]
+
+
+def test_grep_search_prefix_parity_through_nested_repos(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Documented invariant of _grep_candidates: with a literal directory
+    # prefix the candidate set equals the unprefixed one restricted to the
+    # prefix — including when nested working trees sit on the prefix's
+    # ancestor chain or below the prefix directory within the probe depth.
+    repo = project_root / "a" / "b"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("junk/\n")
+    for rel in ("lib.py", "c/deep.py", "c/sub/more.py", "junk/x.py"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("needle\n")
+    (project_root / "a" / "plain.py").parent.mkdir(parents=True, exist_ok=True)
+    (project_root / "a" / "plain.py").write_text("needle\n")
+    (project_root / "a" / "other").mkdir()
+    (project_root / "a" / "other" / "o.py").write_text("needle\n")
+    (project_root / "z.py").write_text("needle\n")
+
+    def rels(prefix: str = "") -> list[str]:
+        return sorted(rel for rel, _ in tools._grep_candidates(project_root, prefix))
+
+    full = rels()
+    assert "a/b/lib.py" in full and "a/b/junk/x.py" not in full
+    for prefix in ("a/", "a/b/", "a/b/c/", "a/b/c/sub/", "a/other/", "a/b/junk/"):
+        assert rels(prefix) == [r for r in full if r.startswith(prefix)], prefix
+    # End to end: the include-pruned run agrees with the unpruned one.
+    unpruned = grep_search(project_root, "needle")
+    for include in ("a/**", "a/b/**", "a/b/c/**", "a/other/**"):
+        assert grep_search(project_root, "needle", include=include) == [
+            line for line in unpruned if line.startswith(include[:-3])
+        ], include
+
+
+def test_grep_search_exact_include_parity_with_depth_3_repo(
+    project_root: Path,
+) -> None:
+    # An exact include must agree with the unpruned run on which files
+    # exist: a gitignored file inside a depth-3 nested working tree is
+    # governed by the repo's ls-files (probe depth 3) — the exact include
+    # probes the same ancestor chain and therefore finds nothing too.
+    repo = project_root / "a" / "b" / "c"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("d.txt\n")
+    (repo / "ok.txt").write_text("needle\n")
+    (repo / "d.txt").write_text("needle\n")
+    assert grep_search(project_root, "needle") == ["a/b/c/ok.txt:1: needle"]
+    assert grep_search(project_root, "needle", include="a/b/c/d.txt") == []
+    assert grep_search(project_root, "needle", include="a/b/c/*.txt") == [
+        "a/b/c/ok.txt:1: needle"
+    ]
+
+
+def test_grep_search_prefix_chain_deeper_than_probe_not_honored(
+    project_root: Path,
+) -> None:
+    # The unprefixed walk never probes beyond root/a/b/c, so a prefix whose
+    # ancestor chain is deeper than the probe depth must not probe a depth-4
+    # working tree either — its files stay plain-walk candidates (gitignore
+    # NOT applied), keeping the prefix/unprefixed result sets identical.
+    deep = project_root / "a" / "b" / "c" / "d"
+    deep.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(deep)], check=True)
+    (deep / ".gitignore").write_text("gen/\n")
+    (deep / "real.py").write_text("needle\n")
+    (deep / "gen" / "x.py").parent.mkdir(parents=True)
+    (deep / "gen" / "x.py").write_text("needle\n")
+
+    full = sorted(rel for rel, _ in tools._grep_candidates(project_root))
+    # The depth-4 repo is not probed: plain walk, so its .gitignore file is
+    # an ordinary candidate and "gen/" is NOT excluded.
+    assert full == ["a/b/c/d/.gitignore", "a/b/c/d/gen/x.py", "a/b/c/d/real.py"]
+    prefixed = sorted(
+        rel for rel, _ in tools._grep_candidates(project_root, "a/b/c/d/")
+    )
+    assert prefixed == [r for r in full if r.startswith("a/b/c/d/")]
+    assert grep_search(project_root, "needle", include="a/b/c/d/**") == [
+        "a/b/c/d/real.py:1: needle",
+        "a/b/c/d/gen/x.py:1: needle",
+    ]
+
+
 def test_grep_search_bad_regex_raises(project_root: Path) -> None:
     with pytest.raises(re.error):
         grep_search(project_root, "[")

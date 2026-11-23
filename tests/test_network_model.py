@@ -395,3 +395,88 @@ async def test_provider_extra_body_reaches_request_body(
     body = seen["body"]
     assert body["cache_prompt"] is True
     assert body["top_p"] == 0.5
+
+
+# -- reasoning effort / thinking budget in extra_body ---------------------------------
+
+
+def test_base_model_settings_sends_reasoning_effort() -> None:
+    """A valid effort level rides the extra_body on top of the provider
+    fields (the per-model knob outranks the provider-wide extra body)."""
+    settings = agent_model.base_model_settings(
+        make_config(
+            reasoning_effort="low",
+            provider_extra_body={"reasoning_effort": "high", "top_p": 0.5},
+        )
+    )
+    body = settings.get("extra_body")
+    assert body == {
+        "cache_prompt": True,
+        "top_p": 0.5,
+        "reasoning_effort": "low",  # the per-model knob wins
+    }
+
+
+def test_base_model_settings_off_and_none_send_nothing() -> None:
+    """None = not set; the "off" sentinel = never send the field (the
+    escape hatch for gateways that reject it)."""
+    assert agent_model.base_model_settings(make_config()).get("extra_body") == {
+        "cache_prompt": True
+    }
+    off = agent_model.base_model_settings(make_config(reasoning_effort="off"))
+    assert off.get("extra_body") == {"cache_prompt": True}
+
+
+def test_base_model_settings_sends_thinking_budget() -> None:
+    """The Anthropic-style thinking block; both knobs may coexist (the
+    gateway picks)."""
+    settings = agent_model.base_model_settings(
+        make_config(reasoning_effort="medium", thinking_budget=4096)
+    )
+    assert settings.get("extra_body") == {
+        "cache_prompt": True,
+        "reasoning_effort": "medium",
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+    }
+    assert agent_model.base_model_settings(make_config(thinking_budget=0)).get(
+        "extra_body"
+    ) == {"cache_prompt": True}
+
+
+def test_utility_builders_default_low_effort(monkeypatch) -> None:
+    """The tool-less utility builders (compaction summarizer, title
+    generator) force "low" when the resolved connection carries no
+    explicit effort — and pass an explicit value through unchanged."""
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from drcode import compaction, title_gen
+
+    seen: list[Config] = []
+
+    def fake_build_model(config: Config, announce_wait: object = None) -> object:
+        seen.append(config)
+        # The lambda never runs here (no agent run) — it just has to be a
+        # well-formed response factory: pydantic-ai 2.x has no
+        # ModelResponse.from_text, build the single text part explicitly.
+        return FunctionModel(
+            lambda messages, info: ModelResponse(parts=[TextPart("ok")])
+        )
+
+    monkeypatch.setattr(agent_model, "build_model", fake_build_model)
+
+    compaction.build_compaction_agent(make_config())
+    assert seen[-1].reasoning_effort == "low"
+
+    title_gen.build_title_agent(make_config())
+    assert seen[-1].reasoning_effort == "low"
+
+    compaction.build_compaction_agent(make_config(reasoning_effort="off"))
+    assert seen[-1].reasoning_effort == "off"
+    title_gen.build_title_agent(make_config(reasoning_effort="high"))
+    assert seen[-1].reasoning_effort == "high"
+
+    from drcode.agent_build import build_resolver_reviewer_agent
+
+    build_resolver_reviewer_agent(make_config())
+    assert seen[-1].reasoning_effort == "low"

@@ -51,6 +51,7 @@ from ..providers import (
     Provider,
     UserModelsConfig,
     UserModelsStore,
+    coerce_reasoning_effort,
     load_seeded_catalog,
 )
 from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
@@ -267,6 +268,7 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
+    #mc-effort { width: 16; }
     #mc-footer {
         height: auto;
         margin-top: 1;
@@ -370,6 +372,10 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     yield Input(id="mc-model-id", placeholder="model id")
                     yield Input(id="mc-ctx", placeholder="context tokens")
                     yield Input(id="mc-pct", placeholder="compact % (empty = inherit)")
+                    yield Input(
+                        id="mc-effort",
+                        placeholder="reasoning effort (empty = auto)",
+                    )
                 with Horizontal(classes="mc-btnrow"):
                     yield Button("Update", id="mc-model-update")
                     yield Button("Remove", id="mc-model-del")
@@ -633,6 +639,14 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     self.query_one("#mc-pct", Input).value.strip()
                     != ("" if pct is None else str(pct))
                 ),
+                self.query_one("#mc-effort", Input): (
+                    self.query_one("#mc-effort", Input).value.strip()
+                    != (
+                        ""
+                        if entry is None or entry.reasoning_effort is None
+                        else entry.reasoning_effort
+                    )
+                ),
             }
         )
 
@@ -798,6 +812,8 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         self.query_one("#mc-ctx", Input).value = str(entry.max_context_tokens)
         pct = entry.compaction_threshold
         self.query_one("#mc-pct", Input).value = "" if pct is None else str(pct)
+        effort = entry.reasoning_effort
+        self.query_one("#mc-effort", Input).value = "" if effort is None else effort
 
     @on(DataTable.RowHighlighted, "#mc-models")
     def _model_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -842,7 +858,7 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         return next((m for m in provider.models if m.id == model_id), None)
 
     def _clear_model_inputs(self) -> None:
-        for input_id in ("#mc-model-id", "#mc-ctx", "#mc-pct"):
+        for input_id in ("#mc-model-id", "#mc-ctx", "#mc-pct", "#mc-effort"):
             self.query_one(input_id, Input).value = ""
 
     @on(Button.Pressed, "#mc-model-update")
@@ -852,13 +868,17 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
     @on(Input.Submitted, "#mc-model-id")
     @on(Input.Submitted, "#mc-ctx")
     @on(Input.Submitted, "#mc-pct")
+    @on(Input.Submitted, "#mc-effort")
     def _model_input_submitted(self) -> None:
         self._update_model()
 
-    def _parse_caps(self) -> tuple[int, int | None] | None:
-        """Parse the context / compaction-limit editor fields into
-        (context_tokens, compaction_threshold); None on a validation error
-        (the status line explains)."""
+    def _parse_caps(self) -> tuple[int, int | None, str | None] | None:
+        """Parse the context / compaction-limit / reasoning-effort editor
+        fields into (context_tokens, compaction_threshold,
+        reasoning_effort); None on a validation error (the status line
+        explains). The effort field tolerates anything the catalog
+        validator would accept — an unknown word degrades to None
+        ("not set") with a status note instead of an error."""
         raw_ctx = self.query_one("#mc-ctx", Input).value.strip()
         try:
             ctx = int(raw_ctx)
@@ -879,7 +899,15 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
             if not 1 <= pct <= 100:
                 self._status("✗ compact % must be an integer between 1 and 100")
                 return None
-        return ctx, pct
+        raw_effort = self.query_one("#mc-effort", Input).value.strip()
+        effort = coerce_reasoning_effort(raw_effort) if raw_effort else None
+        if raw_effort and effort is None:
+            self._status(
+                "ℹ unknown reasoning effort '"
+                + raw_effort
+                + "' — cleared (use minimal/low/medium/high or off)"
+            )
+        return ctx, pct, effort
 
     def _update_model(self) -> None:
         """Write the edited id / context / compaction limit back into the
@@ -894,7 +922,7 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         caps = self._parse_caps()
         if caps is None:
             return
-        ctx, pct = caps
+        ctx, pct, effort = caps
         if new_id != entry.id:
             if any(m.id == new_id for m in provider.models):
                 self._status(f"✗ model '{new_id}' already exists")
@@ -910,6 +938,7 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         if ctx != entry.max_context_tokens:
             entry.max_context_tokens = ctx
         entry.compaction_threshold = pct
+        entry.reasoning_effort = effort
         self._refresh_models()
         limit = f"{pct}% of context" if pct is not None else "inherits"
         self._status(f"✓ {entry.id}: context {ctx}, compaction {limit}")
@@ -949,12 +978,13 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         caps = self._parse_caps()
         if caps is None:
             return
-        ctx, pct = caps
+        ctx, pct, effort = caps
         provider.models.append(
             ModelEntry(
                 id=model_id,
                 max_context_tokens=ctx,
                 compaction_threshold=pct,
+                reasoning_effort=effort,
             )
         )
         self._selected_model = model_id

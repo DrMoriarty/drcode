@@ -40,6 +40,7 @@ _HEAVY_REEXPORTS = frozenset(
     {
         "DEFAULT_TIMEOUT",
         "AsyncOpenAI",
+        "REASONING_EFFORT_LEVELS",
         "TailInjectionModel",
         "ThrottledModel",
         "base_model_settings",

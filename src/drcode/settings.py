@@ -777,6 +777,18 @@ class ProjectSettings(BaseModel):
     # longer read window than a coding turn (a real case died at exactly
     # 600 s mid-generation).
     role_request_timeout: dict[str, int] = Field(default_factory=dict)
+    # -- per-role reasoning-effort overrides ----------------------------------
+    # Per-role REASONING EFFORT overrides: keys are AgentRole values,
+    # values are "minimal" / "low" / "medium" / "high" or the special
+    # "off" (= never send `reasoning_effort` — the escape hatch for
+    # gateways that reject the field; it also suppresses the tool-less
+    # utility agents' "low" default, see `providers.utility_effort_config`).
+    # Absent = inherit (the model entry's `reasoning_effort`, else the
+    # utility default for the tool-less agents). The most specific layer —
+    # the role — beats the catalog entry (providers.resolve applies it
+    # last). Edited only by hand in settings.json (no dialog fields): a
+    # thinking budget per role is the rare, expert-level tweak.
+    role_reasoning_effort: dict[str, str] = Field(default_factory=dict)
 
     # -- GitHub Issues integration ------------------------------------------
     # Enabled may be switched on even with no token/repo set (or when the
@@ -883,6 +895,28 @@ class ProjectSettings(BaseModel):
         """Same filtering as `role_max_tokens` (see `_clean_role_int_map`):
         the per-role request timeouts are as typo-prone as the token caps."""
         return _clean_role_int_map(value)
+
+    @field_validator("role_reasoning_effort", mode="before")
+    @classmethod
+    def _clean_role_reasoning_effort(cls, value: object) -> object:
+        """Keep only valid role keys with a recognizable effort value
+        (`providers.coerce_reasoning_effort` semantics: case-insensitive
+        level match plus the "off" sentinel); junk keys/values are
+        dropped — a typo must not invalidate the whole settings file."""
+        if not isinstance(value, dict):
+            return value
+        # Imported lazily: settings.py must not import providers.py at
+        # module level (providers reads this module).
+        from .providers import coerce_reasoning_effort
+
+        cleaned: dict[str, str] = {}
+        for key, v in value.items():
+            if key not in _ROLE_MAX_TOKENS_KEYS or not isinstance(v, str):
+                continue
+            effort = coerce_reasoning_effort(v)
+            if effort is not None:
+                cleaned[key] = effort
+        return cleaned
 
     @field_validator("web_fetch_allow_hosts", "web_fetch_block_hosts", mode="before")
     @classmethod

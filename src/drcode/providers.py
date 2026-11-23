@@ -156,6 +156,52 @@ def coerce_price(value: object) -> float | None:
     return price if math.isfinite(price) and price >= 0 else None
 
 
+REASONING_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+# The special "never send the field" value: an explicit opt-OUT that also
+# suppresses the tool-less utility agents' default ("low",
+# `utility_effort_config`) — for gateways that reject `reasoning_effort`
+# outright. "none" is accepted as a synonym (the GPT-5.1-era spelling).
+REASONING_EFFORT_OFF = "off"
+
+
+def coerce_reasoning_effort(value: object) -> str | None:
+    """Tolerant reasoning-effort coercion shared by the catalog validator
+    and the settings map cleaner: case-insensitive match against
+    `REASONING_EFFORT_LEVELS` plus the "off" sentinel ("none" as a
+    synonym); everything else — junk, numbers, empty strings — degrades to
+    None (= "not set"), never a validation error."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in ("off", "none", "disabled"):
+        return REASONING_EFFORT_OFF
+    if normalized in REASONING_EFFORT_LEVELS:
+        return normalized
+    return None
+
+
+def coerce_thinking_budget(value: object) -> int | None:
+    """Tolerant thinking-budget coercion: ints pass through, numeric
+    strings are parsed, everything else — junk, bools, non-positive
+    values — degrades to None (= "not set"), never a validation error."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        budget = value
+    elif isinstance(value, float):
+        budget = int(value)
+    elif isinstance(value, str):
+        try:
+            budget = int(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return budget if budget > 0 else None
+
+
 def _reject_slash(value: str) -> str:
     """Shared validator body: `/` is the separator of the
     "<provider>/<model-id>" reference format and is forbidden in provider
@@ -195,6 +241,24 @@ class ModelEntry(BaseModel):
     # catalog UI (a separate task) will sort favorites to the top. Stored
     # on the model entry in the user-level models.json.
     favorite: int = 0
+    # Reasoning-effort knob sent to the model as `reasoning_effort` in the
+    # request body (extra_body; see `agent_model.base_model_settings`).
+    # Values: "minimal" / "low" / "medium" / "high" (the OpenAI-compatible
+    # scale), the special value "off" = NEVER send the field (the escape
+    # hatch for gateways that reject it — the tool-less utility agents
+    # default to "low", see `utility_effort_config`), None/absent = nothing
+    # is set: the provider's own default applies, and the utility agents
+    # (compaction summarizer, resolver reviewer, title generator) run at
+    # "low". Tolerantly coerced: junk in models.json degrades to None.
+    reasoning_effort: str | None = None
+    # Anthropic-style thinking budget (tokens): sent as
+    # `extra_body["thinking"] = {"type": "enabled", "budget_tokens": N}`
+    # for gateways that translate it (OpenAI-compatible front-ends of
+    # reasoning APIs). None/absent = nothing is sent. For a model whose
+    # effort is controlled via `reasoning_effort` set ONE of the two —
+    # both present means both are sent and the gateway picks. Junk
+    # degrades to None, a non-positive value too.
+    thinking_budget: int | None = None
     # Per-token prices in USD (per ONE token, not per 1k): prompt (plain
     # input AND cache writes — the gateways rarely price cache writes
     # separately, and the usage store's `input` counter already includes
@@ -215,6 +279,16 @@ class ModelEntry(BaseModel):
         if not 0 <= value <= 3:
             raise ValueError("favorite must be 0..3 (0 = not a favorite)")
         return value
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _coerce_effort(cls, value: object) -> str | None:
+        return coerce_reasoning_effort(value)
+
+    @field_validator("thinking_budget", mode="before")
+    @classmethod
+    def _coerce_budget(cls, value: object) -> int | None:
+        return coerce_thinking_budget(value)
 
     @field_validator(
         "price_prompt", "price_completion", "price_cache_read", mode="before"
@@ -335,10 +409,25 @@ class CustomModelEntry(BaseModel):
     max_context_tokens: int = 200_000
     # None = keep whatever the flat config / env provides.
     max_tokens: int | None = None
+    # Reasoning-effort / thinking-budget knobs — same semantics as the
+    # catalog `ModelEntry` fields (see the coercion helpers above): junk
+    # degrades to None, "off" suppresses the field entirely.
+    reasoning_effort: str | None = None
+    thinking_budget: int | None = None
     # Cap on concurrent HTTP requests to this connection (0 = unlimited);
     # a custom model is its own connection, so it carries its own cap —
     # see `Provider.max_parallel_requests`.
     max_parallel_requests: int = 0
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _coerce_effort(cls, value: object) -> str | None:
+        return coerce_reasoning_effort(value)
+
+    @field_validator("thinking_budget", mode="before")
+    @classmethod
+    def _coerce_budget(cls, value: object) -> int | None:
+        return coerce_thinking_budget(value)
 
     @field_validator("model", "base_url")
     @classmethod
@@ -881,9 +970,13 @@ def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
       (seconds; the OpenAI client timeout of `agent_model.build_model`).
       Only roles present in the map get a value — every other role keeps
       0 = the SDK default (600 s).
+    - `role_reasoning_effort[role]` beats the model entry's
+      `reasoning_effort` (the same "off" sentinel is accepted, so a role
+      can opt out of even the utility agents' "low" default).
 
-    See `ProjectSettings.role_max_tokens` / `role_request_timeout`. One
-    settings read for both maps (they are edited in the same dialog)."""
+    See `ProjectSettings.role_max_tokens` / `role_request_timeout` /
+    `role_reasoning_effort`. One settings read for the maps (they are
+    edited in the same dialogs)."""
     settings = ProjectSettingsStore(config._project_root).load()
     update: dict[str, object] = {}
     tokens = settings.role_max_tokens.get(role.value)
@@ -892,6 +985,9 @@ def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
     timeout = settings.role_request_timeout.get(role.value)
     if timeout is not None and timeout != config.request_timeout:
         update["request_timeout"] = float(timeout)
+    effort = settings.role_reasoning_effort.get(role.value)
+    if effort is not None and effort != config.reasoning_effort:
+        update["reasoning_effort"] = effort
     if not update:
         return config
     return config.model_copy(update=update)
@@ -959,6 +1055,14 @@ def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config
         # setting).
         if entry.compaction_threshold is not None:
             update["compaction_threshold"] = entry.compaction_threshold
+        # The reasoning knobs ride with the model like the token caps:
+        # None = nothing is set (the provider default + the utility
+        # agents' "low" default apply), "off" = suppress the field
+        # everywhere (including the utility default).
+        if entry.reasoning_effort is not None:
+            update["reasoning_effort"] = entry.reasoning_effort
+        if entry.thinking_budget is not None:
+            update["thinking_budget"] = entry.thinking_budget
     return config.model_copy(update=update)
 
 
@@ -996,6 +1100,10 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
             }
             if custom.max_tokens is not None:
                 update["max_tokens"] = custom.max_tokens
+            if custom.reasoning_effort is not None:
+                update["reasoning_effort"] = custom.reasoning_effort
+            if custom.thinking_budget is not None:
+                update["thinking_budget"] = custom.thinking_budget
             return config.model_copy(update=update)
 
     # 3. The user-level ordered chain: primary first, then the availability
@@ -1012,6 +1120,27 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
 
     # 4. Nothing selected for this role: "model not set".
     return config.model_copy(update={"model": ""})
+
+
+UTILITY_REASONING_EFFORT = "low"
+
+
+def utility_effort_config(config: Config) -> Config:
+    """The config for a TOOL-LESS utility agent (the compaction summarizer,
+    the resolver reviewer, the title generator): these read a prompt and
+    return text — deep reasoning buys nothing there, and on reasoning
+    models the thinking output tokens are the most expensive kind.
+
+    The default is `UTILITY_REASONING_EFFORT` ("low") whenever the
+    resolved connection carries no explicit `reasoning_effort`; an
+    explicit value (including the "off" sentinel — the escape hatch for
+    gateways that reject the field) always wins, so both the catalog
+    entry and the per-role project override outrank this default.
+    `thinking_budget` is untouched: it is an explicit per-model choice,
+    never defaulted from here."""
+    if config.reasoning_effort is not None:
+        return config
+    return config.model_copy(update={"reasoning_effort": UTILITY_REASONING_EFFORT})
 
 
 def resolve_model_key(config: Config, role: AgentRole) -> str:

@@ -43,9 +43,11 @@ from .agent_model import (
     _ThrottlePool,
 )
 from .config import Config
+from .providers import REASONING_EFFORT_LEVELS
 
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "REASONING_EFFORT_LEVELS",
     "AsyncOpenAI",
     "TailInjectionModel",
     "ThrottledModel",
@@ -77,16 +79,38 @@ def base_model_settings(config: Config) -> ModelSettings:
     The provider extra body (catalog `Provider.extra_body`, carried into
     the resolved Config as `provider_extra_body` by the resolver) is MERGED
     into the cache-prompt extra body — never a replacement: an empty dict
-    leaves the settings exactly as before (nothing is added)."""
+    leaves the settings exactly as before (nothing is added).
+
+    The reasoning knobs of the resolved connection ride the same extra
+    body ON TOP of the provider fields (a per-model explicit knob outranks
+    the provider-wide routing fields):
+
+    - `reasoning_effort` (valid level only — "off" and None send nothing)
+      as the `reasoning_effort` body field;
+    - `thinking_budget` (> 0) as the Anthropic-style
+      `thinking: {type: enabled, budget_tokens: N}` block.
+
+    Setting BOTH knobs is allowed but unusual: the gateway decides which
+    one it honors — set one per model (see `ModelEntry`)."""
+    body: dict[str, Any] = {**CACHE_PROMPT_EXTRA_BODY}
+    provider_extra = config.provider_extra_body
+    if provider_extra:
+        # Merge OVER the cache-prompt flag: the provider's own values win…
+        body.update(provider_extra)
+    # …but the explicit per-model reasoning knobs win over everything:
+    # they were set for THIS model specifically.
+    if config.reasoning_effort in REASONING_EFFORT_LEVELS:
+        body["reasoning_effort"] = config.reasoning_effort
+    if config.thinking_budget is not None and config.thinking_budget > 0:
+        body["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": config.thinking_budget,
+        }
     settings: ModelSettings = {
         "extra_headers": EXTRA_HEADERS,
         "max_tokens": config.max_tokens,
-        **CACHE_PROMPT_SETTINGS,
+        "extra_body": body,
     }
-    provider_extra = config.provider_extra_body
-    if provider_extra:
-        # Merge OVER the cache-prompt flag: the provider's own values win.
-        settings["extra_body"] = {**CACHE_PROMPT_EXTRA_BODY, **provider_extra}
     return settings
 
 

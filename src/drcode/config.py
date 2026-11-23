@@ -119,6 +119,8 @@ _PROVIDER_FIELDS: frozenset[str] = frozenset(
         "health_check_url",
         "max_context_tokens",
         "max_tokens",
+        "reasoning_effort",
+        "thinking_budget",
         "provider_extra_body",
         "provider_max_parallel_requests",
         "request_timeout",
@@ -153,6 +155,25 @@ class Config(BaseSettings):
     # generated." Set via DRCODE_MAX_TOKENS when the default doesn't match the
     # model; keep it at or below max_context_tokens.
     max_tokens: int = 8192
+    # Reasoning-effort knob of the resolved connection ("minimal" / "low" /
+    # "medium" / "high"; the special "off" = never send the field — the
+    # escape hatch for gateways that reject it; None = not set). NEVER read
+    # from any json layer (see `_PROVIDER_FIELDS`): written over a Config
+    # copy by `drcode.providers._apply_provider` from the model entry's
+    # `reasoning_effort` (models.json) or the role's custom model, then
+    # overlaid by the per-role project setting
+    # (`ProjectSettings.role_reasoning_effort`). Consumed by
+    # `agent_model.base_model_settings` (extra_body) — and by
+    # `providers.utility_effort_config`, which defaults the tool-less
+    # utility agents to "low" when this is None.
+    reasoning_effort: str | None = None
+    # Anthropic-style thinking budget (tokens) of the resolved connection:
+    # sent as extra_body {"thinking": {"type": "enabled",
+    # "budget_tokens": N}}. NEVER read from any json layer (see
+    # `_PROVIDER_FIELDS`): written from the model entry / the custom model
+    # only. No per-role override, no utility default — an explicit
+    # per-model choice.
+    thinking_budget: int | None = None
     # Extra JSON fields merged into the body of EVERY request to the
     # resolved provider's models (pydantic-ai ModelSettings `extra_body`).
     # NEVER read from any json layer (see `_PROVIDER_FIELDS`): the value is

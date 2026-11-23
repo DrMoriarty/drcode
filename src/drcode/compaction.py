@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from . import agent_model
 from .config import Config
 from .prompts import load_compaction_prompts
+from .providers import utility_effort_config
 from .transcript import (
     BACKGROUND_COMPACTION_MARK_PREFIX,
     COMPACTION_RESUME_PREFIX,
@@ -95,9 +96,16 @@ def build_compaction_agent(
     forwarded to `agent_model.build_model`, so a summarizer call queued
     behind the provider's `max_parallel_requests` cap says so in the task's
     chat instead of looking like a hung compaction.
+
+    The summarizer is a TOOL-LESS utility pass: it runs at "low"
+    reasoning effort unless the resolved connection carries an explicit
+    one (see `providers.utility_effort_config`) — deep reasoning buys a
+    summary nothing, and on reasoning models the thinking tokens are the
+    most expensive kind.
     """
     from pydantic_ai import Agent
 
+    config = utility_effort_config(config)
     system_prompt, _ = load_compaction_prompts()
     return Agent(
         agent_model.build_model(config, announce_wait),

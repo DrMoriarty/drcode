@@ -1743,3 +1743,185 @@ def test_model_entry_price_junk_does_not_invalidate_catalog(
     assert good.price_prompt == pytest.approx(0.000002)
     assert good.price_completion == pytest.approx(8e-6)
     assert good.price_cache_read is None
+
+
+# -- reasoning effort / thinking budget knobs -----------------------------------
+
+
+def test_model_entry_reasoning_knobs_coercion() -> None:
+    """The knob fields are TOLERANT: case-insensitive levels, the "off"
+    sentinel ("none" as a synonym), numeric-string budgets; junk degrades
+    to None — never a ValidationError (a bad hand-edited models.json must
+    not invalidate the whole catalog)."""
+    entry = ModelEntry(id="m", reasoning_effort="  HIGH ")
+    assert entry.reasoning_effort == "high"
+    assert (
+        ModelEntry.model_validate({"id": "m", "thinking_budget": " 8192 "}).thinking_budget
+        == 8192
+    )
+    assert ModelEntry(id="m", reasoning_effort="none").reasoning_effort == "off"
+    assert ModelEntry(id="m", reasoning_effort="OFF").reasoning_effort == "off"
+    # Runtime-junk must be fed through model_validate: the field types are
+    # int | None / str | None, so the before-coercers' tolerance is only
+    # observable for values pyright would reject as constructor kwargs.
+    junk = ModelEntry.model_validate(
+        {
+            "id": "m",
+            "reasoning_effort": "yolo",
+            "thinking_budget": " 8192 ",
+        }
+    )
+    assert junk.reasoning_effort is None
+    assert junk.thinking_budget == 8192
+    assert (
+        ModelEntry.model_validate(
+            {"id": "m", "reasoning_effort": 42, "thinking_budget": "junk"}
+        ).reasoning_effort
+        is None
+    )
+    assert (
+        ModelEntry.model_validate({"id": "m", "thinking_budget": True}).thinking_budget
+        is None
+    )
+    assert ModelEntry(id="m", reasoning_effort="").reasoning_effort is None
+    assert ModelEntry(id="m", thinking_budget=0).thinking_budget is None
+    assert ModelEntry(id="m", thinking_budget=-5).thinking_budget is None
+    assert ModelEntry(id="m").reasoning_effort is None
+    assert ModelEntry(id="m").thinking_budget is None
+
+
+def test_custom_model_entry_reasoning_knobs_coercion() -> None:
+    """The custom-model copies coerce the same way."""
+    custom = CustomModelEntry(
+        model="m", base_url="http://localhost:9/v1", reasoning_effort="Low"
+    )
+    assert custom.reasoning_effort == "low"
+    assert custom.thinking_budget is None
+
+
+def test_resolve_entry_reasoning_knobs_ride_with_the_model(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The entry's effort/budget land in the resolved config of EVERY role
+    the model serves — like the token caps."""
+    entry = catalog.providers[0].models[0]
+    entry.reasoning_effort = "medium"
+    entry.thinking_budget = 4096
+    write_user_catalog(catalog, project_root)
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root, model="flat-m")
+    resolved = resolve(config, AgentRole.TESTER)
+    assert resolved.reasoning_effort == "medium"
+    assert resolved.thinking_budget == 4096
+    # A model without the knobs keeps them unset.
+    set_project_model(
+        project_root, AgentRole.RESEARCH, ModelRef(provider="local-swap", model="small")
+    )
+    bare = resolve(config, AgentRole.RESEARCH)
+    assert bare.reasoning_effort is None
+    assert bare.thinking_budget is None
+
+
+def test_resolve_custom_model_reasoning_knobs(project_root: Path) -> None:
+    """A custom connection carries its own knobs into the resolution."""
+    set_project_custom_model(
+        project_root,
+        AgentRole.CODING,
+        CustomModelEntry(
+            model="m",
+            base_url="http://localhost:9/v1",
+            reasoning_effort="low",
+            thinking_budget=2048,
+        ),
+    )
+    resolved = resolve(make_config(project_root), AgentRole.CODING)
+    assert resolved.reasoning_effort == "low"
+    assert resolved.thinking_budget == 2048
+
+
+def _set_role_reasoning_effort(project_root: Path, role: AgentRole, value: str) -> None:
+    from drcode.settings import ProjectSettingsStore
+
+    store = ProjectSettingsStore(project_root)
+    settings = store.load()
+    settings.role_reasoning_effort[role.value] = value
+    store.save(settings)
+
+
+def test_resolve_role_reasoning_effort_beats_entry(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The per-role project setting is the most specific layer: it beats
+    the catalog entry's effort; the "off" sentinel works as the explicit
+    opt-out; other roles keep the entry's value."""
+    catalog.providers[0].models[0].reasoning_effort = "high"
+    write_user_catalog(catalog, project_root)
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).reasoning_effort == "high"
+    _set_role_reasoning_effort(project_root, AgentRole.TESTER, "LOW")
+    assert resolve(config, AgentRole.TESTER).reasoning_effort == "low"
+    _set_role_reasoning_effort(project_root, AgentRole.TESTER, "off")
+    assert resolve(config, AgentRole.TESTER).reasoning_effort == "off"
+    # Only the tester role is overridden.
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    assert resolve(config, AgentRole.CODING).reasoning_effort is None
+
+
+def test_role_reasoning_effort_validator_drops_junk(project_root: Path) -> None:
+    """A stray key or an unknown value in settings.json is dropped, the
+    rest of the map survives."""
+    from drcode.settings import ProjectSettingsStore
+
+    path = ProjectSettingsStore(project_root).path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "role_reasoning_effort": {
+                    "coding": "low",
+                    "typo_role": "high",
+                    "tester": "banana",
+                    "resolver": 3,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = ProjectSettingsStore(project_root).load()
+    assert settings.role_reasoning_effort == {"coding": "low"}
+
+
+def test_utility_effort_config_defaults_low() -> None:
+    """Tool-less utility agents default to "low"; an explicit value
+    (including "off") always wins; the budget is never touched."""
+    from drcode.providers import utility_effort_config
+
+    config = make_config(Path("/tmp/unused"))
+    forced = utility_effort_config(config)
+    assert forced.reasoning_effort == "low"
+    assert forced.thinking_budget is None
+    # The input config is not mutated.
+    assert config.reasoning_effort is None
+    assert (
+        utility_effort_config(
+            make_config(Path("/tmp/unused"), reasoning_effort="high")
+        ).reasoning_effort
+        == "high"
+    )
+    assert (
+        utility_effort_config(
+            make_config(Path("/tmp/unused"), reasoning_effort="off")
+        ).reasoning_effort
+        == "off"
+    )

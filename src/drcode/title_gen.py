@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from pydantic_ai import Agent
 from .config import Config
 from .prompts import load_title_prompt
+from .providers import utility_effort_config
 
 # The stored-title cap: the same 60 characters TaskManager.create /
 # edit_task derive titles with (title_display then truncates to 40 for the
@@ -54,9 +55,14 @@ def build_title_agent(
     forwarded to :func:`agent_model.build_model`, so a title call queued
     behind the provider's ``max_parallel_requests`` cap says so in the
     task's chat instead of looking like a stalled activation.
+
+    A tool-less utility pass: it runs at "low" reasoning effort unless
+    the resolved connection carries an explicit one (see
+    ``providers.utility_effort_config``) — a title needs no reasoning.
     """
     from pydantic_ai import Agent
 
+    config = utility_effort_config(config)
     return Agent(
         agent_model.build_model(config, announce_wait),
         instructions=load_title_prompt(),

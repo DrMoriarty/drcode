@@ -59,7 +59,7 @@ from .prompts import (
     load_system_prompt,
     load_tester_prompt,
 )
-from .providers import AgentRole
+from .providers import AgentRole, utility_effort_config
 from .service_events import log_service_event
 from .settings import CodeIndexMode, GitPolicy, ProjectSettings
 from .subagents import SubagentGate, run_delegate_tool
@@ -2029,7 +2029,13 @@ def build_resolver_reviewer_agent(
     verdict lands in the same `verdicts` list.
 
     `announce_wait` — see `build_agent`: the provider slot-wait announcer.
+
+    A tool-less utility pass (one prompt, one verdict): it runs at "low"
+    reasoning effort unless the resolved connection carries an explicit
+    one (see `providers.utility_effort_config`) — the reviewer's value is
+    in reading the diffs, not in thinking depth.
     """
+    config = utility_effort_config(config)
     model = agent_model.build_model(config, announce_wait)
     agent = Agent(
         model,

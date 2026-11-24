@@ -3783,8 +3783,9 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
     "Project environment…" (the infrastructure dialog) and "Agent
     runtime…" (the runtime-behavior dialog). The Code index preference
     lives ONLY in the runtime dialog — no palette entry anymore."""
-    from textual.widgets import Label, RadioButton, Select
+    from textual.widgets import Label, RadioButton
 
+    from drcode.settings import Verification
     from drcode.tui.command_providers import (
         AgentRuntimeCommandProvider,
         ProjectEnvironmentCommandProvider,
@@ -3886,8 +3887,8 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
             "#ts-todo-tail",
         ):
             assert dialog.query_one(selector)
-        assert dialog.query_one("#ts-verification", Select).value is (
-            app.settings.verification
+        assert dialog.query_one("#ts-verification", RadioButton).value is (
+            app.settings.verification is Verification.TESTER
         )
         sections = [
             str(cast(Label, label).render())
@@ -3967,7 +3968,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
     until Apply, ESC discards everything, and Apply persists ONCE and
     replays the same side effects as the per-field actions (_advance,
     _update_keepawake)."""
-    from textual.widgets import Button, Select
+    from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore, Verification
     from drcode.tui.task_settings_dialog import AgentRuntimeDialog
@@ -4005,7 +4006,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
         assert isinstance(dialog, AgentRuntimeDialog)
 
         # Edit a field through the widget.
-        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        dialog.query_one("#ts-verification", RadioButton).value = False
         await pilot.pause()
         # Nothing persisted while editing; the live settings are untouched.
         assert saves == []
@@ -4025,7 +4026,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, AgentRuntimeDialog)
-        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        dialog.query_one("#ts-verification", RadioButton).value = False
         await pilot.pause()
         dialog.query_one("#ts-apply", Button).press()
         await pilot.pause()

@@ -26,7 +26,9 @@ policy:
 - **Host policy** (project setting `web_fetch_mode`): `off` (the tool is
   not registered at all), `allowlist` (only the configured hosts and their
   subdomains; an empty list refuses everything with a hint to configure
-  it) or `all` (every public host). `web_fetch_block_hosts` always wins.
+  it), `all` (every public host) or `unrestricted` (no host restrictions —
+  both host lists are dormant; the SSRF guard below still applies).
+  `web_fetch_block_hosts` always wins wherever it applies.
 - **Limits**: a 20 s timeout, at most ~1.5 MB downloaded (streamed and cut
   at the cap, never buffered past it) and a bounded text output (~24k
   chars ≈ 6k tokens by the conventional chars/4 estimate of
@@ -221,7 +223,10 @@ class WebFetchPolicy:
         The block list wins over everything (including the `all` mode); in
         allowlist mode a host not covered by the allow list is refused with
         an actionable explanation — an EMPTY allow list therefore refuses
-        every fetch, which is the safe reading of "allowlist".
+        every fetch, which is the safe reading of "allowlist". In
+        `unrestricted` mode BOTH host lists are dormant: the saved values
+        have no effect and every host passes this check (the SSRF guard in
+        `_check_target` still refuses the non-public ones).
         """
         if not self.enabled:
             return (
@@ -231,6 +236,8 @@ class WebFetchPolicy:
         bare = normalize_host_entry(host)
         if not bare:
             return "the URL has no host."
+        if self.mode is WebFetchMode.UNRESTRICTED:
+            return None
         if _matches_host_list(bare, self.block_hosts):
             return (
                 f"the host {bare} is on the project's web-fetch BLOCK list "

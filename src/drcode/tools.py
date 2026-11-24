@@ -1759,12 +1759,21 @@ def _check_network_command(
     args: list[str],
     *,
     web_fetch_available: bool = False,
+    network_unrestricted: bool = False,
 ) -> None:
     """Refuse an outbound request of a network client unless it is loopback.
 
     Raises PathViolation — a plain refusal (the agent layer logs it and hands
     the text back as a retry prompt), never a crash.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode) is
+    the ONLY way past this guard: the whole network check — redirect flags,
+    target host resolution, the conservative unparsable-quoting refusal — is
+    skipped, any host is reachable. The other run_bash guards (rm/mv/cp,
+    stash, filesystem scans) are untouched by it.
     """
+    if network_unrestricted:
+        return
     flag = _redirect_flag(cmd, args)
     if flag is not None:
         raise _redirect_violation(command, cmd, flag)
@@ -1791,6 +1800,7 @@ def check_command(
     extra_writable: Path | None = None,
     *,
     web_fetch_available: bool = False,
+    network_unrestricted: bool = False,
 ) -> None:
     """Refuse rm/mv/cp whose path arguments escape the writable area.
 
@@ -1830,6 +1840,12 @@ def check_command(
     `web_fetch_available` only shapes the refusal text: when the running role
     carries the `web_fetch` tool the model is pointed at it, otherwise it is
     told that external access is closed in this run.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode)
+    lifts ONLY the network half of the guard: network clients may target any
+    host, redirect flags are allowed and the conservative unparsable-quoting
+    refusal for a network command is dropped. The destructive-command, git
+    stash and filesystem-scan checks apply unchanged.
     """
     state_dir = (root / PROJECT_STATE_DIRNAME).resolve()
     for segment in _split_segments(command):
@@ -1847,7 +1863,7 @@ def check_command(
                 ) from None
             if _GIT_STASH_WORD.search(segment):
                 raise _stash_violation(command) from None
-            if _NETWORK_WORD.search(segment):
+            if _NETWORK_WORD.search(segment) and not network_unrestricted:
                 raise _network_violation(
                     command,
                     "a network client",
@@ -1883,6 +1899,7 @@ def check_command(
                 base,
                 words[i + 1 :],
                 web_fetch_available=web_fetch_available,
+                network_unrestricted=network_unrestricted,
             )
             continue
         if base in SCAN_ROOT_COMMANDS:
@@ -2080,6 +2097,7 @@ async def _check_command_async(
     extra_writable: Path | None,
     *,
     web_fetch_available: bool,
+    network_unrestricted: bool = False,
 ) -> None:
     """`check_command` off the event loop.
 
@@ -2096,6 +2114,7 @@ async def _check_command_async(
                 command,
                 extra_writable,
                 web_fetch_available=web_fetch_available,
+                network_unrestricted=network_unrestricted,
             ),
             timeout=_NETWORK_CHECK_TIMEOUT,
         )
@@ -2117,12 +2136,14 @@ async def run_bash(
     extra_writable: Path | None = None,
     task_id: str | None = None,
     web_fetch_available: bool = False,
+    network_unrestricted: bool = False,
 ) -> str:
     await _check_command_async(
         root,
         command,
         extra_writable,
         web_fetch_available=web_fetch_available,
+        network_unrestricted=network_unrestricted,
     )
     effective = clamp_bash_timeout(timeout)
     env = sanitized_env()

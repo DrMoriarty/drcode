@@ -69,6 +69,20 @@ def web_fetch_available(deps: AgentDeps | TesterDeps | ResolverDeps) -> bool:
     return getattr(deps, "web_fetch_gate", None) is not None
 
 
+def network_unrestricted(deps: AgentDeps | TesterDeps | ResolverDeps) -> bool:
+    """Whether this run's run_bash may reach external hosts.
+
+    Mirrors the project's `unrestricted` web-fetch mode (the pipeline stamps
+    it onto every dep shape — coding/tester/resolver included: the mode is a
+    PROJECT-level network-access decision, not a property of one role). With
+    the flag the bash network guard (`drcode.tools.check_command`) is lifted
+    entirely — any host, redirect flags included; every other run_bash
+    refusal (rm/mv/cp, git stash, filesystem scans) still applies. Off by
+    default and for dep shapes that never carry the field.
+    """
+    return bool(getattr(deps, "network_unrestricted", False))
+
+
 async def _run_bash_logged(
     deps: AgentDeps | TesterDeps | ResolverDeps,
     root: Path,
@@ -88,6 +102,10 @@ async def _run_bash_logged(
             # an agent WITH web_fetch is pointed at it, one without is told
             # that external access is closed in this run.
             web_fetch_available=web_fetch_available(deps),
+            # The project's `unrestricted` web-fetch mode lifts the whole
+            # network guard (any host, redirect flags included) — see
+            # `network_unrestricted`.
+            network_unrestricted=network_unrestricted(deps),
         )
     except PathViolation as e:
         log_violation(deps, "run_bash", str(e))

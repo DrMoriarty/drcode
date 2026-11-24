@@ -42,6 +42,7 @@ from ..core.usage import (
 from ..models import ImageAttachment, PendingInput, Task, TaskKind, TaskStatus
 from ..providers import AgentRole, resolve_available, subagent_usage_key
 from ..read_cache import ReadCache
+from ..settings import WebFetchMode
 from ..tools import scratch_dir
 from ..web_fetch import WebFetchGate, web_fetch_policy_for
 from .pipeline_stream import NodeStreamView
@@ -433,6 +434,13 @@ class PipelineAgentRunLayer(CoreState):
                             # for THIS run (None = the tool is not
                             # registered, see _prepare_agent_run).
                             web_fetch_gate=web_fetch_gate,
+                            # The project's `unrestricted` web-fetch mode
+                            # lifts the run_bash network guard for THIS run
+                            # (any role — a project-level decision).
+                            network_unrestricted=(
+                                self.settings.web_fetch_mode
+                                is WebFetchMode.UNRESTRICTED
+                            ),
                             # The code-index decision for THIS run: the
                             # nested delegate_research subagents inherit
                             # it (they are the index's main

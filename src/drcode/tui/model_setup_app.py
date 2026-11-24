@@ -14,7 +14,8 @@ check (`probe_model`), one-click model auto-discovery (`fetch_models`,
 existing entries keep their manual edits — favorites included — and new
 ones are appended) and an editable model table: selecting a row (single
 click or arrow keys — no double click needed) fills the editor line below
-it with the model's id, context size and compaction limit; "Update" writes
+it with the model's id, context size, compaction limit and reasoning
+effort (a combobox of the valid values); "Update" writes
 the edited values back to the selected model, "Add model" creates a new
 model from the same fields, "Remove" deletes it. A click on a row's
 Favorites cell cycles its favorite level (empty → • → ★ → ✚ → empty);
@@ -41,11 +42,13 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, OptionList, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ..agent import ModelFetchError, fetch_models, probe_model
 from ..providers import (
+    REASONING_EFFORT_LEVELS,
+    REASONING_EFFORT_OFF,
     USER_MODELS_FILENAME,
     ModelEntry,
     Provider,
@@ -57,6 +60,19 @@ from ..providers import (
 from .changed_highlight import CHANGED_CSS, ChangedHighlightMixin
 
 _PROBE_TIMEOUT = 15.0
+
+# The reasoning-effort editor is a COMBOBOX, not a free-text input: its
+# options are exactly the values the catalog validator accepts
+# (`coerce_reasoning_effort` — the four effort levels plus the "off"
+# sentinel). The "" value is the "auto / not set" slot (an empty stored
+# `reasoning_effort`); it is a regular option, not the Select's blank, so
+# the widget always carries one of the fixed values.
+_EFFORT_AUTO = ""
+_EFFORT_LEVEL_CHOICES = (*REASONING_EFFORT_LEVELS, REASONING_EFFORT_OFF)
+_EFFORT_OPTIONS: list[tuple[str, str]] = [
+    ("auto", _EFFORT_AUTO),
+    *[(value, value) for value in _EFFORT_LEVEL_CHOICES],
+]
 
 # Fallback width of the "model id" table column (used before the first
 # layout pass): long ids are middle-truncated so the context /
@@ -270,7 +286,10 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
     #mc-model-row Input { height: 1; }
     #mc-model-id { width: 1fr; }
     #mc-ctx, #mc-pct { width: 14; }
-    #mc-effort { width: 16; }
+    /* The reasoning-effort combobox: compact (borderless, one line like
+       the neighbouring Inputs), fixed width so the 1fr model-id field
+       absorbs the rest. */
+    #mc-effort { width: 12; }
     #mc-footer {
         height: auto;
         margin-top: 1;
@@ -377,9 +396,11 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     yield Input(id="mc-model-id", placeholder="model id")
                     yield Input(id="mc-ctx", placeholder="context tokens")
                     yield Input(id="mc-pct", placeholder="compact % (empty = inherit)")
-                    yield Input(
+                    yield Select(
+                        _EFFORT_OPTIONS,
+                        allow_blank=False,
+                        compact=True,
                         id="mc-effort",
-                        placeholder="reasoning effort (empty = auto)",
                     )
                 with Horizontal(classes="mc-btnrow"):
                     yield Button("Update", id="mc-model-update")
@@ -644,10 +665,10 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     self.query_one("#mc-pct", Input).value.strip()
                     != ("" if pct is None else str(pct))
                 ),
-                self.query_one("#mc-effort", Input): (
-                    self.query_one("#mc-effort", Input).value.strip()
+                self.query_one("#mc-effort", Select): (
+                    self.query_one("#mc-effort", Select).value
                     != (
-                        ""
+                        _EFFORT_AUTO
                         if entry is None or entry.reasoning_effort is None
                         else entry.reasoning_effort
                     )
@@ -818,13 +839,23 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         pct = entry.compaction_threshold
         self.query_one("#mc-pct", Input).value = "" if pct is None else str(pct)
         effort = entry.reasoning_effort
-        self.query_one("#mc-effort", Input).value = "" if effort is None else effort
+        self.query_one("#mc-effort", Select).value = (
+            _EFFORT_AUTO if effort is None else effort
+        )
 
     @on(DataTable.RowHighlighted, "#mc-models")
     def _model_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if self._suppress_highlight:
             # Swallow the re-highlight queued by the Remove rebuild.
             self._suppress_highlight = False
+            return
+        if event.row_key.value == self._selected_model:
+            # A re-highlight of the row ALREADY shown in the editor —
+            # one of the events a table rebuild in Update/Add queues.
+            # The editor holds the user's (just-applied or pending)
+            # edits; a refill here would clobber them. Deliveries are
+            # not ordered relative to the test/user's next input, so
+            # this guard must not depend on event timing.
             return
         self._select_model(event.row_key.value)
 
@@ -863,8 +894,9 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         return next((m for m in provider.models if m.id == model_id), None)
 
     def _clear_model_inputs(self) -> None:
-        for input_id in ("#mc-model-id", "#mc-ctx", "#mc-pct", "#mc-effort"):
+        for input_id in ("#mc-model-id", "#mc-ctx", "#mc-pct"):
             self.query_one(input_id, Input).value = ""
+        self.query_one("#mc-effort", Select).value = _EFFORT_AUTO
 
     @on(Button.Pressed, "#mc-model-update")
     def _update_clicked(self) -> None:
@@ -873,17 +905,24 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
     @on(Input.Submitted, "#mc-model-id")
     @on(Input.Submitted, "#mc-ctx")
     @on(Input.Submitted, "#mc-pct")
-    @on(Input.Submitted, "#mc-effort")
     def _model_input_submitted(self) -> None:
         self._update_model()
+
+    @on(Select.Changed, "#mc-effort")
+    def _effort_select_changed(self) -> None:
+        """The effort combobox changed (user pick or a programmatic
+        refill): re-sync the "changed" markers — a refill restores the
+        snapshot value, so the marker clears, same contract as the
+        Inputs."""
+        self._sync_changed()
 
     def _parse_caps(self) -> tuple[int, int | None, str | None] | None:
         """Parse the context / compaction-limit / reasoning-effort editor
         fields into (context_tokens, compaction_threshold,
         reasoning_effort); None on a validation error (the status line
-        explains). The effort field tolerates anything the catalog
-        validator would accept — an unknown word degrades to None
-        ("not set") with a status note instead of an error."""
+        explains). The effort field is a combobox offering exactly the
+        values the catalog validator accepts — the "auto" slot maps to
+        None ("not set")."""
         raw_ctx = self.query_one("#mc-ctx", Input).value.strip()
         try:
             ctx = int(raw_ctx)
@@ -904,14 +943,11 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
             if not 1 <= pct <= 100:
                 self._status("✗ compact % must be an integer between 1 and 100")
                 return None
-        raw_effort = self.query_one("#mc-effort", Input).value.strip()
-        effort = coerce_reasoning_effort(raw_effort) if raw_effort else None
-        if raw_effort and effort is None:
-            self._status(
-                "ℹ unknown reasoning effort '"
-                + raw_effort
-                + "' — cleared (use minimal/low/medium/high or off)"
-            )
+        raw_effort = self.query_one("#mc-effort", Select).value
+        # The combobox only offers canonical values, but the coercion is
+        # kept as the guard so the parse can never emit a value the
+        # catalog validator would reject.
+        effort = coerce_reasoning_effort(raw_effort)
         return ctx, pct, effort
 
     def _update_model(self) -> None:

@@ -143,7 +143,9 @@ async def test_tool_call_block_counter_never_wraps_stamp() -> None:
 
         def compose(self) -> ComposeResult:
             yield ToolCallBlock(
-                'delegate_research({"task": "GOAL: ' + "map the startup path " * 20 + '"})'
+                'delegate_research({"task": "GOAL: '
+                + "map the startup path " * 20
+                + '"})'
             )
 
     async with _Host().run_test(size=(120, 10)) as pilot:

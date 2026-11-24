@@ -1411,6 +1411,57 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     assert guard < enter_at
 
 
+def test_term_js_ctrl_c0_keys_send_csi_u() -> None:
+    """xterm.js does not speak the kitty keyboard protocol and encodes
+    every ctrl combination whose legacy byte is a C0 control as that raw
+    byte, which Textual decodes as its NAMED key — Ctrl+M arrives as \\r
+    ("enter", the merge screen never opens), Ctrl+H as \\x08
+    ("backspace"), Ctrl+I as \\t ("tab"), Ctrl+J as \\n, Ctrl+[ as ESC,
+    Ctrl+Space as \\x00. The key handler must intercept the WHOLE
+    C0-colliding set (letters a-z plus the space/@/bracket row —
+    everything a terminal maps into C0 via codepoint & 0x1f) and forward
+    it as the kitty CSI u sequence \\x1b[<codepoint>;5u (Textual's parser
+    decodes it back into ctrl+<key>), placed AFTER the font-size shortcuts
+    so their gate stays authoritative and gated on a live session like the
+    modified-Enter branch."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    handler = js[js.index("function terminalKeyHandler") :]
+
+    # Systematic, not per-key: the old hardcoded Ctrl+M payload is gone.
+    assert '"\\x1b[109;5u"' not in handler
+
+    # AFTER the font-shortcut branches (Ctrl+, / Ctrl+= / Ctrl+- / Ctrl+0 —
+    # Ctrl+_ rides the Ctrl+- font branch), so those keep priority and the
+    # ctrl-only gate is passed first.
+    gate = handler.index("if (!ev.ctrlKey")
+    font_zero = handler.index('ev.key === "0"')
+    c0_at = handler.index("isC0Key")
+    assert gate < font_zero < c0_at
+
+    # The interception matches pure ctrl only (no meta/alt/shift mix-ins —
+    # those stay with the tab-switch shortcuts and the metaKey gate) on a
+    # single-character key.
+    cond_at = handler.rfind("if (ev.ctrlKey", 0, c0_at)
+    cond = handler[cond_at : handler.index(") {", cond_at)]
+    assert "ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey" in cond
+    assert "ev.key.length === 1" in cond
+
+    block = handler[cond_at : handler.index("return false;", c0_at)]
+    # The covered set: letters a-z (Ctrl+M/H/I/J …) plus the symbols a
+    # terminal maps into C0 (Ctrl+Space/@ → \\x00, Ctrl+[ → ESC,
+    # Ctrl+\\ / ] / ^ / _ → \\x1c…\\x1f).
+    assert "cp >= 97 && cp <= 122" in block
+    assert '" @[]^_\\\\"' in block
+
+    # Only while a live session exists (welcome screen has no PTY), and
+    # the event is swallowed (preventDefault + return false).
+    assert "ws.readyState !== WebSocket.OPEN" in block
+    assert "ev.preventDefault();" in block
+    # The payload is the kitty CSI u encoding Textual understands, built
+    # from the key's own codepoint with 5 = 1 + ctrl modifier.
+    assert '"\\x1b[" + cp + ";5u"' in block
+
+
 def test_term_js_font_settings_wiring() -> None:
     """Static check of the font-settings flow: boot-time load through the
     bridge, constructor pickup, family application, and Ctrl+, interception."""
@@ -1979,10 +2030,14 @@ def test_term_js_flow_control_wiring() -> None:
     assert "function flowDecide(tab)" in src
     # The send frames live in the scheduled flowDecide only — they are no
     # longer reached from the per-chunk flowUpdate body.
-    flow_update = src[src.index("function flowUpdate") : src.index("function flowDecide")]
+    flow_update = src[
+        src.index("function flowUpdate") : src.index("function flowDecide")
+    ]
     assert '"type": "pause"' not in flow_update
     assert '"type": "resume"' not in flow_update
-    flow_decide = src[src.index("function flowDecide") : src.index("function connectTab")]
+    flow_decide = src[
+        src.index("function flowDecide") : src.index("function connectTab")
+    ]
     assert '{ type: "pause", tab: tab.id }' in flow_decide
     assert '{ type: "resume", tab: tab.id }' in flow_decide
     assert "clearTimeout(tab.flowTimer);" in src
@@ -2127,9 +2182,11 @@ def test_term_js_hidden_tab_webgl_recycling() -> None:
     # activateTab drives the lifecycle per pane toggle.
     assert "deactivateTabRender(t)" in src
     assert "activateTabRender(t)" in src
-    lifecycle = src[src.index("function deactivateTabRender") : src.index(
-        "/* ---------------- terminal setup (per tab) ---------------- */"
-    )]
+    lifecycle = src[
+        src.index("function deactivateTabRender") : src.index(
+            "/* ---------------- terminal setup (per tab) ---------------- */"
+        )
+    ]
     # Deactivation: dispose the addon and cancel any pending context-loss
     # recovery (it would re-arm a GPU context for an unwatched tab).
     deact = lifecycle[: lifecycle.index("function activateTabRender")]
@@ -2142,7 +2199,9 @@ def test_term_js_hidden_tab_webgl_recycling() -> None:
     assert "term.dispose" not in lifecycle
     # The font-change fan-out leaves hidden tabs rendererless (activation
     # re-attaches instead of handing a GPU context to an unwatched tab).
-    recreate = src[src.index("function recreateWebgl") : src.index("function refitAfterFontChange")]
+    recreate = src[
+        src.index("function recreateWebgl") : src.index("function refitAfterFontChange")
+    ]
     assert 'tab.pane.classList.contains("hidden")' in recreate
 
 
@@ -2754,13 +2813,17 @@ def test_term_js_osc_filter_logic(tmp_path: Path) -> None:
 
     # 1. No-ESC frames: one forward of the IDENTICAL buffer, nothing else.
     assert result["r1"] == {
-        "n": 1, "same": True, "text": "plain PTY output \r\n 123 ",
-        "titles": 0, "copies": 0,
+        "n": 1,
+        "same": True,
+        "text": "plain PTY output \r\n 123 ",
+        "titles": 0,
+        "copies": 0,
     }
     # r1b text: the raw UTF-8 bytes of "привет ok" read back latin1 —
     # the point is that they pass through UNTOUCHED (same=True above).
     assert result["r1b"] == {
-        "n": 1, "same": True,
+        "n": 1,
+        "same": True,
         "text": "привет ok".encode().decode("latin1"),
     }
 
@@ -3042,7 +3105,9 @@ def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
     # activate re-attaches fresh and renews the budget; a hidden tab gets
     # no context back from the font fan-out.
     assert out["deactivate"] == {
-        "webglGone": True, "recoveryTimersLeft": 0, "timerFieldCleared": True,
+        "webglGone": True,
+        "recoveryTimersLeft": 0,
+        "timerFieldCleared": True,
     }
     assert out["activate"]["webglBack"] and out["activate"]["freshAddon"]
     assert out["activate"]["attempts"] == 0

@@ -133,6 +133,4 @@ def test_mcp_example_template_not_ignored(project_root: Path) -> None:
     for entry in GITIGNORE_ENTRIES:
         assert entry != example
         # No wildcard entry may swallow the .example suffix.
-        assert not (
-            entry.endswith("*") and example.startswith(entry.rstrip("*"))
-        )
+        assert not (entry.endswith("*") and example.startswith(entry.rstrip("*")))

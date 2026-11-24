@@ -180,9 +180,7 @@ def _tree_cursor_landed(screen: GoalScreen) -> bool:
     that race under load)."""
     tree = screen.query("#goal-tree")
     first = tree.first() if tree else None
-    return isinstance(first, ListView) and isinstance(
-        first.highlighted_child, TaskItem
-    )
+    return isinstance(first, ListView) and isinstance(first.highlighted_child, TaskItem)
 
 
 def _screen_ready(app: DrCodeApp, screen_type, selector: str) -> bool:
@@ -704,12 +702,8 @@ async def test_new_task_goal_picker_indents_sub_goals(app: DrCodeApp) -> None:
     async with app.run_test() as pilot:
         await _started(app, pilot)
         parent = app.manager.goals.create("Parent goal")
-        child = app.manager.goals.create(
-            "Child goal", parent_id=parent.id
-        )
-        grandchild = app.manager.goals.create(
-            "Grandchild goal", parent_id=child.id
-        )
+        child = app.manager.goals.create("Child goal", parent_id=parent.id)
+        grandchild = app.manager.goals.create("Grandchild goal", parent_id=child.id)
         other = app.manager.goals.create("Other goal")
 
         app.action_new_task()

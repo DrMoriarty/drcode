@@ -2030,10 +2030,14 @@ def test_term_js_flow_control_wiring() -> None:
     assert "function flowDecide(tab)" in src
     # The send frames live in the scheduled flowDecide only — they are no
     # longer reached from the per-chunk flowUpdate body.
-    flow_update = src[src.index("function flowUpdate") : src.index("function flowDecide")]
+    flow_update = src[
+        src.index("function flowUpdate") : src.index("function flowDecide")
+    ]
     assert '"type": "pause"' not in flow_update
     assert '"type": "resume"' not in flow_update
-    flow_decide = src[src.index("function flowDecide") : src.index("function connectTab")]
+    flow_decide = src[
+        src.index("function flowDecide") : src.index("function connectTab")
+    ]
     assert '{ type: "pause", tab: tab.id }' in flow_decide
     assert '{ type: "resume", tab: tab.id }' in flow_decide
     assert "clearTimeout(tab.flowTimer);" in src
@@ -2178,9 +2182,11 @@ def test_term_js_hidden_tab_webgl_recycling() -> None:
     # activateTab drives the lifecycle per pane toggle.
     assert "deactivateTabRender(t)" in src
     assert "activateTabRender(t)" in src
-    lifecycle = src[src.index("function deactivateTabRender") : src.index(
-        "/* ---------------- terminal setup (per tab) ---------------- */"
-    )]
+    lifecycle = src[
+        src.index("function deactivateTabRender") : src.index(
+            "/* ---------------- terminal setup (per tab) ---------------- */"
+        )
+    ]
     # Deactivation: dispose the addon and cancel any pending context-loss
     # recovery (it would re-arm a GPU context for an unwatched tab).
     deact = lifecycle[: lifecycle.index("function activateTabRender")]
@@ -2193,7 +2199,9 @@ def test_term_js_hidden_tab_webgl_recycling() -> None:
     assert "term.dispose" not in lifecycle
     # The font-change fan-out leaves hidden tabs rendererless (activation
     # re-attaches instead of handing a GPU context to an unwatched tab).
-    recreate = src[src.index("function recreateWebgl") : src.index("function refitAfterFontChange")]
+    recreate = src[
+        src.index("function recreateWebgl") : src.index("function refitAfterFontChange")
+    ]
     assert 'tab.pane.classList.contains("hidden")' in recreate
 
 
@@ -2805,13 +2813,17 @@ def test_term_js_osc_filter_logic(tmp_path: Path) -> None:
 
     # 1. No-ESC frames: one forward of the IDENTICAL buffer, nothing else.
     assert result["r1"] == {
-        "n": 1, "same": True, "text": "plain PTY output \r\n 123 ",
-        "titles": 0, "copies": 0,
+        "n": 1,
+        "same": True,
+        "text": "plain PTY output \r\n 123 ",
+        "titles": 0,
+        "copies": 0,
     }
     # r1b text: the raw UTF-8 bytes of "привет ok" read back latin1 —
     # the point is that they pass through UNTOUCHED (same=True above).
     assert result["r1b"] == {
-        "n": 1, "same": True,
+        "n": 1,
+        "same": True,
         "text": "привет ok".encode().decode("latin1"),
     }
 
@@ -3093,7 +3105,9 @@ def test_term_js_webgl_recovery_logic(tmp_path: Path) -> None:
     # activate re-attaches fresh and renews the budget; a hidden tab gets
     # no context back from the font fan-out.
     assert out["deactivate"] == {
-        "webglGone": True, "recoveryTimersLeft": 0, "timerFieldCleared": True,
+        "webglGone": True,
+        "recoveryTimersLeft": 0,
+        "timerFieldCleared": True,
     }
     assert out["activate"]["webglBack"] and out["activate"]["freshAddon"]
     assert out["activate"]["attempts"] == 0

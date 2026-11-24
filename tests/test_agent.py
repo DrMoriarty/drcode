@@ -1892,8 +1892,8 @@ async def test_git_commit_docs_commits_only_tracked_files(tmp_path: Path) -> Non
     _git(tmp_path, "remote", "add", "origin", str(origin))
 
     result = await agent_mod._commit_tracked_files(
-    deps, tmp_path, "docs: add guide", allow_push=True
-)
+        deps, tmp_path, "docs: add guide", allow_push=True
+    )
 
     assert "Committed successfully" in result
     assert "Pushed successfully" in result

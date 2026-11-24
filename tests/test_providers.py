@@ -1756,7 +1756,9 @@ def test_model_entry_reasoning_knobs_coercion() -> None:
     entry = ModelEntry(id="m", reasoning_effort="  HIGH ")
     assert entry.reasoning_effort == "high"
     assert (
-        ModelEntry.model_validate({"id": "m", "thinking_budget": " 8192 "}).thinking_budget
+        ModelEntry.model_validate(
+            {"id": "m", "thinking_budget": " 8192 "}
+        ).thinking_budget
         == 8192
     )
     assert ModelEntry(id="m", reasoning_effort="none").reasoning_effort == "off"

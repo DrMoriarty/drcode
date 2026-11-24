@@ -160,9 +160,7 @@ def test_freshness_counts_thinking_bearing_exchanges_only() -> None:
         # A plain text exchange between: carries no thinking, consumes no
         # freshness — the window still spans 5 THINKING-BEARING exchanges.
         messages.append(ModelResponse(parts=[TextPart("still working")]))
-    cleaned, _ = strip_stale_thinking(
-        serialize_messages(messages), keep_recent_turns=5
-    )
+    cleaned, _ = strip_stale_thinking(serialize_messages(messages), keep_recent_turns=5)
     kept = thinking_parts_in(cleaned)
     # The two oldest thinking exchanges are stale even though five plain
     # exchanges follow them.
@@ -254,9 +252,7 @@ def app_small_ctx(
     return DrCodeApp(project_root)
 
 
-def _seed_thinking_task(
-    app: DrCodeApp, thinkings: list[str], *, usage: int = 0
-) -> Any:
+def _seed_thinking_task(app: DrCodeApp, thinkings: list[str], *, usage: int = 0) -> Any:
     # No pending input (empty brief): the mount-time _advance() must leave
     # the task queued, so the gates are exercised by direct calls.
     task = app.manager.create("docs", "", kind=TaskKind.RESEARCH)

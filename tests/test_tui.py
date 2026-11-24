@@ -3783,8 +3783,9 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
     "Project environment…" (the infrastructure dialog) and "Agent
     runtime…" (the runtime-behavior dialog). The Code index preference
     lives ONLY in the runtime dialog — no palette entry anymore."""
-    from textual.widgets import Label, RadioButton, Select
+    from textual.widgets import Label, RadioButton
 
+    from drcode.settings import Verification
     from drcode.tui.command_providers import (
         AgentRuntimeCommandProvider,
         ProjectEnvironmentCommandProvider,
@@ -3886,8 +3887,8 @@ async def test_settings_menu_task_settings_entries(app: DrCodeApp) -> None:
             "#ts-todo-tail",
         ):
             assert dialog.query_one(selector)
-        assert dialog.query_one("#ts-verification", Select).value is (
-            app.settings.verification
+        assert dialog.query_one("#ts-verification", RadioButton).value is (
+            app.settings.verification is Verification.TESTER
         )
         sections = [
             str(cast(Label, label).render())
@@ -3967,7 +3968,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
     until Apply, ESC discards everything, and Apply persists ONCE and
     replays the same side effects as the per-field actions (_advance,
     _update_keepawake)."""
-    from textual.widgets import Button, Select
+    from textual.widgets import Button, RadioButton
 
     from drcode.settings import ProjectSettingsStore, Verification
     from drcode.tui.task_settings_dialog import AgentRuntimeDialog
@@ -4005,7 +4006,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
         assert isinstance(dialog, AgentRuntimeDialog)
 
         # Edit a field through the widget.
-        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        dialog.query_one("#ts-verification", RadioButton).value = False
         await pilot.pause()
         # Nothing persisted while editing; the live settings are untouched.
         assert saves == []
@@ -4025,7 +4026,7 @@ async def test_task_settings_dialog_draft_isolation_and_apply(
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, AgentRuntimeDialog)
-        dialog.query_one("#ts-verification", Select).value = Verification.NONE
+        dialog.query_one("#ts-verification", RadioButton).value = False
         await pilot.pause()
         dialog.query_one("#ts-apply", Button).press()
         await pilot.pause()
@@ -4149,6 +4150,47 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
         dialog = app.screen
         assert isinstance(dialog, AgentRuntimeDialog)
         assert dialog.query_one("#ts-todo-tail", RadioButton).value is True
+
+
+async def test_task_settings_dialog_web_fetch_host_lists_hidden(
+    app: DrCodeApp,
+) -> None:
+    """The allow list shows ONLY in allowlist mode; the `unrestricted`
+    mode hides it too (both host lists are dormant there — the saved
+    values are kept, never rewritten)."""
+    from textual.widgets import Select
+
+    from drcode.settings import WebFetchMode
+    from drcode.tui.task_settings_dialog import AgentRuntimeDialog
+
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+
+        def allow_col(dialog: AgentRuntimeDialog):
+            col = dialog.query_one("#ts-web-fetch-allow").parent
+            assert col is not None  # the input always sits in a ts-col
+            return col
+
+        # Allowlist mode: the allow field is visible.
+        app.settings.web_fetch_mode = WebFetchMode.ALLOWLIST
+        app.action_open_agent_runtime()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, AgentRuntimeDialog)
+        assert "ts-hidden" not in allow_col(dialog).classes
+
+        # Switching the draft to the unrestricted mode hides it at once.
+        dialog.query_one("#ts-web-fetch-mode", Select).value = WebFetchMode.UNRESTRICTED
+        await pilot.pause()
+        assert "ts-hidden" in allow_col(dialog).classes
+
+        # And switching back to allowlist shows it again.
+        dialog.query_one("#ts-web-fetch-mode", Select).value = WebFetchMode.ALLOWLIST
+        await pilot.pause()
+        assert "ts-hidden" not in allow_col(dialog).classes
+        await pilot.press("escape")
+        await pilot.pause()
 
 
 async def test_task_settings_dialog_label_click_toggles(app: DrCodeApp) -> None:

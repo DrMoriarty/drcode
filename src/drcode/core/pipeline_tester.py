@@ -33,6 +33,7 @@ from ..github import issue_commit_hint
 from ..models import Task, TaskStatus, VerificationStatus
 from ..providers import AgentRole
 from ..read_cache import ReadCache
+from ..settings import WebFetchMode
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
@@ -376,6 +377,11 @@ class PipelineTesterLayer(CoreState):
                 # create_bug_report creates a DRAFT task when the setting
                 # is on (the user finishes it in the editor).
                 agent_creates_drafts=self.settings.agent_creates_drafts,
+                # The project's `unrestricted` web-fetch mode lifts the
+                # run_bash network guard for this round (see AgentDeps).
+                network_unrestricted=(
+                    self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+                ),
                 # Pipeline triggers for the tester's send_task_input tool
                 # (extra input into a bug report the tester created) — see
                 # _input_delivery_hooks.

@@ -202,7 +202,12 @@ class AgentDeps:
     `input_hooks` carries the pipeline triggers the send_task_input tool
     fires after a successful delivery (restart the receiver's in-flight
     run, schedule _advance) — see agent_tools.InputDeliveryHooks. None =
-    delivery still works, the hooks degrade to no-ops."""
+    delivery still works, the hooks degrade to no-ops.
+
+    `network_unrestricted` mirrors the project's `unrestricted` web-fetch
+    mode: the run_bash network guard is lifted for this run (any host,
+    redirect flags included). The SSRF guard of the managed `web_fetch`
+    tool is NOT affected — see `drcode.web_fetch`."""
 
     root: Path
     manager: TaskManager
@@ -213,6 +218,7 @@ class AgentDeps:
     agent_creates_drafts: bool = False
     record_usage: Callable[[RunUsage], None] | None = None
     web_fetch_gate: WebFetchGate | None = None
+    network_unrestricted: bool = False
     wait_announcer: agent_model.WaitAnnouncer | None = None
     code_index: bool = False
     input_hooks: InputDeliveryHooks | None = None
@@ -263,7 +269,11 @@ class TesterDeps:
     `input_hooks` carries the pipeline triggers the send_task_input tool
     fires after a successful delivery — see agent_tools.InputDeliveryHooks
     and the AgentDeps note. None = delivery still works, the hooks
-    degrade to no-ops."""
+    degrade to no-ops.
+
+    `network_unrestricted` mirrors the project's `unrestricted` web-fetch
+    mode: the run_bash network guard is lifted for this run — see the
+    AgentDeps note."""
 
     root: Path
     manager: TaskManager
@@ -272,6 +282,7 @@ class TesterDeps:
     review_gate: bool = False
     max_dev_rounds: int = 3
     agent_creates_drafts: bool = False
+    network_unrestricted: bool = False
     input_hooks: InputDeliveryHooks | None = None
     # Per-run read_file dedup (see read_cache.ReadCache); one fresh cache
     # per tester round. None = plain uncached reads.
@@ -287,6 +298,10 @@ class ResolverDeps:
 
     `verdicts` accumulates the agent's set_resolution / set_review
     outcomes; the pipeline reads the LAST one after the run ends.
+
+    `network_unrestricted` mirrors the project's `unrestricted` web-fetch
+    mode: the run_bash network guard is lifted for this run — see the
+    AgentDeps note.
     """
 
     root: Path
@@ -294,6 +309,7 @@ class ResolverDeps:
     task_id: str
     scratch: Path
     verdicts: list[ResolutionVerdict] = field(default_factory=list)
+    network_unrestricted: bool = False
     # Per-run read_file dedup (see read_cache.ReadCache); one fresh cache
     # per resolver round / reviewer pass. None = plain uncached reads.
     read_cache: ReadCache | None = None

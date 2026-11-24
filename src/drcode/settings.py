@@ -198,13 +198,20 @@ class WebFetchMode(str, enum.Enum):
     (every fetch is refused with a hint to configure the hosts) — that is
     on purpose, the safe mode must never silently allow everything.
     ALL: every public host is fetchable except `web_fetch_block_hosts`
-    (which wins over the allow list too) — the SSRF guard always applies,
-    in every mode.
+    (which wins over the allow list too).
+    UNRESTRICTED: every host the SSRF guard admits is fetchable — BOTH host
+    lists are dormant (their saved values are kept but have no effect), and
+    the run_bash network guard is lifted too (shell clients may reach
+    external hosts, redirect flags included). The SSRF guard (private,
+    loopback, link-local and metadata addresses are refused) and the
+    structural checks (http/https, ports 80/443, no credentials) apply in
+    EVERY mode, unrestricted included.
     """
 
     OFF = "off"
     ALLOWLIST = "allowlist"
     ALL = "all"
+    UNRESTRICTED = "unrestricted"
 
     @property
     def label(self) -> str:
@@ -213,6 +220,8 @@ class WebFetchMode(str, enum.Enum):
             return "allowlist"
         if self is WebFetchMode.ALL:
             return "all hosts"
+        if self is WebFetchMode.UNRESTRICTED:
+            return "unrestricted"
         return "off"
 
     @property
@@ -233,6 +242,12 @@ class WebFetchMode(str, enum.Enum):
                 "The research agent may read any public web host (the block "
                 "list and the private-network guard still apply)."
             )
+        if self is WebFetchMode.UNRESTRICTED:
+            return (
+                "No host restrictions: the allow/block lists are hidden and "
+                "unused, and run_bash may reach external hosts — the "
+                "private-network guard still applies."
+            )
         return "The research agent gets no web access tool at all."
 
 
@@ -240,6 +255,7 @@ WEB_FETCH_MODE_OPTIONS: tuple[WebFetchMode, ...] = (
     WebFetchMode.OFF,
     WebFetchMode.ALLOWLIST,
     WebFetchMode.ALL,
+    WebFetchMode.UNRESTRICTED,
 )
 
 
@@ -623,16 +639,18 @@ class ProjectSettings(BaseModel):
     # Settings starts/stops the server immediately (hot switch).
     mcp_enabled: bool = False
     # Web access of the RESEARCH agent (WebFetchMode docstring): off (no
-    # tool), allowlist (only web_fetch_allow_hosts + their subdomains) or
-    # all (every public host). The structured `web_fetch` tool is the only
-    # way an agent reads external pages: it is GET-only, SSRF-guarded
-    # (private/loopback/link-local/metadata addresses are refused), size-
-    # and time-capped, and every result is framed as untrusted content.
-    # run_bash is local-only regardless of this mode — the bash network
-    # guard refuses external requests of curl/wget/http/https/ftp even
-    # here, where the tool itself is unavailable. Only the research role
-    # gets the tool — the coding agent, the tester and the resolver never
-    # do.
+    # tool), allowlist (only web_fetch_allow_hosts + their subdomains),
+    # all (every public host) or unrestricted (no host restrictions — both
+    # lists are dormant, and the run_bash network guard is lifted too).
+    # The structured `web_fetch` tool is the only managed way an agent
+    # reads external pages: it is GET-only, SSRF-guarded
+    # (private/loopback/link-local/metadata addresses are refused in every
+    # mode), size- and time-capped, and every result is framed as
+    # untrusted content. In the modes off/allowlist/all run_bash is
+    # local-only — the bash network guard refuses external requests of
+    # curl/wget/http/https/ftp even where the tool itself is unavailable;
+    # only `unrestricted` lifts that guard. Only the research role gets
+    # the tool — the coding agent, the tester and the resolver never do.
     web_fetch_mode: WebFetchMode = WebFetchMode.OFF
     # Hosts the research agent may fetch in allowlist mode (allowlist mode
     # MEANS an entry here — with an empty list every fetch is refused with
@@ -1182,6 +1200,21 @@ def task_settings_hints(
                 text=(
                     "Web fetch: the host lists are parked — web fetch is off, "
                     "so the research agent has no web tool at all."
+                ),
+                scope="runtime",
+            )
+        )
+    if draft.web_fetch_mode is WebFetchMode.UNRESTRICTED and (
+        draft.web_fetch_allow_hosts or draft.web_fetch_block_hosts
+    ):
+        hints.append(
+            SettingsHint(
+                severity="dormant",
+                text=(
+                    "Web fetch: the host lists are hidden and unused in the "
+                    f"{WebFetchMode.UNRESTRICTED.label} mode — every host "
+                    "the private-address guard admits is fetchable. Switch "
+                    "back to allowlist/all hosts to make them effective."
                 ),
                 scope="runtime",
             )

@@ -19,8 +19,10 @@ anyway; the brief decides what is looked at).
 WEB FETCH is the one conditional extra: the managed `web_fetch` tool
 (`drcode.web_fetch`) is INHERITED from the parent run — present only
 when the parent run itself had it (a RESEARCH parent whose project
-setting `web_fetch_mode` is allowlist/all). The subagent then runs
-under the SAME policy object (allow/block host lists, the block list
+setting `web_fetch_mode` is allowlist/all/unrestricted). The subagent
+then runs
+under the SAME policy object (allow/block host lists — both dormant in
+the `unrestricted` mode, the block list
 always wins, SSRF guard, per-hop redirect revalidation, untrusted-content
 frame) with its OWN smaller budget (`web_fetch.SUBAGENT_FETCHES_PER_RUN`
 on a per-delegation `WebFetchGate`), and every fetch logs a service

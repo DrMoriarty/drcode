@@ -748,7 +748,7 @@ class SubagentsResearcherOptionsProvider(CommandListProvider):
 
 class WebFetchModeOptionsProvider(CommandListProvider):
     """Options of the "Web fetch (research)" setting (off / allowlist /
-    all hosts).
+    all hosts / unrestricted).
 
     Same selection-palette UX as RetentionOptionsProvider: pick an option
     to apply it immediately, Escape keeps the current one. The active

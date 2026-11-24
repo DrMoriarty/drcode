@@ -126,6 +126,61 @@ def test_policy_block_list_wins_over_all_mode() -> None:
     assert policy.host_refusal("example.com") is None
 
 
+def test_policy_unrestricted_ignores_both_host_lists() -> None:
+    """The `unrestricted` mode: BOTH host lists are dormant — the saved
+    values have no effect and every host passes the host-policy check
+    (the SSRF guard still refuses the non-public ones, see the fetch
+    tests below)."""
+    policy = _policy(
+        WebFetchMode.UNRESTRICTED,
+        allow=("example.com",),
+        block=("blocked.example.com",),
+    )
+    assert policy.enabled is True
+    assert policy.host_refusal("example.com") is None
+    # A host on the (dormant) block list passes.
+    assert policy.host_refusal("blocked.example.com") is None
+    assert policy.host_refusal("a.blocked.example.com") is None
+    # So does a host outside the (dormant) allow list.
+    assert policy.host_refusal("other.org") is None
+
+
+def test_unrestricted_mode_ssrf_still_enforced() -> None:
+    """Mode 4 lifts ONLY the host lists — loopback, RFC1918 and the cloud
+    metadata service are refused exactly as in every other mode, while a
+    public host (even one on the dormant block list) is fetched."""
+    policy = _policy(
+        WebFetchMode.UNRESTRICTED,
+        allow=("example.com",),
+        block=("example.com",),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _page("<html><body><p>ok</p></body></html>")
+
+    page = fetch(
+        "https://example.com/",
+        policy,
+        transport=_client(handler),
+        resolver=_resolver(PUBLIC),
+    )
+    assert "ok" in page.text
+    for url in (
+        "http://127.0.0.1:8000/",  # loopback literal
+        "http://169.254.169.254/latest/meta-data/",  # cloud metadata
+        "http://192.168.0.10/",  # RFC1918 literal
+    ):
+        with pytest.raises(WebFetchError):
+            fetch(url, policy, resolver=_resolver(PUBLIC))
+    # A NAME resolving into the private range is refused too.
+    with pytest.raises(WebFetchError):
+        fetch(
+            "http://internal.example.com/",
+            policy,
+            resolver=_resolver("10.1.2.3"),
+        )
+
+
 def test_policy_allowlist_matches_host_and_subdomains() -> None:
     policy = _policy(WebFetchMode.ALLOWLIST, allow=("example.com",))
     assert policy.host_refusal("example.com") is None
@@ -178,6 +233,27 @@ def test_web_fetch_policy_from_settings() -> None:
     assert policy.block_hosts == ("bad.example.com",)
 
 
+def test_web_fetch_policy_from_settings_unrestricted() -> None:
+    """The new mode reads from the settings WITHOUT a migration; the saved
+    host lists ride along but are dormant."""
+    settings = ProjectSettings(
+        web_fetch_mode=WebFetchMode.UNRESTRICTED,
+        web_fetch_allow_hosts=["example.com"],
+        web_fetch_block_hosts=["bad.example.com"],
+    )
+    policy = web_fetch_policy(settings)
+    assert policy.mode is WebFetchMode.UNRESTRICTED
+    assert policy.enabled is True
+    assert policy.host_refusal("bad.example.com") is None
+
+
+def test_store_roundtrip_unrestricted_mode(project_root: Path) -> None:
+    """Existing files keep loading; the new value round-trips as-is."""
+    store = ProjectSettingsStore(project_root)
+    store.save(ProjectSettings(web_fetch_mode=WebFetchMode.UNRESTRICTED))
+    assert store.load().web_fetch_mode is WebFetchMode.UNRESTRICTED
+
+
 # -- role scoping ---------------------------------------------------------------
 
 
@@ -188,6 +264,14 @@ def test_policy_for_is_research_only() -> None:
     assert web_fetch_policy_for(settings, AgentRole.RESEARCH) is not None
     for role in (AgentRole.CODING, AgentRole.TESTER, AgentRole.RESOLVER):
         assert web_fetch_policy_for(settings, role) is None
+    # The unrestricted mode keeps the same role gating: the research agent
+    # gets the tool (with the host policy switched off), nobody else does.
+    unrestricted = ProjectSettings(web_fetch_mode=WebFetchMode.UNRESTRICTED)
+    research_policy = web_fetch_policy_for(unrestricted, AgentRole.RESEARCH)
+    assert research_policy is not None
+    assert research_policy.host_refusal("example.com") is None
+    for role in (AgentRole.CODING, AgentRole.TESTER, AgentRole.RESOLVER):
+        assert web_fetch_policy_for(unrestricted, role) is None
 
 
 def test_policy_for_is_none_when_off() -> None:
@@ -1067,13 +1151,16 @@ def test_mode_labels_and_enabled() -> None:
     assert WebFetchMode.OFF.label == "off"
     assert WebFetchMode.ALLOWLIST.label == "allowlist"
     assert WebFetchMode.ALL.label == "all hosts"
+    assert WebFetchMode.UNRESTRICTED.label == "unrestricted"
     assert WebFetchMode.OFF.enabled is False
     assert WebFetchMode.ALLOWLIST.enabled is True
     assert WebFetchMode.ALL.enabled is True
+    assert WebFetchMode.UNRESTRICTED.enabled is True
     assert WEB_FETCH_MODE_OPTIONS == (
         WebFetchMode.OFF,
         WebFetchMode.ALLOWLIST,
         WebFetchMode.ALL,
+        WebFetchMode.UNRESTRICTED,
     )
 
 
@@ -1168,6 +1255,27 @@ def test_hint_warns_about_parked_lists_when_off() -> None:
         ProjectSettings(web_fetch_allow_hosts=["example.com"]), git_available=True
     )
     assert any("parked" in h.text for h in hints)
+
+
+def test_hint_warns_about_dormant_lists_in_unrestricted_mode() -> None:
+    """The `unrestricted` mode hides both host lists: any saved values are
+    dormant and get a hint saying so; clean values get none."""
+    hints = task_settings_hints(
+        ProjectSettings(
+            web_fetch_mode=WebFetchMode.UNRESTRICTED,
+            web_fetch_allow_hosts=["example.com"],
+            web_fetch_block_hosts=["bad.example.com"],
+        ),
+        git_available=True,
+    )
+    dormant = [h for h in hints if "hidden and unused" in h.text]
+    assert dormant and all(h.severity == "dormant" for h in dormant)
+    # No lists parked → no hint.
+    clean = task_settings_hints(
+        ProjectSettings(web_fetch_mode=WebFetchMode.UNRESTRICTED),
+        git_available=True,
+    )
+    assert not [h for h in clean if "web fetch" in h.text.lower()]
 
 
 def test_no_hint_for_a_healthy_web_fetch_setup() -> None:

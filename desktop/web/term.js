@@ -996,6 +996,36 @@
       applyFontSize(DEFAULT_FONT_SIZE);
       return false;
     }
+    /* Ctrl+<C0 key>: xterm.js does not speak the kitty keyboard protocol
+     * and encodes every ctrl combination whose legacy byte is a C0 control
+     * as that raw byte, so Textual decodes the byte as its NAMED key
+     * instead of ctrl+<key> and the matching binding never fires. The
+     * colliding set is exactly what terminals map into C0 via
+     * codepoint & 0x1f: the letters a–z (Ctrl+M → \r "enter",
+     * Ctrl+H → \x08 "backspace", Ctrl+I → \t "tab", Ctrl+J → \n) plus
+     * Ctrl+Space / Ctrl+@ → \x00 and the bracket row [ \ ] ^ _
+     * (Ctrl+[ → ESC … Ctrl+_ → \x1f). Same gap as modified Enter above,
+     * same fix, generalized: emit the kitty CSI u form
+     * \x1b[<codepoint>;5u (<codepoint> = the key's own codepoint,
+     * 5 = 1 + ctrl modifier), which Textual's input parser decodes back
+     * into ctrl+<key>. Strictly a shim on the JS side — native terminals
+     * speaking the kitty protocol are unaffected, and the TUI/xterm stay
+     * untouched. Placed AFTER the font shortcuts so their gate stays
+     * authoritative (Ctrl+_ / Ctrl+0 / Ctrl+, therefore stay font
+     * shortcuts); like the Enter branch, it only fires while the tab's
+     * session is live (the welcome screen has no PTY to talk to). */
+    if (ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey &&
+        typeof ev.key === "string" && ev.key.length === 1) {
+      var lower = ev.key.toLowerCase();
+      var cp = lower.charCodeAt(0);
+      var isC0Key = (cp >= 97 && cp <= 122) || " @[]^_\\".indexOf(lower) !== -1;
+      if (isC0Key) {
+        if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN || !tab.started) return true;
+        ev.preventDefault();
+        tab.ws.send(new TextEncoder().encode("\x1b[" + cp + ";5u"));
+        return false;
+      }
+    }
     return true;
   }
 

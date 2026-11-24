@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 import pytest
 from textual.app import App
-from textual.widgets import DataTable, Input, OptionList
+from textual.widgets import Button, DataTable, Input, OptionList, Select
 
 from drcode.providers import (
+    REASONING_EFFORT_OFF,
     AgentRole,
     ModelEntry,
     Provider,
@@ -29,6 +31,27 @@ from drcode.tui.model_setup_app import (
     ModelCatalogApp,
     ModelCatalogScreen,
 )
+from tests.network_mocks import wait_until
+
+
+async def _click_button(pilot: Any, screen: ModelCatalogScreen, selector: str) -> None:
+    """Click a button, waiting out its press animation first.
+
+    The "-active" press effect is cleared by a WALL-CLOCK set_timer
+    (0.2 s) that `pilot.pause()` does not await — a pilot.click landing
+    inside that window is silently DROPPED (`Button._on_click` ignores
+    clicks while "-active" is set), which makes rapid re-clicks of the
+    same button racy under parallel pytest workers. Wait until the
+    effect has cleared, then click and settle.
+    """
+    button = screen.query_one(selector, Button)
+    await wait_until(
+        lambda: "-active" not in button.classes,
+        pilot=pilot,
+        what=f"{selector} press animation cleared",
+    )
+    await pilot.click(selector)
+    await pilot.pause()
 
 
 class _Host(App):
@@ -389,6 +412,74 @@ async def test_row_selection_fills_editor_and_update_remove(tmp_path: Path) -> N
         assert screen.query_one("#mc-pct", Input).value == ""
 
 
+async def test_reasoning_effort_combobox(tmp_path: Path) -> None:
+    """The reasoning-effort editor field is a combobox of the values the
+    catalog validator accepts (auto/minimal/low/medium/high/off): row
+    selection fills it, Update/Add model store the picked level, the
+    "auto" slot clears the stored value."""
+    path = tmp_path / "models.json"
+    store = UserModelsStore(path)
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(name="p", base_url="http://p/v1", models=[ModelEntry(id="m")])
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        effort = screen.query_one("#mc-effort", Select)
+        # The combobox offers exactly the canonical set, "auto" first
+        # (the "auto" label carries the "" = not-set value).
+        assert list(effort._options) == [
+            ("auto", ""),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("off", "off"),
+        ]
+        assert effort.value == ""  # the "auto" slot = not set
+        # Row selection fills the combobox from the entry (not set → auto).
+        screen._select_model("m")
+        assert effort.value == ""
+        # Picking a level and pressing Update stores it.
+        effort.value = "high"
+        await pilot.pause()
+        await _click_button(pilot, screen, "#mc-model-update")
+        assert screen.catalog.providers[0].models[0].reasoning_effort == "high"
+        # "off" (never send the field) is a valid option too.
+        effort.value = REASONING_EFFORT_OFF
+        await pilot.pause()
+        await _click_button(pilot, screen, "#mc-model-update")
+        assert screen.catalog.providers[0].models[0].reasoning_effort == "off"
+        # Re-selecting the row now shows the stored value.
+        screen._selected_model = None
+        screen._select_model("m")
+        assert effort.value == "off"
+        # The "auto" slot clears the stored value.
+        effort.value = ""
+        await pilot.pause()
+        await _click_button(pilot, screen, "#mc-model-update")
+        assert screen.catalog.providers[0].models[0].reasoning_effort is None
+        # Add model picks the level up from the same combobox.
+        screen.query_one("#mc-model-id", Input).value = "m2"
+        screen.query_one("#mc-ctx", Input).value = "8192"
+        effort.value = "low"
+        await pilot.pause()
+        await _click_button(pilot, screen, "#mc-model-add")
+        added = screen.catalog.providers[0].models[-1]
+        assert added.id == "m2"
+        assert added.reasoning_effort == "low"
+        # And the whole thing persists on Save.
+        await _click_button(pilot, screen, "#mc-save")
+        entries = json.loads(path.read_text())["providers"][0]["models"]
+        assert entries[0]["reasoning_effort"] is None
+        assert entries[1]["reasoning_effort"] == "low"
+
+
 # -- favorites ----------------------------------------------------------------------
 
 
@@ -542,7 +633,9 @@ async def test_assign_agents_button_present(tmp_path: Path) -> None:
         screen = pilot.app.screen
         assert isinstance(screen, ModelCatalogScreen)
         assert screen.query("#mc-assign-agents")  # entry point exists
-        assert not screen.query("Select")  # no role editors on this screen
+        # No role editors on this screen — the only Select is the model
+        # editor's reasoning-effort combobox.
+        assert [s.id for s in screen.query("Select")] == ["mc-effort"]
 
 
 async def test_slash_rejected_in_provider_name_and_allowed_in_model_id(

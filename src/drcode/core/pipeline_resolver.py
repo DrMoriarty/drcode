@@ -91,6 +91,7 @@ from ..merge_resolver import (
 from ..models import Task, TaskStatus
 from ..providers import AgentRole
 from ..read_cache import ReadCache
+from ..settings import WebFetchMode
 from ..tools import scratch_dir
 from .pipeline_stream import NodeStreamView
 from .state import CoreState
@@ -643,6 +644,11 @@ class PipelineResolverLayer(CoreState):
                 manager=self.manager,
                 task_id=task_id,
                 scratch=scratch_dir(task_id),
+                # The project's `unrestricted` web-fetch mode lifts the
+                # run_bash network guard for this round (see AgentDeps).
+                network_unrestricted=(
+                    self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+                ),
                 # Per-round read_file dedup (see read_cache.ReadCache).
                 read_cache=ReadCache(),
             )
@@ -1025,6 +1031,11 @@ class PipelineResolverLayer(CoreState):
             manager=self.manager,
             task_id=task.id,
             scratch=scratch_dir(task.id),
+            # The project's `unrestricted` web-fetch mode lifts the
+            # run_bash network guard for this pass (see AgentDeps).
+            network_unrestricted=(
+                self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+            ),
             # Per-pass read_file dedup (see read_cache.ReadCache).
             read_cache=ReadCache(),
         )

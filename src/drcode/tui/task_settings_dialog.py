@@ -1075,8 +1075,9 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                 widget.set_class(is_changed, "changed")
         # Web fetch host lists are HIDDEN entirely (their values are kept,
         # never rewritten — the user's entries come back when the mode
-        # turns on): the allow list shows ONLY in allowlist mode, the
-        # block list is hidden in every mode.
+        # turns on): the allow list shows ONLY in allowlist mode (in the
+        # `unrestricted` mode BOTH lists are dormant — the saved values
+        # have no effect), the block list is hidden in every mode.
         allow_visible = d.web_fetch_mode is WebFetchMode.ALLOWLIST
         allow_col = self.query_one("#ts-web-fetch-allow").parent
         assert allow_col is not None  # the input always sits in a ts-col

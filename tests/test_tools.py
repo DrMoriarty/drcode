@@ -1461,6 +1461,42 @@ def test_network_guard_via_run_bash(project_root: Path, fake_dns) -> None:
     assert "exit=0" in asyncio.run(run_bash(project_root, "echo hello"))
 
 
+def test_network_guard_unrestricted_allows_any_host(
+    project_root: Path, fake_dns
+) -> None:
+    """The project's `unrestricted` web-fetch mode lifts ONLY the network
+    guard: any external host, redirect flags included, and no conservative
+    refusal for an unparsable quoting of a network command."""
+    fake_dns["example.com"] = ["93.184.216.34"]
+    for command in (
+        "curl https://example.com/page",
+        "wget http://example.com/file.tgz",
+        "ftp example.com",
+        "curl --url https://example.com/",
+        "curl -sL --location --max-redirs 5 example.com",
+        "wget --max-redirect=2 http://example.com/",
+        "curl -L localhost:8000/x",  # redirect flags: no target check at all
+        "VAR=1 nohup curl https://example.com",
+        "echo hi && curl https://example.com",
+        "echo hi | curl -d @- https://example.com",
+        "curl 'https://example.com",  # unparsable quoting: no network refusal
+    ):
+        check_command(project_root, command, None, network_unrestricted=True)
+
+
+def test_network_guard_unrestricted_keeps_other_refusals(project_root: Path) -> None:
+    """Lifting the network guard does not weaken the rm/mv/cp, filesystem
+    scan and git stash checks."""
+    for command in (
+        "rm -rf /etc",
+        "find /Users -name '*.py'",
+        "du -sh /Library",
+        "git stash pop",
+    ):
+        with pytest.raises(PathViolation):
+            check_command(project_root, command, None, network_unrestricted=True)
+
+
 # -- run_bash (async) ----------------------------------------------------------------
 
 

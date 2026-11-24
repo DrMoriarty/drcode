@@ -996,6 +996,23 @@
       applyFontSize(DEFAULT_FONT_SIZE);
       return false;
     }
+    /* Ctrl+M: xterm.js encodes it as the byte \r (carriage return — the
+     * historical terminal encoding), which Textual decodes as "enter", so
+     * the TUI's ctrl+m binding (the merge screen) could never fire. Same
+     * gap as modified Enter above, same fix: emit the kitty CSI u form
+     * \x1b[109;5u (109 = codepoint of "m", 5 = 1 + ctrl modifier), which
+     * Textual's input parser decodes back into ctrl+m. Strictly a shim on
+     * the JS side — native terminals speaking the kitty protocol are
+     * unaffected, and the TUI/xterm stay untouched. Placed AFTER the font
+     * shortcuts so their gate stays authoritative; like the Enter branch,
+     * it only fires while the tab's session is live (the welcome screen
+     * has no PTY to talk to). */
+    if (ev.key === "m" && ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey) {
+      if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN || !tab.started) return true;
+      ev.preventDefault();
+      tab.ws.send(new TextEncoder().encode("\x1b[109;5u"));
+      return false;
+    }
     return true;
   }
 

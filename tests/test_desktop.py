@@ -1411,6 +1411,39 @@ def test_term_js_modified_enter_sends_csi_u() -> None:
     assert guard < enter_at
 
 
+def test_term_js_ctrl_m_sends_csi_u() -> None:
+    """xterm.js encodes Ctrl+M as the byte \\r, which Textual decodes as
+    "enter" — so the TUI's ctrl+m binding (the merge screen) could never
+    fire from the desktop shell. The key handler must intercept Ctrl+M and
+    forward it as the kitty CSI u sequence \\x1b[109;5u (Textual's parser
+    decodes it back into ctrl+m), placed AFTER the font-size shortcuts so
+    their gate stays authoritative and gated on a live session like the
+    modified-Enter branch."""
+    js = (DESKTOP_DIR / "web" / "term.js").read_text(encoding="utf-8")
+    handler = js[js.index("function terminalKeyHandler") :]
+
+    # The interception matches exactly Ctrl+M (no meta/alt/shift mix-ins —
+    # those stay with the tab-switch shortcuts and the metaKey gate).
+    m_at = handler.index('ev.key === "m"')
+    line = handler[handler.rfind("\n", 0, m_at) + 1 : handler.index("\n", m_at)]
+    assert "ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey" in line
+
+    # AFTER the font-shortcut branches (Ctrl+, / Ctrl+= / Ctrl+- / Ctrl+0),
+    # so those keep priority and the ctrl-only gate is passed first.
+    gate = handler.index("if (!ev.ctrlKey")
+    font_zero = handler.index('ev.key === "0"')
+    assert gate < font_zero < m_at
+
+    # Only while a live session exists (welcome screen has no PTY), and
+    # the event is swallowed (preventDefault + return false).
+    tail = handler[m_at : handler.index("return false;", m_at)]
+    assert "ws.readyState !== WebSocket.OPEN" in tail
+    assert "ev.preventDefault();" in tail
+    # The payload is the kitty CSI u encoding Textual understands:
+    # 109 = codepoint of "m", 5 = 1 + ctrl modifier.
+    assert '"\\x1b[109;5u"' in tail
+
+
 def test_term_js_font_settings_wiring() -> None:
     """Static check of the font-settings flow: boot-time load through the
     bridge, constructor pickup, family application, and Ctrl+, interception."""

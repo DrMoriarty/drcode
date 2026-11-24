@@ -1,1 +1,5 @@
-{}
+{
+  "models": {
+    "research": "zveno.ai/deepseek/deepseek-v4.1-flash-1017"
+  }
+}

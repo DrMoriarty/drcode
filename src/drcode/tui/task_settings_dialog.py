@@ -76,7 +76,6 @@ from ..settings import (
     RETENTION_OPTIONS,
     STALL_NUDGE_OPTIONS,
     SUBAGENTS_OPTIONS,
-    VERIFICATION_OPTIONS,
     WEB_FETCH_MODE_OPTIONS,
     WORKTREE_REMOVAL_OPTIONS,
     WORKTREE_SNAPSHOT_OPTIONS,
@@ -956,23 +955,21 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     toggle_id="ts-background-compaction",
                 )
                 yield Label("Testing", classes="ts-section")
-                with Horizontal(classes="ts-row"):
-                    with Vertical(classes="ts-col"):
-                        yield Label("Verification", classes="ts-label")
-                        yield Select(
-                            [(o.label, o) for o in VERIFICATION_OPTIONS],
-                            value=d.verification,
-                            allow_blank=False,
-                            id="ts-verification",
-                        )
-                    with Vertical(classes="ts-col"):
-                        yield Label("Max development rounds", classes="ts-label")
-                        yield Select(
-                            [(dev_rounds_label(n), n) for n in DEV_ROUNDS_OPTIONS],
-                            value=d.max_dev_rounds,
-                            allow_blank=False,
-                            id="ts-dev-rounds",
-                        )
+                yield ToggleRow(
+                    "Verification — the tester round: after development "
+                    "a tester verifies the task before it completes "
+                    "(off: tasks complete right after development; the "
+                    "tester's Git policy stays parked)",
+                    value=d.verification is Verification.TESTER,
+                    toggle_id="ts-verification",
+                )
+                yield Label("Max development rounds", classes="ts-label")
+                yield Select(
+                    [(dev_rounds_label(n), n) for n in DEV_ROUNDS_OPTIONS],
+                    value=d.max_dev_rounds,
+                    allow_blank=False,
+                    id="ts-dev-rounds",
+                )
                 with Horizontal(classes="ts-row"):
                     with Vertical(classes="ts-col"):
                         yield Label("Nudge stalled agent after", classes="ts-label")
@@ -1022,7 +1019,7 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         self._set_select("#ts-subagents-researcher", d.subagents_researcher)
         self._set_select("#ts-web-fetch-mode", d.web_fetch_mode)
         self._set_toggle("#ts-code-index-mode", d.code_index_mode is CodeIndexMode.ON)
-        self._set_select("#ts-verification", d.verification)
+        self._set_toggle("#ts-verification", d.verification is Verification.TESTER)
         self._set_select("#ts-dev-rounds", d.max_dev_rounds)
         self._set_select("#ts-nudge", d.stall_nudge)
         self._set_select("#ts-esc-abort", d.esc_abort)
@@ -1134,12 +1131,11 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
             self._draft.web_fetch_block_hosts = hosts
             self._refresh()
 
-    @on(Select.Changed, "#ts-verification")
-    def _verification_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, Verification) and (
-            event.value is not self._draft.verification
-        ):
-            self._draft.verification = event.value
+    @on(RadioButton.Changed, "#ts-verification")
+    def _verification_changed(self, event: RadioButton.Changed) -> None:
+        value = Verification.TESTER if event.value else Verification.NONE
+        if value is not self._draft.verification:
+            self._draft.verification = value
             self._refresh()
 
     @on(Select.Changed, "#ts-dev-rounds")

@@ -82,6 +82,15 @@ on inactive tabs, several terminals inside one tab.
 - `⌘/Ctrl+⇧+R` — restart the active tab's session.
 - `⌘/Ctrl+,` — terminal font dialog; `⌘/Ctrl+=` / `⌘/Ctrl+-` /
   `⌘/Ctrl+0` — font size up / down / reset.
+- `Ctrl+<C0 key>` — xterm.js does not speak the kitty keyboard protocol
+  and encodes ctrl combinations colliding with C0 bytes as those raw
+  bytes (Ctrl+M → `\r`, Ctrl+H → `\x08`, Ctrl+I → `\t`, Ctrl+J → `\n`,
+  Ctrl+[ → ESC, Ctrl+Space → `\x00`), so Textual sees the named key, not
+  `ctrl+<letter>`, and the binding never fires. `terminalKeyHandler`
+  intercepts the whole colliding set (letters a–z plus Space/@/`[`/`\`/`]`/
+  `^`/`_`) and forwards it as the kitty CSI u form
+  `\x1b[<codepoint>;5u` for Textual to decode back. Native terminals
+  already speaking the kitty protocol are unaffected.
 
 ## Building
 

@@ -22,8 +22,8 @@ from ..agent import (
     backdate_user_prompt,
     build_title_prompt,
     clean_generated_title,
-    ends_with_empty_response,
     ends_with_open_request,
+    ends_with_truncated_response,
     is_pending_retry,
     last_response_usage,
     resumable_history,
@@ -968,7 +968,9 @@ class PipelineAgentRunLayer(CoreState):
                         self._write_history_line("user", entry.text)
             return content, consumed, workflow_instructions
         if task.unfinished:
-            if not ends_with_open_request(task.messages):
+            if not ends_with_open_request(
+                task.messages
+            ) and not ends_with_truncated_response(task.messages):
                 # The interrupted attempt actually finished its
                 # exchange — nothing to resume. But the pause that set
                 # the flag may have announced a compaction (the gate
@@ -982,6 +984,16 @@ class PipelineAgentRunLayer(CoreState):
                 task.unfinished = False
                 self.manager.storage.save(task)
                 return None
+            # A tail response that still carries unanswered tool calls (or
+            # no content at all — `ends_with_truncated_response`) is NOT a
+            # finished exchange: the flag stays ON and the continuation
+            # turn below resumes the attempt (`resumable_history` trims
+            # the invalid tail and the model re-generates). Clearing the
+            # flag on a mere response-tail made the run "unresumable" and
+            # the epilogue read the tool-call tail as a clean finish
+            # (incident #46c6314d: a stale network-retry timer superseded
+            # the live run mid-tool, the fresh run saw a response-tail,
+            # dropped the flag and auto-completed the task).
             # The unfinished flag stays ON through the continuation turn:
             # clearing it here (before the model request even went out)
             # lost the resume marker when the run was cancelled in that
@@ -1474,19 +1486,24 @@ class PipelineAgentRunLayer(CoreState):
             # The request is recorded in the transcript: the retry
             # resumes the attempt without new text.
             task.unfinished = True
-        self._agent_net_retry_at[task_id] = time.monotonic() + delay
+        retry_at = time.monotonic() + delay
+        self._agent_net_retry_at[task_id] = retry_at
         self.manager.storage.save(task)
         if outage:
             # Outage mode: the re-run is gated behind a cheap TCP probe of
             # the gateway host — while the host is unreachable the tick
             # only re-probes (see _outage_retry_tick) instead of firing
             # full model requests at a dead gateway.
-            self._schedule_pipeline_timer(
+            self._schedule_net_retry(
+                task_id,
+                retry_at,
                 delay,
                 partial(self._outage_retry_tick, task_id, role),
             )
         else:
-            self._schedule_pipeline_timer(delay, partial(self.run_agent, task_id))
+            self._schedule_net_retry(
+                task_id, retry_at, delay, partial(self.run_agent, task_id)
+            )
 
     def _agent_turn_failed(
         self,
@@ -1583,26 +1600,33 @@ class PipelineAgentRunLayer(CoreState):
             task.status is TaskStatus.ACTIVE
             and not task.pending_input
             and not task.unfinished
-            and ends_with_empty_response(task.messages)
+            and ends_with_truncated_response(task.messages)
         ):
-            # A "clean" run end whose final answer is EMPTY (no text, no
-            # tool call — the same invalid tail `resumable_history` trims):
-            # the model said nothing, so this is not a completed answer.
+            # A "clean" run end whose final exchange is actually OPEN: the
+            # tail response either carries no usable content at all (no
+            # text, no tool call) or carries a tool call whose result
+            # never arrived (a tool result is a separate request message
+            # — the same invalid tail `resumable_history` trims). The
+            # model did not finish, so this is not a completed answer.
             # Auto-completing here would mark the task done with zero
-            # content and tear down its worktree/branch (incident #0dc7fc65:
-            # a watchdog nudge resumed an interrupted attempt, the gateway
-            # answered with an empty response, the run loop saw a closed
-            # exchange and this epilogue completed the research task — the
-            # partially-done work was deleted with the worktree). Treat it
-            # like an interrupted attempt instead: keep the task ACTIVE
-            # paused on the unfinished flag — a new message or a restart
-            # (auto-resume) picks the attempt back up.
+            # content and tear down its worktree/branch (incident
+            # #0dc7fc65: a watchdog nudge resumed an interrupted attempt,
+            # the gateway answered with an empty response, the run loop
+            # saw a closed exchange and this epilogue completed the
+            # research task — the partially-done work was deleted with
+            # the worktree; incident #46c6314d: the tail response still
+            # held an unanswered tool call, the narrower empty-response
+            # guard passed it, and the task went to TESTING mid-work).
+            # Treat it like an interrupted attempt instead: keep the task
+            # ACTIVE paused on the unfinished flag — a new message or a
+            # restart (auto-resume) picks the attempt back up.
             task.unfinished = True
             self.manager.storage.save(task)
             self._show_event(
                 task,
-                "The model returned an empty response (no text, no tool "
-                "call) — the attempt is kept unfinished instead of being "
+                "The run ended on an unfinished exchange (a response with "
+                "tool calls no result arrived for, or an empty response) "
+                "— the attempt is kept unfinished instead of being "
                 "completed; send a message to resume it.",
             )
             self.refresh_sidebar()

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
 from functools import partial
+from typing import Any
 
 from ..agent import probe_model
 from ..models import Task, TaskStatus
@@ -20,6 +22,33 @@ from .usage import NETWORK_OUTAGE_PROBE_INTERVAL, NETWORK_RETRIES, tcp_reachable
 
 
 class PipelineNetLayer(CoreState):
+    def _schedule_net_retry(
+        self,
+        task_id: str,
+        retry_at: float,
+        delay: float,
+        callback: Callable[[], Any],
+    ) -> None:
+        """Schedule an agent network-retry timer with a staleness guard:
+        the callback fires only while `_agent_net_retry_at` still holds
+        the exact deadline this timer was armed with.
+
+        A nudge restart (Ctrl+R / stall watchdog) pops that stamp along
+        with the rest of the network-retry state — without the guard the
+        orphaned timer would fire minutes later, re-enter `run_agent`, and
+        the exclusive `agent-<task_id>` worker group would kill the FRESH
+        run mid-tool (incident #46c6314d: Ctrl+R during the "retry 5/5 in
+        60 s" wait, the stale timer superseded the restarted run exactly
+        60 s later, mid-tool-execution). A newer retry re-arms the stamp,
+        so only the newest timer per task can ever fire."""
+
+        def fire() -> None:
+            if self._agent_net_retry_at.get(task_id) != retry_at:
+                return
+            callback()
+
+        self._schedule_pipeline_timer(delay, fire)
+
     async def _check_model(self) -> None:
         # The NoMatches teardown guard lives in the host layer
         # (tui.header_view): the probe round-trip can outlive the app (ESC
@@ -139,12 +168,18 @@ class PipelineNetLayer(CoreState):
             retry_at = time.monotonic() + NETWORK_OUTAGE_PROBE_INTERVAL
             if tester:
                 self._tester_retry_at[task_id] = retry_at
+                self._schedule_pipeline_timer(
+                    NETWORK_OUTAGE_PROBE_INTERVAL,
+                    partial(self._outage_retry_tick, task_id, role),
+                )
             else:
                 self._agent_net_retry_at[task_id] = retry_at
-            self._schedule_pipeline_timer(
-                NETWORK_OUTAGE_PROBE_INTERVAL,
-                partial(self._outage_retry_tick, task_id, role),
-            )
+                self._schedule_net_retry(
+                    task_id,
+                    retry_at,
+                    NETWORK_OUTAGE_PROBE_INTERVAL,
+                    partial(self._outage_retry_tick, task_id, role),
+                )
 
     # -- live output rate (header tok/s) --------------------------------------
 

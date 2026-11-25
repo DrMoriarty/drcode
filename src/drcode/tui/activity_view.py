@@ -451,6 +451,18 @@ class ActivityLayer(DrCodeState):
             task.subagent_slots_used = 0
             task.subagent_slot_refunds = 0
             task.web_fetch_used = 0
+            # A nudge is a fresh start of the run: drop the network-retry
+            # state of the previous one AND defuse an already-armed retry
+            # timer — its callback is guarded by the `_agent_net_retry_at`
+            # stamp (see _schedule_net_retry) and must not fire minutes
+            # later only to supersede the restarted run mid-tool (incident
+            # #46c6314d: Ctrl+R during the "retry 5/5 in 60 s" wait, the
+            # stale timer killed the fresh run exactly 60 s later). The
+            # retry counter resets too: an explicit restart starts a fresh
+            # network-retry budget.
+            self._agent_net_retry_at.pop(task.id, None)
+            self._agent_net_count.pop(task.id, None)
+            self._agent_retry_resumes.discard(task.id)
             # Persist (the guard above saved only its own flag change —
             # before this reset).
             task.touch()

@@ -126,6 +126,38 @@ def ends_with_empty_response(data: list[dict[str, Any]]) -> bool:
     return True
 
 
+def ends_with_truncated_response(data: list[dict[str, Any]]) -> bool:
+    """True when the transcript ends with a model response whose exchange
+    is NOT closed: the response carries a tool call whose result never
+    arrived (a tool result is a separate request message), or it has no
+    usable content at all.
+
+    The serialized-dict mirror of the tail rule `resumable_history` cuts
+    by — a response is a safe stopping point only when it holds non-empty
+    text and no tool call — so this is True exactly when
+    `resumable_history(data)` would trim the tail. Deliberately a
+    SUPERSET of `ends_with_empty_response`: a tail response with an
+    unanswered tool call is just as unfinished as an empty one, and a run
+    ending on it must not be treated as a completed answer (incident
+    #46c6314d: a stale network-retry timer superseded the live run mid-
+    tool, the tail still held the tool-call response, and the epilogue's
+    empty-response-only guard let the task auto-complete)."""
+    if not data:
+        return False
+    last = data[-1]
+    if last.get("kind") != "response" and last.get("role") != "response":
+        return False
+    has_text = False
+    for part in last.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("part_kind") == "tool-call":
+            return True
+        if part.get("part_kind") == "text" and part.get("content"):
+            has_text = True
+    return not has_text
+
+
 def _usage_context_tokens(input_tokens: int, output_tokens: int) -> int:
     """Tokens held by the model's context slot: prompt + generated output,
     matching llama.cpp's slot `n_tokens`. pydantic-ai normalizes usage from

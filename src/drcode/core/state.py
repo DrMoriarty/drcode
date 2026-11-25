@@ -415,6 +415,14 @@ class CoreState:
 
     def _outage_retry_tick(self, task_id: str, role: AgentRole) -> None: ...
 
+    def _schedule_net_retry(
+        self,
+        task_id: str,
+        retry_at: float,
+        delay: float,
+        callback: Callable[[], Any],
+    ) -> None: ...
+
     def _next_testing(self) -> Task | None: ...
 
     def _advance(self) -> None: ...

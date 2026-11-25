@@ -33,6 +33,7 @@ from drcode.agent import (
     compacted_messages,
     ends_with_empty_response,
     ends_with_open_request,
+    ends_with_truncated_response,
     extract_display,
     extract_previous_summary,
     first_user_prompt,
@@ -182,6 +183,92 @@ def test_ends_with_empty_response() -> None:
     assert not ends_with_empty_response(
         serialize_messages([user_msg("q"), tool_call_response(), tool_return_msg()])
     )
+
+
+def test_ends_with_truncated_response() -> None:
+    """The resumable_history tail rule as a predicate: a tail response with
+    an unanswered tool call (a tool result is a separate request message)
+    or no usable content is an UNFINISHED exchange; a final text answer is
+    a clean finish (incident #46c6314d)."""
+    assert not ends_with_truncated_response([])
+    assert not ends_with_truncated_response(serialize_messages([user_msg("q")]))
+    # A final text answer — the only clean finish.
+    assert not ends_with_truncated_response(
+        serialize_messages([user_msg("q"), text_response("done")])
+    )
+    # A completed exchange ends with the tool result (a request) or the
+    # next response — not with the tool-call response.
+    assert not ends_with_truncated_response(
+        serialize_messages([user_msg("q"), tool_call_response(), tool_return_msg()])
+    )
+    assert not ends_with_truncated_response(
+        serialize_messages(
+            [
+                user_msg("q"),
+                tool_call_response(),
+                tool_return_msg(),
+                text_response("ok"),
+            ]
+        )
+    )
+    # The incident tail: response with (thinking +) tool call, no result.
+    assert ends_with_truncated_response(
+        serialize_messages([user_msg("q"), tool_call_response()])
+    )
+    assert ends_with_truncated_response(
+        serialize_messages(
+            [
+                user_msg("q"),
+                ModelResponse(
+                    parts=[
+                        ThinkingPart(content="hmm"),
+                        ToolCallPart(
+                            tool_name="run_bash",
+                            args={"command": "ninja"},
+                            tool_call_id="c1",
+                        ),
+                    ]
+                ),
+            ]
+        )
+    )
+    # Text AND a tool call in one response is still an open exchange
+    # (resumable_history trims it too).
+    assert ends_with_truncated_response(
+        serialize_messages(
+            [
+                user_msg("q"),
+                ModelResponse(
+                    parts=[
+                        TextPart(content="running"),
+                        ToolCallPart(
+                            tool_name="run_bash",
+                            args={"command": "ninja"},
+                            tool_call_id="c1",
+                        ),
+                    ]
+                ),
+            ]
+        )
+    )
+    # Superset of the empty-response guard: contentless responses count.
+    assert ends_with_truncated_response(
+        serialize_messages([user_msg("q"), ModelResponse(parts=[])])
+    )
+    assert ends_with_truncated_response(
+        serialize_messages([user_msg("q"), text_response("")])
+    )
+    # The predicate agrees with resumable_history on every shape above.
+    for data in (
+        serialize_messages([user_msg("q"), text_response("done")]),
+        serialize_messages([user_msg("q"), tool_call_response()]),
+        serialize_messages([user_msg("q"), tool_call_response(), tool_return_msg()]),
+        serialize_messages([user_msg("q"), ModelResponse(parts=[])]),
+        serialize_messages([user_msg("q"), text_response("")]),
+    ):
+        assert ends_with_truncated_response(data) == (
+            len(resumable_history(data)) != len(data)
+        )
 
 
 def test_is_pending_retry() -> None:

@@ -26,6 +26,8 @@ wheels/
 .drcode/search_index.json
 .drcode/pending_notifications.json
 .drcode/goals/*.state.json
+uv.toml
+build.sh
 *.log
 .drcode/mcp.json
 .drcode/fastcontext-scout

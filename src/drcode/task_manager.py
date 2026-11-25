@@ -1555,8 +1555,17 @@ class TaskManager:
             self.storage.save(completed)
             return completed
         stripped = report.strip()
-        if stripped:
-            task.pending_input.append(PendingInput(text=stripped))
+        if not stripped:
+            # An empty report must never reach the queue without input:
+            # promote_next activates a QUEUED task only when it has
+            # pending_input or an unfinished attempt, so a bare requeue
+            # would strand it forever (nothing else picks it up).
+            stripped = (
+                "Testing failed — the tester returned the task for another "
+                "development round without a failure report; fix the "
+                "problems found during testing and resubmit."
+            )
+        task.pending_input.append(PendingInput(text=stripped))
         old = task.status
         task.status = TaskStatus.QUEUED
         task.verification = None

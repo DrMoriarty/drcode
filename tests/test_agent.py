@@ -1598,6 +1598,39 @@ async def test_retry_failed_here_respects_custom_cap(tmp_path: Path) -> None:
     assert "create_bug_report" in message
 
 
+async def test_set_verification_empty_report_retries_model(
+    tmp_path: Path, fake_config: Config
+) -> None:
+    """A retry_here verdict with an empty report is refused at the
+    tool-contract level (incident 02df4dd8 class): the requeue never
+    happens (the task stays TESTING) and the model is asked to call
+    set_verification again with the real report — instead of queueing
+    nothing and claiming it was queued."""
+    deps = _testing_deps(tmp_path)
+    task = deps.manager.get(deps.task_id)
+    tester = agent_mod.build_tester_agent(fake_config, allow_push=False)
+    tool = next(
+        t
+        for t in tester._function_toolset.tools.values()
+        if t.name == "set_verification"
+    )
+
+    with pytest.raises(ModelRetry) as exc_info:
+        tool.function(
+            cast("Any", SimpleNamespace(deps=deps)),
+            success=False,
+            retry_here=True,
+            report="   ",
+        )
+
+    assert "non-empty `report`" in str(exc_info.value)
+    # The verdict was NOT applied: the task is still in testing, so the
+    # retried call lands on the unchanged state.
+    assert task.status is TaskStatus.TESTING
+    assert task.pending_input == []
+    assert task.fix_rounds == 0
+
+
 # -- tester create_bug_report: the report waits for the verified task ----------------
 
 

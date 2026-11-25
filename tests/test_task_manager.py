@@ -1162,6 +1162,28 @@ def test_requeue_failed_fix_returns_task_to_development(manager: TaskManager) ->
     assert manager.promote_next() is task
 
 
+def test_requeue_failed_fix_empty_report_stays_promotable(
+    manager: TaskManager,
+) -> None:
+    """An empty tester report must not strand the task: promote_next only
+    activates a QUEUED task with pending_input or unfinished, so the
+    requeue substitutes a fallback text for the missing report."""
+    task = manager.create("t", "x")
+    task.pending_input.clear()  # consumed by round 1
+    _to_testing(manager, task.id)
+
+    manager.requeue_failed_fix(task.id, "", max_rounds=3)
+    _to_testing(manager, task.id)
+    manager.requeue_failed_fix(task.id, "   \n  ", max_rounds=3)
+
+    assert task.status is TaskStatus.QUEUED
+    assert task.fix_rounds == 2
+    assert len(task.pending_input) == 2
+    assert all(e.text.strip() for e in task.pending_input)
+    # The whole point: the task is promotable without manual input.
+    assert manager.promote_next() is task
+
+
 def test_requeue_failed_fix_rounds_accumulate(manager: TaskManager) -> None:
     task = manager.create("t", "x")
     task.pending_input.clear()  # consumed by round 1

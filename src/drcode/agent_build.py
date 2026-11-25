@@ -1832,7 +1832,9 @@ def build_tester_agent(
           regressions of previously working functionality). The task returns
           to development in its own worktree and `report` (what failed: the
           exact command and the error output) becomes its next input — do
-          NOT call create_bug_report in this case.
+          NOT call create_bug_report in this case. A retry_here=True verdict
+          requires a NON-EMPTY report — it is the only thing the fix round
+          sees of this failure.
         - retry_here=False: THIS task's own deliverable does not work and
           cannot be accepted, and another development round is pointless
           (the task built the wrong thing, its result is fundamentally
@@ -1856,6 +1858,19 @@ def build_tester_agent(
         testing until the external review delivers its verdict."""
         deps = ctx.deps
         if not success and retry_here:
+            if not report.strip():
+                # An empty report would be queued as nothing: without this
+                # guard the task re-enters the queue with no pending input
+                # and promote_next never activates it again. The verdict
+                # stays unapplied (the task is still TESTING) — ask the
+                # model for the real report.
+                raise ModelRetry(
+                    "set_verification(success=False, retry_here=True) "
+                    "requires a non-empty `report` — the failure report "
+                    "(the exact command and the error output) becomes the "
+                    "task's next input in the fix round. Call "
+                    "set_verification again with the report."
+                )
             # Every retry_here verdict goes through _retry_failed_here: a
             # stale one (the task already left TESTING mid-round) is
             # ignored there and reported as such — the model must never

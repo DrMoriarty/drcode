@@ -163,6 +163,15 @@ class AgentChainsScreen(ChangedHighlightMixin, ModalScreen["bool | None"]):
         background: $panel;
         border: thick $accent;
     }
+    /* Until the first post-layout label refit: the on_mount refresh builds
+    the option labels at the fallback widths (the lists have no render
+    region yet), so painting that state shows wrapped names for a frame
+    and then repaints — the blink on open. Opacity, NOT visibility:
+    `visibility: hidden` makes Textual skip the subtree's layout entirely
+    (zero regions), and the refit needs the real geometry. */
+    #ac-dialog.ac-preparing {
+        opacity: 0;
+    }
     .ac-title {
         color: $accent;
         text-style: bold;
@@ -270,7 +279,7 @@ class AgentChainsScreen(ChangedHighlightMixin, ModalScreen["bool | None"]):
     # -- compose ----------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="ac-dialog"):
+        with Vertical(id="ac-dialog", classes="ac-preparing"):
             yield Static(
                 "Agent model chains — up to 3 models per agent role, in "
                 "priority order (first = primary, the rest are availability "
@@ -416,12 +425,23 @@ class AgentChainsScreen(ChangedHighlightMixin, ModalScreen["bool | None"]):
         # The refreshes above run before the first layout pass (the lists
         # still have no render region), so the labels are built at the
         # fallback widths; re-fit them once the layout is final even if no
-        # Resize event arrives.
-        self.call_after_refresh(self._lists_resized)
+        # Resize event arrives — and only then show the dialog (the
+        # pre-layout paint is the reported blink).
+        self.call_after_refresh(self._reveal)
         self.query_one("#ac-filter", Input).focus()
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+    def _reveal(self) -> None:
+        """Re-fit the labels to the real render geometry (the on_mount
+        refresh ran before the first layout pass) and only then show the
+        dialog: the single visible paint already carries the final,
+        fitted labels, so no delayed repaint is ever seen."""
+        if not self.is_mounted:
+            return
+        self._lists_resized()
+        self.query_one("#ac-dialog").remove_class("ac-preparing")
 
     @on(_FittingOptionList.WidthChanged)
     def _lists_resized(self) -> None:

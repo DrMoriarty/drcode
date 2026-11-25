@@ -208,6 +208,27 @@ async def test_long_names_middle_truncated_no_wrap(tmp_path: Path) -> None:
         assert len(second_group_label) <= group.scrollable_content_region.width
 
 
+async def test_dialog_hidden_until_first_label_refit(tmp_path: Path) -> None:
+    """On open the dialog is painted transparent (ac-preparing): the
+    on_mount refresh builds the labels at the fallback widths (no render
+    region yet), so showing the dialog before the post-layout refit
+    painted wrapped names for a frame and then repainted — the blink.
+    After the first refit round the reveal class is gone (the dialog is
+    never left stuck invisible) and every label fits on one line."""
+    path = tmp_path / "models.json"
+    store = _seed_store(path)
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        screen = pilot.app.screen
+        assert isinstance(screen, AgentChainsScreen)
+        await pilot.pause()
+        assert not screen.query_one("#ac-dialog").has_class("ac-preparing")
+        right = _right_list(screen)
+        group = _group_list(screen, AgentRole.CODING)
+        for option_list in (right, group):
+            if option_list.option_count:
+                assert option_list.virtual_size.height == option_list.option_count
+
+
 async def test_filter_narrows_model_list(tmp_path: Path) -> None:
     path = tmp_path / "models.json"
     store = _seed_store(path)

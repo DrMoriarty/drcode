@@ -214,15 +214,19 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         padding: 1 2;
         background: $panel;
         border: thick $accent;
-        /* The dialog itself NEVER scrolls: the tall middle block
-           (#mc-scroll) does, while the connection actions, the status
-           line, the hint and the Save button stay pinned in the fixed
-           bottom zone — always visible, whatever the content height. */
+        /* The dialog itself NEVER scrolls — there is no main scroll at
+           all: the height fit is done by the model table (#mc-models,
+           1fr), whose own scroll absorbs the terminal height, while the
+           connection actions, the status line, the hint and the action
+           column stay pinned in the fixed bottom zone. */
         overflow: hidden;
     }
-    #mc-scroll {
+    #mc-content {
+        /* The middle block: a fixed stack whose only flexible member is
+           the model table below — no scrolling here, the table shrinks
+           or grows to make the whole content fit the dialog. */
         height: 1fr;
-        overflow-y: auto;
+        overflow: hidden;
     }
     .mc-title {
         color: $accent;
@@ -290,18 +294,29 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
        the neighbouring Inputs), fixed width so the 1fr model-id field
        absorbs the rest. */
     #mc-effort { width: 12; }
+    /* The FIXED bottom zone: the grey hint on the left (its wrapped
+       block spans down to the dialog's bottom edge) and the action
+       column on the right — Assign agents above Save. */
     #mc-footer {
         height: auto;
         margin-top: 1;
-        align-horizontal: right;
     }
-    #mc-footer Button { margin-left: 1; }
+    #mc-btn-col {
+        width: auto;
+        height: auto;
+        margin-left: 1;
+    }
+    #mc-btn-col Button { min-width: 0; }
     #mc-hint {
-        width: 100%;
+        width: 1fr;
+        height: auto;
+        /* At least as tall as the two-button column next to it, so the
+           grey block always reaches the dialog's bottom edge. */
+        min-height: 2;
         /* No top padding: the footer's own margin-top already separates
-           the hint from the Save row, and the catalog grew by one provider
-           field (max parallel requests) — every spare row keeps Save
-           inside a 56-row terminal. */
+           the hint from the content above, and the catalog grew by one
+           provider field (max parallel requests) — every spare row keeps
+           the buttons inside a 56-row terminal. */
         padding: 0 2 0 2;
         color: $text-disabled;
     }
@@ -343,9 +358,10 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mc-dialog"):
-            # The SCROLLABLE middle: title, the two-column provider block,
-            # the model table and its editor — everything tall lives here.
-            with Vertical(id="mc-scroll"):
+            # The middle block (NOT scrollable): title, the two-column
+            # provider block, the model table and its editor — the table's
+            # own 1fr height makes it all fit the dialog.
+            with Vertical(id="mc-content"):
                 yield Static(
                     "Model catalog — OpenAI-compatible providers and their models. "
                     f"Stored in [b]{self.store.path.name}[/b] (user level).",
@@ -407,19 +423,21 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                     yield Button("Remove", id="mc-model-del")
                     yield Button("Add model", id="mc-model-add")
             # The FIXED bottom zone — never scrolls with the content: the
-            # status line, the hint and the footer (Assign agents + Save,
-            # pinned to the modal's bottom-right).
+            # status line, then the footer — the grey hint stretching down
+            # the dialog's bottom edge on the left, the Assign agents /
+            # Save column on the right (Save at the bottom).
             yield Static("", id="mc-status")
-            yield Static(
-                "esc — close without saving · Update / Add model / Remove "
-                "edit the table below (the Favorites cell cycles • → ★ → ✚); "
-                "max parallel requests caps concurrent calls per provider "
-                "(empty / 0 = unlimited)",
-                id="mc-hint",
-            )
             with Horizontal(id="mc-footer"):
-                yield Button("Assign agents…", id="mc-assign-agents")
-                yield Button("Save", variant="primary", id="mc-save")
+                yield Static(
+                    "esc — close without saving · Update / Add model / "
+                    "Remove edit the table below (the Favorites cell "
+                    "cycles • → ★ → ✚); max parallel requests caps "
+                    "concurrent calls per provider (empty / 0 = unlimited)",
+                    id="mc-hint",
+                )
+                with Vertical(id="mc-btn-col"):
+                    yield Button("Assign agents…", id="mc-assign-agents")
+                    yield Button("Save", variant="primary", id="mc-save")
 
     # -- helpers ------------------------------------------------------------
 

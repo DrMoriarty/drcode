@@ -671,6 +671,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # hooks (branch checkout, dev-done, external review, accept) and
         # .drcode/git-workflow.md rules (read at prompt-build time). None =
         # the default single-developer workflow, the pipeline unchanged.
+        # The assignment goes through CoreState.workflow's setter; the
+        # property getter hot-reloads the script on an (mtime_ns, size)
+        # change, so a workflow.py created after this line still works.
         self.workflow = load_hooks(project_root)
         # External-review bookkeeping (session-scoped): whether a review
         # worker is in flight (set synchronously in _advance, like

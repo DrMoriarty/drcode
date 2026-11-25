@@ -55,7 +55,7 @@ from ..settings import (
 from ..task_env import TaskEnvironment
 from ..task_manager import TaskManager
 from ..usage_store import UsageStore
-from ..workflow import WorkflowHooks
+from ..workflow import WORKFLOW_SCRIPT, WorkflowHooks, load_hooks
 from .host import PipelineHost
 from .usage import CacheHitRateMonitor, SessionTokenUsage
 from .voice_input import VoiceInputController
@@ -607,7 +607,104 @@ class CoreState:
     # research finalization awaits them before running its hook.
     _snapshot_jobs: set[asyncio.Task[None]]
     # Custom team workflow (.drcode/workflow.py hooks); None = absent.
-    workflow: WorkflowHooks | None
+    # HOT-RELOADED: the `workflow` property below re-stats the script on
+    # every access and reloads on an (mtime_ns, size) change — the same
+    # stat-pair pattern as the persisted search index (task_search.py) —
+    # so a workflow.py created/edited/deleted after the app started is
+    # picked up without a restart. A hook BODY was never frozen (every
+    # call is a fresh subprocess importing the script from disk); only
+    # the file's existence and the AST-scanned hook-name set were.
+    _workflow: WorkflowHooks | None
+    _workflow_stat: tuple[int, int] | None
+
+    @property
+    def workflow(self) -> WorkflowHooks | None:
+        """The project's custom workflow hooks, reloaded on file change.
+
+        Every access costs one `stat` of `.drcode/workflow.py` (the
+        `has()` gates — units per task lifecycle, never per model
+        request): an unchanged (mtime_ns, size) pair returns the cached
+        object with zero file reads, a changed pair reloads through
+        `load_hooks` (a fresh AST scan of the hook names), a newly
+        appeared file loads for the first time and a deleted file drops
+        the hooks entirely. Every actual (re)load and every removal is
+        announced through the host toast — the script is arbitrary code
+        running with the user's permissions, its appearance mid-session
+        must not be silent. The initial load goes through the setter
+        (the app's __init__) and stays silent: the Settings screen
+        already shows the workflow line."""
+        stat = self._workflow_script_stat()
+        cached = self._workflow
+        if cached is None:
+            if stat is None:
+                return None
+            hooks = load_hooks(self.project_root)
+            if hooks is None:  # vanished between stat and load
+                self._workflow_stat = None
+                return None
+            self._workflow = hooks
+            self._workflow_stat = self._workflow_script_stat() or stat
+            self._workflow_event(
+                f"workflow.py загружен: {self._workflow_summary(hooks)}"
+            )
+            return hooks
+        if stat is None:
+            self._workflow = None
+            self._workflow_stat = None
+            self._workflow_event(
+                "workflow.py удалён — хуки отключены", severity="warning"
+            )
+            return None
+        if stat != self._workflow_stat:
+            hooks = load_hooks(self.project_root)
+            if hooks is None:  # vanished between stat and load
+                self._workflow = None
+                self._workflow_stat = None
+                self._workflow_event(
+                    "workflow.py удалён — хуки отключены", severity="warning"
+                )
+                return None
+            self._workflow = hooks
+            self._workflow_stat = self._workflow_script_stat() or stat
+            self._workflow_event(
+                f"workflow.py изменился — перезагружен: {self._workflow_summary(hooks)}"
+            )
+            return hooks
+        return cached
+
+    @workflow.setter
+    def workflow(self, hooks: WorkflowHooks | None) -> None:
+        """Initial load (DrCodeApp.__init__) and explicit reloads: cache
+        the object together with the stat pair it was loaded from, so
+        the first property access does not report a spurious change."""
+        self._workflow = hooks
+        self._workflow_stat = (
+            self._workflow_script_stat() if hooks is not None else None
+        )
+
+    def _workflow_script_stat(self) -> tuple[int, int] | None:
+        """The (mtime_ns, size) pair of `.drcode/workflow.py`, or None
+        when the file does not exist (yet / anymore)."""
+        try:
+            st = (self.project_root / ".drcode" / WORKFLOW_SCRIPT).stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    @staticmethod
+    def _workflow_summary(hooks: WorkflowHooks) -> str:
+        """One-line hook list for the reload announcements."""
+        if hooks.load_error:
+            return f"не разбирается ({hooks.load_error}) — хуки отключены"
+        return ", ".join(hooks.defined_hooks()) or "хуков не определено"
+
+    def _workflow_event(self, text: str, *, severity: str = "information") -> None:
+        """Announce an actual workflow.py (re)load / removal through the
+        host toast (best-effort: no host assigned yet — no toast, the
+        Settings screen still reflects the fresh state)."""
+        host = getattr(self, "host", None)
+        if host is not None:
+            host.host_notify(text, title="Workflow", severity=severity)
 
     # -- GitHub Issues sync bookkeeping -------------------------------------
     _github_state_store: GitHubSyncStateStore

@@ -9,6 +9,7 @@ network anywhere) — same style as tests/network_mocks.py."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ import pytest
 
 from drcode import agent_model, tools
 from drcode.agent import all_user_prompts
+from drcode.core.state import CoreState
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.prompts import (
     GIT_WORKFLOW_HEADER,
@@ -1483,3 +1485,152 @@ def test_tester_passed_hook_in_lifecycle_order(project_root: Path) -> None:
     assert hooks.has("on_tester_passed")
     assert hooks.defined_hooks() == ["on_tester_passed"]
     assert "on_tester_passed" in describe_project_workflow(project_root)
+
+
+# -- hot reload of workflow.py (CoreState.workflow property) -------------------------
+
+
+class _ToastHost:
+    """Captures the reload announcements (`host.host_notify`)."""
+
+    def __init__(self, toasts: list[tuple[str | None, str, str]]) -> None:
+        self._toasts = toasts
+
+    def host_notify(
+        self,
+        message: str = "",
+        *,
+        title: str | None = None,
+        severity: str = "information",
+        timeout: float | None = None,
+    ) -> None:
+        self._toasts.append((title, message, severity))
+
+
+class _ReloadState(CoreState):
+    """Minimal CoreState for the `workflow` property: only `project_root`
+    and a stub host are needed — the property must not touch the UI."""
+
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.toasts: list[tuple[str | None, str, str]] = []
+        self.host = _ToastHost(self.toasts)  # type: ignore[assignment]
+        self.workflow = load_hooks(project_root)  # the __init__ setter path
+
+
+def _bump_mtime(path: Path) -> None:
+    """Force a fresh (mtime_ns, size) pair even on coarse filesystems."""
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+
+def _workflow_toasts(state: _ReloadState) -> list[str]:
+    return [m for title, m, _ in state.toasts if title == "Workflow"]
+
+
+def test_hot_reload_file_appears_after_init(project_root: Path) -> None:
+    """A workflow.py created AFTER the state was initialized (a -f case):
+    the next `workflow` access loads it — `has("on_accepted")` becomes
+    True without a restart, announced by a toast."""
+    state = _ReloadState(project_root)
+    assert state.workflow is None
+    assert state._workflow_stat is None
+    make_script(project_root, "def on_accepted(task):\n    return None\n")
+    hooks = state.workflow
+    assert hooks is not None
+    assert hooks.has("on_accepted")
+    toasts = _workflow_toasts(state)
+    assert len(toasts) == 1
+    assert "загружен" in toasts[0] and "on_accepted" in toasts[0]
+
+
+def test_hot_reload_added_hook_becomes_visible(project_root: Path) -> None:
+    """A hook ADDED to an existing workflow.py (a -b case): the changed
+    (mtime_ns, size) pair triggers a reload with a fresh AST scan."""
+    make_script(project_root, "def on_task_start(task):\n    return None\n")
+    state = _ReloadState(project_root)
+    first = state.workflow
+    assert first is not None and not first.has("on_accepted")
+    make_script(
+        project_root,
+        "def on_task_start(task):\n    return None\n\n"
+        "def on_accepted(task):\n    return None\n",
+    )
+    _bump_mtime(project_root / ".drcode" / "workflow.py")
+    hooks = state.workflow
+    assert hooks is not None
+    assert hooks.has("on_task_start") and hooks.has("on_accepted")
+    assert hooks is not first  # a fresh object, not the stale cache
+    toasts = _workflow_toasts(state)
+    assert len(toasts) == 1
+    assert "изменился" in toasts[0] and "on_accepted" in toasts[0]
+
+
+def test_hot_reload_removed_file_drops_hooks(project_root: Path) -> None:
+    """A deleted workflow.py (a -c case): the hooks honestly disappear
+    (None again), announced with a warning toast."""
+    make_script(project_root, "def on_accepted(task):\n    return None\n")
+    state = _ReloadState(project_root)
+    assert state.workflow is not None
+    (project_root / ".drcode" / "workflow.py").unlink()
+    assert state.workflow is None
+    toasts = _workflow_toasts(state)
+    assert len(toasts) == 1
+    assert "удалён" in toasts[0]
+    # And it can come back afterwards.
+    make_script(project_root, "def on_review(task):\n    return None\n")
+    hooks = state.workflow
+    assert hooks is not None and hooks.has("on_review")
+
+
+def test_hot_reload_broken_file_degrades(project_root: Path) -> None:
+    """A syntactically broken workflow.py (a -d case): no crash, the
+    hooks object survives with `load_error` in describe() and no hooks
+    reported; the toast says the script is unparseable."""
+    make_script(project_root, "def on_accepted(task):\n    return None\n")
+    state = _ReloadState(project_root)
+    assert state.workflow is not None
+    (project_root / ".drcode" / "workflow.py").write_text("def broken(:\n")
+    _bump_mtime(project_root / ".drcode" / "workflow.py")
+    hooks = state.workflow
+    assert hooks is not None
+    assert "unparseable" in hooks.describe()
+    assert not hooks.has("on_accepted")
+    toasts = _workflow_toasts(state)
+    assert len(toasts) == 1
+    assert "не разбирается" in toasts[0]
+
+
+def test_hot_reload_unchanged_file_not_reread(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged file (a -e case): repeated accesses return the SAME
+    cached object and never call load_hooks again — one stat, zero file
+    reads."""
+    make_script(project_root, "def on_accepted(task):\n    return None\n")
+    state = _ReloadState(project_root)
+    first = state.workflow
+    assert first is not None
+
+    calls = []
+    real = load_hooks
+
+    def counting(project_root: Path) -> WorkflowHooks | None:
+        calls.append(project_root)
+        return real(project_root)
+
+    monkeypatch.setattr("drcode.core.state.load_hooks", counting)
+    for _ in range(3):
+        hooks = state.workflow
+        assert hooks is first
+        assert hooks is not None and hooks.has("on_accepted")
+    assert calls == []
+
+
+def test_hot_reload_init_assignment_does_not_announce(project_root: Path) -> None:
+    """The initial load (the app's __init__ path) is silent: no toast on
+    the first access of an unchanged, already-loaded workflow.py."""
+    make_script(project_root, "def on_accepted(task):\n    return None\n")
+    state = _ReloadState(project_root)
+    assert state.workflow is not None
+    assert _workflow_toasts(state) == []

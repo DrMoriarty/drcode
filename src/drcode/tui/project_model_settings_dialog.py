@@ -63,10 +63,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, RadioButton, Select, Static
 
@@ -79,7 +81,7 @@ from ..providers import (
     load_project_model_slots,
 )
 from ..settings import ProjectSettingsStore
-from .model_setup_app import _FAVORITE_GLYPHS
+from .model_setup_app import _FAVORITE_GLYPHS, _truncate_middle
 from .setup_dialog import ModelSetup, ModelSetupDialog
 from .toggle_row import ToggleRow
 
@@ -99,6 +101,38 @@ _CUSTOM_NEW = "__custom__"
 # rows). It sits in the two-column gutter every catalog row starts with,
 # so no row grows wider than before.
 DEFAULT_MARKER = "▸"
+
+# Fallback Select width, used before the first layout pass (the widget's
+# render region is still empty): the measured Select width inside the
+# default 88-col dialog. Option labels are middle-truncated to the
+# select's real width (see `_FittingSelect` / `_row_budget`) so long
+# model names never wrap onto a second line — same approach as the agent
+# chains dialog's `_label_width`.
+_FALLBACK_SELECT_WIDTH = 48
+# Chrome cells an option's text loses inside the select: the dropdown
+# overlay's tall border (4) + the option component's padding (2) + the
+# vertical scrollbar that shows once the options exceed the overlay's
+# max-height (2) — measured 38 usable cells at a 48-wide select; the
+# closed SelectCurrent field is 2 cells wider, so the dropdown governs.
+_SELECT_CHROME = 10
+# Floor for the whole row budget on very narrow terminals — never
+# truncate below this, a readable stub beats a clipped one.
+_MIN_ROW_BUDGET = 20
+
+
+class _FittingSelect(Select):
+    """Select that reports its own width changes to the dialog: option
+    labels are middle-truncated to the select's current width, so a
+    terminal resize must re-fit them (`events.Resize` does NOT bubble —
+    same pattern as the agent chains dialog's `_FittingOptionList`)."""
+
+    class WidthChanged(Message):
+        """The Select's width changed; its option labels should be
+        re-fitted."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.post_message(self.WidthChanged())
+
 
 _ROLE_TITLES: dict[AgentRole, str] = {
     AgentRole.CODING: "Coding",
@@ -371,7 +405,15 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         There is NO selectable reset option here: an empty slot is the
         Select's blank value (prompt "(user default)" / "(inherit parent
         role)" for SUBAGENT), and the reset is the dedicated ✕ button next
-        to the Select."""
+        to the Select.
+
+        Every name is middle-truncated (beginning and end kept, the
+        middle cut into a single ``…``) to the select's real width, so a
+        long model id never wraps the narrow row onto a second line; the
+        marker gutter (default ``▸`` column + favorite tier glyph column
+        — 4 cells together) and the ``Custom: `` prefix are subtracted
+        from the budget, they occupy the same row."""
+        budget = self._row_budget(role)
         catalog = UserModelsStore().load()
         user_default = catalog.default_ref(role)
         slot = self._slots[role]
@@ -399,8 +441,13 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                 # base style — same rule as the catalog table and the
                 # chains dialog).
                 prompt.append(f"{glyph.plain} ", style=glyph.style)
-            # The default's name is bold on top of the arrow marker.
-            prompt.append(ref, style="bold" if is_default else None)
+            # The default's name is bold on top of the arrow marker; the
+            # 4-cell gutter (marker + favorite columns) comes off the
+            # budget before truncation.
+            prompt.append(
+                _truncate_middle(ref, max(8, budget - 4)),
+                style="bold" if is_default else None,
+            )
             options.append((prompt, ref))
         if isinstance(slot, ModelRef) and str(slot) not in {
             value for _, value in options
@@ -410,10 +457,18 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
             # cloned elsewhere): without an option carrying the slot value
             # the Select constructor raises InvalidSelectValueError. Keep
             # the draft slot selectable instead of crashing.
-            options.append((f"{slot} (not in user catalog)", str(slot)))
+            suffix = " (not in user catalog)"
+            name = _truncate_middle(str(slot), max(8, budget - len(suffix)))
+            options.append((f"{name}{suffix}", str(slot)))
         custom = self._customs.get(role)
         if custom is not None:
-            options.append((f"Custom: {custom.model}", "custom"))
+            prefix = "Custom: "
+            options.append(
+                (
+                    f"{prefix}{_truncate_middle(custom.model, max(8, budget - len(prefix)))}",
+                    "custom",
+                )
+            )
         elif slot == "custom":
             # A "custom" slot whose saved custom_models[role] entry is
             # missing/invalid: same missing-value hazard as above.
@@ -435,6 +490,25 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
 
     def _select(self, role: AgentRole) -> Select:
         return self.query_one(f"#pms-model-{role.value}", Select)
+
+    def _row_budget(self, role: AgentRole) -> int:
+        """Usable character width for ONE option row of a role's Select —
+        the whole prompt, markers included.
+
+        Measured from the select's real width (`_FittingSelect` re-fits
+        the labels on resize; `events.Resize` does not bubble, hence the
+        message round-trip); `_FALLBACK_SELECT_WIDTH` before the first
+        layout pass. The chrome around the text is the dropdown overlay's
+        border + option padding + scrollbar (the tighter side — the
+        closed field has 2 cells more)."""
+        try:
+            width = self._select(role).size.width
+        except NoMatches:
+            # compose() is still building the widgets — the fallback
+            # (dialog-designed) width applies.
+            width = 0
+        width = width or _FALLBACK_SELECT_WIDTH
+        return max(_MIN_ROW_BUDGET, width - _SELECT_CHROME)
 
     def _tokens_input(self, role: AgentRole) -> Input:
         return self.query_one(f"#pms-tokens-{role.value}", Input)
@@ -468,7 +542,7 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
                                     tooltip=_ROLE_RESET_TOOLTIP[role],
                                     id=f"pms-reset-{role.value}",
                                 )
-                                yield Select(
+                                yield _FittingSelect(
                                     self._model_options(role),
                                     value=self._slot_value(role),
                                     prompt=_ROLE_BLANK_PROMPT[role],
@@ -544,6 +618,17 @@ class ProjectModelSettingsDialog(ModalScreen[ProjectModelSettingsResult | None])
         return self.query_one("#pms-split-row", ToggleRow)
 
     def on_mount(self) -> None:
+        for role in AgentRole:
+            self._refresh_role(role)
+
+    @on(_FittingSelect.WidthChanged)
+    def _refit_options(self) -> None:
+        """Re-truncate every role's option labels after a width change
+        (a terminal resize) — the same re-fit rule as the agent chains
+        dialog. Before mount the selects are not built yet: nothing to
+        re-fit (the compose-time options already carry the fallback)."""
+        if not self.is_attached:
+            return
         for role in AgentRole:
             self._refresh_role(role)
 

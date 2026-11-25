@@ -3026,6 +3026,72 @@ async def test_role_model_label_variants(app: DrCodeApp, project_root: Path) -> 
 # -- project model settings dialog -----------------------------------------------
 
 
+async def test_project_model_dialog_long_names_middle_truncated(
+    app: DrCodeApp, project_root: Path
+) -> None:
+    """A long model id is middle-truncated (beginning and end kept, the
+    middle cut into ``…``) so the narrow Select row never wraps onto a
+    second line; the marker gutter (default ``▸`` + favorite tier glyph
+    columns, 4 cells together) and the ``Custom: `` prefix come off the
+    truncation budget — every row, markers included, fits one line."""
+    from drcode.providers import (
+        ModelEntry,
+        ModelRef,
+        Provider,
+        UserModelsConfig,
+        UserModelsStore,
+    )
+    from drcode.tui.project_model_settings_dialog import (
+        DEFAULT_MARKER,
+        ProjectModelSettingsDialog,
+    )
+
+    long_id = "meta-llama/Llama-3.1-405B-Instruct-fp8-very-long-suffix"
+    catalog = UserModelsConfig(
+        providers=[
+            Provider(
+                name="local-swap",
+                base_url="http://localhost:8080/v1",
+                models=[
+                    ModelEntry(id=long_id),
+                    ModelEntry(id=f"{long_id}-fav", favorite=2),
+                ],
+            )
+        ]
+    )
+    catalog.defaults[AgentRole.CODING] = [
+        ModelRef(provider="local-swap", model=long_id)
+    ]
+    UserModelsStore().save(catalog)
+    async with app.run_test() as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        app.action_open_project_model_settings()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ProjectModelSettingsDialog)
+        select = _pms_select(dialog, AgentRole.CODING)
+        plain = [str(p) for p, _ in select._options]
+        # The long default name (with its ▸ marker and blank favorite
+        # column) and the long favorite name are cut in the middle, both
+        # endings visible; short names pass through untouched.
+        default_row = next(p for p in plain if p.startswith(DEFAULT_MARKER))
+        assert default_row.startswith(f"{DEFAULT_MARKER}   local-swap/")
+        assert default_row.endswith("-suffix")
+        assert "…" in default_row
+        fav_row = next(p for p in plain if "fav" in p)
+        assert fav_row.startswith("  ★ local-swap/")
+        assert fav_row.endswith("-suffix-fav")
+        assert "…" in fav_row
+        # Whole rows (markers included) stay within one line: no option
+        # is longer than the select's row budget (name + markers).
+        budget = dialog._row_budget(AgentRole.CODING)
+        assert max(len(p) for p in plain) <= budget
+        # The custom entry is truncated after its "Custom: " prefix.
+        # (No custom model saved here — the plain tail options are short.)
+        assert plain[-1] == "Custom…"
+
+
 def _pms_select(dialog: Any, role: AgentRole) -> Any:
     from textual.widgets import Select
 

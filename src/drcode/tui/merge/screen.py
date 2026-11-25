@@ -7,7 +7,7 @@ and when it gives up (`task.needs_human`) or the user simply wants to
 decide by hand, this screen opens on the parked conflict.
 
 The ``v`` funnel runs with visible per-stage progress: a panel line per
-check (braille spinner + elapsed seconds while running, ok/FAILED/skip
+check (spinner + elapsed seconds while running, ok/FAILED/skip
 marks when done, plus a percent/ETA footer estimated from the rolling
 per-check durations persisted across runs next to the verify report) —
 the checks themselves stay serial and off the UI thread, the panel is
@@ -125,6 +125,7 @@ from textual.widgets import ListView, Static
 
 from ... import merge_resolver
 from ...conflict import ConflictWorktree, DiffStat, Hunk, numstat, parse_hunks
+from ...core.blocks import SPINNER_FRAMES as _SPINNER_FRAMES
 from ...merge_engine import (
     MergeReport,
     is_fast_forward,
@@ -153,9 +154,9 @@ if TYPE_CHECKING:
 # first, possibly accidental press).
 _ARM_SECONDS = 2.0
 
-# The verification-funnel progress indicator: braille spinner frames and
-# how often the panel's animation timer redraws the running line.
-_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# How often the progress panel's animation timer redraws the running line
+# (`_SPINNER_FRAMES` is the app-wide set from core.blocks — braille on a
+# Unicode terminal, `/ - \ |` on a single-byte one).
 _SPINNER_INTERVAL = 0.15
 
 
@@ -924,7 +925,7 @@ class ConflictScreen(ModalScreen[None]):
 
     def _render_prepare_panel(self) -> None:
         """The live prepare view — identical mechanics to the funnel
-        panel: `[⠹] merge…  (12s)` for the running step, `[ok]` /
+        panel: `[/] merge…  (12s)` for the running step, `[ok]` /
         `[FAILED]` for the finished ones, plus the percent/ETA footer."""
         if not self.is_mounted:
             return
@@ -1132,7 +1133,7 @@ class ConflictScreen(ModalScreen[None]):
             self._render_resolver_panel()
 
     def _render_resolver_panel(self) -> None:
-        """The single watch-mode line: `[⠹] automatic resolver running…`
+        """The single watch-mode line: `[/] automatic resolver running…`
         — the round's detailed progress deliberately stays in the
         task's chat (the rejected variant of streaming it here)."""
         if not self.is_mounted or not self._resolver_round:
@@ -1373,7 +1374,7 @@ class ConflictScreen(ModalScreen[None]):
     def _begin_checks(self) -> None:
         """Reset the per-stage progress state and start the panel's
         animation timer. The timer is deliberately independent of the
-        worker: the checks run in worker threads, and a braille spinner
+        worker: the checks run in worker threads, and a spinner
         plus elapsed/ETA line must keep moving while the event loop idles
         between the `asyncio.to_thread` awaits."""
         self._checks_generation += 1
@@ -1426,7 +1427,7 @@ class ConflictScreen(ModalScreen[None]):
 
     def _render_checks_panel(self) -> None:
         """The live progress view: one status line per stage
-        ("[ok] compile (0.4s)", "[⠹] pyright… (12s)", "[ ] test suite")
+        ("[ok] compile (0.4s)", "[/] pyright… (12s)", "[ ] test suite")
         plus the percent/ETA footer. Plain text (the panel is
         markup=False) — redrawn between stages and from the animation
         timer, never from the worker threads."""

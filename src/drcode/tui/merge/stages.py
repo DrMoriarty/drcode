@@ -1,8 +1,10 @@
 """Stage arithmetic of the conflict screen's progress panel.
 
 The screen renders its long-running work (the OPENING prepare phase and
-the ``v`` verification funnel) as one line per stage with a braille
-spinner while a stage runs, ok/FAILED/skip marks when it is done, and a
+the ``v`` verification funnel) as one line per stage with a spinner
+(braille frames on a Unicode terminal, ``/ - \\ |`` otherwise — the
+app-wide set from ``core.blocks``) while a stage runs, ok/FAILED/skip
+marks when it is done, and a
 percent/ETA footer estimated from the rolling per-stage durations
 persisted across runs next to the verify report. This module holds the
 stage dataclasses and the pure ETA/percent arithmetic over them —

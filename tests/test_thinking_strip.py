@@ -7,11 +7,12 @@ Covers:
   their thinking verbatim, older ones lose it, a thinking-only stale
   response is dropped entirely, `keep_recent_turns <= 0` disables;
 - the ≈token accounting (stale_thinking_tokens) the batch gate compares
-  against THINKING_PAUSE_FRACTION-th of the window;
+  against ≈2/3 of the serving role's window (THINKING_PAUSE_FRACTION is
+  the shared gate's divisor: 1.5 = 2/3);
 - the pipeline wiring: the strip rides the batch eviction pass in
   _maybe_evict_marked (one pass, one event, one credit), fires standalone
-  only above THINKING_PAUSE_FRACTION-th of the window, and the
-  `thinking_keep_recent_turns` project setting gates it all (0 = off).
+  only above ≈2/3 of the window, and the `thinking_keep_recent_turns`
+  project setting gates it all (default 0 = off).
 """
 
 from __future__ import annotations
@@ -203,8 +204,8 @@ def test_lazy_export_resolves() -> None:
 # -- project setting --------------------------------------------------------------
 
 
-def test_setting_defaults_to_five() -> None:
-    assert ProjectSettings().thinking_keep_recent_turns == 5
+def test_setting_defaults_to_zero() -> None:
+    assert ProjectSettings().thinking_keep_recent_turns == 0
 
 
 @pytest.mark.parametrize(
@@ -213,9 +214,9 @@ def test_setting_defaults_to_five() -> None:
         (5, 5),
         (0, 0),
         (-3, 0),
-        (True, 5),  # bool is junk, not 1
-        ("3", 5),  # a string is junk, not coerced
-        (None, 5),
+        (True, 0),  # bool is junk, not 1
+        ("3", 0),  # a string is junk, not coerced
+        (None, 0),
         (2.9, 2),
     ],
 )
@@ -246,10 +247,13 @@ def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def app_small_ctx(
     project_root: Path, configured_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> DrCodeApp:
-    # The strip is ON by default (thinking_keep_recent_turns=5); the small
-    # window makes the ≈1/6 pause threshold easy to cross.
+    # The strip is OFF by default (thinking_keep_recent_turns=0) — the
+    # pipeline wiring tests opt in explicitly; the small window makes the
+    # ≈2/3 pause threshold easy to cross.
     monkeypatch.setenv("DRCODE_MAX_CONTEXT_TOKENS", "1000")
-    return DrCodeApp(project_root)
+    app = DrCodeApp(project_root)
+    app.settings.thinking_keep_recent_turns = 5
+    return app
 
 
 def _seed_thinking_task(app: DrCodeApp, thinkings: list[str], *, usage: int = 0) -> Any:
@@ -274,35 +278,35 @@ def _seed_thinking_task(app: DrCodeApp, thinkings: list[str], *, usage: int = 0)
 async def test_standalone_strip_fires_above_the_pause_threshold(
     app_small_ctx: DrCodeApp,
 ) -> None:
-    # 7 thinking-bearing exchanges of ≈200 tokens each: the 2 stale ones
-    # hold ≈400 tokens ≥ 1000/6 — the strip earns its own batch.
-    thinkings = ["x" * 800 for _ in range(7)]
+    # 7 thinking-bearing exchanges of ≈400 tokens each: the 2 stale ones
+    # hold ≈800 tokens ≥ 2/3 of 1000 — the strip earns its own batch.
+    thinkings = ["x" * 1600 for _ in range(7)]
     task = _seed_thinking_task(app_small_ctx, thinkings)
     assert app_small_ctx._stale_thinking_due(task)
-    assert app_small_ctx._stale_thinking_tokens(task) == 2 * estimate_tokens("x" * 800)
+    assert app_small_ctx._stale_thinking_tokens(task) == 2 * estimate_tokens("x" * 1600)
 
     async with app_small_ctx.run_test() as pilot:
         await pilot.pause()
         total = app_small_ctx._maybe_evict_marked(task)
         await pilot.pause()
 
-    assert total == 2 * estimate_tokens("x" * 800)
-    assert thinking_parts_in(task.messages) == ["x" * 800] * 5
+    assert total == 2 * estimate_tokens("x" * 1600)
+    assert thinking_parts_in(task.messages) == ["x" * 1600] * 5
     assert task.marked_unneeded == []
     assert any("stripped stale thinking" in t for t in event_texts(task))
     # The strip credit is deposited for the fill gates.
-    assert app_small_ctx._evicted_ctx_tokens[task.id] == 2 * estimate_tokens("x" * 800)
+    assert app_small_ctx._evicted_ctx_tokens[task.id] == 2 * estimate_tokens("x" * 1600)
     # Persisted, not just in memory.
     reloaded = {t.id: t for t in Storage(app_small_ctx.project_root).load_all()}[
         task.id
     ]
-    assert thinking_parts_in(reloaded.messages) == ["x" * 800] * 5
+    assert thinking_parts_in(reloaded.messages) == ["x" * 1600] * 5
 
 
 async def test_strip_below_the_pause_threshold_is_noop(
     app_small_ctx: DrCodeApp,
 ) -> None:
-    # 2 stale exchanges of ≈25 tokens: 50 * 6 < 1000 — no standalone batch.
+    # 2 stale exchanges of ≈25 tokens: 50 * 1.5 < 1000 — no standalone batch.
     thinkings = ["y" * 100 for _ in range(7)]
     task = _seed_thinking_task(app_small_ctx, thinkings)
     assert not app_small_ctx._stale_thinking_due(task)

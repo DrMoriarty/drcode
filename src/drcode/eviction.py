@@ -84,12 +84,14 @@ AUTO_EVICTION_PAUSE_FRACTION = 6
 # strip rides EVERY eviction batch for free — one prompt-cache invalidation
 # already covers the whole pass — but a STANDALONE strip (no eviction batch
 # firing for other reasons) must earn its own invalidation: it fires only
-# when the stale thinking's ≈volume (chars/4) reached this fraction of the
-# serving role's window. Same value as the auto-clearing's pause fraction:
-# stale thinking renews itself at a similar per-turn pace once past the
-# freshness window, and a strip per exchange would invalidate the cache more
-# often than the dropped tokens save.
-THINKING_PAUSE_FRACTION = 6
+# when the stale thinking's ≈volume (chars/4) reached 2/3 (66.6%) of the
+# serving role's window. The constant is the divisor of the shared gate
+# form `tokens * FRACTION >= window`, so 1.5 = 1/1.5 = 2/3 of the window.
+# Deliberately far higher than the marks (1/3) and auto-clearing (1/6)
+# gates: a strip costs a prompt-cache invalidation per batch, so it is
+# worth paying for only when a large share of the window is stale
+# reasoning — the old 1/6 gate fired far too eagerly.
+THINKING_PAUSE_FRACTION = 1.5
 
 
 # -- extractive digest ----------------------------------------------------------------

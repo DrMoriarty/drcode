@@ -913,7 +913,7 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     yield Input(
                         value=str(d.thinking_keep_recent_turns),
                         id="ts-thinking-keep",
-                        placeholder="5",
+                        placeholder="0",
                         max_length=3,
                     )
                     yield Label(

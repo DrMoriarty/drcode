@@ -1690,6 +1690,27 @@ def test_run_bash_refuses_scan_outside_via_run_bash(project_root: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("platform", "want_mdfind"),
+    [("darwin", True), ("linux", False), ("win32", False)],
+)
+def test_scan_violation_mdfind_hint_is_macos_only(
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    want_mdfind: bool,
+) -> None:
+    # mdfind (Spotlight) exists only on macOS — the refusal must not point
+    # non-mac agents at a command that is not there.
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(PathViolation) as exc_info:
+        check_command(project_root, "find ~ -name x")
+    text = str(exc_info.value)
+    assert ("use `mdfind -name" in text) is want_mdfind
+    # The scoped-search advice is platform-independent.
+    assert "find . -name" in text and "grep_search/glob" in text
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "find . -name x",

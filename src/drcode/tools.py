@@ -44,6 +44,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -1445,6 +1446,13 @@ _SCAN_ROOT_FLAGS = {"--search-path"}
 
 
 def _scan_violation(command: str, cmd: str, raw: str, root: Path) -> PathViolation:
+    anywhere = ""
+    if sys.platform == "darwin":
+        anywhere = (
+            ", or — to locate a file anywhere on disk — use `mdfind -name "
+            "<name>` (Spotlight index: it does not walk the filesystem) and "
+            "then read only the concrete paths found"
+        )
     return PathViolation(
         f"Command refused: '{command}': {cmd} would scan '{raw}', which is "
         f"outside the allowed locations. A recursive walk of the user's "
@@ -1453,9 +1461,7 @@ def _scan_violation(command: str, cmd: str, raw: str, root: Path) -> PathViolati
         f"/Volumes, …) fires a system privacy (TCC) prompt attributed to this "
         f"app. {_writable_hint(root, None)} Scope the search inside the "
         f"project (plain `find . -name …` or `find {root} …`, grep_search/glob "
-        f"tools), or — to locate a file anywhere on disk — use `mdfind -name "
-        f"<name>` (Spotlight index: it does not walk the filesystem) and then "
-        f"read only the concrete paths found."
+        f"tools){anywhere}."
     )
 
 
@@ -1827,7 +1833,8 @@ def check_command(
     data the task does not need and, on macOS, fires TCC privacy prompts
     attributed to DrCode (the 2026-11-23 incident). `find` with no explicit
     path (default `.`) is untouched, and `mdfind` is deliberately allowed —
-    the refusal suggests it as the safe way to locate a file anywhere. See
+    the refusal suggests it as the safe way to locate a file anywhere, but
+    only on macOS (Spotlight is unavailable elsewhere). See
     the "bash filesystem-scan guard" section for the exact scope.
 
     Finally, an outbound request of a network client (`curl`, `wget`, `http`,

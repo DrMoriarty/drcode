@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import sys
+from collections.abc import Mapping
 from datetime import datetime
 
 from rich.cells import cell_len
@@ -20,10 +23,97 @@ from rich.style import Style
 from rich.syntax import Syntax
 from rich.text import Text
 
-# Braille spinner frames for the "work in progress" animation shown in a
-# reasoning block while the model is thinking and in a tool-call block while
-# the tool is executing.
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Spinner frame sets for the "work in progress" animation shown in a
+# reasoning block while the model is thinking, in a tool-call block while
+# the tool is executing and in the merge screens' busy/progress lines.
+# `SPINNER_FRAMES` (below) picks the set for the ACTUAL terminal at import
+# time — the braille glyphs only render when the session's character set
+# carries them (see spinner_frames), single-byte terminals get the plain
+# `/ - \ |` wheel.
+BRAILLE_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+ASCII_SPINNER_FRAMES = "/-\\|"
+
+
+def _locale_is_utf8(locale: str) -> bool:
+    """Whether the locale's character set can carry the braille pattern
+    block (U+2800–U+28FF): only the UTF-8 family can — C/POSIX, KOI8-*,
+    ISO-8859-*, CP125x and the like are single-byte charsets.
+
+    The character set is the trailing component after the last '.' or '@'
+    (en_US.UTF-8, C.utf8, de_DE@UTF-8); a bare 'C'/'POSIX' has none at all.
+    """
+    for sep in (".", "@"):
+        head, _, tail = locale.rpartition(sep)
+        if head and tail.strip().lower().replace("-", "").replace("_", "") == "utf8":
+            return True
+    return False
+
+
+def _braille_encodable(encoding: str) -> bool:
+    """Whether a stream with `encoding` can carry the braille frames
+    ("" or an unknown codec fails closed to the ASCII set)."""
+    if not encoding:
+        return False
+    try:
+        BRAILLE_SPINNER_FRAMES.encode(encoding)
+    except (LookupError, UnicodeEncodeError, ValueError):
+        return False
+    return True
+
+
+def spinner_frames(
+    environ: Mapping[str, str] | None = None,
+    output_encoding: str | None = None,
+) -> str:
+    """Pick the spinner frame set for the ACTUAL terminal.
+
+    CPython forces UTF-8 mode itself when the locale is C/POSIX, so the
+    stream encodings are NOT a reliable signal that the terminal renders
+    Unicode — the session's locale environment is. Order:
+
+    1. `DRCODE_SPINNER=ascii|braille` forces either side explicitly (the
+       escape hatch for a UTF-8 session whose terminal font lacks the
+       braille block — it would show empty boxes);
+    2. the POSIX resolution of LC_CTYPE — `LC_ALL`, then `LC_CTYPE`, then
+       `LANG`, the first non-empty wins: a UTF-8 character set means the
+       terminal speaks Unicode; anything else (C/POSIX, KOI8-*,
+       ISO-8859-*, CP125x, …) means a single-byte charset, where the
+       braille bytes render as stray letters and marks — the plain
+       `/ - \\ |` wheel is used there;
+    3. with no locale information at all (Windows), the encoding of the
+       stream Textual renders its frames into (`sys.__stderr__`) decides:
+       braille only when it can encode them.
+
+    The safe direction is the ASCII set: it renders on every terminal,
+    while a wrong braille choice is the visible garble.
+    """
+    env = os.environ if environ is None else environ
+    override = (env.get("DRCODE_SPINNER") or "").strip().lower()
+    if override in ("ascii", "plain"):
+        return ASCII_SPINNER_FRAMES
+    if override == "braille":
+        return BRAILLE_SPINNER_FRAMES
+    for var in ("LC_ALL", "LC_CTYPE", "LANG"):
+        value = (env.get(var) or "").strip()
+        if value:
+            return (
+                BRAILLE_SPINNER_FRAMES
+                if _locale_is_utf8(value)
+                else ASCII_SPINNER_FRAMES
+            )
+    if output_encoding is None:
+        stream = sys.__stderr__
+        output_encoding = str(getattr(stream, "encoding", "") or "")
+    return (
+        BRAILLE_SPINNER_FRAMES
+        if _braille_encodable(output_encoding)
+        else ASCII_SPINNER_FRAMES
+    )
+
+
+# The set the live TUI uses — resolved for this process's terminal at
+# import time (a session's character set does not change mid-run).
+SPINNER_FRAMES = spinner_frames()
 SPINNER_INTERVAL = 0.12
 
 # Task-id mention: '#' + 8 hex chars (models._short_id() = uuid4().hex[:8]).

@@ -60,6 +60,7 @@ from textual.timer import Timer
 from textual.widgets import Label, ListItem, ListView, Static
 
 from .. import merge_engine, merge_resolver
+from ..core.blocks import SPINNER_FRAMES as _SPINNER_FRAMES
 from ..merge_engine import is_fast_forward
 from ..models import TaskKind
 from ..task_env import WorktreeUnavailable
@@ -68,10 +69,10 @@ from .merge.stages import _fmt_seconds
 if TYPE_CHECKING:
     from .app import DrCodeApp
 
-# The busy spinner of the short blocking ops (r / m): braille frames and
-# the footer redraw interval — the same look as the ConflictScreen's
-# progress panel (which owns the canonical copies).
-_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# The footer redraw interval of the busy spinner of the short blocking
+# ops (r / m) — the frames themselves are the app-wide set from core.blocks
+# (`_SPINNER_FRAMES` — braille on a Unicode terminal, `/ - \ |` on a
+# single-byte one), the same look as the ConflictScreen's progress panel.
 _SPINNER_INTERVAL = 0.15
 
 # The footer's idle content (the hotkey line) — restored when a busy op
@@ -251,7 +252,7 @@ class UnmergedListScreen(ModalScreen[None]):
 
     def _start_title_spinner(self) -> None:
         """A silent (automatic) refresh begins: the title line shows the
-        same braille spinner as the footer's busy line — the dialog is
+        same spinner as the footer's busy line — the dialog is
         on screen with an empty list while the git sweep runs."""
         if self._title_timer is None:
             self._spinner_frame = 0

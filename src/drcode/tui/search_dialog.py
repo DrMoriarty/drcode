@@ -148,7 +148,7 @@ class SearchDialog(ModalScreen[None]):
             list[tuple[str, dict[str, Any], list[tuple[str, str]]]] | None
         ) = None
         self._search_timer = None
-        # Loading-indicator state: a braille spinner + elapsed-seconds
+        # Loading-indicator state: a spinner + elapsed-seconds
         # timer + real progress counts (see _load_archive). The timer
         # lives until the load worker finishes OR the dialog is torn
         # down, whichever comes first.
@@ -190,7 +190,7 @@ class SearchDialog(ModalScreen[None]):
     # -- loading indicator (spinner + elapsed + progress) ----------------------
 
     def _start_loading_indicator(self) -> None:
-        """Animate #srch-status while the archive loads: a braille frame
+        """Animate #srch-status while the archive loads: a spinner frame
         (same set/intervals as ReasoningBlock's thinking spinner), the
         elapsed seconds next to it and, once the progress callback starts
         arriving, the indexed-files count — the user sees the dialog is

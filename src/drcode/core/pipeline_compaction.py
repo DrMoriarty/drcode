@@ -1044,10 +1044,11 @@ class PipelineCompactionLayer(CoreState):
     def _stale_thinking_due(self, task: Task) -> bool:
         """Whether stale thinking (the sliding-window strip's selection)
         has piled up enough to be worth its OWN batch strip (its own
-        prompt-cache invalidation): its ≈volume (chars/4) reached
-        THINKING_PAUSE_FRACTION-th of the serving role's window. Below the
-        threshold the strip still rides every eviction batch that fires
-        anyway — there the invalidation is already paid for."""
+        prompt-cache invalidation): its ≈volume (chars/4) reached 2/3
+        (66.6%) of the serving role's window (THINKING_PAUSE_FRACTION as
+        the shared gate's divisor). Below the threshold the strip still
+        rides every eviction batch that fires anyway — there the
+        invalidation is already paid for."""
         tokens = self._stale_thinking_tokens(task)
         if tokens <= 0:
             return False
@@ -1104,9 +1105,8 @@ class PipelineCompactionLayer(CoreState):
         cost nothing, fresh results stay verbatim behind the
         AUTO_EVICTION_KEEP_RECENT anchor; the per-batch cache
         invalidation is the accepted tradeoff, exactly as in Claude
-        Code), or (c) the stale thinking's ≈volume reached
-        THINKING_PAUSE_FRACTION-th of the window — a standalone strip must
-        earn its own invalidation. Below (c) the stale thinking STILL
+        Code), or (c) the stale thinking's ≈volume reached 2/3 of the
+        window — a standalone strip must earn its own invalidation. Below (c) the stale thinking STILL
         rides every batch that fires for (a)/(b)/force: there the
         invalidation is already paid for. With all the gates quiet the
         pass does not fire. ``force=True`` is the PRE-COMPACTION eviction

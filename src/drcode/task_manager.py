@@ -601,12 +601,32 @@ class TaskManager:
         # that exists and is not COMPLETED yet) sink below every runnable
         # one; the git mergedness half of the gate is checked by the
         # pipeline's promotion worker, not here (no git calls in a sort).
+        # Above the bug block sits the REWORK tier: a task the tester or the
+        # external review has sent back for another development round
+        # (fix_rounds / review_rejections > 0) with input actually waiting
+        # for that round. Rework always outranks fresh work regardless of
+        # kind — a returned fix-round task is usually older than the bug
+        # reports a failed testing round just spawned, and must not lose
+        # the race to the next free slot. The pending_input guard keeps the
+        # tier active only while the round is still queued: the counters
+        # reset on success (set_verification / finalize_verified), so
+        # completed tasks never re-enter the queue anyway.
         def _queue_key(t: Task) -> tuple:
             blocked = 1 if self._status_blocked(t) else 0
+            # 0 = rework task (top tier), 1 = ordinary work — like `blocked`,
+            # the flag SINKS its holder, so rework sorts before everything.
+            rework = 0 if self._in_rework_tier(t) else 1
             if t.kind is TaskKind.BUG:
-                return (blocked, 0, 0, -(t.queue_seq if t.queue_seq is not None else 0))
+                return (
+                    blocked,
+                    rework,
+                    0,
+                    0,
+                    -(t.queue_seq if t.queue_seq is not None else 0),
+                )
             return (
                 blocked,
+                rework,
                 1,
                 not t.queue_head,
                 t.queue_seq if t.queue_seq is not None else 0,
@@ -614,6 +634,18 @@ class TaskManager:
 
         tasks.sort(key=_queue_key)
         return tasks
+
+    def _in_rework_tier(self, task: Task) -> bool:
+        """The REWORK tier of the queue sort: the task was sent back for
+        another development round (by the tester's retry_here verdict or an
+        external review rejection) and its round input is still waiting.
+        Such a task outranks all fresh work (bug block included). The
+        pending_input guard keeps the tier active only while the round is
+        actually queued; the counters themselves reset on success, so a
+        completed task can never re-enter the queue in this state."""
+        return bool(task.pending_input) and (
+            task.fix_rounds > 0 or task.review_rejections > 0
+        )
 
     def _status_blocked(self, task: Task) -> bool:
         """The STATUS half of the dependency gate: some dependency exists
@@ -1149,11 +1181,12 @@ class TaskManager:
         Returns the moved task, or None when the move is impossible: the
         task is not queued, it is already at the corresponding edge of the
         queue, the swap would cross the bug block (bug reports always run
-        first — hold a bug with set_hold if it must wait) or the
-        dependency-blocked tier (a blocked task sinks below every runnable
-        one no matter the stamps — a swap across that boundary cannot be
-        reproduced by the queued() sort and would snap right back, looking
-        like a no-op).
+        first — hold a bug with set_hold if it must wait), the rework tier
+        (a task returned for a fix/review round always outranks fresh work)
+        or the dependency-blocked tier (a blocked task sinks below every
+        runnable one no matter the stamps — a swap across any of those
+        boundaries cannot be reproduced by the queued() sort and would snap
+        right back, looking like a no-op).
         """
         task = self.tasks.get(task_id)
         j = self._move_target(task_id, up=up)
@@ -1190,6 +1223,11 @@ class TaskManager:
         # key element), so a swap across the blocked/unblocked boundary is
         # unreproducible: the stamps would be re-sorted straight back.
         if self._status_blocked(order[j]) != self._status_blocked(task):
+            return None
+        # Same for the rework tier (the second key element): a returned
+        # fix-round/review-rejection task always outranks fresh work no
+        # matter the stamps.
+        if self._in_rework_tier(order[j]) != self._in_rework_tier(task):
             return None
         return j
 

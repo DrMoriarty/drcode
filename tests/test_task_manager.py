@@ -1242,6 +1242,98 @@ def test_requeue_failed_fix_persists_across_restart(
     assert [e.text for e in task2.pending_input] == ["broken"]
 
 
+# -- rework tier: a returned fix/review round outranks all fresh work ---------------
+
+
+def _requeue_fix_round(manager: TaskManager, kind: TaskKind = TaskKind.BUG) -> Task:
+    """Drive a task through one failed testing round back to QUEUED
+    (the tester's retry_here path)."""
+    task = manager.create("fix", "round 1 work", kind)
+    task.pending_input.clear()  # the original prompt was consumed by round 1
+    _to_testing(manager, task.id)
+    task.verification = VerificationStatus.FAILED
+    manager.storage.save(task)
+    manager.requeue_failed_fix(task.id, "your change broke pytest", max_rounds=3)
+    return task
+
+
+def test_requeued_fix_round_outranks_fresh_bug(manager: TaskManager) -> None:
+    fix = _requeue_fix_round(manager, kind=TaskKind.BUG)
+    assert fix.fix_rounds == 1
+    # A bug report created AFTER the fix task entered development — its
+    # queue_seq is newer, so without the rework tier it would sort ahead.
+    fresh = manager.create("fresh bug", "regression", kind=TaskKind.BUG)
+
+    assert manager.queued() == [fix, fresh]
+    assert manager.promote_next() is fix
+
+
+def test_requeued_fix_round_outranks_fresh_work_of_any_kind(
+    manager: TaskManager,
+) -> None:
+    fix = _requeue_fix_round(manager, kind=TaskKind.FEATURE)
+    fresh_bug = manager.create("fresh bug", "x", kind=TaskKind.BUG)
+    fresh_feature = manager.create("fresh feature", "x")
+    assert manager.queued() == [fix, fresh_bug, fresh_feature]
+
+
+def test_requeued_review_rejection_outranks_fresh_bug(manager: TaskManager) -> None:
+    task = manager.create("reviewed", "work")
+    task.pending_input.clear()
+    _to_testing(manager, task.id)
+    manager.requeue_review_rejection(task.id, "fix the style")
+    assert task.review_rejections == 1
+    fresh = manager.create("fresh bug", "x", kind=TaskKind.BUG)
+
+    assert manager.queued() == [task, fresh]
+    assert manager.promote_next() is task
+
+
+def test_rework_tier_requires_pending_input(manager: TaskManager) -> None:
+    """The tier is active only while the round is actually waiting: a task
+    with fix_rounds > 0 but nothing left to run (its input was already
+    consumed mid-run) keeps its ordinary queue position, and a task whose
+    counters were reset (e.g. the user sent new input, set_verification
+    passed) never gets the boost back."""
+    stale = _requeue_fix_round(manager, kind=TaskKind.BUG)
+    stale.pending_input.clear()
+    stale.touch()
+    manager.storage.save(stale)
+    fresh = manager.create("fresh bug", "x", kind=TaskKind.BUG)
+    assert manager.queued() == [fresh, stale]
+
+    # Counters reset on a user message to a TESTING task (send() path).
+    reset = manager.create("reset", "x", kind=TaskKind.BUG)
+    reset.pending_input.clear()
+    _to_testing(manager, reset.id)
+    reset.fix_rounds = 1
+    manager.storage.save(reset)
+    manager.send(reset.id, "try again differently")
+    assert reset.fix_rounds == 0
+    # reset has the newest bug stamp, stale the oldest — plain bug order.
+    assert manager.queued() == [reset, fresh, stale]
+
+
+def test_move_cannot_cross_rework_tier(manager: TaskManager) -> None:
+    """Like the bug block and the blocked tier, the rework tier is a hard
+    boundary: a swap across it can never be reproduced by the queued()
+    sort (the returned task outranks fresh work no matter the stamps)."""
+    fix = _requeue_fix_round(manager, kind=TaskKind.FEATURE)
+    a = manager.create("a", "x")
+    assert manager.queued() == [fix, a]
+
+    # Moving the ordinary task ahead of the rework task — refused.
+    assert manager.move_in_queue(a.id, up=False) is None
+    # Moving the rework task below the ordinary one — refused too.
+    assert manager.move_in_queue(fix.id, up=True) is None
+    assert manager.queued() == [fix, a]
+
+    # Manual order within the ordinary block keeps reproducing itself.
+    b = manager.create("b", "x")
+    assert manager.move_in_queue(b.id, up=False) is b
+    assert manager.queued() == [fix, b, a]
+
+
 # -- dependencies (depends_on promotion gate) -------------------------------------
 
 

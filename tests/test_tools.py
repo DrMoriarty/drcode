@@ -769,10 +769,20 @@ def test_grep_search_default_timeout_partial_results(
     # stopped at, and the advice to narrow the include mask.
     for n in range(40):
         (project_root / f"f{n:02}.txt").write_text("needle\n")
-    # Budget 0.5s vs 20ms per read: the lazy enumeration (one `git ls-files`
-    # spawn) fits comfortably inside the budget, the 40 reads do not.
     _slow_read(monkeypatch, delay=0.02)
     monkeypatch.setattr(tools, "GREP_DEFAULT_TIMEOUT_S", 0.5)
+    # Materialize the candidate list BEFORE the clock starts: grep_search
+    # budgets the lazy enumeration (a `git ls-files` spawn for a governing
+    # tree, else a scandir walk) together with the reads, and under CPU
+    # contention that spawn+walk alone can eat the whole 0.5s — the scan is
+    # then cut before the first read (no hits) or at a candidate whose index
+    # trails the hit count (scandir order is not sorted). This test is about
+    # the per-candidate deadline, so hand over a sorted, instant enumeration
+    # and let only the 20ms reads race the budget.
+    candidates = sorted(tools._grep_candidates(project_root))
+    monkeypatch.setattr(
+        tools, "_grep_candidates", lambda root, prefix="": iter(candidates)
+    )
     results = grep_search(project_root, "needle")
     hits = [r for r in results if r.endswith(": needle")]
     notes = [r for r in results if not r.endswith(": needle")]

@@ -27,6 +27,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Static
 
 from drcode import merge_engine as me
+from drcode import merge_resolver
 from drcode.models import TaskStatus, VerificationStatus
 from drcode.settings import ProjectSettings, ProjectSettingsStore, TaskIsolation
 from drcode.task_env import TaskEnvironment, branch_for
@@ -628,7 +629,11 @@ async def test_land_spins_through_phases_and_restores_footer(
         )
         screen = app.screen
         assert isinstance(screen, UnmergedListScreen)
-        # Slow the concluding ff-merge so its phase is observable.
+        # Slow BOTH phases so their labels are observable: the preparing
+        # phase covers only real git calls otherwise, and under load a
+        # starved event loop can batch the footer transition straight to
+        # "fast-forwarding…" before the poll ever sees the preparing
+        # label (no wait deadline can recover a missed transient phase).
         env = app.task_env
         original_ff = env.ff_merge_branch
 
@@ -637,6 +642,20 @@ async def test_land_spins_through_phases_and_restores_footer(
             return original_ff(task_id)
 
         monkeypatch.setattr(env, "ff_merge_branch", slow_ff)
+        original_prepare = merge_resolver.prepare
+
+        def slow_prepare(
+            project_root: Path,
+            task_id: str,
+            worktree: Path,
+            base_branch: str,
+        ) -> object:
+            time.sleep(0.4)
+            return original_prepare(
+                project_root, task_id, worktree, base_branch
+            )
+
+        monkeypatch.setattr(merge_resolver, "prepare", slow_prepare)
         await pilot.press("m")
         await wait_until(
             lambda: f"merging #{t1}" in _footer_text(screen),

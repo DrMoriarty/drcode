@@ -4239,11 +4239,8 @@ async def test_task_settings_dialog_web_fetch_host_lists_hidden(
             assert allow_col is not None  # the input always sits in a ts-col
             return {
                 "allow": "ts-hidden" in allow_col.classes,
-                "block_label": (
-                    "ts-hidden" in dialog.query_one("#ts-web-fetch-block-label").classes
-                ),
                 "block": (
-                    "ts-hidden" in dialog.query_one("#ts-web-fetch-block").classes
+                    "ts-hidden" in dialog.query_one("#ts-web-fetch-block-col").classes
                 ),
             }
 
@@ -4261,7 +4258,6 @@ async def test_task_settings_dialog_web_fetch_host_lists_hidden(
             assert isinstance(dialog, AgentRuntimeDialog)
             assert hidden_map(dialog) == {
                 "allow": allow_hidden,
-                "block_label": block_hidden,
                 "block": block_hidden,
             }, f"mode={mode}"
             await pilot.press("escape")
@@ -4284,9 +4280,36 @@ async def test_task_settings_dialog_web_fetch_host_lists_hidden(
             await pilot.pause()
             assert hidden_map(dialog) == {
                 "allow": allow_hidden,
-                "block_label": block_hidden,
                 "block": block_hidden,
             }, f"switched to {mode}"
+
+        # Geometry: the block field sits in the mode row, to the RIGHT of
+        # the "Research web fetch" select (mirroring the allow field's
+        # placement in allowlist mode) — not full-width below it.
+        mode_select.value = WebFetchMode.ALL
+        await pilot.pause()
+        block_col = dialog.query_one("#ts-web-fetch-block-col")
+        mode_row = mode_select.parent
+        assert mode_row is not None and mode_row.parent is not None
+        assert block_col.parent is mode_row.parent, (
+            "block col must share the mode row with the select"
+        )
+        assert (
+            dialog.query_one("#ts-web-fetch-block-label").region.x
+            > mode_select.region.x + mode_select.region.width - 1
+        ), "block label must start right of the mode select"
+        # In allowlist mode BOTH fields are visible, independently
+        # toggleable, and both sit in the same row.
+        mode_select.value = WebFetchMode.ALLOWLIST
+        await pilot.pause()
+        allow_input = dialog.query_one("#ts-web-fetch-allow")
+        block_input = dialog.query_one("#ts-web-fetch-block")
+        assert allow_input.parent is not None and block_input.parent is not None
+        assert allow_input.parent.parent is mode_row.parent
+        assert block_input.parent.parent is mode_row.parent
+        assert block_input.region.x > allow_input.region.x, (
+            "block field must sit right of the allow field in allowlist mode"
+        )
         await pilot.press("escape")
         await pilot.pause()
 

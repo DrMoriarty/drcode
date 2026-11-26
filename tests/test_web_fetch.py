@@ -198,7 +198,7 @@ def test_policy_allowlist_empty_refuses_everything_with_a_hint() -> None:
     policy = _policy(WebFetchMode.ALLOWLIST)
     refusal = policy.host_refusal("example.com")
     assert refusal is not None
-    assert "EMPTY" in refusal and "all hosts" in refusal
+    assert "EMPTY" in refusal and "blacklist" in refusal
 
 
 def test_policy_block_beats_allowlist() -> None:
@@ -1150,7 +1150,7 @@ def test_subagent_web_fetch_budget_is_its_own(
 def test_mode_labels_and_enabled() -> None:
     assert WebFetchMode.OFF.label == "off"
     assert WebFetchMode.ALLOWLIST.label == "allowlist"
-    assert WebFetchMode.ALL.label == "all hosts"
+    assert WebFetchMode.ALL.label == "blacklist"
     assert WebFetchMode.UNRESTRICTED.label == "unrestricted"
     assert WebFetchMode.OFF.enabled is False
     assert WebFetchMode.ALLOWLIST.enabled is True

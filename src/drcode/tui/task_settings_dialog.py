@@ -870,19 +870,20 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                             id="ts-web-fetch-allow",
                             placeholder="docs.example.com, github.com",
                         )
-                yield Label(
-                    "Web fetch block list (comma-separated hosts) — always "
-                    "wins over the allow list and over the all-hosts mode; "
-                    "private and link-local addresses are refused in every "
-                    "mode",
-                    id="ts-web-fetch-block-label",
-                    classes="ts-label",
-                )
-                yield Input(
-                    value=", ".join(d.web_fetch_block_hosts),
-                    id="ts-web-fetch-block",
-                    placeholder="(empty — nothing blocked)",
-                )
+                    with Vertical(classes="ts-col", id="ts-web-fetch-block-col"):
+                        yield Label(
+                            "Web fetch block list (comma-separated hosts) — "
+                            "always wins over the allow list and over the "
+                            "blacklist mode; private and link-local "
+                            "addresses are refused in every mode",
+                            id="ts-web-fetch-block-label",
+                            classes="ts-label",
+                        )
+                        yield Input(
+                            value=", ".join(d.web_fetch_block_hosts),
+                            id="ts-web-fetch-block",
+                            placeholder="(empty — nothing blocked)",
+                        )
                 yield Label("Code index", classes="ts-section")
                 yield ToggleRow(
                     "Code index — the agents get the code_symbols/"
@@ -1076,10 +1077,11 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         # Web fetch host lists (their values are kept in the dormant modes,
         # never rewritten — the user's entries come back when the mode
         # turns on): the allow list shows ONLY in allowlist mode; the
-        # block list shows in allowlist AND all modes (it always wins, so
-        # it is meaningful in both — the user can block specific hosts);
-        # the `unrestricted` mode hides BOTH lists (dormant — the saved
-        # values have no effect there).
+        # block list shows in allowlist AND blacklist modes (it always
+        # wins, so it is meaningful in both — the user can block specific
+        # hosts); the `unrestricted` mode hides BOTH lists (dormant — the
+        # saved values have no effect there). Each field hides through its
+        # own ts-col in the mode row, independently.
         allow_visible = d.web_fetch_mode is WebFetchMode.ALLOWLIST
         block_visible = d.web_fetch_mode in (
             WebFetchMode.ALLOWLIST,
@@ -1088,10 +1090,9 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         allow_col = self.query_one("#ts-web-fetch-allow").parent
         assert allow_col is not None  # the input always sits in a ts-col
         allow_col.set_class(not allow_visible, "ts-hidden")
-        self.query_one("#ts-web-fetch-block-label").set_class(
+        self.query_one("#ts-web-fetch-block-col").set_class(
             not block_visible, "ts-hidden"
         )
-        self.query_one("#ts-web-fetch-block").set_class(not block_visible, "ts-hidden")
 
     # -- widgets -> draft ------------------------------------------------------
 

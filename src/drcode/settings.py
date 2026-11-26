@@ -219,7 +219,7 @@ class WebFetchMode(str, enum.Enum):
         if self is WebFetchMode.ALLOWLIST:
             return "allowlist"
         if self is WebFetchMode.ALL:
-            return "all hosts"
+            return "blacklist"
         if self is WebFetchMode.UNRESTRICTED:
             return "unrestricted"
         return "off"
@@ -239,8 +239,9 @@ class WebFetchMode(str, enum.Enum):
             )
         if self is WebFetchMode.ALL:
             return (
-                "The research agent may read any public web host (the block "
-                "list and the private-network guard still apply)."
+                "Blacklist mode: the research agent may read any public web "
+                "host EXCEPT those on the web-fetch block list (the "
+                "private-network guard still applies)."
             )
         if self is WebFetchMode.UNRESTRICTED:
             return (
@@ -659,7 +660,7 @@ class ProjectSettings(BaseModel):
     # host also matches its subdomains.
     web_fetch_allow_hosts: list[str] = Field(default_factory=list)
     # Hosts the research agent must NEVER fetch (wins over the allow list
-    # and over the "all hosts" mode). The private-network / metadata-address
+    # and over the "blacklist" mode). The private-network / metadata-address
     # guard of `drcode.web_fetch` applies in every mode regardless.
     web_fetch_block_hosts: list[str] = Field(default_factory=list)
     # Agent-created task drafts: when on, the agents' task-creation tools
@@ -1175,7 +1176,7 @@ def task_settings_hints(
                     "until at least one host is allowed."
                 ),
                 fix=lambda s: setattr(s, "web_fetch_mode", WebFetchMode.ALL),
-                fix_label="Allow all hosts",
+                fix_label="Switch to blacklist",
                 scope="runtime",
             )
         )
@@ -1218,7 +1219,7 @@ def task_settings_hints(
                     "Web fetch: the host lists are hidden and unused in the "
                     f"{WebFetchMode.UNRESTRICTED.label} mode — every host "
                     "the private-address guard admits is fetchable. Switch "
-                    "back to allowlist/all hosts to make them effective."
+                    "back to allowlist/blacklist to make them effective."
                 ),
                 scope="runtime",
             )

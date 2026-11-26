@@ -249,7 +249,7 @@ class WebFetchPolicy:
                     "web fetch runs in ALLOWLIST mode with an EMPTY allow "
                     "list, so every host is refused. Ask the user to add the "
                     "hosts to allow (Settings → Web fetch), or switch the "
-                    "mode to all hosts."
+                    "mode to blacklist."
                 )
             if not _matches_host_list(bare, self.allow_hosts):
                 allowed = ", ".join(self.allow_hosts)

@@ -827,6 +827,12 @@ class PipelineAgentRunLayer(CoreState):
             # The code-index tools (code_symbols/code_outline): None
             # effect at the OFF default — nothing is registered.
             code_index=code_index,
+            # The project's `unrestricted` web-fetch mode lifts the
+            # run_bash network guard for THIS run — run_bash's
+            # description must say so (see build_agent).
+            network_unrestricted=(
+                self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+            ),
             # The real scratch path is baked into the write tools'
             # descriptions (no literal <task-id> placeholder for the model
             # to copy verbatim into a path argument).

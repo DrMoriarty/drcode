@@ -245,7 +245,10 @@ async def test_resolver_runs_for_unmerged_branch(
     state.steps = [api_error()]
 
     def fake_build_agent(
-        config: Any, root: Path | None = None, task_id: str | None = None
+        config: Any,
+        root: Path | None = None,
+        task_id: str | None = None,
+        network_unrestricted: bool = False,
     ) -> Agent[Any, str]:
         return Agent(state.model())
 

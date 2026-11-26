@@ -214,6 +214,7 @@ def coding_tool_schemas(
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the coding agent for `kind` (builds the agent —
     no network, pure wiring). `research_git`, `subagent_limit`,
@@ -224,7 +225,8 @@ def coding_tool_schemas(
     kind — see `web_fetch.web_fetch_policy_for`); `code_index` is the
     project's code_index_mode decision resolved per role by
     `agent_build.code_index_tools_for` (one of the three §8.2 accounting
-    mirrors)."""
+    mirrors); `network_unrestricted` mirrors the run_bash network
+    description (see `agent_build._network_desc`)."""
     from .agent import build_agent
 
     return tool_schemas(
@@ -236,6 +238,7 @@ def coding_tool_schemas(
             subagent_limit=subagent_limit,
             research_web_fetch=research_web_fetch,
             code_index=code_index,
+            network_unrestricted=network_unrestricted,
         )
     )
 
@@ -247,9 +250,11 @@ def tester_tool_schemas(
     allow_push: bool = False,
     root: Path | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
 ) -> list[tuple[str, str]]:
-    """Tool wire-texts of the tester agent (`code_index` mirrors the
-    tester's code-index decision — see `coding_tool_schemas`)."""
+    """Tool wire-texts of the tester agent (`code_index` and
+    `network_unrestricted` mirror the tester's code-index decision and the
+    run_bash network description — see `coding_tool_schemas`)."""
     from .agent import build_tester_agent
 
     return tool_schemas(
@@ -259,6 +264,7 @@ def tester_tool_schemas(
             allow_push=allow_push,
             root=root,
             code_index=code_index,
+            network_unrestricted=network_unrestricted,
         )
     )
 
@@ -285,14 +291,23 @@ def resolver_tool_schemas(
     *,
     root: Path | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
 ) -> list[tuple[str, str]]:
     """Tool wire-texts of the resolver agent (read/inspect tools + the
     edit pair + set_resolution — whatever `build_resolver_agent`
-    registers; no network, pure wiring). `code_index` mirrors the
-    resolver's code-index decision — see `coding_tool_schemas`."""
+    registers; no network, pure wiring). `code_index` and
+    `network_unrestricted` mirror the resolver's code-index decision and
+    the run_bash network description — see `coding_tool_schemas`."""
     from .agent import build_resolver_agent
 
-    return tool_schemas(build_resolver_agent(config, root=root, code_index=code_index))
+    return tool_schemas(
+        build_resolver_agent(
+            config,
+            root=root,
+            code_index=code_index,
+            network_unrestricted=network_unrestricted,
+        )
+    )
 
 
 # -- per-agent selection (shared by the status-bar counter and the dialog) ----
@@ -759,6 +774,7 @@ def task_reports(
     subagent_limit: int = 0,
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
     active_goals: list[Goal] | None = None,
     linked_goal: Goal | None = None,
 ) -> tuple[CtxReport | None, CtxReport | None, CtxReport | None, RunUsage, int]:
@@ -782,7 +798,9 @@ def task_reports(
     request as leading system messages and are estimated as their own line
     of the development report's "system prompt" section (absent there when
     the hook yields None); the tester and resolver never carry goals, so
-    their reports are unaffected. `*_live_tokens`
+    their reports are unaffected. `network_unrestricted` mirrors the
+    project's `unrestricted` web-fetch mode for all three reports (the
+    run_bash network description differs there). `*_live_tokens`
     carry the live in-run
     readings of the respective agents where one is running (they win over
     the persisted transcript, like the dev counter does).
@@ -804,6 +822,7 @@ def task_reports(
                 subagent_limit=subagent_limit,
                 research_web_fetch=research_web_fetch,
                 code_index=code_index,
+                network_unrestricted=network_unrestricted,
             ),
             goals_component=goals_system_component(
                 task.kind, task.goal_id, active_goals or [], linked_goal
@@ -826,6 +845,7 @@ def task_reports(
                 allow_push=tester_allow_push,
                 root=project_root,
                 code_index=code_index,
+                network_unrestricted=network_unrestricted,
             ),
             exact_tokens=tester_live_tokens,
         )
@@ -838,7 +858,10 @@ def task_reports(
             resolver_config,
             system_components=system_components_resolver(project_root),
             tools=resolver_tool_schemas(
-                resolver_config, root=project_root, code_index=code_index
+                resolver_config,
+                root=project_root,
+                code_index=code_index,
+                network_unrestricted=network_unrestricted,
             ),
             exact_tokens=resolver_live_tokens,
         )

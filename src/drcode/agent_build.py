@@ -119,16 +119,31 @@ def _scratch_desc(task_id: str | None) -> str:
     return str(tools.scratch_dir(task_id)) if task_id else "/tmp/drcode/<task-id>"
 
 
-def _network_desc(*, web_fetch_available: bool) -> str:
+def _network_desc(
+    *, web_fetch_available: bool, network_unrestricted: bool = False
+) -> str:
     """The network half of a run_bash tool description.
 
-    External access belongs to the managed `web_fetch` tool, run_bash is
-    local-only — the model must know it BEFORE it tries `curl
+    By default external access belongs to the managed `web_fetch` tool and
+    run_bash is local-only — the model must know it BEFORE it tries `curl
     https://example.com` and burns a round on the refusal (see the "bash
     network guard" section in `drcode.tools`). An agent that has no
     `web_fetch` tool in this run is told so plainly, so it does not go
     looking for a replacement.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode)
+    lifts the guard for this run (`tools.check_command` skips its network
+    half) — the description must say so, or the model never dares to use
+    the network it is actually allowed to use.
     """
+    if network_unrestricted:
+        return (
+            "Network: external requests from bash are ALLOWED — this run "
+            "runs with the network-unrestricted mode, so any host "
+            "(curl, wget, http/https) and the redirect-following flags "
+            "are permitted. For reading web pages prefer the web_fetch "
+            "tool when it is available in this run."
+        )
     if web_fetch_available:
         instead = "read web pages with the web_fetch tool, not from bash"
     else:
@@ -462,6 +477,7 @@ def build_agent(
     todo_supplier: Callable[[], str | None] | None = None,
     research_web_fetch: WebFetchPolicy | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
     mcp_toolsets: Sequence[AbstractToolset] | None = None,
     request_turns: Callable[[], int] | None = None,
@@ -547,6 +563,12 @@ def build_agent(
     budget — see `drcode.subagents.run_delegate_tool`); the parent's fetch
     budget (`FETCHES_PER_RUN`) and host policy are enforced by
     `drcode.web_fetch`.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode,
+    read at activation) lifts the run_bash network guard for this run —
+    the run_bash description must say so (see `_network_desc`), or the
+    model never uses the network it is actually allowed to use. The same
+    flag rides the deps (`AgentDeps.network_unrestricted`).
 
     `announce_wait` (the pipeline's per-run slot-wait announcer) is
     forwarded to `agent_model.build_model`: when the provider's
@@ -868,7 +890,7 @@ def build_agent(
             "suites) —\nvalues above 3600 (60 minutes) are clamped to 3600.\n"
             "rm/mv/cp are only allowed with paths inside the project root or "
             f"your\nscratch directory {scratch}.\n"
-            f"{_network_desc(web_fetch_available=research_web_fetch is not None)}"
+            f"{_network_desc(web_fetch_available=research_web_fetch is not None, network_unrestricted=network_unrestricted)}"
         )
     )
     async def run_bash(
@@ -1526,6 +1548,7 @@ def build_tester_agent(
     review_gate: bool = False,
     task_id: str | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
     mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[TesterDeps, str]:
@@ -1555,6 +1578,11 @@ def build_tester_agent(
     `code_index_tools_for` and read at activation) registers the
     `code_symbols` / `code_outline` tools on the tester too; at False
     (the default) they are not registered at all.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode,
+    read at activation) lifts the run_bash network guard for this round —
+    the run_bash description must say so (see `_network_desc` and
+    `build_agent`).
 
     `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
@@ -1661,7 +1689,7 @@ def build_tester_agent(
             "suites, builds) —\nvalues above 3600 (60 minutes) are clamped "
             "to 3600.\nrm/mv/cp are only allowed with paths inside the "
             f"project root or your\nscratch directory {scratch}.\n"
-            f"{_network_desc(web_fetch_available=False)}"
+            f"{_network_desc(web_fetch_available=False, network_unrestricted=network_unrestricted)}"
         )
     )
     async def run_bash(
@@ -1968,6 +1996,7 @@ def build_resolver_agent(
     root: Path | None = None,
     task_id: str | None = None,
     code_index: bool = False,
+    network_unrestricted: bool = False,
     announce_wait: agent_model.WaitAnnouncer | None = None,
     mcp_toolsets: Sequence[AbstractToolset] | None = None,
 ) -> Agent[ResolverDeps, str]:
@@ -1990,6 +2019,11 @@ def build_resolver_agent(
     `code_index_tools_for` and read at activation) registers the
     `code_symbols` / `code_outline` tools on the resolver too; at False
     (the default) they are not registered at all.
+
+    `network_unrestricted` (the project's `unrestricted` web-fetch mode,
+    read at activation) lifts the run_bash network guard for this round —
+    the run_bash description must say so (see `_network_desc` and
+    `build_agent`).
 
     `announce_wait` — see `build_agent`: the provider slot-wait announcer.
     """
@@ -2080,7 +2114,7 @@ def build_resolver_agent(
             "verification suite (the pipeline runs those checks itself\nand "
             "its verdict decides).\nrm/mv/cp are only allowed with paths "
             f"inside the worktree or your\nscratch directory {scratch}.\n"
-            f"{_network_desc(web_fetch_available=False)}"
+            f"{_network_desc(web_fetch_available=False, network_unrestricted=network_unrestricted)}"
         )
     )
     async def run_bash(

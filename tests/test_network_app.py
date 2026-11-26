@@ -206,6 +206,7 @@ async def test_research_task_builds_agent_with_research_role_config(
         todo_supplier: Any = None,
         research_web_fetch: Any = None,
         code_index: bool = False,
+        network_unrestricted: bool = False,
         announce_wait: Any = None,
         mcp_toolsets: Any = None,
         request_turns: Any = None,
@@ -228,6 +229,8 @@ async def test_research_task_builds_agent_with_research_role_config(
             kwargs["todo_supplier"] = todo_supplier
         if research_web_fetch is not None:
             kwargs["research_web_fetch"] = research_web_fetch
+        if network_unrestricted:
+            kwargs["network_unrestricted"] = network_unrestricted
         if announce_wait is not None:
             kwargs["announce_wait"] = announce_wait
         return real_build_agent(config, **kwargs)

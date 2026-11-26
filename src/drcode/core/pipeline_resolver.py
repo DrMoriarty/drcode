@@ -634,6 +634,12 @@ class PipelineResolverLayer(CoreState):
                 code_index=code_index_tools_for(self.settings, AgentRole.RESOLVER),
                 # Provider slot-wait visibility (see _wait_announcer).
                 announce_wait=self._wait_announcer(task_id, AgentRole.RESOLVER),
+                # The project's `unrestricted` web-fetch mode lifts the
+                # run_bash network guard for this round — run_bash's
+                # description must say so (see build_resolver_agent).
+                network_unrestricted=(
+                    self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+                ),
                 # External MCP servers (docs/mcp-client-design.md §2), read
                 # at activation; empty roles matrix = none. The reviewer
                 # agent below deliberately gets none (read-only pass).

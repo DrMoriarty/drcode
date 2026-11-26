@@ -60,6 +60,7 @@ from ..eviction import (
 from ..models import Task, TaskKind, render_todos
 from ..prompts import load_compaction_prompts, load_resolver_prompt
 from ..providers import AgentRole
+from ..settings import WebFetchMode
 from ..transcript import (
     MODEL_SWITCH_NOTE_PREFIX,
     drop_model_switch_notes,
@@ -471,8 +472,13 @@ class PipelineCompactionLayer(CoreState):
                     root=root,
                     # Mirror rule (§8.2): the tool schemas counted here
                     # must match the real wiring — the tester carries the
-                    # code-index tools when the mode is ON.
+                    # code-index tools when the mode is ON, and the
+                    # run_bash network description follows the project's
+                    # `unrestricted` web-fetch mode.
                     code_index=code_index_tools_for(self.settings, AgentRole.TESTER),
+                    network_unrestricted=(
+                        self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+                    ),
                 )
             elif role is AgentRole.RESOLVER:
                 instructions = load_resolver_prompt(root)
@@ -487,6 +493,9 @@ class PipelineCompactionLayer(CoreState):
                         root=root,
                         code_index=code_index_tools_for(
                             self.settings, AgentRole.RESOLVER
+                        ),
+                        network_unrestricted=(
+                            self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
                         ),
                     )
                 )
@@ -503,8 +512,12 @@ class PipelineCompactionLayer(CoreState):
                     # framing whenever the tool is registered for this role.
                     research_web_fetch=web_fetch_policy_for(self.settings, role),
                     # Same mirror rule for the code-index tools (None
-                    # effect at the OFF default).
+                    # effect at the OFF default) and the run_bash network
+                    # description (the project's `unrestricted` mode).
                     code_index=code_index_tools_for(self.settings, role),
+                    network_unrestricted=(
+                        self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+                    ),
                 )
         except Exception:  # noqa: BLE001 - a measurement gap must not kill compaction
             return None

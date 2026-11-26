@@ -2126,11 +2126,15 @@ async def _check_command_async(
             timeout=_NETWORK_CHECK_TIMEOUT,
         )
     except TimeoutError:
+        # NOTE: this path is reachable only while the network half of the
+        # guard is in force — the `unrestricted` mode skips it entirely
+        # (see check_command) — so the loopback wording below stays
+        # accurate for every run that can actually hit this refusal.
         raise PathViolation(
             f"Command refused: '{command}': checking the target's address took "
             f"longer than {_NETWORK_CHECK_TIMEOUT:.0f}s (a stalled name "
-            f"resolver), so the command cannot be shown to reach only the LOCAL "
-            f"machine. run_bash may only talk to loopback (localhost, "
+            f"resolver), so the command cannot be shown to stay within this "
+            f"run's bash network policy (local-only: loopback — localhost, "
             f"127.0.0.0/8, ::1); retry with a loopback address or an IP literal."
         ) from None
 

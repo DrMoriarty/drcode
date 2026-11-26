@@ -1073,17 +1073,25 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                 widget.parent.set_changed(is_changed)
             else:
                 widget.set_class(is_changed, "changed")
-        # Web fetch host lists are HIDDEN entirely (their values are kept,
+        # Web fetch host lists (their values are kept in the dormant modes,
         # never rewritten — the user's entries come back when the mode
-        # turns on): the allow list shows ONLY in allowlist mode (in the
-        # `unrestricted` mode BOTH lists are dormant — the saved values
-        # have no effect), the block list is hidden in every mode.
+        # turns on): the allow list shows ONLY in allowlist mode; the
+        # block list shows in allowlist AND all modes (it always wins, so
+        # it is meaningful in both — the user can block specific hosts);
+        # the `unrestricted` mode hides BOTH lists (dormant — the saved
+        # values have no effect there).
         allow_visible = d.web_fetch_mode is WebFetchMode.ALLOWLIST
+        block_visible = d.web_fetch_mode in (
+            WebFetchMode.ALLOWLIST,
+            WebFetchMode.ALL,
+        )
         allow_col = self.query_one("#ts-web-fetch-allow").parent
         assert allow_col is not None  # the input always sits in a ts-col
         allow_col.set_class(not allow_visible, "ts-hidden")
-        self.query_one("#ts-web-fetch-block-label").set_class(True, "ts-hidden")
-        self.query_one("#ts-web-fetch-block").set_class(True, "ts-hidden")
+        self.query_one("#ts-web-fetch-block-label").set_class(
+            not block_visible, "ts-hidden"
+        )
+        self.query_one("#ts-web-fetch-block").set_class(not block_visible, "ts-hidden")
 
     # -- widgets -> draft ------------------------------------------------------
 

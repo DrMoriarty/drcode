@@ -26,6 +26,7 @@ from ..context_layout import (
 )
 from ..models import Task, TaskKind, TaskStatus, VerificationStatus, _now
 from ..providers import AgentRole
+from ..settings import WebFetchMode
 from ..web_fetch import web_fetch_policy_for
 from .ctx_dialog import ContextDialog
 from .state import DrCodeState, update_static_if_changed
@@ -650,6 +651,11 @@ class TaskStatusLayer(DrCodeState):
             # the same project decision for all three non-research
             # roles).
             code_index=self._code_index_tools_for(role),
+            # Mirror rule (§8.2): the run_bash network description follows
+            # the project's `unrestricted` web-fetch mode.
+            network_unrestricted=(
+                self.settings.web_fetch_mode is WebFetchMode.UNRESTRICTED
+            ),
             # The goals data for the dev report's dynamic-instructions line:
             # the roadmap block needs the active list, the per-task block
             # the goal behind task.goal_id (None when absent/deleted).

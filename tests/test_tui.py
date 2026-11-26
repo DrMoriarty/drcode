@@ -4221,9 +4221,10 @@ async def test_task_settings_dialog_todo_tail_toggle(app: DrCodeApp) -> None:
 async def test_task_settings_dialog_web_fetch_host_lists_hidden(
     app: DrCodeApp,
 ) -> None:
-    """The allow list shows ONLY in allowlist mode; the `unrestricted`
-    mode hides it too (both host lists are dormant there — the saved
-    values are kept, never rewritten)."""
+    """The allow list shows ONLY in allowlist mode; the block list shows
+    in allowlist AND all modes (it always wins, so it is meaningful in
+    both); the `unrestricted` mode hides both (both host lists are
+    dormant there — the saved values are kept, never rewritten)."""
     from textual.widgets import Select
 
     from drcode.settings import WebFetchMode
@@ -4233,28 +4234,59 @@ async def test_task_settings_dialog_web_fetch_host_lists_hidden(
         await pilot.press("escape")
         await pilot.pause()
 
-        def allow_col(dialog: AgentRuntimeDialog):
-            col = dialog.query_one("#ts-web-fetch-allow").parent
-            assert col is not None  # the input always sits in a ts-col
-            return col
+        def hidden_map(dialog: AgentRuntimeDialog) -> dict[str, bool]:
+            allow_col = dialog.query_one("#ts-web-fetch-allow").parent
+            assert allow_col is not None  # the input always sits in a ts-col
+            return {
+                "allow": "ts-hidden" in allow_col.classes,
+                "block_label": (
+                    "ts-hidden" in dialog.query_one("#ts-web-fetch-block-label").classes
+                ),
+                "block": (
+                    "ts-hidden" in dialog.query_one("#ts-web-fetch-block").classes
+                ),
+            }
 
-        # Allowlist mode: the allow field is visible.
+        # Per-mode visibility (fresh dialog per mode).
+        for mode, allow_hidden, block_hidden in [
+            (WebFetchMode.OFF, True, True),
+            (WebFetchMode.ALLOWLIST, False, False),
+            (WebFetchMode.ALL, True, False),
+            (WebFetchMode.UNRESTRICTED, True, True),
+        ]:
+            app.settings.web_fetch_mode = mode
+            app.action_open_agent_runtime()
+            await pilot.pause()
+            dialog = app.screen
+            assert isinstance(dialog, AgentRuntimeDialog)
+            assert hidden_map(dialog) == {
+                "allow": allow_hidden,
+                "block_label": block_hidden,
+                "block": block_hidden,
+            }, f"mode={mode}"
+            await pilot.press("escape")
+            await pilot.pause()
+
+        # Live switching in an open dialog.
         app.settings.web_fetch_mode = WebFetchMode.ALLOWLIST
         app.action_open_agent_runtime()
         await pilot.pause()
         dialog = app.screen
         assert isinstance(dialog, AgentRuntimeDialog)
-        assert "ts-hidden" not in allow_col(dialog).classes
-
-        # Switching the draft to the unrestricted mode hides it at once.
-        dialog.query_one("#ts-web-fetch-mode", Select).value = WebFetchMode.UNRESTRICTED
-        await pilot.pause()
-        assert "ts-hidden" in allow_col(dialog).classes
-
-        # And switching back to allowlist shows it again.
-        dialog.query_one("#ts-web-fetch-mode", Select).value = WebFetchMode.ALLOWLIST
-        await pilot.pause()
-        assert "ts-hidden" not in allow_col(dialog).classes
+        mode_select = dialog.query_one("#ts-web-fetch-mode", Select)
+        for mode, allow_hidden, block_hidden in [
+            (WebFetchMode.UNRESTRICTED, True, True),
+            (WebFetchMode.ALL, True, False),
+            (WebFetchMode.OFF, True, True),
+            (WebFetchMode.ALLOWLIST, False, False),
+        ]:
+            mode_select.value = mode
+            await pilot.pause()
+            assert hidden_map(dialog) == {
+                "allow": allow_hidden,
+                "block_label": block_hidden,
+                "block": block_hidden,
+            }, f"switched to {mode}"
         await pilot.press("escape")
         await pilot.pause()
 

@@ -12,10 +12,10 @@ loses at most the one in-flight model call, never the whole day.
 Deliberately decoupled from pydantic-ai beyond the `RunUsage` shape:
 the store folds plain counters, the TUI layer extracts them.
 
-File format (version 1)::
+File format (version 2)::
 
     {
-      "version": 1,
+      "version": 2,
       "days": {
         "2026-11-04": {
           "coding/openai/gpt-5": {"requests": 40, "input": 120000,
@@ -23,11 +23,37 @@ File format (version 1)::
                                    "cache_write": 3000}
         }
       },
+      "costs": {
+        "2026-11-04": {
+          "coding/openai/gpt-5": {"cost": 0.023, "sessions": 12}
+        }
+      },
       "recent": [
         {"at": "2026-11-04T12:03:44", "key": "coding/openai/gpt-5",
-         "input": 3100, "cache_read": 2800, "cache_write": 0, "output": 210}
+         "input": 3100, "cache_read": 2800, "cache_write": 0, "output": 210,
+         "cost": 0.0007, "task": "e5449310"}
       ]
     }
+
+Version 2 added money on top of version 1's token accounting:
+
+- ``costs`` — per (day, model key) aggregates of the FROZEN USD cost
+  (see `drcode.cost`): the sum of the request costs computed at
+  response time from the catalog prices AS THEY WERE THEN, and the
+  number of priced sessions (requests) behind that sum. Requests of
+  unpriced models (custom / env / locally free endpoints) carry no
+  cost and enter neither the sum nor the session count — a session
+  without a price is NOT a zero-cost session (`drcode.cost` for the
+  full contract).
+- ``recent`` records gained the optional per-request ``cost`` and the
+  ``task`` id the request was served for (audit trail; the durable
+  task attribution lives in the Task metadata itself).
+
+Migration: version-1 files stay fully readable — their ``days`` load
+as-is, the money fields are simply absent (an empty ``costs``), and the
+next record rewrites the file in the version-2 shape. Any OTHER version
+(older or newer) is still rejected wholesale: a newer format would be
+misread here — starting fresh beats corrupting it.
 
 The optional ``recent`` ring holds the last `RECENT_LIMIT` per-request
 records (oldest first) — the rolling cache hit-rate over the last N
@@ -61,8 +87,11 @@ USAGE_FILENAME = "usage.json"
 
 # The version this module reads and writes; data carrying any other
 # version is treated as unreadable (a newer format would be misread
-# here — starting fresh beats corrupting it).
-VERSION = 1
+# here — starting fresh beats corrupting it). Version 1 files are the
+# one accepted exception: the pre-cost format loads as-is (its money
+# fields are simply absent) and is rewritten in the v2 shape on the
+# next record — see the module docstring's migration note.
+VERSION = 2
 
 # Counter fields of one day/model entry, in display order.
 FIELDS: tuple[str, ...] = (
@@ -75,6 +104,12 @@ FIELDS: tuple[str, ...] = (
 
 # Type of one day's model→counters map.
 DayEntry = dict[str, dict[str, int]]
+
+# Type of one day's model→money map: the frozen USD cost of the day's
+# priced sessions of the key and their count. Unpriced sessions never
+# enter it — "no price" is not "zero price" (see `drcode.cost`).
+CostCell = dict[str, float]  # {"cost": float, "sessions": int}
+CostEntry = dict[str, dict[str, CostCell]]
 
 # How many most-recent per-request records the store keeps alongside the
 # day aggregates (the "recent" ring in the file). The aggregates cannot
@@ -145,7 +180,10 @@ def rolling_hit_rate(
 def _clean_record(raw: Any) -> dict[str, Any] | None:
     """Shape-check one per-request record (tolerant, like `_validated`):
     a record without a string key is junk and dropped, a bad counter
-    becomes 0 — one malformed line never invalidates the history."""
+    becomes 0 — one malformed line never invalidates the history. The
+    v2 money fields are optional: `cost` passes through only as a real
+    number (a null/absent/insane one degrades to None — the record was
+    unpriced), `task` only as a string."""
     if not isinstance(raw, dict) or not isinstance(raw.get("key"), str):
         return None
     at = raw.get("at")
@@ -158,7 +196,28 @@ def _clean_record(raw: Any) -> dict[str, Any] | None:
         record[field] = (
             value if isinstance(value, int) and not isinstance(value, bool) else 0
         )
+    cost = raw.get("cost")
+    record["cost"] = (
+        cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+    )
+    task = raw.get("task")
+    record["task"] = task if isinstance(task, str) else ""
     return record
+
+
+def _clean_records(data: Any) -> list[dict[str, Any]]:
+    """The parsed file's per-request ring, shape-checked. Read failures
+    degrade to an empty history — the ring is a metric, losing it in a
+    corrupt file is never worth a failed usage record."""
+    raw = data.get("recent") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in raw:
+        record = _clean_record(item)
+        if record is not None:
+            records.append(record)
+    return records
 
 
 class UsageStore:
@@ -186,22 +245,33 @@ class UsageStore:
         A missing, corrupted or foreign-version file is skipped, never
         fatal: statistics are a sidecar, an unreadable file must not
         crash the pipeline (or the usage dialog) — the next record
-        simply starts a fresh file.
+        simply starts a fresh file. Version-1 files load exactly like
+        version-2 ones (see the migration note in the module docstring).
         """
-        try:
-            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return {}
-        return self._validated(data)
+        return self._read_all()[0]
+
+    def load_costs(self) -> CostEntry:
+        """The persisted per-day frozen-cost aggregates (UTC date →
+        model key → {"cost": USD sum, "sessions": priced count}).
+
+        Same tolerance rules as `load`; a version-1 file (or any file
+        without a well-shaped ``costs`` section) yields an empty map —
+        old days genuinely have no recorded cost, which must not read
+        as zero."""
+        return self._read_all()[1]
+
+    @staticmethod
+    def _accepted_version(data: Any) -> bool:
+        """The version gate: 1 (pre-cost, money fields absent) and the
+        current VERSION are readable; anything else is foreign."""
+        return isinstance(data, dict) and data.get("version") in (1, VERSION)
 
     @staticmethod
     def _validated(data: Any) -> dict[str, DayEntry]:
         """Shape-check the parsed json: dict of date-strings → dict of
         model keys → counter dicts (ints only). Anything else (or a
         wrong `version`) is rejected wholesale."""
-        if not isinstance(data, dict) or data.get("version") != VERSION:
+        if not UsageStore._accepted_version(data):
             return {}
         days = data.get("days")
         if not isinstance(days, dict):
@@ -223,11 +293,71 @@ class UsageStore:
             out[day] = clean
         return out
 
+    @staticmethod
+    def _validated_costs(data: Any) -> CostEntry:
+        """Shape-check the ``costs`` section the same tolerant way:
+        day → key → {"cost": positive-sum float, "sessions": positive
+        int}. Junk cells are dropped, never fatal — a malformed money
+        line must not take the token history down with it."""
+        if not isinstance(data, dict) or not UsageStore._accepted_version(data):
+            return {}
+        raw = data.get("costs")
+        if not isinstance(raw, dict):
+            return {}
+        out: CostEntry = {}
+        for day, entry in raw.items():
+            if not isinstance(day, str) or not isinstance(entry, dict):
+                continue
+            clean: dict[str, CostCell] = {}
+            for key, cell in entry.items():
+                if not isinstance(key, str) or not isinstance(cell, dict):
+                    continue
+                cost = cell.get("cost")
+                sessions = cell.get("sessions")
+                if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+                    continue
+                if (
+                    isinstance(sessions, bool)
+                    or not isinstance(sessions, int)
+                    or sessions <= 0
+                ):
+                    continue
+                clean[key] = {"cost": float(cost), "sessions": sessions}
+            out[day] = clean
+        return out
+
+    def _read_all(self) -> tuple[dict[str, DayEntry], CostEntry, list[dict[str, Any]]]:
+        """One parse of the file → (days, costs, recent ring). All three
+        readers share it so a record never pays three reads, and a
+        read failure degrades every section to empty together — the
+        whole file is unreadable or none of it is."""
+        try:
+            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}, {}, []
+        return self._validated(data), self._validated_costs(data), _clean_records(data)
+
     # -- writing -------------------------------------------------------------
 
-    def record(self, role: AgentRole, model_id: str, usage: RunUsage) -> None:
+    def record(
+        self,
+        role: AgentRole,
+        model_id: str,
+        usage: RunUsage,
+        cost: float | None = None,
+        task_id: str | None = None,
+    ) -> None:
         """Fold one model call's exact usage into today's (UTC) entry of
         the calling role's model key and atomically rewrite the file.
+
+        `cost` is the request's FROZEN USD cost (see `drcode.cost`):
+        computed by the caller at response time from the then-current
+        catalog prices, or None when the model has no computable price.
+        None contributes NOTHING to the ``costs`` section — neither to
+        the sum nor to the priced-session count (a session without a
+        price is not a zero-cost session) — while the token counters
+        fold exactly as before. `task_id` rides the recent ring's
+        record for the audit trail.
 
         The role is part of the key, so calls made by different roles are
         always accounted separately, even when they resolve to the same
@@ -256,17 +386,23 @@ class UsageStore:
         day = _now().date().isoformat()
         key = f"{role.value}/{model_id}" if model_id else role.value
         try:
-            days = self.load()
+            days, costs, recent = self._read_all()
             entry = days.setdefault(day, {}).setdefault(key, _empty_entry())
             entry["requests"] += usage.requests or 1
             entry["input"] += usage.input_tokens or 0
             entry["output"] += usage.output_tokens or 0
             entry["cache_read"] += usage.cache_read_tokens or 0
             entry["cache_write"] += usage.cache_write_tokens or 0
+            # The frozen money aggregate: only priced sessions move it.
+            if cost is not None:
+                cell = costs.setdefault(day, {}).setdefault(
+                    key, {"cost": 0.0, "sessions": 0}
+                )
+                cell["cost"] = cell.get("cost", 0.0) + cost
+                cell["sessions"] = int(cell.get("sessions", 0)) + 1
             # Per-request granularity for the rolling hit-rate (the day
             # aggregates alone cannot answer "the last N requests"). The
             # ring is trimmed to RECENT_LIMIT — the file must stay small.
-            recent = self._recent_from_disk()
             recent.append(
                 {
                     "at": _now().isoformat(timespec="seconds"),
@@ -275,12 +411,15 @@ class UsageStore:
                     "cache_read": usage.cache_read_tokens or 0,
                     "cache_write": usage.cache_write_tokens or 0,
                     "output": usage.output_tokens or 0,
+                    "cost": cost,
+                    "task": task_id or "",
                 }
             )
             self._write(
                 {
                     "version": VERSION,
                     "days": days,
+                    "costs": costs,
                     "recent": recent[-RECENT_LIMIT:],
                 }
             )
@@ -293,29 +432,11 @@ class UsageStore:
 
     # -- per-request history (rolling hit-rate window) -----------------------
 
-    def _recent_from_disk(self) -> list[dict[str, Any]]:
-        """The persisted per-request ring, shape-checked. Read failures
-        degrade to an empty history — the ring is a metric, losing it in a
-        corrupt file is never worth a failed usage record."""
-        try:
-            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return []
-        raw = data.get("recent") if isinstance(data, dict) else None
-        if not isinstance(raw, list):
-            return []
-        records: list[dict[str, Any]] = []
-        for item in raw:
-            record = _clean_record(item)
-            if record is not None:
-                records.append(record)
-        return records
-
     def load_recent(self, limit: int | None = None) -> list[dict[str, Any]]:
         """The last `limit` per-request records, oldest → newest (an empty
         list when the file has no history yet). Read failures are never
         fatal — same discipline as `load`."""
-        records = self._recent_from_disk()
+        records = self._read_all()[2]
         return records if limit is None else records[-limit:]
 
     def _write(self, data: dict[str, Any]) -> None:

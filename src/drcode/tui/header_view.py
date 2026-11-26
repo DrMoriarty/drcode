@@ -20,6 +20,7 @@ from ..core.usage import NETWORK_RETRIES
 
 if TYPE_CHECKING:
     from pydantic_ai.usage import RunUsage
+from ..cost import fmt_cost, prices_for, row_cost
 from ..models import TaskKind, TaskStatus
 from ..providers import AgentRole
 from .header import (
@@ -232,13 +233,33 @@ class HeaderLayer(DrCodeState):
         return line
 
     def _header_stats_text(self) -> str:
-        """The expanded header's bottom line: the TTS-announcements and
-        ntfy push-notification switches, followed by the GitHub
+        """The expanded header's bottom line: the viewed task's live
+        cumulative cost, then the TTS-announcements and ntfy
+        push-notification switches, followed by the GitHub
         integration status and the embedded MCP server state."""
-        return (
-            f"{self._header_tts_text()} | {self._header_notifications_text()} | "
-            f"{self._header_github_text()} | {self._header_mcp_text()}"
-        )
+        parts = [
+            self._header_task_cost_text(),
+            self._header_tts_text(),
+            self._header_notifications_text(),
+            self._header_github_text(),
+            self._header_mcp_text(),
+        ]
+        return " | ".join(part for part in parts if part)
+
+    def _header_task_cost_text(self) -> str:
+        """The viewed task's cumulative frozen cost for the expanded
+        header's second line. Updated per request (`_record_session_usage`
+        re-renders this line) and by the 1 s poller, so the figure moves
+        with the running task in real time. A task with no priced session
+        yet shows a dash — never "$0": "no cost recorded" and "costed
+        nothing" are different facts (unpriced models simply do not
+        enter the ledger)."""
+        task = self.viewed
+        if task is None:
+            return ""
+        if task.cost_usd > 0:
+            return f"Задача: {fmt_cost(task.cost_usd)}"
+        return "Задача: —"
 
     def _header_mcp_text(self) -> str:
         """Embedded MCP server status for the expanded header (design doc
@@ -323,7 +344,11 @@ class HeaderLayer(DrCodeState):
         return str(n)
 
     def _record_session_usage(
-        self, usage: RunUsage | None, role: AgentRole, model_id: str
+        self,
+        usage: RunUsage | None,
+        role: AgentRole,
+        model_id: str,
+        task_id: str | None = None,
     ) -> None:
         """Fold one model call's exact token usage into the session
         totals (main agent, tester, compaction summarizer, resolver and
@@ -334,6 +359,13 @@ class HeaderLayer(DrCodeState):
         instant update — the 1 s poller keeps it live while the header
         is collapsed (no-op there).
 
+        When `task_id` is given, the request's FROZEN USD cost is also
+        folded into the task's cumulative `cost_usd` (see `drcode.cost`
+        for the frozen-price contract; unpriced models contribute
+        nothing). The metadata-only persist mirrors the pipeline's
+        per-request `_next_notice_turn` pattern: cheap, atomic, and
+        immune to compaction rewrites.
+
         The store write is best-effort: statistics must never break the
         model run this hook sits in the hot path of (a failed write —
         disk full, a read-only config dir, the agent-guard — costs at
@@ -342,10 +374,31 @@ class HeaderLayer(DrCodeState):
         if usage is None:
             return
         self._session_usage.add(usage)
+        cost: float | None = None
         try:
-            self._usage_store.record(role, model_id, usage)
+            prices = prices_for(model_id)
+            if prices is not None:
+                cost = row_cost(
+                    {
+                        "input": usage.input_tokens or 0,
+                        "output": usage.output_tokens or 0,
+                        "cache_read": usage.cache_read_tokens or 0,
+                    },
+                    prices,
+                )
+            self._usage_store.record(role, model_id, usage, cost=cost, task_id=task_id)
         except Exception:  # noqa: BLE001, S110 - statistics never fatal
             pass
+        if cost is not None and task_id:
+            # The task-side money ledger is independent of the store's
+            # fate: a failed usage-file write must not lose the task's
+            # own figure (and vice versa).
+            try:
+                task = self.manager.get(task_id)
+                task.cost_usd += cost
+                self.manager.storage.save_metadata(task)
+            except Exception:  # noqa: BLE001, S110 - statistics never fatal
+                pass
         self._render_header_tall()
 
     def _header_usage_text(self) -> str:

@@ -21,6 +21,32 @@ if getattr(sys, "frozen", False):
     if os.path.isdir(bundled):
         os.environ.setdefault("DRCODE_TS_PACK_CACHE", bundled)
 
+# Frozen mode must also behave like an interpreter for the classic `-c`
+# one-liners external tooling spawns with sys.executable as the python
+# command — notably merge_resolver's `_module_importable` probe
+# (`<binary> -c "import <module>"`). Ignoring the argument would launch a
+# FULL second drcode instance (live event loop, holding the parent's TTY
+# on fd 0) instead of a one-shot import — two readers split the
+# keyboard input of the real TUI. Unfrozen runs are untouched: there
+# sys.executable is a real python and `-c` works natively.
+if getattr(sys, "frozen", False) and "-c" in sys.argv:
+    _idx = sys.argv.index("-c")
+    if _idx + 1 >= len(sys.argv):
+        # Mirror CPython's own message/exit code for `python -c` with no code.
+        print("Argument expected for the -c option", file=sys.stderr)
+        sys.exit(2)
+    _code = sys.argv[_idx + 1]
+    try:
+        exec(compile(_code, "<string>", "exec"), {"__name__": "__main__"})  # noqa: S102 — the whole point: frozen interpreter emulation
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 — mirror CPython: ANY error in -c code exits 1 with a traceback
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
+    sys.exit(0)
+
 from drcode import main
 
 main()

@@ -624,6 +624,81 @@ async def test_refetch_preserves_favorites(
         assert models == {"m-a": 2, "m-b": 0, "m-new": 0}
 
 
+async def test_refetch_merges_prices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-discovery overwrites an existing entry's price fields ONLY when
+    the gateway actually reports a price (not None); a fetched None keeps
+    the stored value (hand-entered prices survive a price-less gateway).
+    All other existing fields — favorite, context size, compaction
+    threshold — are never touched."""
+
+    async def fake_fetch_models(*args: object, **kwargs: object):
+        return [
+            # Priced: every field the gate reports overwrites the stored one.
+            ModelEntry(
+                id="m-priced",
+                price_prompt=0.01,
+                price_completion=0.02,
+                price_cache_read=0.003,
+            ),
+            # Price-less: the stored prices must survive untouched.
+            ModelEntry(id="m-bare"),
+            ModelEntry(id="m-new", price_prompt=0.5),
+        ]
+
+    monkeypatch.setattr("drcode.tui.model_setup_app.fetch_models", fake_fetch_models)
+    store = UserModelsStore(tmp_path / "models.json")
+    store.save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="p",
+                    base_url="http://p/v1",
+                    models=[
+                        ModelEntry(
+                            id="m-priced",
+                            price_prompt=9.0,
+                            price_completion=9.0,
+                            price_cache_read=9.0,
+                            favorite=2,
+                            max_context_tokens=123456,
+                            compaction_threshold=80,
+                        ),
+                        ModelEntry(
+                            id="m-bare",
+                            price_prompt=None,
+                            price_completion=7.5,
+                        ),
+                    ],
+                )
+            ]
+        )
+    )
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ModelCatalogScreen)
+        await pilot.click("#mc-fetch")
+        await pilot.pause()
+        models = {m.id: m for m in screen.catalog.providers[0].models}
+        assert set(models) == {"m-priced", "m-bare", "m-new"}
+        priced = models["m-priced"]
+        assert priced.price_prompt == pytest.approx(0.01)
+        assert priced.price_completion == pytest.approx(0.02)
+        assert priced.price_cache_read == pytest.approx(0.003)
+        # Non-price fields of an existing entry are never replaced.
+        assert priced.favorite == 2
+        assert priced.max_context_tokens == 123456
+        assert priced.compaction_threshold == 80
+        # Fetched None keeps the stored price; a stored None stays None.
+        bare = models["m-bare"]
+        assert bare.price_prompt is None
+        assert bare.price_completion == pytest.approx(7.5)
+        # New models still arrive whole.
+        assert models["m-new"].price_prompt == pytest.approx(0.5)
+
+
 async def test_assign_agents_button_present(tmp_path: Path) -> None:
     """The model→agent binding dialog is a separate screen; this one only
     carries its entry-point button (no role selects anymore)."""

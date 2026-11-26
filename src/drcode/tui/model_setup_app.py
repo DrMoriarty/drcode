@@ -825,9 +825,23 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
                 return
             # Existing entries are NEVER replaced (only fresh ids are
             # appended), so the user's manual edits — favorite levels
-            # included — survive a re-discovery untouched.
-            existing = {m.id for m in provider.models}
-            fresh = [e for e in entries if e.id not in existing]
+            # included — survive a re-discovery untouched. The ONE
+            # exception is the price fields: when the gateway actually
+            # reports a price (not None), it overwrites the existing
+            # value; a fetched None keeps the stored one (a gateway that
+            # prices nothing must not wipe hand-entered prices).
+            fresh: list[ModelEntry] = []
+            for entry in entries:
+                existing_entry = next(
+                    (m for m in provider.models if m.id == entry.id), None
+                )
+                if existing_entry is None:
+                    fresh.append(entry)
+                    continue
+                for field in ("price_prompt", "price_completion", "price_cache_read"):
+                    value = getattr(entry, field)
+                    if value is not None:
+                        setattr(existing_entry, field, value)
             provider.models.extend(fresh)
             self._refresh_models()
             self._refresh_providers()

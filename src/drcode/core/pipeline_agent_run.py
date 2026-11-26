@@ -222,7 +222,10 @@ class PipelineAgentRunLayer(CoreState):
             # other model call (under the role that actually served it —
             # compaction/<model> normally, the task's role on fallback).
             self._record_session_usage(
-                result.usage, title_role, self.resolved_model_key(title_role)
+                result.usage,
+                title_role,
+                self.resolved_model_key(title_role),
+                task_id=task.id,
             )
             title = clean_generated_title(result.output)
         except Exception as e:  # noqa: BLE001 - a failed title must not kill the run
@@ -421,13 +424,16 @@ class PipelineAgentRunLayer(CoreState):
                             # providers.subagent_usage_key and
                             # _record_session_usage).
                             record_usage=(
-                                lambda u, _role=role: self._record_session_usage(
-                                    u,
-                                    *subagent_usage_key(
-                                        self.config,
-                                        _role,
-                                        self.resolved_model_key(_role),
-                                    ),
+                                lambda u, _role=role, _tid=task_id: (
+                                    self._record_session_usage(
+                                        u,
+                                        *subagent_usage_key(
+                                            self.config,
+                                            _role,
+                                            self.resolved_model_key(_role),
+                                        ),
+                                        task_id=_tid,
+                                    )
                                 )
                             ),
                             # The research agent's web_fetch budget/policy
@@ -1112,7 +1118,7 @@ class PipelineAgentRunLayer(CoreState):
         # session totals and the persistent per-day usage store.
         usage = last_response_usage(run)
         model_key = self.resolved_model_key(role)
-        self._record_session_usage(usage, role, model_key)
+        self._record_session_usage(usage, role, model_key, task_id=task_id)
         # The same request feeds the cache hit-rate watchdog: 5 consecutive
         # low-hit requests on the same task + model key drop one deduped
         # service event (see core.usage.CacheHitRateMonitor) — the

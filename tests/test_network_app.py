@@ -936,9 +936,9 @@ async def test_summarizer_always_streams(
     monkeypatch.setattr(
         DrCodeApp,
         "_record_session_usage",
-        lambda self, usage, role, model_id: (
+        lambda self, usage, role, model_id, task_id=None: (
             recorded.append((usage, role)),
-            orig_record(self, usage, role, model_id),
+            orig_record(self, usage, role, model_id, task_id=task_id),
         ),
     )
     task = _seed_transcript(net_app_small_ctx, "long task " * 200)
@@ -2205,9 +2205,9 @@ async def test_map_reduce_compaction_over_window(
     monkeypatch.setattr(
         DrCodeApp,
         "_record_session_usage",
-        lambda self, usage, role, model_id: (
+        lambda self, usage, role, model_id, task_id=None: (
             recorded.append(usage),
-            orig_record(self, usage, role, model_id),
+            orig_record(self, usage, role, model_id, task_id=task_id),
         ),
     )
 

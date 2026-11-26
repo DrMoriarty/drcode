@@ -765,6 +765,7 @@ class PipelineCompactionLayer(CoreState):
             usage,
             AgentRole.COMPACTION,
             self.resolved_model_key(AgentRole.COMPACTION),
+            task_id=task_id,
         )
         return unwrap_summary_envelope(output)
 

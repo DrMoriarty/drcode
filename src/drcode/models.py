@@ -408,6 +408,19 @@ class Task(BaseModel):
     # nudge restart and an automatic fix-round re-queue all CONTINUE the
     # count.
     model_request_count: int = 0
+    # Cumulative USD cost of the task's model work, accumulated
+    # INCREMENTALLY per request (never reconstructed from transcripts —
+    # compaction rewrites them and the collapsed usage metadata is gone;
+    # metadata survives compaction by construction). Each request's cost
+    # is FROZEN at response time from the catalog prices as they were
+    # then (`drcode.cost` for the contract): later price edits never
+    # re-price history, so a task's figure stays comparable across
+    # models and days. Sessions of unpriced models (free local endpoints,
+    # custom models without prices) contribute NOTHING — not zero: the
+    # sum only grows when a priced session lands, which keeps mixed
+    # setups (free compaction/tester + paid coder/research) honest.
+    # Plain optional field: old task files load with 0.0 (no migration).
+    cost_usd: float = 0.0
     # True when the user CANCELLED the task (Ctrl+X): the status is
     # COMPLETED (cancel completes immediately, skipping the tester) but the
     # task's work was never honestly finished — the goal auto-lifecycle

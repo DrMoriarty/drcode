@@ -562,6 +562,7 @@ class PipelineTesterLayer(CoreState):
                                     last_response_usage(run),
                                     AgentRole.TESTER,
                                     self.resolved_model_key(AgentRole.TESTER),
+                                    task_id=task_id,
                                 )
                                 # A model call went through: the network-retry
                                 # budget for this testing round starts over,

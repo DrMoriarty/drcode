@@ -330,7 +330,11 @@ class CoreState:
     def _todo_completion_warning(self, task: Task) -> None: ...
 
     def _record_session_usage(
-        self, usage: RunUsage | None, role: AgentRole, model_id: str
+        self,
+        usage: RunUsage | None,
+        role: AgentRole,
+        model_id: str,
+        task_id: str | None = None,
     ) -> None: ...
 
     def _touch_activity(

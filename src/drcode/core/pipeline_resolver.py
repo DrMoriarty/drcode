@@ -710,6 +710,7 @@ class PipelineResolverLayer(CoreState):
                                 last_response_usage(run),
                                 AgentRole.RESOLVER,
                                 self.resolved_model_key(AgentRole.RESOLVER),
+                                task_id=task_id,
                             )
                             self._note_network_recovered(task, self._resolver_net_count)
                             self._resolver_net_count.pop(task_id, None)
@@ -1157,6 +1158,7 @@ class PipelineResolverLayer(CoreState):
             result.usage,
             AgentRole.RESOLVER,
             self.resolved_model_key(AgentRole.RESOLVER),
+            task_id=task.id,
         )
         rverdict = rdeps.verdicts[-1] if rdeps.verdicts else None
         return (

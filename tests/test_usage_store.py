@@ -80,7 +80,7 @@ def test_record_accumulates_per_day_and_model(tmp_path: Path) -> None:
 def test_version_field_is_written(tmp_path: Path) -> None:
     target = tmp_path / "usage.json"
     UsageStore(path=target).record(AgentRole.TESTER, "m", _usage(input=1))
-    assert _read(target)["version"] == 1
+    assert _read(target)["version"] == VERSION
 
 
 def test_load_of_missing_file_is_empty(tmp_path: Path) -> None:
@@ -168,6 +168,110 @@ def test_foreign_version_is_ignored(tmp_path: Path) -> None:
         json.dumps({"version": 999, "days": {"2026-01-01": {}}}), encoding="utf-8"
     )
     assert UsageStore(path=target).load() == {}
+
+
+# -- frozen-cost section (version 2) -------------------------------------------------
+
+
+def test_record_with_cost_accumulates_money(tmp_path: Path) -> None:
+    """A priced request folds its FROZEN cost into the day's ``costs``
+    cell (sum + priced-session count); an unpriced request in the same
+    day contributes NOTHING to the money cell but keeps its tokens."""
+    target = tmp_path / "usage.json"
+    store = UsageStore(path=target)
+    store.record(AgentRole.CODING, "openai/gpt-5", _usage(input=100), cost=0.001)
+    store.record(
+        AgentRole.CODING, "openai/gpt-5", _usage(input=50), cost=0.002, task_id="t1"
+    )
+    store.record(AgentRole.CODING, "openai/gpt-5", _usage(input=70))
+    day = next(iter(store.load()))
+    costs = store.load_costs()
+    cell = costs[day]["coding/openai/gpt-5"]
+    assert cell["cost"] == pytest.approx(0.003)
+    assert cell["sessions"] == 2  # the unpriced request never entered
+    # Token accounting is untouched by the money layer.
+    assert store.load()[day]["coding/openai/gpt-5"]["input"] == 220
+    # The recent ring carries the per-request audit trail.
+    recent = store.load_recent()
+    assert [r.get("cost") for r in recent] == [0.001, 0.002, None]
+    assert [r.get("task") for r in recent] == ["", "t1", ""]
+
+
+def test_record_without_cost_writes_no_money_cells(tmp_path: Path) -> None:
+    target = tmp_path / "usage.json"
+    store = UsageStore(path=target)
+    store.record(AgentRole.TESTER, "m", _usage(input=1))
+    assert store.load_costs() == {}
+    data = _read(target)
+    assert data["version"] == VERSION
+    assert data["costs"] == {}
+
+
+def test_v1_file_loads_and_upgrades_in_place(tmp_path: Path) -> None:
+    """A version-1 file (pre-cost era) stays fully readable: its days
+    load as-is, money fields are simply absent — and the next record
+    rewrites it in the v2 shape WITHOUT losing the old days."""
+    target = tmp_path / "usage.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "days": {
+                    "2026-01-01": {
+                        "coding/openai/gpt-5": {
+                            "requests": 4,
+                            "input": 1000,
+                            "output": 100,
+                            "cache_read": 0,
+                            "cache_write": 0,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = UsageStore(path=target)
+    days = store.load()
+    assert days["2026-01-01"]["coding/openai/gpt-5"]["input"] == 1000
+    assert store.load_costs() == {}  # no recorded cost — absent, not zero
+    store.record(AgentRole.CODING, "openai/gpt-5", _usage(input=10), cost=0.5)
+    data = _read(target)
+    assert data["version"] == VERSION
+    assert data["days"]["2026-01-01"]["coding/openai/gpt-5"]["input"] == 1000
+    cost_day = next(iter(data["costs"]))  # today's day, distinct from the v1 one
+    assert data["costs"][cost_day]["coding/openai/gpt-5"] == {
+        "cost": 0.5,
+        "sessions": 1,
+    }
+
+
+def test_malformed_cost_cells_are_dropped(tmp_path: Path) -> None:
+    """One insane money cell (string cost, zero/negative sessions) is
+    dropped, never fatal — and never takes the days mapping down."""
+    target = tmp_path / "usage.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": VERSION,
+                "days": {"2026-01-01": {"m": dict.fromkeys(FIELDS, 1)}},
+                "costs": {
+                    "2026-01-01": {
+                        "m": {"cost": "rich", "sessions": 2},
+                        "m2": {"cost": 1.0, "sessions": 0},
+                        "m3": {"cost": 1.5, "sessions": 3},
+                    },
+                    "oops": "not a dict",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = UsageStore(path=target)
+    assert store.load()["2026-01-01"]["m"]["input"] == 1  # days unaffected
+    costs = store.load_costs()
+    assert set(costs["2026-01-01"]) == {"m3"}
+    assert costs["2026-01-01"]["m3"] == {"cost": 1.5, "sessions": 3}
 
 
 # -- the ebe6ba15 agent guard -------------------------------------------------------
@@ -259,7 +363,7 @@ async def test_app_usage_hook_is_best_effort(
     app = DrCodeApp(project_root)
     async with app.run_test():
 
-        def boom(role: AgentRole, model_id: str, usage: RunUsage) -> None:
+        def boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("disk exploded")
 
         monkeypatch.setattr(app._usage_store, "record", boom)
@@ -418,3 +522,202 @@ async def test_app_usage_dialog_cost_without_cache_read_price(
         # cost = 1000*0.000002 + 100*0.000008 = 0.0028
         assert coding == "$0.0028"
         assert research == ""  # cache reads present, cache price unknown
+
+
+# -- the frozen task-cost ledger (TUI hook) -------------------------------------------
+
+
+def _priced_catalog() -> None:
+    """A tiny user catalog: one priced model, one unpriced."""
+    from drcode.providers import ModelEntry, Provider, UserModelsConfig
+
+    config_module._USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UserModelsStore().save(
+        UserModelsConfig(
+            providers=[
+                Provider(
+                    name="zveno",
+                    base_url="https://zveno.ai/v1",
+                    models=[
+                        ModelEntry(
+                            id="m1",
+                            price_prompt=0.000002,
+                            price_completion=0.000008,
+                        ),
+                        ModelEntry(id="free-local"),
+                    ],
+                )
+            ]
+        )
+    )
+
+
+async def test_app_task_cost_freezes_per_request(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The hook folds each priced request's cost into the task's
+    cumulative `cost_usd` (frozen at record time) AND persists it into
+    the metadata file — compaction cannot destroy it later. An unpriced
+    model's session contributes NOTHING (not zero, nothing)."""
+    from drcode.tui.app import DrCodeApp
+
+    _priced_catalog()
+    app = DrCodeApp(project_root)
+    async with app.run_test():
+        task = app.manager.create("paid", "work the bill")
+        # cost = 1000*0.000002 + 100*0.000008 = 0.0028
+        app._record_session_usage(
+            _usage(input=1000, output=100, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+            task_id=task.id,
+        )
+        app._record_session_usage(
+            _usage(input=5000, output=10, requests=1),
+            AgentRole.COMPACTION,
+            "zveno/free-local",  # unpriced: no cost, no ledger entry
+            task_id=task.id,
+        )
+        app._record_session_usage(
+            _usage(input=2000, output=50, requests=1),
+            AgentRole.TESTER,
+            "zveno/m1",
+            task_id=task.id,
+        )
+        assert task.cost_usd == pytest.approx(0.0028 + 0.0044)
+        # Survives a reload from disk (metadata, not just memory).
+        meta = json.loads(
+            (project_root / ".drcode" / "tasks" / f"{task.id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert meta["cost_usd"] == pytest.approx(task.cost_usd)
+        # The store's money section saw exactly the two priced sessions.
+        costs = app._usage_store.load_costs()
+        cell = costs[next(iter(costs))]["coding/zveno/m1"]
+        assert cell["sessions"] == 1
+        tester_cell = costs[next(iter(costs))]["tester/zveno/m1"]
+        assert tester_cell["sessions"] == 1
+
+
+async def test_app_task_cost_survives_a_failing_store(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The task-side ledger is independent of the usage file's fate:
+    a store write failure must not lose the task's own figure (and the
+    header session totals fold regardless)."""
+    from drcode.tui.app import DrCodeApp
+
+    _priced_catalog()
+    app = DrCodeApp(project_root)
+    async with app.run_test():
+        task = app.manager.create("paid", "work the bill")
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("disk exploded")
+
+        original = app._usage_store.record
+        object.__setattr__(app._usage_store, "record", boom)
+        try:
+            app._record_session_usage(
+                _usage(input=1000, output=100, requests=1),
+                AgentRole.CODING,
+                "zveno/m1",
+                task_id=task.id,
+            )
+        finally:
+            object.__setattr__(app._usage_store, "record", original)
+        assert task.cost_usd == pytest.approx(0.0028)
+        assert app._session_usage.input_tokens == 1000
+        assert app._usage_store.load_costs() == {}
+
+
+async def test_app_header_shows_live_task_cost(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The expanded header's second line carries the viewed task's
+    cumulative cost: a dash while no priced session exists (never a
+    bare "$0"), the frozen sum once one lands, and no segment at all
+    when no task is viewed."""
+    from drcode.tui.app import DrCodeApp
+
+    _priced_catalog()
+    app = DrCodeApp(project_root)
+    async with app.run_test():
+        # No viewed task: no segment.
+        assert "Задача" not in app._header_stats_text()
+        task = app.manager.create("paid", "work the bill")
+        app.viewed_id = task.id
+        assert app._header_stats_text().startswith("Задача: —")
+        app._record_session_usage(
+            _usage(input=1000, output=100, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+            task_id=task.id,
+        )
+        assert app._header_stats_text().startswith("Задача: $0.0028")
+        # A different (unpriced) viewed task shows the dash again.
+        other = app.manager.create("free", "work the other bill")
+        app.viewed_id = other.id
+        assert app._header_stats_text().startswith("Задача: —")
+
+
+async def test_app_usage_dialog_shows_agent_cost_averages(
+    project_root: Path, user_config_dir: Path
+) -> None:
+    """The frozen-cost averages table: one row per (day, agent) with
+    priced sessions — the average over the PRICED session count, free
+    models invisible; the day×model table above keeps its rows."""
+    from textual.widgets import DataTable
+
+    from drcode.tui.app import DrCodeApp
+    from drcode.tui.stats_dialog import StatsDialog
+
+    _priced_catalog()
+    app = DrCodeApp(project_root)
+    async with app.run_test() as pilot:
+        # coding: 0.0028 and 0.0056 → avg 0.0042 over 2 sessions.
+        app._record_session_usage(
+            _usage(input=1000, output=100, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+        )
+        app._record_session_usage(
+            _usage(input=2000, output=200, requests=1),
+            AgentRole.CODING,
+            "zveno/m1",
+        )
+        # tester: one priced session, 0.0044.
+        app._record_session_usage(
+            _usage(input=2000, output=50, requests=1),
+            AgentRole.TESTER,
+            "zveno/m1",
+        )
+        # compaction on the free model: no money anywhere.
+        app._record_session_usage(
+            _usage(input=999, output=1, requests=1),
+            AgentRole.COMPACTION,
+            "zveno/free-local",
+        )
+        dialog = StatsDialog(project_root, usage_store=app._usage_store)
+        await app.push_screen(dialog)
+        await pilot.pause()
+        dialog.query_one("#stats-tabs", Tabs).active = "usage"
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        cost_table = dialog.query_one("#cost-table", DataTable)
+        rows = [cost_table.get_row_at(i) for i in range(cost_table.row_count)]
+        # Newest-first row order between days is irrelevant here (one
+        # day): sorted by (day, role) desc → tester first, coding second.
+        assert rows[0][1] == "tester"
+        assert rows[0][2] == "1"
+        assert rows[0][3] == "$0.0044"
+        assert rows[0][4] == "$0.0044"
+        assert rows[1][1] == "coding"
+        assert rows[1][2] == "2"
+        assert rows[1][3] == "$0.0042"
+        assert rows[1][4] == "$0.0084"
+        assert cost_table.row_count == 2  # compaction never appears
+        # The day×model table above is intact: 3 data rows + Σ.
+        usage_table = dialog.query_one("#usage-table", DataTable)
+        assert usage_table.row_count == 4

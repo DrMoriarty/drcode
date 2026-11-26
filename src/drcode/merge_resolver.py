@@ -191,6 +191,7 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
             text=True,
             timeout=_TIMEOUT,
             check=False,
+            stdin=subprocess.DEVNULL,
             **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -375,6 +376,7 @@ def _run_checked(
             timeout=timeout,
             check=False,
             env=env,
+            stdin=subprocess.DEVNULL,
             **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -433,6 +435,7 @@ def _module_importable(python_cmd: list[str], module: str, cwd: Path) -> bool:
             timeout=600,
             check=False,
             env=env,
+            stdin=subprocess.DEVNULL,
             **child_priority_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -596,6 +599,7 @@ def _compile_chunks(
                 text=True,
                 timeout=timeout,
                 check=False,
+                stdin=subprocess.DEVNULL,
                 **child_priority_kwargs(),
             )
         except subprocess.TimeoutExpired:

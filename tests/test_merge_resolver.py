@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from pydantic_ai import RunContext
@@ -234,6 +234,35 @@ def test_module_importable_runs_uv_offline(
     assert mr._module_importable(["uv", "run", "python"], "ruff", repo)
     assert not mr._module_importable([str(shim)], "ruff", repo)
     assert log.read_text().splitlines() == ["1", ""]
+
+
+def test_subprocesses_never_inherit_parent_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The desktop keyboard-input incident: a verification-funnel probe
+    # spawned without `stdin=` inherits the parent TUI's TTY — two
+    # processes then race for the same terminal, and a frozen child
+    # (`-c` in a onedir bundle) that never exits steals the input for
+    # good. Every subprocess in this module must pin
+    # `stdin=subprocess.DEVNULL`: the probe children read stdin never.
+    captured: list[dict[str, object]] = []
+
+    def spy(cmd: Any, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured.append(kwargs)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(mr.subprocess, "run", spy)
+
+    py_files = [str(tmp_path / "mod.py")]
+    assert mr._module_importable([sys.executable], "os", tmp_path)
+    assert mr._git("status", cwd=tmp_path) == (0, "")
+    result = mr._run_checked("probe", [sys.executable, "-c", "pass"], cwd=tmp_path)
+    assert result.ok
+    assert mr._compile_chunks(tmp_path, py_files, [sys.executable]).ok
+    assert len(captured) == 4
+    assert all(kwargs.get("stdin") is subprocess.DEVNULL for kwargs in captured), (
+        "every spawned child must get stdin=DEVNULL, not the parent's TTY"
+    )
 
 
 def test_run_test_suite_uses_worktree_venv(

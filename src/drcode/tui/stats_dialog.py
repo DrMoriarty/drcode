@@ -46,7 +46,7 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Sparkline, Static, Tab, Tabs
@@ -169,8 +169,7 @@ class StatsDialog(ModalScreen[None]):
     #stats-tabs { margin-top: 1; }
     #stats-project-pane { height: 1fr; }
     #stats-project-pane.hidden { display: none; }
-    #stats-scroll { height: 1fr; margin-top: 1; }
-    #stats-table { height: auto; max-height: 1fr; }
+    #stats-table { height: 1fr; }
     #stats-sparklines {
         height: auto;
         margin-top: 1;
@@ -227,7 +226,7 @@ class StatsDialog(ModalScreen[None]):
                 Tab("Токены", id=_USAGE_TAB),
                 id="stats-tabs",
             )
-            with Vertical(id="stats-project-pane"), VerticalScroll(id="stats-scroll"):
+            with Vertical(id="stats-project-pane"):
                 yield DataTable(id="stats-table")
                 with Vertical(id="stats-sparklines"):
                     with Vertical(classes="stats-spark-row"):

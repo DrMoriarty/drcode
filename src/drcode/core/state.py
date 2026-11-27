@@ -452,7 +452,10 @@ class CoreState:
     ) -> None: ...
 
     def _persist_task_messages(
-        self, task: Task, run: AgentRun[AgentDeps, str] | None
+        self,
+        task: Task,
+        run: AgentRun[AgentDeps, str] | None,
+        generation: int | None = None,
     ) -> None: ...
 
     def _flush_in_flight_prompt(self, task: Task) -> None: ...

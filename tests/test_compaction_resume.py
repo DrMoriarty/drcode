@@ -404,6 +404,109 @@ async def test_run_stamps_last_run_end(app: DrCodeApp, scripted: ScriptedState) 
     assert (datetime.now(UTC) - task.last_run_end).total_seconds() < 120
 
 
+# -- the mid-run persist stamp (the crash guard) -------------------------------------
+
+
+def test_persist_stamp_guarded_by_generation(app: DrCodeApp) -> None:
+    """Every node-boundary persist re-stamps `last_run_end` — but a
+    SUPERSEDED run (its generation no longer the task's newest) must not
+    re-stamp over a newer run, same guard the worker's finally uses."""
+    task = _seed_task(app, 100)
+    app._agent_generations[task.id] = 5
+    stale = datetime.now(UTC) - timedelta(seconds=400)
+
+    class _FakeRun:
+        def all_messages(self) -> list[Any]:  # pragma: no cover - trivial
+            return []
+
+    task.last_run_end = stale
+    app._persist_task_messages(task, _FakeRun(), 5)  # type: ignore[arg-type]
+    fresh = task.last_run_end
+    assert fresh is not None and fresh > stale
+    # A superseded run persists its transcript but never re-stamps.
+    app._persist_task_messages(task, _FakeRun(), 4)  # type: ignore[arg-type]
+    assert task.last_run_end is fresh
+
+
+async def test_crash_restart_gate_sees_fresh_idle(
+    app: DrCodeApp,
+    scripted: ScriptedState,
+    wide_compaction: None,
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+) -> None:
+    """The process dies mid-run (kill/OOM): the worker's finally never
+    executes and the pre-fix disk stamp stayed at the PREVIOUS run's end —
+    the idle gate then "measured" a huge fake gap and force-compacted a
+    still cache-warm transcript.
+
+    Emulation: the first node-boundary persist lands (fresh disk stamp),
+    then the run's generation is bumped so the finally's guarded stamp is
+    suppressed — the exact disk state a killed process leaves. A
+    restarted app must measure the idle from the persist stamp: under
+    RESUME_COMPACTION_MIN_IDLE_SECONDS the gate stays silent despite the
+    fill being far above the threshold."""
+    # The previous life runs with the feature OFF (default threshold 0):
+    # its pre-run gate must not interfere — the crash happens mid-run.
+    task = _seed_task(app, 30_000)
+    stale = datetime.now(UTC) - timedelta(seconds=400)
+    task.last_run_end = stale
+    app.manager.storage.save(task)
+
+    real_persist = DrCodeApp._persist_task_messages
+    persisted: list[datetime] = []
+
+    def crash_after_first_persist(
+        self: DrCodeApp,
+        task: Any,
+        run: Any,
+        generation: int | None = None,
+    ) -> None:
+        real_persist(self, task, run, generation)
+        if run is not None:
+            persisted.append(task.last_run_end)
+            # The crash: every later guarded stamp (the worker's
+            # finally) is suppressed — as if the process died here.
+            self._agent_generations[task.id] = (
+                self._agent_generations.get(task.id, 0) + 1
+            )
+
+    monkeypatch.setattr(DrCodeApp, "_persist_task_messages", crash_after_first_persist)
+    app.manager.send(task.id, "continue")
+    scripted.steps = [text_response("partial work")]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await wait_until(lambda: bool(persisted), pilot, what="first node persist")
+        await pilot.pause()
+
+    assert persisted, "the run never reached a node-boundary persist"
+    assert persisted[0] > stale
+
+    # Restart: the feature is now on (persisted, so the fresh app reads
+    # it from disk) and a fresh app over the same project root reads the
+    # task metadata — the stamp must be the persist's, not the stale
+    # pre-run one.
+    app.settings.compaction_resume_min_tokens = 25_000
+    app.settings_store.save(app.settings)
+    app2 = DrCodeApp(project_root)
+    task2 = app2.manager.tasks[task.id]
+    assert task2.last_run_end is not None
+    assert task2.last_run_end > stale
+    assert (datetime.now(UTC) - task2.last_run_end).total_seconds() < 300
+
+    calls_before = len(scripted.calls)
+    scripted.steps = [text_response("SUMMARY")]
+    async with app2.run_test() as pilot:
+        await pilot.pause()
+        await app2._maybe_compact_after_idle(task2)
+        await pilot.pause()
+    # Fresh idle → the gate never ran: no summarizer call, no summary,
+    # no pre-run compaction event.
+    assert len(scripted.calls) == calls_before
+    assert not any(is_summary_message(m) for m in task2.messages)
+    assert not any("pre-run compaction" in t for t in event_texts(task2))
+
+
 # -- settings plumbing ---------------------------------------------------------------------
 
 

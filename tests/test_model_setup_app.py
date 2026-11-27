@@ -793,6 +793,29 @@ async def test_footer_anchored_to_dialog_bottom(tmp_path: Path) -> None:
         assert footer.content_region.bottom == dialog.content_region.bottom
 
 
+async def test_footer_buttons_equal_width_with_gap(tmp_path: Path) -> None:
+    """The action column: Assign agents and Save are EQUAL width (16 cells —
+    the wider "Assign agents…" label: 14 chars + 2 padding) and Save sits one
+    blank line below Assign agents. The hint keeps the rest of the footer
+    width (a `1fr` button here would absorb the whole footer and crush the
+    hint to an invisible sliver — pinned by the width assertion below)."""
+    store = UserModelsStore(tmp_path / "models.json")
+    async with _Host(store).run_test(size=(120, 56)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        hint = screen.query_one("#mc-hint")
+        assign = screen.query_one("#mc-assign-agents", Button)
+        save = screen.query_one("#mc-save", Button)
+        # The hint is not crushed: it keeps enough width to show the help
+        # line (a broken button sizing squeezes it to a few cells).
+        assert hint.region.width > 20
+        # Both buttons exactly the width of the wider label, and equal.
+        assert assign.region.width == 16
+        assert save.region.width == 16
+        # One blank line between the buttons: Save's row is Assign's + 2.
+        assert save.region.y - assign.region.y == 2
+
+
 # -- seeding from the user-level drcode.json --------------------------------------
 
 

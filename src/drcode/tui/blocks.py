@@ -361,12 +361,15 @@ class ToolCallBlock(Static):
     # (checked in order; the first present wins). Single-argument tools
     # always show that one argument's value.
     _MAIN_PARAM_KEYS = ("path", "command", "pattern", "question")
-    _MAX_ARG_LEN = 60
 
     def __init__(self, call: str, at: datetime | None = None) -> None:
         super().__init__(classes="tool-call collapsed")
         self._header, self._args = self._split(call)
-        self._header += self._primary_arg_suffix(self._args)
+        # The primary-argument value is kept FULL (never truncated here):
+        # the width-aware fitting happens in _redraw against the real
+        # available space between the block prefix and the elapsed
+        # counter / timestamp — a fixed cap would waste a wide terminal.
+        self._primary_suffix = self._primary_arg_value(self._args)
         self.at = at or datetime.now()
         self._spin_timer: Timer | None = None
         self._spin_frame = 0
@@ -416,8 +419,10 @@ class ToolCallBlock(Static):
         return call, ""
 
     @classmethod
-    def _primary_arg_suffix(cls, args: str) -> str:
-        """Return " value" for the tool's primary argument, "" if none."""
+    def _primary_arg_value(cls, args: str) -> str:
+        """Return " value" (FULL, untruncated) for the tool's primary
+        argument, "" if none; _redraw fits the joined header to the
+        available width."""
         try:
             parsed = json.loads(args) if args else None
         except ValueError:
@@ -433,8 +438,6 @@ class ToolCallBlock(Static):
         text = " ".join(str(value).split())
         if not text:
             return ""
-        if len(text) > cls._MAX_ARG_LEN:
-            text = text[: cls._MAX_ARG_LEN - 1] + "…"
         return f" {text}"
 
     def on_click(self) -> None:
@@ -485,7 +488,7 @@ class ToolCallBlock(Static):
         # width — the event time wrapped to the next line (worst on the
         # longest headers, e.g. delegate_research's GOAL preview).
         budget = width - cell_len(prefix) - cell_len(elapsed) - len(stamp) - 1
-        text = Text(prefix + _fit_cells(self._header, budget))
+        text = Text(prefix + _fit_cells(self._header + self._primary_suffix, budget))
         if elapsed:
             text.append(elapsed, "dim")
         _append_stamp(text, stamp, width)

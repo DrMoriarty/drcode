@@ -165,6 +165,36 @@ async def test_tool_call_block_counter_never_wraps_stamp() -> None:
         assert len(plain) <= block.content_size.width
 
 
+async def test_tool_call_block_header_uses_full_width_budget() -> None:
+    """The primary-argument value is NOT capped by a fixed constant: on a
+    wide terminal the header grows to the real available space between the
+    block prefix and the right-edge stamp (previously it was pre-truncated
+    to 60 characters in the constructor and _redraw had nothing to add)."""
+
+    class _Host(App[None]):
+        CSS = "ToolCallBlock { width: 200; }"
+
+        def compose(self) -> ComposeResult:
+            yield ToolCallBlock(
+                'run_bash({"command": "echo '
+                + "x" * 140
+                + ' tail_marker_reaches_the_end"})'
+            )
+
+    async with _Host().run_test(size=(220, 10)) as pilot:
+        block = pilot.app.query_one(ToolCallBlock)
+        rendered = block.render()
+        assert isinstance(rendered, Content)
+        plain = rendered.plain
+        # Single line, stamp still at the right edge…
+        assert "\n" not in plain
+        assert _stamp_label(block.at) in plain
+        # …and the command value survives far beyond the old 60-char cap,
+        # up to its very tail.
+        assert "tail_marker_reaches_the_end" in plain
+        assert "x" * 140 in plain
+
+
 def test_linkify_matches_task_mention() -> None:
     text = linkify(Text("see #69c8bd30 please"))
     assert _clicks(text) == [("#69c8bd30", "app.open_task('69c8bd30')")]

@@ -1005,6 +1005,16 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # sets so a failure seen by one role's transcript never disables
         # another role's gate.
         self._compaction_failed: set[str] = set()
+        # Transient-failure re-arm bookkeeping of the same gate
+        # (session-only): remaining cooldown ticks per task (presence = the
+        # transient latch is ON) and consecutive transient failures without
+        # a success in between (the anti-DDOS cap turns it into the
+        # permanent latch above). See core.state and
+        # core.pipeline_compaction.COMPACTION_RETRY_COOLDOWN_TURNS.
+        self._compaction_transient_cooldown: dict[str, int] = {}
+        self._compaction_transient_streak: dict[str, int] = {}
+        # See core.state._last_compaction_llm_transient.
+        self._last_compaction_llm_transient: bool = False
         # Tasks whose HARD-LIMIT escalation could not shrink the transcript
         # either (nothing beyond the verbatim original prompts to trim): the
         # hard-level gate bypass must stop firing for them, or the pause →

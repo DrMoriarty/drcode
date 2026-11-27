@@ -501,6 +501,10 @@ class CoreState:
 
     async def _maybe_compact(self, task: Task) -> None: ...
 
+    def _compaction_gate_open(self, task: Task) -> bool: ...
+
+    def _compaction_cooldown_tick(self, task: Task) -> None: ...
+
     async def _maybe_compact_after_idle(self, task: Task) -> None: ...
 
     async def _prepare_model_switch_transcript(
@@ -988,6 +992,25 @@ class CoreState:
     # role's gate.
     _compaction_failed: set[str]
     _hard_limit_exhausted: set[str]
+    # Transient-failure re-arm bookkeeping of the same gate: a transport
+    # (or HTTP 408/429/5xx) summarizer failure must not latch the gate off
+    # for the whole session like a persistent one — the gate re-arms after
+    # a cooldown of gate ticks (see
+    # core.pipeline_compaction.COMPACTION_RETRY_COOLDOWN_TURNS). The
+    # cooldown dict holds the remaining ticks per task; its PRESENCE is
+    # the transient latch. The streak dict counts consecutive transient
+    # failures without an intervening successful compaction — past the
+    # cap (COMPACTION_TRANSIENT_MAX_STREAK) the latch becomes permanent.
+    # Session-only, like `_compaction_failed`.
+    _compaction_transient_cooldown: dict[str, int]
+    _compaction_transient_streak: dict[str, int]
+    # Whether the most recent `llm_failed=True` outcome of
+    # `_compact_transcript` came from a TRANSIENT summarizer error: the
+    # hard-limit escalation catches the exception inside and reports it
+    # only as the `llm_failed` flag, so the latch sites need the
+    # classification to ride along. Reset at every `_compact_transcript`
+    # call.
+    _last_compaction_llm_transient: bool
     # Same bookkeeping for the tester ROUND gate (see
     # _maybe_compact_tester_round): an agent-transcript compaction failure
     # or livelock must never disable the testing round's mid-round gate.

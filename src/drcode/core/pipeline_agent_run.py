@@ -1207,12 +1207,14 @@ class PipelineAgentRunLayer(CoreState):
         executed are the last thing the model saw, and a break leaves
         them uncommitted in run.all_messages() (the transcript ends with
         unanswered tool calls — sanitized away, the redo of that one
-        round is the price of the pause). Skipped when compaction keeps
-        failing at the THRESHOLD level, otherwise a persistently broken
-        summarizer would loop break→continuation→break — but the
+        round is the price of the pause). Skipped while the THRESHOLD-level
+        gate is latched off (a persistent summarizer failure, or a
+        transient one whose re-arm cooldown is still running — see
+        `_compaction_gate_open`), otherwise a broken summarizer would
+        loop break→continuation→break — but the
         HARD-LIMIT level fires regardless: growth past it means a
         deterministic death of the run, so the gate must bypass
-        `_compaction_failed` (unless even the hard-level escalation
+        the latch (unless even the hard-level escalation
         proved unable to shrink the transcript —
         `_hard_limit_exhausted`)."""
         from pydantic_ai.messages import (
@@ -1271,8 +1273,12 @@ class PipelineAgentRunLayer(CoreState):
         # suppresses the turn-boundary gate; the HARD-LIMIT level stays
         # active — it is the crash-guard, not an ordinary compaction.
         bg_held = task.id in self._background_compactions
+        # Every tools node is a gate activation: one tick of the
+        # transient-compaction cooldown (the turn-boundary `_maybe_compact`
+        # is the other tick source) — at zero the threshold gate re-arms.
+        self._compaction_cooldown_tick(task)
         if tokens is not None and (
-            (not bg_held and task.id not in self._compaction_failed)
+            (not bg_held and self._compaction_gate_open(task))
             or (hard_due and task.id not in self._hard_limit_exhausted)
         ):
             pct = round(tokens * 100 / self.resolved_config(role).max_context_tokens)

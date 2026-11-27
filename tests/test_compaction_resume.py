@@ -19,6 +19,7 @@ import pytest
 
 from drcode import agent_model
 from drcode.agent import is_summary_message, serialize_messages
+from drcode.core.pipeline_compaction import COMPACTION_RETRY_COOLDOWN_TURNS
 from drcode.models import TaskKind, TaskStatus
 from drcode.providers import AgentRole
 from drcode.transcript import last_context_tokens
@@ -307,8 +308,10 @@ async def test_summarizer_failure_degrades_to_uncompressed_run(
     app: DrCodeApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A broken summarizer is never fatal: the gate logs an event and the
-    transcript stays untouched; the NEXT activation does not retry the
-    futile compaction (`_compaction_failed` latch)."""
+    transcript stays untouched. A TRANSIENT failure (plain ModelAPIError)
+    arms the cooldown re-arm instead of the permanent latch — the gate
+    stays closed (no futile retry on every activation) until the cooldown
+    ticks down; the NEXT activation during the cooldown is a no-op."""
 
     def failing(messages: list, info: Any) -> Any:
         raise api_error("Connection error.")
@@ -330,7 +333,11 @@ async def test_summarizer_failure_degrades_to_uncompressed_run(
         texts = event_texts(task)
         assert any("Pre-run compaction failed" in t for t in texts)
         assert not any(is_summary_message(m) for m in task.messages)
-        assert task.id in app._compaction_failed
+        # Transient classification: cooldown armed, gate closed, the
+        # permanent latch NOT set.
+        assert task.id in app._compaction_transient_cooldown
+        assert task.id not in app._compaction_failed
+        assert not app._compaction_gate_open(task)
 
         # The degraded latch: a second activation attempt is a no-op.
         events_before = len(task.events)
@@ -338,6 +345,13 @@ async def test_summarizer_failure_degrades_to_uncompressed_run(
         await pilot.pause()
         assert len(task.events) == events_before
         assert not any(is_summary_message(m) for m in task.messages)
+
+        # The cooldown ticks down (the run's gates tick it); at zero the
+        # gate re-arms and a later activation may retry the summarizer.
+        for _ in range(COMPACTION_RETRY_COOLDOWN_TURNS):
+            app._compaction_cooldown_tick(task)
+        assert app._compaction_gate_open(task)
+        assert any("re-armed after cooldown" in t for t in event_texts(task))
 
 
 # -- role resolution --------------------------------------------------------------------

@@ -145,6 +145,19 @@ RESUME_COMPACTION_MIN_IDLE_SECONDS = 180.0
 # summary there would only lose detail (and burn a call).
 MODEL_SWITCH_COMPACTION_MIN_TOKENS = RESUME_COMPACTION_MIN_TOKENS
 
+# The hysteresis of the "spare the summarizer" branch of the threshold gate
+# (_maybe_compact): the forced pre-compaction eviction may cancel the
+# summarizer only when the credit-corrected post-eviction fill dropped at
+# least this many percentage points of the window BELOW the threshold. A
+# smaller freeing re-crosses the threshold within a few turns, and the
+# evict→re-cross→evict cycle then repeats — each pass a forced eviction
+# that invalidates the prompt cache (the next request re-reads most of the
+# window at uncached-input price) to spare a few percent of carried tokens;
+# compacting right away on the lightened history is strictly cheaper. A
+# margin, not an absolute floor: it scales with a per-model
+# compaction_threshold from the catalog.
+_EVICTION_SPARE_MARGIN_PCT = 20
+
 # Background compaction (`background_compaction` setting, the OpenCode v2
 # `experimental.background_compaction` pattern): the trigger point sits
 # this many percentage points of the window BELOW the compaction
@@ -265,6 +278,40 @@ class PipelineCompactionLayer(CoreState):
                 self._task_role(task),
             ),
         )
+
+    def _eviction_spare_or_due(self, task: Task) -> int | None:
+        """The re-measure after the forced pre-compaction eviction — the
+        credit-corrected post-eviction fill judged against the HYSTERESIS
+        floor, not the bare threshold (`_EVICTION_SPARE_MARGIN_PCT` below
+        it). The summarizer is spared only when the eviction freed ENOUGH:
+        the post-eviction fill dropped below the floor. A fill at or above
+        the floor is returned instead, so the gate compacts right away on
+        the lightened history: the forced pass already invalidated the
+        prompt cache, and a fill this close to the threshold re-crosses it
+        within a few turns — sparing the summarizer there would start the
+        evict→re-cross→evict cycle the hysteresis exists to prevent. None
+        (spare) when the credit emptied the reading entirely or the window
+        is unknown.
+
+        This replaces the plain `_compaction_due` re-measure: that one
+        applies the threshold check to the RAW reading and the credit
+        afterwards, so it can hand back a sub-threshold fill (e.g. a fill
+        at 58% of the window) and defeat the floor."""
+        role = self._task_role(task)
+        role_config = self.resolved_config(role)
+        if role_config.max_context_tokens <= 0:
+            return None
+        fill = self._apply_eviction_credit(
+            task.id,
+            self._fill_tokens(self._live_ctx_tokens.get(task.id), task.messages, role),
+        )
+        if not fill:
+            return None
+        threshold = min(max(role_config.compaction_threshold, 1), 100)
+        floor_pct = max(threshold - _EVICTION_SPARE_MARGIN_PCT, 1)
+        if fill * 100 >= floor_pct * role_config.max_context_tokens:
+            return fill
+        return None
 
     def _fill_over_hard_limit(
         self,
@@ -1126,9 +1173,10 @@ class PipelineCompactionLayer(CoreState):
         pass does not fire. ``force=True`` is the PRE-COMPACTION eviction
         from _maybe_compact: before the summarizer runs, every mark is
         honored, every old result collapsed and every stale thinking
-        dropped — the unloading alone may pull the fill back under the
-        threshold and spare the summarizer entirely, and a still-needed
-        summarizer works on the lightened history either way.
+        dropped — the unloading alone may spare the summarizer (when the
+        post-eviction fill dropped below the hysteresis floor, see
+        _eviction_spare_or_due), and a still-needed summarizer works on
+        the lightened history either way.
 
         The collapsed/stripped ≈size is deposited as an eviction credit
         (`_evicted_ctx_tokens`): every fill reading the dev-transcript
@@ -1305,9 +1353,14 @@ class PipelineCompactionLayer(CoreState):
         then comes out OVER the threshold, a forced eviction of everything
         still selectable (remaining marks AND remaining old results) runs
         BEFORE the summarizer is considered — the fill is re-measured with
-        the eviction credit applied, so one unloading can pull it back
-        under the threshold and spare the summarizer entirely; a
-        still-needed summarizer works on the already lightened history.
+        the eviction credit applied, and the unloading spares the
+        summarizer only when it freed ENOUGH: the post-eviction fill must
+        drop below the hysteresis floor (the threshold minus
+        _EVICTION_SPARE_MARGIN_PCT points of the window). A fill between
+        the floor and the threshold compacts right away, on the already
+        lightened history — the forced pass costs its own prompt-cache
+        invalidation, so a mere dip under the threshold (re-crossed within
+        a few turns) would cost more than the summarizer call it spares.
         """
         self._maybe_evict_marked(task)
         # Background compaction (project setting `background_compaction`):
@@ -1322,9 +1375,22 @@ class PipelineCompactionLayer(CoreState):
         ):
             # Pre-compaction eviction: honor every remaining mark and
             # collapse every remaining old result before the summarizer
-            # is even considered, then re-measure.
+            # is even considered, then re-measure. The forced pass costs
+            # its own prompt-cache invalidation, so it may cancel the
+            # summarizer only when it freed ENOUGH (the hysteresis floor,
+            # _EVICTION_SPARE_MARGIN_PCT): a fill that merely dipped under
+            # the threshold re-crosses it within a few turns, and the
+            # evict→re-cross→evict cycle would repeat — each pass
+            # re-reading most of the window at uncached-input price to
+            # spare a few percent of carried tokens. A fill at or above
+            # the floor compacts right away, on the lightened history.
             self._maybe_evict_marked(task, force=True)
-            tokens = self._compaction_due(task)
+            # The re-measure IS the hysteresis decision: the credit-
+            # corrected post-eviction fill either sits at/above the floor
+            # (returned — compact right away on the lightened history) or
+            # dropped below it (None — the unloading alone did the job,
+            # the summarizer is spared).
+            tokens = self._eviction_spare_or_due(task)
         hard = self._hard_limit_due(task)
         # An under-threshold observation credits progress toward the
         # progress-gated reset of the threshold-livelock counter; an

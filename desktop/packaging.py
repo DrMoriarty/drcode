@@ -4,13 +4,14 @@ Builds the shell with PyInstaller (desktop.spec) around the pre-built
 drcode onedir payload (``scripts/build-binary.sh`` → ``dist/drcode/``)
 and produces per-platform distributables:
 
-  macos      DrCode.app (inside a .zip) — Info.plist + icon + ad-hoc
-             codesign (real Developer ID signing is an external
-             condition: set DRCODE_CODESIGN_IDENTITY, otherwise ad-hoc)
-  appimage   DrCode-<version>-linux-<arch>.AppImage — bundles WebKitGTK
-             (ldd-closure of seed libs) so the runtime WebKit version
-             stops mattering
-  deb        DrCode-<version>-linux-<arch>.deb — system package that
+  macos      DrCode.app (inside a drcode-desktop-<version>-<target>.zip)
+             — Info.plist + icon + ad-hoc codesign (real Developer ID
+             signing is an external condition: set
+             DRCODE_CODESIGN_IDENTITY, otherwise ad-hoc)
+  appimage   drcode-desktop-<version>-<target>.AppImage — bundles
+             WebKitGTK (ldd-closure of seed libs) so the runtime WebKit
+             version stops mattering
+  deb        drcode-desktop-<version>-<target>.deb — system package that
              *depends* on distro-provided WebKitGTK instead of bundling
 
 Usage (from the repo root)::
@@ -268,6 +269,12 @@ def linux_arch() -> str:
     raise SystemExit(f"Unsupported Linux architecture: {machine}")
 
 
+def linux_target() -> str:
+    """CI matrix target string (linux-x86_64 / linux-arm64)."""
+    arch = linux_arch()
+    return f"linux-{arch if arch != 'aarch64' else 'arm64'}"
+
+
 def _is_whitelisted(soname: str) -> bool:
     return any(soname.startswith(prefix) for prefix in GLIBC_WHITELIST_PREFIXES)
 
@@ -447,7 +454,7 @@ def build_appimage(shell_dir: Path, dist_out: Path) -> Path:
 
     dist_out.mkdir(parents=True, exist_ok=True)
     tool = _appimage_tool(arch)
-    out_file = dist_out / f"{APP_NAME}-{repo_version()}-linux-{arch}.AppImage"
+    out_file = dist_out / f"drcode-desktop-{repo_version()}-{linux_target()}.AppImage"
     run(
         [tool, "--appimage-extract-and-run", str(app_dir), str(out_file)],
         cwd=REPO,
@@ -479,7 +486,7 @@ DEB_DEPENDS = "libgtk-3-0, libwebkit2gtk-4.1-0, libgirepository-1.0-1"
 
 def build_deb(shell_dir: Path, dist_out: Path) -> Path:
     arch_map = {"x86_64": "amd64", "aarch64": "arm64"}
-    arch, deb_arch = linux_arch(), arch_map[linux_arch()]
+    deb_arch = arch_map[linux_arch()]
     version = repo_version()
     root = DESKTOP / "build" / "deb-root"
     if root.exists():
@@ -534,7 +541,7 @@ def build_deb(shell_dir: Path, dist_out: Path) -> Path:
     )
 
     dist_out.mkdir(parents=True, exist_ok=True)
-    out_file = dist_out / f"{APP_NAME}-{version}-linux-{arch}.deb"
+    out_file = dist_out / f"drcode-desktop-{version}-{linux_target()}.deb"
     run(["dpkg-deb", "--build", "--root-owner-group", str(root), str(out_file)])
     return out_file
 
@@ -561,7 +568,7 @@ def build_macos(payload_dir: Path, dist_out: Path) -> Path:
     app_path = build_shell(payload_dir, REPO / "dist-desktop")
     codesign_app(app_path)
     return zip_app(
-        app_path, dist_out / f"{APP_NAME}-{repo_version()}-{macos_arch()}.zip"
+        app_path, dist_out / f"drcode-desktop-{repo_version()}-{macos_arch()}.zip"
     )
 
 

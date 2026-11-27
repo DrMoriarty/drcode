@@ -108,7 +108,7 @@ Build (per platform; the drcode payload must exist first):
 bash scripts/build-binary.sh                      # the payload: dist/drcode/
 uv sync --group desktop --group build
 
-# macOS: dist-desktop/DrCode.app + dist/DrCode-<v>-macos-arm64.zip
+# macOS: dist-desktop/DrCode.app + dist/drcode-desktop-<v>-<target>.zip
 uv run --group desktop --group build python -m desktop.packaging --target macos
 # Linux: AppImage (bundles WebKitGTK) — needs libwebkit2gtk-4.1-dev etc.
 uv run --group desktop --group build python -m desktop.packaging --target appimage

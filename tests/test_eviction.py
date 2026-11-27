@@ -728,9 +728,11 @@ async def test_batch_eviction_gate_below_threshold_is_noop(
 async def test_pre_compaction_eviction_spares_the_summarizer(
     app_small_ctx: DrCodeApp, scripted: ScriptedState
 ) -> None:
-    """Fill over the compaction threshold (900 ≥ 80% of 1000), marked
-    result worth ≈1500 tokens: the forced pre-compaction eviction pulls
-    the fill back under the threshold and the summarizer never runs."""
+    """Fill over the compaction threshold (908 ≥ 80% of 1000), marked
+    result worth ≈1500 tokens: the forced pre-compaction eviction frees
+    far more than the hysteresis floor (80% − 20 points = 60% of 1000) —
+    the post-eviction fill collapses to ≈0, below the floor, and the
+    summarizer never runs."""
     task = _seed_marked_task(app_small_ctx, "y" * 6000, usage=900)
     assert app_small_ctx._compaction_due(task) == 908
 
@@ -745,6 +747,57 @@ async def test_pre_compaction_eviction_spares_the_summarizer(
     (stub_part,) = stubs_in(task.messages)
     assert stub_part["tool_call_id"] == "c1"
     assert task.marked_unneeded == []
+
+
+async def test_pre_compaction_eviction_small_freeing_compacts(
+    app_small_ctx: DrCodeApp,
+    scripted: ScriptedState,
+    wide_compaction: None,
+) -> None:
+    """The forced eviction freed only ≈300 tokens: the post-eviction fill
+    (608) is UNDER the threshold (800) but still at/above the hysteresis
+    floor (600) — the unloading does NOT spare the summarizer: a mere dip
+    under the threshold re-crosses it within a few turns, and each forced
+    pass would invalidate the prompt cache. The compaction runs on the
+    lightened history."""
+    task = _seed_marked_task(app_small_ctx, "y" * 1200, usage=900)
+    assert app_small_ctx._compaction_due(task) == 908
+    scripted.steps = [text_response("THE SUMMARY BODY")]
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    assert any("Context unloading" in t for t in event_texts(task))
+    # The summarizer worked on the lightened history: its request carried
+    # the stub, not the collapsed body.
+    assert "tool result evicted" in scripted.calls[-1]
+    assert "y" * 200 not in scripted.calls[-1]
+
+
+async def test_pre_compaction_eviction_spare_decision_is_credit_corrected(
+    app_small_ctx: DrCodeApp, scripted: ScriptedState
+) -> None:
+    """The spare decision is taken on the CREDIT-corrected post-eviction
+    fill, not on the raw (pre-eviction) usage reading: the mark frees
+    ≈325 tokens, the persisted usage still reads 908 — at or above the
+    floor (600) — but 908 − 325 = 583 is below it, so the summarizer is
+    spared. A raw reading would have compacted."""
+    task = _seed_marked_task(app_small_ctx, "y" * 1300, usage=900)
+    assert app_small_ctx._compaction_due(task) == 908
+
+    async with app_small_ctx.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx._maybe_compact(task)
+        await pilot.pause()
+
+    assert scripted.calls == []  # the summarizer was never invoked
+    assert not any("Context compacted" in t for t in event_texts(task))
+    assert any("Context unloading" in t for t in event_texts(task))
+    (stub_part,) = stubs_in(task.messages)
+    assert stub_part["tool_call_id"] == "c1"
 
 
 async def test_pre_compaction_eviction_lightens_the_summarizer_input(
@@ -922,7 +975,9 @@ async def test_pre_compaction_auto_clearing_spares_the_summarizer(
     """Fill over the threshold (908 ≥ 80% of 1000) with NO marks: the
     automatic clearing at the gate entry deposits its credit, the
     re-measured fill falls under the threshold and the summarizer never
-    runs — the unloading alone did the compaction."""
+    runs — the unloading alone did the compaction. The freed ≈1200 tokens
+    dwarf the hysteresis floor (600): the post-eviction fill collapses to
+    ≈0, so sparing is the right call here."""
     content = "y" * 800
     task = app_small_ctx.manager.create("docs", "", kind=TaskKind.RESEARCH)
     task.messages = auto_transcript(content, n=15, last_usage=900)
@@ -937,6 +992,39 @@ async def test_pre_compaction_auto_clearing_spares_the_summarizer(
     assert not any("Context compacted" in t for t in event_texts(task))
     assert any("Context unloading" in t for t in event_texts(task))
     assert len(stubs_in(task.messages)) == 6
+
+
+async def test_pre_compaction_auto_clearing_small_freeing_compacts(
+    app_small_ctx_auto_off: DrCodeApp,
+    scripted: ScriptedState,
+    wide_compaction: None,
+) -> None:
+    """Same via the FORCED pre-compaction pass (auto_context_unloading
+    off, so the gate-entry batch stays quiet and the forced pass does the
+    collapsing): the six old results free ≈300 tokens — the post-eviction
+    fill (608) is under the threshold (800) but at/above the hysteresis
+    floor (600), so the summarizer is NOT spared: the compaction runs on
+    the lightened history."""
+    content = "y" * 200  # ≈50 tokens per result × 6
+    task = app_small_ctx_auto_off.manager.create("docs", "", kind=TaskKind.RESEARCH)
+    task.messages = auto_transcript(content, n=15, last_usage=900)
+    app_small_ctx_auto_off.manager.storage.save(task)
+    assert not app_small_ctx_auto_off._maybe_evict_marked(task)  # entry: quiet
+    assert app_small_ctx_auto_off._compaction_due(task) == 908
+    scripted.steps = [text_response("THE SUMMARY BODY")]
+
+    async with app_small_ctx_auto_off.run_test() as pilot:
+        await pilot.pause()
+        await app_small_ctx_auto_off._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    assert any("Context unloading" in t for t in event_texts(task))
+    # The summarizer worked on the lightened history: its request carried
+    # the six stubs, not the collapsed bodies.
+    assert scripted.calls[-1].count("tool result evicted") == 6
+    # The still-fresh middle and the anchor stay verbatim in the request —
+    # only the six old results were collapsed.
 
 
 async def test_marks_and_auto_clearing_share_one_batch(

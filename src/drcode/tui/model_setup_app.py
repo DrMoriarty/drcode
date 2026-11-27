@@ -306,7 +306,13 @@ class ModelCatalogScreen(ChangedHighlightMixin, ModalScreen[None]):
         height: auto;
         margin-left: 1;
     }
-    #mc-btn-col Button { min-width: 0; }
+    /* Equal-width buttons: an explicit 16-cell width matches the wider
+       "Assign agents…" label (14 chars + 2 padding). `1fr` does NOT work
+       here — inside the auto-width column it resolves against the footer's
+       width, absorbing the whole row and crushing #mc-hint. One blank line
+       above Save pushes it a row below Assign agents. */
+    #mc-btn-col Button { min-width: 0; width: 16; }
+    #mc-btn-col #mc-save { margin-top: 1; }
     #mc-hint {
         width: 1fr;
         height: auto;

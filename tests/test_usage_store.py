@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai.usage import RunUsage
+from rich.text import Text
 from textual.widgets import DataTable, Tabs
 
 import drcode.config as config_module
@@ -25,6 +26,12 @@ def _usage(**kw: int) -> RunUsage:
         cache_write_tokens=kw.get("cache_write", 0),
         requests=kw.get("requests", 1),
     )
+
+
+def _plain(cell: object) -> str:
+    """Plain text of a usage-table cell (Rich Text on the styled rows,
+    a bare string on the padding cells)."""
+    return cell.plain if isinstance(cell, Text) else str(cell)
 
 
 def _read(path: Path) -> dict:
@@ -399,8 +406,16 @@ async def test_app_usage_dialog_renders_the_store(
         await app.workers.wait_for_complete()
         await pilot.pause()
         table = dialog.query_one("#usage-table", DataTable)
-        # One data row + the period total.
-        assert table.row_count == 2
+        # One date header row + one data row + the period total.
+        assert table.row_count == 3
+        header, model_row, total = (table.get_row_at(i) for i in range(3))
+        # The day is a styled group header row, not a cell: date in the
+        # first cell, everything else empty; the model row carries the
+        # key first.
+        assert _plain(header[0]).count("-") == 2  # a YYYY-MM-DD date
+        assert all(_plain(cell) == "" for cell in header[1:])
+        assert _plain(model_row[0]) == "coding/openai/gpt-5"
+        assert _plain(total[0]) == "Σ период"
         status = str(dialog.query_one("#usage-status").render())
         assert "1 дн." in status
 
@@ -459,14 +474,14 @@ async def test_app_usage_dialog_cost_column(
         await app.workers.wait_for_complete()
         await pilot.pause()
         table = dialog.query_one("#usage-table", DataTable)
-        # Two data rows + the period total.
-        assert table.row_count == 3
-        # Rows are sorted by (day desc, key): "coding/zveno/m1" first,
-        # then "coding/zveno/unpriced", then the Σ row.
-        first, second, total = (table.get_row_at(i) for i in range(3))
-        assert first[-1] == "$0.00205"
-        assert second[-1] == ""  # unknown price — empty, not zero
-        assert total[-1] == "$0.00205"
+        # Date header + two data rows + the period total.
+        assert table.row_count == 4
+        # Rows are sorted by (day desc, key): the date header, then
+        # "coding/zveno/m1", then "coding/zveno/unpriced", then the Σ row.
+        first, second, total = (table.get_row_at(i) for i in range(1, 4))
+        assert _plain(first[-1]) == "$0.00205"
+        assert _plain(second[-1]) == ""  # unknown price — empty, not zero
+        assert _plain(total[-1]) == "$0.00205"
 
 
 async def test_app_usage_dialog_cost_without_cache_read_price(
@@ -516,7 +531,13 @@ async def test_app_usage_dialog_cost_without_cache_read_price(
         await pilot.pause()
         table = dialog.query_one("#usage-table", DataTable)
         rows = [table.get_row_at(i) for i in range(table.row_count)]
-        by_key = {row[1]: row[-1] for row in rows if row[0] != "Σ период"}
+        # Model rows are keyed by the FIRST cell now (the day header rows
+        # carry the date there); a model key always contains a slash.
+        by_key = {
+            _plain(row[0]): _plain(row[-1])
+            for row in rows
+            if "/" in _plain(row[0])
+        }
         coding = by_key["coding/zveno/m1"]
         research = by_key["research/zveno/m1"]
         # cost = 1000*0.000002 + 100*0.000008 = 0.0028
@@ -718,6 +739,6 @@ async def test_app_usage_dialog_shows_agent_cost_averages(
         assert rows[1][3] == "$0.0042"
         assert rows[1][4] == "$0.0084"
         assert cost_table.row_count == 2  # compaction never appears
-        # The day×model table above is intact: 3 data rows + Σ.
+        # The day×model table above is intact: date header + 3 data rows + Σ.
         usage_table = dialog.query_one("#usage-table", DataTable)
-        assert usage_table.row_count == 4
+        assert usage_table.row_count == 5

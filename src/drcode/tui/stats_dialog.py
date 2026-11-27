@@ -10,7 +10,9 @@ A single modal with two tabs over the main screen:
   collected by `drcode.usage_store` (`~/.config/drcode/usage.json`): one
   table row per (day, model key) with the four per-response counters
   pydantic-ai reports plus the request count, and a period-total row at
-  the bottom. The keys are "<role>/<model>" — model id in the catalog's
+  the bottom. The days are not a column — each day opens with a styled
+  date header row its model rows group under (rows painted per agent
+  role). The keys are "<role>/<model>" — model id in the catalog's
   "<provider>/<model-id>" format where the provider is known — so the
   same model serving different roles shows as separate rows. When the
   model's catalog entry carries per-token prices (auto-discovered from
@@ -40,6 +42,7 @@ import asyncio
 from pathlib import Path
 from typing import ClassVar
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -76,6 +79,42 @@ _HINTS: dict[str, str] = {
 def _fmt(n: int) -> str:
     """Thousands-separated counter for the usage table cells."""
     return f"{n:,}"
+
+
+# The counter fields the usage table renders, in display order — the
+# canonical FIELDS list of the store minus cache_write (a write-amplification
+# detail; the store keeps accounting it, the table just doesn't show it).
+_USAGE_FIELDS: tuple[str, ...] = tuple(f for f in FIELDS if f != "cache_write")
+
+# Header row of the usage table: the model key first, then one column per
+# rendered field, then hit-rate and cost. The day is NOT a column — each
+# day's models are preceded by a full-width date header row instead.
+_USAGE_COLUMNS: tuple[str, ...] = (
+    "Модель",
+    "Запросы",
+    "Input",
+    "Output",
+    "Cache read",
+    "Hit-rate",
+    "Стоимость",
+)
+
+# Rich style of the per-day header rows (and the Σ period row): a muted
+# group separator the model rows are visually grouped under.
+_DAY_STYLE = "bold dim"
+
+# Row color per agent role (the "<role>/" prefix of the usage key): the
+# whole model row is painted so rows of different roles stay distinguishable
+# even when the Модель column has scrolled out of view. Unknown roles fall
+# back to the base style; "coding" IS the base style.
+_ROLE_STYLES: dict[str, str] = {
+    "coding": "",
+    "tester": "yellow",
+    "resolver": "magenta",
+    "compaction": "blue",
+    "subagent": "dim",
+    "research": "cyan",
+}
 
 
 # Per-model prices of one usage key: (prompt, completion, cache_read) per
@@ -213,17 +252,7 @@ class StatsDialog(ModalScreen[None]):
         table.zebra_stripes = True
         self._build_columns()
         usage_table = self.query_one("#usage-table", DataTable)
-        usage_table.add_columns(
-            "День",
-            "Модель",
-            "Запросы",
-            "Input",
-            "Output",
-            "Cache read",
-            "Cache write",
-            "Hit-rate",
-            "Стоимость",
-        )
+        usage_table.add_columns(*_USAGE_COLUMNS)
         cost_table = self.query_one("#cost-table", DataTable)
         cost_table.add_columns(
             "День",
@@ -360,13 +389,25 @@ class StatsDialog(ModalScreen[None]):
         """One row per (day, model), newest day first, then a period
         total. Clearing first makes a future reload idempotent.
 
+        The day is not a column: each day's model rows are preceded by a
+        full-width date header row (the date in the first cell, styled
+        `_DAY_STYLE`, every other cell empty) — the model rows of the day
+        follow immediately, without a day cell of their own. The period
+        total ("Σ период") stays the last row, its format unchanged.
+
+        Every model-row cell is painted in the row's role style
+        (`_ROLE_STYLES`) so rows of different roles stay distinguishable
+        with the Модель column scrolled out of view; the date header rows
+        keep the neutral group style.
+
         The cost column shows the USD amount of the row per the model's
         CURRENT catalog prices (the historical behavior of this table —
         deliberately untouched; the FROZEN-at-record-time figures live
         in the agent table below and in `drcode.cost`'s contract); a
         model whose prices are unknown (or missing the cache-read price
         while the row has cache reads) shows an empty cell — never 0.
-        The period total sums the computable rows only.
+        The period total sums the computable rows only. The cache_write
+        counter is accounted in the totals but never rendered.
         The hit-rate column is the row's daily cache_read/input share —
         the day window of the metric (the rolling last-N-requests window
         lives in the status line under the table)."""
@@ -375,6 +416,12 @@ class StatsDialog(ModalScreen[None]):
         total_cost = 0.0
         rows = 0
         for day in sorted(days, reverse=True):
+            if not days[day]:
+                continue
+            table.add_row(
+                Text(day, style=_DAY_STYLE),
+                *([""] * (len(_USAGE_COLUMNS) - 1)),
+            )
             for key in sorted(days[day]):
                 counters = days[day][key]
                 for field in FIELDS:
@@ -384,23 +431,28 @@ class StatsDialog(ModalScreen[None]):
                 # keyed by the model part ("<provider>/<model-id>" or the
                 # bare id) — strip the role prefix (first slash only: the
                 # model id itself may contain slashes).
-                row_prices = (prices or {}).get(key.partition("/")[2])
+                role, _, _model = key.partition("/")
+                row_style = _ROLE_STYLES.get(role, "")
+                row_prices = (prices or {}).get(_model)
                 cost = _row_cost(counters, row_prices) if row_prices else None
                 if cost is not None:
                     total_cost += cost
                 table.add_row(
-                    day,
-                    key,
-                    *(_fmt(counters.get(field, 0)) for field in FIELDS),
-                    _fmt_rate(daily_hit_rate(counters)),
-                    _fmt_cost(cost) if cost is not None else "",
+                    *(
+                        Text(cell, style=row_style)
+                        for cell in (
+                            key,
+                            *(_fmt(counters.get(field, 0)) for field in _USAGE_FIELDS),
+                            _fmt_rate(daily_hit_rate(counters)),
+                            _fmt_cost(cost) if cost is not None else "",
+                        )
+                    )
                 )
         if rows == 0:
             return
         table.add_row(
-            "Σ период",
-            "",
-            *(_fmt(totals[field]) for field in FIELDS),
+            Text("Σ период", style=_DAY_STYLE),
+            *(_fmt(totals[field]) for field in _USAGE_FIELDS),
             _fmt_rate(hit_rate(totals["cache_read"], totals["input"])),
             _fmt_cost(total_cost) if total_cost else "",
         )

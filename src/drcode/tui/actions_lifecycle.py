@@ -621,6 +621,10 @@ class TaskLifecycleLayer(DrCodeState):
         # Drop the deleted task's cache hit-rate episode state (session-only
         # bookkeeping, see core.usage.CacheHitRateMonitor).
         self._cache_hit_monitor.forget(task.id)
+        # And its compaction-gate bookkeeping (session-only, see
+        # core.state._compaction_transient_cooldown).
+        self._compaction_transient_cooldown.pop(task.id, None)
+        self._compaction_transient_streak.pop(task.id, None)
         # The chat pane shows the deleted task: switch to another one (or
         # an empty pane when the backlog is gone entirely).
         self.viewed_id = None

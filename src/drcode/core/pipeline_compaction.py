@@ -169,6 +169,40 @@ _EVICTION_SPARE_MARGIN_PCT = 20
 # several turns of headroom.
 _BACKGROUND_TRIGGER_MARGIN_PCT = 10
 
+# Transient summarizer failures (transport-level plain ModelAPIError and
+# HTTP 408/429/5xx — the same classes the retry layer in core.usage treats
+# as retryable) do not latch the THRESHOLD-level gate off for the session:
+# the gate re-arms after this many gate ticks (the mid-run gate counts one
+# per tools node, the turn-boundary `_maybe_compact` one per turn
+# boundary). A one-off network blip must not disable threshold compaction
+# until the app restarts.
+COMPACTION_RETRY_COOLDOWN_TURNS = 10
+
+# Anti-DDOS cap of the transient re-arm: after this many CONSECUTIVE
+# transient summarizer failures without an intervening successful
+# compaction, the cooldown is replaced by the permanent session latch — a
+# flapping (half-dead) summarizer provider must not be probed on every
+# cooldown expiry for the rest of the session.
+COMPACTION_TRANSIENT_MAX_STREAK = 3
+
+
+def _is_transient_compaction_error(e: BaseException) -> bool:
+    """Whether a summarizer failure is TRANSIENT: transport-level (any
+    plain ModelAPIError — connection refused, timeout, DNS) or an HTTP
+    status the retry layer in core.usage also retries (408 request
+    timeout, 429 rate limiting, 5xx server errors). Such a failure arms
+    the cooldown re-arm instead of the permanent session latch.
+    ModelHTTPError subclasses ModelAPIError, so the HTTP branch is
+    checked first; the deterministic context-overflow 400s never reach
+    this classification at all (the mechanical floor handles them — see
+    `_is_context_overflow_error`), every other 4xx and anything unknown
+    is persistent."""
+    from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+
+    if isinstance(e, ModelHTTPError):
+        return e.status_code in (408, 429) or e.status_code >= 500
+    return isinstance(e, ModelAPIError)
+
 
 @dataclass
 class BackgroundCompaction:
@@ -723,6 +757,7 @@ class PipelineCompactionLayer(CoreState):
         words `_compaction_failed` may mean "the summarizer is
         unavailable", never "growth past the limit is allowed".
         """
+        self._last_compaction_llm_transient = False
         try:
             summary = await self._summarize_history(
                 task,
@@ -760,6 +795,10 @@ class PipelineCompactionLayer(CoreState):
             # The fill is at the hard-limit level: retrying later is not an
             # option (the run would die deterministically before it), so a
             # broken summarizer here escalates to the mechanical trim.
+            # Remember the classification: the callers latch from the
+            # `llm_failed` flag alone and must not turn a transient error
+            # into the permanent session latch.
+            self._last_compaction_llm_transient = _is_transient_compaction_error(e)
             self._show_event(
                 task,
                 f"The summarizer failed ({type(e).__name__}: {e}) with the "
@@ -1309,6 +1348,85 @@ class PipelineCompactionLayer(CoreState):
             live if live else last_context_tokens(task.messages),
         )
 
+    def _compaction_gate_open(self, task: Task) -> bool:
+        """Whether the THRESHOLD-level dev/research transcript gate may
+        fire (the HARD-LIMIT level bypasses the latch by design — growth
+        past the hard limit is never allowed). False under a permanent
+        latch — a persistent summarizer error (4xx, anything unknown),
+        the consecutive-transient-failures cap, the no-op guard, the
+        livelock stop — and under a TRANSIENT latch whose re-arm
+        cooldown is still counting down. The permanent latch clears only
+        on a successful compaction (`_note_compaction_success`); the
+        transient one re-arms itself after COMPACTION_RETRY_COOLDOWN_TURNS
+        gate ticks (`_compaction_cooldown_tick`)."""
+        if task.id in self._compaction_failed:
+            return False
+        return task.id not in self._compaction_transient_cooldown
+
+    def _note_compaction_failure(self, task: Task, error: BaseException) -> bool:
+        """Latch a summarizer failure of the dev/research transcript
+        gate, classified: a TRANSIENT error (transport / 408 / 429 /
+        5xx) arms the cooldown re-arm, everything else latches the gate
+        off for the session as before. Returns True when the failure was
+        classified transient (the cooldown was armed)."""
+        if not _is_transient_compaction_error(error):
+            self._compaction_failed.add(task.id)
+            return False
+        return self._arm_transient_cooldown(task)
+
+    def _arm_transient_cooldown(self, task: Task) -> bool:
+        """Arm (or re-arm) the transient-failure cooldown of the
+        dev/research gate. After COMPACTION_TRANSIENT_MAX_STREAK
+        consecutive transient failures without an intervening success
+        the latch becomes permanent instead (the anti-DDOS cap: a
+        flapping summarizer provider must not be probed on every
+        cooldown expiry) with a diagnostic service event. Returns True
+        when the cooldown was armed."""
+        streak = self._compaction_transient_streak.get(task.id, 0) + 1
+        if streak >= COMPACTION_TRANSIENT_MAX_STREAK:
+            self._compaction_transient_streak.pop(task.id, None)
+            self._compaction_transient_cooldown.pop(task.id, None)
+            self._compaction_failed.add(task.id)
+            self._show_event(
+                task,
+                f"compaction failed {streak} times in a row (transient "
+                "errors) — threshold compaction stays off for the session.",
+            )
+            return False
+        self._compaction_transient_streak[task.id] = streak
+        self._compaction_transient_cooldown[task.id] = COMPACTION_RETRY_COOLDOWN_TURNS
+        return True
+
+    def _note_compaction_success(self, task: Task) -> None:
+        """A compaction landed: clear every latch/bookkeeping of the
+        dev/research gate (permanent latch, transient cooldown, the
+        consecutive-failure streak — a success proves the summarizer
+        healthy again)."""
+        self._compaction_failed.discard(task.id)
+        self._compaction_transient_cooldown.pop(task.id, None)
+        self._compaction_transient_streak.pop(task.id, None)
+
+    def _compaction_cooldown_tick(self, task: Task) -> None:
+        """One gate tick of the transient-compaction cooldown: the
+        mid-run gate runs it on every tools node, the turn-boundary
+        `_maybe_compact` on every turn boundary. Decrements the
+        remaining counter; at zero the gate re-arms (the next threshold
+        breach retries the summarizer) with a service event — the event
+        fires exactly once per cooldown cycle, so it never spams."""
+        remaining = self._compaction_transient_cooldown.get(task.id)
+        if not remaining:
+            return
+        remaining -= 1
+        if remaining > 0:
+            self._compaction_transient_cooldown[task.id] = remaining
+            return
+        self._compaction_transient_cooldown.pop(task.id, None)
+        self._show_event(
+            task,
+            "compaction re-armed after cooldown — the summarizer will be "
+            "retried when the fill next crosses the threshold.",
+        )
+
     async def _maybe_compact(self, task: Task) -> None:
         """Context compaction gate, called between agent turns (a turn
         boundary is the only safe point: the transcript never ends with
@@ -1362,6 +1480,10 @@ class PipelineCompactionLayer(CoreState):
         invalidation, so a mere dip under the threshold (re-crossed within
         a few turns) would cost more than the summarizer call it spares.
         """
+        # A turn boundary is one of the two tick sources of the
+        # transient-compaction cooldown (the mid-run gate is the other):
+        # count one down, re-arm the gate at zero.
+        self._compaction_cooldown_tick(task)
         self._maybe_evict_marked(task)
         # Background compaction (project setting `background_compaction`):
         # land a ready summary, clean a stale mark, maybe start a new
@@ -1461,6 +1583,7 @@ class PipelineCompactionLayer(CoreState):
             else "the fill reached the hard limit",
         )
         old_messages = task.messages
+        transient_failure = False
         try:
             compacted = await self._compact_transcript(
                 old_messages,
@@ -1477,9 +1600,14 @@ class PipelineCompactionLayer(CoreState):
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the run
-            self._compaction_failed.add(task.id)
+            transient_failure = _is_transient_compaction_error(e)
             if not hard:
-                self._show_event(task, f"compaction failed: {type(e).__name__}: {e}")
+                self._note_compaction_failure(task, e)
+                self._show_event(
+                    task,
+                    f"compaction failed: {type(e).__name__}: {e}"
+                    + (" — will retry after a cooldown." if transient_failure else ""),
+                )
                 return
             # Hard-limit escalation: the run must not continue
             # uncompressed past the hard limit — trim mechanically.
@@ -1496,10 +1624,21 @@ class PipelineCompactionLayer(CoreState):
         else:
             new_messages, event, llm_failed, mechanical = compacted
         if llm_failed:
-            self._compaction_failed.add(task.id)
+            if transient_failure or self._last_compaction_llm_transient:
+                # A TRANSIENT summarizer failure: the cooldown is already
+                # armed (`_note_compaction_failure` in the except above, or
+                # the hard-level escalation caught the error inside
+                # `_compact_transcript` — see
+                # `_last_compaction_llm_transient`). The mechanical trim (at
+                # the hard limit) still landed, so only the cooldown
+                # applies: the threshold gate re-arms instead of staying
+                # off for the session.
+                self._arm_transient_cooldown(task)
+            else:
+                self._compaction_failed.add(task.id)
             self._hard_limit_exhausted.discard(task.id)
         else:
-            self._compaction_failed.discard(task.id)
+            self._note_compaction_success(task)
             self._hard_limit_exhausted.discard(task.id)
         if hard and self._messages_estimate(new_messages) >= self._messages_estimate(
             task.messages
@@ -1856,10 +1995,12 @@ class PipelineCompactionLayer(CoreState):
         idle = (datetime.now(UTC) - task.last_run_end).total_seconds()
         if idle < RESUME_COMPACTION_MIN_IDLE_SECONDS:
             return
-        if task.id in self._compaction_failed:
-            # The summarizer failed before: degrade to running without
-            # the pre-run compaction instead of repeating a futile
-            # (and delaying) attempt on every activation.
+        if not self._compaction_gate_open(task):
+            # The summarizer failed before (a persistent error, or a
+            # transient one whose re-arm cooldown is still running):
+            # degrade to running without the pre-run compaction instead
+            # of repeating a futile (and delaying) attempt on every
+            # activation.
             return
         role = self._task_role(task)
         tokens = self._pre_run_fill_tokens(task)
@@ -1934,18 +2075,22 @@ class PipelineCompactionLayer(CoreState):
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - compaction must not kill the run
-            self._compaction_failed.add(task.id)
+            transient = self._note_compaction_failure(task, e)
             self._show_event(
                 task,
                 f"Pre-run compaction failed: {type(e).__name__}: {e} — "
-                "continuing with the uncompressed history.",
+                "continuing with the uncompressed history."
+                + (" Will retry after a cooldown." if transient else ""),
             )
             return False
         new_messages, event, llm_failed, mechanical = compacted
         if llm_failed:
+            # `hard` defaults to False in this pre-run call, so an
+            # llm_failed=True here is always the deterministic
+            # context-overflow path — a permanent latch, as before.
             self._compaction_failed.add(task.id)
         else:
-            self._compaction_failed.discard(task.id)
+            self._note_compaction_success(task)
         self._archive_transcript_replacement(
             task,
             old_messages,
@@ -2036,7 +2181,7 @@ class PipelineCompactionLayer(CoreState):
         # the run will actually receive.
         will_call = bool(task.pending_input) or ends_with_open_request(task.messages)
         compacted = False
-        if task.id not in self._compaction_failed:
+        if self._compaction_gate_open(task):
             compacted = await self._force_pre_run_compaction(
                 task,
                 role,

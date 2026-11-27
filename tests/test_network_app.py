@@ -36,6 +36,10 @@ from drcode.agent import (
 )
 from drcode.core import pipeline as pipeline_module
 from drcode.core import pipeline_agent_run, pipeline_deps, pipeline_net, pipeline_tester
+from drcode.core.pipeline_compaction import (
+    COMPACTION_RETRY_COOLDOWN_TURNS,
+    COMPACTION_TRANSIENT_MAX_STREAK,
+)
 from drcode.core.usage import NETWORK_RETRIES
 from drcode.models import TaskKind, TaskStatus, VerificationStatus
 from drcode.providers import AgentRole
@@ -865,6 +869,228 @@ async def test_compaction_failure_is_not_fatal(
     # Uncompressed history: the run continues with what it has.
     assert not any(is_summary_message(m) for m in task.messages)
     assert last_context_tokens(task.messages) == 908  # 900 input + 8 output
+
+
+async def test_transient_compaction_failure_rearms_after_cooldown(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ONE-OFF transient summarizer failure (plain ModelAPIError — a
+    transport error) must not disable the threshold gate for the whole
+    session: the gate re-arms after the cooldown of gate ticks, and the
+    next threshold breach compacts successfully (the latch is gone)."""
+    app = net_app_small_ctx
+
+    def failing(messages: list, info: Any) -> Any:
+        raise api_error("Connection error.")
+
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg, announce_wait=None: function_model(failing),
+    )
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+        # Transient classification: the cooldown is armed, the gate is
+        # closed, the permanent latch is NOT set.
+        assert not app._compaction_gate_open(task)
+        assert (
+            app._compaction_transient_cooldown[task.id]
+            == COMPACTION_RETRY_COOLDOWN_TURNS
+        )
+        assert task.id not in app._compaction_failed
+        assert any(
+            e.text.startswith("compaction failed: ModelAPIError") for e in task.events
+        )
+        assert not any(is_summary_message(m) for m in task.messages)
+
+        # The gate ticks count the cooldown down; at zero it re-arms.
+        for _ in range(COMPACTION_RETRY_COOLDOWN_TURNS):
+            app._compaction_cooldown_tick(task)
+        assert app._compaction_gate_open(task)
+        assert not app._compaction_transient_cooldown
+        assert any("compaction re-armed after cooldown" in e.text for e in task.events)
+
+        # The summarizer recovered: the next threshold breach compacts
+        # and clears the whole bookkeeping.
+        state = ScriptedState()
+        state.steps = [text_response("THE SUMMARY BODY")]
+        monkeypatch.setattr(
+            agent_model,
+            "build_model",
+            lambda cfg, announce_wait=None: function_model(state.fn),
+        )
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+    assert any("Context compacted" in t for t in event_texts(task))
+    assert any(is_summary_message(m) for m in task.messages)
+    assert app._compaction_gate_open(task)
+    assert not app._compaction_transient_cooldown
+    assert not app._compaction_transient_streak
+
+
+async def test_persistent_compaction_failure_latches_for_session(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent summarizer failure (HTTP 401 — authentication) keeps
+    the old semantics: the threshold gate is latched off for the session,
+    no cooldown is armed and the gate ticks never re-arm it."""
+    app = net_app_small_ctx
+
+    def failing(messages: list, info: Any) -> Any:
+        raise http_error(401, "invalid api key")
+
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg, announce_wait=None: function_model(failing),
+    )
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._maybe_compact(task)
+        await pilot.pause()
+
+        assert task.id in app._compaction_failed
+        assert not app._compaction_gate_open(task)
+        assert not app._compaction_transient_cooldown
+        assert not app._compaction_transient_streak
+
+        # Ticks do not re-arm a permanent latch.
+        for _ in range(COMPACTION_RETRY_COOLDOWN_TURNS + 1):
+            app._compaction_cooldown_tick(task)
+        assert not app._compaction_gate_open(task)
+
+    assert any(
+        e.text.startswith("compaction failed: ModelHTTPError") for e in task.events
+    )
+    assert not any("re-armed" in e.text for e in task.events)
+    assert not any(is_summary_message(m) for m in task.messages)
+
+
+async def test_transient_compaction_cap_turns_permanent(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After COMPACTION_TRANSIENT_MAX_STREAK consecutive transient
+    failures without an intervening success the cooldown is replaced by
+    the permanent session latch (the anti-DDOS cap: a flapping summarizer
+    provider must not be probed on every cooldown expiry) with a
+    diagnostic event."""
+    app = net_app_small_ctx
+
+    def failing(messages: list, info: Any) -> Any:
+        raise api_error("Connection error.")
+
+    monkeypatch.setattr(
+        agent_model,
+        "build_model",
+        lambda cfg, announce_wait=None: function_model(failing),
+    )
+    task = _seed_transcript(net_app_small_ctx, "long task " * 200)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(COMPACTION_TRANSIENT_MAX_STREAK):
+            await app._maybe_compact(task)
+            await pilot.pause()
+
+        assert task.id in app._compaction_failed
+        assert not app._compaction_gate_open(task)
+        assert not app._compaction_transient_cooldown
+        assert not app._compaction_transient_streak
+
+        # Ticks do not re-arm the permanent latch the cap installed.
+        for _ in range(COMPACTION_RETRY_COOLDOWN_TURNS):
+            app._compaction_cooldown_tick(task)
+        assert not app._compaction_gate_open(task)
+
+    texts = event_texts(task)
+    assert len([t for t in texts if t.startswith("compaction failed: ")]) >= 3
+    assert any("times in a row" in t for t in texts)
+    assert not any("re-armed" in t for t in texts)
+
+
+async def test_transient_streak_resets_on_success(
+    net_app_small_ctx: DrCodeApp, wide_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful compaction clears the consecutive-transient-failure
+    streak (and the cooldown with it): two failures, a success, then two
+    more failures — still transient bookkeeping, no permanent latch."""
+    app = net_app_small_ctx
+
+    def failing(messages: list, info: Any) -> Any:
+        raise api_error("Connection error.")
+
+    prompt = "long task " * 200
+    task = _seed_transcript(net_app_small_ctx, prompt)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(
+            agent_model,
+            "build_model",
+            lambda cfg, announce_wait=None: function_model(failing),
+        )
+        for _ in range(2):
+            await app._maybe_compact(task)
+        assert app._compaction_transient_streak[task.id] == 2
+
+        # A success proves the summarizer healthy: the streak starts over.
+        state = ScriptedState()
+        state.steps = [text_response("THE SUMMARY BODY")]
+        monkeypatch.setattr(
+            agent_model,
+            "build_model",
+            lambda cfg, announce_wait=None: function_model(state.fn),
+        )
+        await app._maybe_compact(task)
+        assert any("Context compacted" in t for t in event_texts(task))
+        assert not app._compaction_transient_streak
+        assert not app._compaction_transient_cooldown
+        assert app._compaction_gate_open(task)
+        # The threshold-livelock counter is a separate guard (its real reset
+        # is the under-threshold progress streak) — this test drove it to
+        # its cap with the failing attempts; clear it so the second phase
+        # can attempt compactions again.
+        app._threshold_compactions.pop(task.id, None)
+
+        # Two fresh transient failures afterwards: cooldown bookkeeping
+        # again — still short of the cap, nothing permanent. The
+        # successful compaction replaced the transcript (its fill now
+        # reads under the threshold), so re-seed a fat one first.
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            UserPromptPart,
+        )
+        from pydantic_ai.usage import RequestUsage
+
+        task.messages = serialize_messages(
+            [
+                ModelRequest(parts=[UserPromptPart(prompt)]),
+                ModelResponse(
+                    parts=[TextPart("more work")],
+                    usage=RequestUsage(input_tokens=900, output_tokens=8),
+                ),
+            ]
+        )
+        monkeypatch.setattr(
+            agent_model,
+            "build_model",
+            lambda cfg, announce_wait=None: function_model(failing),
+        )
+        for _ in range(2):
+            await app._maybe_compact(task)
+        assert app._compaction_transient_streak[task.id] == 2
+        assert task.id not in app._compaction_failed
+        assert app._compaction_transient_cooldown[task.id]  # cooldown armed
 
 
 async def test_compaction_success_replaces_history(

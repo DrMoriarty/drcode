@@ -512,7 +512,14 @@ class PipelineAgentRunLayer(CoreState):
                                 )
                             elif Agent.is_call_tools_node(node):
                                 if await self._agent_tools_node(
-                                    task, task_id, run_key, node, run, role, stream
+                                    task,
+                                    task_id,
+                                    run_key,
+                                    node,
+                                    run,
+                                    role,
+                                    stream,
+                                    generation,
                                 ):
                                     # Mid-run compaction pause: the attempt
                                     # is marked unfinished and resumed via a
@@ -524,7 +531,7 @@ class PipelineAgentRunLayer(CoreState):
                             # a switch away+back mid-turn shows the pre-turn
                             # transcript and everything streamed before the
                             # switch is lost from the history.
-                            self._persist_task_messages(task, run)
+                            self._persist_task_messages(task, run, generation)
                     if run.result is not None:
                         task.messages = serialize_messages(run.result.all_messages())
                         self.manager.storage.save(task)
@@ -645,7 +652,11 @@ class PipelineAgentRunLayer(CoreState):
                 # compaction gate measures its idle gap against this
                 # stamp — a superseded run must not re-stamp (it would
                 # shorten the pause the newer run's gate will see; the
-                # newer run re-stamps at its own end anyway).
+                # newer run re-stamps at its own end anyway). The node
+                # boundary persists re-stamp the same field during the
+                # run (same generation guard), so a crash that skips
+                # this finally leaves the disk stamp at the last
+                # transcript write instead of the previous run's end.
                 task.last_run_end = datetime.now(UTC)
                 self.manager.storage.save(task)
             # A cancelled run (user abort, or a newer run taking over) must
@@ -1180,6 +1191,7 @@ class PipelineAgentRunLayer(CoreState):
         run: AgentRun[AgentDeps, str],
         role: AgentRole,
         stream: NodeStreamView,
+        generation: int,
     ) -> bool:
         """Render one call-tools node (tool-call blocks + spinners) and
         run the mid-run compaction gate at the tool boundary.
@@ -1268,7 +1280,7 @@ class PipelineAgentRunLayer(CoreState):
                 task,
                 f"Context fill {pct}% — pausing the run to compact history…",
             )
-            self._persist_task_messages(task, run)
+            self._persist_task_messages(task, run, generation)
             task.messages = sanitized_messages(task.messages)
             task.unfinished = True
             self.manager.storage.save(task)
@@ -1299,7 +1311,7 @@ class PipelineAgentRunLayer(CoreState):
         else:
             return False
         self._show_event(task, pause_event)
-        self._persist_task_messages(task, run)
+        self._persist_task_messages(task, run, generation)
         task.messages = sanitized_messages(task.messages)
         task.unfinished = True
         self.manager.storage.save(task)
@@ -1340,7 +1352,7 @@ class PipelineAgentRunLayer(CoreState):
             # results, the empty interrupted request) so later messages
             # can append in any order.
             self._backdate_consumed_prompt(run, consumed, content)
-            self._persist_task_messages(task, run)
+            self._persist_task_messages(task, run, generation)
             if run is None and consumed:
                 # Cancelled before the run context was even entered (e.g.
                 # during the compaction gate): the prompts were popped
@@ -1408,7 +1420,7 @@ class PipelineAgentRunLayer(CoreState):
             # interrupted turn managed to do, then sanitize the API-invalid
             # tail so later messages can append in any order.
             self._backdate_consumed_prompt(run, consumed, content)
-            self._persist_task_messages(task, run)
+            self._persist_task_messages(task, run, generation)
             task.messages = sanitized_messages(task.messages)
             task.unfinished = True
             self.manager.storage.save(task)
@@ -1476,7 +1488,7 @@ class PipelineAgentRunLayer(CoreState):
         # bookkeeping that backdates it was skipped) — correct it before
         # the persist freezes the wrong stamp.
         self._backdate_consumed_prompt(run, consumed, content)
-        self._persist_task_messages(task, run)
+        self._persist_task_messages(task, run, generation)
         task.messages = sanitized_messages(task.messages)
         if run is None and consumed:
             # The request never started (pydantic-ai appends the user
@@ -1544,7 +1556,7 @@ class PipelineAgentRunLayer(CoreState):
             # user does next).
             self._drop_stream_preview(task_id, generation)
         self._backdate_consumed_prompt(run, consumed, content)
-        self._persist_task_messages(task, run)
+        self._persist_task_messages(task, run, generation)
         task.messages = sanitized_messages(task.messages)
         # Not lost: unfinished marks the attempt; promotion resumes it
         # (this session it is excluded via _agent_failed so a dead

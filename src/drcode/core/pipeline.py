@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -683,7 +684,10 @@ class PipelineCoreLayer(CoreState):
         self._notifications_primed = True
 
     def _persist_task_messages(
-        self, task: Task, run: AgentRun[AgentDeps, str] | None
+        self,
+        task: Task,
+        run: AgentRun[AgentDeps, str] | None,
+        generation: int | None = None,
     ) -> None:
         """Snapshot the transcript produced so far into the task.
 
@@ -704,6 +708,15 @@ class PipelineCoreLayer(CoreState):
         entered (e.g. `agent.iter()` or `resumable_history()` raised); there
         is nothing new to persist then — the pending input is re-queued by
         the caller and retried on the next activation.
+
+        Each persist also re-stamps `task.last_run_end` (guarded by the
+        run's `generation`: a superseded run must not re-stamp over a
+        newer run). The stamp then means "the moment the run last wrote
+        to the transcript" — which is exactly the semantics the pre-run
+        idle gate documents — and a crash (kill/OOM) that skips the
+        worker's finally-block stamp leaves the DISK stamp at the last
+        node boundary instead of the previous run's end: after a restart
+        the idle gate measures the honest gap.
         """
         if run is None:
             return
@@ -712,6 +725,11 @@ class PipelineCoreLayer(CoreState):
         except Exception:  # noqa: BLE001 - state may be mid-teardown after cancel
             return
         task.messages = serialize_messages(messages)
+        if (
+            generation is not None
+            and self._agent_generations.get(task.id) == generation
+        ):
+            task.last_run_end = datetime.now(UTC)
         self.manager.storage.save(task)
 
     def _flush_in_flight_prompt(self, task: Task) -> None:

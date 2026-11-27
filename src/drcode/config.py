@@ -66,6 +66,35 @@ def _resolve_user_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "drcode"
 
 
+def env_max_tokens_set() -> bool:
+    """Whether DRCODE_MAX_TOKENS is explicitly present in any env source
+    `Config` reads — the process environment first, then the dotenv files
+    (the same `_REPO_ENV_FILES` the dotenv settings source uses, read from
+    `Config.model_config` so a test sandbox that disables the source —
+    `env_file = ()` — disables this check too).
+
+    The value alone cannot serve: an env-set 8192 is indistinguishable
+    from the class default by `Config.max_tokens`, yet the providers
+    resolver must treat the two differently (an explicit 8192 beats the
+    reasoning-effort-derived default, the class default does not — see
+    `Config.max_tokens`)."""
+    if os.environ.get("DRCODE_MAX_TOKENS") is not None:
+        return True
+    env_files = Config.model_config.get("env_file") or ()
+    if isinstance(env_files, (str, Path)):
+        env_files = (env_files,)
+    from dotenv import dotenv_values
+
+    for path in env_files:
+        try:
+            values = dotenv_values(path)
+        except Exception:  # noqa: BLE001, S112 - unreadable dotenv never breaks resolution
+            continue
+        if values.get("DRCODE_MAX_TOKENS") is not None:
+            return True
+    return False
+
+
 # User-level config directory/file, resolved once at import. Child processes
 # re-import the module with the sandboxing DRCODE_USER_CONFIG_DIR already in
 # their environment, so a per-task sandbox redirect needs no lazy lookup.
@@ -148,13 +177,30 @@ class Config(BaseSettings):
     max_context_tokens: int = 200_000
     # Per-response output token cap (tokens): the `max_tokens` model setting of
     # pydantic-ai's OpenAIChatModel, distinct from max_context_tokens (the whole
-    # context window). It caps a single model response's output length. With
-    # no explicit value the provider's default is used, which for many gateways
-    # is far too small and fails with
+    # context window). It caps a single model response's output length. The
+    # DEFAULT (when no explicit source sets it) is derived from the role's
+    # FINAL reasoning_effort by `drcode.providers.resolve` — a thinking model
+    # burns the output budget on reasoning before any content, so a higher
+    # effort gets a proportionally higher cap (minimal/low → 8192,
+    # medium → 16384, high → 32768; None/"off" → 8192). An EXPLICIT source
+    # always wins, even when it equals 8192: DRCODE_MAX_TOKENS, the catalog
+    # entry's `max_tokens`, the role's custom model `max_tokens` and the
+    # project setting `role_max_tokens[role]`. Without any of them the flat
+    # provider default applies, which for many gateways is far too small and
+    # fails with
     # "Model token limit (provider default) exceeded before any response was
     # generated." Set via DRCODE_MAX_TOKENS when the default doesn't match the
-    # model; keep it at or below max_context_tokens.
+    # model; keep it at or below max_context_tokens (the derived default is
+    # clamped to the window; an explicit value is not).
     max_tokens: int = 8192
+    # Whether an EXPLICIT max_tokens source (catalog entry / role custom
+    # model / per-role project override) was applied during
+    # `drcode.providers` resolution — the flag that separates "the user set
+    # 8192" from "8192 is just the class default" (a value comparison cannot,
+    # both are 8192). Set only by the resolver's apply helpers; the flat
+    # default and the env layer (detected separately via `env_max_tokens_set`)
+    # leave it False.
+    _max_tokens_explicit: bool = PrivateAttr(default=False)
     # Reasoning-effort knob of the resolved connection ("minimal" / "low" /
     # "medium" / "high"; the special "off" = never send the field — the
     # escape hatch for gateways that reject it; None = not set). NEVER read

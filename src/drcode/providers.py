@@ -77,6 +77,14 @@ The resolver returns a `config.model_copy(update={...})` so
 (the provider slot-wait announcer) is an optional second argument, so the
 historical single-argument call sites stay valid.
 
+When NO explicit max_tokens source applied on any path (DRCODE_MAX_TOKENS,
+the catalog entry, the role's custom model, `role_max_tokens[role]`), the
+final step of every resolution derives the cap from the role's FINAL
+reasoning effort (`_apply_default_max_tokens`): minimal/low → 8192,
+medium → 16384, high → 32768, None/"off" → 8192 — a thinking model burns
+the output budget on reasoning before any content. An explicit value
+always wins, even when it equals 8192.
+
 The catalog deliberately does NOT ride on `Config`: `Config` is a flat
 BaseSettings whose corrupted json layer is silently skipped, which is the
 wrong behavior for a hand-curated catalog — here a corrupted file falls
@@ -106,6 +114,7 @@ from .config import (
     PROJECT_CONFIG_FILENAME,
     PROJECT_STATE_DIRNAME,
     Config,
+    env_max_tokens_set,
 )
 from .gitignore import ensure_drcode_gitignored
 from .settings import ProjectSettingsStore
@@ -965,7 +974,8 @@ def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
     — beats the catalog entry and the flat config / env):
 
     - `role_max_tokens[role]` beats the catalog entry's `max_tokens` and
-      the flat config's default / DRCODE_MAX_TOKENS;
+      the flat config's default / DRCODE_MAX_TOKENS (explicit even when it
+      equals the current value — it must beat the effort-derived default);
     - `role_request_timeout[role]` sets the role's `request_timeout`
       (seconds; the OpenAI client timeout of `agent_model.build_model`).
       Only roles present in the map get a value — every other role keeps
@@ -980,7 +990,9 @@ def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
     settings = ProjectSettingsStore(config._project_root).load()
     update: dict[str, object] = {}
     tokens = settings.role_max_tokens.get(role.value)
-    if tokens is not None and tokens != config.max_tokens:
+    if tokens is not None:
+        # Explicit even when it equals the current value: a role pinned to
+        # 8192 must beat the reasoning-effort-derived default below.
         update["max_tokens"] = tokens
     timeout = settings.role_request_timeout.get(role.value)
     if timeout is not None and timeout != config.request_timeout:
@@ -990,7 +1002,63 @@ def _apply_role_overrides(config: Config, role: AgentRole) -> Config:
         update["reasoning_effort"] = effort
     if not update:
         return config
-    return config.model_copy(update=update)
+    resolved = config.model_copy(update=update)
+    if tokens is not None:
+        resolved._max_tokens_explicit = True
+    return resolved
+
+
+# The reasoning-effort-derived default output cap (see
+# `Config.max_tokens`): a thinking model spends the per-response output
+# budget on reasoning before any content, so a higher final effort gets a
+# proportionally higher cap. Effort None / "off" (and any unknown value —
+# fail safe) degenerate to the historical flat 8192.
+DEFAULT_MAX_TOKENS_BY_EFFORT: dict[str, int] = {
+    "minimal": 8192,
+    "low": 8192,
+    "medium": 16384,
+    "high": 32768,
+}
+_DEFAULT_MAX_TOKENS = 8192
+
+
+def _default_max_tokens_for_effort(effort: str | None) -> int:
+    """The default per-response output cap for a role whose FINAL
+    reasoning effort is `effort` (after all overrides)."""
+    if effort is None:
+        return _DEFAULT_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS_BY_EFFORT.get(effort, _DEFAULT_MAX_TOKENS)
+
+
+def _apply_default_max_tokens(config: Config, role: AgentRole) -> Config:
+    """Derive the role's `max_tokens` from its FINAL reasoning effort when
+    NO explicit source set one — the last resolution step, shared by
+    `resolve` and the availability chain (`_resolve_available_chain`).
+
+    Explicit sources always win, even when they equal 8192: DRCODE_MAX_TOKENS
+    (`config.env_max_tokens_set` — the env value cannot be told apart from
+    the class default by value), the catalog entry's `max_tokens`, the role
+    custom model's `max_tokens` and `ProjectSettings.role_max_tokens[role]`
+    (all three tracked in `Config._max_tokens_explicit`). The derived value
+    is clamped to the model's context window (`max_tokens ≤
+    max_context_tokens`); an explicit value is left alone.
+
+    The tool-less utility agents (`utility_effort_config`) default to
+    effort "low" AFTER resolution — and low maps to 8192, the same value
+    None maps to, so their derived cap is consistent either way.
+
+    A "model not set" outcome (empty `model`, `is_ready` False) keeps the
+    flat value: the role is not runnable anyway and the flat cap is the
+    documented pass-through of the not-configured case."""
+    if not config.is_ready or config._max_tokens_explicit or env_max_tokens_set():
+        return config
+    derived = min(
+        _default_max_tokens_for_effort(config.reasoning_effort),
+        config.max_context_tokens,
+    )
+    if derived == config.max_tokens:
+        return config
+    return config.model_copy(update={"max_tokens": derived})
 
 
 def resolve(config: Config, role: AgentRole) -> Config:
@@ -1003,9 +1071,13 @@ def resolve(config: Config, role: AgentRole) -> Config:
     the returned config (`is_ready` is False). The project's per-role
     overrides (`ProjectSettings.role_max_tokens` /
     `role_request_timeout`) are applied to every outcome — they are the
-    most specific layer.
+    most specific layer. When no explicit max_tokens source applied
+    anywhere, the cap is finally derived from the role's FINAL
+    reasoning effort (`_apply_default_max_tokens`).
     """
-    return _apply_role_overrides(_resolve_connection(config, role), role)
+    return _apply_default_max_tokens(
+        _apply_role_overrides(_resolve_connection(config, role), role), role
+    )
 
 
 def _match_ref(catalog: UserModelsConfig, ref: ModelRef) -> Provider | None:
@@ -1046,10 +1118,12 @@ def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config
         "provider_max_parallel_requests": provider.max_parallel_requests,
     }
     entry = next((m for m in provider.models if m.id == ref.model), None)
+    explicit_tokens = False
     if entry is not None:
         update["max_context_tokens"] = entry.max_context_tokens
         if entry.max_tokens is not None:
             update["max_tokens"] = entry.max_tokens
+            explicit_tokens = True
         # The compaction limit rides with the model: an entry-level
         # value overrides the flat config, None keeps it (project/user
         # setting).
@@ -1063,7 +1137,10 @@ def _apply_provider(config: Config, ref: ModelRef, provider: Provider) -> Config
             update["reasoning_effort"] = entry.reasoning_effort
         if entry.thinking_budget is not None:
             update["thinking_budget"] = entry.thinking_budget
-    return config.model_copy(update=update)
+    resolved = config.model_copy(update=update)
+    if explicit_tokens:
+        resolved._max_tokens_explicit = True
+    return resolved
 
 
 def _resolve_connection(config: Config, role: AgentRole) -> Config:
@@ -1098,13 +1175,18 @@ def _resolve_connection(config: Config, role: AgentRole) -> Config:
                 # concurrency cap (0 = unlimited), never the catalog's.
                 "provider_max_parallel_requests": custom.max_parallel_requests,
             }
+            explicit_tokens = False
             if custom.max_tokens is not None:
                 update["max_tokens"] = custom.max_tokens
+                explicit_tokens = True
             if custom.reasoning_effort is not None:
                 update["reasoning_effort"] = custom.reasoning_effort
             if custom.thinking_budget is not None:
                 update["thinking_budget"] = custom.thinking_budget
-            return config.model_copy(update=update)
+            resolved = config.model_copy(update=update)
+            if explicit_tokens:
+                resolved._max_tokens_explicit = True
+            return resolved
 
     # 3. The user-level ordered chain: primary first, then the availability
     #    fallbacks; the first reference resolving to a catalog provider
@@ -1411,7 +1493,9 @@ async def _resolve_available_chain(
         # caller decides whether to start anyway).
         return AvailableResolution(theoretical_config, theoretical_key, False, down)
     ref, provider = chosen
-    cfg = _apply_role_overrides(_apply_provider(config, ref, provider), role)
+    cfg = _apply_default_max_tokens(
+        _apply_role_overrides(_apply_provider(config, ref, provider), role), role
+    )
     return AvailableResolution(cfg, f"{provider.name}/{ref.model}", True, down)
 
 

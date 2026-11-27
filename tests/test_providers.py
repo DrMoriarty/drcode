@@ -400,7 +400,9 @@ def test_resolve_custom_slot_max_tokens_none_keeps_flat(
     config = make_config(project_root, max_tokens=1234)
     resolved = resolve(config, AgentRole.COMPACTION)
     assert resolved.model == "m"
-    assert resolved.max_tokens == 1234
+    # The custom entry sets no max_tokens: no explicit source exists, so
+    # the cap is derived from the (unset) effort — 8192, not the flat 1234.
+    assert resolved.max_tokens == 8192
 
 
 def test_resolve_user_default_when_project_slot_absent(
@@ -595,6 +597,224 @@ def test_resolve_role_max_tokens_does_not_mutate_original(
     config = make_config(project_root, model="flat-m", max_tokens=1234)
     resolve(config, AgentRole.TESTER)
     assert config.max_tokens == 1234
+
+
+# -- effort-derived default max_tokens -----------------------------------------
+# When NO explicit source sets max_tokens (env DRCODE_MAX_TOKENS, the catalog
+# entry, the role's custom model, role_max_tokens[role]), the cap is derived
+# from the role's FINAL reasoning effort: minimal/low → 8192, medium → 16384,
+# high → 32768, None/"off" → 8192 (providers._apply_default_max_tokens).
+
+
+def test_resolve_default_max_tokens_by_effort(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The full effort → default table on an entry without an explicit
+    max_tokens ("small"): None and "off" keep the historical 8192."""
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 8192  # effort None
+    for effort, expected in (
+        ("minimal", 8192),
+        ("low", 8192),
+        ("medium", 16384),
+        ("high", 32768),
+        ("off", 8192),
+    ):
+        catalog.providers[0].models[1].reasoning_effort = effort
+        write_user_catalog(catalog, project_root)
+        assert resolve(config, AgentRole.TESTER).max_tokens == expected, effort
+
+
+def test_resolve_entry_max_tokens_beats_effort_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """An explicit entry max_tokens wins even when it equals the flat
+    default 8192 — and 4096 stays 4096 on a high-effort entry."""
+    entry = catalog.providers[0].models[1]  # "small": no max_tokens
+    entry.reasoning_effort = "high"
+    write_user_catalog(catalog, project_root)
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 32768
+    entry.max_tokens = 8192  # explicit, equal to the flat default
+    write_user_catalog(catalog, project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 8192
+    # The other entry keeps its explicit 4096.
+    set_project_model(
+        project_root,
+        AgentRole.TESTER,
+        ModelRef(provider="local-swap", model="qwen3-coder-30b"),
+    )
+    assert resolve(config, AgentRole.TESTER).max_tokens == 4096
+
+
+def test_resolve_custom_model_max_tokens_beats_effort_default(
+    project_root: Path,
+) -> None:
+    """The role's custom model: an explicit max_tokens wins over the
+    effort-derived default; without one the default is derived."""
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(
+            model="custom-m", base_url="http://c/v1", reasoning_effort="high"
+        ),
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 32768
+    set_project_custom_model(
+        project_root,
+        AgentRole.TESTER,
+        CustomModelEntry(
+            model="custom-m",
+            base_url="http://c/v1",
+            reasoning_effort="high",
+            max_tokens=8192,
+        ),
+    )
+    assert resolve(config, AgentRole.TESTER).max_tokens == 8192
+
+
+def test_resolve_env_max_tokens_beats_effort_default(
+    project_root: Path, catalog: UserModelsConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DRCODE_MAX_TOKENS=8192 is EXPLICIT (the env value cannot be told
+    apart from the class default by value): it beats the high-effort
+    default of 32768; without the env var the default is derived."""
+    _set_role_reasoning_effort(project_root, AgentRole.CODING, "high")
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.CODING).max_tokens == 32768
+    monkeypatch.setenv("DRCODE_MAX_TOKENS", "8192")
+    assert resolve(config, AgentRole.CODING).max_tokens == 8192
+
+
+def test_resolve_role_effort_override_changes_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The per-role effort override is part of the FINAL effort the
+    default is derived from: tester=high → 32768 while coding (same model,
+    no override) keeps 8192."""
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    _set_role_reasoning_effort(project_root, AgentRole.TESTER, "high")
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 32768
+    assert resolve(config, AgentRole.CODING).max_tokens == 8192
+
+
+def test_resolve_role_max_tokens_8192_beats_effort_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """role_max_tokens[role] = 8192 is explicit even though it equals the
+    flat default: it pins the cap against the high-effort default."""
+    catalog.providers[0].models[1].reasoning_effort = "high"
+    write_user_catalog(catalog, project_root)
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 32768
+    _set_role_max_tokens(project_root, AgentRole.TESTER, 8192)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 8192
+
+
+def test_resolve_derived_max_tokens_clamped_to_window(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """The derived value never exceeds the model's context window."""
+    entry = catalog.providers[0].models[1]
+    entry.reasoning_effort = "high"
+    entry.max_context_tokens = 10000
+    write_user_catalog(catalog, project_root)
+    set_project_model(
+        project_root, AgentRole.TESTER, ModelRef(provider="local-swap", model="small")
+    )
+    config = make_config(project_root)
+    assert resolve(config, AgentRole.TESTER).max_tokens == 10000
+
+
+def test_resolve_derived_default_skipped_when_model_not_set(
+    project_root: Path,
+) -> None:
+    """The "model not set" outcome keeps the flat max_tokens pass-through:
+    the role is not runnable, no derived value is invented for it."""
+    config = make_config(project_root, model="flat-m", max_tokens=1234)
+    resolved = resolve(config, AgentRole.COMPACTION)
+    assert resolved.model == ""
+    assert resolved.max_tokens == 1234
+
+
+def test_resolve_effective_fallback_derives_default(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """RESEARCH with nothing selected falls back to the resolved CODING
+    model — including the effort-derived default cap."""
+    set_project_model(
+        project_root, AgentRole.CODING, ModelRef(provider="local-swap", model="small")
+    )
+    catalog.providers[0].models[1].reasoning_effort = "high"
+    write_user_catalog(catalog, project_root)
+    config = make_config(project_root)
+    resolved = resolve_effective(config, AgentRole.RESEARCH)
+    assert resolved.model == "small"
+    assert resolved.max_tokens == 32768
+
+
+def test_utility_role_gets_low_effort_default_tokens(
+    project_root: Path, catalog: UserModelsConfig
+) -> None:
+    """A utility agent (effort None at resolve time → utility default
+    "low") derives 8192 — the same value None maps to, so the cap is
+    consistent before and after `utility_effort_config`."""
+    from drcode.providers import utility_effort_config
+
+    set_project_model(
+        project_root,
+        AgentRole.COMPACTION,
+        ModelRef(provider="local-swap", model="small"),
+    )
+    config = make_config(project_root)
+    resolved = resolve(config, AgentRole.COMPACTION)
+    assert resolved.reasoning_effort is None
+    assert resolved.max_tokens == 8192
+    forced = utility_effort_config(resolved)
+    assert forced.reasoning_effort == "low"
+    assert forced.max_tokens == 8192
+
+
+def test_env_max_tokens_set_detects_env_and_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`env_max_tokens_set` sees the process environment AND the dotenv
+    files `Config` reads; with neither it is False."""
+    from drcode.config import env_max_tokens_set
+
+    monkeypatch.delenv("DRCODE_MAX_TOKENS", raising=False)
+    assert not env_max_tokens_set()
+    monkeypatch.setenv("DRCODE_MAX_TOKENS", "8192")
+    assert env_max_tokens_set()
+    monkeypatch.delenv("DRCODE_MAX_TOKENS", raising=False)
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("DRCODE_MAX_TOKENS=8192\n", encoding="utf-8")
+    monkeypatch.setitem(Config.model_config, "env_file", (dotenv,))
+    assert env_max_tokens_set()
+    # A dotenv file without the variable keeps the flag False.
+    other = tmp_path / "other.env"
+    other.write_text("DRCODE_MODEL=m\n", encoding="utf-8")
+    monkeypatch.setitem(Config.model_config, "env_file", (other,))
+    assert not env_max_tokens_set()
 
 
 # -- per-role request timeout override -----------------------------------------------

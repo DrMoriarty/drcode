@@ -799,10 +799,14 @@ class ProjectSettings(BaseModel):
     # ("coding" / "research" / "tester" / "compaction" / "resolver"),
     # values are positive ints (the role's per-response max_tokens).
     # Absent / empty = inherit (the catalog entry's max_tokens, else the
-    # flat config default / DRCODE_MAX_TOKENS). The most specific layer —
+    # flat config default / DRCODE_MAX_TOKENS, else — when no explicit
+    # source exists at all — the value derived from the role's final
+    # reasoning effort: minimal/low 8192, medium 16384, high 32768; see
+    # providers._apply_default_max_tokens). The most specific layer —
     # the role — beats the more general ones (providers.resolve applies
-    # it last): a thinking model burns the default 8192 budget on
-    # reasoning alone, so the tester/resolver roles commonly need 16–32k.
+    # it last): a thinking model burns the effort-derived default on
+    # reasoning alone, so the tester/resolver roles commonly pin 16–32k
+    # here (a value set here is EXPLICIT and always wins, even 8192).
     role_max_tokens: dict[str, int] = Field(default_factory=dict)
     # -- per-role request timeouts -------------------------------------------
     # Per-role REQUEST TIMEOUT overrides, in seconds: keys are AgentRole

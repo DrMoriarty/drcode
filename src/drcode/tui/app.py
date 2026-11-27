@@ -68,6 +68,7 @@ from ..task_manager import TaskManager
 from ..tools import cleanup_orphan_scratches
 from ..usage_store import UsageStore, usage_file
 from ..workflow import load_hooks
+from . import clipboard_diag
 from .actions import ActionsLayer
 from .attachments import StagedImage
 from .blocks import (  # noqa: F401
@@ -77,6 +78,15 @@ from .blocks import (  # noqa: F401
     ToolCallBlock,
 )
 from .chat_view import ChatViewLayer
+from .clipboard_diag import (
+    DiagState,
+    arm_probe,
+    disarm_probe,
+    install_parser_hook,
+    poll_probe_reply,
+    send_osc52_query,
+    toast_message,
+)
 from .command_providers import (
     AgentRuntimeCommandProvider,
     ModelSettingsCommandProvider,
@@ -766,6 +776,13 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         self._chat_has_content = False
         # Auto-hide timer for the "copied" toast.
         self._copy_toast_timer: Timer | None = None
+        # Remote (ssh/tmux) clipboard-delivery diagnostics, cached for the
+        # session (see tui/clipboard_diag.py). The parser hook MUST be
+        # installed before run() starts application mode — the driver's
+        # input thread builds its parser at startup, and the hook is what
+        # keeps an OSC 52 probe reply away from the key parser.
+        install_parser_hook()
+        self._clipboard_diag = DiagState()
         # Per-task tester failure tracking: consecutive failure count and
         # the earliest monotonic time the task may be retried. A failed
         # tester run is retried with backoff, not dropped: tasks in TESTING
@@ -1640,6 +1657,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         # worker-thread calls that must hop over via call_from_thread.
         self._thread_id = threading.get_ident()
         self._update_terminal_title()
+        # One-shot remote clipboard diagnostics (tmux set-clipboard + OSC 52
+        # probe), in a worker — the tmux call is a subprocess with a timeout.
+        self._start_clipboard_diag()
         # Keep the tab title's agent badge in sync with the pipeline: every
         # status transition (active/testing/queued/…) re-renders the title.
         self.manager.add_status_listener(self._on_title_status_change)
@@ -2381,6 +2401,85 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
 
     # -- copy on select -------------------------------------------------------
 
+    def _start_clipboard_diag(self) -> None:
+        """Kick off the one-shot remote clipboard diagnostics (worker).
+
+        Runs when the session is remote (ssh/tmux — detected in
+        __init__); a local session never pays for anything here. Also
+        re-checked (idempotently) on the first copy, so a copy racing the
+        mount still gets diagnostics.
+        """
+        state = self._clipboard_diag
+        if state.probe_started or not state.remote:
+            return
+        driver = self._driver
+        if driver is not None and type(driver).__name__ == "HeadlessDriver":
+            # No real terminal behind the app (tests): probing would be a
+            # pure no-op with a pointless wait window.
+            return
+        state.probe_started = True
+        self.run_worker(
+            self._clipboard_diag_worker(),
+            group="clipboard-diag",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _clipboard_diag_worker(self) -> None:
+        """tmux set-clipboard check + one silent OSC 52 read probe.
+
+        Never fatal: every failure degrades to "unknown", which the toast
+        handles with the honest (non-promising) wording. Silence on the
+        probe is deliberately NOT reported — most terminals refuse
+        clipboard reads but accept writes (kitty by default, xterm).
+        """
+        state = self._clipboard_diag
+        try:
+            await asyncio.to_thread(state.run_tmux_check)
+            if state.tmux_off:
+                self._log_clipboard_diag_event(
+                    "tmux set-clipboard off — копирование из TUI не дойдёт "
+                    "до локального буфера: добавьте set -g set-clipboard on "
+                    "в ~/.tmux.conf и перезагрузите конфиг"
+                )
+                return
+            arm_probe()
+            if not send_osc52_query(self):
+                return
+            deadline = time.monotonic() + clipboard_diag.PROBE_WINDOW_SECONDS
+            while time.monotonic() < deadline:
+                if poll_probe_reply() is not None:
+                    state.probe_ok = True
+                    break
+                await asyncio.sleep(0.05)
+        except Exception:  # noqa: BLE001, S110 - diagnostics never break a copy
+            pass
+        finally:
+            state.probe_done = True
+            disarm_probe()
+            if state.probe_ok:
+                self._log_clipboard_diag_event(
+                    "Буфер подтверждён: цепочка OSC 52 рабочая "
+                    "(терминал ответил на read-запрос)"
+                )
+
+    def _log_clipboard_diag_event(self, text: str) -> None:
+        """Best-effort service event for clipboard diagnostics: into the
+        viewed task's event log when one is open, else a plain notification
+        (diagnostics are session-level, not tied to a task)."""
+        task = (
+            self.manager.tasks.get(self.viewed_id)
+            if self.viewed_id is not None
+            else None
+        )
+        if task is not None:
+            self._show_event(task, text)
+        elif self.is_running:
+            try:
+                self.notify(text, title="Clipboard", timeout=8)
+            except Exception:  # noqa: BLE001, S110 - app shutting down
+                pass
+
     def _selected_text(self) -> str | None:
         """Extract the currently selected text.
 
@@ -2410,7 +2509,15 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
     def _show_copy_toast(self, text: str) -> None:
         preview = escape(text if len(text) <= 40 else text[:39] + "…")
         toast = self.query_one("#copy-toast", Static)
-        toast.update(f"✓ copied: {preview}")
+        # The honest toast: over ssh/tmux an OSC 52 write is only a HOPE,
+        # not a delivery confirmation — the wording depends on what the
+        # one-shot diagnostics know (clipboard_diag). A local session
+        # ("local" verdict) or a probe-confirmed chain keeps the
+        # confident toast.
+        verdict = self._clipboard_diag.verdict()
+        if verdict not in ("local", "confirmed"):
+            self._start_clipboard_diag()
+        toast.update(toast_message(verdict, preview))
         toast.remove_class("hidden")
         if self._copy_toast_timer is not None:
             self._copy_toast_timer.stop()

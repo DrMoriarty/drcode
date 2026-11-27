@@ -134,6 +134,7 @@ def copy_task_settings(dst: ProjectSettings, src: ProjectSettings) -> None:
     dst.agent_creates_drafts = src.agent_creates_drafts
     dst.generate_task_titles = src.generate_task_titles
     dst.eviction_hint = src.eviction_hint
+    dst.redact_secrets_on_completion = src.redact_secrets_on_completion
     dst.auto_context_unloading = src.auto_context_unloading
     dst.thinking_keep_recent_turns = src.thinking_keep_recent_turns
     dst.todo_tail = src.todo_tail
@@ -1004,6 +1005,14 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
                     value=d.generate_task_titles,
                     toggle_id="ts-generate-titles",
                 )
+                yield ToggleRow(
+                    "Redact secrets on completion — when a task turns "
+                    "COMPLETED, credential-like strings (provider tokens, "
+                    "Bearer, JWT, GUIDs) are IRREVERSIBLY masked in its "
+                    "transcripts, title, events and search/archive copies",
+                    value=d.redact_secrets_on_completion,
+                    toggle_id="ts-redact-secrets",
+                )
             yield Vertical(id="ts-hints")
             with Horizontal(id="ts-buttons"):
                 yield Button("Apply", variant="primary", id="ts-apply")
@@ -1027,6 +1036,7 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
         self._set_toggle("#ts-agent-drafts", d.agent_creates_drafts)
         self._set_toggle("#ts-generate-titles", d.generate_task_titles)
         self._set_toggle("#ts-eviction-hint", d.eviction_hint)
+        self._set_toggle("#ts-redact-secrets", d.redact_secrets_on_completion)
         self._set_toggle("#ts-auto-unload", d.auto_context_unloading)
         self._set_toggle("#ts-todo-tail", d.todo_tail)
         self._set_toggle("#ts-background-compaction", d.background_compaction)
@@ -1054,6 +1064,9 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
             "#ts-agent-drafts": d.agent_creates_drafts != o.agent_creates_drafts,
             "#ts-generate-titles": (d.generate_task_titles != o.generate_task_titles),
             "#ts-eviction-hint": d.eviction_hint != o.eviction_hint,
+            "#ts-redact-secrets": (
+                d.redact_secrets_on_completion != o.redact_secrets_on_completion
+            ),
             "#ts-auto-unload": (d.auto_context_unloading != o.auto_context_unloading),
             "#ts-todo-tail": d.todo_tail != o.todo_tail,
             "#ts-background-compaction": (
@@ -1187,6 +1200,12 @@ class AgentRuntimeDialog(TaskSettingsDialogBase):
     def _eviction_hint_changed(self, event: RadioButton.Changed) -> None:
         if event.value != self._draft.eviction_hint:
             self._draft.eviction_hint = event.value
+            self._refresh()
+
+    @on(RadioButton.Changed, "#ts-redact-secrets")
+    def _redact_secrets_changed(self, event: RadioButton.Changed) -> None:
+        if event.value != self._draft.redact_secrets_on_completion:
+            self._draft.redact_secrets_on_completion = event.value
             self._refresh()
 
     @on(RadioButton.Changed, "#ts-auto-unload")

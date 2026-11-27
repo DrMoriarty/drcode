@@ -608,6 +608,29 @@ def _write_disk_index(project_root: Path, entries: dict[str, list[Any]]) -> None
         pass
 
 
+def invalidate_task_entry(project_root: Path, task_id: str) -> None:
+    """Drop ONE task's record from the in-memory cache AND the on-disk
+    index (`.drcode/search_index.json` holds prompt/event text copies —
+    the secret-redaction scrubber calls this after it rewrote the task's
+    metadata file, so no plaintext secret survives in the index; the
+    next `load_archive` re-parses the freshly scrubbed metadata and
+    rebuilds the entry). Never raises on file problems — the index is
+    disposable by contract (see _load_disk_index).
+    """
+    root = Path(project_root)
+    name = f"{task_id}.json"
+    with _ARCHIVE_LOCK:
+        cached = _ARCHIVE_CACHES.get(str(root))
+        if isinstance(cached, _CachedArchive):
+            cached.records = [r for r in cached.records if r[0] != task_id]
+            cached.by_name.pop(name, None)
+            cached.file_keys.pop(name, None)
+        entries = _load_disk_index(root)
+        if name in entries:
+            del entries[name]
+            _write_disk_index(root, entries)
+
+
 def clear_archive_cache(project_root: Path | None = None) -> None:
     """Drop the archive cache (one project, or all when root is None).
 

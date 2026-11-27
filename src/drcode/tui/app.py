@@ -632,6 +632,9 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
             on_error=self._notify_error,
             speaker=self.voice_tts.speak,
         )
+        # Push-queue secret sweep (see _redact_pending_notifications):
+        # registered here, after the notifier exists.
+        self.manager.add_completion_listener(self._redact_pending_notifications)
         # Push-to-talk voice dictation (Ctrl+B in the input fields).
         self.voice_input = VoiceInputController(TextualVoiceHost(self))
         # Keep-awake (system-sleep assertion while the pipeline has work):
@@ -1340,6 +1343,20 @@ class DrCodeApp(ChatViewLayer, ActionsLayer, PipelineLayer, App[None]):
         if self.settings.worktree_removal is not WorktreeRemoval.ON_COMPLETION:
             return
         self.task_env.schedule_removal(task.id, task)
+
+    def _redact_pending_notifications(
+        self, task: Task, old: TaskStatus, origin: str
+    ) -> None:
+        """Completion listener sweeping the PUSH queue for credential-like
+        patterns (drcode.redact): the "task completed" notification was
+        already built from the task's title by the STATUS-listener stage
+        (it fires before the completion listeners in
+        `fire_status_change`), and earlier failed pushes keep sitting in
+        the pending file with their original text. The task-side scrubber
+        (registered in TaskManager) covers the task's own files; this
+        covers the notifier's queue. Never raises on its own —
+        Notifier.redact_pending swallows its failures."""
+        self.notifier.redact_pending()
 
     def _remove_merged_completed_worktrees(self) -> None:
         """Post-merge tail of `worktree_removal: on_completion`, called

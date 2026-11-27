@@ -456,8 +456,27 @@ class ChatTimelineLayer(DrCodeState):
         end = count + len(tail)
         if len(timeline) < end:
             return False
-        for offset, (tail_role, tail_text, tail_block) in enumerate(tail):
-            entry = timeline[count + offset]
+        index = count
+        for tail_role, tail_text, tail_block in tail:
+            # Service events can sort INTO the middle of the live tail
+            # after the fact: a completion listener (e.g. the secret
+            # scrubber) appends its note to task.events once the run's
+            # last write is already in the ledger, and the wall-clock
+            # interleave places it between mounted live entries. Such an
+            # event is a legitimate late arrival — skip over timeline
+            # event entries the tail never mounted; they ride along in
+            # the appended region below (everything else still matches
+            # 1:1, so a genuine mismatch still forces the full rebuild).
+            while (
+                index < len(timeline)
+                and timeline[index][2] == "event"
+                and self._fingerprint_role(tail_role) != "event"
+            ):
+                index += 1
+            if index >= len(timeline):
+                return False
+            entry = timeline[index]
+            index += 1
             if self._fingerprint_role(entry[2]) != self._fingerprint_role(tail_role):
                 return False
             if tail_block is not None:
@@ -467,14 +486,14 @@ class ChatTimelineLayer(DrCodeState):
                 return False
         if self._timeline_fingerprint(timeline[:count]) != self._rendered_prefix:
             return False
-        if len(timeline) == end:
+        if index == len(timeline):
             # Nothing to mount: the live tail IS the timeline tail — fold
             # it into the rendered prefix so later deltas build on it.
             self._live_tail.clear()
-            self._rendered_count = end
+            self._rendered_count = index
             self._rendered_prefix = self._timeline_fingerprint(timeline)
             return True
-        for at, _, role, text in timeline[end:]:
+        for at, _, role, text in timeline[index:]:
             block = self._write_history_line(
                 role, text, None if at == _MIN_TIME else at
             )

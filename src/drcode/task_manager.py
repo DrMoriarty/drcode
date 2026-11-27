@@ -24,6 +24,8 @@ from .models import (
     VerificationStatus,
     _now,
 )
+from .redact import scrub_jsonl_file, scrub_task
+from .settings import ProjectSettingsStore
 from .stats import StatsStore
 from .storage import Storage
 from .tools import remove_scratch
@@ -223,6 +225,13 @@ class TaskManager:
         # line): when the LAST linked task honestly completes, the goal
         # moves to DONE on its own.
         self.add_completion_listener(self._goal_auto_done)
+        # Secret scrubbing (drcode.redact): the ONE-WAY redaction of the
+        # agreed deterministic secret patterns on every entry into
+        # COMPLETED — transcripts, metadata copies, the compaction
+        # archive and the search index. Registered after the goal
+        # listeners (human-facing bookkeeping first, the irreversible
+        # scrub last).
+        self.add_completion_listener(self._redact_secrets_on_completion)
         # Statistics: every creation (user, agent bug report, GitHub
         # import — it all funnels through create()) bumps the day's
         # "created" counter.
@@ -459,6 +468,58 @@ class TaskManager:
         always runs."""
         self.fire_status_change(task, old, origin)
         self.storage.save(task)
+
+    def _redact_secrets_on_completion(
+        self, task: Task, _old: TaskStatus, _origin: str
+    ) -> None:
+        """Completion listener: one-way secret redaction at the entry
+        into COMPLETED (drcode.redact — the module docstring carries the
+        full contract). Reads the project settings on every fire, so the
+        `redact_secrets_on_completion` toggle applies immediately. Never
+        raises (the funnel guards its listeners individually anyway):
+        a scrubbing failure must not break the completion, the task
+        simply stays unscrubbed."""
+        try:
+            settings = ProjectSettingsStore(self.storage.root).load()
+            if not settings.redact_secrets_on_completion:
+                return
+            report = scrub_task(task)
+            # The append-only compaction archive (pre-compaction
+            # transcripts) and the persistent search index hold copies
+            # of the same texts — scrub them with the same patterns
+            # EVEN when the live transcripts had no hits: after a
+            # compaction an original prompt with the secret may exist
+            # ONLY in the archive.
+            archive_report = scrub_jsonl_file(self.storage.archive_path(task.id))
+            if not report.changed and not archive_report.changed:
+                return
+            # The chat-visible note fires only for REAL credentials: the
+            # GUID trade-off masks UUIDs in practically every task's
+            # logs — a noise event per completed task would be chatter.
+            if report.credentials_masked or archive_report.credentials_masked:
+                task.events.append(
+                    TaskEvent(
+                        kind="system",
+                        text=(
+                            "secret redaction: credential-like strings were "
+                            "masked in the task transcripts and metadata "
+                            "(compaction archive and search index scrubbed "
+                            "too) — irreversible, paste the token anew if "
+                            "you re-open this task"
+                        ),
+                    )
+                )
+            # One save flushes the scrubbed sidecar AND rebuilds the
+            # search skeleton from the scrubbed messages.
+            self.storage.save(task)
+            from . import task_search
+
+            task_search.invalidate_task_entry(self.storage.root, task.id)
+        except Exception as e:  # noqa: BLE001 - an observer must not break the pipeline
+            print(
+                f"drcode: secret scrubber failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     def _goal_progress_event(self, task: Task, _old: TaskStatus, _origin: str) -> None:
         """Completion listener closing the goal-planning loop: a task with a

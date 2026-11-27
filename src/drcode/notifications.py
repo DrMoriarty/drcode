@@ -61,6 +61,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .models import TaskStatus, VerificationStatus
+from .redact import redact_text
 
 if TYPE_CHECKING:
     from .models import Task
@@ -262,6 +263,32 @@ class Notifier:
                 self._persist_locked()
         if kick:
             self._spawn_flush()
+
+    def redact_pending(self) -> None:
+        """Mask credential-like patterns (drcode.redact) in every
+        not-yet-delivered notification and persist the pending file when
+        something changed.
+
+        The app's completion wiring calls this alongside the task-side
+        scrubber: the "task completed" push is built from the task's
+        title BEFORE the completion listeners run (the status listeners
+        fire first in `fire_status_change`), and notifications that
+        failed to deliver earlier keep sitting in the pending file with
+        their original text — this sweep covers both. Never raises."""
+        try:
+            with self._lock:
+                changed = False
+                for entry in self._pending:
+                    title = redact_text(entry.title)
+                    message = redact_text(entry.message)
+                    if title != entry.title or message != entry.message:
+                        entry.title = title
+                        entry.message = message
+                        changed = True
+                if changed:
+                    self._persist_locked()
+        except Exception as e:  # noqa: BLE001 - notifications must never crash anything
+            self._report_error(f"pending-notification redaction failed: {e}")
 
     def _delivery_message(self, entry: PendingNotification) -> str:
         """Message text for the wire: a deferred re-send announces the
@@ -485,6 +512,12 @@ class Notifier:
         change) are not reported — they already saw it happen."""
         if origin == "user" or old is new:
             return
+        # Secrets never leave the machine in a push: the title may carry
+        # a credential pasted into the description's first line (see
+        # drcode.redact). Redaction here is one-way masking of the agreed
+        # deterministic patterns — the user still sees what the push is
+        # about. Cheap (a handful of regexes), applied on every push.
+        task_title = redact_text(task.title)
         # Voice announcements (each behind its own project-settings
         # checkbox; they ride on the same system-origin transitions the
         # pushes use, so no pipeline logic is duplicated here):
@@ -504,25 +537,25 @@ class Notifier:
                     else self._settings_getter().voice_tts_completed
                 ),
                 self._phrase(
-                    "completed_failed" if failed else "completed", title=task.title
+                    "completed_failed" if failed else "completed", title=task_title
                 ),
             )
         elif new.value == "queued" and old.value == "testing":
             self._speak(
                 self._settings_getter().voice_tts_tester_failed,
-                self._phrase("requeued", title=task.title),
+                self._phrase("requeued", title=task_title),
             )
         elif new.value == "clarification":
             self._speak(
                 self._settings_getter().voice_tts_clarification,
-                self._phrase("clarification", title=task.title),
+                self._phrase("clarification", title=task_title),
             )
         # The special settled states below cover "everything finished";
         # a per-task completion message is still useful and is not deduped.
         # Текст уведомления: "задача <status>" / "#{id} «{title}» — <описание статуса>".
         self.notify(
             self._title(f"task {new.value}"),
-            f'#{task.id} "{task.title}" — {_status_text(new, task)}',
+            f'#{task.id} "{task_title}" — {_status_text(new, task)}',
             tags=["clipboard" if new.value == "completed" else "hammer_and_wrench"],
             priority=(
                 Priority.HIGH

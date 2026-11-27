@@ -701,6 +701,18 @@ class ProjectSettings(BaseModel):
     # frozen texts, no big old tool returns); leaving it out keeps the
     # request framing minimal everywhere else.
     eviction_hint: bool = False
+    # One-way secret redaction on the entry into COMPLETED (drcode.redact):
+    # when on (the default), every transition into COMPLETED scrubs the
+    # task's transcripts, metadata copies (title/events/pending input/
+    # todos), the compaction archive and the search index of the agreed
+    # deterministic secret patterns (provider tokens, Bearer, JWT, GUIDs) —
+    # irreversibly. ON by default: the mechanism can never make the
+    # context worse (it runs after the last model exchange of the task)
+    # and the failure mode of having it off is a token sitting in
+    # plaintext forever. Off = the historical behavior (nothing is
+    # touched). Unfinished tasks (hold/unfinished/clarification) are never
+    # scrubbed — the agent still needs their content.
+    redact_secrets_on_completion: bool = True
     # Automatic context unloading (the auto half of drcode.eviction — the
     # Claude Code recipe): when on, old tool results (past
     # AUTO_EVICTION_MIN_AGE_TURNS model exchanges, minus the freshest

@@ -97,9 +97,9 @@ on inactive tabs, several terminals inside one tab.
 ```bash
 bash scripts/build-binary.sh     # payload first: dist/drcode/
 uv sync --group desktop --group build
-uv run --group desktop --group build python -m desktop.packaging --target macos     # DrCode.app + zip
-uv run --group desktop --group build python -m desktop.packaging --target appimage  # .AppImage (Linux)
-uv run --group desktop --group build python -m desktop.packaging --target deb       # .deb (Linux)
+uv run --group desktop --group build python -m desktop.packaging --target macos     # DrCode.app → drcode-desktop-<version>-<target>.zip
+uv run --group desktop --group build python -m desktop.packaging --target appimage  # drcode-desktop-<version>-<target>.AppImage (Linux)
+uv run --group desktop --group build python -m desktop.packaging --target deb       # drcode-desktop-<version>-<target>.deb (Linux)
 ```
 
 - **macOS** — PyInstaller BUNDLE with Info.plist + generated icon;

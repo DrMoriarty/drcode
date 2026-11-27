@@ -230,18 +230,23 @@ class TaskStatusLayer(DrCodeState):
             if total is None:
                 return None
             left_fixed = cell_len(kind_plain) + 3 + cell_len(f"#{task.id}") + 1
-            right_widths = [
-                w
-                for w in (
-                    cell_len(date_plain),
-                    cell_len(status_plain),
-                    cell_len(counter_plain),
-                )
-                if w
-            ]
-            return (
-                total - left_fixed - sum(right_widths) - max(0, len(right_widths) - 1)
-            )
+            # The cluster's REAL rendered width: every mid fragment is
+            # followed by one space (the join separator, the trailing one
+            # glues the mid widget to the right one), and ONE further cell
+            # is reserved for the gap between the title and the cluster —
+            # without it a title truncated to the full room fills the 1fr
+            # widget exactly and the date/counter start flush against the
+            # ellipsis (the missing-space bug).
+            cluster = 0
+            if date_plain:
+                cluster += cell_len(date_plain) + 1
+            if status_plain:
+                cluster += cell_len(status_plain) + 1
+            if counter_plain:
+                cluster += cell_len(counter_plain)
+            if cluster:
+                cluster += 1
+            return total - left_fixed - cluster
 
         date_plain = task.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
         # The MEASURED status fragment must mirror the RENDERED markup

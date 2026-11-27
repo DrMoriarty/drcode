@@ -534,9 +534,7 @@ async def test_app_usage_dialog_cost_without_cache_read_price(
         # Model rows are keyed by the FIRST cell now (the day header rows
         # carry the date there); a model key always contains a slash.
         by_key = {
-            _plain(row[0]): _plain(row[-1])
-            for row in rows
-            if "/" in _plain(row[0])
+            _plain(row[0]): _plain(row[-1]) for row in rows if "/" in _plain(row[0])
         }
         coding = by_key["coding/zveno/m1"]
         research = by_key["research/zveno/m1"]

@@ -651,9 +651,7 @@ async def test_land_spins_through_phases_and_restores_footer(
             base_branch: str,
         ) -> object:
             time.sleep(0.4)
-            return original_prepare(
-                project_root, task_id, worktree, base_branch
-            )
+            return original_prepare(project_root, task_id, worktree, base_branch)
 
         monkeypatch.setattr(merge_resolver, "prepare", slow_prepare)
         await pilot.press("m")

@@ -133,11 +133,11 @@ RESUME_COMPACTION_MIN_TOKENS = 20_000
 # Pre-run forced compaction: the minimum idle gap (seconds) since the
 # previous run stopped writing to the transcript before the gate may fire.
 # A provider's prompt cache survives minutes of idle at best — past this
-# the next request re-reads the whole transcript cold anyway, so paying
-# the summarizer to shrink it first cannot make anything worse. A constant,
-# deliberately not a setting: below it the cache is possibly still warm and
-# the ordinary threshold gate keeps working as before.
-RESUME_COMPACTION_MIN_IDLE_SECONDS = 180.0
+# (5 minutes) the next request re-reads the whole transcript cold anyway,
+# so paying the summarizer to shrink it first cannot make anything worse.
+# A constant, deliberately not a setting: below it the cache is possibly
+# still warm and the ordinary threshold gate keeps working as before.
+RESUME_COMPACTION_MIN_IDLE_SECONDS = 300.0
 
 # Model-switch housekeeping (`_prepare_model_switch_transcript`): a dev
 # transcript is force-compacted on a model change only above this token

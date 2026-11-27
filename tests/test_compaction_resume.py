@@ -1,7 +1,7 @@
 """Pre-run forced compaction of a cold-resume transcript (project setting
 `compaction_resume_min_tokens`, see core/pipeline_compaction.
 
-When a task is re-activated after its previous run ended ≥ 3 minutes ago
+When a task is re-activated after its previous run ended ≥ 5 minutes ago
 (the provider's prefix cache has burnt out) and its dev/research
 transcript fill exceeds the token threshold, the transcript is
 force-compacted BEFORE the first turn. Every gate below asserts the
@@ -142,12 +142,12 @@ def _tiny_compaction_window(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_resume_compaction_fires_before_first_turn(
     app: DrCodeApp, scripted: ScriptedState, wide_compaction: None
 ) -> None:
-    """Fill above the threshold + idle ≥ 3 min: the summarizer runs BEFORE
+    """Fill above the threshold + idle ≥ 5 min: the summarizer runs BEFORE
     the agent's first turn, and the run then proceeds over the compacted
     transcript."""
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 30_000)
-    _idle(app, task, 200)
+    _idle(app, task, 400)
     app.manager.send(task.id, "continue")
     scripted.steps = [
         text_response("THE SUMMARY BODY"),
@@ -193,7 +193,7 @@ async def test_mechanical_pre_run_compaction_reports_shrunk_fill(
     _tiny_compaction_window(monkeypatch)
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 711_046)
-    _idle(app, task, 200)
+    _idle(app, task, 400)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -224,7 +224,7 @@ async def test_disabled_below_minimum_tokens(
     even with a huge fill and a long idle."""
     app.settings.compaction_resume_min_tokens = threshold
     task = _seed_task(app, 30_000)
-    task.last_run_end = datetime.now(UTC) - timedelta(seconds=200)
+    task.last_run_end = datetime.now(UTC) - timedelta(seconds=400)
     app.manager.storage.save(task)
     app.manager.send(task.id, "continue")
     scripted.steps = [text_response("done")]
@@ -250,7 +250,7 @@ async def test_no_compaction_below_threshold_fill(
     pre-run compaction."""
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 20_000)
-    _idle(app, task, 200)
+    _idle(app, task, 400)
     app.manager.send(task.id, "continue")
     scripted.steps = [text_response("done")]
     async with app.run_test() as pilot:
@@ -265,7 +265,7 @@ async def test_no_compaction_below_threshold_fill(
 async def test_no_compaction_on_short_idle(
     app: DrCodeApp, scripted: ScriptedState, wide_compaction: None
 ) -> None:
-    """The pause is under 3 minutes: the cache may still be warm — no
+    """The pause is under 5 minutes: the cache may still be warm — no
     pre-run compaction, even with a huge fill."""
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 30_000)
@@ -320,7 +320,7 @@ async def test_summarizer_failure_degrades_to_uncompressed_run(
     )
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 30_000)
-    _idle(app, task, 200)
+    _idle(app, task, 400)
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -371,7 +371,7 @@ async def test_research_task_compacts_with_research_role(
     monkeypatch.setattr(DrCodeApp, "_compact_transcript", spy)
     app.settings.compaction_resume_min_tokens = 25_000
     task = _seed_task(app, 30_000, kind=TaskKind.RESEARCH)
-    _idle(app, task, 200)
+    _idle(app, task, 400)
     app.manager.send(task.id, "continue")
     scripted.steps = [text_response("SUMMARY"), text_response("done")]
     async with app.run_test() as pilot:

@@ -159,7 +159,11 @@ class TaskStatusLayer(DrCodeState):
         # short id (with the `#` prefix) to the clipboard
         # (action_copy_task_id).
         id_markup = f"[@click=app.copy_task_id('{task.id}')]#{task.id}[/]"
-        title_plain = task.title_display
+        # Full whitespace-normalized title (NOT title_display — that one
+        # hard-caps at 40 chars for the narrow sidebar): the adaptive
+        # layout below gives the title all room between #id and the right
+        # cluster and truncates only when the row is physically too short.
+        title_plain = " ".join(task.title.split())
         status_colors = {
             TaskStatus.DRAFT: "bright_black",
             TaskStatus.QUEUED: "yellow",
